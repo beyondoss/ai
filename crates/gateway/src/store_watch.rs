@@ -52,7 +52,7 @@ pub struct WatcherService {
 
 #[async_trait]
 impl BackgroundService for WatcherService {
-    async fn start(&self, _shutdown: ShutdownWatch) {
+    async fn start(&self, mut shutdown: ShutdownWatch) {
         // Resume position + on-disk snapshot writer persist across reconnects: a NATS blip resumes
         // the watch from `cursor` instead of re-scanning, and `seeded` stays true so we don't reseed.
         let mut cursor = WatchCursor::none();
@@ -94,15 +94,47 @@ impl BackgroundService for WatcherService {
         }
 
         loop {
-            match connect(&self.state).await {
-                Ok(store) => {
-                    info!("slipstream connected; watching deny-set");
-                    watch_deny(&self.state, store, &mut cursor, &mut writer, &mut seeded).await;
-                    warn!("deny-set watch exited; reconnecting");
+            // Connect, but bail immediately if Pingora signals shutdown mid-connect (e.g. NATS is
+            // down and `connect` is retrying its own backoff) rather than blocking teardown.
+            let store = tokio::select! {
+                _ = shutdown.changed() => {
+                    info!("shutdown signaled; deny-set watcher exiting");
+                    return;
                 }
-                Err(e) => error!(error = %e, "slipstream connect failed; retrying"),
+                outcome = connect(&self.state) => match outcome {
+                    Ok(store) => store,
+                    Err(e) => {
+                        error!(error = %e, "slipstream connect failed; retrying");
+                        // Reconnect backoff, also interruptible by shutdown.
+                        tokio::select! {
+                            _ = shutdown.changed() => return,
+                            _ = tokio::time::sleep(Duration::from_secs(2)) => continue,
+                        }
+                    }
+                },
+            };
+
+            info!("slipstream connected; watching deny-set");
+            // `watch_deny` returns `true` when it exited because shutdown was signaled — stop the
+            // reconnect loop cleanly instead of trying to reconnect a shutting-down process.
+            if watch_deny(
+                &self.state,
+                store,
+                &mut cursor,
+                &mut writer,
+                &mut seeded,
+                &mut shutdown,
+            )
+            .await
+            {
+                info!("shutdown signaled; deny-set watcher exiting");
+                return;
             }
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            warn!("deny-set watch exited; reconnecting");
+            tokio::select! {
+                _ = shutdown.changed() => return,
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+            }
         }
     }
 }
@@ -166,13 +198,16 @@ async fn connect(state: &GatewayState) -> crate::error::Result<Arc<dyn KvStore>>
     Ok(store)
 }
 
+/// Seed (if needed) and stream deny-set deltas until the watch ends or shutdown is signaled.
+/// Returns `true` iff it exited because `shutdown` fired — the caller then stops reconnecting.
 async fn watch_deny(
     state: &Arc<GatewayState>,
     store: Arc<dyn KvStore>,
     cursor: &mut WatchCursor,
     writer: &mut Option<SnapshotWriter>,
     seeded: &mut bool,
-) {
+    shutdown: &mut ShutdownWatch,
+) -> bool {
     // Seed once, on the first connect that lacks a usable resume point (cold boot with no snapshot,
     // or after a `CursorExpired` reset). A NATS scan is a point-in-time read of the live set; the
     // highest revision among its entries is the baseline the watch resumes strictly after. An empty
@@ -212,7 +247,7 @@ async fn watch_deny(
                 // No baseline yet — serve whatever's already in memory (fail-open) and let the
                 // reconnect loop retry the scan.
                 warn!(error = %e, "deny-set scan failed; serving current set, will retry");
-                return;
+                return false;
             }
         }
     }
@@ -221,7 +256,7 @@ async fn watch_deny(
     // New) — that would drop anything written in the seed→subscribe window.
     let Some(watcher) = store.watcher() else {
         warn!("store has no watcher; deny-set will not update");
-        return;
+        return false;
     };
     let (tx, mut rx) = tokio::sync::mpsc::channel::<KvUpdate>(256);
     let w = watcher.clone();
@@ -233,8 +268,20 @@ async fn watch_deny(
 
     // Updates are rcu (clone-on-write); the set is tiny (O(denied)). Each applied delta also
     // advances the in-memory cursor (so a reconnect resumes from here) and is appended to the
-    // on-disk snapshot if one is configured.
-    while let Some(update) = rx.recv().await {
+    // on-disk snapshot if one is configured. We `select!` on shutdown so a quiet stream (no deltas
+    // arriving) doesn't pin the task open through teardown; `select!` can only switch at an await
+    // point — between updates — so we never abort mid-`persist_update`, leaving the snapshot intact.
+    loop {
+        let update = tokio::select! {
+            _ = shutdown.changed() => {
+                watch.abort();
+                return true;
+            }
+            update = rx.recv() => match update {
+                Some(u) => u,
+                None => break,
+            },
+        };
         state.deny.rcu(|cur| {
             let mut set = (**cur).clone();
             match &update {
@@ -268,6 +315,7 @@ async fn watch_deny(
         Ok(Err(e)) => warn!(error = %e, "deny-set watch ended"),
         Err(e) => warn!(error = %e, "deny-set watch task panicked"),
     }
+    false
 }
 
 /// Append one applied delta to the on-disk snapshot (if configured) and checkpoint the cursor.

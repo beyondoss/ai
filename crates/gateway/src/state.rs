@@ -15,7 +15,7 @@ use crate::route::{self, AuthScheme, Provider};
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// How long a resolved upstream address is reused before re-resolving.
@@ -83,15 +83,17 @@ pub struct GatewayState {
     pub rate_limit: Option<RateLimit>,
 
     /// TTL cache of resolved upstream addresses, so `upstream_peer` neither blocks on a synchronous
-    /// `getaddrinfo` nor re-resolves the same provider host every request.
-    dns_cache: Mutex<HashMap<String, (SocketAddr, Instant)>>,
+    /// `getaddrinfo` nor re-resolves the same provider host every request. `ArcSwap` so the common
+    /// case — a cache hit, on every admitted request after warmup — is a lock-free atomic load; the
+    /// only writes are the ~10 providers' entries refreshed once per `DNS_TTL`, applied via `rcu`.
+    dns_cache: ArcSwap<HashMap<String, (SocketAddr, Instant)>>,
 }
 
 impl GatewayState {
     pub fn new(config: AiConfig, metrics: Arc<Metrics>) -> Result<Arc<Self>> {
         let keyring = config.build_keyring()?;
         let providers = build_providers(&config);
-        let rate_limit = RateLimit::new(config.rate_limit_rps);
+        let rate_limit = RateLimit::new(config.rate_limit_rps, config.byo_rate_limit_rps);
 
         Ok(Arc::new(Self {
             metrics,
@@ -99,7 +101,7 @@ impl GatewayState {
             providers,
             deny: ArcSwap::from_pointee(DenySet::new()),
             rate_limit,
-            dns_cache: Mutex::new(HashMap::new()),
+            dns_cache: ArcSwap::from_pointee(HashMap::new()),
             config,
         }))
     }
@@ -114,20 +116,11 @@ impl GatewayState {
     /// `tokio::net::lookup_host` (runs `getaddrinfo` on the blocking pool — async-safe) instead of
     /// `HttpPeer::new`'s eager blocking resolve.
     pub async fn resolve(&self, authority: &str) -> Result<SocketAddr> {
-        // Scope the guard so the `std::sync::Mutex` is provably released before the `.await` below —
-        // a `std` guard is not `Send` and must never be held across an await. The explicit block
-        // makes that invariant local and obvious (a stray log/borrow added before the await would
-        // otherwise either deadlock or fail to compile). A miss may let two concurrent callers both
-        // resolve; that's harmless (same answer, last writer wins) and not worth a lock across DNS.
-        {
-            // Recover from a poisoned lock (a prior holder panicked) rather than propagating the
-            // panic: the cache holds only transient `SocketAddr` entries, so a poisoned-but-readable
-            // map is safe to use. Without this, one panic would wedge every later DNS lookup.
-            let cache = self.dns_cache.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some((addr, at)) = cache.get(authority) {
-                if at.elapsed() < DNS_TTL {
-                    return Ok(*addr);
-                }
+        // Cache hit (the common case after warmup): a lock-free `ArcSwap` load — no mutex, no
+        // syscall — so concurrent workers never serialize on a DNS lookup that's already resolved.
+        if let Some((addr, at)) = self.dns_cache.load().get(authority) {
+            if at.elapsed() < DNS_TTL {
+                return Ok(*addr);
             }
         }
         let addr = tokio::net::lookup_host(authority)
@@ -135,10 +128,15 @@ impl GatewayState {
             .map_err(|e| GatewayError::Dns(format!("{authority}: {e}")))?
             .next()
             .ok_or_else(|| GatewayError::Dns(format!("{authority}: no addresses")))?;
-        self.dns_cache
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(authority.to_string(), (addr, Instant::now()));
+        // rcu the new/refreshed entry in. Two concurrent misses for the same host may both resolve
+        // and both rcu; that's harmless (same answer, last writer wins) and far cheaper than holding
+        // a lock across `getaddrinfo`. The clone-on-write copies a ~10-entry map — trivial, and only
+        // on the rare miss/refresh path, never on a hit.
+        self.dns_cache.rcu(|cur| {
+            let mut next = HashMap::clone(cur);
+            next.insert(authority.to_string(), (addr, Instant::now()));
+            next
+        });
         Ok(addr)
     }
 }

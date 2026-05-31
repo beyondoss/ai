@@ -65,7 +65,9 @@ mod route {
 
 mod deny {
     use super::*;
-    use beyond_ai::deny;
+    use beyond_ai::deny::{self, DenyReason, DenySet};
+
+    // --- ingest path: parse a watched NATS key/value into the set (off the request hot path) ---
 
     #[divan::bench]
     fn parse_key() -> Option<u64> {
@@ -80,6 +82,56 @@ mod deny {
     #[divan::bench]
     fn parse_reason_json() -> beyond_ai::deny::DenyReason {
         deny::parse_reason(black_box(br#"{"reason":"fraud","exp":123}"#))
+    }
+
+    // --- request hot path: the lookup run on EVERY managed request (`proxy::request_filter`) ---
+
+    /// Build a deny-set holding `n` cut-off tenants (ids `0..n`). Built outside the timed closure.
+    fn populated(n: u64) -> DenySet {
+        (0..n).map(|t| (t, DenyReason::Spend)).collect()
+    }
+
+    /// The common case: tenant **absent** from the set (default-allow). The headline invariant is
+    /// that this is O(1) and **0-alloc regardless of set size** — so the args span an empty set and
+    /// a large one (1M cut-off tenants); the ns/iter and the (absent) alloc columns must stay flat.
+    /// A regression to anything size-dependent shows up as the big-`n` row diverging from the small.
+    #[divan::bench(args = [0, 1_000_000])]
+    fn reason_miss(bencher: Bencher, n: u64) {
+        let set = populated(n);
+        // A tenant id past the populated range → guaranteed miss (the allow path).
+        bencher.bench(|| set.reason(black_box(n + 1)));
+    }
+
+    /// The deny case: tenant present. Same O(1) hash lookup, returning the reason — proves the
+    /// enforce path costs the same as the allow path (no surprise on the rejection branch).
+    #[divan::bench(args = [1, 1_000_000])]
+    fn reason_hit(bencher: Bencher, n: u64) {
+        let set = populated(n);
+        bencher.bench(|| set.reason(black_box(n / 2)));
+    }
+}
+
+mod ratelimit {
+    use super::*;
+    use beyond_ai::ratelimit::RateLimit;
+
+    /// Guardrail charged on **every request before verify** (`proxy::request_filter`). Managed: a
+    /// seeded hash of the raw credential + the per-credential sketch `observe` (the BYO global tier is
+    /// skipped). Fixed memory regardless of key cardinality, so this must be flat and low-alloc.
+    #[divan::bench]
+    fn check_managed(bencher: Bencher) {
+        let rl = RateLimit::new(1_000_000, 1_000_000).expect("enabled");
+        let cred = "bai_v1.1.AAAAAAAAAAAAAAAAAAAAAA.signature-base64url-payload-here";
+        bencher.bench(|| rl.check(black_box(cred), black_box(true)));
+    }
+
+    /// A longer BYO provider token — exercises both tiers (global BYO bucket + per-credential sketch)
+    /// against a realistic raw token length: the full per-request BYO cost.
+    #[divan::bench]
+    fn check_byo(bencher: Bencher) {
+        let rl = RateLimit::new(1_000_000, 1_000_000).expect("enabled");
+        let token = "sk-some-byo-provider-token-of-realistic-length-abcdef0123456789";
+        bencher.bench(|| rl.check(black_box(token), black_box(false)));
     }
 }
 
@@ -136,5 +188,42 @@ mod peek {
             scanner.feed(black_box(&body));
             scanner.take_model()
         });
+    }
+
+    use beyond_ai::peek::plan_stream_usage_injection;
+
+    /// A streaming body whose large `content` value precedes the root `stream` field — the worst
+    /// case for the injection planner: it must walk past `padding` bytes of uninteresting string
+    /// content (the SIMD fast-skip target) before it can decide.
+    fn streaming_body(padding: usize) -> Vec<u8> {
+        let content = "x".repeat(padding);
+        format!(r#"{{"messages":[{{"role":"user","content":"{content}"}}],"model":"gpt-4o","stream":true}}"#)
+            .into_bytes()
+    }
+
+    /// The common case: a non-streaming body (no `stream` field). The planner must prove absence,
+    /// which today means a full structural walk — the case the `memmem` pre-filter short-circuits.
+    fn non_streaming_body(padding: usize) -> Vec<u8> {
+        let content = "x".repeat(padding);
+        format!(r#"{{"messages":[{{"role":"user","content":"{content}"}}],"model":"gpt-4o"}}"#)
+            .into_bytes()
+    }
+
+    /// Plan injection on a **streaming** body (must walk past the big content value to find `stream`).
+    #[divan::bench(args = [0, 4 * 1024, 256 * 1024])]
+    fn plan_inject_streaming(bencher: Bencher, padding: usize) {
+        let body = streaming_body(padding);
+        bencher
+            .counter(BytesCount::of_slice(&body))
+            .bench(|| plan_stream_usage_injection(black_box(&body)));
+    }
+
+    /// Plan injection on a **non-streaming** body (no `stream` key — the majority case).
+    #[divan::bench(args = [0, 4 * 1024, 256 * 1024])]
+    fn plan_inject_non_streaming(bencher: Bencher, padding: usize) {
+        let body = non_streaming_body(padding);
+        bencher
+            .counter(BytesCount::of_slice(&body))
+            .bench(|| plan_stream_usage_injection(black_box(&body)));
     }
 }

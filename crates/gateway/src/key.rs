@@ -150,9 +150,12 @@ impl Keyring {
         let vk = self.get(kid).ok_or(KeyError::UnknownKid(kid))?;
 
         // The signed message binds version + kid + payload, so none can be swapped independently.
-        // Build it into a stack buffer (≤ 40 bytes) — no allocation per verify.
+        // Build it into a stack buffer (≤ 40 bytes) — no allocation per verify. A payload longer
+        // than the buffer can hold can't be a valid 16-byte payload anyway, so it's `Malformed`
+        // rather than a panic on this per-request hot path.
         let mut signed_buf = [0u8; SIGNED_BYTES_CAP];
-        let signed = write_signed_bytes(&mut signed_buf, kid, payload_b64);
+        let signed =
+            write_signed_bytes(&mut signed_buf, kid, payload_b64).ok_or(KeyError::Malformed)?;
         vk.verify(signed, &signature)
             .map_err(|_| KeyError::BadSignature)?;
 
@@ -165,19 +168,21 @@ impl Keyring {
 const SIGNED_BYTES_CAP: usize = 64;
 
 /// Write the signature-covered bytes `bai_v1.{kid}.{payload}` into `buf`, returning the written
-/// slice. Binding kid + payload here is what stops an attacker from re-pointing a valid signature
-/// at a different kid or a tampered payload. Bounded length (see `SIGNED_BYTES_CAP`) so the fixed
-/// buffer never overflows — keeps both verify and mint allocation-free.
+/// slice — or `None` if they don't fit in `SIGNED_BYTES_CAP`. Binding kid + payload here is what
+/// stops an attacker from re-pointing a valid signature at a different kid or a tampered payload.
+/// For a well-formed key the length is bounded (≤ 40 bytes; see `SIGNED_BYTES_CAP`), so `None`
+/// means the input was malformed — `write!` returns `WriteZero` rather than panicking or
+/// truncating, keeping the verify hot path allocation- *and* panic-free.
 fn write_signed_bytes<'a>(
     buf: &'a mut [u8; SIGNED_BYTES_CAP],
     kid: Kid,
     payload_b64: &str,
-) -> &'a [u8] {
+) -> Option<&'a [u8]> {
     use std::io::Write;
     let mut cur = std::io::Cursor::new(&mut buf[..]);
-    write!(cur, "{PREFIX}.{kid}.{payload_b64}").expect("signed bytes fit in SIGNED_BYTES_CAP");
+    write!(cur, "{PREFIX}.{kid}.{payload_b64}").ok()?;
     let n = cur.position() as usize;
-    &buf[..n]
+    Some(&buf[..n])
 }
 
 /// Parse an Ed25519 public key from a slipstream `signkey.*` value: accept raw 32 bytes or
@@ -207,7 +212,10 @@ pub fn verifying_key_from_value(bytes: &[u8]) -> Option<VerifyingKey> {
 pub fn mint(vk: &VirtualKey, kid: Kid, signing_key: &SigningKey) -> String {
     let payload_b64 = URL_SAFE_NO_PAD.encode(vk.encode_payload());
     let mut signed_buf = [0u8; SIGNED_BYTES_CAP];
-    let signed = write_signed_bytes(&mut signed_buf, kid, &payload_b64);
+    // mint builds the payload itself (a fixed 22-char base64 of 16 bytes) from controlled inputs,
+    // so it always fits; this `expect` is a true invariant assertion, not a fallible runtime path.
+    let signed = write_signed_bytes(&mut signed_buf, kid, &payload_b64)
+        .expect("minted signed bytes fit in SIGNED_BYTES_CAP");
     let sig: Signature = signing_key.sign(signed);
     let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes());
     format!("{PREFIX}.{kid}.{payload_b64}.{sig_b64}")

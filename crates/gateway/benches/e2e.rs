@@ -26,6 +26,10 @@ use common::*;
 
 const MANAGED_BODY: &str = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#;
 
+/// A plausible BYO provider token (anything not starting with `bai_` is BYO — passed through
+/// unchanged, no verify/deny/swap). The mock upstream accepts any token.
+const BYO_KEY: &str = "sk-byo-provider-token-1234567890";
+
 /// Concurrency level for the throughput group — enough in-flight requests to expose per-request
 /// overhead and connection-pool behavior without saturating a laptop.
 const CONCURRENCY: u64 = 32;
@@ -47,9 +51,13 @@ struct Stack {
 }
 
 async fn start_stack() -> Stack {
+    start_stack_with(Mode::Json).await
+}
+
+async fn start_stack_with(mode: Mode) -> Stack {
     let nats = Nats::start().await;
     let (pubkey, sk) = test_keypair(1);
-    let mock = MockUpstream::start(Mode::Json).await;
+    let mock = MockUpstream::start(mode).await;
     let gw = Gateway::start(nats.port, &mock.authority(), &b64(&pubkey)).await;
     let vkey = mint(
         &VirtualKey {
@@ -109,9 +117,45 @@ async fn managed_roundtrip(s: &Stack) {
     let _ = resp.bytes().await.expect("body");
 }
 
+/// One **BYO** round-trip: a non-`bai_` token, passed straight through — no key verify, no deny-set
+/// check, no key swap. Isolates the passthrough path's overhead from the managed path's auth work.
+async fn byo_roundtrip(s: &Stack) {
+    let resp = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.url))
+        .header("authorization", format!("Bearer {BYO_KEY}"))
+        .header("content-type", "application/json")
+        .body(MANAGED_BODY)
+        .send()
+        .await
+        .expect("request");
+    debug_assert_eq!(resp.status().as_u16(), 200);
+    let _ = resp.bytes().await.expect("body");
+}
+
+/// One **rejected** request: no API key ⇒ 401, short-circuited in `request_filter` **before** any
+/// upstream connection. Benched to prove a flood of rejects costs far less than a proxied request —
+/// the rate-guardrail/flood rationale (a reject must not consume the upstream-connection
+/// constraint). The gap between this and `managed_json_latency` is the gateway's reject headroom.
+async fn reject_roundtrip(s: &Stack) {
+    let resp = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.url))
+        .header("content-type", "application/json")
+        .body(MANAGED_BODY)
+        .send()
+        .await
+        .expect("request");
+    debug_assert_eq!(resp.status().as_u16(), 401);
+    let _ = resp.bytes().await.expect("body");
+}
+
 fn bench_e2e(c: &mut Criterion) {
     let rt = Runtime::new().expect("tokio runtime");
     let stack = rt.block_on(start_stack());
+    // A second stack whose mock streams SSE, so the response-tap (tail buffer + compaction) hot path
+    // is actually exercised — it's a near no-op for the single-shot JSON body.
+    let sse_stack = rt.block_on(start_stack_with(Mode::Sse));
 
     let mut group = c.benchmark_group("e2e");
     // Real round-trips are sub-millisecond on loopback but still ~100× a micro-bench; trim the
@@ -119,9 +163,20 @@ fn bench_e2e(c: &mut Criterion) {
     group.sample_size(50);
     group.measurement_time(Duration::from_secs(10));
 
-    // Single-request latency through the full proxy.
+    // Single-request latency through the full proxy: managed (verify + deny + key swap), BYO
+    // (pure passthrough), SSE relay (exercises the streaming response tap), and the reject
+    // fast-path (401, no upstream). Compared against each other these isolate where time goes.
     group.bench_function("managed_json_latency", |b| {
         b.to_async(&rt).iter(|| managed_roundtrip(&stack));
+    });
+    group.bench_function("byo_json_latency", |b| {
+        b.to_async(&rt).iter(|| byo_roundtrip(&stack));
+    });
+    group.bench_function("managed_sse_latency", |b| {
+        b.to_async(&rt).iter(|| managed_roundtrip(&sse_stack));
+    });
+    group.bench_function("reject_missing_key_latency", |b| {
+        b.to_async(&rt).iter(|| reject_roundtrip(&stack));
     });
 
     // Throughput: CONCURRENCY requests in flight per iteration. `Throughput::Elements` makes
@@ -154,8 +209,9 @@ fn bench_e2e(c: &mut Criterion) {
 
     group.finish();
 
-    // Keep the stack alive until every bench has run, then tear it down explicitly.
+    // Keep the stacks alive until every bench has run, then tear them down explicitly.
     drop(stack);
+    drop(sse_stack);
 }
 
 criterion_group!(benches, bench_e2e);

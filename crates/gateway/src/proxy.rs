@@ -18,9 +18,11 @@
 //! (the supported hook), feeding each chunk to a streaming structural scanner (`peek::ModelScanner`,
 //! O(1) memory) — never withholding or buffering it.
 //!
-//! Not done by design: OpenAI `stream_options.include_usage` injection — a streaming OpenAI client
-//! that omits it has no usage chunk to meter (the SDK/platform can set it). Worth it to keep the
-//! request body a pure passthrough rather than buffering+rewriting every request.
+//! One deliberate exception to the no-buffer rule: a **managed** OpenAI chat/responses request is
+//! buffered and gets `stream_options.include_usage` injected when it streams without it — otherwise
+//! OpenAI emits no usage chunk and the request couldn't be metered. We can't set that option in a
+//! client SDK we don't control, so the gateway guarantees it, out of the box. Scoped to exactly that
+//! path (managed + OpenAI dialect + streaming-capable); BYO and everything else stay pure passthrough.
 //!
 //! Auth branches on key format: `bai_…` is a managed virtual key (verify → deny-check → swap to
 //! the pool key); anything else is a **BYO** request — the user's own provider token, passed
@@ -30,7 +32,6 @@
 //! `upstream_peer` runs. Any non-default provider is reached via the `x-beyond-provider` header
 //! (providers are data — see `route`). Model is still captured (from the streamed body) for usage.
 
-use crate::ratelimit::RlKey;
 use crate::route::{self, Dialect, Provider};
 use crate::state::GatewayState;
 use crate::{peek, usage};
@@ -76,9 +77,18 @@ pub struct RequestCtx {
     /// Whether this is a **managed** request (`bai_…` key → swap to the pool key). `false` for
     /// **BYO** — we leave the user's own auth header untouched (passthrough).
     managed: bool,
-    /// Requested model, extracted exactly from the request body via a streaming structural scan.
+    /// Model the client *requested*, extracted from the request body. This is the billing-log
+    /// **fallback** — the authoritative value is the model the provider echoes in its response (see
+    /// `resp_model_scanner`), because a client may send an alias (`gpt-4o`) that the provider resolves
+    /// to and bills under a pinned id (`gpt-4o-2024-08-06`).
     model: String,
     model_scanner: peek::ModelScanner,
+    /// Extracts the model the **provider** reports in its response (the resolved/billed id), fed the
+    /// response stream in `response_body_filter`. Preferred over `model` in the `ai.usage` event so
+    /// the billed model is authoritative, not the requested alias. Works for SSE too: the scanner
+    /// skips the `data: ` prefix and reads the first chunk's root `model`. Falls back to `model` when
+    /// the response carries none (e.g. an error body).
+    resp_model_scanner: peek::ModelScanner,
     /// Whether the upstream response is an SSE stream — set in `response_filter` from the response
     /// Content-Type (we don't read the request to learn this).
     streaming: bool,
@@ -87,17 +97,28 @@ pub struct RequestCtx {
     /// Running total of request-body bytes seen, to enforce `MAX_REQUEST_BODY` even when the client
     /// uses chunked transfer encoding (no `Content-Length` to check up front).
     body_bytes_fed: usize,
+    /// Managed OpenAI chat/responses request: buffer the body and inject
+    /// `stream_options.include_usage` if it streams without it, so the usage chunk (hence the
+    /// billable token count) is guaranteed. The single, deliberate exception to "never buffer the
+    /// request body" — scoped to the managed OpenAI streaming-capable path and bounded by
+    /// `MAX_REQUEST_BODY`. BYO and every other request still stream straight through.
+    inject_eligible: bool,
+    /// Accumulated request body — populated only when `inject_eligible`; otherwise stays empty and
+    /// the body is never buffered.
+    req_buf: Vec<u8>,
     start: Instant,
     /// Connect-retry counter (see `fail_to_connect`).
     attempt: u8,
 }
 
 impl AiProxy {
-    /// Write a small JSON error and signal `request_filter` to short-circuit.
+    /// Write a small JSON error and signal `request_filter` to short-circuit. The body is built with
+    /// `serde_json` (not `format!`) so a `typ`/`msg` containing `"` or `\` can never break out of the
+    /// JSON structure — keeps this safe if a future caller passes a non-literal message.
     async fn reject(session: &mut Session, status: u16, typ: &str, msg: &str) -> Result<bool> {
-        let body = Bytes::from(format!(
-            r#"{{"error":{{"type":"{typ}","message":"{msg}"}}}}"#
-        ));
+        let body = Bytes::from(
+            serde_json::json!({ "error": { "type": typ, "message": msg } }).to_string(),
+        );
         let mut resp = ResponseHeader::build(status, None)?;
         resp.insert_header("content-type", "application/json")?;
         resp.insert_header("content-length", body.len().to_string())?;
@@ -120,12 +141,54 @@ fn extract_virtual_key(session: &Session) -> Option<&str> {
         .and_then(|v| v.strip_prefix("Bearer "))
 }
 
+/// Upper bound on a model id we'll record. Real ids are short (`claude-opus-4-8`,
+/// `accounts/fireworks/models/…`); anything longer is junk or an attempt to bloat the billing log.
+const MAX_MODEL_LEN: usize = 128;
+
+/// Sanitize the model id extracted from the (client-controlled) request body before it lands in the
+/// `ai.usage` billing log. `tracing`'s JSON layer escapes the value, but a downstream consumer
+/// (logfwd/OTLP → ClickHouse) may re-handle it, so we refuse anything that could break out of a JSON
+/// string or a line-oriented log: control bytes, `"`, `\`, `DEL`. A violating or over-long value is
+/// recorded as `"unknown"` (matching `peek`'s non-UTF-8 fallback) rather than the raw bytes — a
+/// mislabeled-but-safe usage row beats a corrupted or injected one.
+fn sanitize_model(model: String) -> String {
+    let bad = model.len() > MAX_MODEL_LEN
+        || model
+            .bytes()
+            .any(|b| b < 0x20 || b == b'"' || b == b'\\' || b == 0x7f);
+    if bad { "unknown".to_string() } else { model }
+}
+
 fn dialect_for_path(path: &str) -> Dialect {
     // Anthropic Messages vs OpenAI Chat Completions/Embeddings. Embeddings are OpenAI-dialect only.
     if path.starts_with("/v1/messages") {
         Dialect::Anthropic
     } else {
         Dialect::OpenAI
+    }
+}
+
+/// OpenAI **streaming-capable** endpoints: chat completions + the Responses API. These are the only
+/// requests we buffer for `stream_options.include_usage` injection — embeddings and every other
+/// OpenAI-dialect path never stream, so there's nothing to meter and no reason to buffer them.
+fn openai_streamable_path(path: &str) -> bool {
+    path.starts_with("/v1/chat/completions") || path.starts_with("/v1/responses")
+}
+
+/// Splice `stream_options.include_usage` into a buffered OpenAI chat body when it streams without it
+/// (see `peek::plan_stream_usage_injection`); otherwise return it unchanged. This is what guarantees
+/// a usage chunk — hence a billable token count — from a stock client that never set the option.
+fn maybe_inject_stream_usage(body: Vec<u8>) -> Vec<u8> {
+    match peek::plan_stream_usage_injection(&body) {
+        Some(at) => {
+            const FRAG: &[u8] = br#""stream_options":{"include_usage":true},"#;
+            let mut out = Vec::with_capacity(body.len() + FRAG.len());
+            out.extend_from_slice(&body[..at]);
+            out.extend_from_slice(FRAG);
+            out.extend_from_slice(&body[at..]);
+            out
+        }
+        None => body,
     }
 }
 
@@ -174,7 +237,26 @@ impl ProxyHttp for AiProxy {
             return Self::reject(session, 401, "authentication_error", "missing API key").await;
         };
 
-        // 3. Reject oversized bodies up front (Content-Length) so we never buffer a huge upload.
+        // 3. Rate guardrails (see `ratelimit`), charged on the *raw presented key* **before** any
+        // verification or upstream connect. Keying on the credential we already hold (rather than the
+        // verified tenant id) is what lets this sit ahead of the Ed25519 verify: a single leaked,
+        // runaway, or forged key can't drive unbounded crypto work (per-credential tier), and a flood
+        // of distinct random BYO tokens can't drive junk-auth connects to providers from our egress
+        // IPs (global BYO tier — managed traffic is exempt, see `ratelimit`). The `check` borrow of
+        // `raw_key` ends as the call returns, so the `&mut session` reject is free to run on the
+        // over-limit path (where `raw_key` is unused afterward).
+        if let Some(rl) = &self.state.rate_limit {
+            if let Some(reason) = rl.check(raw_key, raw_key.starts_with("bai_")) {
+                self.state
+                    .metrics
+                    .rejections_total
+                    .with_label_values(&[reason.label()])
+                    .inc();
+                return Self::reject(session, 429, "rate_limit_error", "rate limit exceeded").await;
+            }
+        }
+
+        // 4. Reject oversized bodies up front (Content-Length) so we never buffer a huge upload.
         if let Some(len) = session
             .req_header()
             .headers
@@ -193,7 +275,7 @@ impl ProxyHttp for AiProxy {
             }
         }
 
-        // 4. Identity + key handling. `bai_…` → managed (stateless verify → deny-check → swap to the
+        // 5. Identity + key handling. `bai_…` → managed (stateless verify → deny-check → swap to the
         // pool key). Anything else → BYO: the user's own provider token, passed through unchanged
         // (no Beyond identity, so no deny-set and no per-tenant attribution).
         let (tenant_id, vpc_id, managed) = if raw_key.starts_with("bai_") {
@@ -234,24 +316,13 @@ impl ProxyHttp for AiProxy {
             (0, 0, false)
         };
 
-        // 5. Per-key rate guardrail (see `ratelimit`): caps a single key's request velocity. Keyed by
-        // tenant for managed traffic, by a hash of the BYO token otherwise. Computed into an owned
-        // key so the `raw_key` borrow of `session` ends before the `&mut session` reject below.
-        if let Some(rl) = &self.state.rate_limit {
-            let key = if managed {
-                RlKey::Tenant(tenant_id)
-            } else {
-                RlKey::byo(raw_key)
-            };
-            if !rl.check(&key) {
-                self.state
-                    .metrics
-                    .rejections_total
-                    .with_label_values(&["rate_limit"])
-                    .inc();
-                return Self::reject(session, 429, "rate_limit_error", "rate limit exceeded").await;
-            }
-        }
+        // Mark OpenAI managed chat/responses streams for body buffering + `stream_options` injection
+        // (handled in `request_body_filter`). Scoped tight: managed only (BYO stays pure
+        // passthrough), OpenAI dialect only, streaming-capable paths only — so everything else still
+        // streams through untouched.
+        let inject_eligible = managed
+            && dialect == Dialect::OpenAI
+            && openai_streamable_path(session.req_header().uri.path());
 
         *ctx = Some(RequestCtx {
             tenant_id,
@@ -261,8 +332,16 @@ impl ProxyHttp for AiProxy {
             managed,
             model: String::new(),
             model_scanner: peek::ModelScanner::new(),
+            resp_model_scanner: peek::ModelScanner::new(),
             streaming: false,
-            resp_tail: Vec::with_capacity(USAGE_TAIL_CAP),
+            inject_eligible,
+            req_buf: Vec::new(),
+            // Grown lazily by the response tap (`response_body_filter`), not pre-reserved: a
+            // non-streaming response — the common case — is a few hundred bytes, so reserving the
+            // full 64KB cap up front would waste an allocation on every request to hold ~200B. A
+            // long stream grows it geometrically to the bounded 2×cap and compacts; that handful of
+            // reallocs is lost in the network noise of a stream we're already relaying chunk by chunk.
+            resp_tail: Vec::new(),
             body_bytes_fed: 0,
             start,
             attempt: 0,
@@ -347,6 +426,14 @@ impl ProxyHttp for AiProxy {
                 upstream_request.set_uri(uri);
             }
         }
+
+        // Injection-eligible (OpenAI managed stream): the body is rewritten in `request_body_filter`,
+        // changing its length, and we can't know the new length here (headers go out before the body
+        // filter runs). So drop the client's `Content-Length` and frame the buffered body as chunked.
+        if rc.inject_eligible {
+            upstream_request.remove_header("content-length");
+            upstream_request.insert_header("transfer-encoding", "chunked")?;
+        }
         Ok(())
     }
 
@@ -378,10 +465,28 @@ impl ProxyHttp for AiProxy {
                 return Err(pingora_core::Error::new_str("request body exceeds limit"));
             }
             rc.model_scanner.feed(chunk);
+            // Eligible requests are buffered so we can splice the root object before any byte reaches
+            // the upstream (injection inserts near the front, so we can't have forwarded it already).
+            if rc.inject_eligible {
+                rc.req_buf.extend_from_slice(chunk);
+            }
         }
+
+        if rc.inject_eligible {
+            if end_of_stream {
+                // Emit the whole (possibly rewritten) body in one shot; `transfer-encoding: chunked`
+                // (set in `upstream_request_filter`) makes the changed length fine.
+                let buf = std::mem::take(&mut rc.req_buf);
+                *body = Some(Bytes::from(maybe_inject_stream_usage(buf)));
+            } else {
+                // Withhold — the bytes are buffered above; nothing goes upstream until end-of-stream.
+                *body = None;
+            }
+        }
+
         if end_of_stream && rc.model.is_empty() {
             if let Some(m) = rc.model_scanner.take_model() {
-                rc.model = m;
+                rc.model = sanitize_model(m);
             }
         }
         Ok(())
@@ -428,6 +533,12 @@ impl ProxyHttp for AiProxy {
         // but moves bytes O(stream_len / cap) times instead of once per chunk — for a long stream of
         // small chunks that's the difference between one memmove per 64 KB and one per chunk.
         if let (Some(rc), Some(chunk)) = (ctx.as_mut(), body.as_ref()) {
+            // Tap the provider-reported (resolved/billed) model from the response *head* — the
+            // scanner stops at the first root `model`, so this is O(1) and cheap (it finds the model
+            // in the first chunk and ignores the rest). Kept separate from the tail because the model
+            // is at the start of the response while the usage event is at the end.
+            rc.resp_model_scanner.feed(chunk);
+
             rc.resp_tail.extend_from_slice(chunk);
             if rc.resp_tail.len() > 2 * USAGE_TAIL_CAP {
                 let keep_from = rc.resp_tail.len() - USAGE_TAIL_CAP;
@@ -461,7 +572,7 @@ impl ProxyHttp for AiProxy {
         _e: Option<&pingora_core::Error>,
         ctx: &mut Self::CTX,
     ) {
-        let Some(rc) = ctx.as_ref() else { return };
+        let Some(rc) = ctx.as_mut() else { return };
 
         // The buffer may transiently hold up to 2× the cap before compaction; the usage event is
         // always in the last cap bytes, so slice to that bounded tail before parsing.
@@ -487,21 +598,80 @@ impl ProxyHttp for AiProxy {
         m.upstream_latency_seconds
             .observe(rc.start.elapsed().as_secs_f64());
 
-        // Emit the usage *fact* on a dedicated target. logfwd/OTLP ships `ai.usage` → ClickHouse;
-        // pricing is a closed downstream consumer (we emit token counts only).
-        info!(
-            target: "ai.usage",
-            tenant_id = rc.tenant_id,
-            vpc_id = rc.vpc_id,
-            provider = rc.provider.name.as_str(),
-            model = %rc.model,
-            stream = rc.streaming,
-            input_tokens = usage.input_tokens,
-            output_tokens = usage.output_tokens,
-            cache_read_tokens = usage.cache_read_tokens,
-            cache_write_tokens = usage.cache_write_tokens,
-            latency_ms = rc.start.elapsed().as_millis() as u64,
-            "usage"
-        );
+        // Emit the usage *fact* on a dedicated target — **managed only**. The event is an
+        // identity-keyed billing record (logfwd/OTLP ships `ai.usage` → ClickHouse → a closed
+        // pricing consumer); BYO carries no Beyond identity, so a BYO event would be a billing row
+        // with `tenant_id=0` — unbillable, unattributable, and a footgun for any consumer that sums
+        // without filtering it out. Aggregate gateway throughput (incl. BYO) is already covered by
+        // the Prometheus metrics above, which is the right tool for non-billing observability.
+        if rc.managed {
+            // Emit BOTH models. `model` is the one the *provider* resolved + billed (echoed in its
+            // response) — the key for pricing AND for reconciling against the provider's invoice,
+            // which itemizes by the pinned snapshot. `requested_model` is the alias the client sent —
+            // product analytics ("what they asked for") and a fallback rate when a snapshot is newer
+            // than the downstream price table. They're equal when the response carried no model (e.g.
+            // an error body), where `model` falls back to the request alias. Both sanitized.
+            let billed_model = rc
+                .resp_model_scanner
+                .take_model()
+                .map(sanitize_model)
+                .unwrap_or_else(|| rc.model.clone());
+            info!(
+                target: "ai.usage",
+                tenant_id = rc.tenant_id,
+                vpc_id = rc.vpc_id,
+                provider = rc.provider.name.as_str(),
+                model = %billed_model,
+                requested_model = %rc.model,
+                stream = rc.streaming,
+                input_tokens = usage.input_tokens,
+                output_tokens = usage.output_tokens,
+                cache_read_tokens = usage.cache_read_tokens,
+                cache_write_tokens = usage.cache_write_tokens,
+                latency_ms = rc.start.elapsed().as_millis() as u64,
+                "usage"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_model_passes_real_ids() {
+        for id in [
+            "gpt-4o",
+            "claude-opus-4-8",
+            "openrouter/meta-llama/llama-3.1",
+            "accounts/fireworks/models/llama-v3p1-70b-instruct",
+            "gpt-4o-mini-2024-07-18",
+        ] {
+            assert_eq!(sanitize_model(id.to_string()), id);
+        }
+    }
+
+    #[test]
+    fn sanitize_model_rejects_json_and_log_injection() {
+        // A `"` would close the JSON string; `\` could escape; a newline breaks line-oriented log
+        // shipping. Any of them ⇒ recorded as "unknown" rather than injected into the billing log.
+        for evil in [
+            r#"real","injected":"x"#,
+            r#"a\b"#,
+            "line1\nline2",
+            "ctrl\u{0}byte",
+        ] {
+            assert_eq!(sanitize_model(evil.to_string()), "unknown");
+        }
+    }
+
+    #[test]
+    fn sanitize_model_rejects_overlong() {
+        let long = "a".repeat(MAX_MODEL_LEN + 1);
+        assert_eq!(sanitize_model(long), "unknown");
+        // Exactly at the cap is fine.
+        let ok = "a".repeat(MAX_MODEL_LEN);
+        assert_eq!(sanitize_model(ok.clone()), ok);
     }
 }

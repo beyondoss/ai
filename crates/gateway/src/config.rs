@@ -70,12 +70,26 @@ pub struct AiConfig {
     /// to talk to a plaintext mock.
     pub upstream_tls: bool,
 
-    /// Per-key request-rate ceiling (requests/sec). A blast-radius guardrail (see `ratelimit`), not
-    /// a spend control: it caps how fast a single tenant (managed) or BYO caller can drive the
-    /// gateway, bounding a leaked/runaway key during the deny-set's reaction lag and a failure flood
-    /// that never bills. `0` disables it. The default is generous — a circuit breaker, not a quota;
-    /// tune from `ai_rejections_total{reason="rate_limit"}`.
+    /// Per-credential request-rate ceiling (requests/sec). A blast-radius guardrail (see `ratelimit`),
+    /// not a spend control: it caps how fast a single credential (managed virtual key ≈ a `(tenant,
+    /// app)`, or a BYO token) can drive the gateway, bounding a leaked/runaway key during the
+    /// deny-set's reaction lag and a failure flood that never bills. `0` disables it. The default is
+    /// generous — a circuit breaker, not a quota; tune from `ai_rejections_total{reason="rate_limit"}`.
     pub rate_limit_rps: u32,
+
+    /// Aggregate request-rate ceiling (requests/sec) for **all BYO traffic combined** — a single
+    /// shared bucket. BYO is unverified and upstream-bound, so a flood of *distinct* random BYO tokens
+    /// slips past the per-credential ceiling and would open junk-auth connections to providers from
+    /// our egress IPs (getting them rate-limited or banned). This bounds that aggregate regardless of
+    /// token variation. Managed traffic is **exempt** (it's Ed25519-verified before any upstream
+    /// connect and can't be forged), so this shared bucket never sheds core tenant load. `0` disables
+    /// it. Generous by default; tune from `ai_rejections_total{reason="rate_limit_byo_global"}`.
+    ///
+    /// Before changing this (or reaching for per-IP limiting), read the **design-decision** block in
+    /// the `ratelimit` module docs: it records why this is a global cap and not per-source-IP, what it
+    /// deliberately doesn't cover, and why the real fix for egress-reputation pain is a
+    /// provider-feedback circuit breaker rather than a bigger number here.
+    pub byo_rate_limit_rps: u32,
 }
 
 impl Default for AiConfig {
@@ -97,9 +111,13 @@ impl Default for AiConfig {
             write_timeout_secs: 60,
             idle_timeout_secs: 90,
             upstream_tls: true,
-            // Generous per-key circuit breaker, on by default. Won't touch legitimate steady-state
-            // traffic; caps a runaway/leaked key or a retry-storm flood. Set 0 to disable.
+            // Generous per-credential circuit breaker, on by default. Won't touch legitimate
+            // steady-state traffic; caps a runaway/leaked key or a retry-storm flood. Set 0 to disable.
             rate_limit_rps: 100,
+            // Generous aggregate BYO ceiling, on by default — well above any expected legitimate BYO
+            // throughput, low enough that a junk-auth flood can't get our egress IPs flagged by the
+            // providers. Tune from the metric; set 0 to disable. (Managed traffic is exempt.)
+            byo_rate_limit_rps: 1_000,
         }
     }
 }

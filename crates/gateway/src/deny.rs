@@ -88,15 +88,18 @@ pub fn parse_key(key: &str) -> Option<u64> {
 /// object `{"reason":"spend", ...}`. Anything else → `Unknown` (still denied — fail safe).
 pub fn parse_reason(value: &[u8]) -> DenyReason {
     let s = std::str::from_utf8(value).unwrap_or("").trim();
-    let token = if s.starts_with('{') {
-        serde_json::from_slice::<serde_json::Value>(value)
+    // The JSON branch must own its extracted reason (it's borrowed from a temporary `Value`); the
+    // bare-token branch matches the borrowed `&str` directly — no allocation on the common path.
+    let json_reason: Option<String>;
+    let token: &str = if s.starts_with('{') {
+        json_reason = serde_json::from_slice::<serde_json::Value>(value)
             .ok()
-            .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(str::to_owned))
-            .unwrap_or_default()
+            .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(str::to_owned));
+        json_reason.as_deref().unwrap_or("")
     } else {
-        s.to_owned()
+        s
     };
-    match token.as_str() {
+    match token {
         "spend" => DenyReason::Spend,
         "fraud" => DenyReason::Fraud,
         _ => DenyReason::Unknown,

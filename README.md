@@ -26,10 +26,10 @@ client = OpenAI(base_url="http://ai.internal/v1", api_key="sk-your-openai-key")
 ## What It Does
 
 - **Managed keys** (`bai_v1…`) — Ed25519-verified, stateless. Swaps to the pool key. Attributes usage to tenant + VPC. Deny-set checked (spend/fraud).
-- **BYO keys** — any other token passes through to the provider untouched. No attribution, no deny-set, no metering.
+- **BYO keys** — any other token passes through to the provider untouched. No key-swap, no deny-set, no attribution, no `ai.usage` billing event (aggregate throughput metrics still count it).
 - **10 providers, zero config** — openai, anthropic, openrouter, fireworks, groq, deepseek, together, cerebras, mistral, xai. Add more in `config.toml` under `[provider_authorities]`.
 - **Never buffers** — request and response stream through; a SIMD scanner extracts `model` in O(1) memory. 64KB tail taps usage without holding the body.
-- **Token facts, not pricing** — emits `ai.usage` events to slipstream. A downstream consumer prices.
+- **Token facts, not pricing** — emits `ai.usage` token-count events as structured logs (stdout → logfwd/OTLP → ClickHouse). A closed downstream consumer prices; slipstream carries only the deny-set.
 - **Rate guardrail** — per-key request ceiling (`rate_limit_rps`). Circuit breaker against runaway keys. Deny-set owns spend control.
 - **Fail-open NATS** — auth works without NATS. A NATS outage stales the deny-set; existing allows stay allowed.
 

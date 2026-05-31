@@ -26,12 +26,21 @@ idle_timeout_secs = 90
 
 # upstream_tls = true   # set false only for a plaintext mock (tests)
 
-# Per-key request-rate ceiling (requests/sec) — a blast-radius circuit breaker, not a spend control
-# (the deny-set owns spend). Caps how fast one tenant (managed) or BYO caller can drive the gateway,
-# bounding a leaked/runaway key during the deny-set's reaction lag and a failure flood that never
-# bills. Generous by default so legitimate traffic never trips it; set 0 to disable. Tune from the
-# `ai_rejections_total{reason="rate_limit"}` metric.
+# Per-credential request-rate ceiling (requests/sec) — a blast-radius circuit breaker, not a spend
+# control (the deny-set owns spend). Caps how fast one credential (managed virtual key ≈ a tenant+app,
+# or a BYO token) can drive the gateway, bounding a leaked/runaway key during the deny-set's reaction
+# lag and a failure flood that never bills. Generous by default so legitimate traffic never trips it;
+# set 0 to disable. Tune from the `ai_rejections_total{reason="rate_limit"}` metric.
 rate_limit_rps = 100
+
+# Aggregate request-rate ceiling (requests/sec) for ALL BYO traffic combined — one shared bucket.
+# BYO is unverified and upstream-bound: a flood of *distinct* random BYO tokens slips past the
+# per-credential ceiling and would open junk-auth connections to providers from our egress IPs,
+# getting them rate-limited or banned. This bounds that aggregate regardless of token variation.
+# Managed traffic is EXEMPT (verified before any upstream connect, can't be forged), so this bucket
+# never sheds core tenant load. Generous by default; set 0 to disable. Tune from the
+# `ai_rejections_total{reason="rate_limit_byo_global"}` metric.
+byo_rate_limit_rps = 1000
 
 # Optional per-provider upstream authority (host:port), BY PROVIDER NAME. For a known provider this
 # overrides its built-in default; for an unknown name it ADDS a new OpenAI-wire provider, reachable
