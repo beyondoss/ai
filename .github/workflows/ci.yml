@@ -4,9 +4,9 @@ on:
     branches: [main]
 env:
   CARGO_TERM_COLOR: always
-  # Belt-and-suspenders: the panic-surface + `unused_must_use` denies live in `[workspace.lints]`
-  # (Cargo.toml) so they bind locally too, but escalate *every* warning to an error in CI in case a
-  # lint isn't expressible there (build scripts, future targets).
+  # Belt-and-suspenders: the panic-surface + `unused_must_use` denies live in `[lints]` (Cargo.toml)
+  # so they bind locally too, but escalate *every* warning to an error in CI in case a lint isn't
+  # expressible there (build scripts, future targets).
   RUSTFLAGS: -D warnings
 jobs:
   check:
@@ -19,8 +19,8 @@ jobs:
       # Formatting: dprint (config/json/etc) + rustfmt.
       - run: mise check:fmt
       - run: cargo fmt --all --check
-      # Lints: clippy `-D warnings` across all targets. With `[workspace.lints.clippy]` denying the
-      # panic surface (unwrap/expect/panic/todo/unimplemented), a new `.unwrap()` in production code
+      # Lints: clippy `-D warnings` across all targets. With `[lints.clippy]` denying the panic
+      # surface (unwrap/expect/panic/todo/unimplemented), a new `.unwrap()` in production code
       # fails the build here.
       - run: mise check:rs
       - run: mise test:unit:rs

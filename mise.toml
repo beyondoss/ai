@@ -14,7 +14,7 @@ run = "cargo build"
 run = "cargo build --release"
 
 [tasks."check:rs"]
-run = "cargo clippy --workspace --all-targets -- -D warnings"
+run = "cargo clippy --all-targets -- -D warnings"
 
 [tasks."check:fmt"]
 run = "dprint check"
