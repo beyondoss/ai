@@ -4,7 +4,8 @@
 //! exposes them with no extra wiring. `Metrics::new` is called exactly once (in `main`).
 
 use prometheus::{
-    HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts, default_registry,
+    Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts,
+    default_registry,
 };
 use std::sync::Arc;
 
@@ -26,6 +27,13 @@ pub struct Metrics {
     /// "cache hit rate fell off a cliff after a deploy" (cache write ≈ 3× input, cache read ≈ 0.1×,
     /// so a regression is a real cost event, not just a latency one).
     pub tokens_total: IntCounterVec,
+    /// The four `tokens_total` children, resolved once at boot. The label set (`input`/`output`/
+    /// `cache_read`/`cache_write`) is fixed and known at compile time, so we pay the
+    /// `with_label_values` map lookup once here instead of four times per metered response.
+    pub tokens_input: IntCounter,
+    pub tokens_output: IntCounter,
+    pub tokens_cache_read: IntCounter,
+    pub tokens_cache_write: IntCounter,
     /// Labeled by provider: TTFT varies by an order of magnitude across providers (Groq/Cerebras
     /// <100ms vs. a large Anthropic/xAI model at seconds), so an unlabeled histogram can't tell you
     /// *which* provider's first-token time regressed.
@@ -92,6 +100,12 @@ impl Metrics {
         )?;
         let tokens_total =
             IntCounterVec::new(Opts::new("ai_tokens_total", "Tokens metered"), &["kind"])?;
+        // Resolve the fixed-label children once. Created against the (about-to-be-registered) vec, so
+        // they export normally; the hot path then bumps a direct handle, no per-call label lookup.
+        let tokens_input = tokens_total.with_label_values(&["input"]);
+        let tokens_output = tokens_total.with_label_values(&["output"]);
+        let tokens_cache_read = tokens_total.with_label_values(&["cache_read"]);
+        let tokens_cache_write = tokens_total.with_label_values(&["cache_write"]);
         let ttft_seconds = HistogramVec::new(
             HistogramOpts::new("ai_ttft_seconds", "Time to first byte from upstream")
                 .buckets(TTFT_BUCKETS.to_vec()),
@@ -138,6 +152,10 @@ impl Metrics {
             upstream_responses_total,
             connect_retries_total,
             tokens_total,
+            tokens_input,
+            tokens_output,
+            tokens_cache_read,
+            tokens_cache_write,
             ttft_seconds,
             upstream_latency_seconds,
             active_streams,
@@ -145,5 +163,66 @@ impl Metrics {
             deny_set_size,
             nats_connected,
         }))
+    }
+}
+
+/// Per-provider metric handles, resolved once at boot and held on the [`Provider`](crate::route::Provider).
+///
+/// Every per-provider metric (`ttft_seconds`, `upstream_latency_seconds`, `upstream_responses_total`,
+/// `connect_retries_total`) is keyed on the provider name — a label known at boot from the provider
+/// registry. Resolving the child handles here lets the response path bump a direct counter/histogram
+/// instead of doing a string-keyed `with_label_values` map lookup on every response.
+pub struct ProviderMetrics {
+    pub ttft_seconds: Histogram,
+    pub upstream_latency_seconds: Histogram,
+    pub connect_retries_total: IntCounter,
+    /// Responses by status class, indexed `[2xx, 3xx, 4xx, 5xx]` (see [`Self::record_response`]).
+    responses: [IntCounter; 4],
+}
+
+impl ProviderMetrics {
+    /// Resolve the child handles for `provider` from the shared label vecs. Called once per provider
+    /// at boot (see `state::build_providers`).
+    pub fn resolve(m: &Metrics, provider: &str) -> Self {
+        ProviderMetrics {
+            ttft_seconds: m.ttft_seconds.with_label_values(&[provider]),
+            upstream_latency_seconds: m.upstream_latency_seconds.with_label_values(&[provider]),
+            connect_retries_total: m.connect_retries_total.with_label_values(&[provider]),
+            responses: [
+                m.upstream_responses_total
+                    .with_label_values(&[provider, "2xx"]),
+                m.upstream_responses_total
+                    .with_label_values(&[provider, "3xx"]),
+                m.upstream_responses_total
+                    .with_label_values(&[provider, "4xx"]),
+                m.upstream_responses_total
+                    .with_label_values(&[provider, "5xx"]),
+            ],
+        }
+    }
+
+    /// Count one upstream response, bucketed by status class (`2xx`/`3xx`/`4xx`/`5xx`).
+    pub fn record_response(&self, status: u16) {
+        let idx = match status {
+            200..=299 => 0,
+            300..=399 => 1,
+            400..=499 => 2,
+            _ => 3,
+        };
+        self.responses[idx].inc();
+    }
+
+    /// Standalone, **unregistered** handles for tests that build a `Provider` without a live registry.
+    #[cfg(test)]
+    pub fn disconnected() -> Self {
+        let counter = || IntCounter::new("t", "t").expect("valid counter opts");
+        let hist =
+            || Histogram::with_opts(HistogramOpts::new("t", "t")).expect("valid histogram opts");
+        ProviderMetrics {
+            ttft_seconds: hist(),
+            upstream_latency_seconds: hist(),
+            connect_retries_total: counter(),
+            responses: [counter(), counter(), counter(), counter()],
+        }
     }
 }

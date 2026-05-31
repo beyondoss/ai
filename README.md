@@ -35,15 +35,21 @@ client = OpenAI(base_url="http://ai.internal/v1", api_key="sk-your-openai-key")
 
 ## Providers
 
-Select a non-default provider with `x-beyond-provider: <name>`:
+The provider is the **first path segment** of the base URL — no header, nothing tool-specific. Bare
+`/v1` defaults to OpenAI (and `/v1/messages` to Anthropic), so the two big providers are a host-only
+swap; everything else is `/{provider}/…` using that provider's own path (forwarded verbatim).
 
 ```python
-client = OpenAI(
-    base_url="http://ai.internal/v1",
-    api_key="bai_v1...",
-    default_headers={"x-beyond-provider": "groq"},
-)
+# OpenAI (default) — change only the host
+client = OpenAI(base_url="http://ai.internal/v1", api_key="bai_v1...")
+
+# Groq — its native base path is /openai/v1, so the gateway path is /groq/openai/v1
+client = OpenAI(base_url="http://ai.internal/groq/openai/v1", api_key="bai_v1...")
+
+# Fireworks mounts at /inference/v1 → /fireworks/inference/v1; OpenRouter at /api/v1 → /openrouter/api/v1
 ```
+
+An unknown first segment is a 404. See `route::KNOWN_PROVIDERS` for each provider's native base path.
 
 ## Config
 

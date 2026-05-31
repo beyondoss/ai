@@ -43,9 +43,10 @@ rate_limit_rps = 100
 byo_rate_limit_rps = 1000
 
 # Optional per-provider upstream authority (host:port), BY PROVIDER NAME. For a known provider this
-# overrides its built-in default; for an unknown name it ADDS a new OpenAI-wire provider, reachable
-# via `x-beyond-provider: <name>`. Known providers (zero-config defaults): openai, anthropic,
-# openrouter, fireworks, groq, deepseek, together, cerebras, mistral, xai.
+# overrides its built-in default; for an unknown name it ADDS a new OpenAI-wire provider, then
+# reachable at `/{name}/…` (the provider is the first path segment of the request). Known providers
+# (zero-config defaults): openai, anthropic, openrouter, fireworks, groq, deepseek, together,
+# cerebras, mistral, xai.
 # [provider_authorities]
 # openai = "api.openai.com:443"
 # my-self-hosted = "llm.internal:8443"

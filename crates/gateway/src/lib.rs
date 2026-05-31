@@ -8,6 +8,11 @@
 // they apply to *both* crate roots — this lib and the `main.rs` binary — not just whichever unit
 // carries a crate-level `#![deny]`. A dropped `Result` (e.g. an unchecked `write_response_*`) is
 // therefore a hard error, and `unsafe` is forbidden, everywhere in the crate.
+//
+// `unwrap_used`/`expect_used`/`panic` are denied in production code (see `[workspace.lints.clippy]`)
+// but a unit test's whole job is to assert a precondition holds — `.unwrap()` *is* the assertion — so
+// allow them in `#[cfg(test)]` modules.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod admin;
 pub mod config;

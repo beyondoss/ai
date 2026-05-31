@@ -209,6 +209,7 @@ pub fn verifying_key_from_value(bytes: &[u8]) -> Option<VerifyingKey> {
 /// Mint a virtual key. Lives here for tests + determinism checks and as the reference
 /// implementation; production minting is the Go control plane (`crypto/ed25519`), which must
 /// produce byte-identical output for the same inputs.
+#[allow(clippy::expect_used)] // payload is a fixed 22-char base64 of 16 bytes; always fits the cap
 pub fn mint(vk: &VirtualKey, kid: Kid, signing_key: &SigningKey) -> String {
     let payload_b64 = URL_SAFE_NO_PAD.encode(vk.encode_payload());
     let mut signed_buf = [0u8; SIGNED_BYTES_CAP];

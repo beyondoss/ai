@@ -1,7 +1,7 @@
 //! The Pingora `ProxyHttp` passthrough service.
 //!
-//! Flow: verify the virtual key (stateless) → deny-set check (O(1), default-allow) → pick the
-//! provider from the ingress dialect (+ optional `x-beyond-provider` override) → swap the auth
+//! Flow: pick the provider from the **first path segment** (`/{provider}/…`) → verify the virtual
+//! key (stateless) → deny-set check (O(1), default-allow) → swap the auth
 //! header to the pool key (managed only) → **stream the request body straight through** (never
 //! buffered; original framing preserved) while feeding it to a structural scanner that extracts the
 //! exact root-level `model` → relay the response **without buffering** → tap usage from a bounded
@@ -28,12 +28,15 @@
 //! the pool key); anything else is a **BYO** request — the user's own provider token, passed
 //! through unchanged (no swap, no Beyond identity, no deny-set).
 //!
-//! Consequence: routing is by **dialect**, not model — the body (hence model) isn't known when
-//! `upstream_peer` runs. Any non-default provider is reached via the `x-beyond-provider` header
-//! (providers are data — see `route`). Model is still captured (from the streamed body) for usage.
+//! Routing is by the **first path segment** = provider name (`route`, data-driven): `/{provider}/…`
+//! selects the provider and the rest of the path is forwarded **verbatim** (the gateway holds no
+//! per-provider mount knowledge). A bare path with no provider prefix that starts with `/v1` is the
+//! drop-in default — dialect picks openai/anthropic (`dialect_for_path`) — so an OpenAI/Anthropic
+//! client works by changing only the host. An unknown first segment is a 404. Model isn't used for
+//! routing (the body isn't read pre-connect); it's still captured from the body for usage.
 
 use crate::route::{self, Dialect, Provider};
-use crate::state::GatewayState;
+use crate::state::{GatewayState, RequestId};
 use crate::{peek, usage};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -42,6 +45,7 @@ use pingora_core::Result;
 use pingora_core::protocols::ALPN;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_proxy::{ProxyHttp, Session};
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
@@ -79,6 +83,11 @@ pub struct RequestCtx {
     /// The resolved upstream provider (authority/host + precomputed managed auth value), shared from
     /// the boot-time registry — a cheap `Arc` clone, nothing re-allocated per request.
     provider: Arc<Provider>,
+    /// The path (+ query) to send upstream: the client path with the `/{provider}` segment stripped
+    /// (provider-prefixed request) or unchanged (bare-path default). Forwarded **verbatim** — the
+    /// gateway does no per-provider path rewriting. Applied as the upstream URI in
+    /// `upstream_request_filter`.
+    forward_path: String,
     /// Whether this is a **managed** request (`bai_…` key → swap to the pool key). `false` for
     /// **BYO** — we leave the user's own auth header untouched (passthrough).
     managed: bool,
@@ -116,7 +125,7 @@ pub struct RequestCtx {
     attempt: u8,
     /// Process-unique id for this request (`{instance}-{seq}`), echoed in the `x-beyond-request-id`
     /// response header and the `ai.usage` event so a client report ties back to a log line.
-    request_id: String,
+    request_id: RequestId,
 }
 
 impl AiProxy {
@@ -172,12 +181,16 @@ const MAX_MODEL_LEN: usize = 128;
 /// string or a line-oriented log: control bytes, `"`, `\`, `DEL`. A violating or over-long value is
 /// recorded as `"unknown"` (matching `peek`'s non-UTF-8 fallback) rather than the raw bytes — a
 /// mislabeled-but-safe usage row beats a corrupted or injected one.
-fn sanitize_model(model: String) -> String {
+fn sanitize_model(model: String) -> Cow<'static, str> {
     let bad = model.len() > MAX_MODEL_LEN
         || model
             .bytes()
             .any(|b| b < 0x20 || b == b'"' || b == b'\\' || b == 0x7f);
-    if bad { "unknown".to_string() } else { model }
+    if bad {
+        Cow::Borrowed("unknown")
+    } else {
+        Cow::Owned(model)
+    }
 }
 
 fn dialect_for_path(path: &str) -> Dialect {
@@ -189,11 +202,13 @@ fn dialect_for_path(path: &str) -> Dialect {
     }
 }
 
-/// OpenAI **streaming-capable** endpoints: chat completions + the Responses API. These are the only
-/// requests we buffer for `stream_options.include_usage` injection — embeddings and every other
-/// OpenAI-dialect path never stream, so there's nothing to meter and no reason to buffer them.
-fn openai_streamable_path(path: &str) -> bool {
-    path.starts_with("/v1/chat/completions") || path.starts_with("/v1/responses")
+/// Whether the **forwarded** (provider-native) path targets an OpenAI streaming-capable endpoint —
+/// chat completions or the Responses API. Checked by *suffix*, so it holds regardless of the
+/// provider's mount prefix (`/v1/chat/completions`, `/openai/v1/chat/completions`,
+/// `/inference/v1/chat/completions`, …). Only these get buffered for `stream_options.include_usage`
+/// injection — embeddings and everything else never stream, so there's nothing to meter.
+fn is_streamable_path(forward_path: &str) -> bool {
+    forward_path.ends_with("/chat/completions") || forward_path.ends_with("/responses")
 }
 
 /// Splice `stream_options.include_usage` into a buffered OpenAI chat body when it streams without it
@@ -213,17 +228,6 @@ fn maybe_inject_stream_usage(body: Vec<u8>) -> Vec<u8> {
     }
 }
 
-/// The `x-beyond-provider` override value, if present — a provider *name* resolved against the
-/// registry in `request_filter`. (An unknown name is rejected there, not silently ignored.)
-fn provider_override(session: &Session) -> Option<&str> {
-    session
-        .req_header()
-        .headers
-        .get("x-beyond-provider")?
-        .to_str()
-        .ok()
-}
-
 #[async_trait]
 impl ProxyHttp for AiProxy {
     type CTX = Option<RequestCtx>;
@@ -240,29 +244,49 @@ impl ProxyHttp for AiProxy {
         // admitted path. Cheap: a counter bump + a short `format!` (see `next_request_id`).
         let request_id = self.state.next_request_id();
 
-        // 1. Resolve the upstream provider first — from the ingress dialect (the body/model isn't
-        // available pre-connect), with an explicit `x-beyond-provider` override. Resolving up front
-        // means an unknown provider is a clean 400 before any auth work, and (since it borrows
-        // nothing) keeps the borrow checker happy when the key is extracted next. An `Arc` clone of
-        // the boot-time registry entry — nothing re-allocated per request.
-        let dialect = dialect_for_path(session.req_header().uri.path());
-        let provider = match provider_override(session) {
-            Some(name) => self.state.provider(name).cloned(),
-            None => self
-                .state
-                .provider(route::dialect_default(dialect))
-                .cloned(),
+        // 1. Route by the **first path segment** = provider; forward the rest of the path verbatim
+        // (native passthrough — the gateway holds no per-provider mount knowledge). A path with no
+        // provider segment that starts with `/v1` is the drop-in default: dialect picks
+        // openai/anthropic and the path is forwarded as-is. Anything else → unknown provider (404).
+        // We resolve before auth (an unknown route is cheap) and compute owned values inside the
+        // block so the session borrow ends before any `&mut session` reject below.
+        let (provider_opt, forward_path) = {
+            let uri = &session.req_header().uri;
+            let path = uri.path();
+            let query = uri.query();
+            // `nth(1)`: `/openai/v1/…` → "openai"; `/v1/…` → "v1"; "/" or "" → "".
+            let first = path.split('/').nth(1).unwrap_or("");
+            let with_query = |p: &str| match query {
+                Some(q) => format!("{p}?{q}"),
+                None => p.to_string(),
+            };
+            if let Some(p) = self.state.provider(first) {
+                // Provider-prefixed: strip the leading `/{first}` segment, forward the remainder.
+                let rest = &path[1 + first.len()..];
+                (
+                    Some(p.clone()),
+                    with_query(if rest.is_empty() { "/" } else { rest }),
+                )
+            } else if path.starts_with(route::DEFAULT_PREFIX) {
+                // Bare default: dialect picks the provider; forward the path unchanged.
+                let name = route::dialect_default(dialect_for_path(path));
+                (self.state.provider(name).cloned(), with_query(path))
+            } else {
+                (None, String::new())
+            }
         };
-        let Some(provider) = provider else {
+        let Some(provider) = provider_opt else {
             return Self::reject(
                 session,
                 &request_id,
-                400,
+                404,
                 "invalid_request_error",
                 "unknown provider",
             )
             .await;
         };
+        // Dialect now comes from the resolved provider (usage parsing + injection eligibility).
+        let dialect = provider.dialect;
 
         // 2. Extract the presented key — a managed virtual key (`bai_…`) or a raw BYO provider token.
         let Some(raw_key) = extract_virtual_key(session) else {
@@ -381,16 +405,16 @@ impl ProxyHttp for AiProxy {
         // Mark OpenAI managed chat/responses streams for body buffering + `stream_options` injection
         // (handled in `request_body_filter`). Scoped tight: managed only (BYO stays pure
         // passthrough), OpenAI dialect only, streaming-capable paths only — so everything else still
-        // streams through untouched.
-        let inject_eligible = managed
-            && dialect == Dialect::OpenAI
-            && openai_streamable_path(session.req_header().uri.path());
+        // streams through untouched. Checked on the forwarded path (suffix), so it's prefix-agnostic.
+        let inject_eligible =
+            managed && dialect == Dialect::OpenAI && is_streamable_path(&forward_path);
 
         *ctx = Some(RequestCtx {
             tenant_id,
             vpc_id,
             dialect,
             provider,
+            forward_path,
             managed,
             model: String::new(),
             model_scanner: peek::ModelScanner::new(),
@@ -441,7 +465,7 @@ impl ProxyHttp for AiProxy {
                 // already formatted into `e`) instead of discarding it behind an opaque static string.
                 // `error_because` chains `e` as the cause so it shows in the Pingora error log.
                 warn!(
-                    request_id = rc.request_id,
+                    request_id = %rc.request_id,
                     provider = rc.provider.name.as_str(),
                     authority = rc.provider.authority.as_str(),
                     error = %e,
@@ -509,22 +533,23 @@ impl ProxyHttp for AiProxy {
             }
         }
 
-        // Point Host at the upstream. The body passes through untouched, so the client's original
-        // framing (Content-Length / chunked) is preserved — true passthrough.
+        // Point Host at the upstream.
         upstream_request.insert_header("host", rc.provider.host.as_str())?;
 
-        // Rewrite the path to the provider's mount point when it isn't `/v1` (e.g. Groq serves the
-        // OpenAI surface under `/openai/v1`, Fireworks under `/inference/v1`). Most providers mount
-        // at `/v1`, so `upstream_path` returns `None` and the URI is left untouched (no realloc).
-        // The query string is preserved.
-        if let Some(new_path) = rc.provider.upstream_path(upstream_request.uri.path()) {
-            let pq = match upstream_request.uri.query() {
-                Some(q) => format!("{new_path}?{q}"),
-                None => new_path,
-            };
-            if let Ok(uri) = pq.parse() {
-                upstream_request.set_uri(uri);
-            }
+        // Forward the provider-native path (computed in `request_filter`): the client path with the
+        // `/{provider}` segment stripped, or unchanged for a bare-path default. We send it verbatim —
+        // no per-provider rewriting. Only set the URI when it actually differs from the inbound path
+        // (i.e. a `/{provider}` prefix was stripped); the bare-path case needs no change, so we skip
+        // the parse + realloc. The body's framing (Content-Length / chunked) is preserved.
+        if rc.forward_path
+            != upstream_request
+                .uri
+                .path_and_query()
+                .map(|pq| pq.as_str())
+                .unwrap_or("")
+            && let Ok(uri) = rc.forward_path.parse()
+        {
+            upstream_request.set_uri(uri);
         }
 
         // Injection-eligible (OpenAI managed stream): the body is rewritten in `request_body_filter`,
@@ -599,7 +624,7 @@ impl ProxyHttp for AiProxy {
 
         if end_of_stream && rc.model.is_empty() {
             if let Some(m) = rc.model_scanner.take_model() {
-                rc.model = sanitize_model(m);
+                rc.model = sanitize_model(m).into_owned();
             }
         }
         Ok(())
@@ -612,27 +637,19 @@ impl ProxyHttp for AiProxy {
         ctx: &mut Self::CTX,
     ) -> Result<()> {
         if let Some(rc) = ctx.as_mut() {
-            // Headers arrived ≈ time-to-first-byte. Labeled by provider — first-token latency is
-            // per-provider, so an unlabeled histogram can't tell you which one regressed.
-            self.state
+            // Headers arrived ≈ time-to-first-byte. Per-provider handle resolved once at boot (see
+            // `ProviderMetrics`) — first-token latency is per-provider, so an unlabeled histogram
+            // can't tell you which one regressed.
+            rc.provider
                 .metrics
                 .ttft_seconds
-                .with_label_values(&[rc.provider.name.as_str()])
                 .observe(rc.start.elapsed().as_secs_f64());
 
             // Per-provider response counter, bucketed by status class — the signal that a provider
             // is degrading (429/5xx) before it shows up only as latency or a missing usage event.
-            let status_class = match upstream_response.status.as_u16() {
-                s if (200..300).contains(&s) => "2xx",
-                s if (300..400).contains(&s) => "3xx",
-                s if (400..500).contains(&s) => "4xx",
-                _ => "5xx",
-            };
-            self.state
+            rc.provider
                 .metrics
-                .upstream_responses_total
-                .with_label_values(&[rc.provider.name.as_str(), status_class])
-                .inc();
+                .record_response(upstream_response.status.as_u16());
 
             // Derive streaming from the response, not the request: SSE ⇒ use the streaming usage
             // parser; otherwise the body is a single JSON object.
@@ -651,7 +668,7 @@ impl ProxyHttp for AiProxy {
             // Echo the request id so a client (or an oncall reading a captured response) can quote it
             // and land on this request's log line. `insert_header` only fails on an invalid value;
             // our id is `[0-9a-f-]`, always valid — but surface a failure rather than silently drop.
-            upstream_response.insert_header(REQUEST_ID_HEADER, &rc.request_id)?;
+            upstream_response.insert_header(REQUEST_ID_HEADER, rc.request_id.as_str())?;
         }
         Ok(())
     }
@@ -705,13 +722,9 @@ impl ProxyHttp for AiProxy {
                 // egress-IP ban — connect is where that first bites) shows up only as extra latency
                 // on `upstream_latency_seconds`, indistinguishable from a slow model. The counter is
                 // the dashboard signal; the `warn!` carries the request_id to grep.
-                self.state
-                    .metrics
-                    .connect_retries_total
-                    .with_label_values(&[rc.provider.name.as_str()])
-                    .inc();
+                rc.provider.metrics.connect_retries_total.inc();
                 warn!(
-                    request_id = rc.request_id,
+                    request_id = %rc.request_id,
                     provider = rc.provider.name.as_str(),
                     attempt = rc.attempt,
                     error = %e,
@@ -742,7 +755,7 @@ impl ProxyHttp for AiProxy {
         // 42 get 502s for 5 minutes" is one grep on the request_id, not a reconstruction.
         if let Some(e) = e {
             warn!(
-                request_id = rc.request_id,
+                request_id = %rc.request_id,
                 tenant_id = rc.tenant_id,
                 vpc_id = rc.vpc_id,
                 provider = rc.provider.name.as_str(),
@@ -766,22 +779,16 @@ impl ProxyHttp for AiProxy {
         .unwrap_or_default();
 
         let m = &self.state.metrics;
-        m.tokens_total
-            .with_label_values(&["input"])
-            .inc_by(usage.input_tokens);
-        m.tokens_total
-            .with_label_values(&["output"])
-            .inc_by(usage.output_tokens);
+        // Pre-resolved fixed-label children (see `Metrics`) — no per-call `with_label_values` lookup.
+        m.tokens_input.inc_by(usage.input_tokens);
+        m.tokens_output.inc_by(usage.output_tokens);
         // Cache tokens, too — these are in the `ai.usage` billing log below, but that ships with lag;
         // the counter is the alerting surface for a cache-hit-rate cliff after a deploy.
-        m.tokens_total
-            .with_label_values(&["cache_read"])
-            .inc_by(usage.cache_read_tokens);
-        m.tokens_total
-            .with_label_values(&["cache_write"])
-            .inc_by(usage.cache_write_tokens);
-        m.upstream_latency_seconds
-            .with_label_values(&[rc.provider.name.as_str()])
+        m.tokens_cache_read.inc_by(usage.cache_read_tokens);
+        m.tokens_cache_write.inc_by(usage.cache_write_tokens);
+        rc.provider
+            .metrics
+            .upstream_latency_seconds
             .observe(rc.start.elapsed().as_secs_f64());
         // Balance the `active_streams` increment from `response_filter`. `logging` runs exactly once
         // per request (including on upstream errors / client disconnects), so a stream that opened is
@@ -803,18 +810,17 @@ impl ProxyHttp for AiProxy {
             // product analytics ("what they asked for") and a fallback rate when a snapshot is newer
             // than the downstream price table. They're equal when the response carried no model (e.g.
             // an error body), where `model` falls back to the request alias. Both sanitized.
-            let billed_model = rc
-                .resp_model_scanner
-                .take_model()
-                .map(sanitize_model)
-                .unwrap_or_else(|| rc.model.clone());
+            let billed = rc.resp_model_scanner.take_model().map(sanitize_model);
+            // Borrow the requested model as the fallback rather than cloning it — it's still read as
+            // `requested_model` below, so a clone would be pure waste on every managed response.
+            let billed_model = billed.as_deref().unwrap_or(&rc.model);
             info!(
                 target: "ai.usage",
-                request_id = rc.request_id,
+                request_id = %rc.request_id,
                 tenant_id = rc.tenant_id,
                 vpc_id = rc.vpc_id,
                 provider = rc.provider.name.as_str(),
-                model = %billed_model,
+                model = billed_model,
                 requested_model = %rc.model,
                 stream = rc.streaming,
                 input_tokens = usage.input_tokens,

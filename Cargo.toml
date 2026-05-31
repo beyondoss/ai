@@ -14,6 +14,19 @@ rust-version = "1.85"
 unsafe_code = "forbid"
 unused_must_use = "deny"
 
+# Panic surface: a stray `.unwrap()`/`.expect()`/`panic!`/`todo!` in a request path is a worker
+# crash, not an error response. Deny them so a new one is a hard CI failure (mise `check:rs` runs
+# clippy with `-D warnings`). These are clippy *restriction* lints (allow-by-default); naming them
+# here turns them on. The handful of genuine boot-time invariants carry a local
+# `#[allow(clippy::expect_used)]` with a SAFETY-style note; test/bench targets allow them wholesale
+# at the file head (asserting a precondition with `.unwrap()` is the point of a test).
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+
 # Release builds wrap arithmetic silently by default; turn that into a panic so an overflow on a
 # size/count never goes unnoticed. Negligible cost for a proxy (arithmetic isn't the bottleneck).
 [profile.release]
@@ -31,6 +44,7 @@ pingora-limits = "0.8"
 pingora-proxy = "0.8"
 
 arc-swap = "1"
+arrayvec = "0.7"
 async-nats = "0.46"
 async-trait = "0.1"
 base64 = "0.22"

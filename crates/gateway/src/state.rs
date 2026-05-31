@@ -9,11 +9,13 @@ use crate::config::AiConfig;
 use crate::deny::DenySet;
 use crate::error::{GatewayError, Result};
 use crate::key::Keyring;
-use crate::metrics::Metrics;
+use crate::metrics::{Metrics, ProviderMetrics};
 use crate::ratelimit::RateLimit;
-use crate::route::{self, AuthScheme, Provider};
+use crate::route::{self, AuthScheme, Dialect, Provider};
 use arc_swap::ArcSwap;
+use arrayvec::ArrayString;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,11 +25,16 @@ use tracing::warn;
 /// How long a resolved upstream address is reused before re-resolving.
 const DNS_TTL: Duration = Duration::from_secs(60);
 
+/// A process-unique request id, `{instance:x}-{seq:x}`. Two `u64`s in hex (≤16 chars each) plus the
+/// `-` separator never exceed 33 bytes, so it lives inline on the stack — no per-request heap
+/// allocation on the admitted path (it's minted for every request, including fast rejects).
+pub type RequestId = ArrayString<33>;
+
 /// Build the resolved provider registry from the static known set + config: every known provider
 /// (its authority overridable by `provider_authorities`), plus any config-only OpenAI-wire provider
 /// (a `provider_authorities` entry whose name isn't known). Each provider's pool key (if any) is
 /// looked up by name and its managed auth header value precomputed.
-fn build_providers(config: &AiConfig) -> HashMap<String, Arc<Provider>> {
+fn build_providers(config: &AiConfig, metrics: &Metrics) -> HashMap<String, Arc<Provider>> {
     let mut providers = HashMap::new();
     for spec in route::KNOWN_PROVIDERS {
         let authority = config
@@ -41,9 +48,10 @@ fn build_providers(config: &AiConfig) -> HashMap<String, Arc<Provider>> {
             Arc::new(Provider::resolve(
                 spec.name,
                 authority,
-                spec.base_path,
+                spec.dialect,
                 spec.auth,
                 pool_key,
+                ProviderMetrics::resolve(metrics, spec.name),
             )),
         );
     }
@@ -57,9 +65,10 @@ fn build_providers(config: &AiConfig) -> HashMap<String, Arc<Provider>> {
                 Arc::new(Provider::resolve(
                     name,
                     authority.clone(),
-                    route::CLIENT_PREFIX,
+                    Dialect::OpenAI,
                     AuthScheme::Bearer,
                     pool_key,
+                    ProviderMetrics::resolve(metrics, name),
                 )),
             );
         }
@@ -90,11 +99,11 @@ pub struct GatewayState {
     /// only writes are the ~10 providers' entries refreshed once per `DNS_TTL`, applied via `rcu`.
     dns_cache: ArcSwap<HashMap<String, (SocketAddr, Instant)>>,
 
-    /// Per-process instance token (hex of 8 OS-random bytes), the high half of every `request_id`.
+    /// Per-process instance token (8 OS-random bytes), the high half of every `request_id`.
     /// Random rather than a uuid dep, so log lines from two gateways don't collide when aggregated —
     /// and random rather than the boot wall-clock, which collides when a rapid scale-up boots several
     /// instances within the same nanosecond.
-    instance_id: String,
+    instance_id: u64,
     /// Monotonic per-request counter, the low half of `request_id`. A relaxed `fetch_add` — the only
     /// requirement is uniqueness within the process, not cross-request ordering.
     request_seq: AtomicU64,
@@ -106,15 +115,24 @@ impl GatewayState {
         // No signing keys ⇒ every `bai_…` fails verify and falls through to BYO treatment: no key
         // swap, no deny-set, no `ai.usage` billing. That's a *valid* mode (a BYO-only deployment),
         // but a far more common cause is a missing/typo'd `signing_keys` (SSM param, env) — which
-        // looks healthy while silently dropping all billing. Warn loudly so the boot logs flag it;
-        // don't `exit` (BYO-only is legitimate and tests rely on it).
+        // looks healthy while silently dropping all billing. A managed deployment sets
+        // `require_signing_keys = true` so this mis-deploy is a hard, visible boot failure; otherwise
+        // we warn loudly and continue (BYO-only is legitimate and the test/e2e harnesses run keyless).
         if config.signing_keys.is_empty() {
+            if config.require_signing_keys {
+                return Err(GatewayError::Config(
+                    "require_signing_keys is set but no signing_keys are configured — refusing to \
+                     boot into silent BYO-only mode (no key swap, no deny-set, no billing). Check \
+                     the signing_keys config / SSM param."
+                        .to_string(),
+                ));
+            }
             warn!(
                 "no signing_keys configured — all managed (bai_) traffic will be treated as BYO \
                  (no key swap, no deny-set, no billing). Expected only for a BYO-only deployment."
             );
         }
-        let providers = build_providers(&config);
+        let providers = build_providers(&config, &metrics);
         let rate_limit = RateLimit::new(config.rate_limit_rps, config.byo_rate_limit_rps);
 
         // 8 OS-random bytes as the instance token, so two gateways' request_ids never collide when
@@ -140,7 +158,7 @@ impl GatewayState {
             deny: ArcSwap::from_pointee(DenySet::new()),
             rate_limit,
             dns_cache: ArcSwap::from_pointee(HashMap::new()),
-            instance_id: format!("{instance:x}"),
+            instance_id: instance,
             request_seq: AtomicU64::new(0),
             config,
         }))
@@ -149,14 +167,21 @@ impl GatewayState {
     /// A process-unique request id (`{instance}-{seq}`) for log correlation and the
     /// `x-beyond-request-id` response header. Deliberately *not* a uuid: a per-process instance
     /// token (computed once at boot) plus a relaxed atomic counter is unique across the fleet, costs
-    /// one `fetch_add` + one small `format!`, and needs no extra crate or randomness.
-    pub fn next_request_id(&self) -> String {
+    /// one `fetch_add` + a hex format into a stack buffer (no heap allocation), and needs no
+    /// randomness per request.
+    pub fn next_request_id(&self) -> RequestId {
         let seq = self.request_seq.fetch_add(1, Ordering::Relaxed);
-        format!("{}-{seq:x}", self.instance_id)
+        let mut id = RequestId::new();
+        // Can't overflow: two `u64`s in hex + `-` is ≤33 bytes, exactly the buffer's capacity. The
+        // `write!` is infallible here, but if a future format change ever exceeded the cap we'd
+        // rather emit a truncated id than panic on a correlation aid — so swallow the result.
+        let _ = write!(id, "{:x}-{seq:x}", self.instance_id);
+        id
     }
 
-    /// The resolved provider for `name` (`x-beyond-provider` value or dialect default), or `None`
-    /// if no such provider is registered.
+    /// The resolved provider for `name` (the request's first path segment, or the bare-path dialect
+    /// default), or `None` if no such provider is registered — which `request_filter` turns into a
+    /// 404.
     pub fn provider(&self, name: &str) -> Option<&Arc<Provider>> {
         self.providers.get(name)
     }
@@ -181,9 +206,20 @@ impl GatewayState {
         // and both rcu; that's harmless (same answer, last writer wins) and far cheaper than holding
         // a lock across `getaddrinfo`. The clone-on-write copies a ~10-entry map — trivial, and only
         // on the rare miss/refresh path, never on a hit.
+        //
+        // Sweep entries that are long dead while we're already paying for the clone. The cache keys
+        // are provider authorities, which come entirely from the boot-time registry (so in practice
+        // the map is bounded by the provider count, not by traffic) — this sweep is belt-and-
+        // suspenders against authorities ever becoming dynamic, and it's a *TTL* drop, not an
+        // eviction *policy*: there's no capacity contest here, so LRU/SIEVE would be machinery for a
+        // problem we don't have. We keep anything within `2 × DNS_TTL` so a still-live provider whose
+        // entry just expired (and is about to be refreshed) is never dropped out from under a
+        // concurrent resolve.
+        let now = Instant::now();
         self.dns_cache.rcu(|cur| {
             let mut next = HashMap::clone(cur);
-            next.insert(authority.to_string(), (addr, Instant::now()));
+            next.retain(|_, (_, at)| now.duration_since(*at) < DNS_TTL * 2);
+            next.insert(authority.to_string(), (addr, now));
             next
         });
         Ok(addr)
@@ -222,7 +258,7 @@ mod tests {
             ]),
             ..Default::default()
         };
-        let providers = build_providers(&config);
+        let providers = build_providers(&config, &test_metrics());
 
         // Known provider: authority overridden, pool auth precomputed in the right scheme.
         let openai = providers.get("openai").unwrap();

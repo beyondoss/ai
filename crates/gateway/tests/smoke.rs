@@ -22,6 +22,9 @@
 //! Model ids are the cheapest small model per provider as of 2026-05; adjust if a provider retires
 //! one (a model-not-found is a stale id here, not a gateway bug).
 
+// Test target: `.unwrap()`/`.expect()`/`panic!` are assertions, not production code. See e2e.rs.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 mod common;
 
 use beyond_ai::key::{VirtualKey, mint};
@@ -54,9 +57,10 @@ async fn managed_gateway(nats: &Nats, provider: &str, real_key: &str) -> (Gatewa
     (gw, vkey)
 }
 
-/// Drive one OpenAI-wire provider through the gateway as a managed request. `openai` is the dialect
-/// default (no header); everything else is selected by `x-beyond-provider`.
-async fn smoke_openai_wire(provider: &str, key_env: &str, model: &str) {
+/// Drive one OpenAI-wire provider through the gateway as a managed request. The provider is selected
+/// by the first path segment; `chat_path` is the full gateway path — `/{provider}/{native-base}/
+/// chat/completions` (the provider's own base path after the selector, forwarded verbatim).
+async fn smoke_openai_wire(provider: &str, key_env: &str, model: &str, chat_path: &str) {
     let Some(key) = env_key(key_env) else {
         eprintln!("smoke[{provider}]: {key_env} unset — skipping");
         return;
@@ -68,21 +72,20 @@ async fn smoke_openai_wire(provider: &str, key_env: &str, model: &str) {
     let body = format!(
         r#"{{"model":"{model}","max_tokens":16,"messages":[{{"role":"user","content":"Reply with the single word: ping"}}]}}"#
     );
-    let mut req = client
-        .post(format!("{}/v1/chat/completions", gw.url()))
+    let resp = client
+        .post(format!("{}{chat_path}", gw.url()))
         .header("authorization", format!("Bearer {vkey}"))
-        .header("content-type", "application/json");
-    if provider != "openai" {
-        req = req.header("x-beyond-provider", provider);
-    }
-
-    let resp = req.body(body).send().await.expect("request to gateway");
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("request to gateway");
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     assert!(
         status.is_success(),
-        "smoke[{provider}] model={model}: expected 2xx, got {status}.\n\
-         404 ⇒ base-path rewrite wrong; 401 ⇒ pool-key swap/verify; 403 ⇒ deny-set; \
+        "smoke[{provider}] model={model} path={chat_path}: expected 2xx, got {status}.\n\
+         404 ⇒ wrong native path / provider segment; 401 ⇒ pool-key swap/verify; 403 ⇒ deny-set; \
          a model error ⇒ stale model id. body: {text}"
     );
     assert!(
@@ -103,14 +106,15 @@ async fn smoke_anthropic() {
     let (gw, vkey) = managed_gateway(&nats, "anthropic", &key).await;
     let client = reqwest::Client::new();
 
-    // `/v1/messages` → Anthropic dialect → provider `anthropic`. The minted virtual key is presented
-    // in `x-api-key` (the Anthropic SDK's header); the gateway verifies it and swaps in the real key
-    // — again in `x-api-key` (not Bearer). The required `anthropic-version` header passes through.
-    // This is the *only* test covering the x-api-key auth scheme + a real TLS handshake to
-    // api.anthropic.com via the full managed path.
+    // `/anthropic/v1/messages` → provider `anthropic` (selected by the path segment, stripped to
+    // `/v1/messages` upstream). The minted virtual key is presented in `x-api-key` (the Anthropic
+    // SDK's header); the gateway verifies it and swaps in the real key — again in `x-api-key` (not
+    // Bearer). The required `anthropic-version` header passes through. This is the *only* test
+    // covering the x-api-key auth scheme + a real TLS handshake to api.anthropic.com via the full
+    // managed path.
     let body = r#"{"model":"claude-haiku-4-5","max_tokens":16,"messages":[{"role":"user","content":"Reply with the single word: ping"}]}"#;
     let resp = client
-        .post(format!("{}/v1/messages", gw.url()))
+        .post(format!("{}/anthropic/v1/messages", gw.url()))
         .header("x-api-key", &vkey)
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
@@ -137,24 +141,38 @@ async fn smoke_anthropic() {
 #[tokio::test]
 #[ignore = "live provider smoke; run via `mise run test:smoke` with API keys set"]
 async fn smoke_openai() {
-    smoke_openai_wire("openai", "OPENAI_API_KEY", "gpt-4o-mini").await;
+    smoke_openai_wire(
+        "openai",
+        "OPENAI_API_KEY",
+        "gpt-4o-mini",
+        "/openai/v1/chat/completions",
+    )
+    .await;
 }
 
 #[tokio::test]
 #[ignore = "live provider smoke; run via `mise run test:smoke` with API keys set"]
 async fn smoke_groq() {
-    // Proves the `/v1` → `/openai/v1` rewrite against a real mount (the highest-value rewrite case).
-    smoke_openai_wire("groq", "GROQ_API_KEY", "llama-3.1-8b-instant").await;
+    // Groq mounts under `/openai/v1`; the client sends `/groq/openai/v1/...` and the gateway strips
+    // `/groq` and forwards the rest verbatim. The highest-value non-`/v1` native-path case.
+    smoke_openai_wire(
+        "groq",
+        "GROQ_API_KEY",
+        "llama-3.1-8b-instant",
+        "/groq/openai/v1/chat/completions",
+    )
+    .await;
 }
 
 #[tokio::test]
 #[ignore = "live provider smoke; run via `mise run test:smoke` with API keys set"]
 async fn smoke_fireworks() {
-    // Proves the `/v1` → `/inference/v1` rewrite against a real mount.
+    // Fireworks mounts under `/inference/v1`: client sends `/fireworks/inference/v1/...`.
     smoke_openai_wire(
         "fireworks",
         "FIREWORKS_API_KEY",
         "accounts/fireworks/models/llama-v3p1-8b-instruct",
+        "/fireworks/inference/v1/chat/completions",
     )
     .await;
 }
@@ -162,14 +180,26 @@ async fn smoke_fireworks() {
 #[tokio::test]
 #[ignore = "live provider smoke; run via `mise run test:smoke` with API keys set"]
 async fn smoke_openrouter() {
-    // Proves the `/v1` → `/api/v1` rewrite against a real mount.
-    smoke_openai_wire("openrouter", "OPENROUTER_API_KEY", "openai/gpt-4o-mini").await;
+    // OpenRouter mounts under `/api/v1`: client sends `/openrouter/api/v1/...`.
+    smoke_openai_wire(
+        "openrouter",
+        "OPENROUTER_API_KEY",
+        "openai/gpt-4o-mini",
+        "/openrouter/api/v1/chat/completions",
+    )
+    .await;
 }
 
 #[tokio::test]
 #[ignore = "live provider smoke; run via `mise run test:smoke` with API keys set"]
 async fn smoke_deepseek() {
-    smoke_openai_wire("deepseek", "DEEPSEEK_API_KEY", "deepseek-chat").await;
+    smoke_openai_wire(
+        "deepseek",
+        "DEEPSEEK_API_KEY",
+        "deepseek-chat",
+        "/deepseek/v1/chat/completions",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -179,6 +209,7 @@ async fn smoke_together() {
         "together",
         "TOGETHER_API_KEY",
         "meta-llama/Llama-3.1-8B-Instruct-Turbo",
+        "/together/v1/chat/completions",
     )
     .await;
 }
@@ -186,17 +217,35 @@ async fn smoke_together() {
 #[tokio::test]
 #[ignore = "live provider smoke; run via `mise run test:smoke` with API keys set"]
 async fn smoke_cerebras() {
-    smoke_openai_wire("cerebras", "CEREBRAS_API_KEY", "llama3.1-8b").await;
+    smoke_openai_wire(
+        "cerebras",
+        "CEREBRAS_API_KEY",
+        "llama3.1-8b",
+        "/cerebras/v1/chat/completions",
+    )
+    .await;
 }
 
 #[tokio::test]
 #[ignore = "live provider smoke; run via `mise run test:smoke` with API keys set"]
 async fn smoke_mistral() {
-    smoke_openai_wire("mistral", "MISTRAL_API_KEY", "mistral-small-latest").await;
+    smoke_openai_wire(
+        "mistral",
+        "MISTRAL_API_KEY",
+        "mistral-small-latest",
+        "/mistral/v1/chat/completions",
+    )
+    .await;
 }
 
 #[tokio::test]
 #[ignore = "live provider smoke; run via `mise run test:smoke` with API keys set"]
 async fn smoke_xai() {
-    smoke_openai_wire("xai", "XAI_API_KEY", "grok-3-mini").await;
+    smoke_openai_wire(
+        "xai",
+        "XAI_API_KEY",
+        "grok-3-mini",
+        "/xai/v1/chat/completions",
+    )
+    .await;
 }

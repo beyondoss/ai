@@ -1,3 +1,6 @@
+// Bench target: `.unwrap()`/`.expect()` set up fixtures; not production code. See tests/e2e.rs.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Unit bench: the pure, IO-free hot paths. Timing **and** allocations come from `divan` — its
 //! `AllocProfiler` (installed as the global allocator below) reports alloc count + bytes per
 //! sample right beside ns/iter, so the design's allocation claims are visible in one table.

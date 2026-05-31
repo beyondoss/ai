@@ -47,6 +47,14 @@ pub struct AiConfig {
     /// → base64 public key. Multiple allowed for zero-downtime rotation. Config, not NATS.
     pub signing_keys: HashMap<String, String>,
 
+    /// Fail the boot if `signing_keys` is empty, instead of degrading to BYO-only. Empty signing
+    /// keys is a *legitimate* mode (a BYO-only deployment) but is far more often a mis-deploy — a
+    /// typo'd/absent SSM param — that looks healthy while silently dropping **all** managed billing
+    /// and deny-set enforcement. A managed deployment should set this `true` so a bad deploy fails
+    /// fast and visibly at boot rather than serving for free. Default `false` to keep BYO-only and
+    /// the test/e2e harnesses (which run keyless) working out of the box.
+    pub require_signing_keys: bool,
+
     /// Managed Beyond pool keys, **by provider name** (`openai`, `anthropic`, `fireworks`, …).
     /// From the `[pool_keys]` TOML table or SSM-injected `AI_POOL_KEY_<NAME>` env (the env form is
     /// the production path — see `load_with_path`). A provider with no pool key here can't serve
@@ -56,8 +64,9 @@ pub struct AiConfig {
 
     /// Per-provider upstream authority (`host:port`), **by provider name**. For a known provider
     /// (see `route::KNOWN_PROVIDERS`) this *overrides* its default; for an unknown name it *adds* a
-    /// new OpenAI-wire provider reachable via `x-beyond-provider`. Empty = every known provider uses
-    /// its built-in default. (The e2e harness points providers at a mock here.)
+    /// new OpenAI-wire provider, then reachable at `/{name}/…` (the provider is the request's first
+    /// path segment). Empty = every known provider uses its built-in default. (The e2e harness points
+    /// providers at a mock here.)
     pub provider_authorities: HashMap<String, String>,
 
     /// Upstream timeouts (seconds). Streaming responses are long, so read/idle are generous.
@@ -118,6 +127,7 @@ impl Default for AiConfig {
             config_bucket: "ai-gateway".to_string(),
             snapshot_path: None,
             signing_keys: HashMap::new(),
+            require_signing_keys: false,
             pool_keys: HashMap::new(),
             provider_authorities: HashMap::new(),
             connect_timeout_secs: 10,

@@ -9,18 +9,18 @@ response untouched, and emits token-usage facts for billing.
 
 ## Concepts & Terminology
 
-| Term                                             | What It Controls / Gates                                                               | NOT                                                                          |
-| ------------------------------------------------ | -------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| **Managed key** (`bai_v1.…`)                     | Ed25519-verified identity; enables key swap, deny-set check, and `ai.usage` billing    | A session token or capability grant — just tenant attribution                |
-| **BYO key** (anything else)                      | Forwarded as-is to the provider; no swap, no billing, no deny-set                      | A lesser tier — same proxy, minus attribution and billing                    |
-| **Pool key**                                     | Real provider API key held by the gateway; swapped in for managed traffic              | Per-tenant — one key per provider, shared by all managed callers             |
-| **Tenant**                                       | The billing entity from the virtual key payload (`tenant_id: u32`)                     | An org, user, or namespace — an opaque integer the gateway doesn't interpret |
-| **Dialect**                                      | Wire protocol implied by the request path (OpenAI `/v1/…` vs Anthropic `/v1/messages`) | The provider — dialect determines auth scheme and usage parsing format       |
-| **Provider**                                     | Named row in the routing table: authority, base path, auth scheme                      | A vendor relationship — just connection facts and auth wiring                |
-| **Deny-set**                                     | Sparse set of denied `tenant_id`s; gates managed traffic; default-allow                | An allowlist or ACL — misses are allowed, not blocked                        |
-| **Tail tap**                                     | Bounded 64KB window kept from the end of the response for usage extraction             | A buffer or copy — the response is relayed unbuffered; only the tail is kept |
-| **Snapshot**                                     | On-disk deny-set cache (entries + NATS cursor) for edge/tunnel deployments             | Persistent store — a pure cache; delete it and the gateway re-scans NATS     |
-| **Virtual key** (`bai_v1.{kid}.{payload}.{sig}`) | Ed25519-signed token encoding `tenant_id` + `vpc_id`                                   | A session or auth token — stateless, no server-side lookup, no revocation    |
+| Term                                             | What It Controls / Gates                                                                                                                                    | NOT                                                                          |
+| ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| **Managed key** (`bai_v1.…`)                     | Ed25519-verified identity; enables key swap, deny-set check, and `ai.usage` billing                                                                         | A session token or capability grant — just tenant attribution                |
+| **BYO key** (anything else)                      | Forwarded as-is to the provider; no swap, no billing, no deny-set                                                                                           | A lesser tier — same proxy, minus attribution and billing                    |
+| **Pool key**                                     | Real provider API key held by the gateway; swapped in for managed traffic                                                                                   | Per-tenant — one key per provider, shared by all managed callers             |
+| **Tenant**                                       | The billing entity from the virtual key payload (`tenant_id: u32`)                                                                                          | An org, user, or namespace — an opaque integer the gateway doesn't interpret |
+| **Dialect**                                      | A provider attribute (OpenAI-wire vs Anthropic-wire) driving usage parsing; for a bare-path request it's derived from the path to pick the default provider | The provider — a prefixed request uses its provider's dialect, not the path  |
+| **Provider**                                     | The request's **first path segment** (`/{provider}/…`); a named row in the routing table: authority, dialect, auth scheme                                   | A vendor relationship — just connection facts and auth wiring                |
+| **Deny-set**                                     | Sparse set of denied `tenant_id`s; gates managed traffic; default-allow                                                                                     | An allowlist or ACL — misses are allowed, not blocked                        |
+| **Tail tap**                                     | Bounded 64KB window kept from the end of the response for usage extraction                                                                                  | A buffer or copy — the response is relayed unbuffered; only the tail is kept |
+| **Snapshot**                                     | On-disk deny-set cache (entries + NATS cursor) for edge/tunnel deployments                                                                                  | Persistent store — a pure cache; delete it and the gateway re-scans NATS     |
+| **Virtual key** (`bai_v1.{kid}.{payload}.{sig}`) | Ed25519-signed token encoding `tenant_id` + `vpc_id`                                                                                                        | A session or auth token — stateless, no server-side lookup, no revocation    |
 
 ---
 
@@ -30,7 +30,8 @@ response untouched, and emits token-usage facts for billing.
 client (stock SDK, Bearer/ x-api-key)
    │
    ▼ request_filter
-   ├─ provider = dialect(path) [+ x-beyond-provider override]   (unknown → 400)
+   ├─ provider = first path segment `/{provider}/…` (strip + forward rest verbatim);
+   │             bare `/v1…` → dialect default (openai/anthropic);  unknown → 404
    ├─ extract key                                               (missing → 401)
    ├─ rate guardrails ← BEFORE verify/connect: per-credential (seeded raw-key hash) +
    │                    global BYO aggregate (managed exempt; protects egress IPs); over → 429
@@ -120,13 +121,14 @@ client (stock SDK, Bearer/ x-api-key)
 
   Both tiers are generous circuit breakers, not quotas; `rate_limit_rps = 0` / `byo_rate_limit_rps = 0`
   disable them independently.
-- **Routing is dialect-based** (model isn't known before peer selection); any non-default provider
-  is reached via the `x-beyond-provider: <name>` header. **Providers are data** — a row in
-  `route::KNOWN_PROVIDERS` (name, authority, **base path**, auth scheme) or a config entry — so
-  adding an OpenAI-wire provider is one line, no new code paths. Each row's connection facts are
-  **verified against the provider's official docs (cited inline in `route.rs`)**; the client's `/v1`
-  prefix is rewritten to the provider's mount point (Groq `/openai/v1`, Fireworks `/inference/v1`,
-  OpenRouter `/api/v1`) so a verbatim passthrough can't 404.
+- **Routing is by the first path segment = provider** (model isn't known before peer selection).
+  `/{provider}/…` selects the provider and the rest of the path is forwarded **verbatim** — the
+  gateway holds no per-provider mount knowledge, so the client uses the provider's own native path
+  (`/groq/openai/v1/…`, `/fireworks/inference/v1/…`). A bare path with no provider prefix that starts
+  with `/v1` is the **drop-in default** (dialect → openai/anthropic); an unknown segment is a **404**.
+  **Providers are data** — a row in `route::KNOWN_PROVIDERS` (name, authority, dialect, auth scheme)
+  or a config entry — so adding an OpenAI-wire provider is one line, no new code paths. Each row's
+  authority/auth is **verified against the provider's official docs (cited inline in `route.rs`)**.
 - **Connect retries only** (`fail_to_connect`); no HTTP-status retry (Pingora-idiomatic, SDKs back off).
 - **`ai.usage` carries _both_ models: `model` (resolved) + `requested_model` (alias).** `model` is
   the id the provider resolved + billed, taken from the _response_ (a second `ModelScanner` over the
@@ -173,36 +175,38 @@ All fields configurable via `config.example.toml` and environment (`AI_` prefix,
 Secret-bearing fields (`pool_keys`, `nats_creds`) are held as `Secret` — stray `Debug`/`Serialize`
 output redacts values.
 
-| Field                         | Default                           | Runtime Effect                                                                                                                                                   |
-| ----------------------------- | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `signing_keys`                | _(required)_                      | Map of kid → base64 Ed25519 public key. Multiple kids enable rotation. Missing → all traffic falls through to BYO treatment.                                     |
-| `pool_keys.<name>`            | _(from `AI_POOL_KEY_<NAME>` env)_ | Real provider API key. Missing for a provider → managed requests to that provider return 503.                                                                    |
-| `provider_authorities.<name>` | _(none)_                          | Override or add a provider's `authority` (host:port). Enables config-added providers beyond `KNOWN_PROVIDERS` with zero code change.                             |
-| `snapshot_path`               | _(unset)_                         | Path for the on-disk deny-set cache. Unset → re-scan NATS on every cold boot. Set → load from disk and enforce before NATS reconnects (edge/tunnel deployments). |
-| `rate_limit_rps`              | `100`                             | Per-credential request ceiling (count-min, keyed on raw key hash). `0` disables. Exceeded → 429. Checked before Ed25519 verify.                                  |
-| `byo_rate_limit_rps`          | `1000`                            | Aggregate ceiling for all BYO traffic (single shared bucket). `0` disables. Managed traffic exempt.                                                              |
-| `connect_timeout_secs`        | `10`                              | TCP connect timeout to the upstream provider. Exceeded → retry up to 2×, then 502.                                                                               |
-| `read_timeout_secs`           | `600`                             | Response read timeout. 10 minutes accommodates long-running LLM streams.                                                                                         |
-| `nats_url`                    | `nats://localhost:4222`           | NATS server for the deny-set watcher. Unreachable → fail-open (stale or empty set).                                                                              |
-| `nats_creds`                  | _(unset)_                         | NATS credentials file path. Required for authenticated clusters.                                                                                                 |
-| `listen_addr`                 | `0.0.0.0:8080`                    | Proxy listener address.                                                                                                                                          |
-| `metrics_listen`              | `0.0.0.0:9090`                    | Internal admin/observability listener: `/metrics` (Prometheus scrape), `/livez`, `/readyz`. Separate from the client listener — not externally reachable.        |
+| Field                         | Default                           | Runtime Effect                                                                                                                                                                                                                       |
+| ----------------------------- | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `signing_keys`                | _(required)_                      | Map of kid → base64 Ed25519 public key. Multiple kids enable rotation. Missing → all traffic falls through to BYO treatment.                                                                                                         |
+| `require_signing_keys`        | `false`                           | When `true`, an empty `signing_keys` is a hard boot failure instead of silent BYO-only mode. Set on managed deployments so a typo'd/absent SSM param fails fast rather than serving for free (no key swap, no deny-set, no billing). |
+| `pool_keys.<name>`            | _(from `AI_POOL_KEY_<NAME>` env)_ | Real provider API key. Missing for a provider → managed requests to that provider return 503.                                                                                                                                        |
+| `provider_authorities.<name>` | _(none)_                          | Override or add a provider's `authority` (host:port). Enables config-added providers beyond `KNOWN_PROVIDERS` with zero code change.                                                                                                 |
+| `snapshot_path`               | _(unset)_                         | Path for the on-disk deny-set cache. Unset → re-scan NATS on every cold boot. Set → load from disk and enforce before NATS reconnects (edge/tunnel deployments).                                                                     |
+| `rate_limit_rps`              | `100`                             | Per-credential request ceiling (count-min, keyed on raw key hash). `0` disables. Exceeded → 429. Checked before Ed25519 verify.                                                                                                      |
+| `byo_rate_limit_rps`          | `1000`                            | Aggregate ceiling for all BYO traffic (single shared bucket). `0` disables. Managed traffic exempt.                                                                                                                                  |
+| `connect_timeout_secs`        | `10`                              | TCP connect timeout to the upstream provider. Exceeded → retry up to 2×, then 502.                                                                                                                                                   |
+| `read_timeout_secs`           | `600`                             | Response read timeout. 10 minutes accommodates long-running LLM streams.                                                                                                                                                             |
+| `nats_url`                    | `nats://localhost:4222`           | NATS server for the deny-set watcher. Unreachable → fail-open (stale or empty set).                                                                                                                                                  |
+| `nats_creds`                  | _(unset)_                         | NATS credentials file path. Required for authenticated clusters.                                                                                                                                                                     |
+| `listen_addr`                 | `0.0.0.0:8080`                    | Proxy listener address.                                                                                                                                                                                                              |
+| `metrics_listen`              | `0.0.0.0:9090`                    | Internal admin/observability listener: `/metrics` (Prometheus scrape), `/livez`, `/readyz`. Separate from the client listener — not externally reachable.                                                                            |
 
 ---
 
 ## Failure Modes
 
-| Failure                                     | What Actually Happens                                                                                       | Recovery                                                                                                        |
-| ------------------------------------------- | ----------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| NATS unreachable at boot                    | Deny-set starts empty (fail-open). Auth still works — keys from config.                                     | Watcher reconnects; seeds from NATS or disk snapshot on connect.                                                |
-| NATS disconnects mid-run                    | Last-known deny-set stays active. New deny entries not applied until reconnect.                             | Watcher reconnects (1s→30s exponential backoff, reset on success) and resumes from saved revision — no re-scan. |
-| NATS history compacted past snapshot cursor | `CursorExpired` → full re-scan from current NATS state.                                                     | After re-scan, new cursor set; delta watch resumes normally.                                                    |
-| Virtual key tampered or forged              | Ed25519 verify fails → falls through to BYO treatment. No billing event.                                    | Billing miss detectable downstream; no security boundary breach.                                                |
-| Pool key missing for provider               | Managed request returns 503 before any upstream connection.                                                 | Add `AI_POOL_KEY_<NAME>` env and redeploy.                                                                      |
-| Provider DNS fails                          | `upstream_peer` returns error → 502 to client.                                                              | TTL-cached DNS (60s) serves stale; poisoned-lock guard re-resolves on next request.                             |
-| Provider TCP connect fails                  | `fail_to_connect` retries up to 2×, then returns 502.                                                       | Client SDK retries with backoff. No HTTP-status retries (Pingora-idiomatic).                                    |
-| Response body > 128KB before usage chunk    | Tail compaction fires: `drain(..half)` discards first half, keeps tail. Usage extracted from retained tail. | No action — O(1) tail tap is designed for this; SSE usage is always in the final data line.                     |
-| Gateway crash mid-request                   | In-flight request drops; client receives TCP close, not a structured error. No partial state written.       | Client SDK retries. No DB writes in the request path — no cleanup needed.                                       |
+| Failure                                     | What Actually Happens                                                                                                          | Recovery                                                                                                        |
+| ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------- |
+| NATS unreachable at boot                    | Deny-set starts empty (fail-open). Auth still works — keys from config.                                                        | Watcher reconnects; seeds from NATS or disk snapshot on connect.                                                |
+| NATS disconnects mid-run                    | Last-known deny-set stays active. New deny entries not applied until reconnect.                                                | Watcher reconnects (1s→30s exponential backoff, reset on success) and resumes from saved revision — no re-scan. |
+| NATS history compacted past snapshot cursor | `CursorExpired` → full re-scan from current NATS state.                                                                        | After re-scan, new cursor set; delta watch resumes normally.                                                    |
+| Virtual key tampered or forged              | Ed25519 verify fails → falls through to BYO treatment. No billing event.                                                       | Billing miss detectable downstream; no security boundary breach.                                                |
+| `signing_keys` absent (typo'd/missing SSM)  | Default: warn + BYO-only (silently drops all managed billing + deny-set). With `require_signing_keys=true`: hard boot failure. | Set `require_signing_keys=true` on managed deployments so the mis-deploy fails fast and visibly at boot.        |
+| Pool key missing for provider               | Managed request returns 503 before any upstream connection.                                                                    | Add `AI_POOL_KEY_<NAME>` env and redeploy.                                                                      |
+| Provider DNS fails                          | `upstream_peer` returns error → 502 to client.                                                                                 | TTL-cached DNS (60s) serves stale; poisoned-lock guard re-resolves on next request.                             |
+| Provider TCP connect fails                  | `fail_to_connect` retries up to 2×, then returns 502.                                                                          | Client SDK retries with backoff. No HTTP-status retries (Pingora-idiomatic).                                    |
+| Response body > 128KB before usage chunk    | Tail compaction fires: `drain(..half)` discards first half, keeps tail. Usage extracted from retained tail.                    | No action — O(1) tail tap is designed for this; SSE usage is always in the final data line.                     |
+| Gateway crash mid-request                   | In-flight request drops; client receives TCP close, not a structured error. No partial state written.                          | Client SDK retries. No DB writes in the request path — no cleanup needed.                                       |
 
 ---
 

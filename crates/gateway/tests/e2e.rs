@@ -3,6 +3,10 @@
 //!
 //! Signing key + pool key come from the gateway's *config*; NATS carries only the deny-set.
 
+// Test target: `.unwrap()`/`.expect()`/`panic!` are assertions, not production code — allow the
+// panic-surface restriction lints denied workspace-wide in `[workspace.lints.clippy]`.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 mod common;
 
 use beyond_ai::key::{VirtualKey, mint};
@@ -24,17 +28,18 @@ async fn post_status(client: &reqwest::Client, url: &str, key: &str, body: Strin
         .unwrap_or(0)
 }
 
-async fn post_status_provider(
+/// POST to an arbitrary gateway path with a Bearer key — exercises provider routing by the first
+/// path segment (`/{provider}/…`) vs the bare-path default.
+async fn post_path_status(
     client: &reqwest::Client,
     url: &str,
+    path: &str,
     key: &str,
-    provider: &str,
     body: String,
 ) -> u16 {
     client
-        .post(format!("{url}/v1/chat/completions"))
+        .post(format!("{url}{path}"))
         .header("authorization", format!("Bearer {key}"))
-        .header("x-beyond-provider", provider)
         .header("content-type", "application/json")
         .body(body)
         .send()
@@ -165,7 +170,7 @@ async fn byo_passes_user_token_through_unchanged() {
 }
 
 #[tokio::test]
-async fn fireworks_provider_header_routes_and_swaps_pool_key() {
+async fn fireworks_path_prefix_strips_and_swaps_pool_key() {
     let nats = Nats::start().await;
     let (pubkey, sk) = test_keypair(4);
     let mock = MockUpstream::start(Mode::Json).await;
@@ -180,18 +185,19 @@ async fn fireworks_provider_header_routes_and_swaps_pool_key() {
         &sk,
     );
     let client = reqwest::Client::new();
-    // Fireworks model ids contain `/`, so it's reached via the `x-beyond-provider` header, not
-    // model inference. A managed key must swap to the Fireworks-specific pool key.
+    // Fireworks is selected by the `/fireworks` path segment; the client uses its native base path
+    // (`/inference/v1`). The gateway strips `/fireworks` and forwards the rest VERBATIM, and a
+    // managed key swaps to the Fireworks-specific pool key.
     {
         let (c, u, k) = (client.clone(), gw.url(), vkey.clone());
         wait_for_status(200, move || {
             let (c, u, k) = (c.clone(), u.clone(), k.clone());
             async move {
-                post_status_provider(
+                post_path_status(
                     &c,
                     &u,
+                    "/fireworks/inference/v1/chat/completions",
                     &k,
-                    "fireworks",
                     body_for("accounts/fireworks/models/llama-v3p1-70b-instruct"),
                 )
                 .await
@@ -206,12 +212,84 @@ async fn fireworks_provider_header_routes_and_swaps_pool_key() {
         Some("Bearer sk-fireworks-pool"),
         "managed Fireworks request must swap to the Fireworks pool key"
     );
-    // Fireworks mounts the OpenAI surface under `/inference/v1`, not `/v1`: the client's
-    // `/v1/chat/completions` must be rewritten or the real upstream would 404.
+    // The `/fireworks` segment is stripped; the provider-native remainder is forwarded verbatim
+    // (the gateway does no per-provider path rewriting).
     assert_eq!(
         cap.path, "/inference/v1/chat/completions",
-        "client `/v1` path must be remapped to the provider's base path"
+        "first segment (provider) stripped; remainder forwarded verbatim"
     );
+}
+
+#[tokio::test]
+async fn openai_prefix_matches_bare_default() {
+    // `/openai/v1/chat/completions` (explicit prefix) must reach OpenAI identically to bare
+    // `/v1/chat/completions` (dialect default): same pool-key swap, same upstream path after strip.
+    let nats = Nats::start().await;
+    let (pubkey, sk) = test_keypair(8);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::start(nats.port, &mock.authority(), &b64(&pubkey)).await;
+
+    let vkey = mint(
+        &VirtualKey {
+            tenant_id: 1,
+            vpc_id: 1,
+        },
+        1,
+        &sk,
+    );
+    let client = reqwest::Client::new();
+    {
+        let (c, u, k) = (client.clone(), gw.url(), vkey.clone());
+        wait_for_status(200, move || {
+            let (c, u, k) = (c.clone(), u.clone(), k.clone());
+            async move {
+                post_path_status(
+                    &c,
+                    &u,
+                    "/openai/v1/chat/completions",
+                    &k,
+                    body_for("gpt-4o"),
+                )
+                .await
+            }
+        })
+        .await;
+    }
+    let cap = mock.captured().expect("mock received a request");
+    assert_eq!(cap.authorization.as_deref(), Some("Bearer sk-pool-secret"));
+    assert_eq!(
+        cap.path, "/v1/chat/completions",
+        "`/openai` stripped → same upstream path as the bare `/v1` default"
+    );
+}
+
+#[tokio::test]
+async fn unknown_provider_segment_returns_404() {
+    // An unrecognized first path segment that isn't the bare `/v1` default is a routing miss — 404
+    // from the gateway (before any auth), not a confusing upstream error. Provider resolution is the
+    // very first step, so this fires regardless of the key.
+    let nats = Nats::start().await;
+    let (pubkey, sk) = test_keypair(9);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::start(nats.port, &mock.authority(), &b64(&pubkey)).await;
+
+    let vkey = mint(
+        &VirtualKey {
+            tenant_id: 1,
+            vpc_id: 1,
+        },
+        1,
+        &sk,
+    );
+    let client = reqwest::Client::new();
+    let (c, u, k) = (client.clone(), gw.url(), vkey.clone());
+    wait_for_status(404, move || {
+        let (c, u, k) = (c.clone(), u.clone(), k.clone());
+        async move {
+            post_path_status(&c, &u, "/bogus/v1/chat/completions", &k, body_for("gpt-4o")).await
+        }
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -462,7 +540,7 @@ async fn managed_key_via_x_api_key_header_is_accepted() {
 #[tokio::test]
 async fn managed_key_for_unconfigured_provider_returns_503() {
     // The default gateway configures OpenAI + Fireworks pool keys, but NOT Anthropic. A managed key
-    // routed to Anthropic (via the override header) has no pool key → 503, surfaced in
+    // routed to Anthropic (via the `/anthropic` path segment) has no pool key → 503, surfaced in
     // request_filter before any upstream connect.
     let nats = Nats::start().await;
     let (pubkey, sk) = test_keypair(23);
@@ -481,7 +559,14 @@ async fn managed_key_for_unconfigured_provider_returns_503() {
     wait_for_status(503, move || {
         let (c, u, k) = (c.clone(), u.clone(), k.clone());
         async move {
-            post_status_provider(&c, &u, &k, "anthropic", body_for("claude-opus-4-8")).await
+            post_path_status(
+                &c,
+                &u,
+                "/anthropic/v1/messages",
+                &k,
+                body_for("claude-opus-4-8"),
+            )
+            .await
         }
     })
     .await;

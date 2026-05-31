@@ -1,5 +1,8 @@
 //! Beyond AI gateway binary: clap `Run`/`Doctor`, Pingora server bootstrap, services.
 
+// See `lib.rs`: deny the panic surface in production, allow it in `#[cfg(test)]` assertions.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
 use beyond_ai::admin::AdminApp;
 use beyond_ai::config::AiConfig;
 use beyond_ai::doctor;
@@ -61,6 +64,9 @@ fn init_tracing() {
         .init();
 }
 
+// Boot path: every `.expect()` here is a fatal start-up invariant (no runtime to build, no Pingora
+// server) — a panic before we serve a single request is the correct, visible failure.
+#[allow(clippy::expect_used)]
 fn main() {
     // rustls 0.23 requires a process-wide crypto provider for the TLS connections to providers.
     // Idempotent: an `Err` means a provider is already installed (e.g. a second init in tests),

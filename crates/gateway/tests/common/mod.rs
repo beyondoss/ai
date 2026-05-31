@@ -6,6 +6,8 @@
 //! deny-set. Every component picks a free port and cleans up on drop, so tests run in parallel.
 
 #![allow(dead_code)]
+// Test harness: `.unwrap()`/`.expect()`/`panic!` are assertions, not production code. See e2e.rs.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::io::Write;
 use std::net::TcpListener as StdTcpListener;

@@ -29,6 +29,7 @@ impl AdminApp {
     /// Build a `{"status","version"}` JSON health response. `status` is `"ok"`/`"degraded"` so a
     /// human or a probe can read intent without parsing the code. Header values are all static or
     /// integer, so the builder can't fail — `expect` documents that invariant.
+    #[allow(clippy::expect_used)] // builder inputs are all static/integer; cannot fail
     fn health(status: u16, health: &str) -> Response<Vec<u8>> {
         let body = serde_json::json!({ "status": health, "version": VERSION })
             .to_string()
@@ -42,6 +43,7 @@ impl AdminApp {
     }
 
     /// Encode the default Prometheus registry as text (same output as Pingora's built-in service).
+    #[allow(clippy::expect_used)] // builder inputs are encoder-derived/integer; cannot fail
     fn metrics() -> Response<Vec<u8>> {
         let encoder = TextEncoder::new();
         let mut buffer = Vec::new();

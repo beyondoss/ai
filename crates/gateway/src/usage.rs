@@ -5,6 +5,8 @@
 //! an SSE stream. For streaming we scan the relayed bytes for the usage event but never block the
 //! relay on it (see `proxy`).
 
+use serde::Deserialize;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Usage {
     pub input_tokens: u64,
@@ -13,59 +15,104 @@ pub struct Usage {
     pub cache_write_tokens: u64,
 }
 
-fn u64_at(v: &serde_json::Value, ptr: &str) -> u64 {
-    v.pointer(ptr).and_then(|x| x.as_u64()).unwrap_or(0)
+// Typed views of just the fields we meter. Deserializing into these (rather than a
+// `serde_json::Value` DOM) lets serde skip every field we don't read without allocating a node for
+// it — no `Map`/`String`/`Number` tree to build and drop per body or per SSE line. Every field is
+// `#[serde(default)]` so a missing or partial `usage` block reads as zeros, matching the prior
+// pointer-with-`unwrap_or(0)` behavior.
+
+/// OpenAI `usage` block (chat/completions + responses). `prompt`/`completion` map to in/out; cached
+/// input rides in `prompt_tokens_details.cached_tokens`. No cache-write concept on the OpenAI wire.
+#[derive(Deserialize, Default)]
+struct OpenAiUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: OpenAiPromptDetails,
 }
 
-/// OpenAI non-streaming: `usage.{prompt_tokens, completion_tokens}` (+ cached details).
+#[derive(Deserialize, Default)]
+struct OpenAiPromptDetails {
+    #[serde(default)]
+    cached_tokens: u64,
+}
+
+impl From<OpenAiUsage> for Usage {
+    fn from(u: OpenAiUsage) -> Self {
+        Usage {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+            cache_read_tokens: u.prompt_tokens_details.cached_tokens,
+            cache_write_tokens: 0,
+        }
+    }
+}
+
+/// Anthropic `usage` block (`/v1/messages` body + streaming events).
+#[derive(Deserialize, Default)]
+struct AnthropicUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: u64,
+    #[serde(default)]
+    cache_creation_input_tokens: u64,
+}
+
+/// OpenAI non-streaming: top-level `usage`. `None` (absent/`null`) ⇒ no usage to meter.
 pub fn openai_body(body: &[u8]) -> Option<Usage> {
-    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let u = v.get("usage")?;
-    Some(Usage {
-        input_tokens: u64_at(u, "/prompt_tokens"),
-        output_tokens: u64_at(u, "/completion_tokens"),
-        cache_read_tokens: u64_at(u, "/prompt_tokens_details/cached_tokens"),
-        cache_write_tokens: 0,
-    })
+    #[derive(Deserialize)]
+    struct Body {
+        usage: Option<OpenAiUsage>,
+    }
+    serde_json::from_slice::<Body>(body)
+        .ok()?
+        .usage
+        .map(Usage::from)
 }
 
-/// Anthropic non-streaming: `usage.{input_tokens, output_tokens, cache_*}`.
+/// Anthropic non-streaming: top-level `usage.{input,output,cache_*}`.
 pub fn anthropic_body(body: &[u8]) -> Option<Usage> {
-    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let u = v.get("usage")?;
+    #[derive(Deserialize)]
+    struct Body {
+        usage: Option<AnthropicUsage>,
+    }
+    let u = serde_json::from_slice::<Body>(body).ok()?.usage?;
     Some(Usage {
-        input_tokens: u64_at(u, "/input_tokens"),
-        output_tokens: u64_at(u, "/output_tokens"),
-        cache_read_tokens: u64_at(u, "/cache_read_input_tokens"),
-        cache_write_tokens: u64_at(u, "/cache_creation_input_tokens"),
+        input_tokens: u.input_tokens,
+        output_tokens: u.output_tokens,
+        cache_read_tokens: u.cache_read_input_tokens,
+        cache_write_tokens: u.cache_creation_input_tokens,
     })
 }
 
-/// Iterate the JSON objects carried on `data:` lines of an SSE byte stream. `[DONE]` and
-/// non-JSON payloads are skipped. Used by both stream parsers below.
-fn sse_data_objects(sse: &[u8]) -> impl Iterator<Item = serde_json::Value> + '_ {
+/// Iterate the raw JSON payloads carried on `data:` lines of an SSE byte stream. `[DONE]` and the
+/// `data:` framing are stripped; each caller deserializes the payload into its own typed view.
+fn sse_data_lines(sse: &[u8]) -> impl Iterator<Item = &[u8]> + '_ {
     sse.split(|&b| b == b'\n').filter_map(|line| {
         let line = line.strip_prefix(b"data:")?;
         let line = line.strip_prefix(b" ").unwrap_or(line);
-        if line == b"[DONE]" {
-            return None;
-        }
-        serde_json::from_slice::<serde_json::Value>(line).ok()
+        (line != b"[DONE]").then_some(line)
     })
 }
 
 /// OpenAI streaming (requires `stream_options.include_usage`): the penultimate chunk carries a
 /// top-level `usage` object. Last one with usage wins.
 pub fn openai_stream(sse: &[u8]) -> Option<Usage> {
+    #[derive(Deserialize)]
+    struct Chunk {
+        usage: Option<OpenAiUsage>,
+    }
     let mut found = None;
-    for v in sse_data_objects(sse) {
-        if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
-            found = Some(Usage {
-                input_tokens: u64_at(u, "/prompt_tokens"),
-                output_tokens: u64_at(u, "/completion_tokens"),
-                cache_read_tokens: u64_at(u, "/prompt_tokens_details/cached_tokens"),
-                cache_write_tokens: 0,
-            });
+    for line in sse_data_lines(sse) {
+        if let Ok(chunk) = serde_json::from_slice::<Chunk>(line) {
+            if let Some(u) = chunk.usage {
+                found = Some(Usage::from(u));
+            }
         }
     }
     found
@@ -74,20 +121,32 @@ pub fn openai_stream(sse: &[u8]) -> Option<Usage> {
 /// Anthropic streaming: input + cache tokens arrive in `message_start.message.usage`; output
 /// accumulates in `message_delta.usage.output_tokens` (last delta is the cumulative total).
 pub fn anthropic_stream(sse: &[u8]) -> Option<Usage> {
+    #[derive(Deserialize)]
+    struct Message {
+        usage: Option<AnthropicUsage>,
+    }
+    #[derive(Deserialize)]
+    struct Chunk {
+        // `message_start` nests usage under `message`; `message_delta` carries it top-level.
+        message: Option<Message>,
+        usage: Option<AnthropicUsage>,
+    }
     let mut usage = Usage::default();
     let mut saw_any = false;
-    for v in sse_data_objects(sse) {
-        if let Some(u) = v.pointer("/message/usage") {
-            usage.input_tokens = u64_at(u, "/input_tokens");
-            usage.cache_read_tokens = u64_at(u, "/cache_read_input_tokens");
-            usage.cache_write_tokens = u64_at(u, "/cache_creation_input_tokens");
+    for line in sse_data_lines(sse) {
+        let Ok(chunk) = serde_json::from_slice::<Chunk>(line) else {
+            continue;
+        };
+        if let Some(u) = chunk.message.and_then(|m| m.usage) {
+            usage.input_tokens = u.input_tokens;
+            usage.cache_read_tokens = u.cache_read_input_tokens;
+            usage.cache_write_tokens = u.cache_creation_input_tokens;
             saw_any = true;
         }
-        if let Some(u) = v.get("usage") {
+        if let Some(u) = chunk.usage {
             // message_delta carries the running output token count.
-            let out = u64_at(u, "/output_tokens");
-            if out > 0 {
-                usage.output_tokens = out;
+            if u.output_tokens > 0 {
+                usage.output_tokens = u.output_tokens;
             }
             saw_any = true;
         }

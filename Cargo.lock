@@ -305,6 +305,7 @@ name = "beyond-ai"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "arrayvec",
  "async-trait",
  "base64",
  "beyond-slipstream",
