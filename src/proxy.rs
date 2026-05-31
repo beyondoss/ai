@@ -327,13 +327,13 @@ impl ProxyHttp for AiProxy {
         }
 
         // 4. Reject oversized bodies up front (Content-Length) so we never buffer a huge upload.
-        if let Some(len) = session
+        let declared_len = session
             .req_header()
             .headers
             .get("content-length")
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<usize>().ok())
-        {
+            .and_then(|v| v.parse::<usize>().ok());
+        if let Some(len) = declared_len {
             if len > MAX_REQUEST_BODY {
                 return Self::reject(
                     session,
@@ -367,9 +367,15 @@ impl ProxyHttp for AiProxy {
             };
             // Deny-set: O(1), default-allow. The gateway never learns *why*, only the reason code.
             if let Some(reason) = self.state.deny.load().reason(identity.tenant_id) {
+                // Distinct label per reason — `Unknown` is *not* folded into `deny_fraud`. An
+                // `Unknown` arises when the control plane writes a reason string this gateway
+                // doesn't recognize (a control-plane deploy ahead of a gateway deploy), which would
+                // otherwise spike the fraud counter and mask the real fraud signal. A `deny_unknown`
+                // label surfaces it as the deployment-coordination issue it is.
                 let label = match reason {
                     crate::deny::DenyReason::Spend => "deny_spend",
-                    _ => "deny_fraud",
+                    crate::deny::DenyReason::Fraud => "deny_fraud",
+                    crate::deny::DenyReason::Unknown => "deny_unknown",
                 };
                 self.state
                     .metrics
@@ -421,7 +427,17 @@ impl ProxyHttp for AiProxy {
             resp_model_scanner: peek::ModelScanner::new(),
             streaming: false,
             inject_eligible,
-            req_buf: Vec::new(),
+            // Only the inject-eligible path ever buffers the request body (to splice
+            // `stream_options` after the root `{`; the `stream` key can appear anywhere in the root
+            // object, so the decision needs the whole body — buffering is inherent here, not
+            // incidental). When it does, pre-size from the declared Content-Length so accumulation is
+            // a single allocation instead of a geometric realloc chain; capped at `MAX_REQUEST_BODY`
+            // so a lying header can't pre-allocate unbounded memory. Every other request leaves this
+            // empty and never buffers.
+            req_buf: match (inject_eligible, declared_len) {
+                (true, Some(len)) => Vec::with_capacity(len.min(MAX_REQUEST_BODY)),
+                _ => Vec::new(),
+            },
             // Grown lazily by the response tap (`response_body_filter`), not pre-reserved: a
             // non-streaming response — the common case — is a few hundred bytes, so reserving the
             // full 64KB cap up front would waste an allocation on every request to hold ~200B. A

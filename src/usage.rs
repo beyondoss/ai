@@ -95,7 +95,10 @@ pub fn anthropic_body(body: &[u8]) -> Option<Usage> {
 fn sse_data_lines(sse: &[u8]) -> impl Iterator<Item = &[u8]> + '_ {
     sse.split(|&b| b == b'\n').filter_map(|line| {
         let line = line.strip_prefix(b"data:")?;
-        let line = line.strip_prefix(b" ").unwrap_or(line);
+        // SSE strips *all* leading spaces after the field colon (not exactly one) — OpenAI/Anthropic
+        // emit `data: ` (one space), but a config-added OpenAI-wire provider that pads with more
+        // would otherwise leave whitespace in the payload and fail the JSON parse → silent zero usage.
+        let line = line.trim_ascii_start();
         (line != b"[DONE]").then_some(line)
     })
 }
@@ -237,6 +240,23 @@ mod tests {
                 output_tokens: 15,
                 cache_read_tokens: 12,
                 cache_write_tokens: 8
+            }
+        );
+    }
+
+    #[test]
+    fn tolerates_extra_leading_spaces_after_data_colon() {
+        // SSE strips all leading spaces, not just one. A provider padding `data:   {…}` must still
+        // parse — the alternative is a silent zero-usage row for that request.
+        let sse =
+            b"data:   {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":7}}\n\n";
+        assert_eq!(
+            openai_stream(sse).unwrap(),
+            Usage {
+                input_tokens: 3,
+                output_tokens: 7,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0
             }
         );
     }

@@ -13,10 +13,13 @@ use std::collections::HashMap;
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-// `default` so every field is optional. We deliberately do NOT set `deny_unknown_fields`: config is
-// merged from `Env::prefixed("AI_")`, a namespace shared with foreign variables the platform injects
-// (e.g. `AI_AGENT`, `AI_LOG`), so rejecting unknown keys would fail load on a valid environment
-// rather than catch a typo.
+// `default` so every field is optional. We deliberately do NOT set serde's `deny_unknown_fields`:
+// config is merged from `Env::prefixed("AI_")`, a namespace shared with foreign variables the
+// platform injects (e.g. `AI_AGENT`, `AI_LOG`), so rejecting unknown keys at the serde layer would
+// fail load on a valid environment. Typo protection is instead enforced one layer down, against the
+// *TOML file only* (`reject_unknown_toml_keys`): the file is ours alone — not a shared namespace —
+// so an unrecognized key there is unambiguously a mistake, and a silent one (it loads its default
+// and the setting does nothing), worth a hard, visible boot failure.
 #[serde(default)]
 pub struct AiConfig {
     /// Downstream listener for client (app) traffic. Internal-only in production (Service Connect
@@ -74,6 +77,23 @@ pub struct AiConfig {
     pub read_timeout_secs: u64,
     pub write_timeout_secs: u64,
     pub idle_timeout_secs: u64,
+
+    /// Graceful-shutdown drain window (seconds): after SIGTERM, how long Pingora lets **in-flight
+    /// requests finish** before tearing the runtimes down. Maps to Pingora's `grace_period_seconds`
+    /// (left unset, Pingora silently defaults to 300s — this knob makes the window explicit and
+    /// tunable without a code change). The tension: a streaming completion can run up to
+    /// `read_timeout_secs` (600s default), so any in-flight stream longer than this window is cut at
+    /// the boundary (client sees a mid-stream TCP close). Set it to cover your p99 stream, not the
+    /// max — covering the max means every deploy waits the full window. **It is also capped by the
+    /// orchestrator**: ECS SIGKILLs at `stopTimeout` (default 30s, max 120s), so a grace larger than
+    /// `stopTimeout` is wasted unless `stopTimeout` is raised to match. Default 120 = the ECS ceiling.
+    pub shutdown_grace_period_secs: u64,
+    /// Final runtime-teardown timeout (seconds) **after** the drain window: how long Pingora waits for
+    /// the tokio runtimes to exit before forcing the process down. Maps to Pingora's
+    /// `graceful_shutdown_timeout_seconds` (unset ⇒ a silent 5s default). A few seconds is enough to
+    /// flush logs/metrics; this is a backstop against a wedged runtime hanging shutdown forever, not a
+    /// second drain window (that's `shutdown_grace_period_secs`).
+    pub shutdown_runtime_timeout_secs: u64,
 
     /// TLS to the upstream provider. Real providers are HTTPS (true); the e2e harness sets false
     /// to talk to a plaintext mock.
@@ -135,6 +155,12 @@ impl Default for AiConfig {
             read_timeout_secs: 600,
             write_timeout_secs: 60,
             idle_timeout_secs: 90,
+            // Drain in-flight requests for up to the ECS SIGKILL ceiling (120s) on SIGTERM, then a
+            // short runtime-teardown backstop. Explicit so the window is a documented operational
+            // knob, not Pingora's silent 300s default. See the field docs for the read_timeout /
+            // orchestrator-stopTimeout tradeoffs.
+            shutdown_grace_period_secs: 120,
+            shutdown_runtime_timeout_secs: 10,
             upstream_tls: true,
             // Prefer H2 to providers by default (all of `KNOWN_PROVIDERS` offer it; H1 fallback is
             // automatic). Flip to false for an all-H1 upstream without recompiling.
@@ -154,8 +180,15 @@ impl Default for AiConfig {
 
 impl AiConfig {
     pub fn load_with_path(path: Option<&Path>) -> Result<Self> {
+        let toml_path = path.unwrap_or_else(|| Path::new("config.toml"));
+        // Catch a typo'd key in the operator's own TOML *before* any of it merges — a misspelled
+        // `require_signing_keys` would otherwise load its default and silently drop all managed
+        // billing while the gateway looks healthy. Only the TOML file is checked (see the
+        // `deny_unknown_fields` note on `AiConfig`); the env layer must stay lenient.
+        reject_unknown_toml_keys(toml_path)?;
+
         let mut fig = Figment::from(figment::providers::Serialized::defaults(AiConfig::default()));
-        fig = fig.merge(Toml::file(path.unwrap_or_else(|| Path::new("config.toml"))));
+        fig = fig.merge(Toml::file(toml_path));
         // Flat mapping: `AI_READ_TIMEOUT_SECS` → `read_timeout_secs`. (No `.split('_')` — these are
         // flat fields, not nested tables.) Unknown `AI_*` vars are tolerated (see the
         // `deny_unknown_fields` note on `AiConfig`) — which is also why pool keys are collected
@@ -165,7 +198,29 @@ impl AiConfig {
             .extract()
             .map_err(|e| GatewayError::Config(e.to_string()))?;
         cfg.merge_pool_key_env(std::env::vars());
+        cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Reject nonsensical values that would otherwise fail silently at runtime. A `0` connect/read
+    /// timeout (a typo'd SSM param) becomes a `Duration::from_secs(0)` deadline that fails every
+    /// upstream call immediately — surfacing only as a 502 cascade, not a loud boot failure. Catch it
+    /// here so a mis-deploy fails fast and visibly. Write/idle are not load-bearing for correctness
+    /// (Pingora treats them as best-effort), so they're left unconstrained.
+    fn validate(&self) -> Result<()> {
+        if self.connect_timeout_secs == 0 {
+            return Err(GatewayError::Config(
+                "connect_timeout_secs must be > 0 (a 0 connect timeout fails every upstream connect)"
+                    .to_string(),
+            ));
+        }
+        if self.read_timeout_secs == 0 {
+            return Err(GatewayError::Config(
+                "read_timeout_secs must be > 0 (a 0 read timeout aborts every response before it arrives)"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Fold `AI_POOL_KEY_<NAME>` environment variables into `pool_keys` (provider name lowercased).
@@ -196,6 +251,50 @@ impl AiConfig {
     }
 }
 
+/// The set of top-level keys a config file may set, derived from `AiConfig` itself by serializing
+/// its defaults — so it tracks the struct automatically and can never drift from the field list.
+fn known_config_keys() -> std::collections::BTreeSet<String> {
+    use figment::Provider as _;
+    figment::providers::Serialized::defaults(AiConfig::default())
+        .data()
+        .map(|profiles| {
+            profiles
+                .into_values()
+                .flat_map(|dict| dict.into_keys())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Fail the load if the TOML file at `path` carries any key that isn't an `AiConfig` field. A
+/// missing file is fine (the gateway runs on defaults + env), so an unreadable/absent file yields no
+/// keys and passes. See the `deny_unknown_fields` note on `AiConfig` for why this is scoped to the
+/// TOML file and not the env layer.
+fn reject_unknown_toml_keys(path: &Path) -> Result<()> {
+    use figment::Provider as _;
+    let known = known_config_keys();
+    let unknown: std::collections::BTreeSet<String> = Toml::file(path)
+        .data()
+        .map(|profiles| {
+            profiles
+                .into_values()
+                .flat_map(|dict| dict.into_keys())
+                .filter(|k| !known.contains(k))
+                .collect()
+        })
+        .unwrap_or_default();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let unknown: Vec<String> = unknown.into_iter().collect();
+    Err(GatewayError::Config(format!(
+        "unknown key(s) in {}: {} — check for a typo (known keys: {})",
+        path.display(),
+        unknown.join(", "),
+        known.into_iter().collect::<Vec<_>>().join(", "),
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +311,75 @@ mod tests {
     fn loads_without_a_file() {
         let c = AiConfig::load_with_path(None).unwrap();
         assert_eq!(c.listen, "0.0.0.0:8080");
+    }
+
+    #[test]
+    fn validate_rejects_zero_connect_and_read_timeouts() {
+        // A 0 connect/read timeout (a typo'd SSM param) must fail boot loudly, not degrade into a
+        // 502 cascade at runtime.
+        assert!(
+            AiConfig {
+                connect_timeout_secs: 0,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            AiConfig {
+                read_timeout_secs: 0,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+        // Defaults are valid.
+        assert!(AiConfig::default().validate().is_ok());
+    }
+
+    /// Write `body` to a uniquely-named temp TOML file (the literal `label` keeps parallel tests
+    /// from colliding) and return its path; the caller removes it.
+    fn temp_toml(label: &str, body: &str) -> std::path::PathBuf {
+        use std::io::Write as _;
+        let path = std::env::temp_dir().join(format!("beyond-ai-cfg-{label}.toml"));
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+        path
+    }
+
+    #[test]
+    fn rejects_typod_toml_key() {
+        // A misspelled key in the operator's own TOML is a silent footgun (loads its default, the
+        // setting does nothing) — load must fail loudly and name the offending key, not boot healthy.
+        let path = temp_toml(
+            "typo",
+            "listen = \"0.0.0.0:1234\"\nreqiure_signing_keys = true\n",
+        );
+        let err = AiConfig::load_with_path(Some(&path)).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        match err {
+            GatewayError::Config(msg) => assert!(
+                msg.contains("reqiure_signing_keys"),
+                "error must name the typo'd key, got: {msg}"
+            ),
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_known_toml_keys() {
+        // Every key here is a real `AiConfig` field (including the `[signing_keys]` table) — load
+        // must succeed and apply the values.
+        let path = temp_toml(
+            "known",
+            "listen = \"0.0.0.0:1234\"\nrequire_signing_keys = true\nrate_limit_rps = 7\n\n[signing_keys]\n1 = \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"\n",
+        );
+        let c = AiConfig::load_with_path(Some(&path)).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(c.listen, "0.0.0.0:1234");
+        assert!(c.require_signing_keys);
+        assert_eq!(c.rate_limit_rps, 7);
+        assert!(c.signing_keys.contains_key("1"));
     }
 
     #[test]

@@ -133,7 +133,12 @@ fn main() {
 
     // Metrics listener now also serves /livez + /readyz for the ECS/k8s probes. Pingora's built-in
     // prometheus service only does /metrics, so we hand-route all three in one small ServeHttp.
-    let mut admin = ListeningService::new("ai-admin".to_string(), HttpServer::new_app(AdminApp));
+    let mut admin = ListeningService::new(
+        "ai-admin".to_string(),
+        HttpServer::new_app(AdminApp {
+            metrics: state.metrics.clone(),
+        }),
+    );
     admin.add_tcp(&metrics_listen);
     server.add_service(admin);
 

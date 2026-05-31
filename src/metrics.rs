@@ -176,8 +176,8 @@ pub struct ProviderMetrics {
     pub ttft_seconds: Histogram,
     pub upstream_latency_seconds: Histogram,
     pub connect_retries_total: IntCounter,
-    /// Responses by status class, indexed `[2xx, 3xx, 4xx, 5xx]` (see [`Self::record_response`]).
-    responses: [IntCounter; 4],
+    /// Responses by status class, indexed `[1xx, 2xx, 3xx, 4xx, 5xx]` (see [`Self::record_response`]).
+    responses: [IntCounter; 5],
 }
 
 impl ProviderMetrics {
@@ -190,6 +190,8 @@ impl ProviderMetrics {
             connect_retries_total: m.connect_retries_total.with_label_values(&[provider]),
             responses: [
                 m.upstream_responses_total
+                    .with_label_values(&[provider, "1xx"]),
+                m.upstream_responses_total
                     .with_label_values(&[provider, "2xx"]),
                 m.upstream_responses_total
                     .with_label_values(&[provider, "3xx"]),
@@ -201,13 +203,17 @@ impl ProviderMetrics {
         }
     }
 
-    /// Count one upstream response, bucketed by status class (`2xx`/`3xx`/`4xx`/`5xx`).
+    /// Count one upstream response, bucketed by status class (`1xx`/`2xx`/`3xx`/`4xx`/`5xx`).
+    /// A `1xx` (e.g. `100 Continue`, `101 Switching Protocols`) gets its own bucket rather than
+    /// falling through to `5xx` — providers don't normally emit it, but a misbucketed informational
+    /// status would otherwise read as a phantom upstream-error spike on the dashboard.
     pub fn record_response(&self, status: u16) {
         let idx = match status {
-            200..=299 => 0,
-            300..=399 => 1,
-            400..=499 => 2,
-            _ => 3,
+            100..=199 => 0,
+            200..=299 => 1,
+            300..=399 => 2,
+            400..=499 => 3,
+            _ => 4,
         };
         self.responses[idx].inc();
     }
@@ -222,7 +228,31 @@ impl ProviderMetrics {
             ttft_seconds: hist(),
             upstream_latency_seconds: hist(),
             connect_retries_total: counter(),
-            responses: [counter(), counter(), counter(), counter()],
+            responses: [counter(), counter(), counter(), counter(), counter()],
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_response_buckets_by_status_class() {
+        // Lock the index mapping: a 1xx must land in its own bucket, never the 5xx fallback (which
+        // would read as a phantom upstream-error spike on the provider dashboard).
+        let pm = ProviderMetrics::disconnected();
+        pm.record_response(100); // 1xx
+        pm.record_response(204); // 2xx
+        pm.record_response(301); // 3xx
+        pm.record_response(404); // 4xx
+        pm.record_response(503); // 5xx
+        for (idx, status) in [100u16, 204, 301, 404, 503].iter().enumerate() {
+            assert_eq!(
+                pm.responses[idx].get(),
+                1,
+                "status {status} landed in the wrong class bucket"
+            );
         }
     }
 }
