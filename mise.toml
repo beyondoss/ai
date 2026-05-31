@@ -1,0 +1,52 @@
+[tools]
+dprint = "latest"
+rust = { version = "1.92", components = "rustfmt,clippy", targets = "aarch64-unknown-linux-gnu,x86_64-unknown-linux-gnu" }
+yamlfmt = "latest"
+cargo-binstall = "latest"
+"cargo:cross" = "latest"
+# nats-server for the e2e harness (real JetStream KV backing slipstream).
+"ubi:nats-io/nats-server" = { version = "latest", exe = "nats-server" }
+
+[tasks."build:rs"]
+run = "cargo build"
+
+[tasks."build:rs:release"]
+run = "cargo build --release"
+
+[tasks."check:rs"]
+run = "cargo clippy --workspace --all-targets -- -D warnings"
+
+[tasks."check:fmt"]
+run = "dprint check"
+
+[tasks."format"]
+run = "dprint fmt && cargo fmt"
+
+[tasks."test:unit:rs"]
+description = "Unit tests for the pure-logic modules (key/route/peek/usage/deny/config/resolver)."
+run = "cargo test --lib"
+
+# Integration tests (gateway driven against a mock upstream + NATS) — to be added; see ARCHITECTURE.md.
+[tasks."test:integration:rs"]
+description = "End-to-end gateway tests against a mock provider + docker-compose NATS (TODO)."
+run = "cargo test --test '*'"
+
+[tasks."test:smoke"]
+description = "Live smoke tests against REAL providers. Auto-loads .env if present; set the API keys you have (ANTHROPIC_API_KEY, OPENAI_API_KEY, GROQ_API_KEY, …) there or in the environment. Each test skips if its key is unset. Bills real (tiny, max_tokens-capped) requests."
+run = """
+# Auto-load .env if it exists (export every assignment), so the keys reach the test process.
+if [ -f .env ]; then set -a; . ./.env; set +a; fi
+cargo test -p beyond-ai --test smoke -- --ignored --nocapture
+"""
+
+[tasks."bench:unit"]
+description = "divan micro-benchmarks of the IO-free hot paths (key/peek/usage/route/deny): timing + native allocation counts."
+run = "cargo bench --bench unit"
+
+[tasks."bench:e2e"]
+description = "A-1 end-to-end bench: real beyond-ai binary + nats-server + mock upstream over HTTP."
+run = "cargo bench --bench e2e"
+
+[tasks."bench"]
+description = "Run both bench harnesses (unit micro + e2e macro)."
+depends = ["bench:unit", "bench:e2e"]

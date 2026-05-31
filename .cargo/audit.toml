@@ -1,0 +1,32 @@
+# cargo-audit configuration.
+#
+# The advisories ignored below are ALL transitively pinned by dependencies we cannot bump from this
+# repo, and each has been assessed for actual exposure. They are listed individually (not blanket
+# `informational` suppression) so a NEW advisory still fails the audit. Re-evaluate when the upstream
+# pins move — chiefly when `pingora` publishes past 0.8 (it is the latest published release as of
+# this writing) and when `beyond-slipstream` relaxes its `async-nats ^0.46` requirement.
+[advisories]
+ignore = [
+  # rustls-webpki 0.102.8: reachable panic in CRL parsing; name-constraint acceptance bugs (URI /
+  # wildcard); CRL distribution-point matching. Pulled ONLY by async-nats 0.46 (pinned by
+  # beyond-slipstream `^0.46`), used for the NATS/slipstream control-channel TLS — NOT the client-
+  # or provider-facing TLS, which already resolve the patched rustls-webpki 0.103.13. Blast radius
+  # is limited to MITM of the deny-set channel, which is fail-open and carries only deny entries.
+  # Fix path: a beyond-slipstream release on async-nats >= 0.47 (uses rustls-webpki 0.103+).
+  "RUSTSEC-2026-0104",
+  "RUSTSEC-2026-0098",
+  "RUSTSEC-2026-0099",
+  "RUSTSEC-2026-0049",
+
+  # protobuf 2.28.0: DoS via uncontrolled recursion when PARSING protobuf. Pulled by prometheus
+  # 0.13 (both our direct dep — kept at 0.13 to share pingora-core's default registry — and
+  # pingora-core 0.8 itself). We never parse untrusted protobuf: metrics are exposed in the text
+  # exposition format via pingora's prometheus_http_service. Fix path: pingora past 0.8 (drops the
+  # prometheus 0.13 / protobuf 2.x chain).
+  "RUSTSEC-2024-0437",
+
+  # Unmaintained-crate warnings (no known vulnerability), all transitive via pingora 0.8:
+  "RUSTSEC-2025-0134", # rustls-pemfile (via rustls-native-certs <- pingora-rustls / async-nats)
+  "RUSTSEC-2025-0069", # daemonize (via pingora-core)
+  "RUSTSEC-2024-0388", # derivative (via a pingora dependency)
+]

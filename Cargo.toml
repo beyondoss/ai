@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = ["crates/gateway"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# slipstream is published — consume it from crates.io, aliased to `store` so the code's
+# `use store::...` is unchanged. No path deps into the `beyond` repo: this crate builds standalone.
+store = { package = "beyond-slipstream", version = "0.1.0" }
+zeroize = "1"
+
+pingora = { version = "0.8", default-features = false, features = ["rustls"] }
+pingora-core = "0.8"
+pingora-limits = "0.8"
+pingora-proxy = "0.8"
+
+arc-swap = "1"
+async-nats = "0.46"
+async-trait = "0.1"
+base64 = "0.22"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+ed25519-dalek = "2.2"
+figment = { version = "0.10", features = ["toml", "env"] }
+memchr = "2"
+prometheus = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

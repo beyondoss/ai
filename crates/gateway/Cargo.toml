@@ -1,0 +1,62 @@
+[package]
+name = "beyond-ai"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Beyond AI gateway — egress L7 proxy to LLM providers"
+
+[lib]
+name = "beyond_ai"
+path = "src/lib.rs"
+
+[[bin]]
+name = "beyond-ai"
+path = "src/main.rs"
+
+[dependencies]
+store = { workspace = true }
+
+pingora = { workspace = true }
+pingora-core = { workspace = true }
+pingora-limits = { workspace = true }
+pingora-proxy = { workspace = true }
+
+arc-swap = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true }
+ed25519-dalek = { workspace = true }
+figment = { workspace = true }
+memchr = { workspace = true }
+prometheus = { workspace = true }
+rustls = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+# e2e harness: real gateway subprocess + real nats-server + a mock HTTP upstream.
+base64 = { workspace = true }
+# Bench harnesses. Best tool per job: `divan` for the unit micro-bench (it measures allocations
+# natively via AllocProfiler, alongside timing); `criterion` for the e2e macro-bench (`async_tokio`
+# drives the round-trips, and its saved-baseline comparison tracks latency/RPS over time).
+criterion = { version = "0.5", features = ["async_tokio"] }
+divan = "0.1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+
+[[bench]]
+name = "unit"
+harness = false
+
+[[bench]]
+name = "e2e"
+harness = false
