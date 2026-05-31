@@ -80,13 +80,21 @@ pub struct AiConfig {
 
     /// Graceful-shutdown drain window (seconds): after SIGTERM, how long Pingora lets **in-flight
     /// requests finish** before tearing the runtimes down. Maps to Pingora's `grace_period_seconds`
-    /// (left unset, Pingora silently defaults to 300s — this knob makes the window explicit and
-    /// tunable without a code change). The tension: a streaming completion can run up to
-    /// `read_timeout_secs` (600s default), so any in-flight stream longer than this window is cut at
-    /// the boundary (client sees a mid-stream TCP close). Set it to cover your p99 stream, not the
-    /// max — covering the max means every deploy waits the full window. **It is also capped by the
-    /// orchestrator**: ECS SIGKILLs at `stopTimeout` (default 30s, max 120s), so a grace larger than
-    /// `stopTimeout` is wasted unless `stopTimeout` is raised to match. Default 120 = the ECS ceiling.
+    /// (left unset, Pingora silently defaults to 300s — this knob makes the window explicit).
+    ///
+    /// **Default to `read_timeout_secs` so we never truncate a response.** The gateway is a
+    /// transparent man-in-the-middle: cutting an in-flight stream on deploy corrupts a generation the
+    /// caller is paying for and can't cleanly retry (a half-delivered SSE isn't idempotent). The
+    /// longest a request can live is `read_timeout_secs`, so a drain window of at least that
+    /// guarantees every accepted request finishes — Pingora stops *accepting* new connections the
+    /// instant SIGTERM lands, so this only ever waits out the existing longest stream, not new work.
+    /// Slower rollouts are the deliberate price of not mangling responses.
+    ///
+    /// **The orchestrator must grant the same window**, or it caps us: the platform SIGKILLs at its
+    /// own stop timeout regardless of this value. Set k8s `terminationGracePeriodSeconds` (or the EC2
+    /// agent's `ECS_CONTAINER_STOP_TIMEOUT`) to match. Note **ECS Fargate caps `stopTimeout` at 120s**
+    /// — there, full coverage of a 600s stream is impossible and the longest streams will still be
+    /// cut at 120s; that's a Fargate limitation, not a reason to default to truncating.
     pub shutdown_grace_period_secs: u64,
     /// Final runtime-teardown timeout (seconds) **after** the drain window: how long Pingora waits for
     /// the tokio runtimes to exit before forcing the process down. Maps to Pingora's
@@ -134,6 +142,27 @@ pub struct AiConfig {
     /// deliberately doesn't cover, and why the real fix for egress-reputation pain is a
     /// provider-feedback circuit breaker rather than a bigger number here.
     pub byo_rate_limit_rps: u32,
+
+    /// Per-provider circuit breaker: number of upstream **failures within `circuit_breaker_window_secs`**
+    /// that trips the breaker open for that provider. A failure is a **5xx response or a connect
+    /// failure** — i.e. the *provider is broken*. A `429` is deliberately **not** a failure: it means
+    /// the provider is healthy and throttling our pool key (a velocity/spend signal the rate limiter
+    /// and the client's `Retry-After` backoff own), so tripping on it would convert a self-healing
+    /// throttle into a self-inflicted outage. While open, requests to that provider fast-fail with a
+    /// `503` (`ai_rejections_total{reason="circuit_open"}`) instead of piling up against
+    /// `read_timeout_secs` and exhausting connection/in-flight slots for *every* provider. After
+    /// `circuit_breaker_reset_secs` a probe request is allowed; success closes it, failure reopens it.
+    /// Applies to **all** traffic to the provider (managed + BYO) — a down provider is down regardless
+    /// of whose key is used. `0` disables the breaker entirely. Default is generous so normal
+    /// background 5xx noise never trips it.
+    pub circuit_breaker_threshold: u32,
+    /// Rolling window (seconds) over which `circuit_breaker_threshold` failures are counted. Failures
+    /// older than the window are forgotten — so it trips on a *burst* of failures, not on a slow trickle
+    /// spread across a healthy day.
+    pub circuit_breaker_window_secs: u64,
+    /// How long the breaker stays open before allowing a half-open probe request (seconds). Long enough
+    /// to let a provider recover, short enough that recovery is detected promptly.
+    pub circuit_breaker_reset_secs: u64,
 }
 
 impl Default for AiConfig {
@@ -155,11 +184,12 @@ impl Default for AiConfig {
             read_timeout_secs: 600,
             write_timeout_secs: 60,
             idle_timeout_secs: 90,
-            // Drain in-flight requests for up to the ECS SIGKILL ceiling (120s) on SIGTERM, then a
-            // short runtime-teardown backstop. Explicit so the window is a documented operational
-            // knob, not Pingora's silent 300s default. See the field docs for the read_timeout /
-            // orchestrator-stopTimeout tradeoffs.
-            shutdown_grace_period_secs: 120,
+            // Drain for the full request lifetime (= read_timeout_secs) so a deploy never truncates
+            // an in-flight stream — we're a transparent proxy and must not mangle a paid-for
+            // generation. Pingora stops accepting new connections at SIGTERM, so this only waits out
+            // the longest existing stream. The orchestrator's stop timeout must match (see field
+            // docs; ECS Fargate's 120s cap is a hard limit there). Then a short teardown backstop.
+            shutdown_grace_period_secs: 600,
             shutdown_runtime_timeout_secs: 10,
             upstream_tls: true,
             // Prefer H2 to providers by default (all of `KNOWN_PROVIDERS` offer it; H1 fallback is
@@ -174,6 +204,12 @@ impl Default for AiConfig {
             // throughput, low enough that a junk-auth flood can't get our egress IPs flagged by the
             // providers. Tune from the metric; set 0 to disable. (Managed traffic is exempt.)
             byo_rate_limit_rps: 1_000,
+            // Per-provider breaker: trip after 20 upstream failures (5xx/connect) within 10s, stay
+            // open 30s, then probe. Generous enough that a provider's occasional background 5xx never
+            // trips it — only a sustained brownout does. Set threshold 0 to disable.
+            circuit_breaker_threshold: 20,
+            circuit_breaker_window_secs: 10,
+            circuit_breaker_reset_secs: 30,
         }
     }
 }
@@ -221,6 +257,25 @@ impl AiConfig {
             ));
         }
         Ok(())
+    }
+
+    /// The per-provider circuit-breaker config, or `None` when disabled (`circuit_breaker_threshold
+    /// == 0`). Windowed policy: a degrading backend trips on a *burst* of failures, not a slow
+    /// trickle (see `circuit_breaker` crate docs). Each provider gets its own breaker built from this
+    /// (see `state::build_providers`).
+    pub fn circuit_breaker_config(&self) -> Option<crate::circuit_breaker::CircuitBreakerConfig> {
+        if self.circuit_breaker_threshold == 0 {
+            return None;
+        }
+        Some(
+            crate::circuit_breaker::CircuitBreakerConfig::windowed(
+                self.circuit_breaker_threshold,
+                std::time::Duration::from_secs(self.circuit_breaker_window_secs),
+            )
+            .reset_timeout(std::time::Duration::from_secs(
+                self.circuit_breaker_reset_secs,
+            )),
+        )
     }
 
     /// Fold `AI_POOL_KEY_<NAME>` environment variables into `pool_keys` (provider name lowercased).

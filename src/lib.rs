@@ -15,6 +15,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod admin;
+pub mod circuit_breaker;
 pub mod config;
 pub mod deny;
 pub mod doctor;

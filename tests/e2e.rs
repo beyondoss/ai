@@ -846,3 +846,84 @@ async fn health_endpoints_report_ready_on_the_metrics_listener() {
     let (nf_status, _) = gw.admin_get("/nope").await;
     assert_eq!(nf_status, 404);
 }
+
+#[tokio::test]
+async fn circuit_breaker_opens_on_5xx_and_sheds() {
+    // A provider returning 5xx is *broken*: after `threshold` failures the per-provider breaker
+    // opens and the gateway fast-fails with 503 — without connecting upstream — instead of piling
+    // requests against `read_timeout_secs`. BYO traffic (no minting needed); the breaker gates all
+    // traffic to the provider.
+    let nats = Nats::start().await;
+    let (pubkey, _sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Status(500)).await;
+    let gw = Gateway::builder(nats.port, &mock.authority(), &b64(&pubkey))
+        .circuit_breaker_threshold(3)
+        .start()
+        .await;
+    let client = reqwest::Client::new();
+
+    // While closed the gateway relays the mock's 500; once the breaker trips it returns its own 503.
+    // Poll until we observe the trip (each failure is recorded in `logging`, which lags the response
+    // slightly — polling absorbs that).
+    {
+        let (c, u) = (client.clone(), gw.url());
+        wait_for_status(503, move || {
+            let (c, u) = (c.clone(), u.clone());
+            async move { post_status(&c, &u, "sk-byo-test", body_for("gpt-4o")).await }
+        })
+        .await;
+    }
+
+    // The trip is visible as circuit_open rejections — the breaker shed requests before the upstream.
+    assert!(
+        parse_metric(&gw.metrics().await, "ai_rejections_total", "circuit_open") >= 1.0,
+        "expected ai_rejections_total{{reason=\"circuit_open\"}} >= 1 after the breaker tripped"
+    );
+}
+
+#[tokio::test]
+async fn circuit_breaker_does_not_trip_on_429() {
+    // A 429 is a *healthy* provider throttling our pool key — the rate limiter and the client's
+    // Retry-After own that, NOT the breaker. So a 429 storm must never open the circuit: every
+    // request is relayed (429) and reaches the upstream; none is shed (503).
+    let nats = Nats::start().await;
+    let (pubkey, _sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Status(429)).await;
+    let gw = Gateway::builder(nats.port, &mock.authority(), &b64(&pubkey))
+        .circuit_breaker_threshold(3)
+        // Don't let the BYO rate limiter shed these — we want every request to reach the upstream.
+        .byo_rate_limit_rps(0)
+        .start()
+        .await;
+    let client = reqwest::Client::new();
+
+    // Warm up until the gateway is serving and relaying the mock's 429 (the readiness pattern the
+    // other e2e tests use — avoids racing the first request against gateway startup under load).
+    {
+        let (c, u) = (client.clone(), gw.url());
+        wait_for_status(429, move || {
+            let (c, u) = (c.clone(), u.clone());
+            async move { post_status(&c, &u, "sk-byo-test", body_for("gpt-4o")).await }
+        })
+        .await;
+    }
+
+    // Well past the failure threshold (3): all relayed as 429, never the breaker's 503.
+    for _ in 0..10 {
+        assert_eq!(
+            post_status(&client, &gw.url(), "sk-byo-test", body_for("gpt-4o")).await,
+            429
+        );
+    }
+
+    assert_eq!(
+        parse_metric(&gw.metrics().await, "ai_rejections_total", "circuit_open"),
+        0.0,
+        "a 429 storm must not open the circuit breaker"
+    );
+    assert!(
+        mock.hits() >= 10,
+        "every request should have reached the upstream (got {} hits)",
+        mock.hits()
+    );
+}

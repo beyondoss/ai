@@ -11,6 +11,7 @@
 //! paths. Operators can also add/override providers from config (see `state`/`config`). We do not
 //! translate between dialects — that's deliberately out of scope.
 
+use crate::circuit_breaker::CircuitBreaker;
 use crate::metrics::ProviderMetrics;
 use crate::secret::Secret;
 
@@ -191,6 +192,10 @@ pub struct Provider {
     /// Per-provider metric handles, resolved once here so the response path bumps a direct
     /// counter/histogram instead of a string-keyed label lookup per response.
     pub metrics: ProviderMetrics,
+    /// Per-provider circuit breaker, shared across all callers to this provider. `None` when the
+    /// breaker is disabled (`circuit_breaker_threshold == 0`). Checked before connect and fed the
+    /// 5xx/connect outcome — see `proxy`. Lock-free, so the hot path reads it without contention.
+    pub breaker: Option<CircuitBreaker>,
 }
 
 impl Provider {
@@ -204,6 +209,7 @@ impl Provider {
         auth: AuthScheme,
         pool_key: Option<&str>,
         metrics: ProviderMetrics,
+        breaker: Option<CircuitBreaker>,
     ) -> Self {
         let host = authority
             .split(':')
@@ -219,6 +225,7 @@ impl Provider {
             auth,
             pool_auth_value,
             metrics,
+            breaker,
         }
     }
 }
@@ -277,6 +284,7 @@ mod tests {
             AuthScheme::Bearer,
             Some("sk-x"),
             ProviderMetrics::disconnected(),
+            None,
         );
         assert_eq!(p.host, "api.openai.com");
         assert_eq!(p.dialect, Dialect::OpenAI);
@@ -290,6 +298,7 @@ mod tests {
             AuthScheme::XApiKey,
             None,
             ProviderMetrics::disconnected(),
+            None,
         );
         assert!(a.pool_auth_value.is_none());
     }

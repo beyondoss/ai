@@ -48,6 +48,8 @@ Client (stock OpenAI/Anthropic SDK)
   │       │                                    │
   │       │           pool key required ───────────────────────── 503
   │       └─ BYO: pass through (no verify, no deny-set, no billing)
+  │  └─ Circuit breaker (per provider, all traffic): if OPEN ─────► 503
+  │       (claims a half-open probe permit only on an actual attempt)
   │
   ▼  upstream_peer (proxy.rs)
   │  TTL-cached DNS resolve (60s) → HttpPeer (TLS, H2 pref, timeouts)
@@ -79,6 +81,7 @@ Client (stock OpenAI/Anthropic SDK)
   ▼  logging (proxy.rs)
      Parse usage from tail (by dialect + streaming flag)
      Emit ai.usage fact: tenant, vpc, model, requested_model, token counts (managed only)
+     Record circuit-breaker outcome (once): 5xx / connect-fail → failure; else → success (429 incl.)
      Decrement requests_in_flight gauge
 ```
 
@@ -193,6 +196,30 @@ before any upstream connection and cannot be forged.
 Both tiers are generous circuit breakers, not quotas. `rate_limit_rps = 0` / `byo_rate_limit_rps =
 0` disable them independently.
 
+### Circuit Breaker (`circuit_breaker.rs`)
+
+A per-provider, lock-free circuit breaker (single packed `AtomicU64`; windowed failure policy) sits
+on the upstream path. It protects against a **broken provider**, which is a different failure than
+the rate guardrails (which protect against abusive _inbound_ load):
+
+- **Failure = the provider is broken** — a `5xx` response or a connect failure. After
+  `circuit_breaker_threshold` failures within `circuit_breaker_window_secs`, the breaker **opens**:
+  requests to that provider fast-fail with `503` (`ai_rejections_total{reason="circuit_open"}`)
+  instead of piling up against `read_timeout_secs` and exhausting connection / in-flight slots for
+  _every_ provider (head-of-line blocking by one sick dependency). After `circuit_breaker_reset_secs`
+  it half-opens and admits a probe; success closes it, failure reopens it.
+- **A `429` is NOT a failure.** It means the provider is healthy and throttling our pool key — a
+  velocity/spend signal the rate limiter and the client's `Retry-After` backoff own. Tripping on it
+  would convert a self-healing throttle into a self-inflicted outage. The breaker records any response
+  that _arrived_ (2xx/3xx/4xx incl. 429) as a **success**; only 5xx and transport failures count
+  against it.
+- **Applies to all traffic** (managed + BYO) — a down provider is down regardless of whose key is
+  used. One breaker per provider, built at boot, shared lock-free across callers.
+- The `allow()` check is the **last** thing in `request_filter` (after every other rejection), so a
+  scarce half-open probe permit is only claimed for a request that will actually attempt the upstream;
+  the outcome is recorded exactly once in `logging`, so a permit can never leak.
+- `circuit_breaker_threshold = 0` disables it.
+
 ---
 
 ## Why It Behaves This Way
@@ -282,40 +309,47 @@ All fields configurable via `config.example.toml` and environment (`AI_` prefix,
 Secret-bearing fields (`pool_keys`, `nats_creds`) are held as `Secret<T>` — stray `Debug` or
 `Serialize` output redacts to `"***"` and the value is zeroized on drop (`secret.rs`).
 
-| Field                         | Default                           | Runtime Effect                                                                                                                                                                                         |
-| ----------------------------- | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `signing_keys`                | _(required)_                      | Map of kid → base64 Ed25519 public key. Multiple kids enable rotation. Missing → all traffic falls through to BYO treatment.                                                                           |
-| `require_signing_keys`        | `false`                           | When `true`, an empty `signing_keys` is a hard boot failure instead of silent BYO-only mode. Set on managed deployments so a typo'd/absent SSM param fails fast rather than silently serving for free. |
-| `pool_keys.<name>`            | _(from `AI_POOL_KEY_<NAME>` env)_ | Real provider API key. Missing for a provider → managed requests to that provider return 503 before any upstream connection.                                                                           |
-| `provider_authorities.<name>` | _(none)_                          | Override or add a provider's `authority` (host:port). Enables config-added providers beyond `KNOWN_PROVIDERS` with zero code change.                                                                   |
-| `snapshot_path`               | _(unset)_                         | Path for the on-disk deny-set cache. Unset → re-scan NATS on every cold boot. Set → load from disk and enforce before NATS reconnects (edge/tunnel deployments).                                       |
-| `rate_limit_rps`              | `100`                             | Per-credential request ceiling (count-min, keyed on raw key hash). `0` disables. Exceeded → 429. Checked before Ed25519 verify.                                                                        |
-| `byo_rate_limit_rps`          | `1000`                            | Aggregate ceiling for all BYO traffic (single shared bucket). `0` disables. Managed traffic exempt. Exceeded → 429.                                                                                    |
-| `connect_timeout_secs`        | `10`                              | TCP connect timeout to the upstream provider. Exceeded → retry up to 2×, then 502.                                                                                                                     |
-| `read_timeout_secs`           | `600`                             | Response read timeout (10 min accommodates long-running LLM streams).                                                                                                                                  |
-| `write_timeout_secs`          | `60`                              | Upstream request-write timeout (sending the request to the provider).                                                                                                                                  |
-| `idle_timeout_secs`           | `90`                              | Idle timeout on a pooled upstream connection before it's closed.                                                                                                                                       |
-| `nats_url`                    | `nats://localhost:4222`           | NATS server for the deny-set watcher. Unreachable → fail-open (deny-set stays empty or stale).                                                                                                         |
-| `nats_creds`                  | _(unset)_                         | NATS credentials file path. Required for authenticated clusters.                                                                                                                                       |
-| `listen_addr`                 | `0.0.0.0:8080`                    | Proxy listener address (client traffic).                                                                                                                                                               |
-| `metrics_listen`              | `0.0.0.0:9090`                    | Internal admin/observability listener: `/metrics` (Prometheus scrape), `/livez`, `/readyz`. Separate from the client listener — not externally reachable.                                              |
+| Field                           | Default                           | Runtime Effect                                                                                                                                                                                         |
+| ------------------------------- | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `signing_keys`                  | _(required)_                      | Map of kid → base64 Ed25519 public key. Multiple kids enable rotation. Missing → all traffic falls through to BYO treatment.                                                                           |
+| `require_signing_keys`          | `false`                           | When `true`, an empty `signing_keys` is a hard boot failure instead of silent BYO-only mode. Set on managed deployments so a typo'd/absent SSM param fails fast rather than silently serving for free. |
+| `pool_keys.<name>`              | _(from `AI_POOL_KEY_<NAME>` env)_ | Real provider API key. Missing for a provider → managed requests to that provider return 503 before any upstream connection.                                                                           |
+| `provider_authorities.<name>`   | _(none)_                          | Override or add a provider's `authority` (host:port). Enables config-added providers beyond `KNOWN_PROVIDERS` with zero code change.                                                                   |
+| `snapshot_path`                 | _(unset)_                         | Path for the on-disk deny-set cache. Unset → re-scan NATS on every cold boot. Set → load from disk and enforce before NATS reconnects (edge/tunnel deployments).                                       |
+| `rate_limit_rps`                | `100`                             | Per-credential request ceiling (count-min, keyed on raw key hash). `0` disables. Exceeded → 429. Checked before Ed25519 verify.                                                                        |
+| `byo_rate_limit_rps`            | `1000`                            | Aggregate ceiling for all BYO traffic (single shared bucket). `0` disables. Managed traffic exempt. Exceeded → 429.                                                                                    |
+| `circuit_breaker_threshold`     | `20`                              | Per-provider upstream failures (5xx / connect; **not** 429) within the window before the breaker opens. While open, requests to that provider fast-fail with 503. `0` disables.                        |
+| `circuit_breaker_window_secs`   | `10`                              | Rolling window over which failures are counted (trips on a burst, not a slow trickle).                                                                                                                 |
+| `circuit_breaker_reset_secs`    | `30`                              | How long the breaker stays open before admitting a half-open probe. Probe success closes it; failure reopens it.                                                                                       |
+| `connect_timeout_secs`          | `10`                              | TCP connect timeout to the upstream provider. Exceeded → retry up to 2×, then 502.                                                                                                                     |
+| `read_timeout_secs`             | `600`                             | Response read timeout (10 min accommodates long-running LLM streams).                                                                                                                                  |
+| `write_timeout_secs`            | `60`                              | Upstream request-write timeout (sending the request to the provider).                                                                                                                                  |
+| `idle_timeout_secs`             | `90`                              | Idle timeout on a pooled upstream connection before it's closed.                                                                                                                                       |
+| `shutdown_grace_period_secs`    | `600`                             | SIGTERM drain window for in-flight requests (= `read_timeout_secs` so a deploy never truncates a stream). Capped by the orchestrator's stop timeout (ECS Fargate: 120s).                               |
+| `shutdown_runtime_timeout_secs` | `10`                              | Final runtime-teardown backstop after the drain window.                                                                                                                                                |
+| `nats_url`                      | `nats://localhost:4222`           | NATS server for the deny-set watcher. Unreachable → fail-open (deny-set stays empty or stale).                                                                                                         |
+| `nats_creds`                    | _(unset)_                         | NATS credentials file path. Required for authenticated clusters.                                                                                                                                       |
+| `listen_addr`                   | `0.0.0.0:8080`                    | Proxy listener address (client traffic).                                                                                                                                                               |
+| `metrics_listen`                | `0.0.0.0:9090`                    | Internal admin/observability listener: `/metrics` (Prometheus scrape), `/livez`, `/readyz`. Separate from the client listener — not externally reachable.                                              |
 
 ---
 
 ## Failure Modes
 
-| Failure                                     | What Actually Happens                                                                                                          | Recovery                                                                                                        |
-| ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------- |
-| NATS unreachable at boot                    | Deny-set starts empty (fail-open). Auth still works — keys from config.                                                        | Watcher reconnects; seeds from NATS or disk snapshot on connect.                                                |
-| NATS disconnects mid-run                    | Last-known deny-set stays active. New deny entries not applied until reconnect.                                                | Watcher reconnects (1s→30s exponential backoff, reset on success) and resumes from saved revision — no re-scan. |
-| NATS history compacted past snapshot cursor | `CursorExpired` → full re-scan from current NATS state.                                                                        | After re-scan, new cursor set; delta watch resumes normally.                                                    |
-| Virtual key tampered or forged              | Ed25519 verify fails → falls through to BYO treatment. No billing event. No error reveals which part failed.                   | Billing miss detectable downstream; no security boundary breach.                                                |
-| `signing_keys` absent (typo'd/missing SSM)  | Default: warn + BYO-only (silently drops all managed billing + deny-set). With `require_signing_keys=true`: hard boot failure. | Set `require_signing_keys=true` on managed deployments so the mis-deploy fails fast and visibly at boot.        |
-| Pool key missing for provider               | Managed request returns 503 before any upstream connection.                                                                    | Add `AI_POOL_KEY_<NAME>` env and redeploy.                                                                      |
-| Provider DNS fails                          | `upstream_peer` returns error → 502 to client.                                                                                 | TTL-cached DNS (60s) serves stale; poisoned-lock guard re-resolves on next request.                             |
-| Provider TCP connect fails                  | `fail_to_connect` retries up to 2×, then returns 502.                                                                          | Client SDK retries with backoff. No HTTP-status retries (Pingora-idiomatic).                                    |
-| Response body > 128KB before usage chunk    | Tail compaction fires: `drain(..half)` discards first half, keeps tail. Usage extracted from retained tail.                    | No action — SSE usage is always in the final `data:` line, which always lands in the tail.                      |
-| Gateway crash mid-request                   | In-flight request drops; client receives TCP close. No partial state written.                                                  | Client SDK retries. No DB writes in the request path — no cleanup needed.                                       |
+| Failure                                     | What Actually Happens                                                                                                                                                          | Recovery                                                                                                                                                                  |
+| ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| NATS unreachable at boot                    | Deny-set starts empty (fail-open). Auth still works — keys from config.                                                                                                        | Watcher reconnects; seeds from NATS or disk snapshot on connect.                                                                                                          |
+| NATS disconnects mid-run                    | Last-known deny-set stays active. New deny entries not applied until reconnect.                                                                                                | Watcher reconnects (1s→30s exponential backoff, reset on success) and resumes from saved revision — no re-scan.                                                           |
+| NATS history compacted past snapshot cursor | `CursorExpired` → full re-scan from current NATS state.                                                                                                                        | After re-scan, new cursor set; delta watch resumes normally.                                                                                                              |
+| Virtual key tampered or forged              | Ed25519 verify fails → falls through to BYO treatment. No billing event. No error reveals which part failed.                                                                   | Billing miss detectable downstream; no security boundary breach.                                                                                                          |
+| `signing_keys` absent (typo'd/missing SSM)  | Default: warn + BYO-only (silently drops all managed billing + deny-set). With `require_signing_keys=true`: hard boot failure.                                                 | Set `require_signing_keys=true` on managed deployments so the mis-deploy fails fast and visibly at boot.                                                                  |
+| Pool key missing for provider               | Managed request returns 503 before any upstream connection.                                                                                                                    | Add `AI_POOL_KEY_<NAME>` env and redeploy.                                                                                                                                |
+| Provider DNS fails                          | `upstream_peer` returns error → 502 to client.                                                                                                                                 | TTL-cached DNS (60s) serves stale; poisoned-lock guard re-resolves on next request.                                                                                       |
+| Provider TCP connect fails                  | `fail_to_connect` retries up to 2×, then returns 502. Counts as a circuit-breaker failure.                                                                                     | Client SDK retries with backoff. No HTTP-status retries (Pingora-idiomatic).                                                                                              |
+| Provider brownout (sustained 5xx)           | After `circuit_breaker_threshold` 5xx/connect failures in the window, the breaker opens; requests fast-fail 503 (`circuit_open`) instead of stalling against the read timeout. | Auto: after `circuit_breaker_reset_secs` a half-open probe is admitted — success closes the breaker, failure reopens it. Per-provider, so other providers are unaffected. |
+| Provider throttles (429 storm)              | Relayed to the client as 429; the client's `Retry-After` backoff applies. Does **not** trip the breaker (provider is healthy).                                                 | Backpressure via client + the rate guardrails; no gateway-side circuit action.                                                                                            |
+| Response body > 128KB before usage chunk    | Tail compaction fires: `drain(..half)` discards first half, keeps tail. Usage extracted from retained tail.                                                                    | No action — SSE usage is always in the final `data:` line, which always lands in the tail.                                                                                |
+| Gateway crash mid-request                   | In-flight request drops; client receives TCP close. No partial state written.                                                                                                  | Client SDK retries. No DB writes in the request path — no cleanup needed.                                                                                                 |
 
 ---
 
@@ -323,40 +357,41 @@ Secret-bearing fields (`pool_keys`, `nats_creds`) are held as `Secret<T>` — st
 
 Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 
-| Metric                        | Type      | Labels               | What It Measures                                                         |
-| ----------------------------- | --------- | -------------------- | ------------------------------------------------------------------------ |
-| `ai_requests_total`           | Counter   | —                    | Total admitted requests                                                  |
-| `ai_rejections_total`         | Counter   | `reason`             | Rejected requests by cause (auth, deny_spend, deny_fraud, rate_limit, …) |
-| `ai_upstream_responses_total` | Counter   | `provider`, `status` | Upstream responses by provider and status class                          |
-| `ai_tokens_total`             | Counter   | `kind`               | input / output / cache_read / cache_write token counts                   |
-| `ai_ttft_seconds`             | Histogram | `provider`           | Time to first token (50ms–30s buckets)                                   |
-| `ai_upstream_latency_seconds` | Histogram | `provider`           | Full request latency (100ms–600s buckets)                                |
-| `ai_active_streams`           | Gauge     | —                    | Open SSE streams                                                         |
-| `ai_requests_in_flight`       | Gauge     | —                    | All in-flight requests (streaming + non-streaming)                       |
-| `ai_deny_set_size`            | Gauge     | —                    | Current number of denied tenants                                         |
-| `ai_nats_connected`           | Gauge     | —                    | 1 if NATS watcher is connected, 0 otherwise                              |
+| Metric                        | Type      | Labels               | What It Measures                                                                       |
+| ----------------------------- | --------- | -------------------- | -------------------------------------------------------------------------------------- |
+| `ai_requests_total`           | Counter   | —                    | Total admitted requests                                                                |
+| `ai_rejections_total`         | Counter   | `reason`             | Rejected requests by cause (auth, deny_spend, deny_fraud, rate_limit, circuit_open, …) |
+| `ai_upstream_responses_total` | Counter   | `provider`, `status` | Upstream responses by provider and status class                                        |
+| `ai_tokens_total`             | Counter   | `kind`               | input / output / cache_read / cache_write token counts                                 |
+| `ai_ttft_seconds`             | Histogram | `provider`           | Time to first token (50ms–30s buckets)                                                 |
+| `ai_upstream_latency_seconds` | Histogram | `provider`           | Full request latency (100ms–600s buckets)                                              |
+| `ai_active_streams`           | Gauge     | —                    | Open SSE streams                                                                       |
+| `ai_requests_in_flight`       | Gauge     | —                    | All in-flight requests (streaming + non-streaming)                                     |
+| `ai_deny_set_size`            | Gauge     | —                    | Current number of denied tenants                                                       |
+| `ai_nats_connected`           | Gauge     | —                    | 1 if NATS watcher is connected, 0 otherwise                                            |
 
 ---
 
 ## Modules
 
-| Module        | Role                                                                                        | Tested    |
-| ------------- | ------------------------------------------------------------------------------------------- | --------- |
-| `proxy`       | `ProxyHttp` impl — request/response pipeline (request_filter through logging)               | e2e ✓     |
-| `key`         | `bai_v1` parse + Ed25519 verify + mint; keyring with multi-kid rotation support             | unit ✓    |
-| `route`       | Data-driven provider table (name / authority / auth) + dialect default routing              | unit ✓    |
-| `peek`        | `ModelScanner` — streaming structural scan for the root-level `model`; O(1) memory          | unit ✓    |
-| `usage`       | Token extraction (OpenAI / Anthropic, body + SSE)                                           | unit ✓    |
-| `deny`        | Sparse deny-set, default-allow, reason → HTTP status                                        | unit ✓    |
-| `ratelimit`   | Two-tier guardrail: per-credential + global BYO (count-min sketches, fixed memory, no GC)   | unit ✓    |
-| `state`       | Keyring + resolved provider registry + watched deny-set (ArcSwap) + TTL DNS cache           | unit ✓    |
-| `store_watch` | NATS watcher — gap-free deny-set seeding + delta watch as Pingora `BackgroundService`       | e2e ✓     |
-| `config`      | Figment config; build keyring; pool keys / authorities by provider name                     | unit ✓    |
-| `secret`      | Redacting, zeroize-on-drop `Secret<T>` newtype for pool keys and NATS creds                 | unit ✓    |
-| `admin`       | `ServeHttp` on the metrics listener: `/livez`, `/readyz`, `/metrics`                        | e2e ✓     |
-| `metrics`     | Prometheus counter/histogram/gauge registration and update helpers                          | compile ✓ |
-| `doctor`      | Boot-time diagnostics (`beyond-ai doctor`)                                                  | compile ✓ |
-| `main`        | CLI (`run` / `doctor`), rustls init, config load, Pingora server + three services bootstrap | compile ✓ |
+| Module            | Role                                                                                                 | Tested         |
+| ----------------- | ---------------------------------------------------------------------------------------------------- | -------------- |
+| `proxy`           | `ProxyHttp` impl — request/response pipeline (request_filter through logging)                        | e2e ✓          |
+| `key`             | `bai_v1` parse + Ed25519 verify + mint; keyring with multi-kid rotation support                      | unit ✓         |
+| `route`           | Data-driven provider table (name / authority / auth) + dialect default routing                       | unit ✓         |
+| `peek`            | `ModelScanner` — streaming structural scan for the root-level `model`; O(1) memory                   | unit ✓         |
+| `usage`           | Token extraction (OpenAI / Anthropic, body + SSE)                                                    | unit ✓         |
+| `deny`            | Sparse deny-set, default-allow, reason → HTTP status                                                 | unit ✓         |
+| `ratelimit`       | Two-tier guardrail: per-credential + global BYO (count-min sketches, fixed memory, no GC)            | unit ✓         |
+| `circuit_breaker` | Per-provider lock-free breaker (packed `AtomicU64`, windowed policy) — trips on 5xx/connect, not 429 | unit ✓ + e2e ✓ |
+| `state`           | Keyring + resolved provider registry + watched deny-set (ArcSwap) + TTL DNS cache                    | unit ✓         |
+| `store_watch`     | NATS watcher — gap-free deny-set seeding + delta watch as Pingora `BackgroundService`                | e2e ✓          |
+| `config`          | Figment config; build keyring; pool keys / authorities by provider name                              | unit ✓         |
+| `secret`          | Redacting, zeroize-on-drop `Secret<T>` newtype for pool keys and NATS creds                          | unit ✓         |
+| `admin`           | `ServeHttp` on the metrics listener: `/livez`, `/readyz`, `/metrics`                                 | e2e ✓          |
+| `metrics`         | Prometheus counter/histogram/gauge registration and update helpers                                   | compile ✓      |
+| `doctor`          | Boot-time diagnostics (`beyond-ai doctor`)                                                           | compile ✓      |
+| `main`            | CLI (`run` / `doctor`), rustls init, config load, Pingora server + three services bootstrap          | compile ✓      |
 
 ---
 

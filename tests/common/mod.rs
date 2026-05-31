@@ -176,6 +176,9 @@ pub enum Mode {
     /// OpenAI-shaped SSE stream with >128 KiB of content *before* the usage chunk — forces the
     /// proxy's response-tail compaction path.
     SseLarge,
+    /// Always reply with this HTTP status and a small JSON error body — for circuit-breaker tests
+    /// (5xx trips the breaker; 4xx/429 do not).
+    Status(u16),
 }
 
 #[derive(Default, Clone)]
@@ -190,6 +193,7 @@ pub struct Captured {
 pub struct MockUpstream {
     pub port: u16,
     captured: Arc<Mutex<Option<Captured>>>,
+    hits: Arc<std::sync::atomic::AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -227,6 +231,11 @@ fn canned_body(mode: Mode) -> (&'static str, Bytes) {
             Bytes::from_static(CANNED_ANTHROPIC_JSON.as_bytes()),
         ),
         Mode::SseLarge => ("text/event-stream", Bytes::from(large_sse())),
+        // The status is applied by `mock_handle`; the body is a stock error shape.
+        Mode::Status(_) => (
+            "application/json",
+            Bytes::from_static(br#"{"error":{"message":"mock"}}"#),
+        ),
     }
 }
 
@@ -245,8 +254,10 @@ fn proto_label(version: hyper::Version) -> &'static str {
 async fn mock_handle(
     req: Request<hyper::body::Incoming>,
     cap: Arc<Mutex<Option<Captured>>>,
+    hits: Arc<std::sync::atomic::AtomicUsize>,
     mode: Mode,
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
+    hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let version = req.version();
     let path = req.uri().path().to_string();
     // Pull the headers we record before consuming the body (which moves `req`).
@@ -269,8 +280,12 @@ async fn mock_handle(
         body,
     });
     let (ct, payload) = canned_body(mode);
+    let status = match mode {
+        Mode::Status(s) => s,
+        _ => 200,
+    };
     Ok(Response::builder()
-        .status(200)
+        .status(status)
         .header("content-type", ct)
         .header("x-mock-proto", proto_label(version))
         .body(Full::new(payload))
@@ -284,7 +299,9 @@ impl MockUpstream {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let captured: Arc<Mutex<Option<Captured>>> = Arc::new(Mutex::new(None));
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let cap = captured.clone();
+        let hit_counter = hits.clone();
         let task = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -292,8 +309,11 @@ impl MockUpstream {
                 };
                 let io = TokioIo::new(stream);
                 let cap = cap.clone();
+                let hit_counter = hit_counter.clone();
                 tokio::spawn(async move {
-                    let svc = service_fn(move |req| mock_handle(req, cap.clone(), mode));
+                    let svc = service_fn(move |req| {
+                        mock_handle(req, cap.clone(), hit_counter.clone(), mode)
+                    });
                     let _ = hyper::server::conn::http1::Builder::new()
                         .serve_connection(io, svc)
                         .await;
@@ -303,6 +323,7 @@ impl MockUpstream {
         MockUpstream {
             port,
             captured,
+            hits,
             task,
         }
     }
@@ -336,7 +357,9 @@ impl MockUpstream {
         let acceptor = TlsAcceptor::from(Arc::new(tls));
 
         let captured: Arc<Mutex<Option<Captured>>> = Arc::new(Mutex::new(None));
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let cap = captured.clone();
+        let hit_counter = hits.clone();
         let task = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -344,12 +367,15 @@ impl MockUpstream {
                 };
                 let acceptor = acceptor.clone();
                 let cap = cap.clone();
+                let hit_counter = hit_counter.clone();
                 tokio::spawn(async move {
                     let Ok(tls_stream) = acceptor.accept(stream).await else {
                         return;
                     };
                     let io = TokioIo::new(tls_stream);
-                    let svc = service_fn(move |req| mock_handle(req, cap.clone(), mode));
+                    let svc = service_fn(move |req| {
+                        mock_handle(req, cap.clone(), hit_counter.clone(), mode)
+                    });
                     // Auto builder: serves H2 or H1 per the negotiated ALPN.
                     let _ = auto::Builder::new(TokioExecutor::new())
                         .serve_connection(io, svc)
@@ -360,6 +386,7 @@ impl MockUpstream {
         MockUpstream {
             port,
             captured,
+            hits,
             task,
         }
     }
@@ -370,6 +397,12 @@ impl MockUpstream {
 
     pub fn captured(&self) -> Option<Captured> {
         self.captured.lock().unwrap().clone()
+    }
+
+    /// Total requests the mock has received — used to prove an open circuit breaker stops requests
+    /// from reaching the upstream at all.
+    pub fn hits(&self) -> usize {
+        self.hits.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -417,6 +450,9 @@ pub struct GatewayBuilder {
     tls_upstream: bool,
     /// Override the gateway's `upstream_http2` (H2H1 vs H1 ALPN). `None` ⇒ leave the gateway default.
     upstream_http2: Option<bool>,
+    /// Override the per-provider circuit-breaker threshold (failures in the window before opening).
+    /// `None` ⇒ leave the gateway default; `Some(0)` disables the breaker.
+    circuit_breaker_threshold: Option<u32>,
 }
 
 impl GatewayBuilder {
@@ -481,6 +517,13 @@ impl GatewayBuilder {
         self
     }
 
+    /// Set the per-provider circuit-breaker failure threshold (a tight window/reset are written too,
+    /// so the breaker trips fast in-test). `0` disables it.
+    pub fn circuit_breaker_threshold(mut self, threshold: u32) -> Self {
+        self.circuit_breaker_threshold = Some(threshold);
+        self
+    }
+
     pub async fn start(self) -> Gateway {
         let port = free_port();
         let metrics_port = free_port();
@@ -510,6 +553,14 @@ impl GatewayBuilder {
         }
         if let Some(rps) = self.byo_rate_limit_rps {
             cfg.push_str(&format!("byo_rate_limit_rps = {rps}\n"));
+        }
+        if let Some(threshold) = self.circuit_breaker_threshold {
+            // Tight window + reset so the test trips and recovers quickly.
+            cfg.push_str(&format!(
+                "circuit_breaker_threshold = {threshold}\n\
+                 circuit_breaker_window_secs = 60\n\
+                 circuit_breaker_reset_secs = 1\n"
+            ));
         }
         if self.real_upstreams {
             // Real-host smoke mode: built-in provider defaults (no authority overrides). For a
@@ -588,6 +639,7 @@ impl Gateway {
             byo_rate_limit_rps: None,
             tls_upstream: false,
             upstream_http2: None,
+            circuit_breaker_threshold: None,
         }
     }
 

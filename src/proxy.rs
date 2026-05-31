@@ -111,6 +111,11 @@ pub struct RequestCtx {
     /// Running total of request-body bytes seen, to enforce `MAX_REQUEST_BODY` even when the client
     /// uses chunked transfer encoding (no `Content-Length` to check up front).
     body_bytes_fed: usize,
+    /// Upstream HTTP status, set in `response_filter` once the response head arrives. Drives the
+    /// circuit-breaker outcome recorded once in `logging`: `5xx` → failure, any other response →
+    /// success (the provider answered — a `429` is a healthy throttle, not a breaker trip), and a
+    /// `None` here with an upstream error → failure (connect/read failed before any response).
+    upstream_status: Option<u16>,
     /// Managed OpenAI chat/responses request: buffer the body and inject
     /// `stream_options.include_usage` if it streams without it, so the usage chunk (hence the
     /// billable token count) is guaranteed. The single, deliberate exception to "never buffer the
@@ -415,6 +420,31 @@ impl ProxyHttp for AiProxy {
         let inject_eligible =
             managed && dialect == Dialect::OpenAI && is_streamable_path(&forward_path);
 
+        // Circuit breaker (per provider, all traffic — a down provider is down regardless of whose
+        // key is used). Checked here, after every other rejection, so claiming a half-open probe
+        // permit corresponds to an *actual* upstream attempt — and balanced by exactly one
+        // `record_*` in `logging` (which runs once per admitted request), so a permit can't leak.
+        // When open, fast-fail 503 instead of piling the request against `read_timeout_secs` and
+        // exhausting connection/in-flight slots for every provider. 5xx/connect failures trip it;
+        // 429 never does (that's a healthy provider throttling — see `logging`).
+        if let Some(breaker) = &provider.breaker {
+            if breaker.allow().is_err() {
+                self.state
+                    .metrics
+                    .rejections_total
+                    .with_label_values(&["circuit_open"])
+                    .inc();
+                return Self::reject(
+                    session,
+                    &request_id,
+                    503,
+                    "api_error",
+                    "provider temporarily unavailable",
+                )
+                .await;
+            }
+        }
+
         *ctx = Some(RequestCtx {
             tenant_id,
             vpc_id,
@@ -445,6 +475,7 @@ impl ProxyHttp for AiProxy {
             // reallocs is lost in the network noise of a stream we're already relaying chunk by chunk.
             resp_tail: Vec::new(),
             body_bytes_fed: 0,
+            upstream_status: None,
             start,
             attempt: 0,
             request_id,
@@ -663,9 +694,12 @@ impl ProxyHttp for AiProxy {
 
             // Per-provider response counter, bucketed by status class — the signal that a provider
             // is degrading (429/5xx) before it shows up only as latency or a missing usage event.
-            rc.provider
-                .metrics
-                .record_response(upstream_response.status.as_u16());
+            let status = upstream_response.status.as_u16();
+            rc.provider.metrics.record_response(status);
+            // Remember the status for the circuit-breaker outcome resolved in `logging` (a response
+            // arrived, so the provider is reachable — even a 429/5xx is a real answer, not a connect
+            // failure). `logging` decides failure-vs-success from this.
+            rc.upstream_status = Some(status);
 
             // Derive streaming from the response, not the request: SSE ⇒ use the streaming usage
             // parser; otherwise the body is a single JSON object.
@@ -778,6 +812,23 @@ impl ProxyHttp for AiProxy {
                 error = %e,
                 "upstream request errored",
             );
+        }
+
+        // Resolve the circuit-breaker outcome exactly once per admitted request (every request that
+        // claimed a permit in `request_filter` records here, so a half-open probe permit can't leak).
+        // Failure = the provider is *broken*: a 5xx response, or no response at all paired with an
+        // upstream error (connect/read failure). Success = the provider *answered* — 2xx/3xx, and
+        // deliberately **4xx/429 too**: a 429 is a healthy provider throttling our pool key, which the
+        // rate limiter and the client's `Retry-After` own, NOT a reason to cut all traffic to it.
+        if let Some(breaker) = &rc.provider.breaker {
+            match rc.upstream_status {
+                Some(s) if s >= 500 => breaker.record_failure(),
+                Some(_) => breaker.record_success(),
+                None if e.is_some() => breaker.record_failure(),
+                // No response and no error ⇒ client went away before the upstream answered; don't
+                // blame the provider — record success so the probe permit resolves.
+                None => breaker.record_success(),
+            }
         }
 
         // The buffer may transiently hold up to 2× the cap before compaction; the usage event is

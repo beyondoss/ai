@@ -35,6 +35,15 @@ pub type RequestId = ArrayString<33>;
 /// (a `provider_authorities` entry whose name isn't known). Each provider's pool key (if any) is
 /// looked up by name and its managed auth header value precomputed.
 fn build_providers(config: &AiConfig, metrics: &Metrics) -> HashMap<String, Arc<Provider>> {
+    // One independent breaker per provider, all built from the same config (the breaker holds
+    // atomics so it can't be cloned — we mint a fresh one per provider). `None` ⇒ breaker disabled.
+    let cb_config = config.circuit_breaker_config();
+    let breaker = || {
+        cb_config
+            .clone()
+            .map(crate::circuit_breaker::CircuitBreaker::new)
+    };
+
     let mut providers = HashMap::new();
     for spec in route::KNOWN_PROVIDERS {
         let authority = config
@@ -52,6 +61,7 @@ fn build_providers(config: &AiConfig, metrics: &Metrics) -> HashMap<String, Arc<
                 spec.auth,
                 pool_key,
                 ProviderMetrics::resolve(metrics, spec.name),
+                breaker(),
             )),
         );
     }
@@ -69,6 +79,7 @@ fn build_providers(config: &AiConfig, metrics: &Metrics) -> HashMap<String, Arc<
                     AuthScheme::Bearer,
                     pool_key,
                     ProviderMetrics::resolve(metrics, name),
+                    breaker(),
                 )),
             );
         }

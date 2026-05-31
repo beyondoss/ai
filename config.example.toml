@@ -24,6 +24,18 @@ read_timeout_secs = 600
 write_timeout_secs = 60
 idle_timeout_secs = 90
 
+# Graceful shutdown. On SIGTERM, in-flight requests drain for up to grace_period_secs before the
+# runtimes are torn down (then runtime_timeout_secs is the final teardown backstop).
+# Default = read_timeout_secs so a deploy NEVER truncates an in-flight stream — the gateway is a
+# transparent proxy and must not mangle a paid-for generation (a half-delivered SSE can't be cleanly
+# retried). Pingora stops accepting new connections at SIGTERM, so this only waits out the longest
+# existing stream, not new work; slower rollouts are the deliberate price.
+# The orchestrator must grant the same window or it caps us (it SIGKILLs at its own stop timeout):
+# set k8s terminationGracePeriodSeconds (or the EC2 agent's ECS_CONTAINER_STOP_TIMEOUT) to match.
+# NOTE: ECS Fargate caps stopTimeout at 120s — there, streams past 120s are still cut (a Fargate limit).
+shutdown_grace_period_secs = 600
+shutdown_runtime_timeout_secs = 10
+
 # upstream_tls = true   # set false only for a plaintext mock (tests)
 
 # Per-credential request-rate ceiling (requests/sec) — a blast-radius circuit breaker, not a spend
@@ -32,6 +44,18 @@ idle_timeout_secs = 90
 # lag and a failure flood that never bills. Generous by default so legitimate traffic never trips it;
 # set 0 to disable. Tune from the `ai_rejections_total{reason="rate_limit"}` metric.
 rate_limit_rps = 100
+
+# Per-provider circuit breaker. Trips when `circuit_breaker_threshold` upstream FAILURES occur within
+# `circuit_breaker_window_secs`; while open, requests to that provider fast-fail with 503
+# (ai_rejections_total{reason="circuit_open"}) instead of piling up against read_timeout_secs and
+# exhausting connection/in-flight slots for every provider. After `circuit_breaker_reset_secs` a probe
+# is allowed — success closes it, failure reopens it. A FAILURE is a 5xx response or a connect failure
+# (the provider is broken); a 429 is NOT a failure (a healthy provider throttling our pool key — the
+# rate limiter and the client's Retry-After own that). Applies to all traffic (managed + BYO). Set
+# threshold 0 to disable. Defaults are generous so normal background 5xx noise never trips it.
+circuit_breaker_threshold = 20
+circuit_breaker_window_secs = 10
+circuit_breaker_reset_secs = 30
 
 # Aggregate request-rate ceiling (requests/sec) for ALL BYO traffic combined — one shared bucket.
 # BYO is unverified and upstream-bound: a flood of *distinct* random BYO tokens slips past the

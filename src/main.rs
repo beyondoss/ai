@@ -13,6 +13,7 @@ use beyond_ai::store_watch::WatcherService;
 use clap::{Parser, Subcommand};
 use pingora_core::apps::http_app::HttpServer;
 use pingora_core::server::Server;
+use pingora_core::server::configuration::ServerConf;
 use pingora_core::services::background::background_service;
 use pingora_core::services::listening::Service as ListeningService;
 use pingora_proxy::http_proxy_service;
@@ -95,6 +96,9 @@ fn main() {
     let config = load_config(cli.config.as_deref());
     let listen = config.listen.clone();
     let metrics_listen = config.metrics_listen.clone();
+    // Capture the shutdown knobs before `config` is moved into the gateway state below.
+    let grace_period_secs = config.shutdown_grace_period_secs;
+    let runtime_timeout_secs = config.shutdown_runtime_timeout_secs;
     let metrics = match Metrics::new() {
         Ok(m) => m,
         Err(e) => {
@@ -110,7 +114,17 @@ fn main() {
         }
     };
 
-    let mut server = Server::new(None).expect("failed to init pingora server");
+    // Make the graceful-shutdown drain window explicit instead of inheriting Pingora's silent
+    // defaults (300s grace / 5s runtime teardown). `grace_period_seconds` is how long in-flight
+    // requests get to finish after SIGTERM before teardown; `graceful_shutdown_timeout_seconds` is
+    // the final runtime-exit backstop. See the `AiConfig` field docs for the read_timeout /
+    // orchestrator-stopTimeout tradeoffs.
+    let conf = ServerConf {
+        grace_period_seconds: Some(grace_period_secs),
+        graceful_shutdown_timeout_seconds: Some(runtime_timeout_secs),
+        ..ServerConf::default()
+    };
+    let mut server = Server::new_with_opt_and_conf(None, conf);
     server.bootstrap();
 
     // Client (app) traffic.
@@ -142,6 +156,12 @@ fn main() {
     admin.add_tcp(&metrics_listen);
     server.add_service(admin);
 
-    tracing::info!(%listen, %metrics_listen, "starting beyond-ai");
+    tracing::info!(
+        %listen,
+        %metrics_listen,
+        grace_period_secs,
+        runtime_timeout_secs,
+        "starting beyond-ai"
+    );
     server.run_forever();
 }

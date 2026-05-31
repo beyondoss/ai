@@ -110,7 +110,10 @@ impl BackgroundService for WatcherService {
             // down and `connect` is retrying its own backoff) rather than blocking teardown.
             let store = tokio::select! {
                 _ = shutdown.changed() => {
-                    info!("shutdown signaled; deny-set watcher exiting");
+                    info!(
+                        in_flight = self.state.metrics.requests_in_flight.get(),
+                        "shutdown signaled; deny-set watcher exiting"
+                    );
                     return;
                 }
                 outcome = connect(&self.state) => match outcome {
