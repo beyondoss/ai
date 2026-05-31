@@ -2,7 +2,7 @@
 # (e.g. `AI_NATS_URL`, `AI_POOL_KEY_OPENAI`, `AI_READ_TIMEOUT_SECS`). Values below are defaults.
 
 listen = "0.0.0.0:8080" # client (app) traffic; internal-only, fronted as ai.internal
-metrics_listen = "0.0.0.0:9090" # Prometheus /metrics
+metrics_listen = "0.0.0.0:9090" # internal admin: /metrics (Prometheus), /livez, /readyz
 
 # NATS / slipstream — carries ONLY the deny-set (`blackhole.*`). Auth + keys come from this file,
 # so the gateway authenticates + serves managed traffic even if NATS is down.

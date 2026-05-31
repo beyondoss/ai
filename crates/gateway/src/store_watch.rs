@@ -46,6 +46,11 @@ const BLACKHOLE_PREFIX: &str = "blackhole.";
 /// is low-churn, so this is rarely hit; it just bounds the log if a tenant flaps.
 const SNAPSHOT_COMPACT_THRESHOLD: u64 = 1024 * 1024;
 
+/// Reconnect backoff bounds: start at 1s, double to a 30s ceiling. Generous enough to stop log
+/// spam during a long NATS outage, tight enough that recovery is near-immediate once it returns.
+const RECONNECT_BACKOFF_BASE: Duration = Duration::from_secs(1);
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
 pub struct WatcherService {
     pub state: Arc<GatewayState>,
 }
@@ -68,6 +73,7 @@ impl BackgroundService for WatcherService {
                 Ok(Ok(Some(snap))) => {
                     let set = denyset_from_entries(snap.entries.values());
                     info!(count = set.len(), "seeded deny-set from on-disk snapshot");
+                    self.state.metrics.deny_set_size.set(set.len() as i64);
                     self.state.deny.store(Arc::new(set));
                     // A snapshot without a saved cursor can't safely resume (a bare watch would
                     // race), so only treat it as seeded when it carries a resume point; otherwise
@@ -93,6 +99,12 @@ impl BackgroundService for WatcherService {
             }
         }
 
+        // Reconnect backoff: 1s doubling to a 30s cap, reset on every successful connect. A fixed
+        // 2s retry hammered the log at a constant rate through a long outage (minutes to hours),
+        // burying other signals during the very incident an oncall is reading these logs for. The
+        // gateway serves correctly on the stale set throughout — this is purely about log volume
+        // and not pointlessly spinning on a down NATS.
+        let mut backoff = RECONNECT_BACKOFF_BASE;
         loop {
             // Connect, but bail immediately if Pingora signals shutdown mid-connect (e.g. NATS is
             // down and `connect` is retrying its own backoff) rather than blocking teardown.
@@ -104,16 +116,22 @@ impl BackgroundService for WatcherService {
                 outcome = connect(&self.state) => match outcome {
                     Ok(store) => store,
                     Err(e) => {
-                        error!(error = %e, "slipstream connect failed; retrying");
+                        self.state.metrics.nats_connected.set(0);
+                        error!(error = %e, backoff_secs = backoff.as_secs(), "slipstream connect failed; retrying");
                         // Reconnect backoff, also interruptible by shutdown.
                         tokio::select! {
                             _ = shutdown.changed() => return,
-                            _ = tokio::time::sleep(Duration::from_secs(2)) => continue,
+                            _ = tokio::time::sleep(backoff) => {
+                                backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                                continue;
+                            }
                         }
                     }
                 },
             };
 
+            backoff = RECONNECT_BACKOFF_BASE;
+            self.state.metrics.nats_connected.set(1);
             info!("slipstream connected; watching deny-set");
             // `watch_deny` returns `true` when it exited because shutdown was signaled — stop the
             // reconnect loop cleanly instead of trying to reconnect a shutting-down process.
@@ -130,10 +148,13 @@ impl BackgroundService for WatcherService {
                 info!("shutdown signaled; deny-set watcher exiting");
                 return;
             }
+            self.state.metrics.nats_connected.set(0);
             warn!("deny-set watch exited; reconnecting");
             tokio::select! {
                 _ = shutdown.changed() => return,
-                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                _ = tokio::time::sleep(backoff) => {
+                    backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                }
             }
         }
     }
@@ -158,7 +179,17 @@ async fn rebuild_snapshot(
     let res = tokio::task::spawn_blocking(
         move || -> Result<SnapshotWriter, store::snapshot::SnapshotError> {
             // Remove the old log so we don't replay a deleted-but-uncompacted key on a later load.
-            let _ = std::fs::remove_file(&path);
+            // A failed removal is *not* ignorable: if `SnapshotWriter::open` then appends to the
+            // surviving file, a compacted-away `Delete` can't undo its stale `Put`, and a later
+            // `load()` resurrects a tenant we no longer deny — the exact corruption this rebuild
+            // exists to prevent. `NotFound` is the expected, benign case (first boot, or scratch
+            // storage); any other error aborts the rebuild so we run snapshot-less rather than on
+            // poisoned state.
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
             let mut w = SnapshotWriter::open(&path, SNAPSHOT_COMPACT_THRESHOLD)?;
             for e in &entries {
                 w.write_update(&KvUpdate::Put(e.clone()))?;
@@ -183,6 +214,13 @@ async fn rebuild_snapshot(
 
 async fn connect(state: &GatewayState) -> crate::error::Result<Arc<dyn KvStore>> {
     let cfg = &state.config;
+    // `expose().to_string()` lifts the creds out of our `Secret` into the plain `String` the store's
+    // config requires. This doesn't widen the leak surface: `NatsConnectionConfig` has a hand-written
+    // redacting `Debug` (prints `creds: [redacted]`), so a stray `{:?}` on it — in a span, an error
+    // context, a reconnect log — can't print the credential. The plaintext copy is necessarily
+    // un-zeroized for the connection's life (we hand ownership to the store); same trade-off the pool
+    // keys make once they reach Pingora's headers (see `secret`). Redaction, not zeroization, is the
+    // control here.
     let conn = NatsConnection::new(NatsConnectionConfig {
         url: cfg.nats_url.clone(),
         creds: cfg.nats_creds.as_ref().map(|s| s.expose().to_string()),
@@ -227,6 +265,7 @@ async fn watch_deny(
                     revision = baseline_rev,
                     "seeded deny-set from scan"
                 );
+                state.metrics.deny_set_size.set(set.len() as i64);
                 state.deny.store(Arc::new(set));
                 *cursor = WatchCursor::from_u64(baseline_rev);
                 // Persist the freshly-scanned baseline so a later restart can skip the scan. We
@@ -299,6 +338,12 @@ async fn watch_deny(
             }
             Arc::new(set)
         });
+        // Reflect the new cardinality. A lock-free load of the set we just swapped in — cheap, and
+        // the deltas are low-churn, so this is far off any hot path.
+        state
+            .metrics
+            .deny_set_size
+            .set(state.deny.load().len() as i64);
         *cursor = WatchCursor::from_version(update.version().clone());
         persist_update(writer, &update, cursor).await;
     }
@@ -354,5 +399,58 @@ async fn persist_update(
                 Err(e) => warn!(error = %e, "snapshot compaction task panicked"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::deny::DenyReason;
+    use store::VersionToken;
+
+    fn entry(key: &str, value: &[u8]) -> KvEntry {
+        KvEntry {
+            key: key.to_string(),
+            value: value.to_vec(),
+            version: VersionToken::from_u64(1),
+        }
+    }
+
+    #[test]
+    fn denyset_from_entries_seeds_and_skips_malformed() {
+        // This is the seeding core: every boot turns raw KV entries into the live deny-set. A bug
+        // here (or a foreign key bleeding through the `filter_map`) means the deny-set is silently
+        // wrong at boot — denied tenants served, or unrelated keys denying real tenants.
+        let entries = [
+            entry("blackhole.42", b"spend"),
+            entry("blackhole.99", b"fraud"),
+            // Not a `blackhole.{tenant}` key — must be dropped, never inserted as tenant 0 or junk.
+            entry("signkey.1", b"spend"),
+            // `blackhole.` with a non-numeric tail — `parse_key` rejects it, so it's dropped too.
+            entry("blackhole.notanumber", b"spend"),
+            // Unrecognized reason value still denies (fail-safe) under `DenyReason::Unknown`.
+            entry("blackhole.7", b"mystery"),
+        ];
+
+        let set = denyset_from_entries(entries.iter());
+
+        assert_eq!(
+            set.len(),
+            3,
+            "only the three valid blackhole keys are seeded"
+        );
+        assert_eq!(set.reason(42), Some(DenyReason::Spend));
+        assert_eq!(set.reason(99), Some(DenyReason::Fraud));
+        assert_eq!(set.reason(7), Some(DenyReason::Unknown));
+        // The malformed keys produced no entries (and crucially no spurious tenant 0).
+        assert!(!set.is_denied(0));
+        assert!(!set.is_denied(1));
+    }
+
+    #[test]
+    fn denyset_from_entries_empty_is_allow_all() {
+        let set = denyset_from_entries([].iter());
+        assert!(set.is_empty());
+        assert!(!set.is_denied(42)); // default-allow on a cold/empty scan
     }
 }

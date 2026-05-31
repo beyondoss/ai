@@ -16,7 +16,9 @@ use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tracing::warn;
 
 /// How long a resolved upstream address is reused before re-resolving.
 const DNS_TTL: Duration = Duration::from_secs(60);
@@ -87,13 +89,49 @@ pub struct GatewayState {
     /// case — a cache hit, on every admitted request after warmup — is a lock-free atomic load; the
     /// only writes are the ~10 providers' entries refreshed once per `DNS_TTL`, applied via `rcu`.
     dns_cache: ArcSwap<HashMap<String, (SocketAddr, Instant)>>,
+
+    /// Per-process instance token (hex of 8 OS-random bytes), the high half of every `request_id`.
+    /// Random rather than a uuid dep, so log lines from two gateways don't collide when aggregated —
+    /// and random rather than the boot wall-clock, which collides when a rapid scale-up boots several
+    /// instances within the same nanosecond.
+    instance_id: String,
+    /// Monotonic per-request counter, the low half of `request_id`. A relaxed `fetch_add` — the only
+    /// requirement is uniqueness within the process, not cross-request ordering.
+    request_seq: AtomicU64,
 }
 
 impl GatewayState {
     pub fn new(config: AiConfig, metrics: Arc<Metrics>) -> Result<Arc<Self>> {
         let keyring = config.build_keyring()?;
+        // No signing keys ⇒ every `bai_…` fails verify and falls through to BYO treatment: no key
+        // swap, no deny-set, no `ai.usage` billing. That's a *valid* mode (a BYO-only deployment),
+        // but a far more common cause is a missing/typo'd `signing_keys` (SSM param, env) — which
+        // looks healthy while silently dropping all billing. Warn loudly so the boot logs flag it;
+        // don't `exit` (BYO-only is legitimate and tests rely on it).
+        if config.signing_keys.is_empty() {
+            warn!(
+                "no signing_keys configured — all managed (bai_) traffic will be treated as BYO \
+                 (no key swap, no deny-set, no billing). Expected only for a BYO-only deployment."
+            );
+        }
         let providers = build_providers(&config);
         let rate_limit = RateLimit::new(config.rate_limit_rps, config.byo_rate_limit_rps);
+
+        // 8 OS-random bytes as the instance token, so two gateways' request_ids never collide when
+        // aggregated — including when a rapid scale-up boots several instances within the same
+        // nanosecond (which a wall-clock token can't distinguish). If the OS RNG is somehow
+        // unavailable, fall back to the boot wall-clock rather than panicking — a degraded-uniqueness
+        // id beats failing to start.
+        let instance = {
+            let mut buf = [0u8; 8];
+            match getrandom::fill(&mut buf) {
+                Ok(()) => u64::from_le_bytes(buf),
+                Err(_) => SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0),
+            }
+        };
 
         Ok(Arc::new(Self {
             metrics,
@@ -102,8 +140,19 @@ impl GatewayState {
             deny: ArcSwap::from_pointee(DenySet::new()),
             rate_limit,
             dns_cache: ArcSwap::from_pointee(HashMap::new()),
+            instance_id: format!("{instance:x}"),
+            request_seq: AtomicU64::new(0),
             config,
         }))
+    }
+
+    /// A process-unique request id (`{instance}-{seq}`) for log correlation and the
+    /// `x-beyond-request-id` response header. Deliberately *not* a uuid: a per-process instance
+    /// token (computed once at boot) plus a relaxed atomic counter is unique across the fleet, costs
+    /// one `fetch_add` + one small `format!`, and needs no extra crate or randomness.
+    pub fn next_request_id(&self) -> String {
+        let seq = self.request_seq.fetch_add(1, Ordering::Relaxed);
+        format!("{}-{seq:x}", self.instance_id)
     }
 
     /// The resolved provider for `name` (`x-beyond-provider` value or dialect default), or `None`
@@ -147,13 +196,25 @@ mod tests {
     use crate::route::AuthScheme;
     use crate::secret::Secret;
 
+    /// One process-wide `Metrics` (it registers on the default Prometheus registry, which rejects a
+    /// second registration), shared by every test that needs a `GatewayState`.
+    fn test_metrics() -> Arc<Metrics> {
+        use std::sync::OnceLock;
+        static M: OnceLock<Arc<Metrics>> = OnceLock::new();
+        M.get_or_init(|| Metrics::new().expect("register metrics once"))
+            .clone()
+    }
+
     #[test]
     fn registry_resolves_known_overrides_and_additions() {
         let config = AiConfig {
             // Override a known provider's authority + give it a pool key; add a config-only one.
+            // `custom2` is a config-only provider with **no** pool key — the condition that makes a
+            // managed request to it 503 (no managed auth value to swap in).
             provider_authorities: HashMap::from([
                 ("openai".to_string(), "127.0.0.1:9".to_string()),
                 ("custom".to_string(), "llm.internal:8443".to_string()),
+                ("custom2".to_string(), "other.internal:8443".to_string()),
             ]),
             pool_keys: HashMap::from([
                 ("openai".to_string(), Secret::new("sk-openai")),
@@ -185,5 +246,37 @@ mod tests {
             custom.pool_auth_value.as_ref().unwrap().expose(),
             "Bearer sk-custom"
         );
+
+        // Config-only provider with no pool key: registered (reachable by name) but with no managed
+        // auth value — this `None` is exactly what `request_filter` turns into a 503 for a managed
+        // request. (BYO to it still works; it just can't serve the pooled path.)
+        let custom2 = providers.get("custom2").unwrap();
+        assert!(
+            custom2.pool_auth_value.is_none(),
+            "a provider with no configured pool key must have no managed auth value (→ 503)"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_caches_hit_and_errors_on_bad_host() {
+        // `resolve` is on the request hot path (every admitted request hits `upstream_peer`). Cover
+        // the three outcomes: a successful resolve, a cache hit returning the same address without a
+        // fresh lookup, and a lookup failure surfacing as `GatewayError::Dns` (not a panic/hang).
+        let config = AiConfig::default();
+        let state = GatewayState::new(config, test_metrics()).unwrap();
+
+        // An IP literal resolves through `lookup_host` without real DNS — deterministic, offline-safe.
+        let addr = state.resolve("127.0.0.1:9").await.unwrap();
+        assert_eq!(addr, "127.0.0.1:9".parse().unwrap());
+
+        // Second call is served from the TTL cache: same answer, and the entry is now present.
+        assert_eq!(state.resolve("127.0.0.1:9").await.unwrap(), addr);
+        assert!(state.dns_cache.load().contains_key("127.0.0.1:9"));
+
+        // A guaranteed-NXDOMAIN host (RFC 6761 reserves `.invalid`) → a Dns error, never a panic.
+        assert!(matches!(
+            state.resolve("nonexistent.invalid:80").await,
+            Err(GatewayError::Dns(_))
+        ));
     }
 }

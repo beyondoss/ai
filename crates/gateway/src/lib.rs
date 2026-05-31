@@ -4,11 +4,12 @@
 //! (virtual-key verification, deny-set, usage parsing, routing, request peek) lives in modules
 //! free of Pingora/IO so it is unit-tested without a running proxy or live providers.
 
-// Application crate: no `unsafe` is needed, so forbid it outright. `unused_must_use` is denied so
-// a dropped `Result` (e.g. an unchecked `write_response_*`) is a hard error, not a silent swallow.
-#![deny(unsafe_code)]
-#![deny(unused_must_use)]
+// Lint gates (`unsafe_code = "forbid"`, `unused_must_use = "deny"`) live in `[workspace.lints]` so
+// they apply to *both* crate roots — this lib and the `main.rs` binary — not just whichever unit
+// carries a crate-level `#![deny]`. A dropped `Result` (e.g. an unchecked `write_response_*`) is
+// therefore a hard error, and `unsafe` is forbidden, everywhere in the crate.
 
+pub mod admin;
 pub mod config;
 pub mod deny;
 pub mod doctor;

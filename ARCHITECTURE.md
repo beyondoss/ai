@@ -44,10 +44,12 @@ client (stock SDK, Bearer/ x-api-key)
    ▼ request_body_filter  — STREAM BODY THROUGH (never buffered); feed bytes to a structural
    │                         scanner that extracts the exact root-level `model` (O(1), memchr-fast);
    │                         enforce the body cap on the running total (chunked-safe)
-   ▼ response_filter      — TTFT; streaming? = response Content-Type is text/event-stream
+   ▼ response_filter      — TTFT; streaming? = response Content-Type is text/event-stream; count
+   │                         upstream response by provider+status class; set x-beyond-request-id
    ▼ response_body_filter — relay unbuffered; keep a bounded 64KB tail for the usage tap
    ▼ logging              — parse usage from tail (by dialect+streaming); emit `ai.usage` fact
-   │                         (managed only — BYO has no tenant to bill); metrics count all traffic
+   │                         (managed only — BYO has no tenant to bill); metrics count all traffic.
+   │                         Every terminal path (reject + usage) logs the request_id for correlation
         upstream: a registered provider (openai, anthropic, openrouter, fireworks,
                   groq, deepseek, together, cerebras, mistral, xai — + config-added)
 ```
@@ -184,23 +186,23 @@ output redacts values.
 | `nats_url`                    | `nats://localhost:4222`           | NATS server for the deny-set watcher. Unreachable → fail-open (stale or empty set).                                                                              |
 | `nats_creds`                  | _(unset)_                         | NATS credentials file path. Required for authenticated clusters.                                                                                                 |
 | `listen_addr`                 | `0.0.0.0:8080`                    | Proxy listener address.                                                                                                                                          |
-| `prometheus_addr`             | `0.0.0.0:9090`                    | Prometheus `/metrics` scrape endpoint.                                                                                                                           |
+| `metrics_listen`              | `0.0.0.0:9090`                    | Internal admin/observability listener: `/metrics` (Prometheus scrape), `/livez`, `/readyz`. Separate from the client listener — not externally reachable.        |
 
 ---
 
 ## Failure Modes
 
-| Failure                                     | What Actually Happens                                                                                       | Recovery                                                                                    |
-| ------------------------------------------- | ----------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| NATS unreachable at boot                    | Deny-set starts empty (fail-open). Auth still works — keys from config.                                     | Watcher reconnects; seeds from NATS or disk snapshot on connect.                            |
-| NATS disconnects mid-run                    | Last-known deny-set stays active. New deny entries not applied until reconnect.                             | Watcher reconnects and resumes from saved revision — no re-scan needed.                     |
-| NATS history compacted past snapshot cursor | `CursorExpired` → full re-scan from current NATS state.                                                     | After re-scan, new cursor set; delta watch resumes normally.                                |
-| Virtual key tampered or forged              | Ed25519 verify fails → falls through to BYO treatment. No billing event.                                    | Billing miss detectable downstream; no security boundary breach.                            |
-| Pool key missing for provider               | Managed request returns 503 before any upstream connection.                                                 | Add `AI_POOL_KEY_<NAME>` env and redeploy.                                                  |
-| Provider DNS fails                          | `upstream_peer` returns error → 502 to client.                                                              | TTL-cached DNS (60s) serves stale; poisoned-lock guard re-resolves on next request.         |
-| Provider TCP connect fails                  | `fail_to_connect` retries up to 2×, then returns 502.                                                       | Client SDK retries with backoff. No HTTP-status retries (Pingora-idiomatic).                |
-| Response body > 128KB before usage chunk    | Tail compaction fires: `drain(..half)` discards first half, keeps tail. Usage extracted from retained tail. | No action — O(1) tail tap is designed for this; SSE usage is always in the final data line. |
-| Gateway crash mid-request                   | In-flight request drops; client receives TCP close, not a structured error. No partial state written.       | Client SDK retries. No DB writes in the request path — no cleanup needed.                   |
+| Failure                                     | What Actually Happens                                                                                       | Recovery                                                                                                        |
+| ------------------------------------------- | ----------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| NATS unreachable at boot                    | Deny-set starts empty (fail-open). Auth still works — keys from config.                                     | Watcher reconnects; seeds from NATS or disk snapshot on connect.                                                |
+| NATS disconnects mid-run                    | Last-known deny-set stays active. New deny entries not applied until reconnect.                             | Watcher reconnects (1s→30s exponential backoff, reset on success) and resumes from saved revision — no re-scan. |
+| NATS history compacted past snapshot cursor | `CursorExpired` → full re-scan from current NATS state.                                                     | After re-scan, new cursor set; delta watch resumes normally.                                                    |
+| Virtual key tampered or forged              | Ed25519 verify fails → falls through to BYO treatment. No billing event.                                    | Billing miss detectable downstream; no security boundary breach.                                                |
+| Pool key missing for provider               | Managed request returns 503 before any upstream connection.                                                 | Add `AI_POOL_KEY_<NAME>` env and redeploy.                                                                      |
+| Provider DNS fails                          | `upstream_peer` returns error → 502 to client.                                                              | TTL-cached DNS (60s) serves stale; poisoned-lock guard re-resolves on next request.                             |
+| Provider TCP connect fails                  | `fail_to_connect` retries up to 2×, then returns 502.                                                       | Client SDK retries with backoff. No HTTP-status retries (Pingora-idiomatic).                                    |
+| Response body > 128KB before usage chunk    | Tail compaction fires: `drain(..half)` discards first half, keeps tail. Usage extracted from retained tail. | No action — O(1) tail tap is designed for this; SSE usage is always in the final data line.                     |
+| Gateway crash mid-request                   | In-flight request drops; client receives TCP close, not a structured error. No partial state written.       | Client SDK retries. No DB writes in the request path — no cleanup needed.                                       |
 
 ---
 
@@ -219,6 +221,7 @@ output redacts values.
 | `state`                   | keyring + resolved provider registry + watched deny-set + TTL DNS cache       | unit ✓        |
 | `store_watch`             | the single NATS watcher (deny-set), as a Pingora `BackgroundService`          | —             |
 | `proxy`                   | the `ProxyHttp` impl                                                          | e2e ✓         |
+| `admin`                   | `ServeHttp` on the metrics listener: `/livez`, `/readyz`, `/metrics`          | e2e ✓         |
 | `metrics`/`doctor`/`main` | Prometheus, diagnostics, bootstrap                                            | e2e/compile ✓ |
 
 ## Verification

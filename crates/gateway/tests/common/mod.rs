@@ -17,11 +17,13 @@ use base64::Engine;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::service::service_fn;
-use hyper::{HeaderMap, Request, Response};
-use hyper_util::rt::TokioIo;
+use hyper::{Request, Response};
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
 use store::Connection;
 use tokio::net::TcpListener;
 use tokio::time::{sleep, timeout};
+use tokio_rustls::TlsAcceptor;
 
 /// Hand out a TCP port no other `free_port()` call in this test binary has returned.
 ///
@@ -207,6 +209,72 @@ fn large_sse() -> String {
     )
 }
 
+/// The canned `(content-type, body)` for a mode. `SseLarge` allocates; the rest are static.
+fn canned_body(mode: Mode) -> (&'static str, Bytes) {
+    match mode {
+        Mode::Json => (
+            "application/json",
+            Bytes::from_static(CANNED_JSON.as_bytes()),
+        ),
+        Mode::Sse => (
+            "text/event-stream",
+            Bytes::from_static(CANNED_SSE.as_bytes()),
+        ),
+        Mode::AnthropicJson => (
+            "application/json",
+            Bytes::from_static(CANNED_ANTHROPIC_JSON.as_bytes()),
+        ),
+        Mode::SseLarge => ("text/event-stream", Bytes::from(large_sse())),
+    }
+}
+
+/// The protocol the gateway used to *reach the mock* — derived from the version hyper parsed off the
+/// wire. Echoed back in `x-mock-proto`; since the gateway relays response headers untouched, the bench
+/// client reads this to prove which protocol the gateway→upstream hop negotiated (H2 vs H1).
+fn proto_label(version: hyper::Version) -> &'static str {
+    match version {
+        hyper::Version::HTTP_2 => "h2",
+        _ => "http/1.1",
+    }
+}
+
+/// Shared request handler for both the plaintext and TLS listeners: record what the gateway forwarded,
+/// then return the canned body tagged with the negotiated protocol.
+async fn mock_handle(
+    req: Request<hyper::body::Incoming>,
+    cap: Arc<Mutex<Option<Captured>>>,
+    mode: Mode,
+) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
+    let version = req.version();
+    let path = req.uri().path().to_string();
+    // Pull the headers we record before consuming the body (which moves `req`).
+    let (authorization, x_api_key, host) = {
+        let h = req.headers();
+        let get = |k: &str| h.get(k).and_then(|v| v.to_str().ok()).map(String::from);
+        (get("authorization"), get("x-api-key"), get("host"))
+    };
+    let body = req
+        .into_body()
+        .collect()
+        .await
+        .map(|b| b.to_bytes().to_vec())
+        .unwrap_or_default();
+    *cap.lock().unwrap() = Some(Captured {
+        path,
+        authorization,
+        x_api_key,
+        host,
+        body,
+    });
+    let (ct, payload) = canned_body(mode);
+    Ok(Response::builder()
+        .status(200)
+        .header("content-type", ct)
+        .header("x-mock-proto", proto_label(version))
+        .body(Full::new(payload))
+        .unwrap())
+}
+
 impl MockUpstream {
     pub async fn start(mode: Mode) -> Self {
         // Bind `:0` and read the port back, keeping the listener open the whole time — no
@@ -223,51 +291,65 @@ impl MockUpstream {
                 let io = TokioIo::new(stream);
                 let cap = cap.clone();
                 tokio::spawn(async move {
-                    let svc = service_fn(move |req: Request<hyper::body::Incoming>| {
-                        let cap = cap.clone();
-                        async move {
-                            let path = req.uri().path().to_string();
-                            let h: &HeaderMap = req.headers();
-                            let get =
-                                |k: &str| h.get(k).and_then(|v| v.to_str().ok()).map(String::from);
-                            let c = Captured {
-                                path,
-                                authorization: get("authorization"),
-                                x_api_key: get("x-api-key"),
-                                host: get("host"),
-                                body: req
-                                    .into_body()
-                                    .collect()
-                                    .await
-                                    .map(|b| b.to_bytes().to_vec())
-                                    .unwrap_or_default(),
-                            };
-                            *cap.lock().unwrap() = Some(c);
-                            let (ct, payload): (&str, Bytes) = match mode {
-                                Mode::Json => (
-                                    "application/json",
-                                    Bytes::from_static(CANNED_JSON.as_bytes()),
-                                ),
-                                Mode::Sse => (
-                                    "text/event-stream",
-                                    Bytes::from_static(CANNED_SSE.as_bytes()),
-                                ),
-                                Mode::AnthropicJson => (
-                                    "application/json",
-                                    Bytes::from_static(CANNED_ANTHROPIC_JSON.as_bytes()),
-                                ),
-                                Mode::SseLarge => ("text/event-stream", Bytes::from(large_sse())),
-                            };
-                            Ok::<_, std::convert::Infallible>(
-                                Response::builder()
-                                    .status(200)
-                                    .header("content-type", ct)
-                                    .body(Full::new(payload))
-                                    .unwrap(),
-                            )
-                        }
-                    });
+                    let svc = service_fn(move |req| mock_handle(req, cap.clone(), mode));
                     let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, svc)
+                        .await;
+                });
+            }
+        });
+        MockUpstream {
+            port,
+            captured,
+            task,
+        }
+    }
+
+    /// Like [`start`], but terminates **TLS** and serves H1 *and* H2 on the one listener (protocol
+    /// chosen by ALPN, via hyper-util's auto builder). Presents a throwaway self-signed cert, so the
+    /// gateway must be pointed at it with `upstream_tls = true` and `upstream_verify_cert = false`.
+    /// This is what lets the concurrency bench drive the gateway's real TLS+ALPN+H2 path against a
+    /// local mock. Returns the mock; reach it at `authority()` (host `127.0.0.1`).
+    pub async fn start_tls(mode: Mode) -> Self {
+        // rustls 0.23 needs a process crypto provider; both ring and aws-lc are compiled in (so there's
+        // no default), pick ring to match the gateway. Idempotent across multiple mocks in one process.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let ck = rcgen::generate_simple_self_signed(vec![
+            "127.0.0.1".to_string(),
+            "localhost".to_string(),
+        ])
+        .expect("self-signed cert");
+        let certs = vec![ck.cert.der().clone()];
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(ck.key_pair.serialize_der().into());
+        let mut tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .expect("server tls config");
+        // Offer both so the gateway's ALPN preference decides: H2H1 → h2, H1 → http/1.1.
+        tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let acceptor = TlsAcceptor::from(Arc::new(tls));
+
+        let captured: Arc<Mutex<Option<Captured>>> = Arc::new(Mutex::new(None));
+        let cap = captured.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let acceptor = acceptor.clone();
+                let cap = cap.clone();
+                tokio::spawn(async move {
+                    let Ok(tls_stream) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let io = TokioIo::new(tls_stream);
+                    let svc = service_fn(move |req| mock_handle(req, cap.clone(), mode));
+                    // Auto builder: serves H2 or H1 per the negotiated ALPN.
+                    let _ = auto::Builder::new(TokioExecutor::new())
                         .serve_connection(io, svc)
                         .await;
                 });
@@ -326,6 +408,13 @@ pub struct GatewayBuilder {
     snapshot_path: Option<String>,
     real_upstreams: bool,
     pool_key_overrides: Vec<(String, String)>,
+    rate_limit_rps: Option<u32>,
+    byo_rate_limit_rps: Option<u32>,
+    /// Point at a TLS mock (`MockUpstream::start_tls`): `upstream_tls = true` + skip cert verification
+    /// (the mock is self-signed), while still routing via `provider_authorities`. For the H2 bench.
+    tls_upstream: bool,
+    /// Override the gateway's `upstream_http2` (H2H1 vs H1 ALPN). `None` ⇒ leave the gateway default.
+    upstream_http2: Option<bool>,
 }
 
 impl GatewayBuilder {
@@ -361,13 +450,42 @@ impl GatewayBuilder {
         self
     }
 
+    /// Override the per-credential request-rate ceiling (requests/sec). The harness default leaves
+    /// the gateway's own generous default (100) in place; set a small value to exercise the 429 path.
+    pub fn rate_limit_rps(mut self, rps: u32) -> Self {
+        self.rate_limit_rps = Some(rps);
+        self
+    }
+
+    /// Override the aggregate BYO request-rate ceiling (requests/sec). `0` disables that tier so a
+    /// per-credential 429 test isn't perturbed by the shared BYO bucket.
+    pub fn byo_rate_limit_rps(mut self, rps: u32) -> Self {
+        self.byo_rate_limit_rps = Some(rps);
+        self
+    }
+
+    /// Talk to the upstream over TLS without verifying its cert — for a `MockUpstream::start_tls`
+    /// target (self-signed). The gateway still routes via `provider_authorities` (the mock), but with
+    /// real TLS + ALPN, so the H2 path is exercised. Used by the concurrency bench.
+    pub fn tls_upstream(mut self) -> Self {
+        self.tls_upstream = true;
+        self
+    }
+
+    /// Force the gateway's upstream ALPN: `true` ⇒ H2H1 (prefer H2), `false` ⇒ H1 only. The bench
+    /// starts one gateway each way against the same TLS mock to compare them.
+    pub fn upstream_http2(mut self, on: bool) -> Self {
+        self.upstream_http2 = Some(on);
+        self
+    }
+
     pub async fn start(self) -> Gateway {
         let port = free_port();
         let metrics_port = free_port();
         let config_path = std::env::temp_dir().join(format!("beyond-ai-config-{port}.toml"));
         let nats_port = self.nats_port;
         // Scalars first, `[…]` tables last (TOML ordering).
-        let tls = self.real_upstreams;
+        let tls = self.real_upstreams || self.tls_upstream;
         let mut cfg = format!(
             "listen = \"127.0.0.1:{port}\"\n\
              metrics_listen = \"127.0.0.1:{metrics_port}\"\n\
@@ -375,8 +493,21 @@ impl GatewayBuilder {
              config_bucket = \"ai-gateway\"\n\
              upstream_tls = {tls}\n"
         );
+        // TLS mock is self-signed → don't verify its cert (production always verifies).
+        if self.tls_upstream {
+            cfg.push_str("upstream_verify_cert = false\n");
+        }
+        if let Some(h2) = self.upstream_http2 {
+            cfg.push_str(&format!("upstream_http2 = {h2}\n"));
+        }
         if let Some(path) = &self.snapshot_path {
             cfg.push_str(&format!("snapshot_path = \"{path}\"\n"));
+        }
+        if let Some(rps) = self.rate_limit_rps {
+            cfg.push_str(&format!("rate_limit_rps = {rps}\n"));
+        }
+        if let Some(rps) = self.byo_rate_limit_rps {
+            cfg.push_str(&format!("byo_rate_limit_rps = {rps}\n"));
         }
         if self.real_upstreams {
             // Real-host smoke mode: built-in provider defaults (no authority overrides). For a
@@ -451,6 +582,10 @@ impl Gateway {
             snapshot_path: None,
             real_upstreams: false,
             pool_key_overrides: Vec::new(),
+            rate_limit_rps: None,
+            byo_rate_limit_rps: None,
+            tls_upstream: false,
+            upstream_http2: None,
         }
     }
 
@@ -465,6 +600,16 @@ impl Gateway {
             .text()
             .await
             .unwrap()
+    }
+
+    /// GET a path on the admin/metrics listener, returning `(status, body)`. Used to probe
+    /// `/livez` and `/readyz` (which live on `metrics_port`, alongside `/metrics`).
+    pub async fn admin_get(&self, path: &str) -> (u16, String) {
+        let resp = reqwest::get(format!("http://127.0.0.1:{}{path}", self.metrics_port))
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        (status, resp.text().await.unwrap())
     }
 }
 

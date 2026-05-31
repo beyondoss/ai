@@ -148,6 +148,12 @@ impl RateLimit {
     /// BYO. Returns `None` when within budget, or `Some(reason)` once a ceiling is crossed — the very
     /// request that crosses the line is the first one rejected (`observe` returns the running total).
     /// The credential itself is never stored; only its seeded digest feeds the per-credential sketch.
+    ///
+    /// `#[must_use]`: `observe` has already incremented the counters by the time this returns, so a
+    /// caller that drops the result has *charged* the request but skipped enforcement — the limiter is
+    /// silently bypassed. The crate's `#![deny(unused_must_use)]` only bites with this attribute
+    /// present, so it's load-bearing, not decorative.
+    #[must_use = "the throttle decision must be enforced — dropping it charges the request but lets it through"]
     pub fn check(&self, raw_credential: &str, managed: bool) -> Option<Throttled> {
         // Global BYO backstop first: BYO is unverified and upstream-bound, so this is the ceiling that
         // protects our egress IPs from a distinct-token flood. Managed traffic skips it (verified,

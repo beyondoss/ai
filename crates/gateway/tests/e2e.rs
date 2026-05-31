@@ -253,6 +253,19 @@ async fn streaming_relays_sse_and_meters_usage() {
     assert_eq!(resp.status(), 200);
     assert!(resp.text().await.unwrap().contains("[DONE]"));
     wait_for_metric(&gw, "ai_tokens_total", "input", 5.0).await;
+
+    // The client streamed without `stream_options`, so the managed OpenAI path must have buffered the
+    // body and spliced `stream_options.include_usage` in before forwarding — otherwise OpenAI emits no
+    // usage chunk and the request is unbillable. The metric above can't prove this (the mock returns a
+    // usage chunk unconditionally), so assert the *forwarded body* the mock actually received carries
+    // the injected fragment. This is the only coverage that the splice in `request_body_filter` ran.
+    let cap = mock.captured().expect("mock received a request");
+    let needle = br#""stream_options":{"include_usage":true}"#;
+    assert!(
+        cap.body.windows(needle.len()).any(|w| w == needle),
+        "managed OpenAI streaming body must have stream_options.include_usage injected; got: {}",
+        String::from_utf8_lossy(&cap.body)
+    );
 }
 
 #[tokio::test]
@@ -362,6 +375,56 @@ async fn oversized_content_length_is_rejected_413() {
          Connection: close\r\n\r\n"
     );
     assert_eq!(raw_status(gw.port, &req).await, 413);
+}
+
+#[tokio::test]
+async fn per_credential_rate_limit_returns_429() {
+    // Every other rejection code is covered e2e (401/402/403/413/503) — 429 was the gap. A
+    // misconfigured ceiling (e.g. `rate_limit_rps` env typo'd to 0) would silently disable the
+    // guardrail, so prove the full enforcement path: a burst on one credential trips 429, charged on
+    // the raw key in `request_filter` before any verify/upstream connect. BYO (so no key material
+    // needed); the global BYO tier is disabled so this isolates the per-credential ceiling.
+    let nats = Nats::start().await;
+    let (pubkey, _sk) = test_keypair(40);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats.port, &mock.authority(), &b64(&pubkey))
+        .rate_limit_rps(5)
+        .byo_rate_limit_rps(0)
+        .start()
+        .await;
+    let client = reqwest::Client::new();
+
+    // Wait until the gateway serves, using a *different* credential so the flood token's budget is
+    // untouched by readiness probing.
+    {
+        let (c, u) = (client.clone(), gw.url());
+        wait_for_status(200, move || {
+            let (c, u) = (c.clone(), u.clone());
+            async move { post_status(&c, &u, "sk-byo-warmup", body_for("gpt-4o")).await }
+        })
+        .await;
+    }
+
+    // Burst one credential well past its 5 rps ceiling within a single window. The first few are
+    // served (200); once the ceiling is crossed the rest are throttled (429).
+    let mut saw_200 = false;
+    let mut saw_429 = false;
+    for _ in 0..50 {
+        match post_status(&client, &gw.url(), "sk-byo-flood", body_for("gpt-4o")).await {
+            200 => saw_200 = true,
+            429 => saw_429 = true,
+            other => panic!("unexpected status under rate limit: {other}"),
+        }
+    }
+    assert!(
+        saw_200,
+        "the first requests under the ceiling must be served"
+    );
+    assert!(
+        saw_429,
+        "a burst past the per-credential ceiling must yield 429"
+    );
+    wait_for_metric(&gw, "ai_rejections_total", "rate_limit", 1.0).await;
 }
 
 #[tokio::test]
@@ -660,4 +723,41 @@ async fn on_disk_snapshot_enforces_across_restart_without_nats() {
     probe(gw2.url(), allowed, 200).await;
 
     let _ = std::fs::remove_file(&snap);
+}
+
+#[tokio::test]
+async fn health_endpoints_report_ready_on_the_metrics_listener() {
+    // /livez and /readyz live on the metrics listener (alongside /metrics) and must both 200 with a
+    // `{status:"ok"}` body once the process is up. Readiness is intentionally *not* gated on NATS —
+    // the gateway is fail-open, so it can serve from config alone. We stop NATS before probing to
+    // prove readiness doesn't depend on it: a NATS-less gateway is still ready.
+    let mut nats = Nats::start().await;
+    let (pubkey, _sk) = test_keypair(30);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::start(nats.port, &mock.authority(), &b64(&pubkey)).await;
+    nats.stop();
+
+    let (live_status, live_body) = gw.admin_get("/livez").await;
+    assert_eq!(
+        live_status, 200,
+        "livez should be 200 once the process answers"
+    );
+    assert!(
+        live_body.contains("\"status\":\"ok\""),
+        "livez body: {live_body}"
+    );
+
+    let (ready_status, ready_body) = gw.admin_get("/readyz").await;
+    assert_eq!(
+        ready_status, 200,
+        "readyz should be 200 even with NATS down (fail-open): {ready_body}"
+    );
+    assert!(
+        ready_body.contains("\"status\":\"ok\""),
+        "readyz body: {ready_body}"
+    );
+
+    // An unknown admin path is a clean 404, not a hang or a 200.
+    let (nf_status, _) = gw.admin_get("/nope").await;
+    assert_eq!(nf_status, 404);
 }

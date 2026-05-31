@@ -17,7 +17,7 @@ mod common;
 
 use std::time::Duration;
 
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use tokio::runtime::Runtime;
 use tokio::task::JoinSet;
 
@@ -214,5 +214,144 @@ fn bench_e2e(c: &mut Criterion) {
     drop(sse_stack);
 }
 
-criterion_group!(benches, bench_e2e);
+/// Concurrency levels swept by `bench_concurrency`. Spans below and above hyper's default
+/// `SETTINGS_MAX_CONCURRENT_STREAMS` (200) so an H2 stream-concurrency cliff (if any) shows up against
+/// H1's connection pool.
+const SWEEP: &[u64] = &[1, 8, 32, 128, 512];
+
+/// Fire `conc` managed requests at `url` concurrently and drain each body (returns the connection to
+/// the pool). This is one bench iteration; `Throughput::Elements(conc)` makes criterion report req/s.
+async fn drive(client: &reqwest::Client, url: &str, vkey: &str, conc: u64) {
+    let mut set = JoinSet::new();
+    for _ in 0..conc {
+        let (c, u, k) = (client.clone(), url.to_string(), vkey.to_string());
+        set.spawn(async move {
+            let resp = c
+                .post(format!("{u}/v1/chat/completions"))
+                .header("authorization", format!("Bearer {k}"))
+                .header("content-type", "application/json")
+                .body(MANAGED_BODY)
+                .send()
+                .await
+                .expect("request");
+            let _ = resp.bytes().await.expect("body");
+        });
+    }
+    while let Some(r) = set.join_next().await {
+        r.expect("task");
+    }
+}
+
+/// Warm a gateway until it answers 200, then return the protocol it used to reach the upstream — read
+/// from the `x-mock-proto` header the TLS mock stamps and the gateway relays. This is the proof the
+/// "h2"/"h1" bench labels reflect what actually negotiated, not just what we configured.
+async fn warm_and_proto(client: &reqwest::Client, url: &str, vkey: &str) -> String {
+    {
+        let (c, u, k) = (client.clone(), url.to_string(), vkey.to_string());
+        wait_for_status(200, move || {
+            let (c, u, k) = (c.clone(), u.clone(), k.clone());
+            async move {
+                c.post(format!("{u}/v1/chat/completions"))
+                    .header("authorization", format!("Bearer {k}"))
+                    .header("content-type", "application/json")
+                    .body(MANAGED_BODY)
+                    .send()
+                    .await
+                    .map(|r| r.status().as_u16())
+                    .unwrap_or(0)
+            }
+        })
+        .await;
+    }
+    let resp = client
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", format!("Bearer {vkey}"))
+        .header("content-type", "application/json")
+        .body(MANAGED_BODY)
+        .send()
+        .await
+        .expect("warm request");
+    resp.headers()
+        .get("x-mock-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+/// H2-vs-H1 to the upstream, under concurrency. One TLS+H2 mock; two gateways against it — one with
+/// `upstream_http2 = true` (ALPN H2H1 → h2), one `false` (ALPN H1). Same client→gateway transport
+/// (plain H1) for both, so the only variable is the gateway→upstream protocol. The sweep exposes
+/// whether H2 multiplexing wins or hits its stream-concurrency cap vs H1's connection pool.
+fn bench_concurrency(c: &mut Criterion) {
+    let rt = Runtime::new().expect("tokio runtime");
+    let nats = rt.block_on(Nats::start());
+    let mock = rt.block_on(MockUpstream::start_tls(Mode::Json));
+    let (pubkey, sk) = test_keypair(1);
+    let vkey = mint(
+        &VirtualKey {
+            tenant_id: 42,
+            vpc_id: 7,
+        },
+        1,
+        &sk,
+    );
+
+    // Two gateways at the same self-signed TLS mock; ALPN is the only difference. Rate limits OFF
+    // (both tiers): the sweep drives one credential well past the 100 rps default, and a rate-limited
+    // 429 short-circuits *before* the upstream — it would measure the reject path, not H2-vs-H1.
+    let gw_h2 = rt.block_on(
+        Gateway::builder(nats.port, &mock.authority(), &b64(&pubkey))
+            .tls_upstream()
+            .upstream_http2(true)
+            .rate_limit_rps(0)
+            .byo_rate_limit_rps(0)
+            .start(),
+    );
+    let gw_h1 = rt.block_on(
+        Gateway::builder(nats.port, &mock.authority(), &b64(&pubkey))
+            .tls_upstream()
+            .upstream_http2(false)
+            .rate_limit_rps(0)
+            .byo_rate_limit_rps(0)
+            .start(),
+    );
+    let client = reqwest::Client::new();
+    let (url_h2, url_h1) = (gw_h2.url(), gw_h1.url());
+
+    // Prove the gateways actually negotiated what we asked for before trusting the labels.
+    let proto_h2 = rt.block_on(warm_and_proto(&client, &url_h2, &vkey));
+    let proto_h1 = rt.block_on(warm_and_proto(&client, &url_h1, &vkey));
+    assert_eq!(
+        proto_h2, "h2",
+        "upstream_http2=true should negotiate h2 to the mock"
+    );
+    assert_eq!(
+        proto_h1, "http/1.1",
+        "upstream_http2=false should stay http/1.1 to the mock"
+    );
+    eprintln!("e2e_concurrency: confirmed gw_h2→upstream=h2, gw_h1→upstream=http/1.1");
+
+    let mut group = c.benchmark_group("e2e_concurrency");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(6));
+    for &conc in SWEEP {
+        group.throughput(Throughput::Elements(conc));
+        group.bench_with_input(BenchmarkId::new("h2", conc), &conc, |b, &conc| {
+            b.to_async(&rt)
+                .iter(|| drive(&client, &url_h2, &vkey, conc));
+        });
+        group.bench_with_input(BenchmarkId::new("h1", conc), &conc, |b, &conc| {
+            b.to_async(&rt)
+                .iter(|| drive(&client, &url_h1, &vkey, conc));
+        });
+    }
+    group.finish();
+
+    drop(gw_h2);
+    drop(gw_h1);
+    drop(mock);
+    drop(nats);
+}
+
+criterion_group!(benches, bench_e2e, bench_concurrency);
 criterion_main!(benches);

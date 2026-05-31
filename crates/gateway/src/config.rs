@@ -70,6 +70,21 @@ pub struct AiConfig {
     /// to talk to a plaintext mock.
     pub upstream_tls: bool,
 
+    /// Prefer HTTP/2 (with HTTP/1.1 fallback) to the upstream. `true` ⇒ peer ALPN `H2H1`: every
+    /// provider that offers `h2` over TLS is reached over a multiplexed H2 connection (fewer sockets
+    /// and TLS handshakes from our egress IPs), and any host that doesn't offer it negotiates down to
+    /// H1. `false` ⇒ ALPN `H1` (one connection per in-flight request, pooled). The knob exists so an
+    /// operator can fall back to H1 without a code redeploy if a provider's h2 stack misbehaves, and
+    /// so the e2e concurrency bench can compare the two. Only consulted over TLS — a plaintext upstream
+    /// (the mock) has no ALPN and is always H1 regardless.
+    pub upstream_http2: bool,
+
+    /// Verify the upstream's TLS certificate (and that it matches the SNI). `true` everywhere in
+    /// production. The **only** intended `false` is the e2e concurrency bench, whose TLS mock presents
+    /// a self-signed cert — turning verification off there lets us exercise the real TLS+ALPN+H2 path
+    /// against a local mock without a CA. Never set this `false` against a real provider.
+    pub upstream_verify_cert: bool,
+
     /// Per-credential request-rate ceiling (requests/sec). A blast-radius guardrail (see `ratelimit`),
     /// not a spend control: it caps how fast a single credential (managed virtual key ≈ a `(tenant,
     /// app)`, or a BYO token) can drive the gateway, bounding a leaked/runaway key during the
@@ -111,6 +126,11 @@ impl Default for AiConfig {
             write_timeout_secs: 60,
             idle_timeout_secs: 90,
             upstream_tls: true,
+            // Prefer H2 to providers by default (all of `KNOWN_PROVIDERS` offer it; H1 fallback is
+            // automatic). Flip to false for an all-H1 upstream without recompiling.
+            upstream_http2: true,
+            // Verify upstream certs by default; only the bench's self-signed TLS mock turns this off.
+            upstream_verify_cert: true,
             // Generous per-credential circuit breaker, on by default. Won't touch legitimate
             // steady-state traffic; caps a runaway/leaked key or a retry-storm flood. Set 0 to disable.
             rate_limit_rps: 100,

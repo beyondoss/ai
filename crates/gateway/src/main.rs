@@ -1,5 +1,6 @@
 //! Beyond AI gateway binary: clap `Run`/`Doctor`, Pingora server bootstrap, services.
 
+use beyond_ai::admin::AdminApp;
 use beyond_ai::config::AiConfig;
 use beyond_ai::doctor;
 use beyond_ai::metrics::Metrics;
@@ -7,8 +8,10 @@ use beyond_ai::proxy::AiProxy;
 use beyond_ai::state::GatewayState;
 use beyond_ai::store_watch::WatcherService;
 use clap::{Parser, Subcommand};
+use pingora_core::apps::http_app::HttpServer;
 use pingora_core::server::Server;
 use pingora_core::services::background::background_service;
+use pingora_core::services::listening::Service as ListeningService;
 use pingora_proxy::http_proxy_service;
 use std::path::Path;
 use std::process::exit;
@@ -60,9 +63,9 @@ fn init_tracing() {
 
 fn main() {
     // rustls 0.23 requires a process-wide crypto provider for the TLS connections to providers.
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .ok();
+    // Idempotent: an `Err` means a provider is already installed (e.g. a second init in tests),
+    // which is fine to ignore — the provider we want is in place either way.
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     let cli = Cli::parse();
 
@@ -122,10 +125,11 @@ fn main() {
         },
     ));
 
-    // Prometheus /metrics (serves the default registry that `Metrics` registered on).
-    let mut prom = pingora::services::listening::Service::prometheus_http_service();
-    prom.add_tcp(&metrics_listen);
-    server.add_service(prom);
+    // Metrics listener now also serves /livez + /readyz for the ECS/k8s probes. Pingora's built-in
+    // prometheus service only does /metrics, so we hand-route all three in one small ServeHttp.
+    let mut admin = ListeningService::new("ai-admin".to_string(), HttpServer::new_app(AdminApp));
+    admin.add_tcp(&metrics_listen);
+    server.add_service(admin);
 
     tracing::info!(%listen, %metrics_listen, "starting beyond-ai");
     server.run_forever();

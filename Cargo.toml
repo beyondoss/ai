@@ -7,6 +7,18 @@ edition = "2024"
 license = "MIT"
 rust-version = "1.85"
 
+# Applied to every crate root in the workspace (lib *and* bin) via `[lints] workspace = true`.
+# Crate-level `#![deny(...)]` attributes only cover the unit they're written in, so a binary root
+# (`main.rs`) would otherwise escape the library's denies — this closes that gap structurally.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+# Release builds wrap arithmetic silently by default; turn that into a panic so an overflow on a
+# size/count never goes unnoticed. Negligible cost for a proxy (arithmetic isn't the bottleneck).
+[profile.release]
+overflow-checks = true
+
 [workspace.dependencies]
 # slipstream is published — consume it from crates.io, aliased to `store` so the code's
 # `use store::...` is unchanged. No path deps into the `beyond` repo: this crate builds standalone.
@@ -26,6 +38,10 @@ bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 ed25519-dalek = "2.2"
 figment = { version = "0.10", features = ["toml", "env"] }
+getrandom = "0.3"
+# The types Pingora's `ServeHttp` trait speaks (`Response<Vec<u8>>`); pin to the same 1.x already in
+# the tree via Pingora so the admin app can name them directly.
+http = "1"
 memchr = "2"
 prometheus = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }

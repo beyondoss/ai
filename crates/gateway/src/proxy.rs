@@ -39,11 +39,16 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use pingora::http::ResponseHeader;
 use pingora_core::Result;
+use pingora_core::protocols::ALPN;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_proxy::{ProxyHttp, Session};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::info;
+use tracing::{info, warn};
+
+/// Response header carrying the per-request id (`{instance}-{seq}`). Set on both the proxied
+/// response and every reject body so a client can quote it and an oncall can grep for it.
+const REQUEST_ID_HEADER: &str = "x-beyond-request-id";
 
 /// Reject requests whose declared Content-Length exceeds this. The body itself is **not** buffered
 /// (it streams straight through); this is purely an abuse guard checked up front via the header.
@@ -109,19 +114,35 @@ pub struct RequestCtx {
     start: Instant,
     /// Connect-retry counter (see `fail_to_connect`).
     attempt: u8,
+    /// Process-unique id for this request (`{instance}-{seq}`), echoed in the `x-beyond-request-id`
+    /// response header and the `ai.usage` event so a client report ties back to a log line.
+    request_id: String,
 }
 
 impl AiProxy {
     /// Write a small JSON error and signal `request_filter` to short-circuit. The body is built with
     /// `serde_json` (not `format!`) so a `typ`/`msg` containing `"` or `\` can never break out of the
     /// JSON structure — keeps this safe if a future caller passes a non-literal message.
-    async fn reject(session: &mut Session, status: u16, typ: &str, msg: &str) -> Result<bool> {
+    ///
+    /// Every rejection logs one structured `warn` line (the rejection counter only says *how many*,
+    /// not *which request* — this is what an oncall greps when a `deny_fraud`/`rate_limit` spike
+    /// shows on the dashboard) and echoes the `request_id` in a response header so a client report
+    /// quoting that id lands on this line.
+    async fn reject(
+        session: &mut Session,
+        request_id: &str,
+        status: u16,
+        typ: &str,
+        msg: &str,
+    ) -> Result<bool> {
+        warn!(request_id, status, error_type = typ, "request rejected");
         let body = Bytes::from(
             serde_json::json!({ "error": { "type": typ, "message": msg } }).to_string(),
         );
         let mut resp = ResponseHeader::build(status, None)?;
         resp.insert_header("content-type", "application/json")?;
         resp.insert_header("content-length", body.len().to_string())?;
+        resp.insert_header(REQUEST_ID_HEADER, request_id)?;
         session.write_response_header(Box::new(resp), false).await?;
         session.write_response_body(Some(body), true).await?;
         Ok(true)
@@ -214,6 +235,10 @@ impl ProxyHttp for AiProxy {
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
         self.state.metrics.requests_total.inc();
         let start = Instant::now();
+        // One id per request, generated before any reject path so even a 400/401 carries it (in the
+        // log line and the `x-beyond-request-id` header). Moved into `ctx` at the end for the
+        // admitted path. Cheap: a counter bump + a short `format!` (see `next_request_id`).
+        let request_id = self.state.next_request_id();
 
         // 1. Resolve the upstream provider first — from the ingress dialect (the body/model isn't
         // available pre-connect), with an explicit `x-beyond-provider` override. Resolving up front
@@ -229,12 +254,26 @@ impl ProxyHttp for AiProxy {
                 .cloned(),
         };
         let Some(provider) = provider else {
-            return Self::reject(session, 400, "invalid_request_error", "unknown provider").await;
+            return Self::reject(
+                session,
+                &request_id,
+                400,
+                "invalid_request_error",
+                "unknown provider",
+            )
+            .await;
         };
 
         // 2. Extract the presented key — a managed virtual key (`bai_…`) or a raw BYO provider token.
         let Some(raw_key) = extract_virtual_key(session) else {
-            return Self::reject(session, 401, "authentication_error", "missing API key").await;
+            return Self::reject(
+                session,
+                &request_id,
+                401,
+                "authentication_error",
+                "missing API key",
+            )
+            .await;
         };
 
         // 3. Rate guardrails (see `ratelimit`), charged on the *raw presented key* **before** any
@@ -252,7 +291,14 @@ impl ProxyHttp for AiProxy {
                     .rejections_total
                     .with_label_values(&[reason.label()])
                     .inc();
-                return Self::reject(session, 429, "rate_limit_error", "rate limit exceeded").await;
+                return Self::reject(
+                    session,
+                    &request_id,
+                    429,
+                    "rate_limit_error",
+                    "rate limit exceeded",
+                )
+                .await;
             }
         }
 
@@ -267,6 +313,7 @@ impl ProxyHttp for AiProxy {
             if len > MAX_REQUEST_BODY {
                 return Self::reject(
                     session,
+                    &request_id,
                     413,
                     "invalid_request_error",
                     "request body too large",
@@ -285,7 +332,14 @@ impl ProxyHttp for AiProxy {
                     .rejections_total
                     .with_label_values(&["auth"])
                     .inc();
-                return Self::reject(session, 401, "authentication_error", "invalid API key").await;
+                return Self::reject(
+                    session,
+                    &request_id,
+                    401,
+                    "authentication_error",
+                    "invalid API key",
+                )
+                .await;
             };
             // Deny-set: O(1), default-allow. The gateway never learns *why*, only the reason code.
             if let Some(reason) = self.state.deny.load().reason(identity.tenant_id) {
@@ -300,6 +354,7 @@ impl ProxyHttp for AiProxy {
                     .inc();
                 return Self::reject(
                     session,
+                    &request_id,
                     reason.http_status(),
                     "access_denied",
                     "tenant is over limit or suspended",
@@ -309,7 +364,14 @@ impl ProxyHttp for AiProxy {
             // The actual `Bearer …`/`x-api-key` value is precomputed in the provider registry and
             // applied in `upstream_request_filter`; here we only confirm a pool key exists.
             if provider.pool_auth_value.is_none() {
-                return Self::reject(session, 503, "api_error", "no provider key available").await;
+                return Self::reject(
+                    session,
+                    &request_id,
+                    503,
+                    "api_error",
+                    "no provider key available",
+                )
+                .await;
             }
             (identity.tenant_id, identity.vpc_id, true)
         } else {
@@ -345,7 +407,12 @@ impl ProxyHttp for AiProxy {
             body_bytes_fed: 0,
             start,
             attempt: 0,
+            request_id,
         });
+        // Admitted: count it in-flight. Balanced by the decrement in `logging`, which runs exactly
+        // once per admitted request (rejected requests leave `ctx` None and never reach that path,
+        // so the gauge can't leak). `active_streams` only covers SSE; this covers every request.
+        self.state.metrics.requests_in_flight.inc();
         Ok(false)
     }
 
@@ -368,9 +435,22 @@ impl ProxyHttp for AiProxy {
         // e2e harness flips `upstream_tls=false` for a plaintext mock).
         let addr = match self.state.resolve(&rc.provider.authority).await {
             Ok(a) => a,
-            Err(_) => {
-                return Err(pingora_core::Error::new_str(
+            Err(e) => {
+                // DNS failures are rare and usually mean a misconfigured `provider_authorities`
+                // override — so keep the diagnostic (provider name + authority + the resolver error,
+                // already formatted into `e`) instead of discarding it behind an opaque static string.
+                // `error_because` chains `e` as the cause so it shows in the Pingora error log.
+                warn!(
+                    request_id = rc.request_id,
+                    provider = rc.provider.name.as_str(),
+                    authority = rc.provider.authority.as_str(),
+                    error = %e,
                     "upstream dns resolution failed",
+                );
+                return Err(pingora_core::Error::because(
+                    pingora_core::ErrorType::ConnectError,
+                    "upstream dns resolution failed",
+                    e,
                 ));
             }
         };
@@ -379,6 +459,26 @@ impl ProxyHttp for AiProxy {
             self.state.config.upstream_tls,
             rc.provider.host.clone(),
         );
+        // Prefer HTTP/2 to the provider (config `upstream_http2`, default on), fall back to HTTP/1.1.
+        // Every provider in `KNOWN_PROVIDERS` negotiates `h2` over TLS (verified by handshake), and H2
+        // multiplexes many concurrent requests/streams over one connection — fewer sockets and TLS
+        // handshakes from our egress IPs (which also eases the egress-reputation pressure `ratelimit`
+        // guards). `H2H1` is strictly ≥ `H1` on compatibility: ALPN negotiates down to H1 for any host
+        // that doesn't offer h2, and a plaintext upstream (the mock, `upstream_tls=false`) has no ALPN
+        // at all and stays H1. The negotiated protocol is then visible per-request as
+        // `upstream_request.version` (see `upstream_request_filter`), which is what lets the
+        // body-injection path frame correctly. The knob lets an operator force all-H1 without a code
+        // redeploy, and lets the e2e bench compare the two head-to-head.
+        peer.options.alpn = if self.state.config.upstream_http2 {
+            ALPN::H2H1
+        } else {
+            ALPN::H1
+        };
+        // Cert verification is on everywhere except the bench's self-signed TLS mock (see config).
+        if !self.state.config.upstream_verify_cert {
+            peer.options.verify_cert = false;
+            peer.options.verify_hostname = false;
+        }
         peer.options.connection_timeout =
             Some(Duration::from_secs(self.state.config.connect_timeout_secs));
         peer.options.read_timeout = Some(Duration::from_secs(self.state.config.read_timeout_secs));
@@ -429,10 +529,23 @@ impl ProxyHttp for AiProxy {
 
         // Injection-eligible (OpenAI managed stream): the body is rewritten in `request_body_filter`,
         // changing its length, and we can't know the new length here (headers go out before the body
-        // filter runs). So drop the client's `Content-Length` and frame the buffered body as chunked.
+        // filter runs). So drop the client's `Content-Length`; how the now-unknown length is framed
+        // depends on the **negotiated upstream protocol**, which is reliably readable here as
+        // `upstream_request.version`: pingora-proxy sets it to HTTP/2 before this filter on the H2 path
+        // (`proxy_h2.rs`) and to HTTP/1.1 on the H1 path (`proxy_h1.rs`).
+        //
+        //   - **H1**: a body with neither `content-length` nor `transfer-encoding` is framed as
+        //     *zero-length* by pingora's H1 client (RFC 9112 §6.3) — the injected body would be
+        //     silently dropped. So we must set `transfer-encoding: chunked`.
+        //   - **H2**: bodies are delimited by `END_STREAM`, and `transfer-encoding` is a forbidden
+        //     connection-specific header — the `h2` crate *rejects the whole request*
+        //     (`UserError::MalformedHeaders`) if it's present. So we must NOT set it; removing
+        //     `content-length` is sufficient and correct.
         if rc.inject_eligible {
             upstream_request.remove_header("content-length");
-            upstream_request.insert_header("transfer-encoding", "chunked")?;
+            if upstream_request.version != http::Version::HTTP_2 {
+                upstream_request.insert_header("transfer-encoding", "chunked")?;
+            }
         }
         Ok(())
     }
@@ -499,11 +612,28 @@ impl ProxyHttp for AiProxy {
         ctx: &mut Self::CTX,
     ) -> Result<()> {
         if let Some(rc) = ctx.as_mut() {
-            // Headers arrived ≈ time-to-first-byte.
+            // Headers arrived ≈ time-to-first-byte. Labeled by provider — first-token latency is
+            // per-provider, so an unlabeled histogram can't tell you which one regressed.
             self.state
                 .metrics
                 .ttft_seconds
+                .with_label_values(&[rc.provider.name.as_str()])
                 .observe(rc.start.elapsed().as_secs_f64());
+
+            // Per-provider response counter, bucketed by status class — the signal that a provider
+            // is degrading (429/5xx) before it shows up only as latency or a missing usage event.
+            let status_class = match upstream_response.status.as_u16() {
+                s if (200..300).contains(&s) => "2xx",
+                s if (300..400).contains(&s) => "3xx",
+                s if (400..500).contains(&s) => "4xx",
+                _ => "5xx",
+            };
+            self.state
+                .metrics
+                .upstream_responses_total
+                .with_label_values(&[rc.provider.name.as_str(), status_class])
+                .inc();
+
             // Derive streaming from the response, not the request: SSE ⇒ use the streaming usage
             // parser; otherwise the body is a single JSON object.
             rc.streaming = upstream_response
@@ -511,6 +641,17 @@ impl ProxyHttp for AiProxy {
                 .get("content-type")
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(|ct| ct.contains("event-stream"));
+            // Track concurrent SSE streams. Incremented here (response head is in), decremented in
+            // `logging` once the stream completes — so the gauge reflects in-flight streams, not a
+            // counter that only ever climbs. Non-streaming responses don't touch it.
+            if rc.streaming {
+                self.state.metrics.active_streams.inc();
+            }
+
+            // Echo the request id so a client (or an oncall reading a captured response) can quote it
+            // and land on this request's log line. `insert_header` only fails on an invalid value;
+            // our id is `[0-9a-f-]`, always valid — but surface a failure rather than silently drop.
+            upstream_response.insert_header(REQUEST_ID_HEADER, &rc.request_id)?;
         }
         Ok(())
     }
@@ -560,6 +701,22 @@ impl ProxyHttp for AiProxy {
             // Retry transient connect failures a couple of times (Pingora re-invokes upstream_peer).
             if rc.attempt < MAX_CONNECT_RETRIES {
                 rc.attempt += 1;
+                // Surface the retry. Without this, a partially-down provider TCP layer (or an
+                // egress-IP ban — connect is where that first bites) shows up only as extra latency
+                // on `upstream_latency_seconds`, indistinguishable from a slow model. The counter is
+                // the dashboard signal; the `warn!` carries the request_id to grep.
+                self.state
+                    .metrics
+                    .connect_retries_total
+                    .with_label_values(&[rc.provider.name.as_str()])
+                    .inc();
+                warn!(
+                    request_id = rc.request_id,
+                    provider = rc.provider.name.as_str(),
+                    attempt = rc.attempt,
+                    error = %e,
+                    "upstream connect failed; retrying",
+                );
                 e.set_retry(true);
             }
         }
@@ -569,10 +726,30 @@ impl ProxyHttp for AiProxy {
     async fn logging(
         &self,
         _session: &mut Session,
-        _e: Option<&pingora_core::Error>,
+        e: Option<&pingora_core::Error>,
         ctx: &mut Self::CTX,
     ) {
         let Some(rc) = ctx.as_mut() else { return };
+
+        // Balance the in-flight gauge incremented at admission. `logging` runs exactly once per
+        // admitted request — including on upstream errors and client disconnects — so the gauge
+        // always returns to baseline and can't drift upward.
+        self.state.metrics.requests_in_flight.dec();
+
+        // An upstream error (DNS/connect timeout, read timeout, abort) lands here with `Some(e)` but
+        // no `ai.usage` row (no parseable body) — and the earlier `warn!` in `upstream_peer` only
+        // fires for DNS, not connect/read failures. Log it with the full identity so "why did tenant
+        // 42 get 502s for 5 minutes" is one grep on the request_id, not a reconstruction.
+        if let Some(e) = e {
+            warn!(
+                request_id = rc.request_id,
+                tenant_id = rc.tenant_id,
+                vpc_id = rc.vpc_id,
+                provider = rc.provider.name.as_str(),
+                error = %e,
+                "upstream request errored",
+            );
+        }
 
         // The buffer may transiently hold up to 2× the cap before compaction; the usage event is
         // always in the last cap bytes, so slice to that bounded tail before parsing.
@@ -595,8 +772,23 @@ impl ProxyHttp for AiProxy {
         m.tokens_total
             .with_label_values(&["output"])
             .inc_by(usage.output_tokens);
+        // Cache tokens, too — these are in the `ai.usage` billing log below, but that ships with lag;
+        // the counter is the alerting surface for a cache-hit-rate cliff after a deploy.
+        m.tokens_total
+            .with_label_values(&["cache_read"])
+            .inc_by(usage.cache_read_tokens);
+        m.tokens_total
+            .with_label_values(&["cache_write"])
+            .inc_by(usage.cache_write_tokens);
         m.upstream_latency_seconds
+            .with_label_values(&[rc.provider.name.as_str()])
             .observe(rc.start.elapsed().as_secs_f64());
+        // Balance the `active_streams` increment from `response_filter`. `logging` runs exactly once
+        // per request (including on upstream errors / client disconnects), so a stream that opened is
+        // always accounted closed here — the gauge can't leak upward.
+        if rc.streaming {
+            m.active_streams.dec();
+        }
 
         // Emit the usage *fact* on a dedicated target — **managed only**. The event is an
         // identity-keyed billing record (logfwd/OTLP ships `ai.usage` → ClickHouse → a closed
@@ -618,6 +810,7 @@ impl ProxyHttp for AiProxy {
                 .unwrap_or_else(|| rc.model.clone());
             info!(
                 target: "ai.usage",
+                request_id = rc.request_id,
                 tenant_id = rc.tenant_id,
                 vpc_id = rc.vpc_id,
                 provider = rc.provider.name.as_str(),
