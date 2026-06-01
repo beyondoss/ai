@@ -263,7 +263,44 @@ mod tests {
 
     #[test]
     fn no_usage_returns_none() {
-        assert!(openai_stream(b"data: {\"choices\":[]}\n\n").is_none());
-        assert!(anthropic_body(b"{}").map(|u| u.input_tokens).unwrap_or(0) == 0);
+        // Absent `usage` and unparseable bodies must both meter as `None` — never a silent zero-token
+        // row that bills nothing while *looking* like a successful meter. A provider dropping `usage`
+        // (an error 200, a wire-version change) or returning non-JSON must surface as "no fact", which
+        // the proxy logs/alerts on, rather than a phantom 0-token success.
+
+        // --- non-streaming bodies ---
+        assert!(
+            openai_body(br#"{"choices":[{"message":{"content":"hi"}}]}"#).is_none(),
+            "openai body without a `usage` block has nothing to meter"
+        );
+        assert!(
+            openai_body(b"not json at all").is_none(),
+            "malformed openai body must not panic or meter zeros"
+        );
+        assert!(
+            anthropic_body(br#"{"content":[{"type":"text","text":"hi"}]}"#).is_none(),
+            "anthropic body without a `usage` block has nothing to meter"
+        );
+        assert!(
+            anthropic_body(b"{ broken").is_none(),
+            "malformed anthropic body must not panic or meter zeros"
+        );
+
+        // --- streaming: well-formed SSE that simply never carries a usage event ---
+        assert!(
+            openai_stream(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n"
+            )
+            .is_none(),
+            "an openai stream with content but no usage chunk meters nothing"
+        );
+        assert!(
+            anthropic_stream(
+                b"event: content_block_delta\n\
+                  data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"hi\"}}\n\n"
+            )
+            .is_none(),
+            "an anthropic stream with no usage-bearing event meters nothing"
+        );
     }
 }

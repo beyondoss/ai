@@ -151,5 +151,9 @@ mod tests {
     fn spend_is_402_fraud_is_403() {
         assert_eq!(DenyReason::Spend.http_status(), 402);
         assert_eq!(DenyReason::Fraud.http_status(), 403);
+        // Unknown is fail-safe: an unrecognized reason still denies, and maps to 403 like fraud
+        // (not 402) — so a control-plane reason we don't yet parse can't be mistaken for a billing
+        // block or, worse, leak through as an allow.
+        assert_eq!(DenyReason::Unknown.http_status(), 403);
     }
 }

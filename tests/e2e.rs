@@ -506,6 +506,64 @@ async fn per_credential_rate_limit_returns_429() {
 }
 
 #[tokio::test]
+async fn byo_global_rate_limit_caps_distinct_tokens() {
+    // The global BYO aggregate cap is the primary egress-IP protection: a flood of *distinct* junk
+    // BYO tokens (each its own per-credential bucket, so the per-credential tier never trips) would
+    // otherwise open junk-auth connections to providers from our egress IPs and get them banned.
+    // This proves the shared bucket bounds that aggregate. Per-credential is disabled so the only
+    // ceiling in play is the global BYO one — and a regression that inverts the `!managed` guard or
+    // skips the tier would slip past every other test.
+    let nats = Nats::start().await;
+    let (pubkey, _sk) = test_keypair(43);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats.port, &mock.authority(), &b64(&pubkey))
+        .rate_limit_rps(0) // isolate: per-credential tier off
+        .byo_rate_limit_rps(3) // global BYO ceiling
+        .start()
+        .await;
+    let client = reqwest::Client::new();
+
+    // Warm with a *managed* path is pointless here (managed is exempt); warm with a distinct BYO
+    // token whose single hit can't itself exhaust a 3-rps bucket mid-readiness.
+    {
+        let (c, u) = (client.clone(), gw.url());
+        wait_for_status(200, move || {
+            let (c, u) = (c.clone(), u.clone());
+            async move { post_status(&c, &u, "sk-byo-warmup", body_for("gpt-4o")).await }
+        })
+        .await;
+    }
+
+    // Each request uses a *different* BYO token, so per-credential keying would never trip — only the
+    // shared BYO bucket can. The first few are served; once the aggregate ceiling is crossed the rest
+    // are throttled.
+    let mut saw_200 = false;
+    let mut saw_429 = false;
+    for i in 0..50 {
+        match post_status(
+            &client,
+            &gw.url(),
+            &format!("sk-byo-distinct-{i}"),
+            body_for("gpt-4o"),
+        )
+        .await
+        {
+            200 => saw_200 = true,
+            429 => saw_429 = true,
+            other => panic!("unexpected status under BYO global rate limit: {other}"),
+        }
+    }
+    assert!(saw_200, "requests under the BYO ceiling must be served");
+    assert!(
+        saw_429,
+        "a flood of distinct BYO tokens past the global ceiling must yield 429"
+    );
+    // The dedicated BYO-global reason label — distinct from the per-credential `rate_limit` — must be
+    // what fired, so an operator can tell which knob tripped.
+    wait_for_metric(&gw, "ai_rejections_total", "rate_limit_byo_global", 1.0).await;
+}
+
+#[tokio::test]
 async fn managed_key_via_x_api_key_header_is_accepted() {
     // Anthropic SDKs present the key in `x-api-key`, not `Authorization: Bearer`. A managed virtual
     // key must be extracted from either header; here it arrives via x-api-key on the OpenAI path and
