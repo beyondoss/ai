@@ -1,0 +1,943 @@
+//! The Pingora `ProxyHttp` passthrough service.
+//!
+//! Flow: pick the provider from the **first path segment** (`/{provider}/…`) → verify the virtual
+//! key (stateless) → deny-set check (O(1), default-allow) → swap the auth
+//! header to the pool key (managed only) → **stream the request body straight through** (never
+//! buffered; original framing preserved) while feeding it to a structural scanner that extracts the
+//! exact root-level `model` → relay the response **without buffering** → tap usage from a bounded
+//! tail → emit a usage fact. Whether the call is streaming is derived from the *response*
+//! Content-Type.
+//!
+//! Verified end-to-end (`tests/e2e.rs`): a real `beyond-ai` binary against real nats-server + a
+//! mock upstream — passthrough fidelity, key swap, usage metering (non-streaming + SSE), BYO
+//! passthrough, and deny-set propagation all pass.
+//!
+//! We never read the request body in `request_filter`: Pingora's body-forward phase reads the
+//! downstream body itself, so draining it earlier would make Pingora send `Content-Length` bytes
+//! with no body and the upstream would hang. We let the body flow through `request_body_filter`
+//! (the supported hook), feeding each chunk to a streaming structural scanner (`peek::ModelScanner`,
+//! O(1) memory) — never withholding or buffering it.
+//!
+//! One deliberate exception to the no-buffer rule: a **managed** OpenAI chat/responses request is
+//! buffered and gets `stream_options.include_usage` injected when it streams without it — otherwise
+//! OpenAI emits no usage chunk and the request couldn't be metered. We can't set that option in a
+//! client SDK we don't control, so the gateway guarantees it, out of the box. Scoped to exactly that
+//! path (managed + OpenAI dialect + streaming-capable); BYO and everything else stay pure passthrough.
+//!
+//! Auth branches on key format: `bai_…` is a managed virtual key (verify → deny-check → swap to
+//! the pool key); anything else is a **BYO** request — the user's own provider token, passed
+//! through unchanged (no swap, no Beyond identity, no deny-set).
+//!
+//! Routing is by the **first path segment** = provider name (`route`, data-driven): `/{provider}/…`
+//! selects the provider and the rest of the path is forwarded **verbatim** (the gateway holds no
+//! per-provider mount knowledge). A bare path with no provider prefix that starts with `/v1` is the
+//! drop-in default — dialect picks openai/anthropic (`dialect_for_path`) — so an OpenAI/Anthropic
+//! client works by changing only the host. An unknown first segment is a 404. Model isn't used for
+//! routing (the body isn't read pre-connect); it's still captured from the body for usage.
+
+use crate::route::{self, Dialect, Provider};
+use crate::state::{GatewayState, RequestId};
+use crate::{peek, usage};
+use async_trait::async_trait;
+use bytes::Bytes;
+use pingora::http::ResponseHeader;
+use pingora_core::Result;
+use pingora_core::protocols::ALPN;
+use pingora_core::upstreams::peer::HttpPeer;
+use pingora_proxy::{ProxyHttp, Session};
+use std::borrow::Cow;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tracing::{info, warn};
+
+/// Response header carrying the per-request id (`{instance}-{seq}`). Set on both the proxied
+/// response and every reject body so a client can quote it and an oncall can grep for it.
+const REQUEST_ID_HEADER: &str = "x-beyond-request-id";
+
+/// Reject requests whose declared Content-Length exceeds this. The body itself is **not** buffered
+/// (it streams straight through); this is purely an abuse guard checked up front via the header.
+const MAX_REQUEST_BODY: usize = 100 * 1024 * 1024;
+
+/// Bounded tail of the response kept for usage extraction. The usage event is the final SSE chunk
+/// / the whole non-streaming body; keeping a tail means we never buffer a long stream.
+const USAGE_TAIL_CAP: usize = 64 * 1024;
+
+/// Max upstream **connect** retries before surfacing the failure to the client.
+///
+/// We retry connect failures only (the idiomatic Pingora pattern, same as edge). Retrying on a
+/// received **5xx/429 response** is deliberately *not* done: Pingora 0.8 has no clean
+/// post-response retry hook for a streaming passthrough (edge doesn't do it either), the upstream
+/// may have started streaming, and the provider SDKs already back off on 429/5xx + `Retry-After`.
+const MAX_CONNECT_RETRIES: u8 = 2;
+
+pub struct AiProxy {
+    pub state: Arc<GatewayState>,
+}
+
+/// Per-request context. `None` until `request_filter` admits the request; short-circuited
+/// requests (auth/deny failures) leave it `None`, so later filters no-op.
+pub struct RequestCtx {
+    tenant_id: u64,
+    vpc_id: u64,
+    dialect: Dialect,
+    /// The resolved upstream provider (authority/host + precomputed managed auth value), shared from
+    /// the boot-time registry — a cheap `Arc` clone, nothing re-allocated per request.
+    provider: Arc<Provider>,
+    /// The path (+ query) to send upstream: the client path with the `/{provider}` segment stripped
+    /// (provider-prefixed request) or unchanged (bare-path default). Forwarded **verbatim** — the
+    /// gateway does no per-provider path rewriting. Applied as the upstream URI in
+    /// `upstream_request_filter`.
+    forward_path: String,
+    /// Whether this is a **managed** request (`bai_…` key → swap to the pool key). `false` for
+    /// **BYO** — we leave the user's own auth header untouched (passthrough).
+    managed: bool,
+    /// Model the client *requested*, extracted from the request body. This is the billing-log
+    /// **fallback** — the authoritative value is the model the provider echoes in its response (see
+    /// `resp_model_scanner`), because a client may send an alias (`gpt-4o`) that the provider resolves
+    /// to and bills under a pinned id (`gpt-4o-2024-08-06`).
+    model: String,
+    model_scanner: peek::ModelScanner,
+    /// Extracts the model the **provider** reports in its response (the resolved/billed id), fed the
+    /// response stream in `response_body_filter`. Preferred over `model` in the `ai.usage` event so
+    /// the billed model is authoritative, not the requested alias. Works for SSE too: the scanner
+    /// skips the `data: ` prefix and reads the first chunk's root `model`. Falls back to `model` when
+    /// the response carries none (e.g. an error body).
+    resp_model_scanner: peek::ModelScanner,
+    /// Whether the upstream response is an SSE stream — set in `response_filter` from the response
+    /// Content-Type (we don't read the request to learn this).
+    streaming: bool,
+    /// Bounded tail of the response, for the usage tap.
+    resp_tail: Vec<u8>,
+    /// Running total of request-body bytes seen, to enforce `MAX_REQUEST_BODY` even when the client
+    /// uses chunked transfer encoding (no `Content-Length` to check up front).
+    body_bytes_fed: usize,
+    /// Upstream HTTP status, set in `response_filter` once the response head arrives. Drives the
+    /// circuit-breaker outcome recorded once in `logging`: `5xx` → failure, any other response →
+    /// success (the provider answered — a `429` is a healthy throttle, not a breaker trip), and a
+    /// `None` here with an upstream error → failure (connect/read failed before any response).
+    upstream_status: Option<u16>,
+    /// Managed OpenAI chat/responses request: buffer the body and inject
+    /// `stream_options.include_usage` if it streams without it, so the usage chunk (hence the
+    /// billable token count) is guaranteed. The single, deliberate exception to "never buffer the
+    /// request body" — scoped to the managed OpenAI streaming-capable path and bounded by
+    /// `MAX_REQUEST_BODY`. BYO and every other request still stream straight through.
+    inject_eligible: bool,
+    /// Accumulated request body — populated only when `inject_eligible`; otherwise stays empty and
+    /// the body is never buffered.
+    req_buf: Vec<u8>,
+    start: Instant,
+    /// Connect-retry counter (see `fail_to_connect`).
+    attempt: u8,
+    /// Process-unique id for this request (`{instance}-{seq}`), echoed in the `x-beyond-request-id`
+    /// response header and the `ai.usage` event so a client report ties back to a log line.
+    request_id: RequestId,
+}
+
+impl AiProxy {
+    /// Write a small JSON error and signal `request_filter` to short-circuit. The body is built with
+    /// `serde_json` (not `format!`) so a `typ`/`msg` containing `"` or `\` can never break out of the
+    /// JSON structure — keeps this safe if a future caller passes a non-literal message.
+    ///
+    /// Every rejection logs one structured `warn` line (the rejection counter only says *how many*,
+    /// not *which request* — this is what an oncall greps when a `deny_fraud`/`rate_limit` spike
+    /// shows on the dashboard) and echoes the `request_id` in a response header so a client report
+    /// quoting that id lands on this line.
+    async fn reject(
+        session: &mut Session,
+        request_id: &str,
+        status: u16,
+        typ: &str,
+        msg: &str,
+    ) -> Result<bool> {
+        warn!(request_id, status, error_type = typ, "request rejected");
+        let body = Bytes::from(
+            serde_json::json!({ "error": { "type": typ, "message": msg } }).to_string(),
+        );
+        let mut resp = ResponseHeader::build(status, None)?;
+        resp.insert_header("content-type", "application/json")?;
+        resp.insert_header("content-length", body.len().to_string())?;
+        resp.insert_header(REQUEST_ID_HEADER, request_id)?;
+        session.write_response_header(Box::new(resp), false).await?;
+        session.write_response_body(Some(body), true).await?;
+        Ok(true)
+    }
+}
+
+fn extract_virtual_key(session: &Session) -> Option<&str> {
+    let h = session.req_header();
+    // Anthropic SDK sends `x-api-key`; OpenAI SDK sends `Authorization: Bearer`. One neutral
+    // virtual key works in either, so check both. Borrowed from the header — no per-request copy.
+    if let Some(v) = h.headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
+        return Some(v);
+    }
+    h.headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+}
+
+/// Upper bound on a model id we'll record. Real ids are short (`claude-opus-4-8`,
+/// `accounts/fireworks/models/…`); anything longer is junk or an attempt to bloat the billing log.
+const MAX_MODEL_LEN: usize = 128;
+
+/// Sanitize the model id extracted from the (client-controlled) request body before it lands in the
+/// `ai.usage` billing log. `tracing`'s JSON layer escapes the value, but a downstream consumer
+/// (logfwd/OTLP → ClickHouse) may re-handle it, so we refuse anything that could break out of a JSON
+/// string or a line-oriented log: control bytes, `"`, `\`, `DEL`. A violating or over-long value is
+/// recorded as `"unknown"` (matching `peek`'s non-UTF-8 fallback) rather than the raw bytes — a
+/// mislabeled-but-safe usage row beats a corrupted or injected one.
+fn sanitize_model(model: String) -> Cow<'static, str> {
+    let bad = model.len() > MAX_MODEL_LEN
+        || model
+            .bytes()
+            .any(|b| b < 0x20 || b == b'"' || b == b'\\' || b == 0x7f);
+    if bad {
+        Cow::Borrowed("unknown")
+    } else {
+        Cow::Owned(model)
+    }
+}
+
+fn dialect_for_path(path: &str) -> Dialect {
+    // Anthropic Messages vs OpenAI Chat Completions/Embeddings. Embeddings are OpenAI-dialect only.
+    if path.starts_with("/v1/messages") {
+        Dialect::Anthropic
+    } else {
+        Dialect::OpenAI
+    }
+}
+
+/// Whether the **forwarded** (provider-native) path targets an OpenAI streaming-capable endpoint —
+/// chat completions or the Responses API. Checked by *suffix*, so it holds regardless of the
+/// provider's mount prefix (`/v1/chat/completions`, `/openai/v1/chat/completions`,
+/// `/inference/v1/chat/completions`, …). Only these get buffered for `stream_options.include_usage`
+/// injection — embeddings and everything else never stream, so there's nothing to meter.
+fn is_streamable_path(forward_path: &str) -> bool {
+    forward_path.ends_with("/chat/completions") || forward_path.ends_with("/responses")
+}
+
+/// Splice `stream_options.include_usage` into a buffered OpenAI chat body when it streams without it
+/// (see `peek::plan_stream_usage_injection`); otherwise return it unchanged. This is what guarantees
+/// a usage chunk — hence a billable token count — from a stock client that never set the option.
+fn maybe_inject_stream_usage(body: Vec<u8>) -> Vec<u8> {
+    match peek::plan_stream_usage_injection(&body) {
+        Some(at) => {
+            const FRAG: &[u8] = br#""stream_options":{"include_usage":true},"#;
+            let mut out = Vec::with_capacity(body.len() + FRAG.len());
+            out.extend_from_slice(&body[..at]);
+            out.extend_from_slice(FRAG);
+            out.extend_from_slice(&body[at..]);
+            out
+        }
+        None => body,
+    }
+}
+
+#[async_trait]
+impl ProxyHttp for AiProxy {
+    type CTX = Option<RequestCtx>;
+
+    fn new_ctx(&self) -> Self::CTX {
+        None
+    }
+
+    async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
+        self.state.metrics.requests_total.inc();
+        let start = Instant::now();
+        // One id per request, generated before any reject path so even a 400/401 carries it (in the
+        // log line and the `x-beyond-request-id` header). Moved into `ctx` at the end for the
+        // admitted path. Cheap: a counter bump + a short `format!` (see `next_request_id`).
+        let request_id = self.state.next_request_id();
+
+        // 1. Route by the **first path segment** = provider; forward the rest of the path verbatim
+        // (native passthrough — the gateway holds no per-provider mount knowledge). A path with no
+        // provider segment that starts with `/v1` is the drop-in default: dialect picks
+        // openai/anthropic and the path is forwarded as-is. Anything else → unknown provider (404).
+        // We resolve before auth (an unknown route is cheap) and compute owned values inside the
+        // block so the session borrow ends before any `&mut session` reject below.
+        let (provider_opt, forward_path) = {
+            let uri = &session.req_header().uri;
+            let path = uri.path();
+            let query = uri.query();
+            // `nth(1)`: `/openai/v1/…` → "openai"; `/v1/…` → "v1"; "/" or "" → "".
+            let first = path.split('/').nth(1).unwrap_or("");
+            let with_query = |p: &str| match query {
+                Some(q) => format!("{p}?{q}"),
+                None => p.to_string(),
+            };
+            if let Some(p) = self.state.provider(first) {
+                // Provider-prefixed: strip the leading `/{first}` segment, forward the remainder.
+                let rest = &path[1 + first.len()..];
+                (
+                    Some(p.clone()),
+                    with_query(if rest.is_empty() { "/" } else { rest }),
+                )
+            } else if path.starts_with(route::DEFAULT_PREFIX) {
+                // Bare default: dialect picks the provider; forward the path unchanged.
+                let name = route::dialect_default(dialect_for_path(path));
+                (self.state.provider(name).cloned(), with_query(path))
+            } else {
+                (None, String::new())
+            }
+        };
+        let Some(provider) = provider_opt else {
+            return Self::reject(
+                session,
+                &request_id,
+                404,
+                "invalid_request_error",
+                "unknown provider",
+            )
+            .await;
+        };
+        // Dialect now comes from the resolved provider (usage parsing + injection eligibility).
+        let dialect = provider.dialect;
+
+        // 2. Extract the presented key — a managed virtual key (`bai_…`) or a raw BYO provider token.
+        let Some(raw_key) = extract_virtual_key(session) else {
+            return Self::reject(
+                session,
+                &request_id,
+                401,
+                "authentication_error",
+                "missing API key",
+            )
+            .await;
+        };
+
+        // 3. Rate guardrails (see `ratelimit`), charged on the *raw presented key* **before** any
+        // verification or upstream connect. Keying on the credential we already hold (rather than the
+        // verified tenant id) is what lets this sit ahead of the Ed25519 verify: a single leaked,
+        // runaway, or forged key can't drive unbounded crypto work (per-credential tier), and a flood
+        // of distinct random BYO tokens can't drive junk-auth connects to providers from our egress
+        // IPs (global BYO tier — managed traffic is exempt, see `ratelimit`). The `check` borrow of
+        // `raw_key` ends as the call returns, so the `&mut session` reject is free to run on the
+        // over-limit path (where `raw_key` is unused afterward).
+        if let Some(rl) = &self.state.rate_limit {
+            if let Some(reason) = rl.check(raw_key, raw_key.starts_with("bai_")) {
+                self.state
+                    .metrics
+                    .rejections_total
+                    .with_label_values(&[reason.label()])
+                    .inc();
+                return Self::reject(
+                    session,
+                    &request_id,
+                    429,
+                    "rate_limit_error",
+                    "rate limit exceeded",
+                )
+                .await;
+            }
+        }
+
+        // 4. Reject oversized bodies up front (Content-Length) so we never buffer a huge upload.
+        let declared_len = session
+            .req_header()
+            .headers
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<usize>().ok());
+        if let Some(len) = declared_len {
+            if len > MAX_REQUEST_BODY {
+                return Self::reject(
+                    session,
+                    &request_id,
+                    413,
+                    "invalid_request_error",
+                    "request body too large",
+                )
+                .await;
+            }
+        }
+
+        // 5. Identity + key handling. `bai_…` → managed (stateless verify → deny-check → swap to the
+        // pool key). Anything else → BYO: the user's own provider token, passed through unchanged
+        // (no Beyond identity, so no deny-set and no per-tenant attribution).
+        let (tenant_id, vpc_id, managed) = if raw_key.starts_with("bai_") {
+            let Ok(identity) = self.state.keyring.verify(raw_key) else {
+                self.state
+                    .metrics
+                    .rejections_total
+                    .with_label_values(&["auth"])
+                    .inc();
+                return Self::reject(
+                    session,
+                    &request_id,
+                    401,
+                    "authentication_error",
+                    "invalid API key",
+                )
+                .await;
+            };
+            // Deny-set: O(1), default-allow. The gateway never learns *why*, only the reason code.
+            if let Some(reason) = self.state.deny.load().reason(identity.tenant_id) {
+                // Distinct label per reason — `Unknown` is *not* folded into `deny_fraud`. An
+                // `Unknown` arises when the control plane writes a reason string this gateway
+                // doesn't recognize (a control-plane deploy ahead of a gateway deploy), which would
+                // otherwise spike the fraud counter and mask the real fraud signal. A `deny_unknown`
+                // label surfaces it as the deployment-coordination issue it is.
+                let label = match reason {
+                    crate::deny::DenyReason::Spend => "deny_spend",
+                    crate::deny::DenyReason::Fraud => "deny_fraud",
+                    crate::deny::DenyReason::Unknown => "deny_unknown",
+                };
+                self.state
+                    .metrics
+                    .rejections_total
+                    .with_label_values(&[label])
+                    .inc();
+                return Self::reject(
+                    session,
+                    &request_id,
+                    reason.http_status(),
+                    "access_denied",
+                    "tenant is over limit or suspended",
+                )
+                .await;
+            }
+            // The actual `Bearer …`/`x-api-key` value is precomputed in the provider registry and
+            // applied in `upstream_request_filter`; here we only confirm a pool key exists.
+            if provider.pool_auth_value.is_none() {
+                return Self::reject(
+                    session,
+                    &request_id,
+                    503,
+                    "api_error",
+                    "no provider key available",
+                )
+                .await;
+            }
+            (identity.tenant_id, identity.vpc_id, true)
+        } else {
+            (0, 0, false)
+        };
+
+        // Mark OpenAI managed chat/responses streams for body buffering + `stream_options` injection
+        // (handled in `request_body_filter`). Scoped tight: managed only (BYO stays pure
+        // passthrough), OpenAI dialect only, streaming-capable paths only — so everything else still
+        // streams through untouched. Checked on the forwarded path (suffix), so it's prefix-agnostic.
+        let inject_eligible =
+            managed && dialect == Dialect::OpenAI && is_streamable_path(&forward_path);
+
+        // Circuit breaker (per provider, all traffic — a down provider is down regardless of whose
+        // key is used). Checked here, after every other rejection, so claiming a half-open probe
+        // permit corresponds to an *actual* upstream attempt — and balanced by exactly one
+        // `record_*` in `logging` (which runs once per admitted request), so a permit can't leak.
+        // When open, fast-fail 503 instead of piling the request against `read_timeout_secs` and
+        // exhausting connection/in-flight slots for every provider. 5xx/connect failures trip it;
+        // 429 never does (that's a healthy provider throttling — see `logging`).
+        if let Some(breaker) = &provider.breaker {
+            if breaker.allow().is_err() {
+                self.state
+                    .metrics
+                    .rejections_total
+                    .with_label_values(&["circuit_open"])
+                    .inc();
+                return Self::reject(
+                    session,
+                    &request_id,
+                    503,
+                    "api_error",
+                    "provider temporarily unavailable",
+                )
+                .await;
+            }
+        }
+
+        *ctx = Some(RequestCtx {
+            tenant_id,
+            vpc_id,
+            dialect,
+            provider,
+            forward_path,
+            managed,
+            model: String::new(),
+            model_scanner: peek::ModelScanner::new(),
+            resp_model_scanner: peek::ModelScanner::new(),
+            streaming: false,
+            inject_eligible,
+            // Only the inject-eligible path ever buffers the request body (to splice
+            // `stream_options` after the root `{`; the `stream` key can appear anywhere in the root
+            // object, so the decision needs the whole body — buffering is inherent here, not
+            // incidental). When it does, pre-size from the declared Content-Length so accumulation is
+            // a single allocation instead of a geometric realloc chain; capped at `MAX_REQUEST_BODY`
+            // so a lying header can't pre-allocate unbounded memory. Every other request leaves this
+            // empty and never buffers.
+            req_buf: match (inject_eligible, declared_len) {
+                (true, Some(len)) => Vec::with_capacity(len.min(MAX_REQUEST_BODY)),
+                _ => Vec::new(),
+            },
+            // Grown lazily by the response tap (`response_body_filter`), not pre-reserved: a
+            // non-streaming response — the common case — is a few hundred bytes, so reserving the
+            // full 64KB cap up front would waste an allocation on every request to hold ~200B. A
+            // long stream grows it geometrically to the bounded 2×cap and compacts; that handful of
+            // reallocs is lost in the network noise of a stream we're already relaying chunk by chunk.
+            resp_tail: Vec::new(),
+            body_bytes_fed: 0,
+            upstream_status: None,
+            start,
+            attempt: 0,
+            request_id,
+        });
+        // Admitted: count it in-flight. Balanced by the decrement in `logging`, which runs exactly
+        // once per admitted request (rejected requests leave `ctx` None and never reach that path,
+        // so the gauge can't leak). `active_streams` only covers SSE; this covers every request.
+        self.state.metrics.requests_in_flight.inc();
+        Ok(false)
+    }
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        ctx: &mut Self::CTX,
+    ) -> Result<Box<HttpPeer>> {
+        // `ctx` is set by `request_filter` for every admitted request; a missing ctx here means an
+        // unadmitted request reached `upstream_peer` (a Pingora ordering change or future refactor).
+        // Surface it as an error rather than panicking the worker.
+        let Some(rc) = ctx.as_ref() else {
+            return Err(pingora_core::Error::new_str(
+                "upstream_peer reached without request context",
+            ));
+        };
+
+        // Resolve via the TTL cache (async, non-blocking) rather than `HttpPeer::new`'s eager
+        // blocking `getaddrinfo`. SNI/Host = the configured host; TLS on for real providers (the
+        // e2e harness flips `upstream_tls=false` for a plaintext mock).
+        let addr = match self.state.resolve(&rc.provider.authority).await {
+            Ok(a) => a,
+            Err(e) => {
+                // DNS failures are rare and usually mean a misconfigured `provider_authorities`
+                // override — so keep the diagnostic (provider name + authority + the resolver error,
+                // already formatted into `e`) instead of discarding it behind an opaque static string.
+                // `error_because` chains `e` as the cause so it shows in the Pingora error log.
+                warn!(
+                    request_id = %rc.request_id,
+                    provider = rc.provider.name.as_str(),
+                    authority = rc.provider.authority.as_str(),
+                    error = %e,
+                    "upstream dns resolution failed",
+                );
+                return Err(pingora_core::Error::because(
+                    pingora_core::ErrorType::ConnectError,
+                    "upstream dns resolution failed",
+                    e,
+                ));
+            }
+        };
+        let mut peer = HttpPeer::new(
+            addr,
+            self.state.config.upstream_tls,
+            rc.provider.host.clone(),
+        );
+        // Prefer HTTP/2 to the provider (config `upstream_http2`, default on), fall back to HTTP/1.1.
+        // Every provider in `KNOWN_PROVIDERS` negotiates `h2` over TLS (verified by handshake), and H2
+        // multiplexes many concurrent requests/streams over one connection — fewer sockets and TLS
+        // handshakes from our egress IPs (which also eases the egress-reputation pressure `ratelimit`
+        // guards). `H2H1` is strictly ≥ `H1` on compatibility: ALPN negotiates down to H1 for any host
+        // that doesn't offer h2, and a plaintext upstream (the mock, `upstream_tls=false`) has no ALPN
+        // at all and stays H1. The negotiated protocol is then visible per-request as
+        // `upstream_request.version` (see `upstream_request_filter`), which is what lets the
+        // body-injection path frame correctly. The knob lets an operator force all-H1 without a code
+        // redeploy, and lets the e2e bench compare the two head-to-head.
+        peer.options.alpn = if self.state.config.upstream_http2 {
+            ALPN::H2H1
+        } else {
+            ALPN::H1
+        };
+        // Cert verification is on everywhere except the bench's self-signed TLS mock (see config).
+        if !self.state.config.upstream_verify_cert {
+            peer.options.verify_cert = false;
+            peer.options.verify_hostname = false;
+        }
+        peer.options.connection_timeout =
+            Some(Duration::from_secs(self.state.config.connect_timeout_secs));
+        peer.options.read_timeout = Some(Duration::from_secs(self.state.config.read_timeout_secs));
+        peer.options.write_timeout =
+            Some(Duration::from_secs(self.state.config.write_timeout_secs));
+        peer.options.idle_timeout = Some(Duration::from_secs(self.state.config.idle_timeout_secs));
+        Ok(Box::new(peer))
+    }
+
+    async fn upstream_request_filter(
+        &self,
+        _session: &mut Session,
+        upstream_request: &mut pingora::http::RequestHeader,
+        ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        let Some(rc) = ctx.as_ref() else {
+            return Ok(());
+        };
+
+        // Managed: swap the virtual key for the real pool key (precomputed at boot) in the scheme
+        // the upstream wants — removing *both* inbound auth headers first so the virtual key never
+        // leaks upstream. BYO (`!managed`): leave the user's own auth header exactly as presented.
+        if rc.managed {
+            if let Some(av) = &rc.provider.pool_auth_value {
+                upstream_request.remove_header("authorization");
+                upstream_request.remove_header("x-api-key");
+                upstream_request.insert_header(rc.provider.auth.header(), av.expose())?;
+            }
+        }
+
+        // Point Host at the upstream.
+        upstream_request.insert_header("host", rc.provider.host.as_str())?;
+
+        // Forward the provider-native path (computed in `request_filter`): the client path with the
+        // `/{provider}` segment stripped, or unchanged for a bare-path default. We send it verbatim —
+        // no per-provider rewriting. Only set the URI when it actually differs from the inbound path
+        // (i.e. a `/{provider}` prefix was stripped); the bare-path case needs no change, so we skip
+        // the parse + realloc. The body's framing (Content-Length / chunked) is preserved.
+        if rc.forward_path
+            != upstream_request
+                .uri
+                .path_and_query()
+                .map(|pq| pq.as_str())
+                .unwrap_or("")
+            && let Ok(uri) = rc.forward_path.parse()
+        {
+            upstream_request.set_uri(uri);
+        }
+
+        // Injection-eligible (OpenAI managed stream): the body is rewritten in `request_body_filter`,
+        // changing its length, and we can't know the new length here (headers go out before the body
+        // filter runs). So drop the client's `Content-Length`; how the now-unknown length is framed
+        // depends on the **negotiated upstream protocol**, which is reliably readable here as
+        // `upstream_request.version`: pingora-proxy sets it to HTTP/2 before this filter on the H2 path
+        // (`proxy_h2.rs`) and to HTTP/1.1 on the H1 path (`proxy_h1.rs`).
+        //
+        //   - **H1**: a body with neither `content-length` nor `transfer-encoding` is framed as
+        //     *zero-length* by pingora's H1 client (RFC 9112 §6.3) — the injected body would be
+        //     silently dropped. So we must set `transfer-encoding: chunked`.
+        //   - **H2**: bodies are delimited by `END_STREAM`, and `transfer-encoding` is a forbidden
+        //     connection-specific header — the `h2` crate *rejects the whole request*
+        //     (`UserError::MalformedHeaders`) if it's present. So we must NOT set it; removing
+        //     `content-length` is sufficient and correct.
+        if rc.inject_eligible {
+            upstream_request.remove_header("content-length");
+            if upstream_request.version != http::Version::HTTP_2 {
+                upstream_request.insert_header("transfer-encoding", "chunked")?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn request_body_filter(
+        &self,
+        _session: &mut Session,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        let Some(rc) = ctx.as_mut() else {
+            return Ok(());
+        };
+        // Feed the body through the structural scanner as it passes (never withheld, never
+        // buffered) to extract the exact root-level `model`. Body framing is untouched.
+        if let Some(chunk) = body.as_ref() {
+            // Enforce the body cap on the *streamed* size too: the up-front `Content-Length` check in
+            // `request_filter` can't see a chunked-encoded body (no declared length). We don't buffer
+            // — we just count — and abort the proxied request once the running total crosses the cap.
+            // Aborting (vs. a clean 413) is acceptable here: headers are already away to the upstream,
+            // and this is an abuse guard, not a normal client path.
+            rc.body_bytes_fed = rc.body_bytes_fed.saturating_add(chunk.len());
+            if rc.body_bytes_fed > MAX_REQUEST_BODY {
+                self.state
+                    .metrics
+                    .rejections_total
+                    .with_label_values(&["body_too_large"])
+                    .inc();
+                return Err(pingora_core::Error::new_str("request body exceeds limit"));
+            }
+            rc.model_scanner.feed(chunk);
+            // Eligible requests are buffered so we can splice the root object before any byte reaches
+            // the upstream (injection inserts near the front, so we can't have forwarded it already).
+            if rc.inject_eligible {
+                rc.req_buf.extend_from_slice(chunk);
+            }
+        }
+
+        if rc.inject_eligible {
+            if end_of_stream {
+                // Emit the whole (possibly rewritten) body in one shot; `transfer-encoding: chunked`
+                // (set in `upstream_request_filter`) makes the changed length fine.
+                let buf = std::mem::take(&mut rc.req_buf);
+                *body = Some(Bytes::from(maybe_inject_stream_usage(buf)));
+            } else {
+                // Withhold — the bytes are buffered above; nothing goes upstream until end-of-stream.
+                *body = None;
+            }
+        }
+
+        if end_of_stream && rc.model.is_empty() {
+            if let Some(m) = rc.model_scanner.take_model() {
+                rc.model = sanitize_model(m).into_owned();
+            }
+        }
+        Ok(())
+    }
+
+    async fn response_filter(
+        &self,
+        _session: &mut Session,
+        upstream_response: &mut ResponseHeader,
+        ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        if let Some(rc) = ctx.as_mut() {
+            // Headers arrived ≈ time-to-first-byte. Per-provider handle resolved once at boot (see
+            // `ProviderMetrics`) — first-token latency is per-provider, so an unlabeled histogram
+            // can't tell you which one regressed.
+            rc.provider
+                .metrics
+                .ttft_seconds
+                .observe(rc.start.elapsed().as_secs_f64());
+
+            // Per-provider response counter, bucketed by status class — the signal that a provider
+            // is degrading (429/5xx) before it shows up only as latency or a missing usage event.
+            let status = upstream_response.status.as_u16();
+            rc.provider.metrics.record_response(status);
+            // Remember the status for the circuit-breaker outcome resolved in `logging` (a response
+            // arrived, so the provider is reachable — even a 429/5xx is a real answer, not a connect
+            // failure). `logging` decides failure-vs-success from this.
+            rc.upstream_status = Some(status);
+
+            // Derive streaming from the response, not the request: SSE ⇒ use the streaming usage
+            // parser; otherwise the body is a single JSON object.
+            rc.streaming = upstream_response
+                .headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|ct| ct.contains("event-stream"));
+            // Track concurrent SSE streams. Incremented here (response head is in), decremented in
+            // `logging` once the stream completes — so the gauge reflects in-flight streams, not a
+            // counter that only ever climbs. Non-streaming responses don't touch it.
+            if rc.streaming {
+                self.state.metrics.active_streams.inc();
+            }
+
+            // Echo the request id so a client (or an oncall reading a captured response) can quote it
+            // and land on this request's log line. `insert_header` only fails on an invalid value;
+            // our id is `[0-9a-f-]`, always valid — but surface a failure rather than silently drop.
+            upstream_response.insert_header(REQUEST_ID_HEADER, rc.request_id.as_str())?;
+        }
+        Ok(())
+    }
+
+    fn response_body_filter(
+        &self,
+        _session: &mut Session,
+        body: &mut Option<Bytes>,
+        _end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> Result<Option<Duration>>
+    where
+        Self::CTX: Send + Sync,
+    {
+        // Passive tap: copy each chunk into a bounded tail for usage parsing, but never withhold it
+        // — chunks pass straight through, so the stream is relayed with no added buffering.
+        //
+        // We let the tail grow to 2× the cap, then compact once with a single `copy_within` that
+        // keeps the last cap bytes. This bounds memory the same way the old per-chunk `drain` did,
+        // but moves bytes O(stream_len / cap) times instead of once per chunk — for a long stream of
+        // small chunks that's the difference between one memmove per 64 KB and one per chunk.
+        if let (Some(rc), Some(chunk)) = (ctx.as_mut(), body.as_ref()) {
+            // Tap the provider-reported (resolved/billed) model from the response *head* — the
+            // scanner stops at the first root `model`, so this is O(1) and cheap (it finds the model
+            // in the first chunk and ignores the rest). Kept separate from the tail because the model
+            // is at the start of the response while the usage event is at the end.
+            rc.resp_model_scanner.feed(chunk);
+
+            rc.resp_tail.extend_from_slice(chunk);
+            if rc.resp_tail.len() > 2 * USAGE_TAIL_CAP {
+                let keep_from = rc.resp_tail.len() - USAGE_TAIL_CAP;
+                rc.resp_tail.copy_within(keep_from.., 0);
+                rc.resp_tail.truncate(USAGE_TAIL_CAP);
+            }
+        }
+        Ok(None)
+    }
+
+    fn fail_to_connect(
+        &self,
+        _session: &mut Session,
+        _peer: &HttpPeer,
+        ctx: &mut Self::CTX,
+        mut e: Box<pingora_core::Error>,
+    ) -> Box<pingora_core::Error> {
+        if let Some(rc) = ctx.as_mut() {
+            // Retry transient connect failures a couple of times (Pingora re-invokes upstream_peer).
+            if rc.attempt < MAX_CONNECT_RETRIES {
+                rc.attempt += 1;
+                // Surface the retry. Without this, a partially-down provider TCP layer (or an
+                // egress-IP ban — connect is where that first bites) shows up only as extra latency
+                // on `upstream_latency_seconds`, indistinguishable from a slow model. The counter is
+                // the dashboard signal; the `warn!` carries the request_id to grep.
+                rc.provider.metrics.connect_retries_total.inc();
+                warn!(
+                    request_id = %rc.request_id,
+                    provider = rc.provider.name.as_str(),
+                    attempt = rc.attempt,
+                    error = %e,
+                    "upstream connect failed; retrying",
+                );
+                e.set_retry(true);
+            }
+        }
+        e
+    }
+
+    async fn logging(
+        &self,
+        _session: &mut Session,
+        e: Option<&pingora_core::Error>,
+        ctx: &mut Self::CTX,
+    ) {
+        let Some(rc) = ctx.as_mut() else { return };
+
+        // Balance the in-flight gauge incremented at admission. `logging` runs exactly once per
+        // admitted request — including on upstream errors and client disconnects — so the gauge
+        // always returns to baseline and can't drift upward.
+        self.state.metrics.requests_in_flight.dec();
+
+        // An upstream error (DNS/connect timeout, read timeout, abort) lands here with `Some(e)` but
+        // no `ai.usage` row (no parseable body) — and the earlier `warn!` in `upstream_peer` only
+        // fires for DNS, not connect/read failures. Log it with the full identity so "why did tenant
+        // 42 get 502s for 5 minutes" is one grep on the request_id, not a reconstruction.
+        if let Some(e) = e {
+            warn!(
+                request_id = %rc.request_id,
+                tenant_id = rc.tenant_id,
+                vpc_id = rc.vpc_id,
+                provider = rc.provider.name.as_str(),
+                error = %e,
+                "upstream request errored",
+            );
+        }
+
+        // Resolve the circuit-breaker outcome exactly once per admitted request (every request that
+        // claimed a permit in `request_filter` records here, so a half-open probe permit can't leak).
+        // Failure = the provider is *broken*: a 5xx response, or no response at all paired with an
+        // upstream error (connect/read failure). Success = the provider *answered* — 2xx/3xx, and
+        // deliberately **4xx/429 too**: a 429 is a healthy provider throttling our pool key, which the
+        // rate limiter and the client's `Retry-After` own, NOT a reason to cut all traffic to it.
+        if let Some(breaker) = &rc.provider.breaker {
+            match rc.upstream_status {
+                Some(s) if s >= 500 => breaker.record_failure(),
+                Some(_) => breaker.record_success(),
+                None if e.is_some() => breaker.record_failure(),
+                // No response and no error ⇒ client went away before the upstream answered; don't
+                // blame the provider — record success so the probe permit resolves.
+                None => breaker.record_success(),
+            }
+        }
+
+        // The buffer may transiently hold up to 2× the cap before compaction; the usage event is
+        // always in the last cap bytes, so slice to that bounded tail before parsing.
+        let tail_start = rc.resp_tail.len().saturating_sub(USAGE_TAIL_CAP);
+        let tail = &rc.resp_tail[tail_start..];
+
+        // Extract usage facts from the tail (shape depends on dialect + streaming).
+        let usage = match (rc.dialect, rc.streaming) {
+            (Dialect::OpenAI, true) => usage::openai_stream(tail),
+            (Dialect::OpenAI, false) => usage::openai_body(tail),
+            (Dialect::Anthropic, true) => usage::anthropic_stream(tail),
+            (Dialect::Anthropic, false) => usage::anthropic_body(tail),
+        }
+        .unwrap_or_default();
+
+        let m = &self.state.metrics;
+        // Pre-resolved fixed-label children (see `Metrics`) — no per-call `with_label_values` lookup.
+        m.tokens_input.inc_by(usage.input_tokens);
+        m.tokens_output.inc_by(usage.output_tokens);
+        // Cache tokens, too — these are in the `ai.usage` billing log below, but that ships with lag;
+        // the counter is the alerting surface for a cache-hit-rate cliff after a deploy.
+        m.tokens_cache_read.inc_by(usage.cache_read_tokens);
+        m.tokens_cache_write.inc_by(usage.cache_write_tokens);
+        rc.provider
+            .metrics
+            .upstream_latency_seconds
+            .observe(rc.start.elapsed().as_secs_f64());
+        // Balance the `active_streams` increment from `response_filter`. `logging` runs exactly once
+        // per request (including on upstream errors / client disconnects), so a stream that opened is
+        // always accounted closed here — the gauge can't leak upward.
+        if rc.streaming {
+            m.active_streams.dec();
+        }
+
+        // Emit the usage *fact* on a dedicated target — **managed only**. The event is an
+        // identity-keyed billing record (logfwd/OTLP ships `ai.usage` → ClickHouse → a closed
+        // pricing consumer); BYO carries no Beyond identity, so a BYO event would be a billing row
+        // with `tenant_id=0` — unbillable, unattributable, and a footgun for any consumer that sums
+        // without filtering it out. Aggregate gateway throughput (incl. BYO) is already covered by
+        // the Prometheus metrics above, which is the right tool for non-billing observability.
+        if rc.managed {
+            // Emit BOTH models. `model` is the one the *provider* resolved + billed (echoed in its
+            // response) — the key for pricing AND for reconciling against the provider's invoice,
+            // which itemizes by the pinned snapshot. `requested_model` is the alias the client sent —
+            // product analytics ("what they asked for") and a fallback rate when a snapshot is newer
+            // than the downstream price table. They're equal when the response carried no model (e.g.
+            // an error body), where `model` falls back to the request alias. Both sanitized.
+            let billed = rc.resp_model_scanner.take_model().map(sanitize_model);
+            // Borrow the requested model as the fallback rather than cloning it — it's still read as
+            // `requested_model` below, so a clone would be pure waste on every managed response.
+            let billed_model = billed.as_deref().unwrap_or(&rc.model);
+            info!(
+                target: "ai.usage",
+                request_id = %rc.request_id,
+                tenant_id = rc.tenant_id,
+                vpc_id = rc.vpc_id,
+                provider = rc.provider.name.as_str(),
+                model = billed_model,
+                requested_model = %rc.model,
+                stream = rc.streaming,
+                input_tokens = usage.input_tokens,
+                output_tokens = usage.output_tokens,
+                cache_read_tokens = usage.cache_read_tokens,
+                cache_write_tokens = usage.cache_write_tokens,
+                latency_ms = rc.start.elapsed().as_millis() as u64,
+                "usage"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_model_passes_real_ids() {
+        for id in [
+            "gpt-4o",
+            "claude-opus-4-8",
+            "openrouter/meta-llama/llama-3.1",
+            "accounts/fireworks/models/llama-v3p1-70b-instruct",
+            "gpt-4o-mini-2024-07-18",
+        ] {
+            assert_eq!(sanitize_model(id.to_string()), id);
+        }
+    }
+
+    #[test]
+    fn sanitize_model_rejects_json_and_log_injection() {
+        // A `"` would close the JSON string; `\` could escape; a newline breaks line-oriented log
+        // shipping. Any of them ⇒ recorded as "unknown" rather than injected into the billing log.
+        for evil in [
+            r#"real","injected":"x"#,
+            r#"a\b"#,
+            "line1\nline2",
+            "ctrl\u{0}byte",
+        ] {
+            assert_eq!(sanitize_model(evil.to_string()), "unknown");
+        }
+    }
+
+    #[test]
+    fn sanitize_model_rejects_overlong() {
+        let long = "a".repeat(MAX_MODEL_LEN + 1);
+        assert_eq!(sanitize_model(long), "unknown");
+        // Exactly at the cap is fine.
+        let ok = "a".repeat(MAX_MODEL_LEN);
+        assert_eq!(sanitize_model(ok.clone()), ok);
+    }
+}

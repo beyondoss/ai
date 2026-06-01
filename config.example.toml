@@ -1,0 +1,89 @@
+# Beyond AI gateway — example config. Every key is overridable by an `AI_`-prefixed env var
+# (e.g. `AI_NATS_URL`, `AI_POOL_KEY_OPENAI`, `AI_READ_TIMEOUT_SECS`). Values below are defaults.
+
+listen = "0.0.0.0:8080" # client (app) traffic; internal-only, fronted as ai.internal
+metrics_listen = "0.0.0.0:9090" # internal admin: /metrics (Prometheus), /livez, /readyz
+
+# NATS / slipstream — carries ONLY the deny-set (`blackhole.*`). Auth + keys come from this file,
+# so the gateway authenticates + serves managed traffic even if NATS is down.
+nats_url = "nats://localhost:4222"
+# nats_creds = "<base64 .creds>"        # ECS via SOPS
+# nats_creds_file = "/path/to/nats.creds"
+config_bucket = "ai-gateway"
+
+# Optional on-disk deny-set snapshot (slipstream append-log + resume cursor). Set this ONLY on
+# durable storage (edge/tunnel nodes): a restart then seeds the deny-set from disk and resumes the
+# NATS watch from the saved revision — enforcing immediately, even before NATS reconnects, and
+# skipping the boot scan. Leave unset on ephemeral hosts (e.g. Fargate); the gateway seeds from a
+# NATS scan each boot. It's a pure cache: deleting the file just forces a rescan.
+# snapshot_path = "/var/lib/beyond-ai/denyset.snap"
+
+# Upstream timeouts. read/idle are generous: LLM streams can run for minutes.
+connect_timeout_secs = 10
+read_timeout_secs = 600
+write_timeout_secs = 60
+idle_timeout_secs = 90
+
+# Graceful shutdown. On SIGTERM, in-flight requests drain for up to grace_period_secs before the
+# runtimes are torn down (then runtime_timeout_secs is the final teardown backstop).
+# Default = read_timeout_secs so a deploy NEVER truncates an in-flight stream — the gateway is a
+# transparent proxy and must not mangle a paid-for generation (a half-delivered SSE can't be cleanly
+# retried). Pingora stops accepting new connections at SIGTERM, so this only waits out the longest
+# existing stream, not new work; slower rollouts are the deliberate price.
+# The orchestrator must grant the same window or it caps us (it SIGKILLs at its own stop timeout):
+# set k8s terminationGracePeriodSeconds (or the EC2 agent's ECS_CONTAINER_STOP_TIMEOUT) to match.
+# NOTE: ECS Fargate caps stopTimeout at 120s — there, streams past 120s are still cut (a Fargate limit).
+shutdown_grace_period_secs = 600
+shutdown_runtime_timeout_secs = 10
+
+# upstream_tls = true   # set false only for a plaintext mock (tests)
+
+# Per-credential request-rate ceiling (requests/sec) — a blast-radius circuit breaker, not a spend
+# control (the deny-set owns spend). Caps how fast one credential (managed virtual key ≈ a tenant+app,
+# or a BYO token) can drive the gateway, bounding a leaked/runaway key during the deny-set's reaction
+# lag and a failure flood that never bills. Generous by default so legitimate traffic never trips it;
+# set 0 to disable. Tune from the `ai_rejections_total{reason="rate_limit"}` metric.
+rate_limit_rps = 100
+
+# Per-provider circuit breaker. Trips when `circuit_breaker_threshold` upstream FAILURES occur within
+# `circuit_breaker_window_secs`; while open, requests to that provider fast-fail with 503
+# (ai_rejections_total{reason="circuit_open"}) instead of piling up against read_timeout_secs and
+# exhausting connection/in-flight slots for every provider. After `circuit_breaker_reset_secs` a probe
+# is allowed — success closes it, failure reopens it. A FAILURE is a 5xx response or a connect failure
+# (the provider is broken); a 429 is NOT a failure (a healthy provider throttling our pool key — the
+# rate limiter and the client's Retry-After own that). Applies to all traffic (managed + BYO). Set
+# threshold 0 to disable. Defaults are generous so normal background 5xx noise never trips it.
+circuit_breaker_threshold = 20
+circuit_breaker_window_secs = 10
+circuit_breaker_reset_secs = 30
+
+# Aggregate request-rate ceiling (requests/sec) for ALL BYO traffic combined — one shared bucket.
+# BYO is unverified and upstream-bound: a flood of *distinct* random BYO tokens slips past the
+# per-credential ceiling and would open junk-auth connections to providers from our egress IPs,
+# getting them rate-limited or banned. This bounds that aggregate regardless of token variation.
+# Managed traffic is EXEMPT (verified before any upstream connect, can't be forged), so this bucket
+# never sheds core tenant load. Generous by default; set 0 to disable. Tune from the
+# `ai_rejections_total{reason="rate_limit_byo_global"}` metric.
+byo_rate_limit_rps = 1000
+
+# Optional per-provider upstream authority (host:port), BY PROVIDER NAME. For a known provider this
+# overrides its built-in default; for an unknown name it ADDS a new OpenAI-wire provider, then
+# reachable at `/{name}/…` (the provider is the first path segment of the request). Known providers
+# (zero-config defaults): openai, anthropic, openrouter, fireworks, groq, deepseek, together,
+# cerebras, mistral, xai.
+# [provider_authorities]
+# openai = "api.openai.com:443"
+# my-self-hosted = "llm.internal:8443"
+
+# Managed Beyond pool keys, BY PROVIDER NAME. Inject via SSM-backed env in production
+# (AI_POOL_KEY_OPENAI, AI_POOL_KEY_GROQ, …) rather than this file; env wins over any value here.
+# A provider with no pool key can't serve managed traffic (→ 503); BYO is unaffected.
+# [pool_keys]
+# openai = "sk-..."
+# anthropic = "sk-ant-..."
+# fireworks = "fw-..."
+
+# Trusted Ed25519 signing PUBLIC keys (kid -> base64). Multiple for zero-downtime rotation.
+# Managed virtual keys (bai_…) are verified against these; BYO raw tokens skip verification.
+[signing_keys]
+# 1 = "<base64-ed25519-public-key>"

@@ -51,24 +51,3 @@ Apply the **Theory of Constraints**: a system's throughput is limited by its sin
 5. **Repeat.** The bottleneck has shifted. Go back to step 1.
 
 The corollary: if you can't name the current constraint, you aren't ready to optimize.
-
-<!-- wiki-managed:start (managed by `wiki claude install`; edits inside this block will be overwritten) -->
-
-## Wiki
-
-This repo uses [agent-wiki](.wiki/): `.wiki/` indexes repo markdown docs and code symbols into a queryable knowledge graph.
-
-**Read the wiki before grepping the codebase or reading ARCHITECTURE.md.** Pages are pre-indexed — searching them is faster and ~5–10× cheaper than re-deriving from raw files.
-
-Wiki tools — pick based on what you need:
-
-- `wiki_query "<term>"` — first move for any specific question. BM25++ over repo docs and code symbols; returns ranked hits with paths, scores, and inline snippets.
-- `wiki_answer "<question>"` — returns top-ranked pages with query-relevant passage extracts in one round-trip. Best when you expect the answer exists and want it immediately.
-- `wiki_read "path/to/page.md"` (optionally `section: "..."` or `paths: [...]`) — full page, one section, or multiple pages in one call.
-- `wiki_search_code "<query>"` — search exported symbols, signatures, and doc comments when you need to locate a declaration or understand an API.
-- `wiki_usage_examples "<symbol>"` — real call sites with surrounding source code. Use before changing a function (to see every calling convention you must preserve) or when learning how an unfamiliar API is actually used.
-- `wiki_impact "<symbol>"` — blast radius: every symbol that transitively calls this one, ranked by hop distance. Use before refactoring or renaming to know what breaks.
-- `wiki_callees "<symbol>"` — outgoing call hierarchy (rust-analyzer equivalent): every function this symbol transitively calls, ranked by hop distance. Use when you need to understand what a function depends on before touching it — its DB calls, service calls, and abstractions.
-- `wiki_implementors "<symbol>"` — go-to-implementations (rust-analyzer equivalent): every concrete type that implements a trait or interface. Use when you need to know what's behind a trait object, or how many types a trait change will affect.
-
-<!-- wiki-managed:end -->
