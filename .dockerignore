@@ -1,0 +1,8 @@
+target
+.git
+dist
+*.md
+.env
+.env.*
+.claude
+.github

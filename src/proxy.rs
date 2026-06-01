@@ -940,4 +940,33 @@ mod tests {
         let ok = "a".repeat(MAX_MODEL_LEN);
         assert_eq!(sanitize_model(ok.clone()), ok);
     }
+
+    #[test]
+    fn dialect_for_path_selects_anthropic_only_for_messages() {
+        // The dialect drives usage parsing *and* stream injection: misclassifying an Anthropic
+        // `/v1/messages` request as OpenAI mis-meters its tokens. The rule is a `/v1/messages`
+        // prefix ⇒ Anthropic; everything else (chat completions, embeddings, the bare root) is
+        // OpenAI-dialect. This locks that mapping so a refactor can't silently flip it.
+        assert_eq!(dialect_for_path("/v1/messages"), Dialect::Anthropic);
+        assert_eq!(dialect_for_path("/v1/messages/batches"), Dialect::Anthropic);
+        assert_eq!(dialect_for_path("/v1/chat/completions"), Dialect::OpenAI);
+        assert_eq!(dialect_for_path("/v1/embeddings"), Dialect::OpenAI);
+        assert_eq!(dialect_for_path("/"), Dialect::OpenAI);
+    }
+
+    #[test]
+    fn is_streamable_path_matches_generation_suffixes_across_prefixes() {
+        // Only chat-completions / responses get buffered for `stream_options.include_usage`
+        // injection. The check is by *suffix* so it holds whatever mount prefix the provider uses;
+        // a mismatch here either skips injection on a streamable path (lost usage) or needlessly
+        // buffers a non-streaming one.
+        assert!(is_streamable_path("/v1/chat/completions"));
+        assert!(is_streamable_path("/openai/v1/chat/completions"));
+        assert!(is_streamable_path("/inference/v1/chat/completions"));
+        assert!(is_streamable_path("/v1/responses"));
+        // Non-streaming endpoints must not be buffered.
+        assert!(!is_streamable_path("/v1/embeddings"));
+        assert!(!is_streamable_path("/v1/messages"));
+        assert!(!is_streamable_path("/v1/models"));
+    }
 }
