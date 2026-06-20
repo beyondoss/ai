@@ -234,6 +234,7 @@ impl AiConfig {
             .extract()
             .map_err(|e| GatewayError::Config(e.to_string()))?;
         cfg.merge_pool_key_env(std::env::vars());
+        cfg.merge_signing_key_env(std::env::vars());
         cfg.validate()?;
         Ok(cfg)
     }
@@ -292,6 +293,19 @@ impl AiConfig {
             if let Some(name) = k.strip_prefix("AI_POOL_KEY_") {
                 self.pool_keys
                     .insert(name.to_ascii_lowercase(), Secret::new(v));
+            }
+        }
+    }
+
+    /// Fold `AI_SIGNING_KEY_<KID>` environment variables into `signing_keys` (`kid -> base64 pubkey`).
+    /// The prod (ECS) secret path: `[signing_keys]` is a TOML table a flat figment env merge can't
+    /// target, and the container has no mounted config file — so the trusted pubkey(s) arrive as env,
+    /// the same shape as `AI_POOL_KEY_<NAME>`. The `<KID>` suffix is the key id verbatim (e.g.
+    /// `AI_SIGNING_KEY_1`); env wins over any `[signing_keys]` baked into a config file.
+    fn merge_signing_key_env(&mut self, vars: impl Iterator<Item = (String, String)>) {
+        for (k, v) in vars {
+            if let Some(kid) = k.strip_prefix("AI_SIGNING_KEY_") {
+                self.signing_keys.insert(kid.to_string(), v);
             }
         }
     }
@@ -510,5 +524,26 @@ mod tests {
         assert_eq!(c.pool_keys.get("openai").unwrap().expose(), "from-env");
         assert_eq!(c.pool_keys.get("groq").unwrap().expose(), "gsk-x");
         assert!(!c.pool_keys.contains_key("log"));
+    }
+
+    #[test]
+    fn signing_key_env_merges_and_overrides() {
+        // `AI_SIGNING_KEY_<KID>` → `signing_keys[kid]`, env wins over a config-file value (the prod
+        // ECS path where the gateway has no mounted config). Non-signing `AI_*` vars are ignored.
+        let mut c = AiConfig {
+            signing_keys: HashMap::from([("1".to_string(), "from-file".to_string())]),
+            ..Default::default()
+        };
+        c.merge_signing_key_env(
+            [
+                ("AI_SIGNING_KEY_1".to_string(), "from-env".to_string()),
+                ("AI_SIGNING_KEY_2".to_string(), "second-kid".to_string()),
+                ("AI_POOL_KEY_OPENAI".to_string(), "sk-x".to_string()),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(c.signing_keys.get("1").unwrap(), "from-env");
+        assert_eq!(c.signing_keys.get("2").unwrap(), "second-kid");
+        assert!(!c.signing_keys.contains_key("OPENAI"));
     }
 }
