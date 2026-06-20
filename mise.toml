@@ -13,6 +13,10 @@ run = "cargo build"
 [tasks."build:rs:release"]
 run = "cargo build --release"
 
+[tasks."ai:mint-dev-key"]
+description = "Mint a deterministic DEV-ONLY signing pubkey + bai_v1 token (fixed seed) for wiring up the dev config. Not for production."
+run = "cargo run --example mint_dev_key"
+
 [tasks."check:rs"]
 run = "cargo clippy --all-targets -- -D warnings"
 
