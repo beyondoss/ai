@@ -98,7 +98,9 @@ fn sse_data_lines(sse: &[u8]) -> impl Iterator<Item = &[u8]> + '_ {
         // SSE strips *all* leading spaces after the field colon (not exactly one) — OpenAI/Anthropic
         // emit `data: ` (one space), but a config-added OpenAI-wire provider that pads with more
         // would otherwise leave whitespace in the payload and fail the JSON parse → silent zero usage.
-        let line = line.trim_ascii_start();
+        // Trim the trailing end too: SSE permits CRLF line endings (RFC 8895), so splitting on `\n`
+        // leaves a trailing `\r` that would otherwise fail the JSON parse → another silent zero.
+        let line = line.trim_ascii();
         (line != b"[DONE]").then_some(line)
     })
 }
@@ -255,6 +257,24 @@ mod tests {
             Usage {
                 input_tokens: 3,
                 output_tokens: 7,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0
+            }
+        );
+    }
+
+    #[test]
+    fn tolerates_crlf_line_endings() {
+        // SSE permits CRLF (RFC 8895). Splitting on `\n` leaves a trailing `\r` on each line; the
+        // parser must strip it or the JSON parse silently fails → a phantom zero-token billing row.
+        let sse =
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":22}}\r\n\r\n\
+              data: [DONE]\r\n\r\n";
+        assert_eq!(
+            openai_stream(sse).unwrap(),
+            Usage {
+                input_tokens: 11,
+                output_tokens: 22,
                 cache_read_tokens: 0,
                 cache_write_tokens: 0
             }

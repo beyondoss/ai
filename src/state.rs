@@ -143,6 +143,18 @@ impl GatewayState {
                  (no key swap, no deny-set, no billing). Expected only for a BYO-only deployment."
             );
         }
+        // Disabling upstream cert verification turns every provider connection into an unverified
+        // channel — a transparent-MitM opening. It's legitimate *only* for the local self-signed TLS
+        // mock (e2e/bench). Warn loudly at boot so it can never be a silent production misconfig (an
+        // `AI_UPSTREAM_VERIFY_CERT=false` copied out of a bench env) that looks healthy.
+        if config.upstream_tls && !config.upstream_verify_cert {
+            warn!(
+                "upstream TLS certificate verification is DISABLED — connections to providers are \
+                 unauthenticated and vulnerable to interception. This is valid ONLY for a local \
+                 test/bench mock; never set upstream_verify_cert=false against a real provider."
+            );
+        }
+
         let providers = build_providers(&config, &metrics);
         let rate_limit = RateLimit::new(config.rate_limit_rps, config.byo_rate_limit_rps);
 

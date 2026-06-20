@@ -159,18 +159,16 @@ impl CircuitBreakerConfig {
 /// - Bits 62-63: State (0=closed, 1=open, 2=half-open)
 /// - Bits 48-61: Failure count (14 bits, max 16383)
 /// - Bits 32-47: Half-open permits remaining (16 bits)
-/// - Bits 0-31: Timestamp of last state change (seconds since epoch, wraps every 136 years)
-///
-/// For windowed mode, a second atomic tracks the window start timestamp.
+/// - Bits 0-31: Timestamp (seconds since epoch, wraps every 136 years). In OPEN it's when the
+///   circuit opened (drives the reset timeout); in CLOSED windowed mode it doubles as the current
+///   failure window's start. Because the timestamp lives in the same word, a windowed failure can
+///   reset-the-window and increment-the-count in a **single** CAS — so concurrent failures at a
+///   window boundary can never each independently reset to 1 and drop one another.
 ///
 /// This packing ensures all state transitions are atomic via single CAS operations.
 pub struct CircuitBreaker {
     /// Packed state word.
     state: AtomicU64,
-    /// Window start timestamp (only used in windowed mode).
-    /// Stores seconds since epoch when the first failure in the current window occurred.
-    /// 0 means no active window.
-    window_start: AtomicU64,
     /// Configuration (immutable after construction).
     config: CircuitBreakerConfig,
     /// Clock function for getting current time in seconds.
@@ -181,7 +179,6 @@ impl std::fmt::Debug for CircuitBreaker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CircuitBreaker")
             .field("state", &self.state)
-            .field("window_start", &self.window_start)
             .field("config", &self.config)
             .finish_non_exhaustive()
     }
@@ -214,7 +211,6 @@ impl CircuitBreaker {
         let initial = Self::pack(STATE_CLOSED, 0, 0, clock());
         Self {
             state: AtomicU64::new(initial),
-            window_start: AtomicU64::new(0),
             config,
             clock,
         }
@@ -333,22 +329,25 @@ impl CircuitBreaker {
     /// In closed state, resets the failure counter (and window for windowed mode).
     /// In half-open state, closes the circuit (service is healthy again).
     pub fn record_success(&self) {
-        // Reset window start for windowed mode
-        self.window_start.store(0, Ordering::Release);
+        // Fast path: a healthy CLOSED breaker with no accrued failures is the overwhelmingly common
+        // case — every successful response calls this. Bail before any write so high-throughput
+        // success traffic to one provider doesn't bounce its breaker cache line across every worker
+        // thread on each response. The CLOSED timestamp is only read as a window anchor by the *next*
+        // failure (which re-anchors a fresh window when failures==0 regardless), so not refreshing it
+        // on an already-clean breaker changes no observable behavior.
+        let (state, failures, _, _) = Self::unpack(self.state.load(Ordering::Acquire));
+        if state == STATE_CLOSED && failures == 0 {
+            return;
+        }
 
         loop {
             let packed = self.state.load(Ordering::Acquire);
             let (state, _, _, _) = Self::unpack(packed);
 
             let new_packed = match state {
-                STATE_CLOSED => {
-                    // Reset failure count, keep closed
-                    Self::pack(STATE_CLOSED, 0, 0, self.now_secs())
-                }
-                STATE_HALF_OPEN => {
-                    // Success in half-open: close the circuit
-                    Self::pack(STATE_CLOSED, 0, 0, self.now_secs())
-                }
+                // Reset the failure count (and re-anchor the window via the timestamp). Covers both
+                // CLOSED-with-accrued-failures and HALF_OPEN (a probe succeeded → close the circuit).
+                STATE_CLOSED | STATE_HALF_OPEN => Self::pack(STATE_CLOSED, 0, 0, self.now_secs()),
                 STATE_OPEN => return, // Shouldn't record success while open
                 _ => return,
             };
@@ -415,52 +414,40 @@ impl CircuitBreaker {
     }
 
     /// Record failure with windowed failure tracking.
+    ///
+    /// The current window's start lives in the packed timestamp (CLOSED state), so the
+    /// reset-the-window-and-set-to-1 decision and the within-window increment are made from the
+    /// **same** `packed` value and committed in the **same** CAS. That single-CAS atomicity is what
+    /// fixes the old two-atomic race: when many failures land at a window boundary, they retry the
+    /// CAS and each sees the latest count, so they linearize into a correct running total instead of
+    /// each independently resetting to 1 and dropping the others (which could pin the count at 1 and
+    /// keep a genuinely-broken provider's breaker stuck closed).
     fn record_failure_windowed(&self, threshold: u32, window_secs: u64) {
         let now = self.now_secs();
 
-        // Handle window timing
-        let window_start = self.window_start.load(Ordering::Acquire);
-        let (new_window_start, reset_count) = if window_start == 0 {
-            // First failure, start new window
-            (now, true)
-        } else if now.wrapping_sub(window_start) >= window_secs {
-            // Window expired, start new window
-            (now, true)
-        } else {
-            // Within window, continue counting
-            (window_start, false)
-        };
-
-        // Update window start if needed (best-effort, races are acceptable)
-        if new_window_start != window_start {
-            let _ = self.window_start.compare_exchange(
-                window_start,
-                new_window_start,
-                Ordering::Release,
-                Ordering::Relaxed,
-            );
-        }
-
-        // Now update the main state
         loop {
             let packed = self.state.load(Ordering::Acquire);
-            let (state, failures, _, _) = Self::unpack(packed);
+            let (state, failures, _, ts) = Self::unpack(packed);
 
             let new_packed = match state {
                 STATE_CLOSED => {
-                    let new_failures = if reset_count { 1 } else { failures + 1 };
+                    // `failures == 0` ⇒ fresh window (cold start, or just after a success reset);
+                    // `now - ts >= window` ⇒ the window this failure falls into has expired. Either
+                    // way this failure starts a new window at count 1; otherwise it accrues into the
+                    // current one. The anchor (window start) is carried in the timestamp field.
+                    let window_expired = failures == 0 || now.wrapping_sub(ts) >= window_secs;
+                    let (new_failures, anchor) = if window_expired {
+                        (1, now)
+                    } else {
+                        (failures + 1, ts)
+                    };
                     if new_failures >= u64::from(threshold) {
-                        // Reset window when opening circuit
-                        self.window_start.store(0, Ordering::Release);
                         Self::pack(STATE_OPEN, 0, 0, now)
                     } else {
-                        Self::pack(STATE_CLOSED, new_failures, 0, now)
+                        Self::pack(STATE_CLOSED, new_failures, 0, anchor)
                     }
                 }
-                STATE_HALF_OPEN => {
-                    self.window_start.store(0, Ordering::Release);
-                    Self::pack(STATE_OPEN, 0, 0, now)
-                }
+                STATE_HALF_OPEN => Self::pack(STATE_OPEN, 0, 0, now),
                 STATE_OPEN => return,
                 _ => return,
             };
@@ -496,7 +483,6 @@ impl CircuitBreaker {
 
     /// Reset the circuit breaker to closed state.
     pub fn reset(&self) {
-        self.window_start.store(0, Ordering::Release);
         let packed = Self::pack(STATE_CLOSED, 0, 0, self.now_secs());
         self.state.store(packed, Ordering::Release);
     }
@@ -846,6 +832,45 @@ mod tests {
                 total_allowed <= 5,
                 "allowed {} requests but only 5 permits",
                 total_allowed
+            );
+        }
+    }
+
+    /// A fixed clock pins every failure into the same window, so this isolates concurrent *counting*
+    /// from window timing — the exact condition the old two-atomic design dropped increments under.
+    fn fixed_clock() -> u64 {
+        1000
+    }
+
+    #[test]
+    fn test_concurrent_windowed_counts_every_failure() {
+        // Regression for the window-boundary race: with all 20 failures inside one window and the
+        // threshold well above 20, every concurrent failure must be counted — none silently dropped.
+        // The old code computed the window-reset decision outside the state CAS, so losers of the
+        // window_start race could reset a peer's increment back to 1, pinning the count and keeping a
+        // genuinely-failing provider's breaker stuck closed. The single-CAS anchor makes that
+        // impossible: the count must land at exactly 20.
+        for _ in 0..200 {
+            let cb = Arc::new(CircuitBreaker::with_clock(
+                CircuitBreakerConfig::windowed(1000, Duration::from_secs(60)),
+                fixed_clock,
+            ));
+
+            let handles: Vec<_> = (0..20)
+                .map(|_| {
+                    let cb = Arc::clone(&cb);
+                    thread::spawn(move || cb.record_failure())
+                })
+                .collect();
+
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            assert_eq!(
+                cb.state(),
+                CircuitState::Closed { failure_count: 20 },
+                "every concurrent in-window failure must be counted (no lost increments)"
             );
         }
     }

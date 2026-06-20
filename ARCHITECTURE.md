@@ -369,6 +369,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `ai_requests_in_flight`       | Gauge     | —                    | All in-flight requests (streaming + non-streaming)                                     |
 | `ai_deny_set_size`            | Gauge     | —                    | Current number of denied tenants                                                       |
 | `ai_nats_connected`           | Gauge     | —                    | 1 if NATS watcher is connected, 0 otherwise                                            |
+| `ai_usage_parse_errors_total` | Counter   | —                    | Managed 2xx responses with no parseable usage (emitted as a zero-token billing row)    |
 
 ---
 

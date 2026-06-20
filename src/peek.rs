@@ -165,11 +165,11 @@ impl ModelScanner {
 pub fn plan_stream_usage_injection(body: &[u8]) -> Option<usize> {
     let n = body.len();
     // Cheap pre-filter: injection is only ever needed when a root-level `"stream"` key is present.
-    // If the substring `"stream"` doesn't occur *anywhere*, the structural answer is unconditionally
-    // `None`, so a single SIMD `memmem` pass lets us skip the whole walk — the common case, since
-    // most requests aren't streaming. (The needle is a substring of `"stream_options"` too, so a
-    // body carrying only stream_options still passes the filter and is correctly resolved to `None`
-    // by the walk below.)
+    // If the quoted token `"stream"` doesn't occur *anywhere*, the structural answer is
+    // unconditionally `None`, so a single SIMD `memmem` pass lets us skip the whole walk — the
+    // common case, since most requests aren't streaming. (Note `"stream_options"` does NOT contain
+    // the needle: the byte after `stream` is `_`, not a closing quote — so a body carrying only
+    // `stream_options` fails this pre-filter and returns `None` here, which is the correct answer.)
     memchr::memmem::find(body, b"\"stream\"")?;
     let mut i = 0;
     while i < n && body[i].is_ascii_whitespace() {

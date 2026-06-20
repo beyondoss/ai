@@ -274,7 +274,13 @@ impl AiConfig {
             )
             .reset_timeout(std::time::Duration::from_secs(
                 self.circuit_breaker_reset_secs,
-            )),
+            ))
+            // Admit exactly **one** half-open probe (matching ARCHITECTURE.md: "a probe is
+            // admitted"). The library default is 3, but for an egress breaker a single probe is the
+            // conservative choice — one request tests a possibly-still-broken provider, and a success
+            // closes it immediately for full traffic; 3 concurrent probes would send 3× the load at a
+            // provider we believe is down. Deliberately not a config knob: minimum effective surface.
+            .half_open_permits(1),
         )
     }
 
@@ -328,16 +334,26 @@ fn known_config_keys() -> std::collections::BTreeSet<String> {
 fn reject_unknown_toml_keys(path: &Path) -> Result<()> {
     use figment::Provider as _;
     let known = known_config_keys();
-    let unknown: std::collections::BTreeSet<String> = Toml::file(path)
-        .data()
-        .map(|profiles| {
-            profiles
-                .into_values()
-                .flat_map(|dict| dict.into_keys())
-                .filter(|k| !known.contains(k))
-                .collect()
-        })
-        .unwrap_or_default();
+    // `data()` errors two ways we must distinguish: a *missing* file is benign (the gateway runs on
+    // defaults + env), but a *malformed* file is a hard error we must surface here with the file
+    // named — otherwise the syntax error only reappears later as an opaque Figment `extract()`
+    // failure with no path attribution. A missing file yields no keys and passes; any other error
+    // (parse failure, permission denied) fails the load loudly.
+    let unknown: std::collections::BTreeSet<String> = match Toml::file(path).data() {
+        Ok(profiles) => profiles
+            .into_values()
+            .flat_map(|dict| dict.into_keys())
+            .filter(|k| !known.contains(k))
+            .collect(),
+        Err(e) if path.exists() => {
+            return Err(GatewayError::Config(format!(
+                "failed to parse {}: {e}",
+                path.display()
+            )));
+        }
+        // No file (or it vanished between checks): nothing to validate — defaults + env apply.
+        Err(_) => return Ok(()),
+    };
     if unknown.is_empty() {
         return Ok(());
     }
@@ -416,6 +432,22 @@ mod tests {
             GatewayError::Config(msg) => assert!(
                 msg.contains("reqiure_signing_keys"),
                 "error must name the typo'd key, got: {msg}"
+            ),
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_toml_with_path_attribution() {
+        // A syntax error in the operator's TOML must fail the load *here*, naming the file — not
+        // silently pass this check and resurface later as an opaque Figment extract() error.
+        let path = temp_toml("malformed", "listen = \"unterminated\nrate_limit_rps = 7\n");
+        let err = AiConfig::load_with_path(Some(&path)).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        match err {
+            GatewayError::Config(msg) => assert!(
+                msg.contains("malformed") || msg.contains("parse"),
+                "error must indicate a parse failure and name the file, got: {msg}"
             ),
             other => panic!("expected Config error, got {other:?}"),
         }
