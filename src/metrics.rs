@@ -56,6 +56,11 @@ pub struct Metrics {
     /// fail-open — it serves on the last-known set when NATS is down — so staleness is otherwise
     /// silent; this is the metric to alert "deny-set has been stale for >N minutes" on.
     pub nats_connected: IntGauge,
+    /// Managed `2xx` responses that carried no parseable usage block. Such a response still emits a
+    /// zero-token `ai.usage` row, which is indistinguishable downstream from a (non-existent)
+    /// legitimate zero-token generation — so a provider changing its usage wire shape would silently
+    /// zero out billing. This counter (paired with a `warn!`) is the alerting surface for that.
+    pub usage_parse_errors_total: IntCounter,
 }
 
 /// TTFT buckets (seconds). Tuned for LLM latency: sub-second prompts up through the multi-second
@@ -133,6 +138,10 @@ impl Metrics {
             "ai_nats_connected",
             "Deny-set watcher NATS connectivity (1=connected, 0=disconnected)",
         ))?;
+        let usage_parse_errors_total = IntCounter::with_opts(Opts::new(
+            "ai_usage_parse_errors_total",
+            "Managed 2xx responses with no parseable usage (emitted as a zero-token billing row)",
+        ))?;
 
         r.register(Box::new(requests_total.clone()))?;
         r.register(Box::new(rejections_total.clone()))?;
@@ -145,6 +154,7 @@ impl Metrics {
         r.register(Box::new(requests_in_flight.clone()))?;
         r.register(Box::new(deny_set_size.clone()))?;
         r.register(Box::new(nats_connected.clone()))?;
+        r.register(Box::new(usage_parse_errors_total.clone()))?;
 
         Ok(Arc::new(Self {
             requests_total,
@@ -162,6 +172,7 @@ impl Metrics {
             requests_in_flight,
             deny_set_size,
             nats_connected,
+            usage_parse_errors_total,
         }))
     }
 }

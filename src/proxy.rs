@@ -837,13 +837,34 @@ impl ProxyHttp for AiProxy {
         let tail = &rc.resp_tail[tail_start..];
 
         // Extract usage facts from the tail (shape depends on dialect + streaming).
-        let usage = match (rc.dialect, rc.streaming) {
+        let parsed = match (rc.dialect, rc.streaming) {
             (Dialect::OpenAI, true) => usage::openai_stream(tail),
             (Dialect::OpenAI, false) => usage::openai_body(tail),
             (Dialect::Anthropic, true) => usage::anthropic_stream(tail),
             (Dialect::Anthropic, false) => usage::anthropic_body(tail),
+        };
+        // A managed 2xx response is *expected* to carry usage; `None` there means the provider's
+        // usage block changed shape (a new API version, a wire change) and we're about to emit a
+        // zero-token billing row that looks exactly like a (non-existent) legitimate zero-token
+        // generation — silently zeroing that tenant's bill. Surface it on a counter + a warn so it
+        // can be alerted on. A `None` on a 4xx/5xx (error body has no usage) is normal, not logged.
+        if parsed.is_none()
+            && rc.managed
+            && let Some(s) = rc.upstream_status
+            && (200..300).contains(&s)
+        {
+            self.state.metrics.usage_parse_errors_total.inc();
+            warn!(
+                request_id = %rc.request_id,
+                tenant_id = rc.tenant_id,
+                provider = rc.provider.name.as_str(),
+                dialect = ?rc.dialect,
+                stream = rc.streaming,
+                status = s,
+                "managed 2xx response carried no parseable usage; emitting a zero-token billing row",
+            );
         }
-        .unwrap_or_default();
+        let usage = parsed.unwrap_or_default();
 
         let m = &self.state.metrics;
         // Pre-resolved fixed-label children (see `Metrics`) — no per-call `with_label_values` lookup.
