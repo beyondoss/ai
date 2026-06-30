@@ -10,21 +10,41 @@ a Beyond gateway base URL.
 
 ## Capabilities at a glance
 
-The loop has grown well past a single-shot tool-caller; these are the load-bearing seams (each has a
-builder on `Agent` and is exercised by unit tests):
+The loop has grown well past a single-shot tool-caller; these are the load-bearing seams (most have a
+builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
 
 - **Cancellation** — `run_events_cancellable(.., cancel)` races the model stream and the tool-dispatch
   phase against a `CancellationToken`; a trip returns `Error::Cancelled`, drops the stream (reqwest
   aborts the request), and drops in-flight tool futures (a `bash` subprocess dies via `kill_on_drop`).
-- **Steering** — `run_events_steered(.., steering)` drains a `Steering` queue at each would-stop
-  boundary and injects the messages as new user turns, so a client can extend/redirect a live run.
+- **Steering** — `run_events_steered(.., steering)` drains a `Steering` handle's *two* lanes:
+  *follow-ups* (`push`) injected as fresh user turns at each would-stop boundary, and *steers*
+  (`push_steer`) folded onto the in-flight tool-results turn mid-run — so a client can either queue the
+  next task or redirect a busy agent between tool turns without waiting for it to stop.
 - **Hooks** — `AgentHooks` (`with_hooks`) gates (`before_tool_call` → block reason) and rewrites
   (`after_tool_call`) tool calls; the permission/redaction seam. Defaults to `NoHooks`.
 - **Compaction** — when the live prompt crosses `context_window − reserve` (or the provider rejects an
   overflow), [`compaction`](src/compaction.rs) summarizes the prefix via one model call and splices a
-  summary in, keeping recent turns verbatim (`Agent::compact`, auto-trigger, compact-and-retry).
+  summary in, keeping recent turns verbatim (`Agent::compact`, auto-trigger, compact-and-retry). A
+  *second* compaction is incremental: a prior summary (tagged `SUMMARY_MARKER`) is fed forward and
+  updated rather than re-summarized, so early context isn't lost (and re-billed) each cycle.
 - **Thinking** — `ContentBlock::Thinking`/`RedactedThinking` + `ThinkingDelta`/`SignatureDelta` stream
-  events; signatures replay verbatim (Anthropic requires it with tools). `with_thinking(budget)`.
+  events; signatures replay verbatim (Anthropic requires it with tools). `with_thinking(budget)`; the
+  thinking *shape* (Anthropic enabled-budget vs adaptive) is chosen per model from the capability
+  table, and `with_reasoning_effort` drives OpenAI reasoning models / Anthropic adaptive thinking.
+- **Model capabilities** — [`models::capabilities`](src/models.rs) maps a model id (by prefix) to a
+  minimal `ModelCaps` table (context window, max output, `max_tokens` vs `max_completion_tokens` field,
+  long-cache support, vision, thinking shape, reasoning-effort). The dialects and `Agent::new` consult
+  it, so adding a model rarely needs new request-shape plumbing.
+- **Tool output & multimodal** — `Tool::run` returns `ToolOutput { text, images, terminate }`: a tool
+  can attach images the multimodal model sees (a screenshot, `read` on an image), and `terminate` ends
+  the run when *every* call in the batch agrees. `ContentBlock::ToolResult` and both dialects carry the
+  images through to the wire.
+- **Streaming tool progress** — a tool may override `Tool::run_streaming(input, &ToolProgress)` to
+  `emit` incremental output while it runs (pi's `tool_execution_update`); the dispatch forwards each
+  chunk as `AgentEvent::ToolProgress` over a `futures::mpsc` channel, ahead of the tool's `ToolEnd`.
+  Default `run_streaming` delegates to `run`, so non-streaming tools are untouched.
+- **Tool choice** — `ModelRequest::tool_choice` (`Auto`/`None`/`Required`/`Tool(name)`) maps to each
+  dialect's vocabulary; unset emits nothing (provider default), so the common request shape is intact.
 - **Transport resilience** — `GatewayClient` retries transient failures (429/5xx/connection, honoring
   `Retry-After`) up to the first byte; a mid-stream `event: error` or truncated stream surfaces as
   `Error::Transport` (the SSE decoder's `finish` returns `Result`).
@@ -109,6 +129,9 @@ dialect-blind.
 | `ToolRegistry`    | Name → `Arc<dyn Tool>` lookup the loop dispatches against                          | Not a permission system itself — gating is the `AgentHooks::before_tool_call` seam |
 | `AgentHooks`      | Interception around each tool call: `before_tool_call` (block) / `after_tool_call` (rewrite) | Not a sandbox — it decides per call; defaults to `NoHooks` |
 | `ToolError`       | A tool's own failure → an error `tool_result` fed back to the model                | Not a loop-aborting error — the run continues             |
+| `ToolOutput`      | A tool's success value: `text` + `images` (multimodal) + a `terminate` hint        | Not just a string — `String`/`&str` convert in, and `terminate` ends the run only when every call in the batch agrees |
+| `ModelCaps`       | Per-model wire knobs from `capabilities(model)`: max-tokens field, long-cache, vision, thinking shape, reasoning-effort, context window | Not a model catalog or pricing/routing table — the gateway routes and meters; this is the smallest table the wire decisions need |
+| `ToolChoice` / `ReasoningEffort` | How the model may use tools this turn / its effort level — optional `ModelRequest` fields mapped per dialect | Unset emits nothing on the wire (provider default), so the default request shape is unchanged |
 | `Error`           | A loop/transport failure → `run`/`run_events` returns `Err`, the in-flight turn is discarded | `Cancelled` is a user abort, not a fault; malformed tool args are recoverable, not an error |
 | `StreamEvent`      | The normalized unit both dialect decoders emit; what `Accumulator` folds (text/thinking/tool/usage) | Not the wire format — it's the post-translation internal shape |
 | `ContentBlock`     | One piece of a `Message` (`Text`/`Thinking`/`RedactedThinking`/`ToolUse`/`ToolResult`/`Image`) | Not a streaming unit — it's the assembled, turn-final form  |
@@ -158,6 +181,14 @@ All of a turn's results are folded into **one** `Message::tool_results([...])` u
 message per result (`message.rs:85-94`). Anthropic carries a turn's tool results as multiple blocks on
 a single `user` turn and rejects two consecutive same-role messages, so N separate `user` messages
 would 400 the next request whenever the model batched more than one tool call.
+
+Each call resolves to `(text, images, is_error, terminate)`: a tool's `ToolOutput` images ride onto
+its `ContentBlock::ToolResult` so the multimodal model sees them, and if *every* call in the batch set
+`terminate` the loop ends the run after recording the results — an `attempt_completion`/`exit`-style
+tool, gated so one tool can't cut off the others dispatched alongside it. Any **steer** messages a
+client queued mid-run (`Steering::push_steer`) are folded onto this same tool-results user turn as
+trailing text blocks, letting a client redirect a busy agent between tool turns while keeping role
+alternation valid; **follow-ups** (`push`) are a separate lane, injected only at the stop boundary.
 
 ### Session history sharing
 
@@ -215,7 +246,7 @@ socket that splits a write inside a 4-byte emoji (`tests/client_socket.rs`).
 | turn assembled   | —                                    | turn pushed            | —                        | `session.push(assistant)`, `record_usage`, `steps += 1`, `TurnEnd` sunk |
 | turn pushed      | no tool_use blocks / `stop_reason != ToolUse` | done (`Ok`)    | —                        | Returns to caller; session ends on the assistant turn                |
 | turn pushed      | `tool_use` blocks present, `ToolUse` | dispatching tools      | —                        | `ToolStart` sunk per call, in call order                            |
-| dispatching tools | all groups resolve (`buffer_unordered`) | (loop top, next iter)  | —                        | `ToolEnd` sunk + one `tool_results` user message pushed, in call order |
+| dispatching tools | all groups resolve (`buffer_unordered`) | (loop top, next iter)  | —                        | `ToolEnd` sunk + one `tool_results` user message pushed, in call order (carrying any tool images + mid-run steer text); ends the run early instead if every call set `terminate` |
 
 ### Per-block accumulation (`Accumulator`)
 
@@ -284,8 +315,10 @@ An agent loop re-sends an ever-growing prefix every turn — tools, then system,
 conversation — in request order. Without prompt caching each turn re-bills that whole prefix at full
 input-token price: an O(n²) token cost over a `max_steps`-deep run, on the very history this crate
 already keeps O(1) *in memory* via `Arc`/COW (the wire cost was the half left unoptimized).
-`anthropic::build_body` marks `cache_control` (ephemeral; `ttl: "1h"` when `cache_long`) at three points
-(Anthropic caches the request prefix up to each mark; cache reads cost ~10% of input tokens):
+`anthropic::build_body` marks `cache_control` (ephemeral; `ttl: "1h"` only when `cache_long` *and*
+`capabilities(model).supports_long_cache` — an unsupported model silently falls back to the 5-minute
+TTL instead of 400-ing) at three points (Anthropic caches the request prefix up to each mark; cache
+reads cost ~10% of input tokens):
 
 - an **anchor** on the last tool definition — the JSON schemas are byte-identical every turn and sit
   first in the cache order, so this entry stays warm independently of the rolling one;
@@ -357,17 +390,18 @@ selection mechanism — adding a model never requires touching the gateway.
 | File                          | What It Does                                                                                                   |
 | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
 | `lib.rs`                       | Crate root: module list, public re-exports, and the crate-wide `#![cfg_attr(test, allow(...))]` panic-free gate |
-| `agent.rs`                     | `Agent` config + `run`/`run_events`/`run_events_cancellable`/`run_events_steered` loop, `Accumulator`, concurrent tool dispatch, hooks, auto-compaction + overflow retry |
-| `message.rs`                   | `Role`/`ContentBlock`(+ `Thinking`/`RedactedThinking`/`Image`)/`Message`/`ToolDef`/`StopReason`/`StreamEvent`/`TokenUsage` — the internal model |
-| `compaction.rs`                | Context compaction: trigger, cut-point search, summary-prompt build, file-op extraction (the network-free half of `Agent::compact`) |
+| `agent.rs`                     | `Agent` config + `run`/`run_events`/`run_events_cancellable`/`run_events_steered` loop, `Accumulator`, concurrent tool dispatch (threading text/images/`terminate`), tool-driven termination, mid-run + stop-boundary steering, `with_reasoning_effort`, model-aware `new` defaults, hooks, auto-compaction + overflow retry |
+| `message.rs`                   | `Role`/`ContentBlock`(+ `Thinking`/`RedactedThinking`/`Image`; `ToolResult` carries optional `images`)/`Message`/`ToolDef`/`StopReason`(+ `Refusal`)/`StreamEvent`/`TokenUsage`(+ `reasoning_tokens`) — the internal model |
+| `compaction.rs`                | Context compaction: trigger, cut-point search, summary-prompt build, file-op extraction, and incremental update (`previous_summary`/`SUMMARY_MARKER` fold-forward) — the network-free half of `Agent::compact` |
+| `models.rs`                    | `capabilities(model) -> ModelCaps`: minimal per-model wire table (max-tokens field, long-cache, vision, thinking shape, reasoning-effort, context window), matched by id prefix; consumed by the dialects and `Agent::new` |
 | `hooks.rs`                     | `AgentHooks` interception trait (`before_tool_call`/`after_tool_call`) + `NoHooks` default                       |
-| `steering.rs`                  | `Steering` — a shared queue of follow-up messages injected at would-stop boundaries                             |
-| `tool.rs`                      | `Tool` trait + `ToolRegistry` (name-keyed `Arc<dyn Tool>` map, last-registration-wins)                          |
-| `transport.rs`                 | `ModelRequest` (system/tools/thinking/cache_key/cache_long), `ModelTransport` trait, `EventStream` alias         |
-| `client.rs`                    | `GatewayClient`: production `ModelTransport`; retry-with-backoff, chunked-SSE byte framing into whole UTF-8 lines |
+| `steering.rs`                  | `Steering` — two shared queues: `push_steer` (mid-run, folded onto the tool-results turn) and `push`/follow-up (injected at would-stop boundaries) |
+| `tool.rs`                      | `Tool` trait (`run -> ToolOutput`, optional streaming `run_streaming` + `ToolProgress` sink) + `ToolOutput { text, images, terminate }` + `ToolRegistry` (name-keyed `Arc<dyn Tool>` map, last-registration-wins, name-sorted `definitions`) |
+| `transport.rs`                 | `ModelRequest` (system/tools/thinking/`reasoning_effort`/`tool_choice`/cache_key/cache_long), `ReasoningEffort` + `ToolChoice` enums, `ModelTransport` trait, `EventStream` alias |
+| `client.rs`                    | `GatewayClient`: production `ModelTransport`; retry-with-backoff (`Retry-After` delta-seconds *or* HTTP-date), chunked-SSE byte framing into whole UTF-8 lines |
 | `dialect/mod.rs`                | `Dialect` enum (model-id → wire selection), `StreamDecoder` trait, SSE line-splitting (`push_sse_line`/`decode_sse`) |
-| `dialect/anthropic.rs`         | `/v1/messages` body builder (+ three prompt-cache breakpoints, thinking config) + decoder (text/thinking/tool/cache-usage; in-band error + truncation detection) |
-| `dialect/openai.rs`            | `/v1/chat/completions` body builder + decoder — real translation: flattened messages, string-encoded tool args, synthesized block-stop events |
+| `dialect/anthropic.rs`         | `/v1/messages` body builder (three prompt-cache breakpoints, capability-gated 1h TTL, per-model thinking shape, `tool_choice`, tool-result image rewrite) + decoder (text/thinking/tool/cache-usage, reasoning-token breakout, `pause_turn`/refusal-explanation, in-band error + truncation detection) |
+| `dialect/openai.rs`            | `/v1/chat/completions` body builder + decoder — real translation: flattened messages, string-encoded tool args, `image_url` data-URIs (user + fanned-out tool-result images), `max_completion_tokens` vs `max_tokens`, `reasoning_effort`, `tool_choice`, synthesized block-stop events |
 | `session.rs`                   | `Session`: Arc-shared copy-on-write message history + step/token counters, serde round-trippable                |
 | `error.rs`                     | `Error` (loop/transport, aborts the run) and `ToolError` (tool failure, becomes an error `tool_result`)         |
 | `mock.rs`                      | `MockTransport` + `turn::{text, tool_call}` builders — scripted, no-network loop testing                        |
@@ -377,7 +411,7 @@ selection mechanism — adding a model never requires touching the gateway.
 
 | Setting                          | Default | What It Controls                                                                                     |
 | ---------------------------------- | ------- | --------------------------------------------------------------------------------------------------------- |
-| `DEFAULT_MAX_TOKENS` / `Agent::with_max_tokens` | 4096    | Per-turn output token ceiling (`max_tokens` in every dialect's request body)                          |
+| `DEFAULT_MAX_TOKENS` / `Agent::with_max_tokens` | model-aware (≥ 4096) | Per-turn output ceiling (`max_tokens`/`max_completion_tokens` per dialect). `Agent::new` seeds it from `capabilities(model).max_output` (floored at 4096); the compaction `context_window` is likewise seeded from `capabilities`. Both still overridable via the builders |
 | `DEFAULT_MAX_STEPS` / `Agent::with_max_steps`   | 24      | Loop-iteration ceiling; once `session.steps` reaches it, the *next* iteration returns `Error::MaxSteps` before sending a request — a runaway-tool-call backstop |
 | `Agent::with_system`              | `None`  | System prompt; hoisted to each dialect's native system field (Anthropic top-level `system`, OpenAI leading `system` message) |
 | `Agent::with_tools`               | empty   | The tool set advertised to the model; definitions + JSON Schemas computed once here, shared via `Arc<[ToolDef]>` for the agent's lifetime |

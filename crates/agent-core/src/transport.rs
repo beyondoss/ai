@@ -20,6 +20,52 @@ pub struct ThinkingConfig {
     pub budget_tokens: u32,
 }
 
+/// A provider-neutral reasoning effort level. Maps to OpenAI's `reasoning_effort` parameter on
+/// reasoning models (o-series, gpt-5), and to the `output_config.effort` field of Anthropic's
+/// adaptive-thinking shape on models that take it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    Minimal,
+    Low,
+    Medium,
+    High,
+    XHigh,
+}
+
+impl ReasoningEffort {
+    /// The wire string both providers use.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReasoningEffort::Minimal => "minimal",
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+            ReasoningEffort::XHigh => "xhigh",
+        }
+    }
+}
+
+/// How the model may use the advertised tools this turn. A request's [`ModelRequest::tool_choice`] is
+/// an `Option<ToolChoice>`: `None` (the default) emits **nothing** on the wire, leaving the provider's
+/// own default (auto when tools are present). The variants force a choice, and each dialect maps them
+/// to its own vocabulary (see the dialect `build_body`s):
+/// - `Auto` — the model decides whether to call a tool (Anthropic `{type:"auto"}`, OpenAI `"auto"`).
+/// - `None` — forbid tool calls this turn (Anthropic `{type:"none"}`, OpenAI `"none"`).
+/// - `Required` — the model *must* call some tool (Anthropic `{type:"any"}`, OpenAI `"required"`).
+/// - `Tool(name)` — pin the call to one named tool (Anthropic `{type:"tool", name}`, OpenAI the
+///   `{type:"function", function:{name}}` shape).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolChoice {
+    /// The model decides whether to call a tool.
+    Auto,
+    /// No tool may be called this turn.
+    None,
+    /// The model must call at least one tool.
+    Required,
+    /// The model must call this specific tool.
+    Tool(String),
+}
+
 /// One model request: the conversation so far plus the tools the model may call this turn.
 #[derive(Debug, Clone)]
 pub struct ModelRequest {
@@ -38,6 +84,13 @@ pub struct ModelRequest {
     pub max_tokens: u32,
     /// Extended thinking, when requested. `None` leaves it off (the default).
     pub thinking: Option<ThinkingConfig>,
+    /// Reasoning effort, for models driven by an effort level rather than a token budget (OpenAI
+    /// reasoning models; Anthropic adaptive thinking). `None` leaves the provider default.
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// How the model may use tools this turn (auto / none / required / a specific tool). `None` leaves
+    /// the provider default (auto when tools are present) and emits nothing on the wire — so the
+    /// default request shape is unchanged. See [`ToolChoice`].
+    pub tool_choice: Option<ToolChoice>,
     /// A stable per-conversation cache key, for prompt-cache affinity. OpenAI routes cache hits by
     /// `prompt_cache_key`; supplying a consistent value keeps a session pinned to a warm cache node.
     pub cache_key: Option<String>,
@@ -61,6 +114,8 @@ impl ModelRequest {
             tools: Vec::new().into(),
             max_tokens,
             thinking: None,
+            reasoning_effort: None,
+            tool_choice: None,
             cache_key: None,
             cache_long: false,
         }
@@ -82,6 +137,19 @@ impl ModelRequest {
     /// Builder-style: request extended thinking with the given token budget.
     pub fn with_thinking(mut self, budget_tokens: u32) -> Self {
         self.thinking = Some(ThinkingConfig { budget_tokens });
+        self
+    }
+
+    /// Builder-style: set the reasoning effort level.
+    pub fn with_reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
+        self.reasoning_effort = Some(effort);
+        self
+    }
+
+    /// Builder-style: constrain how the model may use tools this turn (see [`ToolChoice`]). Leaving
+    /// it unset emits nothing on the wire (the provider default).
+    pub fn with_tool_choice(mut self, choice: ToolChoice) -> Self {
+        self.tool_choice = Some(choice);
         self
     }
 

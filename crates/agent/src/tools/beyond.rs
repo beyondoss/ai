@@ -11,8 +11,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_core::ToolError;
 use agent_core::tool::Tool;
+use agent_core::{ToolError, ToolOutput};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
@@ -92,7 +92,7 @@ impl Tool for Fork {
             "required": ["app"]
         })
     }
-    async fn run(&self, input: Value) -> Result<String, ToolError> {
+    async fn run(&self, input: Value) -> Result<ToolOutput, ToolError> {
         let app = input
             .get("app")
             .and_then(Value::as_str)
@@ -102,7 +102,7 @@ impl Tool for Fork {
             args.push("--name".into());
             args.push(name.to_string());
         }
-        run_beyond(&self.runner, args).await
+        run_beyond(&self.runner, args).await.map(Into::into)
     }
 }
 
@@ -130,12 +130,12 @@ impl Tool for Sync {
             }
         })
     }
-    async fn run(&self, input: Value) -> Result<String, ToolError> {
+    async fn run(&self, input: Value) -> Result<ToolOutput, ToolError> {
         let mut args = vec!["sync".to_string()];
         if let Some(path) = input.get("path").and_then(Value::as_str) {
             args.push(path.to_string());
         }
-        run_beyond(&self.runner, args).await
+        run_beyond(&self.runner, args).await.map(Into::into)
     }
 }
 
@@ -164,7 +164,7 @@ impl Tool for Logs {
             }
         })
     }
-    async fn run(&self, input: Value) -> Result<String, ToolError> {
+    async fn run(&self, input: Value) -> Result<ToolOutput, ToolError> {
         let mut args = vec!["logs".to_string()];
         if let Some(app) = input.get("app").and_then(Value::as_str) {
             args.push("--app".into());
@@ -174,7 +174,7 @@ impl Tool for Logs {
             args.push("--query".into());
             args.push(query.to_string());
         }
-        run_beyond(&self.runner, args).await
+        run_beyond(&self.runner, args).await.map(Into::into)
     }
 }
 
@@ -201,6 +201,7 @@ mod tests {
                 stdout: "ok".into(),
                 stderr: String::new(),
                 timed_out: false,
+                ..Default::default()
             })
         }
     }
@@ -217,7 +218,8 @@ mod tests {
         let out = Fork::with_runner(r.clone())
             .run(json!({ "app": "myapp", "name": "branch1" }))
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert_eq!(out, "ok");
         let (prog, args) = r.last.lock().unwrap().clone().unwrap();
         assert_eq!(prog, "beyond");
@@ -267,6 +269,7 @@ mod tests {
                     stdout: String::new(),
                     stderr: "no such app".into(),
                     timed_out: false,
+                    ..Default::default()
                 })
             }
         }

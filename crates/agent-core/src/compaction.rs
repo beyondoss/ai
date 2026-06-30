@@ -56,6 +56,22 @@ structure, keeping concrete identifiers (file paths, function names, commands) v
 pleasantries:\n\n## Goal\n## Constraints\n## Progress\n### Done\n### In Progress\n### Blocked\n## Key \
 Decisions\n## Next Steps\n## Critical Context";
 
+/// The instruction used when a *previous* summary already exists — an incremental update rather than a
+/// from-scratch re-summarization. Without this, each compaction re-summarizes the prior summary as raw
+/// transcript, compounding information loss and re-billing those tokens every cycle.
+pub const UPDATE_INSTRUCTION: &str = "Above is the PREVIOUS summary followed by NEW activity since it \
+was written. Produce a single UPDATED summary that folds the new activity into the previous one, in \
+this exact Markdown structure, keeping concrete identifiers (file paths, function names, commands) \
+verbatim and omitting pleasantries. Preserve still-relevant facts from the previous summary; do not \
+drop earlier decisions or context just because they are not repeated in the new activity:\n\n## Goal\n\
+## Constraints\n## Progress\n### Done\n### In Progress\n### Blocked\n## Key Decisions\n## Next Steps\n\
+## Critical Context";
+
+/// Prefix marking a message as a compaction summary, so a later compaction recognizes it and updates
+/// it incrementally instead of re-summarizing it. Created by [`apply_summary`], detected by
+/// [`previous_summary`].
+pub const SUMMARY_MARKER: &str = "[Earlier conversation compacted to save context]";
+
 /// Tool-result content is truncated to this many characters when rendered into the summary prompt —
 /// tool output is usually the bulk of the transcript and the least useful to re-summarize in full.
 const TOOL_RESULT_MAX_CHARS: usize = 2_000;
@@ -204,16 +220,49 @@ pub fn extract_file_ops(messages: &[Message]) -> (Vec<String>, Vec<String>) {
     (read, modified)
 }
 
+/// If `prefix` begins with a prior compaction summary (a user message tagged with [`SUMMARY_MARKER`]),
+/// return the summary body (without the marker line). This is what lets compaction be *incremental*:
+/// the previous summary is fed forward as-is and updated, not re-summarized as transcript.
+pub fn previous_summary(prefix: &[Message]) -> Option<&str> {
+    let first = prefix.first()?;
+    if first.role != Role::User {
+        return None;
+    }
+    let ContentBlock::Text { text } = first.content.first()? else {
+        return None;
+    };
+    let body = text.strip_prefix(SUMMARY_MARKER)?;
+    Some(body.trim_start())
+}
+
 /// Build the (network-free) summarization request: the rendered prefix plus the structured
 /// instruction and file-op tags, as a single user turn. One self-contained message sidesteps any
 /// role-alternation constraints, and capping tool results keeps the prompt well under the window.
+///
+/// When `prefix` already starts with a prior summary, this builds an *incremental update* instead:
+/// the previous summary is presented verbatim, only the activity since it is rendered as transcript,
+/// and the model is asked to merge them — so successive compactions don't re-summarize (and lose) the
+/// same early context over and over.
 pub fn summary_request(model: &str, prefix: &[Message], max_tokens: u32) -> ModelRequest {
-    let transcript = render_prefix(prefix);
     let (read, modified) = extract_file_ops(prefix);
 
     let mut prompt = String::new();
-    prompt.push_str(&transcript);
-    prompt.push_str("\n\n");
+    let instruction = match previous_summary(prefix) {
+        Some(prev) => {
+            // Incremental: previous summary verbatim, then only the new activity (prefix[1..]).
+            prompt.push_str("<previous-summary>\n");
+            prompt.push_str(prev);
+            prompt.push_str("\n</previous-summary>\n\n<new-activity>\n");
+            prompt.push_str(&render_prefix(&prefix[1..]));
+            prompt.push_str("</new-activity>\n\n");
+            UPDATE_INSTRUCTION
+        }
+        None => {
+            prompt.push_str(&render_prefix(prefix));
+            prompt.push_str("\n\n");
+            SUMMARY_INSTRUCTION
+        }
+    };
     if !read.is_empty() {
         prompt.push_str(&format!(
             "<read-files>\n{}\n</read-files>\n",
@@ -226,7 +275,7 @@ pub fn summary_request(model: &str, prefix: &[Message], max_tokens: u32) -> Mode
             modified.join("\n")
         ));
     }
-    prompt.push_str(SUMMARY_INSTRUCTION);
+    prompt.push_str(instruction);
 
     ModelRequest::new(model, Arc::new(vec![Message::user(prompt)]), max_tokens)
         .with_system(SUMMARY_SYSTEM)
@@ -238,9 +287,7 @@ pub fn summary_request(model: &str, prefix: &[Message], max_tokens: u32) -> Mode
 pub fn apply_summary(session: &mut Session, first_kept: usize, summary: &str) {
     let kept = &session.messages[first_kept..];
     let mut new_messages = Vec::with_capacity(1 + kept.len());
-    new_messages.push(Message::user(format!(
-        "[Earlier conversation compacted to save context]\n\n{summary}"
-    )));
+    new_messages.push(Message::user(format!("{SUMMARY_MARKER}\n\n{summary}")));
     new_messages.extend_from_slice(kept);
     session.messages = Arc::new(new_messages);
     session.last_input_tokens = 0;
@@ -330,6 +377,43 @@ mod tests {
         assert!(text.contains("a.rs"));
         assert!(text.contains("## Goal"));
         assert_eq!(req.system.as_deref(), Some(SUMMARY_SYSTEM));
+    }
+
+    #[test]
+    fn second_compaction_updates_the_previous_summary_incrementally() {
+        // Simulate a prefix that begins with a prior summary (as `apply_summary` would produce),
+        // followed by new activity. The request must update the previous summary, not re-summarize it.
+        let prefix = vec![
+            Message::user(format!(
+                "{SUMMARY_MARKER}\n\nPrevious summary body about task X"
+            )),
+            Message::assistant(vec![ContentBlock::Text {
+                text: "new work since".into(),
+            }]),
+            Message::tool_result("9", "new tool output", false),
+        ];
+        // The prior summary is detected and handed back verbatim.
+        assert_eq!(
+            previous_summary(&prefix),
+            Some("Previous summary body about task X")
+        );
+
+        let req = summary_request("claude-test", &prefix, 512);
+        let ContentBlock::Text { text } = &req.messages[0].content[0] else {
+            panic!("expected text");
+        };
+        // Uses the incremental update framing, not the from-scratch instruction.
+        assert!(text.contains("<previous-summary>"));
+        assert!(text.contains("Previous summary body about task X"));
+        assert!(text.contains("<new-activity>"));
+        assert!(text.contains("PREVIOUS summary followed by NEW activity"));
+        // The marker line itself isn't fed back into the transcript as raw text.
+        assert!(!text.contains(SUMMARY_MARKER));
+    }
+
+    #[test]
+    fn previous_summary_is_none_for_a_normal_prefix() {
+        assert!(previous_summary(&convo()).is_none());
     }
 
     #[test]

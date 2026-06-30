@@ -75,6 +75,64 @@ fn serve_dir_cmd(bin: &str, base: &str, session_dir: &str) -> Command {
 }
 
 #[test]
+fn serve_streams_tool_progress_from_a_running_bash() {
+    // The full streaming chain, deterministically (mock model + real bash, no network): the model
+    // calls `bash` with a command that emits output over time; the run must surface those chunks as
+    // `tool_progress` event frames *before* the tool's result.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+
+    let cmd = "printf 'chunk-a\\n'; sleep 0.15; printf 'chunk-b\\n'";
+    let (base, _bodies) = spawn_model_server(vec![
+        turn_tool_use("toolu_b", "bash", &json!({ "command": cmd }).to_string()),
+        turn_text("done"),
+    ]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "run it" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "prompt");
+    drop(stdin);
+    child.wait().unwrap();
+
+    // Collect tool_progress chunks in arrival order, and prove they precede the tool's end.
+    let kinds: Vec<&str> = frames
+        .iter()
+        .filter(|f| f["type"] == "event")
+        .filter_map(|f| f["event"]["kind"].as_str())
+        .collect();
+    let progress_chunks: String = frames
+        .iter()
+        .filter(|f| f["type"] == "event" && f["event"]["kind"] == "tool_progress")
+        .filter_map(|f| f["event"]["chunk"].as_str())
+        .collect();
+
+    assert!(
+        kinds.contains(&"tool_progress"),
+        "a running bash must stream tool_progress frames: {kinds:?}"
+    );
+    assert!(
+        progress_chunks.contains("chunk-a") && progress_chunks.contains("chunk-b"),
+        "streamed chunks should carry the live output, got: {progress_chunks:?}"
+    );
+    let first_progress = kinds.iter().position(|k| *k == "tool_progress").unwrap();
+    let tool_end = kinds.iter().position(|k| *k == "tool_end").unwrap();
+    assert!(
+        first_progress < tool_end,
+        "progress must arrive before tool_end: {kinds:?}"
+    );
+}
+
+#[test]
 fn serve_follow_up_steers_an_in_flight_run() {
     use std::time::Duration;
 
@@ -134,6 +192,81 @@ fn serve_follow_up_steers_an_in_flight_run() {
     let dump = frames.last().unwrap()["data"]["messages"].to_string();
     assert!(dump.contains("now the second thing"));
     assert!(dump.contains("done with the follow-up"));
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_switches_model_and_thinking_at_runtime() {
+    // These are pure control commands — no model call — so the mock server is never hit.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    // The known-model list is returned and non-empty.
+    writeln!(stdin, "{}", json!({ "type": "get_available_models" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_available_models");
+    let models = frames.last().unwrap()["data"]["models"].as_array().unwrap();
+    assert!(
+        models.iter().any(|m| m == "claude-opus-4-8"),
+        "model list should include the default opus id: {models:#?}"
+    );
+
+    // Switch the model; the response echoes it and `get_state` reflects it.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_model", "model": "gpt-4o" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "set_model");
+    assert_eq!(frames.last().unwrap()["data"]["model"], "gpt-4o");
+
+    writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_state");
+    assert_eq!(
+        frames.last().unwrap()["data"]["model"],
+        "gpt-4o",
+        "get_state must reflect the switched model"
+    );
+
+    // A missing `model` is rejected.
+    writeln!(stdin, "{}", json!({ "type": "set_model" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "set_model");
+    assert_eq!(frames.last().unwrap()["success"], false);
+
+    // Set then clear the thinking budget.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_thinking", "budget": 4096 })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "set_thinking");
+    assert_eq!(frames.last().unwrap()["success"], true);
+    assert_eq!(frames.last().unwrap()["data"]["thinking"], 4096);
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_thinking", "budget": Value::Null })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "set_thinking");
+    assert_eq!(frames.last().unwrap()["success"], true);
+    assert!(frames.last().unwrap()["data"]["thinking"].is_null());
 
     drop(stdin);
     child.wait().unwrap();

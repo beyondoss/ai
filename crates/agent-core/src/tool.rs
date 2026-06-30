@@ -9,10 +9,97 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::channel::mpsc::UnboundedSender;
 use serde_json::Value;
 
 use crate::error::ToolError;
-use crate::message::ToolDef;
+use crate::message::{ImageSource, ToolDef};
+
+/// A sink a tool uses to emit incremental output *while it is still running* — a long shell command's
+/// streaming stdout, a large download's progress, a multi-step tool's stage updates. Each chunk
+/// surfaces to the run's observers as an `AgentEvent::ToolProgress` tagged with this call's id and
+/// name (pi's `tool_execution_update`). The loop hands one to every call; a tool that doesn't stream
+/// simply never calls [`emit`](ToolProgress::emit). Cloneable and `Send`, so a tool can hand it to a
+/// background read loop.
+#[derive(Clone)]
+pub struct ToolProgress {
+    tx: UnboundedSender<(String, String, String)>, // (tool_use_id, tool_name, chunk)
+    id: String,
+    name: String,
+}
+
+impl ToolProgress {
+    /// Build a progress handle for one tool call. The loop constructs these; tools receive `&ToolProgress`.
+    pub(crate) fn new(
+        tx: UnboundedSender<(String, String, String)>,
+        id: String,
+        name: String,
+    ) -> Self {
+        Self { tx, id, name }
+    }
+
+    /// Emit a chunk of incremental output for this call. Best-effort: if the run has already finished
+    /// (the receiver is gone), the chunk is dropped rather than erroring.
+    pub fn emit(&self, chunk: impl Into<String>) {
+        let _ = self
+            .tx
+            .unbounded_send((self.id.clone(), self.name.clone(), chunk.into()));
+    }
+}
+
+/// A tool's successful output: text for the model, plus any images it produced (a screenshot, a
+/// rendered chart, `read` on an image file) and an optional hint to end the run.
+///
+/// The overwhelmingly common case is plain text, so [`From<String>`]/[`From<&str>`] make returning it
+/// a one-liner (`Ok("done".into())`). Image-producing tools attach [`ImageSource`]s the multimodal
+/// model can actually see — without this, a tool could only ever hand back UTF-8 text.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ToolOutput {
+    /// Text shown to the model (may be empty if the result is purely visual).
+    pub text: String,
+    /// Images attached to the result. Empty for the typical text-only tool.
+    pub images: Vec<ImageSource>,
+    /// When set, asks the loop to end the run after this batch — provided *every* call in the batch
+    /// agrees (an `attempt_completion`/`exit`-style tool). Defaults to `false`.
+    pub terminate: bool,
+}
+
+impl ToolOutput {
+    /// A text-only result.
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            ..Default::default()
+        }
+    }
+
+    /// A result carrying a single image plus optional accompanying text.
+    pub fn image(text: impl Into<String>, source: ImageSource) -> Self {
+        Self {
+            text: text.into(),
+            images: vec![source],
+            terminate: false,
+        }
+    }
+
+    /// Builder-style: mark this result as requesting the run end (see [`ToolOutput::terminate`]).
+    pub fn with_terminate(mut self, terminate: bool) -> Self {
+        self.terminate = terminate;
+        self
+    }
+}
+
+impl From<String> for ToolOutput {
+    fn from(text: String) -> Self {
+        Self::text(text)
+    }
+}
+
+impl From<&str> for ToolOutput {
+    fn from(text: &str) -> Self {
+        Self::text(text)
+    }
+}
 
 /// A capability the model can call. Implementors are cheap, `Send + Sync` values stored behind an
 /// `Arc` in the registry.
@@ -27,10 +114,25 @@ pub trait Tool: Send + Sync {
     /// JSON Schema for the tool's input arguments object.
     fn input_schema(&self) -> Value;
 
-    /// Run the tool against a (schema-conformant) arguments object, returning text for the model.
-    /// Return [`ToolError`] on failure; the loop surfaces it as an error `tool_result` rather than
-    /// aborting the run.
-    async fn run(&self, input: Value) -> Result<String, ToolError>;
+    /// Run the tool against a (schema-conformant) arguments object, returning a [`ToolOutput`] (text,
+    /// and optionally images, for the model). Plain text converts in with `.into()`. Return
+    /// [`ToolError`] on failure; the loop surfaces it as an error `tool_result` rather than aborting
+    /// the run.
+    async fn run(&self, input: Value) -> Result<ToolOutput, ToolError>;
+
+    /// Run with a [`ToolProgress`] sink for incremental output, for tools whose work is worth
+    /// streaming (long shell commands, large transfers). Defaults to [`run`](Tool::run) — most tools
+    /// produce their result in one shot — so overriding is opt-in and existing tools are unaffected.
+    /// Whatever a tool emits via `progress` reaches the run's observers as `AgentEvent::ToolProgress`
+    /// *before* the final `ToolEnd`/`tool_result`.
+    async fn run_streaming(
+        &self,
+        input: Value,
+        progress: &ToolProgress,
+    ) -> Result<ToolOutput, ToolError> {
+        let _ = progress;
+        self.run(input).await
+    }
 
     /// The filesystem path this call would write to, if any. The loop runs a turn's tool calls
     /// concurrently (see `Agent::run_events`), but two calls that write the *same* path — e.g. the
@@ -123,11 +225,11 @@ mod tests {
                 "required": ["text"],
             })
         }
-        async fn run(&self, input: Value) -> Result<String, ToolError> {
+        async fn run(&self, input: Value) -> Result<ToolOutput, ToolError> {
             input
                 .get("text")
                 .and_then(Value::as_str)
-                .map(str::to_string)
+                .map(|s| s.into())
                 .ok_or_else(|| ToolError::InvalidInput("missing `text`".into()))
         }
     }
@@ -163,7 +265,7 @@ mod tests {
             fn input_schema(&self) -> Value {
                 json!({ "type": "object" })
             }
-            async fn run(&self, _: Value) -> Result<String, ToolError> {
+            async fn run(&self, _: Value) -> Result<ToolOutput, ToolError> {
                 Ok("other".into())
             }
         }
@@ -190,7 +292,7 @@ mod tests {
             fn input_schema(&self) -> Value {
                 json!({ "type": "object" })
             }
-            async fn run(&self, _: Value) -> Result<String, ToolError> {
+            async fn run(&self, _: Value) -> Result<ToolOutput, ToolError> {
                 Ok(self.0.into())
             }
         }
@@ -209,7 +311,7 @@ mod tests {
     #[tokio::test]
     async fn echo_runs() {
         let out = EchoTool.run(json!({ "text": "hi" })).await.unwrap();
-        assert_eq!(out, "hi");
+        assert_eq!(out.text, "hi");
         let err = EchoTool.run(json!({})).await;
         assert!(matches!(err, Err(ToolError::InvalidInput(_))));
     }

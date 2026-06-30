@@ -200,17 +200,32 @@ fn is_retryable_send_error(e: &reqwest::Error) -> bool {
     e.is_timeout() || e.is_connect()
 }
 
-/// Parse a `Retry-After` header (delta-seconds form) into a duration, capped at [`MAX_BACKOFF`].
+/// Parse a `Retry-After` response header into a duration, capped at [`MAX_BACKOFF`].
 fn retry_after(resp: &reqwest::Response) -> Option<Duration> {
-    let secs: u64 = resp
+    let raw = resp
         .headers()
         .get(reqwest::header::RETRY_AFTER)?
         .to_str()
-        .ok()?
-        .trim()
-        .parse()
         .ok()?;
-    Some(Duration::from_secs(secs).min(MAX_BACKOFF))
+    parse_retry_after(raw)
+}
+
+/// Parse a `Retry-After` header *value* into a wait, capped at [`MAX_BACKOFF`]. RFC 7231 allows two
+/// forms: delta-seconds (`120`) and an absolute HTTP-date (`Wed, 21 Oct 2025 07:28:00 GMT`). The
+/// date form is converted to a delay from now; a date already in the past (clock skew, a stale hint)
+/// yields no extra wait. Split out from [`retry_after`] so it's testable without a `reqwest::Response`.
+fn parse_retry_after(raw: &str) -> Option<Duration> {
+    let raw = raw.trim();
+    // Delta-seconds: a bare non-negative integer count of seconds.
+    if let Ok(secs) = raw.parse::<u64>() {
+        return Some(Duration::from_secs(secs).min(MAX_BACKOFF));
+    }
+    // HTTP-date: the absolute instant to retry at. Anything we can't parse as either form is ignored.
+    let target = httpdate::parse_http_date(raw).ok()?;
+    let delay = target
+        .duration_since(std::time::SystemTime::now())
+        .unwrap_or(Duration::ZERO);
+    Some(delay.min(MAX_BACKOFF))
 }
 
 /// The wait before the next attempt (0-indexed): the larger of the server's `Retry-After` hint and
@@ -253,5 +268,27 @@ mod tests {
             Duration::from_secs(2)
         );
         assert_eq!(backoff(0, Some(Duration::from_secs(3600))), MAX_BACKOFF);
+    }
+
+    #[test]
+    fn retry_after_accepts_delta_seconds_and_http_date() {
+        // Delta-seconds form, capped at MAX_BACKOFF.
+        assert_eq!(parse_retry_after("2"), Some(Duration::from_secs(2)));
+        assert_eq!(parse_retry_after(" 3 "), Some(Duration::from_secs(3)));
+        assert_eq!(parse_retry_after("99999"), Some(MAX_BACKOFF));
+        // A value that is neither an integer nor an HTTP-date is ignored.
+        assert_eq!(parse_retry_after("soon"), None);
+        // HTTP-date already in the past → no extra wait.
+        assert_eq!(
+            parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"),
+            Some(Duration::ZERO)
+        );
+        // HTTP-date in the future → a positive, capped delay.
+        let future = std::time::SystemTime::now() + Duration::from_secs(5);
+        let delay = parse_retry_after(&httpdate::fmt_http_date(future)).expect("a parsed delay");
+        assert!(
+            delay > Duration::ZERO && delay <= MAX_BACKOFF,
+            "future http-date should yield a bounded positive delay, got {delay:?}"
+        );
     }
 }

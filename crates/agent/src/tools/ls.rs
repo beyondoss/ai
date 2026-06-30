@@ -1,13 +1,14 @@
 //! `ls` — list a directory's entries (directories suffixed with `/`).
 
-use agent_core::ToolError;
 use agent_core::tool::Tool;
+use agent_core::{ToolError, ToolOutput};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-/// Max entries returned before truncating, to protect the model's context from a `node_modules`-sized
-/// directory. The model can narrow with a more specific path or `find`/`grep`.
-const MAX_ENTRIES: usize = 500;
+/// Default cap on entries returned before truncating, to protect the model's context from a
+/// `node_modules`-sized directory. Overridable per call via the `limit` argument. The model can also
+/// narrow with a more specific path or `find`/`grep`.
+const DEFAULT_LIMIT: usize = 500;
 
 pub struct Ls;
 
@@ -25,14 +26,20 @@ impl Tool for Ls {
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "Directory to list (default \".\")." },
-                "all": { "type": "boolean", "description": "Include dot-files (default false)." }
+                "all": { "type": "boolean", "description": "Include dot-files (default false)." },
+                "limit": { "type": "integer", "description": "Max entries to list before truncating (default 500)." }
             }
         })
     }
 
-    async fn run(&self, input: Value) -> Result<String, ToolError> {
+    async fn run(&self, input: Value) -> Result<ToolOutput, ToolError> {
         let path = input.get("path").and_then(Value::as_str).unwrap_or(".");
         let all = input.get("all").and_then(Value::as_bool).unwrap_or(false);
+        let limit = input
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize)
+            .unwrap_or(DEFAULT_LIMIT);
 
         let mut entries: Vec<String> = Vec::new();
         let dir =
@@ -56,16 +63,16 @@ impl Tool for Ls {
         }
         // Cap the listing so a huge directory can't flood the model's context.
         let total = entries.len();
-        if total > MAX_ENTRIES {
-            entries.truncate(MAX_ENTRIES);
+        if total > limit {
+            entries.truncate(limit);
             let mut out = entries.join("\n");
             out.push_str(&format!(
                 "\n… ({} more entries; {total} total — narrow with a subpath or use `find`/`grep`)",
-                total - MAX_ENTRIES
+                total - limit
             ));
-            return Ok(out);
+            return Ok(out.into());
         }
-        Ok(entries.join("\n"))
+        Ok(entries.join("\n").into())
     }
 }
 
@@ -83,28 +90,51 @@ mod tests {
         let out = Ls
             .run(json!({ "path": dir.path().to_str().unwrap() }))
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert_eq!(out, "subdir/\nfile.txt");
 
         let all = Ls
             .run(json!({ "path": dir.path().to_str().unwrap(), "all": true }))
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(all.contains(".hidden"));
     }
 
     #[tokio::test]
     async fn caps_a_huge_directory() {
         let dir = tempfile::tempdir().unwrap();
-        for i in 0..(MAX_ENTRIES + 50) {
+        for i in 0..(DEFAULT_LIMIT + 50) {
             std::fs::write(dir.path().join(format!("f{i:04}")), "x").unwrap();
         }
         let out = Ls
             .run(json!({ "path": dir.path().to_str().unwrap() }))
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(out.contains("more entries"));
-        // The body is capped to MAX_ENTRIES lines (plus the truncation note).
-        assert_eq!(out.lines().count(), MAX_ENTRIES + 1);
+        // The body is capped to DEFAULT_LIMIT lines (plus the truncation note).
+        assert_eq!(out.lines().count(), DEFAULT_LIMIT + 1);
+    }
+
+    #[tokio::test]
+    async fn limit_param_overrides_the_default_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..10 {
+            std::fs::write(dir.path().join(format!("f{i:02}")), "x").unwrap();
+        }
+        let out = Ls
+            .run(json!({ "path": dir.path().to_str().unwrap(), "limit": 3 }))
+            .await
+            .unwrap()
+            .text;
+        assert!(
+            out.contains("more entries"),
+            "a small limit must truncate: {out}"
+        );
+        assert!(out.contains("7 more entries; 10 total"));
+        // Three entry lines plus the truncation note.
+        assert_eq!(out.lines().count(), 4);
     }
 }

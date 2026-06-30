@@ -45,11 +45,15 @@ pub enum ContentBlock {
     },
     /// The result of running a tool, fed back to the model. Carried on a `User` message (Anthropic
     /// convention). `is_error` lets the model see a failure as a value rather than a dead turn.
+    /// `images` carries any visual output (a screenshot, `read` on an image); empty for the common
+    /// text-only result, and `skip`ped on the wire/disk so existing sessions round-trip unchanged.
     ToolResult {
         tool_use_id: String,
         content: String,
         #[serde(default)]
         is_error: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageSource>,
     },
     /// An image attachment (base64). The wire shape is Anthropic's
     /// `{"type":"image","source":{"type":"base64", media_type, data}}`.
@@ -132,6 +136,7 @@ impl Message {
                 tool_use_id: tool_use_id.into(),
                 content: content.into(),
                 is_error,
+                images: Vec::new(),
             }],
         }
     }
@@ -269,7 +274,8 @@ mod tests {
             ContentBlock::ToolResult {
                 tool_use_id: "tu_1".into(),
                 content: "ok".into(),
-                is_error: false
+                is_error: false,
+                images: Vec::new(),
             }
         );
     }

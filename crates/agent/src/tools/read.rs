@@ -2,10 +2,16 @@
 
 use std::io::{BufRead, BufReader};
 
-use agent_core::ToolError;
+use agent_core::message::ImageSource;
 use agent_core::tool::Tool;
+use agent_core::{ToolError, ToolOutput};
 use async_trait::async_trait;
+use base64::Engine as _;
 use serde_json::{Value, json};
+
+/// Cap on image file size we'll inline as a data-URI (bytes). Beyond this the base64 payload would
+/// dominate the model's context; tell the model to narrow rather than ballooning the request.
+const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 
 /// Default cap on returned lines when no `limit` is given (keeps large files from flooding context).
 const DEFAULT_LIMIT: usize = 2000;
@@ -80,11 +86,17 @@ impl Tool for Read {
         })
     }
 
-    async fn run(&self, input: Value) -> Result<String, ToolError> {
+    async fn run(&self, input: Value) -> Result<ToolOutput, ToolError> {
         let path = input
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing `path`".into()))?;
+
+        // An image file is returned as an attachment the multimodal model can see, not decoded as
+        // UTF-8 text (which would hand back garbage). Detected by extension.
+        if let Some(media_type) = image_media_type(path) {
+            return read_image(path, media_type);
+        }
 
         let offset = input
             .get("offset")
@@ -153,8 +165,45 @@ impl Tool for Read {
                 "… (showing lines {offset}-{last}; use offset={lineno} to continue)\n"
             ));
         }
-        Ok(out)
+        Ok(out.into())
     }
+}
+
+/// The image MIME type for a path's extension, or `None` if it isn't a recognized image. Used to
+/// route `read` to the attachment path instead of UTF-8 text decoding.
+fn image_media_type(path: &str) -> Option<&'static str> {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())?
+        .to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => return None,
+    })
+}
+
+/// Read an image file and return it as a base64 [`ImageSource`] attachment (plus a short text note),
+/// so the multimodal model can actually see it. Oversized files are refused rather than ballooning the
+/// request with a multi-megabyte base64 payload.
+fn read_image(path: &str, media_type: &str) -> Result<ToolOutput, ToolError> {
+    let meta =
+        std::fs::metadata(path).map_err(|e| ToolError::Execution(format!("read {path}: {e}")))?;
+    if meta.len() > MAX_IMAGE_BYTES {
+        return Err(ToolError::InvalidInput(format!(
+            "image {path} is {} bytes; larger than the {MAX_IMAGE_BYTES}-byte inline limit",
+            meta.len()
+        )));
+    }
+    let bytes =
+        std::fs::read(path).map_err(|e| ToolError::Execution(format!("read {path}: {e}")))?;
+    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(ToolOutput::image(
+        format!("Read image {path} ({media_type}, {} bytes).", meta.len()),
+        ImageSource::base64(media_type, data),
+    ))
 }
 
 #[cfg(test)]
@@ -174,7 +223,8 @@ mod tests {
         let out = Read
             .run(json!({ "path": f.path().to_str().unwrap() }))
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(out.contains("     1\talpha"));
         assert!(out.contains("     3\tgamma"));
     }
@@ -195,8 +245,9 @@ mod tests {
         let out = Read
             .run(json!({ "path": f.path().to_str().unwrap(), "limit": 2 }))
             .await
-            .unwrap();
-        // Showed lines 1-2; the model is told to continue at line 3.
+            .unwrap()
+            .text;
+        //Showed lines 1-2; the model is told to continue at line 3.
         assert!(out.contains("use offset=3 to continue"), "got: {out}");
     }
 
@@ -206,7 +257,8 @@ mod tests {
         let out = Read
             .run(json!({ "path": f.path().to_str().unwrap(), "offset": 2, "limit": 2 }))
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(out.contains("     2\tb"));
         assert!(out.contains("     3\tc"));
         assert!(!out.contains("\td\n"));
@@ -230,8 +282,9 @@ mod tests {
         let out = Read
             .run(json!({ "path": f.path().to_str().unwrap() }))
             .await
-            .unwrap();
-        // The stored line is bounded, not the full 16k — the cap plus the framing/marker overhead.
+            .unwrap()
+            .text;
+        //The stored line is bounded, not the full 16k — the cap plus the framing/marker overhead.
         assert!(
             out.len() < MAX_LINE_BYTES * 2,
             "line was not capped: {} bytes",
@@ -240,5 +293,29 @@ mod tests {
         assert!(out.contains("[line truncated]"));
         // The next line is read correctly as line 2 (overflow was drained, not mis-parsed).
         assert!(out.contains("     2\tnext"));
+    }
+
+    #[tokio::test]
+    async fn reads_an_image_as_an_attachment() {
+        // A .png is returned as a base64 image attachment, not UTF-8-decoded into garbage text.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shot.png");
+        // A minimal PNG header byte sequence is enough — we only base64 the bytes.
+        std::fs::write(&path, [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]).unwrap();
+        let out = Read
+            .run(json!({ "path": path.to_str().unwrap() }))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.images.len(),
+            1,
+            "image must be returned as an attachment"
+        );
+        assert_eq!(out.images[0].media_type, "image/png");
+        assert!(!out.images[0].data.is_empty(), "base64 payload present");
+        assert!(
+            out.text.contains("Read image"),
+            "a text note accompanies it"
+        );
     }
 }

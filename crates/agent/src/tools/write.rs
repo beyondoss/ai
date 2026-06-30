@@ -1,7 +1,7 @@
 //! `write` — create or overwrite a file (creating parent directories).
 
-use agent_core::ToolError;
 use agent_core::tool::Tool;
+use agent_core::{ToolError, ToolOutput};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
@@ -33,7 +33,7 @@ impl Tool for Write {
             .map(str::to_string)
     }
 
-    async fn run(&self, input: Value) -> Result<String, ToolError> {
+    async fn run(&self, input: Value) -> Result<ToolOutput, ToolError> {
         let path = input
             .get("path")
             .and_then(Value::as_str)
@@ -54,7 +54,7 @@ impl Tool for Write {
         // session file). `create_dir_all` above ensures the sibling temp's directory exists.
         super::write_atomic(path, content.as_bytes())
             .map_err(|e| ToolError::Execution(format!("write {path}: {e}")))?;
-        Ok(format!("wrote {} bytes to {path}", content.len()))
+        Ok(format!("wrote {} bytes to {path}", content.len()).into())
     }
 }
 
@@ -69,7 +69,8 @@ mod tests {
         let out = Write
             .run(json!({ "path": path.to_str().unwrap(), "content": "hello" }))
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(out.contains("5 bytes"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
     }

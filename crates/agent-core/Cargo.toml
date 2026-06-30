@@ -31,6 +31,11 @@ tracing.workspace = true
 async-stream = "0.3"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 
+# Parse the HTTP-date form of a `Retry-After` header (`Wed, 21 Oct 2025 07:28:00 GMT`). A tiny,
+# dependency-free crate already in the build graph (hyper depends on it), so this adds nothing to
+# compile — just makes the parser reachable from this crate.
+httpdate = "1"
+
 [dev-dependencies]
 # Async test runtime for the `Tool`/loop tests. The library itself is runtime-agnostic — it pulls in
 # no executor, only the `futures` stream traits — so the runtime lives in dev-deps.

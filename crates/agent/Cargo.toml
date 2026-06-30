@@ -35,6 +35,13 @@ globset = "0.4"
 ignore = "0.4"
 regex = "1"
 
+# `edit`'s fuzzy fallback matcher: NFKC folding so a model's reconstructed `old_string` (smart quotes,
+# full-width/ligature chars) still lands against the on-disk bytes.
+unicode-normalization = "0.1"
+
+# `read` base64-encodes image files so the multimodal model can see them (e.g. a screenshot).
+base64 = "0.22"
+
 [dev-dependencies]
 # Scratch files/dirs for the file-tool tests.
 tempfile = "3"

@@ -13,7 +13,7 @@ use serde_json::{Map, Value, json};
 use super::StreamDecoder;
 use crate::error::{Error, Result};
 use crate::message::{ContentBlock, Role, StopReason, StreamEvent, TokenUsage};
-use crate::transport::ModelRequest;
+use crate::transport::{ModelRequest, ToolChoice};
 
 fn text_of(blocks: &[ContentBlock]) -> String {
     blocks
@@ -23,6 +23,37 @@ fn text_of(blocks: &[ContentBlock]) -> String {
             _ => None,
         })
         .collect()
+}
+
+/// Build an OpenAI user-message `content` from a turn's text and image blocks (tool results are
+/// emitted separately). Returns a plain string when there are no images — OpenAI's common case — and
+/// a multimodal parts array (`[{type:"text"}, {type:"image_url"}…]`) when images are present. `None`
+/// if the turn carries neither text nor image (e.g. a tool-result-only turn). Without this, image
+/// blocks were dropped on the floor: `text_of` keeps only text, so vision input silently vanished.
+fn user_content(blocks: &[ContentBlock]) -> Option<Value> {
+    let has_image = blocks
+        .iter()
+        .any(|b| matches!(b, ContentBlock::Image { .. }));
+    if !has_image {
+        let text = text_of(blocks);
+        return (!text.is_empty()).then_some(Value::String(text));
+    }
+    let mut parts: Vec<Value> = Vec::new();
+    for b in blocks {
+        match b {
+            ContentBlock::Text { text } if !text.is_empty() => {
+                parts.push(json!({ "type": "text", "text": text }));
+            }
+            ContentBlock::Image { source } => parts.push(json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": format!("data:{};base64,{}", source.media_type, source.data),
+                },
+            })),
+            _ => {}
+        }
+    }
+    (!parts.is_empty()).then_some(Value::Array(parts))
 }
 
 /// Build the streaming request body, translating the internal messages into OpenAI's flat shape.
@@ -38,19 +69,37 @@ pub fn build_body(req: &ModelRequest) -> Value {
                 messages.push(json!({ "role": "system", "content": text_of(&m.content) }))
             }
             Role::User => {
-                let text = text_of(&m.content);
-                if !text.is_empty() {
-                    messages.push(json!({ "role": "user", "content": text }));
+                // Text + image blocks form the user message (a multimodal parts array when any image
+                // is present); tool results fan out into individual `role:"tool"` messages below.
+                if let Some(content) = user_content(&m.content) {
+                    messages.push(json!({ "role": "user", "content": content }));
                 }
-                // Tool results fan out into individual `role:"tool"` messages.
                 for b in &m.content {
                     if let ContentBlock::ToolResult {
                         tool_use_id,
                         content,
+                        images,
                         ..
                     } = b
                     {
                         messages.push(json!({ "role": "tool", "tool_call_id": tool_use_id, "content": content }));
+                        // OpenAI's `tool` role can't carry images, so fan any visual output out to a
+                        // following `user` message that references the originating call.
+                        if !images.is_empty() {
+                            let mut parts: Vec<Value> = vec![json!({
+                                "type": "text",
+                                "text": format!("Image output from tool call {tool_use_id}:"),
+                            })];
+                            for source in images {
+                                parts.push(json!({
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": format!("data:{};base64,{}", source.media_type, source.data),
+                                    },
+                                }));
+                            }
+                            messages.push(json!({ "role": "user", "content": parts }));
+                        }
                     }
                 }
             }
@@ -89,9 +138,24 @@ pub fn build_body(req: &ModelRequest) -> Value {
         }
     }
 
+    let caps = crate::models::capabilities(&req.model);
     let mut map = Map::new();
     map.insert("model".into(), json!(req.model));
-    map.insert("max_tokens".into(), json!(req.max_tokens));
+    // OpenAI reasoning models (o-series, gpt-5) reject `max_tokens` and require
+    // `max_completion_tokens`; non-reasoning chat models take `max_tokens`. The gateway forwards the
+    // body verbatim, so the agent must pick the right field per model.
+    let max_tokens_field = match caps.max_tokens_field {
+        crate::models::MaxTokensField::MaxCompletionTokens => "max_completion_tokens",
+        crate::models::MaxTokensField::MaxTokens => "max_tokens",
+    };
+    map.insert(max_tokens_field.into(), json!(req.max_tokens));
+    // Reasoning models are driven by `reasoning_effort` (minimal/low/medium/high/xhigh) rather than a
+    // thinking-token budget; emit it when the model takes one and the caller set a level.
+    if caps.reasoning_effort {
+        if let Some(effort) = req.reasoning_effort {
+            map.insert("reasoning_effort".into(), json!(effort.as_str()));
+        }
+    }
     map.insert("stream".into(), json!(true));
     // Ask for a trailing usage chunk so token accounting works on the streaming path.
     map.insert("stream_options".into(), json!({ "include_usage": true }));
@@ -113,7 +177,23 @@ pub fn build_body(req: &ModelRequest) -> Value {
             .collect();
         map.insert("tools".into(), Value::Array(tools));
     }
+    // Constrain tool use only when the caller asked: an unset `tool_choice` emits nothing, leaving
+    // OpenAI's default (auto when tools are present), so the common request shape is untouched.
+    if let Some(choice) = &req.tool_choice {
+        map.insert("tool_choice".into(), tool_choice(choice));
+    }
     Value::Object(map)
+}
+
+/// Map a [`ToolChoice`] to OpenAI's `tool_choice`. The auto/none/required cases are bare strings; a
+/// specific tool is the nested `{type:"function", function:{name}}` object.
+fn tool_choice(choice: &ToolChoice) -> Value {
+    match choice {
+        ToolChoice::Auto => json!("auto"),
+        ToolChoice::None => json!("none"),
+        ToolChoice::Required => json!("required"),
+        ToolChoice::Tool(name) => json!({ "type": "function", "function": { "name": name } }),
+    }
 }
 
 fn map_finish_reason(s: Option<&str>) -> StopReason {
@@ -341,6 +421,141 @@ mod tests {
             .with_cache_key("session-abc");
         let body = build_body(&req);
         assert_eq!(body["prompt_cache_key"], "session-abc");
+    }
+
+    #[test]
+    fn user_images_become_image_url_parts() {
+        use crate::message::ImageSource;
+        let req = ModelRequest::new(
+            "gpt-4o",
+            vec![Message::user_with_images(
+                "what is this?",
+                vec![ImageSource::base64("image/png", "AAAA")],
+            )],
+            64,
+        );
+        let body = build_body(&req);
+        let content = &body["messages"][0]["content"];
+        // A multimodal parts array, not a bare string — the text first, then the image data-URI.
+        assert_eq!(
+            content[0],
+            json!({ "type": "text", "text": "what is this?" })
+        );
+        assert_eq!(
+            content[1],
+            json!({
+                "type": "image_url",
+                "image_url": { "url": "data:image/png;base64,AAAA" }
+            })
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_emitted_only_for_reasoning_models() {
+        use crate::transport::ReasoningEffort;
+        // A reasoning model with an effort set emits `reasoning_effort`.
+        let body = build_body(
+            &ModelRequest::new("o3-mini", vec![Message::user("hi")], 64)
+                .with_reasoning_effort(ReasoningEffort::High),
+        );
+        assert_eq!(body["reasoning_effort"], "high");
+
+        // A non-reasoning model never emits it, even if a level is set.
+        let body = build_body(
+            &ModelRequest::new("gpt-4o", vec![Message::user("hi")], 64)
+                .with_reasoning_effort(ReasoningEffort::High),
+        );
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn tool_result_images_fan_out_to_a_user_message() {
+        use crate::message::ImageSource;
+        let req = ModelRequest::new(
+            "gpt-4o",
+            vec![Message::tool_results(vec![ContentBlock::ToolResult {
+                tool_use_id: "call_1".into(),
+                content: "screenshot attached".into(),
+                is_error: false,
+                images: vec![ImageSource::base64("image/png", "AAAA")],
+            }])],
+            256,
+        );
+        let body = build_body(&req);
+        // The tool role carries the text; the image fans out to a following user message (the tool
+        // role can't carry images on the OpenAI wire).
+        assert_eq!(body["messages"][0]["role"], "tool");
+        assert_eq!(body["messages"][0]["content"], "screenshot attached");
+        assert_eq!(body["messages"][1]["role"], "user");
+        assert_eq!(body["messages"][1]["content"][1]["type"], "image_url");
+        assert_eq!(
+            body["messages"][1]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,AAAA"
+        );
+    }
+
+    #[test]
+    fn reasoning_models_use_max_completion_tokens() {
+        // o-series / gpt-5 reject `max_tokens` on chat-completions; the body must carry
+        // `max_completion_tokens` instead. A non-reasoning model keeps `max_tokens`.
+        let body = build_body(&ModelRequest::new(
+            "o3-mini",
+            vec![Message::user("hi")],
+            256,
+        ));
+        assert_eq!(body["max_completion_tokens"], 256);
+        assert!(body.get("max_tokens").is_none());
+
+        let body = build_body(&ModelRequest::new("gpt-4o", vec![Message::user("hi")], 256));
+        assert_eq!(body["max_tokens"], 256);
+        assert!(body.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn tool_choice_emitted_only_when_set() {
+        use crate::transport::ToolChoice;
+        let tools = vec![ToolDef {
+            name: "get_weather".into(),
+            description: "weather".into(),
+            input_schema: json!({ "type": "object" }),
+        }];
+        // Unset → no `tool_choice` on the wire.
+        let req =
+            ModelRequest::new("gpt-4o", vec![Message::user("hi")], 64).with_tools(tools.clone());
+        assert!(build_body(&req).get("tool_choice").is_none());
+
+        // The auto/none/required cases are bare strings.
+        for (choice, wire) in [
+            (ToolChoice::Auto, "auto"),
+            (ToolChoice::None, "none"),
+            (ToolChoice::Required, "required"),
+        ] {
+            let body = build_body(
+                &ModelRequest::new("gpt-4o", vec![Message::user("hi")], 64)
+                    .with_tools(tools.clone())
+                    .with_tool_choice(choice),
+            );
+            assert_eq!(body["tool_choice"], wire);
+        }
+
+        // A specific tool is the nested function object.
+        let body = build_body(
+            &ModelRequest::new("gpt-4o", vec![Message::user("hi")], 64)
+                .with_tools(tools)
+                .with_tool_choice(ToolChoice::Tool("get_weather".into())),
+        );
+        assert_eq!(
+            body["tool_choice"],
+            json!({ "type": "function", "function": { "name": "get_weather" } })
+        );
+    }
+
+    #[test]
+    fn text_only_user_stays_a_plain_string() {
+        // Regression guard: the common no-image path must keep the flat string shape.
+        let req = ModelRequest::new("gpt-4o", vec![Message::user("hello")], 64);
+        let body = build_body(&req);
+        assert_eq!(body["messages"][0]["content"], "hello");
     }
 
     // A recorded text + tool_call streamed response (trailing usage chunk + [DONE]).

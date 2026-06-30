@@ -26,6 +26,7 @@ pub mod error;
 pub mod hooks;
 pub mod message;
 pub mod mock;
+pub mod models;
 pub mod session;
 pub mod steering;
 pub mod tool;
@@ -40,10 +41,11 @@ pub use message::{
     ContentBlock, ImageSource, Message, Role, StopReason, StreamEvent, TokenUsage, ToolDef,
 };
 pub use mock::MockTransport;
+pub use models::{ModelCaps, capabilities};
 pub use session::Session;
 pub use steering::Steering;
-pub use tool::{Tool, ToolRegistry};
-pub use transport::{ModelRequest, ModelTransport};
+pub use tool::{Tool, ToolOutput, ToolProgress, ToolRegistry};
+pub use transport::{ModelRequest, ModelTransport, ReasoningEffort, ToolChoice};
 // Re-exported because it appears in `Agent::run_events_cancellable`'s signature — callers shouldn't
 // need a direct `tokio-util` dependency to drive a cancellable run.
 pub use tokio_util::sync::CancellationToken;

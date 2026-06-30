@@ -9,8 +9,8 @@
 
 use std::path::PathBuf;
 
-use agent_core::ToolError;
 use agent_core::tool::Tool;
+use agent_core::{ToolError, ToolOutput};
 use async_trait::async_trait;
 use globset::{Glob, GlobMatcher};
 use ignore::WalkBuilder;
@@ -101,7 +101,7 @@ impl Tool for Find {
         })
     }
 
-    async fn run(&self, input: Value) -> Result<String, ToolError> {
+    async fn run(&self, input: Value) -> Result<ToolOutput, ToolError> {
         let pattern = input
             .get("pattern")
             .and_then(Value::as_str)
@@ -133,7 +133,7 @@ impl Tool for Find {
             .map_err(|e| ToolError::Execution(format!("find task failed: {e}")))?;
 
         if paths.is_empty() {
-            return Ok(no_match);
+            return Ok(no_match.into());
         }
         let mut out = String::new();
         for path in &paths {
@@ -144,7 +144,7 @@ impl Tool for Find {
                 "… (result limit {limit} reached; raise `limit` for more)\n"
             ));
         }
-        Ok(out)
+        Ok(out.into())
     }
 }
 
@@ -163,7 +163,8 @@ mod tests {
         let out = Find
             .run(json!({ "pattern": "*.rs", "path": dir.path().to_str().unwrap() }))
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(out.contains("main.rs"));
         assert!(out.contains("lib.rs"));
         assert!(!out.contains("README.md"));
@@ -177,7 +178,8 @@ mod tests {
         let out = Find
             .run(json!({ "pattern": "node_modules", "path": dir.path().to_str().unwrap() }))
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(
             out.contains("node_modules"),
             "directory-name searches must return the directory: {out}"
@@ -191,7 +193,8 @@ mod tests {
         let out = Find
             .run(json!({ "pattern": "*.zzz", "path": dir.path().to_str().unwrap() }))
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(out.contains("no files matching"));
     }
 
@@ -206,6 +209,7 @@ mod tests {
             Find.run(json!({ "pattern": "*.rs", "path": path }))
                 .await
                 .unwrap()
+                .text
         };
         let out = run_once().await;
         let order: Vec<&str> = out.lines().filter_map(|l| l.rsplit('/').next()).collect();
@@ -222,7 +226,8 @@ mod tests {
         let out = Find
             .run(json!({ "pattern": "*.rs", "path": dir.path().to_str().unwrap(), "limit": 3 }))
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(out.contains("result limit 3 reached"));
         assert!(out.contains("f00.rs") && out.contains("f01.rs") && out.contains("f02.rs"));
         assert!(!out.contains("f03.rs"));

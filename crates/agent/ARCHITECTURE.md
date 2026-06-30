@@ -17,19 +17,31 @@ CLI, and the `serve` control protocol built on top of them.
 The harness layers several capabilities over the bare tools + loop:
 
 - **System-prompt assembly** ([`resources`](src/resources.rs)) — the system prompt is built per
-  session from a base identity + project `AGENTS.md`/`CLAUDE.md` (global, then cwd→root) + discovered
-  [`skills`](src/skills.rs) (`<available_skills>`, read-on-demand) + the date/cwd. Flags:
-  `--system-prompt` (replace), `--append-system-prompt`, `--no-context-files`.
+  session from a base identity (overridable by an on-disk `SYSTEM.md`: project `.claude/`, then user) +
+  project instruction files (global, then cwd→root; **one file per directory**, `AGENTS.md` winning
+  over `CLAUDE.md`, matched case-insensitively) + discovered [`skills`](src/skills.rs)
+  (`<available_skills>`, read-on-demand) + the current **local** date and cwd. Flags:
+  `--system-prompt` (replace), `--append-system-prompt`, `--no-context-files`. Skills are discovered
+  recursively (`SKILL.md` at any depth); a `disable-model-invocation` skill is omitted from the listing
+  but still reachable by an explicit `/skill:name`.
 - **Prompt templates** ([`prompts`](src/prompts.rs)) — a `/name args` prompt is expanded from a
-  `.claude/prompts/*.md` template with bash-style substitution before it reaches the model.
+  `.claude/prompts/*.md` template with bash-style substitution before it reaches the model: quote-aware
+  arg splitting, `$N` for any positional, `${@:N}`/`${@:N:L}` slices, and `${N:-default}`. A template's
+  `description` (frontmatter, else first body line) feeds autocomplete.
 - **Session persistence** ([`session_store`](src/session_store.rs)) — append-only JSONL with a header
-  carrying stable id + metadata; a turn appends only its new messages (compaction rewrites atomically),
-  a torn final line is dropped on load. `--session-dir` opens a multi-session `SessionRepo`
-  (list/create/open/delete/fork); `--session-file` is the single-session form.
+  carrying a collision-resistant id + metadata; a turn appends only its new messages (compaction
+  rewrites atomically and records its provenance — `compactions`/`dropped_messages`), every write is
+  `fsync`ed for durability, a torn final line is dropped on load, and a header whose `version` is newer
+  than the build understands is refused (migration hook). `--session-dir` opens a multi-session
+  `SessionRepo` (list-with-metadata/create/open/idempotent-delete/fork); `--session-file` is the
+  single-session form. `list` carries derived `updated_at`/`message_count`/`preview` without opening
+  each transcript fully.
 - **Expanded `serve` surface** — beyond `prompt`/`get_state`/`get_messages`/`new_session`: `abort`,
-  `steer`/`follow_up` (mid-run), `compact`, `list_sessions`/`switch_session`/`fork`/`set_session_name`,
-  `get_last_assistant_text`/`get_session_stats`/`get_commands`. A `prompt` runs concurrently with stdin
-  so `abort`/`steer`/`follow_up` land mid-turn.
+  `steer` (mid-run, folded onto the next tool turn) / `follow_up` (queued for the next stop boundary),
+  `compact`, `list_sessions`/`switch_session`/`fork`/`set_session_name`,
+  `get_last_assistant_text`/`get_session_stats`/`get_commands`, and `set_model`/`set_thinking`
+  (rebuild the `Agent` for subsequent prompts) / `get_available_models`. A `prompt` runs concurrently
+  with stdin so `abort`/`steer`/`follow_up` land mid-turn.
 - **Multimodal** — `prompt` accepts `images: [{media_type, data}]` (base64), built into a multimodal
   user turn.
 
@@ -107,7 +119,7 @@ NDJSON stream a client sees is deterministic regardless of which tool finishes f
 | **`Session`**                   | Message history + step/token counters; optionally `serde`-persisted to `--session-file`           | Not multi-session — one `serve` process holds exactly one active `Session` at a time |
 | **`AgentEvent`**                | `Stream`/`ToolStart`/`ToolEnd`/`TurnEnd` boundaries streamed as `event` frames during a `prompt`   | Not the terminal answer — the `response` frame (success/data/error) is separate and always comes last |
 | **Virtual key** (`bai_v1…`)     | The bearer token this crate forwards to the gateway on every request                                | Not verified or interpreted here — Ed25519 signature check and deny-set live entirely in the gateway |
-| **`max_steps`**                 | Ceiling on loop iterations per `run` invocation, or per `prompt` in `serve` (CLI default 24)        | Not a token budget — `max_tokens` (agent_core's fixed 4096/turn) has no CLI flag in this crate |
+| **`max_steps`**                 | Ceiling on loop iterations per `run` invocation, or per `prompt` in `serve` (CLI default 24)        | Not a token budget — `max_tokens` (seeded model-aware by `agent_core`'s `Agent::new`, ≥4096/turn) has no CLI flag in this crate |
 | **`HARD_CAP`** (grep/find)      | OOM guard: walk quits once 10,000 matches/paths are collected, before `limit` truncation runs       | Not the reported limit — `limit` (default 100/1000) is the user-facing cap; `HARD_CAP` is a backstop far above it |
 
 ---
@@ -125,9 +137,9 @@ each tool actually produces:
 
 | Tool         | `ToolError::InvalidInput` when…                                  | `ToolError::Execution` when…                                |
 | ------------ | ------------------------------------------------------------------ | --------------------------------------------------------------- |
-| `read`       | missing `path`                                                     | file unreadable (missing, permission denied) — non-UTF-8 bytes decode lossily, not an error |
+| `read`       | missing `path`; offset past EOF; image file over the 5 MB inline cap | file unreadable (missing, permission denied) — non-UTF-8 bytes decode lossily, not an error |
 | `write`      | missing `path`/`content`                                           | `mkdir`/`write` syscall fails                                   |
-| `edit`       | `old_string` matches 0 or >1 times (without single-edit `replace_all`); malformed `edits` | file unreadable/unwritable |
+| `edit`       | `old_string` matches 0 or >1 times after exact+fuzzy (without single-edit `replace_all`); overlapping/no-op edits; malformed `edits` | file unreadable/unwritable |
 | `ls`         | —                                                                   | `read_dir` fails                                                 |
 | `grep`/`find`| bad regex / bad glob                                                | the `spawn_blocking` task itself panics (walk failures are swallowed per-entry) |
 | `bash`       | missing `command`                                                  | spawn failure, or timeout (`timed_out`)                          |
@@ -145,15 +157,24 @@ briefly rather than pay that overhead, consistent with "do less work" over refle
   line at `MAX_LINE_BYTES` (4000) — bytes past the cap are drained but not stored, so one pathological
   single line (a minified bundle) can't balloon memory; a capped line gets a `"… [line truncated]"`
   marker. Line bytes decode lossily (`from_utf8_lossy`), so a non-UTF-8 file reads with replacement
-  chars rather than erroring.
+  chars rather than erroring. An **image** file (`.png`/`.jpg`/`.gif`/`.webp`, by extension) skips text
+  decoding entirely: it's returned as a base64 `ImageSource` attachment the multimodal model can see,
+  refused above a 5 MB inline cap rather than ballooning the request.
 - **`write`** creates parent directories (`create_dir_all`), then writes **atomically** (sibling temp
   file + `rename`, shared with `edit` via `tools::write_atomic`) so a kill mid-write can't leave a
   half-written file; always overwrites.
 - **`edit`** accepts either an `edits: [{old_string,new_string}]` array (applied in order) or a
   single `old_string`/`new_string` pair. Each `old_string` must match **exactly once** in the current
   content unless it's a single-edit call with `replace_all: true` — uniqueness is the only safety
-  check; there is no diff/dry-run, the file is rewritten on success.
+  check; there is no diff/dry-run, the file is rewritten on success. Matching tries an **exact** hit
+  first, then a normalized **fuzzy fallback** (NFKC + folding smart quotes/dash family/unicode spaces +
+  per-line trailing-whitespace), with hits mapped back to original byte offsets — so a model's
+  `old_string` carrying a curly quote, em-dash, nbsp, or stray trailing space still lands instead of
+  failing "not found". Edits resolve to byte ranges against the *original* text (order-independent,
+  overlap-rejected).
 - **`ls`** sorts directories first, then alphabetically; dot-entries are hidden unless `all: true`.
+  Caps the listing at `limit` (default 500, overridable) so a `node_modules`-sized directory can't
+  flood context, appending a `"… (N more entries) …"` marker when it truncates.
 
 ### Search tools — gitignore-aware tree walks, deterministic output
 
@@ -188,23 +209,34 @@ sorted+truncated deterministically, but which items entered the collected set be
 can vary — the tool flags this in its trailing `"… limit reached"` line either way.
 
 `grep` additionally clips any single match line to 500 bytes at a UTF-8 char boundary
-(`clip()` in `grep.rs`) so one absurdly long line can't blow the model's context.
+(`clip()` in `grep.rs`) so one absurdly long line can't blow the model's context. It also takes
+context-line params — `context` (both sides, like ripgrep's `-C`) or `before`/`after` per side, each
+clamped to `MAX_CONTEXT` (100) — emitting surrounding lines flagged as context vs match; only matches
+count toward `limit` and `HARD_CAP`.
 
 ### Shell tools — a shared `CommandRunner` seam
 
 `bash` and the Beyond tools (`fork`/`sync`/`logs`) don't touch the filesystem directly; they both
 go through `tools::exec::CommandRunner`, implemented for production by `RealRunner`
-(`tokio::process::Command` with `kill_on_drop(true)` + `tokio::time::timeout`) and by recording test
-doubles in each tool's `#[cfg(test)]` module. This is the same seam pattern as `agent_core`'s
-`Tool`/`ModelTransport` traits — it's what lets `fork_builds_argv`/`sync_builds_argv`/etc. assert the
-exact argv without a live Beyond control plane.
+(`tokio::process::Command` with `kill_on_drop(true)`, a process-group leader so a timeout kills the
+whole tree, and **bounded streaming capture**: each of stdout/stderr keeps only its head+tail
+(~128 KB each) as it drains, so a `yes`-style firehose holds bounded memory instead of OOMing; the
+dropped middle is reported via `ExecResult.truncated`; `CommandRunner::run_streaming` additionally
+hands each chunk to a `ChunkSink` as it arrives, which `bash`'s `Tool::run_streaming` forwards to its
+`ToolProgress` sink so a client sees live command output) and by recording test doubles in each tool's
+`#[cfg(test)]` module. This is the same seam pattern as `agent_core`'s `Tool`/`ModelTransport` traits
+— it's what lets `fork_builds_argv`/`sync_builds_argv`/etc. assert the exact argv without a live
+Beyond control plane.
 
 - **`bash`**: `sh -c "<command>"`, default 120 s timeout (`timeout_ms` overridable). A timeout returns
   `ToolError::Execution` immediately (the command's partial output is discarded). Otherwise stdout+
   stderr are combined and `[exit code N]` is appended for a non-zero exit, or `[killed]` if the
-  process died with no exit code (killed by a signal) — then the combined text is truncated to
-  ~30,000 bytes keeping the **head and tail** (`truncate()` in `bash.rs`) — the middle of a long log
-  is least useful to the model; the start (what ran) and the end (the result/exit status) are kept.
+  process died with no exit code (killed by a signal). The combined text is then run through output
+  hygiene — ANSI/OSC escape stripping and C0 control-char sanitizing so terminal/binary noise can't
+  corrupt the model's context — then capped to `MAX_LINES` (2000) and ~30,000 bytes, each keeping the
+  **head and tail** (the middle of a long log is least useful; the start shows what ran and the end the
+  result). A `… (output truncated at source) …` marker surfaces an exec-layer capture drop even when
+  the display caps don't fire.
 - **`fork`/`sync`/`logs`**: each builds a `beyond <subcommand> [args…]` argv (e.g.
   `["fork", app, "--name", name]`) and runs it through the same runner with a fixed 120 s timeout.
   Non-zero exit becomes `ToolError::Execution` (unlike `bash`, which reports a non-zero exit as text
@@ -341,21 +373,21 @@ container/VM — not by this crate restricting its own tools.
 | ----------------------- | ---------------------------------------------------------------------------------------------------------- |
 | `src/main.rs`          | CLI entry point (`run`/`serve`/`tools` subcommands); `DEFAULT_MODEL`, `DEFAULT_GATEWAY`, `SYSTEM_PROMPT`; renders streamed text + `[tool: name]` markers to stdout for `run` |
 | `src/lib.rs`           | Library root; re-exports `serve`/`tools`/`resources`/`skills`/`prompts`/`session_store` for tests/benches |
-| `src/serve.rs`         | NDJSON control protocol: single stdout-writer task, `Persistence` (file or repo), expanded command set, prompt runs concurrently with stdin (abort/steer) |
-| `src/session_store.rs` | JSONL `SessionStore` (append/rewrite/torn-line recovery, header metadata) + multi-session `SessionRepo` |
-| `src/resources.rs`     | System-prompt assembly: `AGENTS.md`/`CLAUDE.md` discovery, skill injection, date/cwd                    |
-| `src/skills.rs`        | Skill discovery (`SKILL.md` frontmatter) + `<available_skills>` rendering                               |
-| `src/prompts.rs`       | `/name args` prompt-template discovery + bash-style expansion                                           |
+| `src/serve.rs`         | NDJSON control protocol: single stdout-writer task, `Persistence` (file or repo), expanded command set (incl. `set_model`/`set_thinking`/`get_available_models`), prompt runs concurrently with stdin routing `steer` (mid-run) vs `follow_up` (stop-boundary) |
+| `src/session_store.rs` | JSONL `SessionStore` (fsync'd append/atomic-rewrite/torn-line recovery, header metadata + compaction provenance, version-migration guard, collision-safe ids) + multi-session `SessionRepo` (list-with-metadata, idempotent delete, fork) |
+| `src/resources.rs`     | System-prompt assembly: on-disk `SYSTEM.md` base override, one-file-per-dir `AGENTS.md`>`CLAUDE.md` discovery (case-insensitive), skill injection, local date/cwd |
+| `src/skills.rs`        | Recursive skill discovery (`SKILL.md` frontmatter at any depth, `disable-model-invocation`, `/skill:` lookup) + `<available_skills>` rendering |
+| `src/prompts.rs`       | `/name args` prompt-template discovery + bash-style expansion (quote-aware args, `$N`, `${@:N:L}` slices, `${N:-default}`, `description` frontmatter) |
 | `src/tools/mod.rs`     | `default_registry()` — assembles the fixed 10-tool `ToolRegistry`                                      |
-| `src/tools/read.rs`    | `read` — line-numbered read with `offset`/`limit`, byte budget, offset-past-EOF error, continuation hints |
+| `src/tools/read.rs`    | `read` — line-numbered read with `offset`/`limit`, byte budget, offset-past-EOF error, continuation hints; image files as base64 attachments |
 | `src/tools/write.rs`   | `write` — create/overwrite a file, creating parent directories                                          |
-| `src/tools/edit.rs`    | `edit` — replacement matched in LF space (CRLF/BOM restored), against the original, overlap/no-op checks, `replace_all` |
-| `src/tools/ls.rs`      | `ls` — directory listing, directories-first sort, dotfile filtering, entry cap                          |
-| `src/tools/grep.rs`    | `grep` — parallel, gitignore-aware regex (or `literal`) search; deterministic sort+truncate             |
+| `src/tools/edit.rs`    | `edit` — exact-then-fuzzy (NFKC/quote/dash/space/trailing-ws) replacement matched in LF space (CRLF/BOM restored), against the original, overlap/no-op checks, `replace_all` |
+| `src/tools/ls.rs`      | `ls` — directory listing, directories-first sort, dotfile filtering, `limit` entry cap                  |
+| `src/tools/grep.rs`    | `grep` — parallel, gitignore-aware regex (or `literal`) search with `context`/`before`/`after` lines; deterministic sort+truncate |
 | `src/tools/find.rs`    | `find` — sequential, gitignore-aware glob search over files **and** dirs; deterministic sort+truncate    |
-| `src/tools/bash.rs`    | `bash` — `sh -c` execution with timeout and head/tail output truncation (process-group kill on timeout) |
+| `src/tools/bash.rs`    | `bash` — `sh -c` execution with timeout, output hygiene (ANSI strip/control sanitize) and head/tail line+byte truncation (process-group kill on timeout) |
 | `src/tools/beyond.rs`  | `fork`/`sync`/`logs` — shell out to the `beyond` platform CLI                                            |
-| `src/tools/exec.rs`    | `CommandRunner` trait + `RealRunner` — the process-execution seam shared by `bash`/`beyond` tools        |
+| `src/tools/exec.rs`    | `CommandRunner` trait + `RealRunner` (bounded head+tail streaming capture, `ExecResult.truncated`) — the process-execution seam shared by `bash`/`beyond` tools |
 | `benches/search.rs`    | Criterion macro-bench: `grep` (1 vs auto threads) and `find` (sequential) over a 5,000-file tree         |
 | `tests/common/mod.rs`  | Shared test harness: mock Anthropic-SSE model server, gateway binary locator, port/connection helpers    |
 | `tests/run_e2e.rs`     | `run` binary against a mock model server (no gateway in the loop)                                        |
@@ -377,7 +409,8 @@ container/VM — not by this crate restricting its own tools.
 | `timeout_ms` (per-call, `bash` tool input)  | `120000`                 | Wall-clock ceiling for one `bash` invocation                                                     |
 | `RUST_LOG` (`tracing_subscriber::EnvFilter::from_default_env`) | unset (no logs) | Verbosity of `tracing` spans/events emitted by the binary's subscriber                          |
 
-Not configurable from this crate: `max_tokens` (fixed at `agent_core`'s default, 4096/turn) and the
+Not configurable from this crate via a CLI flag: `max_tokens` (seeded model-aware by `agent_core`'s
+`Agent::new`, ≥4096/turn; `serve`'s `set_thinking` tunes the thinking budget at runtime) and the
 tool set itself (always the same 10 tools from `default_registry()` — no enable/disable flag).
 
 ---

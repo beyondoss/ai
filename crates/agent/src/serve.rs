@@ -23,10 +23,14 @@
 //!   - `{type:"get_last_assistant_text"}` → `data: {text}` (the latest assistant reply)
 //!   - `{type:"get_session_stats"}`      → token/step accounting
 //!   - `{type:"get_commands"}`           → discoverable skills + prompt templates
+//!   - `{type:"set_model", model}`       switch the model for subsequent prompts → `data: {model}`
+//!   - `{type:"set_thinking", budget}`   set/clear the thinking budget (integer, or `null` to disable)
+//!   - `{type:"get_available_models"}`   → `data: {models: […]}` (a known, non-exhaustive id list)
 //!
-//! While a `prompt` runs, the loop keeps reading stdin so an `abort` can cancel it, or `steer`/
-//! `follow_up` (with a `message`) can queue input to inject when the model next stops; any other
-//! command issued during a run is rejected as busy (the session is borrowed by the run).
+//! While a `prompt` runs, the loop keeps reading stdin so an `abort` can cancel it, or `steer` /
+//! `follow_up` (with a `message`) can queue input: a `steer` is injected mid-run at the next tool
+//! turn (to redirect a busy agent), a `follow_up` waits for the model to next stop. Any other command
+//! issued during a run is rejected as busy (the session is borrowed by the run).
 //!
 //! Frames (stdout) are either `{type:"response", id?, command, success, data?, error?}` or
 //! `{type:"event", event: <AgentEvent>}`.
@@ -247,18 +251,23 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
     let prompt_templates = crate::prompts::discover(&cwd);
     let skills = crate::skills::discover(&cwd);
 
-    let client = GatewayClient::new(cfg.gateway, cfg.key)?;
-    let mut agent = Agent::new(Arc::new(client), cfg.model.clone())
-        .with_tools(tools::default_registry())
-        .with_system(system)
-        .with_max_steps(cfg.max_steps)
-        .with_context_window(cfg.context_window)
-        // Pin this session to a warm prompt-cache node via its stable id.
-        .with_cache_key(persistence.session_id().to_string())
-        .with_cache_long(cfg.cache_long);
-    if let Some(budget) = cfg.thinking {
-        agent = agent.with_thinking(budget);
-    }
+    // Keep the transport in an `Arc` we can clone: `set_model`/`set_thinking` rebuild the `Agent` at
+    // runtime (a new model id picks a new dialect), and each rebuild reuses this one HTTP client.
+    let client = Arc::new(GatewayClient::new(cfg.gateway.clone(), cfg.key.clone())?);
+
+    // The model and thinking budget are runtime-switchable; everything else (transport, tools, system
+    // prompt, loop bounds, cache settings) is fixed for the process. `build_agent` folds the mutable
+    // pair into a fresh `Agent` whenever either changes.
+    let mut current_model = cfg.model.clone();
+    let mut current_thinking = cfg.thinking;
+    let mut agent = build_agent(
+        client.clone(),
+        &system,
+        &cfg,
+        &current_model,
+        current_thinking,
+        persistence.session_id(),
+    );
 
     // One writer task owns stdout; every frame (events + responses) is serialized through it in FIFO
     // order, so output never interleaves.
@@ -307,7 +316,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
     // writer never started; there is nothing to serve.
     if out_tx
         .send(
-            json!({ "type": "ready", "session_id": persistence.session_id(), "model": cfg.model }),
+            json!({ "type": "ready", "session_id": persistence.session_id(), "model": current_model }),
         )
         .is_err()
     {
@@ -374,8 +383,8 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 // Queue for `steer`/`follow_up` messages a client sends while the run is in flight.
                 let steering = agent_core::Steering::new();
 
-                // Drive the run while staying responsive to stdin: `abort` cancels it, `steer`/
-                // `follow_up` queue a message to inject at the next stop boundary; any other command is
+                // Drive the run while staying responsive to stdin: `abort` cancels it, `steer` queues a
+                // mid-run injection and `follow_up` a stop-boundary one; any other command is
                 // rejected as busy (the session is borrowed by the in-flight run). If stdin closes
                 // mid-run, cancel and drain. The block scopes the run's `&mut session` borrow so we can
                 // persist after.
@@ -425,7 +434,14 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                                         cmd @ ("steer" | "follow_up") => {
                                             match c.get("message").and_then(Value::as_str) {
                                                 Some(m) => {
-                                                    steering.push(m);
+                                                    // `steer` redirects mid-run (injected at the next
+                                                    // tool turn); `follow_up` waits for the stop
+                                                    // boundary. Two separate lanes.
+                                                    if cmd == "steer" {
+                                                        steering.push_steer(m);
+                                                    } else {
+                                                        steering.push(m);
+                                                    }
                                                     let _ = out_tx.send(response(cid, cmd, true, None, None));
                                                 }
                                                 None => {
@@ -474,7 +490,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 let mut data = session_stats(&session);
                 if let Value::Object(m) = &mut data {
                     m.insert("session_id".into(), json!(persistence.session_id()));
-                    m.insert("model".into(), json!(cfg.model));
+                    m.insert("model".into(), json!(current_model));
                     m.insert("message_count".into(), json!(session.messages.len()));
                     m.insert("title".into(), json!(persistence.meta.title));
                 }
@@ -492,7 +508,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 ));
             }
             "new_session" => {
-                session = persistence.new_session(&cfg.model);
+                session = persistence.new_session(&current_model);
                 emit!(response(
                     id,
                     "new_session",
@@ -641,6 +657,94 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     None,
                 ));
             }
+            "set_model" => match cmd.get("model").and_then(Value::as_str) {
+                Some(model) => {
+                    // Rebuild the agent so subsequent prompts use the new model (and, via the id, its
+                    // dialect + capabilities). The session transcript is untouched.
+                    current_model = model.to_string();
+                    agent = build_agent(
+                        client.clone(),
+                        &system,
+                        &cfg,
+                        &current_model,
+                        current_thinking,
+                        persistence.session_id(),
+                    );
+                    emit!(response(
+                        id,
+                        "set_model",
+                        true,
+                        Some(json!({ "model": current_model })),
+                        None,
+                    ));
+                }
+                None => emit!(response(
+                    id,
+                    "set_model",
+                    false,
+                    None,
+                    Some("missing `model`")
+                )),
+            },
+            "set_thinking" => {
+                // `budget` is a positive integer to enable extended thinking, or `null` to disable it.
+                // A present-but-null value is the explicit "turn it off" signal; a missing key is an
+                // error (so a typo can't silently no-op).
+                match cmd.get("budget") {
+                    Some(Value::Null) => {
+                        current_thinking = None;
+                        agent = build_agent(
+                            client.clone(),
+                            &system,
+                            &cfg,
+                            &current_model,
+                            current_thinking,
+                            persistence.session_id(),
+                        );
+                        emit!(response(
+                            id,
+                            "set_thinking",
+                            true,
+                            Some(json!({ "thinking": Value::Null })),
+                            None,
+                        ));
+                    }
+                    Some(v) if v.as_u64().is_some() => {
+                        current_thinking = v.as_u64().map(|n| n as u32);
+                        agent = build_agent(
+                            client.clone(),
+                            &system,
+                            &cfg,
+                            &current_model,
+                            current_thinking,
+                            persistence.session_id(),
+                        );
+                        emit!(response(
+                            id,
+                            "set_thinking",
+                            true,
+                            Some(json!({ "thinking": current_thinking })),
+                            None,
+                        ));
+                    }
+                    _ => emit!(response(
+                        id,
+                        "set_thinking",
+                        false,
+                        None,
+                        Some("`budget` must be a non-negative integer or null"),
+                    )),
+                }
+            }
+            "get_available_models" => {
+                emit!(response(
+                    id,
+                    "get_available_models",
+                    true,
+                    Some(json!({ "models": available_models() })),
+                    None,
+                ));
+            }
             other => {
                 emit!(response(id, other, false, None, Some("unknown command")));
             }
@@ -650,6 +754,50 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
     drop(out_tx);
     let _ = writer.await;
     Ok(())
+}
+
+/// Build the [`Agent`] for the current model + thinking budget. Called once at startup and again on
+/// every `set_model`/`set_thinking`, so a client can re-tune the run without restarting `serve`. The
+/// transport, tools, system prompt, loop bounds, and cache settings are the same each time; only the
+/// model id and thinking budget vary. The context window stays as configured (`--context-window`): a
+/// model switch changes the dialect, not the operator's compaction budget.
+fn build_agent(
+    transport: Arc<GatewayClient>,
+    system: &str,
+    cfg: &ServeConfig,
+    model: &str,
+    thinking: Option<u32>,
+    cache_key: &str,
+) -> Agent {
+    let mut agent = Agent::new(transport, model.to_string())
+        .with_tools(tools::default_registry())
+        .with_system(system.to_string())
+        .with_max_steps(cfg.max_steps)
+        .with_context_window(cfg.context_window)
+        // Pin this session to a warm prompt-cache node via its stable id.
+        .with_cache_key(cache_key.to_string())
+        .with_cache_long(cfg.cache_long);
+    if let Some(budget) = thinking {
+        agent = agent.with_thinking(budget);
+    }
+    agent
+}
+
+/// A small, non-exhaustive list of model ids the [`capabilities`](agent_core::capabilities) table
+/// recognizes, for a client's model picker. The gateway forwards any id verbatim, so this is a
+/// convenience hint — not an allowlist; `set_model` accepts ids outside this list.
+fn available_models() -> &'static [&'static str] {
+    &[
+        "claude-opus-4-8",
+        "claude-sonnet-4-5",
+        "claude-haiku-4-5",
+        "gpt-5",
+        "gpt-5-mini",
+        "gpt-4o",
+        "gpt-4.1",
+        "o3",
+        "o4-mini",
+    ]
 }
 
 /// The concatenated text of the most recent assistant message, for scripting clients that just want

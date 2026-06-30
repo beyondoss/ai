@@ -19,11 +19,13 @@ use tokio_util::sync::CancellationToken;
 use crate::compaction::{self, CompactionConfig};
 use crate::error::{Error, Result};
 use crate::hooks::{AgentHooks, NoHooks};
-use crate::message::{ContentBlock, Message, StopReason, StreamEvent, TokenUsage, ToolDef};
+use crate::message::{
+    ContentBlock, ImageSource, Message, StopReason, StreamEvent, TokenUsage, ToolDef,
+};
 use crate::session::Session;
 use crate::steering::Steering;
 use crate::tool::ToolRegistry;
-use crate::transport::{ModelRequest, ModelTransport};
+use crate::transport::{ModelRequest, ModelTransport, ReasoningEffort};
 
 /// An observable event from a run: a streamed model event, a tool-invocation boundary, or a turn
 /// boundary. The headless server serializes these to its clients; [`Agent::run`] exposes only the
@@ -42,6 +44,13 @@ pub enum AgentEvent {
         id: String,
         name: String,
         input: Value,
+    },
+    /// A chunk of incremental output from a still-running tool (pi's `tool_execution_update`). Emitted
+    /// by a tool via its [`ToolProgress`](crate::ToolProgress) sink, before the tool's `ToolEnd`.
+    ToolProgress {
+        id: String,
+        name: String,
+        chunk: String,
     },
     /// A tool finished (or errored); `result` is what's fed back to the model.
     ToolEnd {
@@ -93,6 +102,9 @@ pub struct Agent {
     max_steps: u32,
     /// Extended-thinking budget, when enabled. Applied to every turn's request.
     thinking: Option<u32>,
+    /// Reasoning effort level (OpenAI reasoning models; Anthropic adaptive thinking). Applied to every
+    /// turn's request when set.
+    reasoning_effort: Option<ReasoningEffort>,
     /// Context-compaction policy: when to summarize the prefix to stay under the context window.
     compaction: CompactionConfig,
     /// Interception hooks around tool calls (gate/rewrite). Defaults to no-ops.
@@ -104,18 +116,26 @@ pub struct Agent {
 }
 
 impl Agent {
-    /// An agent over `transport` using `model`, with no tools and default bounds.
+    /// An agent over `transport` using `model`, with no tools and model-aware defaults: the per-turn
+    /// output ceiling and the compaction context window are seeded from the model's
+    /// [`capabilities`](crate::models::capabilities) (both still overridable via the builders).
     pub fn new(transport: Arc<dyn ModelTransport>, model: impl Into<String>) -> Self {
+        let model = model.into();
+        let caps = crate::models::capabilities(&model);
         Self {
             transport,
             tools: ToolRegistry::new(),
             tool_defs: Vec::new().into(),
-            model: model.into(),
+            model,
             system: None,
-            max_tokens: DEFAULT_MAX_TOKENS,
+            max_tokens: caps.max_output.max(DEFAULT_MAX_TOKENS),
             max_steps: DEFAULT_MAX_STEPS,
             thinking: None,
-            compaction: CompactionConfig::default(),
+            reasoning_effort: None,
+            compaction: CompactionConfig {
+                context_window: caps.context_window,
+                ..CompactionConfig::default()
+            },
             hooks: Arc::new(NoHooks),
             cache_key: None,
             cache_long: false,
@@ -152,6 +172,13 @@ impl Agent {
     /// [`with_max_tokens`](Self::with_max_tokens) (Anthropic requires `max_tokens > budget_tokens`).
     pub fn with_thinking(mut self, budget_tokens: u32) -> Self {
         self.thinking = Some(budget_tokens);
+        self
+    }
+
+    /// Set the reasoning effort level applied to every turn (OpenAI reasoning models; Anthropic
+    /// adaptive thinking). Independent of [`with_thinking`](Self::with_thinking)'s token budget.
+    pub fn with_reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
+        self.reasoning_effort = Some(effort);
         self
     }
 
@@ -285,6 +312,9 @@ impl Agent {
             if let Some(budget) = self.thinking {
                 req = req.with_thinking(budget);
             }
+            if let Some(effort) = self.reasoning_effort {
+                req = req.with_reasoning_effort(effort);
+            }
             if let Some(key) = &self.cache_key {
                 req = req.with_cache_key(key.clone());
             }
@@ -341,10 +371,11 @@ impl Agent {
                 .unwrap_or_default();
 
             if calls.is_empty() || turn.stop_reason != StopReason::ToolUse {
-                // The model ended its turn. Before stopping, drain any steering/follow-up messages a
-                // client queued mid-run and continue with them as new user turns. The last message is
-                // the assistant's, so pushing user turns here keeps the wire's role alternation valid.
-                let injected = steering.drain();
+                // The model ended its turn. Before stopping, drain any follow-up messages a client
+                // queued (plus any steer messages stranded by a tool-less turn) and continue with them
+                // as new user turns. The last message is the assistant's, so pushing user turns here
+                // keeps the wire's role alternation valid.
+                let injected = steering.drain_at_stop();
                 if injected.is_empty() {
                     sink(AgentEvent::AgentEnd {
                         steps: session.steps,
@@ -399,47 +430,72 @@ impl Agent {
             }
             let this = self;
             let malformed = &malformed;
+            // Per-turn progress channel: every call gets a `ToolProgress` cloning `prog_tx`; the drain
+            // loop below forwards each chunk to `sink` as it arrives. `futures`' mpsc keeps this
+            // executor-agnostic (no tokio in the library).
+            let (prog_tx, mut prog_rx) =
+                futures::channel::mpsc::unbounded::<(String, String, String)>();
+            let prog_tx = &prog_tx;
             let group_runs = groups.into_values().map(|indices| {
                 let calls = &calls;
+                let prog_tx = prog_tx.clone();
                 async move {
                     let mut out = Vec::with_capacity(indices.len());
                     for i in indices {
                         let (id, name, input) = &calls[i];
-                        let result = if let Some(raw) = malformed.get(id) {
-                            // The model streamed a tool call whose argument fragments never formed
-                            // valid JSON. Feed that back as an error result the model can correct next
-                            // turn rather than aborting the whole run on one malformed call.
-                            (
-                                format!(
-                                    "tool call arguments were not valid JSON and could not be parsed: {raw}"
-                                ),
-                                true,
-                            )
-                        } else if let Some(reason) =
-                            this.hooks.before_tool_call(name, input).await
-                        {
-                            // A hook blocked the call (e.g. a permission policy). Feed the reason back
-                            // as an error result instead of running the tool.
-                            (format!("tool call blocked: {reason}"), true)
-                        } else {
-                            let (out, is_error) = match this.tools.get(name) {
-                                Some(tool) => match tool.run(input.clone()).await {
-                                    Ok(o) => (o, false),
-                                    Err(e) => (e.to_string(), true),
-                                },
-                                None => (format!("unknown tool: {name}"), true),
+                        // Per call: (text, images, is_error, terminate). Hooks rewrite the *text* and
+                        // error flag; images and the terminate hint pass through untouched.
+                        let result: (String, Vec<ImageSource>, bool, bool) =
+                            if let Some(raw) = malformed.get(id) {
+                                // The model streamed a tool call whose argument fragments never formed
+                                // valid JSON. Feed that back as an error result the model can correct
+                                // next turn rather than aborting the whole run on one malformed call.
+                                (
+                                    format!(
+                                        "tool call arguments were not valid JSON and could not be parsed: {raw}"
+                                    ),
+                                    Vec::new(),
+                                    true,
+                                    false,
+                                )
+                            } else if let Some(reason) =
+                                this.hooks.before_tool_call(name, input).await
+                            {
+                                // A hook blocked the call (e.g. a permission policy). Feed the reason
+                                // back as an error result instead of running the tool.
+                                (format!("tool call blocked: {reason}"), Vec::new(), true, false)
+                            } else {
+                                let progress = crate::tool::ToolProgress::new(
+                                    prog_tx.clone(),
+                                    id.clone(),
+                                    name.clone(),
+                                );
+                                let (text, images, is_error, terminate) =
+                                    match this.tools.get(name) {
+                                        Some(tool) => {
+                                            match tool.run_streaming(input.clone(), &progress).await {
+                                                Ok(o) => (o.text, o.images, false, o.terminate),
+                                                Err(e) => (e.to_string(), Vec::new(), true, false),
+                                            }
+                                        }
+                                        None => {
+                                            (format!("unknown tool: {name}"), Vec::new(), true, false)
+                                        }
+                                    };
+                                // Let a hook rewrite the result text (redact, cap, reclassify) before
+                                // it's fed back to the model.
+                                let (text, is_error) =
+                                    this.hooks.after_tool_call(name, input, text, is_error).await;
+                                (text, images, is_error, terminate)
                             };
-                            // Let a hook rewrite the result (redact, cap, reclassify) before it's fed
-                            // back to the model.
-                            this.hooks.after_tool_call(name, input, out, is_error).await
-                        };
                         out.push((i, result));
                     }
                     out
                 }
             });
-            let mut results: Vec<(String, bool)> =
-                (0..calls.len()).map(|_| (String::new(), false)).collect();
+            let mut results: Vec<(String, Vec<ImageSource>, bool, bool)> = (0..calls.len())
+                .map(|_| (String::new(), Vec::new(), false, false))
+                .collect();
             // Bound how many groups run at once. `buffer_unordered` is safe here because each group
             // yields its results tagged with their original call index `i`; cross-group completion
             // order never reaches the transcript, which is rebuilt in call order below.
@@ -451,11 +507,32 @@ impl Agent {
             {
                 let drain = async {
                     let mut group_stream = futures::stream::iter(group_runs)
-                        .buffer_unordered(MAX_CONCURRENT_TOOL_GROUPS);
-                    while let Some(group) = group_stream.next().await {
-                        for (i, result) in group {
-                            results[i] = result;
+                        .buffer_unordered(MAX_CONCURRENT_TOOL_GROUPS)
+                        .fuse();
+                    // Forward tool-progress chunks to `sink` as they arrive, racing them against group
+                    // completion (progress biased first so chunks flush promptly). The loop ends when
+                    // every group has finished; the progress channel's senders outlive it, so we stop
+                    // on `group_stream`, not on the receiver.
+                    loop {
+                        futures::select_biased! {
+                            prog = prog_rx.next() => {
+                                if let Some((id, name, chunk)) = prog {
+                                    sink(AgentEvent::ToolProgress { id, name, chunk });
+                                }
+                            }
+                            group = group_stream.next() => match group {
+                                Some(group) => {
+                                    for (i, result) in group {
+                                        results[i] = result;
+                                    }
+                                }
+                                None => break,
+                            }
                         }
+                    }
+                    // Flush any chunks buffered between the final poll and group completion.
+                    while let Ok((id, name, chunk)) = prog_rx.try_recv() {
+                        sink(AgentEvent::ToolProgress { id, name, chunk });
                     }
                 };
                 let cancelled = cancel.cancelled();
@@ -465,7 +542,13 @@ impl Agent {
                 }
             }
             let mut result_blocks = Vec::with_capacity(calls.len());
-            for ((id, name, _), (content, is_error)) in calls.iter().zip(results) {
+            // A tool may ask to end the run; honor it only when *every* call in the batch agrees, so a
+            // single tool can't cut off others the model dispatched alongside it.
+            let mut terminate = !results.is_empty();
+            for ((id, name, _), (content, images, is_error, wants_terminate)) in
+                calls.iter().zip(results)
+            {
+                terminate &= wants_terminate;
                 sink(AgentEvent::ToolEnd {
                     id: id.clone(),
                     name: name.clone(),
@@ -476,9 +559,34 @@ impl Agent {
                     tool_use_id: id.clone(),
                     content,
                     is_error,
+                    images,
                 });
             }
+            // Mid-run steering: fold any *steer* messages a client queued while the agent was working
+            // into this same tool-results user turn (as trailing text blocks). Injecting them here —
+            // rather than only at a stop boundary — lets a client redirect a busy agent between
+            // tool-executing turns. They ride on the existing user message instead of a new one, so
+            // role alternation stays valid (no two consecutive user turns). Follow-ups are a separate
+            // lane, injected only at the stop boundary below.
+            let steered = steering.drain_steer();
+            let steered_count = steered.len();
+            for msg in steered {
+                result_blocks.push(ContentBlock::Text { text: msg });
+            }
             session.push(Message::tool_results(result_blocks));
+            if steered_count > 0 {
+                sink(AgentEvent::Steered {
+                    messages: steered_count,
+                });
+            } else if terminate {
+                // A tool requested completion (e.g. an `attempt_completion`/`exit` tool) and the whole
+                // batch agreed — and no steering redirected the run. The results are already recorded;
+                // end the run as if the model had stopped.
+                sink(AgentEvent::AgentEnd {
+                    steps: session.steps,
+                });
+                return Ok(());
+            }
         }
     }
 
@@ -701,11 +809,14 @@ mod tests {
         fn input_schema(&self) -> Value {
             json!({ "type": "object", "properties": { "text": { "type": "string" } }, "required": ["text"] })
         }
-        async fn run(&self, input: Value) -> std::result::Result<String, crate::error::ToolError> {
+        async fn run(
+            &self,
+            input: Value,
+        ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
             input
                 .get("text")
                 .and_then(Value::as_str)
-                .map(str::to_string)
+                .map(|s| s.into())
                 .ok_or_else(|| crate::error::ToolError::InvalidInput("missing text".into()))
         }
     }
@@ -764,7 +875,8 @@ mod tests {
             vec![ContentBlock::ToolResult {
                 tool_use_id: "tu_1".into(),
                 content: "pong".into(),
-                is_error: false
+                is_error: false,
+                images: Vec::new(),
             }]
         );
         // The second request the loop sent must include the tool result.
@@ -774,6 +886,110 @@ mod tests {
                 .messages
                 .iter()
                 .any(|m| matches!(m.content.first(), Some(ContentBlock::ToolResult { .. })))
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_can_terminate_the_run() {
+        // A tool returning `terminate` ends the run after its batch — without the model emitting a
+        // final turn. Only one model turn is scripted; if the loop asked for a second the mock would
+        // be exhausted and the run would error.
+        struct ExitTool;
+        #[async_trait]
+        impl Tool for ExitTool {
+            fn name(&self) -> &str {
+                "exit"
+            }
+            fn description(&self) -> &str {
+                "End the run."
+            }
+            fn input_schema(&self) -> Value {
+                serde_json::json!({ "type": "object" })
+            }
+            async fn run(
+                &self,
+                _: Value,
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+                Ok(crate::tool::ToolOutput::text("done").with_terminate(true))
+            }
+        }
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(ExitTool));
+        let (agent, mock) = agent_with(vec![turn::tool_call("tu_1", "exit", "{}")], tools);
+        let mut session = Session::new();
+        session.user("finish up");
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        // Exactly one model turn, and the tool result was recorded before stopping.
+        assert_eq!(mock.calls(), 1);
+        assert!(matches!(
+            session.messages.last().map(|m| m.content.first()),
+            Some(Some(ContentBlock::ToolResult { .. }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn streaming_tool_emits_progress_before_end() {
+        // A tool that streams two chunks via its `ToolProgress` sink before returning. The loop must
+        // surface both as `ToolProgress` events, in order, ahead of the tool's `ToolEnd`.
+        struct StreamingTool;
+        #[async_trait]
+        impl Tool for StreamingTool {
+            fn name(&self) -> &str {
+                "streamer"
+            }
+            fn description(&self) -> &str {
+                "emits progress"
+            }
+            fn input_schema(&self) -> Value {
+                serde_json::json!({ "type": "object" })
+            }
+            async fn run(
+                &self,
+                _: Value,
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+                Ok("final".into())
+            }
+            async fn run_streaming(
+                &self,
+                _: Value,
+                progress: &crate::tool::ToolProgress,
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+                progress.emit("chunk-1");
+                progress.emit("chunk-2");
+                Ok("final".into())
+            }
+        }
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(StreamingTool));
+        let (agent, _mock) = agent_with(
+            vec![
+                turn::tool_call("tu_1", "streamer", "{}"),
+                turn::text("done"),
+            ],
+            tools,
+        );
+        let mut session = Session::new();
+        session.user("go");
+
+        let mut log: Vec<String> = Vec::new();
+        agent
+            .run_events(&mut session, |ev| match ev {
+                AgentEvent::ToolProgress { chunk, .. } => log.push(format!("progress:{chunk}")),
+                AgentEvent::ToolEnd { .. } => log.push("end".into()),
+                _ => {}
+            })
+            .await
+            .unwrap();
+
+        let first_end = log.iter().position(|e| e == "end").expect("a ToolEnd");
+        assert_eq!(
+            &log[..first_end],
+            &[
+                "progress:chunk-1".to_string(),
+                "progress:chunk-2".to_string()
+            ],
+            "both chunks must arrive, in order, before ToolEnd: {log:?}"
         );
     }
 
@@ -827,9 +1043,9 @@ mod tests {
             async fn run(
                 &self,
                 _input: Value,
-            ) -> std::result::Result<String, crate::error::ToolError> {
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
                 self.barrier.wait().await;
-                Ok(self.id.to_string())
+                Ok(self.id.into())
             }
         }
 
@@ -931,11 +1147,11 @@ mod tests {
             async fn run(
                 &self,
                 _input: Value,
-            ) -> std::result::Result<String, crate::error::ToolError> {
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
                 self.log.lock().unwrap().push(format!("start:{}", self.id));
                 tokio::task::yield_now().await;
                 self.log.lock().unwrap().push(format!("end:{}", self.id));
-                Ok(self.id.to_string())
+                Ok(self.id.into())
             }
         }
 
@@ -1013,12 +1229,12 @@ mod tests {
             async fn run(
                 &self,
                 _input: Value,
-            ) -> std::result::Result<String, crate::error::ToolError> {
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
                 let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                 self.max_seen.fetch_max(now, Ordering::SeqCst);
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 self.in_flight.fetch_sub(1, Ordering::SeqCst);
-                Ok(String::new())
+                Ok(crate::tool::ToolOutput::default())
             }
         }
 
@@ -1386,6 +1602,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn steering_is_injected_mid_run_between_tool_turns() {
+        // A steering message queued while the agent is mid-tool-call must be folded into the *same*
+        // tool-results user turn (not deferred to a stop boundary), so a client can redirect a busy
+        // agent. The message rides alongside the tool_result block — keeping role alternation valid.
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        let (agent, mock) = agent_with(
+            vec![
+                turn::tool_call("tu_1", "echo", r#"{"text":"pong"}"#),
+                turn::text("acknowledged"),
+            ],
+            tools,
+        );
+        let mut session = Session::new();
+        session.user("start");
+
+        let steering = Steering::new();
+        steering.push_steer("actually, also handle the edge case");
+
+        let mut steered = false;
+        agent
+            .run_events_steered(
+                &mut session,
+                |ev| {
+                    if matches!(ev, AgentEvent::Steered { .. }) {
+                        steered = true;
+                    }
+                },
+                CancellationToken::new(),
+                steering,
+            )
+            .await
+            .unwrap();
+
+        assert!(steered, "a Steered event should fire mid-run");
+        assert_eq!(mock.calls(), 2);
+        // The tool-results turn (messages[2]) carries the tool_result *and* the steering text together.
+        let blocks = &session.messages[2].content;
+        assert!(matches!(blocks[0], ContentBlock::ToolResult { .. }));
+        assert!(matches!(
+            &blocks[1],
+            ContentBlock::Text { text } if text == "actually, also handle the edge case"
+        ));
+    }
+
+    #[tokio::test]
     async fn cancellation_aborts_a_hung_tool() {
         use std::time::Duration;
 
@@ -1403,7 +1665,10 @@ mod tests {
             fn input_schema(&self) -> Value {
                 json!({ "type": "object" })
             }
-            async fn run(&self, _: Value) -> std::result::Result<String, crate::error::ToolError> {
+            async fn run(
+                &self,
+                _: Value,
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
                 futures::future::pending::<()>().await;
                 unreachable!()
             }

@@ -178,6 +178,60 @@ fn smoke_agent_through_gateway_to_real_anthropic() {
     );
 }
 
+/// Multimodal end-to-end: the `read` tool returns a real image as an attachment, the dialect encodes
+/// it into Anthropic's `tool_result` content-array shape, and **real Claude vision** sees it. The agent
+/// reads a solid-red PNG and must name the color — exercising the whole new image path live (read
+/// image detection → `ToolOutput.images` → `ContentBlock::ToolResult.images` → wire encoding → vision).
+#[test]
+#[ignore = "live provider smoke; run via `mise run test:smoke:agent` with ANTHROPIC_API_KEY set"]
+fn smoke_reads_an_image_and_describes_it() {
+    use base64::Engine as _;
+
+    let Some(key) = env_key("ANTHROPIC_API_KEY") else {
+        eprintln!("smoke[image]: ANTHROPIC_API_KEY unset — skipping");
+        return;
+    };
+    // A 48x48 solid-red PNG (generated deterministically; no image crate needed).
+    const RED_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAIAAADYYG7QAAAANklEQVR42u3OQQ0AAAgAoetfWls4H2wEoKlXEhISEhISEhISEhISEhISEhISEhISEhISEhK6s98T93mKDkyKAAAAAElFTkSuQmCC";
+    let dir = tempfile::tempdir().unwrap();
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(RED_PNG_B64)
+        .unwrap();
+    std::fs::write(dir.path().join("swatch.png"), png).unwrap();
+
+    let (gw_port, mut gateway) = boot_gateway(dir.path(), &key);
+    let output = Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+        .args([
+            "run",
+            "Use the read tool to read the image file swatch.png in the current directory, then reply with ONLY the single dominant color word you see.",
+            "--gateway-url",
+            &format!("http://127.0.0.1:{gw_port}"),
+            "--key",
+            DEV_TOKEN,
+            "--model",
+            MODEL,
+            "--max-steps",
+            "6",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .expect("spawn agent");
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("--- image stdout ---\n{stdout}\n--- image stderr ---\n{stderr}");
+    assert!(
+        output.status.success(),
+        "agent failed reading an image through the multimodal path.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.to_lowercase().contains("red"),
+        "real Claude vision should have seen a red swatch via the read-tool image path.\nstdout: {stdout}"
+    );
+}
+
 /// Prompt caching actually *hits* against real Anthropic — not just that the body is accepted. A
 /// read-tool round-trip is two model turns: turn 1 writes the prefix cache, turn 2 (re-sending that
 /// prefix) reads it. The `prompt` response's usage must show both a cache write and a cache read.

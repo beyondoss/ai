@@ -9,7 +9,7 @@ use serde_json::{Map, Value, json};
 use super::StreamDecoder;
 use crate::error::{Error, Result};
 use crate::message::{StopReason, StreamEvent, TokenUsage};
-use crate::transport::ModelRequest;
+use crate::transport::{ModelRequest, ToolChoice};
 
 /// Build the streaming request body. `system` is hoisted to a top-level field (Anthropic keeps it
 /// out of `messages`); `messages` and `tools` serialize straight from the internal model.
@@ -28,11 +28,16 @@ pub fn build_body(req: &ModelRequest) -> Value {
     map.insert("max_tokens".into(), Value::from(req.max_tokens));
     map.insert("stream".into(), Value::Bool(true));
 
-    let cc = cache_control(req.cache_long);
+    // The 1-hour TTL is only valid on models that support long cache retention; Anthropic 400s
+    // otherwise. Gate the request's `cache_long` opt-in on the model's capability so an unsupported
+    // model silently falls back to the standard 5-minute TTL instead of erroring the turn.
+    let long = req.cache_long && crate::models::capabilities(&req.model).supports_long_cache;
+    let cc = cache_control(long);
 
     // Rolling breakpoint: cache the conversation prefix (tools + system + every prior message) up to
     // the final block, so next turn the whole accumulated transcript is a cache read, not a re-bill.
     let mut messages = serde_json::to_value(req.messages.as_ref()).unwrap_or(Value::Null);
+    encode_tool_result_images(&mut messages);
     mark_last_block(&mut messages, &cc);
     map.insert("messages".into(), messages);
 
@@ -48,11 +53,21 @@ pub fn build_body(req: &ModelRequest) -> Value {
     }
     if let Some(thinking) = &req.thinking {
         // Extended thinking. Anthropic requires `max_tokens > budget_tokens` and forbids `temperature`
-        // alongside it (we never set temperature), so this is the whole knob.
-        map.insert(
-            "thinking".into(),
-            json!({ "type": "enabled", "budget_tokens": thinking.budget_tokens }),
-        );
+        // alongside it (we never set temperature). Newer models take an *adaptive* shape (effort-based)
+        // rather than an explicit budget; the capability table says which. Every Claude we ship against
+        // today is `Budget` — the live-validated `enabled`+budget shape — so this preserves that path
+        // and only switches to `adaptive` for a model that requires it.
+        let block = match crate::models::capabilities(&req.model).thinking {
+            crate::models::ThinkingShape::Adaptive => {
+                let mut t = json!({ "type": "adaptive" });
+                if let Some(effort) = req.reasoning_effort {
+                    t["output_config"] = json!({ "effort": effort.as_str() });
+                }
+                t
+            }
+            _ => json!({ "type": "enabled", "budget_tokens": thinking.budget_tokens }),
+        };
+        map.insert("thinking".into(), block);
     }
     if !req.tools.is_empty() {
         // Anchor breakpoint: the tool definitions (ten JSON schemas) are identical every turn and sit
@@ -62,7 +77,23 @@ pub fn build_body(req: &ModelRequest) -> Value {
         mark_last_tool(&mut tools, &cc);
         map.insert("tools".into(), tools);
     }
+    // Constrain tool use only when the caller asked: an unset `tool_choice` emits nothing, leaving
+    // Anthropic's default (auto when tools are present), so the common request shape is untouched.
+    if let Some(choice) = &req.tool_choice {
+        map.insert("tool_choice".into(), tool_choice(choice));
+    }
     Value::Object(map)
+}
+
+/// Map a [`ToolChoice`] to Anthropic's `tool_choice` object. Anthropic spells "must call some tool"
+/// as `any` and pins a specific tool with `{type:"tool", name}`.
+fn tool_choice(choice: &ToolChoice) -> Value {
+    match choice {
+        ToolChoice::Auto => json!({ "type": "auto" }),
+        ToolChoice::None => json!({ "type": "none" }),
+        ToolChoice::Required => json!({ "type": "any" }),
+        ToolChoice::Tool(name) => json!({ "type": "tool", "name": name }),
+    }
 }
 
 /// The `cache_control` object to stamp on a breakpoint: ephemeral, with the 1-hour TTL when `long`.
@@ -89,6 +120,48 @@ fn mark_last_block(messages: &mut Value, cc: &Value) {
     }
 }
 
+/// Rewrite `tool_result` blocks carrying images into Anthropic's content-array shape. The derived
+/// JSON is `{type:"tool_result", content:"text", images:[…]}`, but Anthropic wants the images *inside*
+/// `content`: `{content:[{type:"text",text},{type:"image",source}…]}`. A no-op for the common
+/// text-only result (no `images` key), so the existing wire is untouched.
+fn encode_tool_result_images(messages: &mut Value) {
+    let Some(msgs) = messages.as_array_mut() else {
+        return;
+    };
+    for m in msgs {
+        let Some(content) = m.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for block in content {
+            let Some(obj) = block.as_object_mut() else {
+                continue;
+            };
+            if obj.get("type").and_then(Value::as_str) != Some("tool_result") {
+                continue;
+            }
+            let images = match obj.remove("images") {
+                Some(Value::Array(imgs)) if !imgs.is_empty() => imgs,
+                // No images (or the key was already absent): leave the string `content` as-is.
+                _ => continue,
+            };
+            let text = obj
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let mut parts: Vec<Value> = Vec::new();
+            if !text.is_empty() {
+                parts.push(json!({ "type": "text", "text": text }));
+            }
+            // A serialized `ImageSource` is exactly Anthropic's `source` object (`type:"base64"`, …).
+            for source in images {
+                parts.push(json!({ "type": "image", "source": source }));
+            }
+            obj.insert("content".into(), Value::Array(parts));
+        }
+    }
+}
+
 /// Stamp a cache breakpoint onto the last tool definition.
 fn mark_last_tool(tools: &mut Value, cc: &Value) {
     if let Some(tool) = tools
@@ -107,6 +180,12 @@ fn map_stop_reason(s: Option<&str>) -> StopReason {
         Some("max_tokens") => StopReason::MaxTokens,
         Some("stop_sequence") => StopReason::StopSequence,
         Some("refusal") => StopReason::Refusal,
+        // `pause_turn` is Anthropic pausing a long-running turn it expects the client to *resubmit* to
+        // continue — not a natural end. We have no resubmit step in the loop, so map it to `Other`
+        // rather than `EndTurn`: reading it as a clean end-of-turn would silently truncate a turn the
+        // model meant to keep going. (A fully distinct `PauseTurn` variant that drives a resubmit would
+        // need a `message.rs` enum change plus agent-loop handling — out of scope for this fix.)
+        Some("pause_turn") => StopReason::Other,
         _ => StopReason::Other,
     }
 }
@@ -189,9 +268,37 @@ impl StreamDecoder for Decoder {
                         .and_then(|d| d.get("stop_reason"))
                         .and_then(Value::as_str),
                 );
-                let out = u32_at(data.get("usage"), "output_tokens");
+                let usage = data.get("usage");
+                let out = u32_at(usage, "output_tokens");
                 if out > 0 {
                     self.usage.output_tokens = out;
+                }
+                // Reasoning tokens, when broken out separately, are still *included* in
+                // `output_tokens`; capture them so a caller can see the thinking share of the spend.
+                let thinking = usage
+                    .and_then(|u| u.get("output_tokens_details"))
+                    .map(|d| u32_at(Some(d), "thinking_tokens"))
+                    .unwrap_or(0);
+                if thinking > 0 {
+                    self.usage.reasoning_tokens = thinking;
+                }
+                // On a refusal, Anthropic carries a human-readable reason in
+                // `delta.stop_details.explanation`. Surface it as a text delta so it lands in the
+                // assembled assistant message instead of being dropped — otherwise a refusal arrives as
+                // an empty turn with only a `Refusal` stop reason, and the caller can't tell the user
+                // *why*. (The block has already closed by `message_delta`, so this trailing text is
+                // flushed as its own block; see the loop's `Accumulator`.)
+                if self.stop_reason == StopReason::Refusal {
+                    let explanation = delta
+                        .and_then(|d| d.get("stop_details"))
+                        .and_then(|sd| sd.get("explanation"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if !explanation.is_empty() {
+                        return vec![StreamEvent::TextDelta {
+                            text: explanation.to_string(),
+                        }];
+                    }
                 }
                 Vec::new()
             }
@@ -447,6 +554,30 @@ data: {"type":"message_stop"}
     }
 
     #[test]
+    fn captures_reasoning_tokens_from_message_delta() {
+        const SSE: &str = r#"event: message_start
+data: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":10,"output_tokens":1}}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":50,"output_tokens_details":{"thinking_tokens":32}}}
+
+event: message_stop
+data: {"type":"message_stop"}
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, SSE).unwrap();
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::Usage(u) => Some(*u),
+                _ => None,
+            })
+            .expect("a usage event");
+        assert_eq!(usage.output_tokens, 50);
+        assert_eq!(usage.reasoning_tokens, 32);
+    }
+
+    #[test]
     fn long_retention_sets_1h_ttl_on_breakpoints() {
         let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 256)
             .with_system("sys")
@@ -463,6 +594,49 @@ data: {"type":"message_stop"}
             body["messages"][0]["content"][0]["cache_control"]["ttl"],
             "1h"
         );
+    }
+
+    #[test]
+    fn tool_result_images_become_content_array() {
+        use crate::message::ImageSource;
+        let req = ModelRequest::new(
+            "claude-opus-4-8",
+            vec![Message::tool_results(vec![ContentBlock::ToolResult {
+                tool_use_id: "tu_1".into(),
+                content: "here is the screenshot".into(),
+                is_error: false,
+                images: vec![ImageSource::base64("image/png", "AAAA")],
+            }])],
+            256,
+        );
+        let body = build_body(&req);
+        let content = &body["messages"][0]["content"][0]["content"];
+        // The string content was rewritten into an array: text block, then image block.
+        assert_eq!(
+            content[0],
+            json!({ "type": "text", "text": "here is the screenshot" })
+        );
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["type"], "base64");
+        assert_eq!(content[1]["source"]["media_type"], "image/png");
+        assert_eq!(content[1]["source"]["data"], "AAAA");
+        // The transient `images` field must not leak onto the wire.
+        assert!(body["messages"][0]["content"][0].get("images").is_none());
+    }
+
+    #[test]
+    fn long_retention_gated_off_for_unsupported_model() {
+        // Even with `cache_long`, a model whose capabilities don't include long-cache retention must
+        // get the default 5-minute TTL (no `ttl` field) — otherwise Anthropic 400s the turn.
+        let req = ModelRequest::new("some-unknown-model", vec![Message::user("hi")], 256)
+            .with_system("sys")
+            .with_cache_long(true);
+        let body = build_body(&req);
+        assert!(
+            body["system"][0]["cache_control"].get("ttl").is_none(),
+            "unsupported model must not receive the 1h TTL"
+        );
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
     }
 
     #[test]
@@ -562,6 +736,101 @@ data: {"type":"message_stop"}
         assert!(events.contains(&StreamEvent::MessageStop {
             stop_reason: StopReason::Refusal
         }));
+    }
+
+    #[test]
+    fn refusal_explanation_surfaces_as_text() {
+        // A refusal carrying `stop_details.explanation` must surface that text (as a text delta) so
+        // the caller can see *why* the model declined, rather than getting an empty turn.
+        const REFUSED: &str = r#"
+event: message_start
+data: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":5,"output_tokens":1}}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"refusal","stop_details":{"type":"refusal","explanation":"I can't help with that."}},"usage":{"output_tokens":2}}
+
+event: message_stop
+data: {"type":"message_stop"}
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, REFUSED).unwrap();
+        assert!(events.contains(&StreamEvent::TextDelta {
+            text: "I can't help with that.".into()
+        }));
+        assert!(events.contains(&StreamEvent::MessageStop {
+            stop_reason: StopReason::Refusal
+        }));
+    }
+
+    #[test]
+    fn pause_turn_is_not_end_turn() {
+        // `pause_turn` must not read as a clean `EndTurn` (which would truncate a turn the model meant
+        // to continue); it maps to the non-terminal `Other`.
+        const PAUSED: &str = r#"
+event: message_start
+data: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":5,"output_tokens":1}}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"pause_turn"},"usage":{"output_tokens":2}}
+
+event: message_stop
+data: {"type":"message_stop"}
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, PAUSED).unwrap();
+        assert!(events.contains(&StreamEvent::MessageStop {
+            stop_reason: StopReason::Other
+        }));
+        assert!(!events.contains(&StreamEvent::MessageStop {
+            stop_reason: StopReason::EndTurn
+        }));
+    }
+
+    #[test]
+    fn tool_choice_emitted_only_when_set() {
+        use crate::message::ToolDef;
+        use crate::transport::ToolChoice;
+        let tools = vec![ToolDef {
+            name: "read".into(),
+            description: "d".into(),
+            input_schema: json!({ "type": "object" }),
+        }];
+        // Unset → no `tool_choice` on the wire (the default request shape is untouched).
+        let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 64)
+            .with_tools(tools.clone());
+        assert!(build_body(&req).get("tool_choice").is_none());
+
+        // Each variant maps to Anthropic's vocabulary (`any` for required; `{type:"tool",name}`).
+        let body = build_body(
+            &ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 64)
+                .with_tools(tools.clone())
+                .with_tool_choice(ToolChoice::Auto),
+        );
+        assert_eq!(body["tool_choice"], json!({ "type": "auto" }));
+
+        let body = build_body(
+            &ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 64)
+                .with_tools(tools.clone())
+                .with_tool_choice(ToolChoice::None),
+        );
+        assert_eq!(body["tool_choice"], json!({ "type": "none" }));
+
+        let body = build_body(
+            &ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 64)
+                .with_tools(tools.clone())
+                .with_tool_choice(ToolChoice::Required),
+        );
+        assert_eq!(body["tool_choice"], json!({ "type": "any" }));
+
+        let body = build_body(
+            &ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 64)
+                .with_tools(tools)
+                .with_tool_choice(ToolChoice::Tool("read".into())),
+        );
+        assert_eq!(
+            body["tool_choice"],
+            json!({ "type": "tool", "name": "read" })
+        );
     }
 
     #[test]
