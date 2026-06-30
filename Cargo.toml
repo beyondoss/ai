@@ -38,10 +38,13 @@ overflow-checks = true
 # once for the whole tree. Only deps used (or expected to be used) by more than one crate live here;
 # crate-specific deps stay in that crate's manifest.
 [workspace.dependencies]
+async-trait = "0.1"
 base64 = "0.22"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 figment = { version = "0.10", features = ["toml", "env"] }
+# Stream combinators for the agent loop's streaming transport (`BoxStream<StreamEvent>`).
+futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

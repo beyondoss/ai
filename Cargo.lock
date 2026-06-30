@@ -340,6 +340,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "beyond-ai-agent"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "beyond-ai-agent-core",
+ "clap",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "beyond-ai-agent-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "beyond-slipstream"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

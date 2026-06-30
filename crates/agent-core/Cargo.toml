@@ -1,0 +1,29 @@
+[package]
+name = "beyond-ai-agent-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Beyond agent harness — runtime-agnostic core: messages, tools, sessions, the model-transport seam"
+
+[lib]
+# Short, ergonomic extern name (`use agent_core::…`); the published/depended-on package stays
+# `beyond-ai-agent-core`. Same split the gateway uses (package `beyond-ai` / lib `beyond_ai`).
+name = "agent_core"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# Async test runtime for the `Tool`/loop tests. The library itself is runtime-agnostic — it pulls in
+# no executor, only the `futures` stream traits — so the runtime lives in dev-deps.
+tokio.workspace = true
