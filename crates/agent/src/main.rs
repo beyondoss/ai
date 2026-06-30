@@ -1,8 +1,9 @@
 //! Beyond agent harness — CLI.
 //!
-//! `run` drives a one-shot coding task to completion through the gateway. `serve` (M7) will expose
-//! the headless control API. `tools` lists the advertised tool set. Model traffic always flows
-//! through the gateway (`AI_GATEWAY_URL`) authenticated with a `bai_v1` key (`AI_AGENT_KEY`).
+//! `run` drives a one-shot coding task to completion through the gateway. `serve` exposes the
+//! headless control protocol (newline-delimited JSON over stdio). `tools` lists the advertised tool
+//! set. Model traffic always flows through the gateway (`AI_GATEWAY_URL`) authenticated with a
+//! `bai_v1` key (`AI_AGENT_KEY`).
 
 // Unit tests assert preconditions with `.unwrap()`; allow that under `test` (matches the gateway and
 // agent-core crate roots). Production paths stay panic-free per the workspace lints.
@@ -14,6 +15,7 @@ use std::sync::Arc;
 use agent_core::{Agent, GatewayClient, Session, StreamEvent};
 use clap::{Parser, Subcommand};
 
+mod serve;
 mod tools;
 
 /// Default model when neither `--model` nor `AI_AGENT_MODEL` is set.
@@ -51,8 +53,24 @@ enum Command {
         #[arg(long, default_value_t = 24)]
         max_steps: u32,
     },
-    /// Run the headless agent server exposing an attachable control API. (M7.)
-    Serve,
+    /// Run the headless agent server: a newline-delimited JSON control protocol over stdio.
+    Serve {
+        /// Model id (default `claude-opus-4-8`, or `AI_AGENT_MODEL`).
+        #[arg(long, env = "AI_AGENT_MODEL")]
+        model: Option<String>,
+        /// Gateway base URL (default `http://ai.internal`, or `AI_GATEWAY_URL`).
+        #[arg(long, env = "AI_GATEWAY_URL")]
+        gateway_url: Option<String>,
+        /// Virtual key (`bai_v1…`) or BYO provider key. Required; or set `AI_AGENT_KEY`.
+        #[arg(long, env = "AI_AGENT_KEY")]
+        key: Option<String>,
+        /// Persist/restore session state here so a later `serve` reattaches with the transcript.
+        #[arg(long, env = "AI_AGENT_SESSION_FILE")]
+        session_file: Option<String>,
+        /// Max loop iterations per prompt before bailing.
+        #[arg(long, default_value_t = 24)]
+        max_steps: u32,
+    },
     /// List the tools the agent advertises to the model.
     Tools,
 }
@@ -73,8 +91,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             run_task(task, model, gateway_url, key, max_steps).await?;
         }
-        Command::Serve => {
-            println!("scaffold: `serve` is not wired yet (headless control API = M7).");
+        Command::Serve {
+            model,
+            gateway_url,
+            key,
+            session_file,
+            max_steps,
+        } => {
+            let key = key
+                .ok_or("no gateway key: pass --key or set AI_AGENT_KEY (a bai_v1… virtual key)")?;
+            serve::serve(serve::ServeConfig {
+                gateway: gateway_url.unwrap_or_else(|| DEFAULT_GATEWAY.to_string()),
+                key,
+                model: model.unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+                max_steps,
+                system: SYSTEM_PROMPT.to_string(),
+                session_file,
+            })
+            .await?;
         }
         Command::Tools => {
             let reg = tools::default_registry();
