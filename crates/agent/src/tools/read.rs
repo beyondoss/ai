@@ -13,6 +13,10 @@ const DEFAULT_LIMIT: usize = 2000;
 /// single pathological line (a minified bundle, a one-line JSON/CSV blob) is one unbounded line — so
 /// cap each line and drain the overflow without storing it, the way `grep` clips long match lines.
 const MAX_LINE_BYTES: usize = 4000;
+/// Aggregate output budget: the line limit alone (2000 × up to 4000 bytes) could return ~8MB of
+/// mostly-long lines into context. Stop once the rendered output crosses this, telling the model how
+/// to continue.
+const MAX_OUTPUT_BYTES: usize = 256_000;
 
 pub struct Read;
 
@@ -96,8 +100,8 @@ impl Tool for Read {
         // Stream the file line-by-line rather than slurping it whole: a windowed read
         // (`offset`/`limit`) into a huge file shouldn't allocate the entire file first — we hold at
         // most one line plus the bounded output window.
-        let file =
-            std::fs::File::open(path).map_err(|e| ToolError::Execution(format!("read {path}: {e}")))?;
+        let file = std::fs::File::open(path)
+            .map_err(|e| ToolError::Execution(format!("read {path}: {e}")))?;
         let mut reader = BufReader::new(file);
 
         let mut out = String::new();
@@ -115,7 +119,9 @@ impl Tool for Read {
             if lineno < offset {
                 continue; // skipped lines are still drained, so memory stays bounded
             }
-            if shown >= limit {
+            // Stop before showing this line if we've hit the line limit or the byte budget; either way
+            // `lineno` is the first *un*shown line, so it's exactly the offset to continue from.
+            if shown >= limit || out.len() >= MAX_OUTPUT_BYTES {
                 truncated = true;
                 break;
             }
@@ -134,9 +140,17 @@ impl Tool for Read {
         if lineno == 0 {
             return Ok("(empty file)".into());
         }
+        // An offset past the last line returns nothing useful — say so explicitly rather than handing
+        // back a blank result the model can't interpret.
+        if offset > lineno {
+            return Err(ToolError::InvalidInput(format!(
+                "offset {offset} is beyond end of file ({lineno} lines total)"
+            )));
+        }
         if truncated {
+            let last = offset + shown - 1;
             out.push_str(&format!(
-                "… (truncated at {limit} lines; pass a larger `limit` to see more)\n"
+                "… (showing lines {offset}-{last}; use offset={lineno} to continue)\n"
             ));
         }
         Ok(out)
@@ -163,6 +177,27 @@ mod tests {
             .unwrap();
         assert!(out.contains("     1\talpha"));
         assert!(out.contains("     3\tgamma"));
+    }
+
+    #[tokio::test]
+    async fn offset_past_eof_is_an_error() {
+        let f = tmp_file("a\nb\nc\n");
+        let err = Read
+            .run(json!({ "path": f.path().to_str().unwrap(), "offset": 99 }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn truncation_reports_next_offset() {
+        let f = tmp_file("a\nb\nc\nd\ne\n");
+        let out = Read
+            .run(json!({ "path": f.path().to_str().unwrap(), "limit": 2 }))
+            .await
+            .unwrap();
+        // Showed lines 1-2; the model is told to continue at line 3.
+        assert!(out.contains("use offset=3 to continue"), "got: {out}");
     }
 
     #[tokio::test]
@@ -197,7 +232,11 @@ mod tests {
             .await
             .unwrap();
         // The stored line is bounded, not the full 16k — the cap plus the framing/marker overhead.
-        assert!(out.len() < MAX_LINE_BYTES * 2, "line was not capped: {} bytes", out.len());
+        assert!(
+            out.len() < MAX_LINE_BYTES * 2,
+            "line was not capped: {} bytes",
+            out.len()
+        );
         assert!(out.contains("[line truncated]"));
         // The next line is read correctly as line 2 (overflow was drained, not mis-parsed).
         assert!(out.contains("     2\tnext"));

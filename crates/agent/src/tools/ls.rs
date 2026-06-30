@@ -5,6 +5,10 @@ use agent_core::tool::Tool;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
+/// Max entries returned before truncating, to protect the model's context from a `node_modules`-sized
+/// directory. The model can narrow with a more specific path or `find`/`grep`.
+const MAX_ENTRIES: usize = 500;
+
 pub struct Ls;
 
 #[async_trait]
@@ -50,6 +54,17 @@ impl Tool for Ls {
         if entries.is_empty() {
             return Ok("(empty directory)".into());
         }
+        // Cap the listing so a huge directory can't flood the model's context.
+        let total = entries.len();
+        if total > MAX_ENTRIES {
+            entries.truncate(MAX_ENTRIES);
+            let mut out = entries.join("\n");
+            out.push_str(&format!(
+                "\n… ({} more entries; {total} total — narrow with a subpath or use `find`/`grep`)",
+                total - MAX_ENTRIES
+            ));
+            return Ok(out);
+        }
         Ok(entries.join("\n"))
     }
 }
@@ -76,5 +91,20 @@ mod tests {
             .await
             .unwrap();
         assert!(all.contains(".hidden"));
+    }
+
+    #[tokio::test]
+    async fn caps_a_huge_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..(MAX_ENTRIES + 50) {
+            std::fs::write(dir.path().join(format!("f{i:04}")), "x").unwrap();
+        }
+        let out = Ls
+            .run(json!({ "path": dir.path().to_str().unwrap() }))
+            .await
+            .unwrap();
+        assert!(out.contains("more entries"));
+        // The body is capped to MAX_ENTRIES lines (plus the truncation note).
+        assert_eq!(out.lines().count(), MAX_ENTRIES + 1);
     }
 }

@@ -69,10 +69,10 @@ async fn gateway_client_decodes_sse_over_socket() {
     assert!(events.contains(&StreamEvent::TextDelta {
         text: "hi over the wire".into()
     }));
-    assert!(events.contains(&StreamEvent::Usage {
-        input_tokens: 7,
-        output_tokens: 5
-    }));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        StreamEvent::Usage(u) if u.input_tokens == 7 && u.output_tokens == 5
+    )));
     assert!(matches!(
         events.last(),
         Some(StreamEvent::MessageStop { .. })
@@ -112,7 +112,10 @@ async fn gateway_client_reassembles_utf8_split_across_chunks() {
             );
             let bytes = resp.into_bytes();
             // Split two bytes into the emoji's 4-byte sequence (lead byte 0xF0).
-            let lead = bytes.iter().position(|&b| b == 0xF0).expect("emoji present");
+            let lead = bytes
+                .iter()
+                .position(|&b| b == 0xF0)
+                .expect("emoji present");
             let split = lead + 2;
             let _ = stream.write_all(&bytes[..split]);
             let _ = stream.flush();
@@ -162,4 +165,48 @@ async fn gateway_client_surfaces_http_error() {
         .expect("stream");
     let first = stream.next().await.expect("an item");
     assert!(first.is_err(), "a 403 must surface as a stream error");
+}
+
+#[tokio::test]
+async fn gateway_client_retries_transient_503_then_succeeds() {
+    // The server returns a retryable 503 on the first connection and the real SSE body on the second.
+    // The client must transparently retry and deliver the events — a transient gateway hiccup should
+    // not vaporize the request.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    thread::spawn(move || {
+        // First attempt: 503 with a tiny Retry-After so the backoff stays fast.
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(
+                b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+            let _ = stream.flush();
+        }
+        // Second attempt: the real stream.
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{ANTHROPIC_SSE}"
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    let client = GatewayClient::new(format!("http://{addr}"), "bai_v1.test").expect("client");
+    let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 64);
+    let mut stream = client.stream(req).await.expect("stream");
+    let mut events = Vec::new();
+    while let Some(ev) = stream.next().await {
+        events.push(ev.expect("event after retry"));
+    }
+    assert!(
+        events.contains(&StreamEvent::TextDelta {
+            text: "hi over the wire".into()
+        }),
+        "retry must transparently deliver the real stream, got: {events:?}"
+    );
 }

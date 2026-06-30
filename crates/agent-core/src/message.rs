@@ -25,6 +25,17 @@ pub enum Role {
 pub enum ContentBlock {
     /// Plain text — a prompt fragment or assistant prose.
     Text { text: String },
+    /// Extended-thinking output. The wire shape is Anthropic's `{"type":"thinking", thinking, signature}`;
+    /// the `signature` is load-bearing — Anthropic rejects a later tool turn whose prior thinking block
+    /// is missing or unsigned, so the loop must replay the block verbatim (see the dialect's `build_body`).
+    Thinking {
+        #[serde(rename = "thinking")]
+        text: String,
+        signature: String,
+    },
+    /// Encrypted thinking the provider chose not to expose in clear text. Opaque; replayed verbatim so
+    /// the model keeps its reasoning continuity across turns.
+    RedactedThinking { data: String },
     /// The model's request to invoke a tool. `input` is the (already-complete) JSON arguments
     /// object; during streaming it's assembled from `StreamEvent::InputJsonDelta` fragments.
     ToolUse {
@@ -40,6 +51,32 @@ pub enum ContentBlock {
         #[serde(default)]
         is_error: bool,
     },
+    /// An image attachment (base64). The wire shape is Anthropic's
+    /// `{"type":"image","source":{"type":"base64", media_type, data}}`.
+    Image { source: ImageSource },
+}
+
+/// A base64-encoded image source, in Anthropic's nested wire shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageSource {
+    /// Always `base64` for now.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// MIME type, e.g. `image/png`.
+    pub media_type: String,
+    /// Base64-encoded image bytes.
+    pub data: String,
+}
+
+impl ImageSource {
+    /// A base64 image of the given media type.
+    pub fn base64(media_type: impl Into<String>, data: impl Into<String>) -> Self {
+        Self {
+            kind: "base64".into(),
+            media_type: media_type.into(),
+            data: data.into(),
+        }
+    }
 }
 
 /// A single turn in the conversation.
@@ -62,6 +99,23 @@ impl Message {
     pub fn assistant(content: Vec<ContentBlock>) -> Self {
         Self {
             role: Role::Assistant,
+            content,
+        }
+    }
+
+    /// A user turn carrying text plus image attachments. The text block (if any) comes first, then
+    /// one `Image` block per source — the multimodal prompt shape both wire dialects expect.
+    pub fn user_with_images(text: impl Into<String>, images: Vec<ImageSource>) -> Self {
+        let mut content = Vec::with_capacity(images.len() + 1);
+        let text = text.into();
+        if !text.is_empty() {
+            content.push(ContentBlock::Text { text });
+        }
+        for source in images {
+            content.push(ContentBlock::Image { source });
+        }
+        Self {
+            role: Role::User,
             content,
         }
     }
@@ -124,8 +178,36 @@ pub enum StopReason {
     MaxTokens,
     /// Hit a configured stop sequence.
     StopSequence,
+    /// The model declined to respond (Anthropic `refusal`). A distinct terminal state so a caller can
+    /// tell a refusal apart from a normal end-of-turn rather than reading it as success.
+    Refusal,
     /// Anything else / dialect-specific.
     Other,
+}
+
+/// Per-turn token accounting. Carried on [`StreamEvent::Usage`] and folded into the [`Session`]
+/// running totals. The cache fields make the prompt-cache breakpoints we stamp *observable*: without
+/// them a cache that silently never hits would re-bill the full prefix and we'd have no signal.
+///
+/// [`Session`]: crate::session::Session
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenUsage {
+    /// Uncached input tokens billed at full price.
+    pub input_tokens: u32,
+    /// Generated output tokens (includes any thinking tokens the provider folds in).
+    pub output_tokens: u32,
+    /// Input tokens served from the prompt cache (~10% of input price). Anthropic
+    /// `cache_read_input_tokens` / OpenAI `prompt_tokens_details.cached_tokens`.
+    #[serde(default)]
+    pub cache_read_tokens: u32,
+    /// Input tokens written to the prompt cache this turn (~125% of input price). Anthropic
+    /// `cache_creation_input_tokens`.
+    #[serde(default)]
+    pub cache_write_tokens: u32,
+    /// Reasoning/thinking tokens reported separately by the provider (OpenAI
+    /// `completion_tokens_details.reasoning_tokens`); 0 when folded into `output_tokens`.
+    #[serde(default)]
+    pub reasoning_tokens: u32,
 }
 
 /// An incremental event from a streaming model response. The dialect adapters normalize both
@@ -137,6 +219,13 @@ pub enum StreamEvent {
     MessageStart,
     /// A chunk of assistant text.
     TextDelta { text: String },
+    /// A chunk of extended-thinking text.
+    ThinkingDelta { text: String },
+    /// The cryptographic signature closing a thinking block (arrives after its text). Captured so the
+    /// block can be replayed verbatim on the next request.
+    SignatureDelta { signature: String },
+    /// A complete redacted (encrypted) thinking block — self-contained, no deltas follow.
+    RedactedThinking { data: String },
     /// A tool-call block opened; `id` and `name` are known before its arguments stream in.
     ToolUseStart { id: String, name: String },
     /// A chunk of the in-progress tool call's JSON arguments.
@@ -144,10 +233,9 @@ pub enum StreamEvent {
     /// The current content block finished (text or tool-call).
     ContentBlockStop,
     /// Token accounting. May arrive at end-of-stream (OpenAI) or alongside other events (Anthropic).
-    Usage {
-        input_tokens: u32,
-        output_tokens: u32,
-    },
+    /// A newtype over [`TokenUsage`] so the wire shape stays `{"type":"usage", …fields}` while the
+    /// loop, the session, and future fields all share one struct.
+    Usage(TokenUsage),
     /// The assistant turn finished, with the reason it stopped.
     MessageStop { stop_reason: StopReason },
 }

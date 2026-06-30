@@ -12,6 +12,27 @@ This crate is the "everything above the wire" layer. `agent_core` owns the messa
 and the two seams (`Tool`, `ModelTransport`); this crate is the concrete `Tool` implementations, the
 CLI, and the `serve` control protocol built on top of them.
 
+## Beyond the basics
+
+The harness layers several capabilities over the bare tools + loop:
+
+- **System-prompt assembly** ([`resources`](src/resources.rs)) — the system prompt is built per
+  session from a base identity + project `AGENTS.md`/`CLAUDE.md` (global, then cwd→root) + discovered
+  [`skills`](src/skills.rs) (`<available_skills>`, read-on-demand) + the date/cwd. Flags:
+  `--system-prompt` (replace), `--append-system-prompt`, `--no-context-files`.
+- **Prompt templates** ([`prompts`](src/prompts.rs)) — a `/name args` prompt is expanded from a
+  `.claude/prompts/*.md` template with bash-style substitution before it reaches the model.
+- **Session persistence** ([`session_store`](src/session_store.rs)) — append-only JSONL with a header
+  carrying stable id + metadata; a turn appends only its new messages (compaction rewrites atomically),
+  a torn final line is dropped on load. `--session-dir` opens a multi-session `SessionRepo`
+  (list/create/open/delete/fork); `--session-file` is the single-session form.
+- **Expanded `serve` surface** — beyond `prompt`/`get_state`/`get_messages`/`new_session`: `abort`,
+  `steer`/`follow_up` (mid-run), `compact`, `list_sessions`/`switch_session`/`fork`/`set_session_name`,
+  `get_last_assistant_text`/`get_session_stats`/`get_commands`. A `prompt` runs concurrently with stdin
+  so `abort`/`steer`/`follow_up` land mid-turn.
+- **Multimodal** — `prompt` accepts `images: [{media_type, data}]` (base64), built into a multimodal
+  user turn.
+
 ---
 
 ## Data Flow
@@ -319,16 +340,20 @@ container/VM — not by this crate restricting its own tools.
 | File                  | What It Does                                                                                          |
 | ----------------------- | ---------------------------------------------------------------------------------------------------------- |
 | `src/main.rs`          | CLI entry point (`run`/`serve`/`tools` subcommands); `DEFAULT_MODEL`, `DEFAULT_GATEWAY`, `SYSTEM_PROMPT`; renders streamed text + `[tool: name]` markers to stdout for `run` |
-| `src/lib.rs`           | Library root; re-exports `serve` and `tools` so integration tests/benches drive them without spawning the binary |
-| `src/serve.rs`         | NDJSON control protocol: single stdout-writer task, command dispatch, `--session-file` persistence    |
+| `src/lib.rs`           | Library root; re-exports `serve`/`tools`/`resources`/`skills`/`prompts`/`session_store` for tests/benches |
+| `src/serve.rs`         | NDJSON control protocol: single stdout-writer task, `Persistence` (file or repo), expanded command set, prompt runs concurrently with stdin (abort/steer) |
+| `src/session_store.rs` | JSONL `SessionStore` (append/rewrite/torn-line recovery, header metadata) + multi-session `SessionRepo` |
+| `src/resources.rs`     | System-prompt assembly: `AGENTS.md`/`CLAUDE.md` discovery, skill injection, date/cwd                    |
+| `src/skills.rs`        | Skill discovery (`SKILL.md` frontmatter) + `<available_skills>` rendering                               |
+| `src/prompts.rs`       | `/name args` prompt-template discovery + bash-style expansion                                           |
 | `src/tools/mod.rs`     | `default_registry()` — assembles the fixed 10-tool `ToolRegistry`                                      |
-| `src/tools/read.rs`    | `read` — line-numbered file read with `offset`/`limit`                                                  |
+| `src/tools/read.rs`    | `read` — line-numbered read with `offset`/`limit`, byte budget, offset-past-EOF error, continuation hints |
 | `src/tools/write.rs`   | `write` — create/overwrite a file, creating parent directories                                          |
-| `src/tools/edit.rs`    | `edit` — exact-string replacement, unique-match-or-`replace_all`                                        |
-| `src/tools/ls.rs`      | `ls` — directory listing, directories-first sort, dotfile filtering                                     |
-| `src/tools/grep.rs`    | `grep` — parallel, gitignore-aware regex search; deterministic sort+truncate                            |
-| `src/tools/find.rs`    | `find` — sequential, gitignore-aware glob search; deterministic sort+truncate                           |
-| `src/tools/bash.rs`    | `bash` — `sh -c` execution with timeout and head/tail output truncation                                 |
+| `src/tools/edit.rs`    | `edit` — replacement matched in LF space (CRLF/BOM restored), against the original, overlap/no-op checks, `replace_all` |
+| `src/tools/ls.rs`      | `ls` — directory listing, directories-first sort, dotfile filtering, entry cap                          |
+| `src/tools/grep.rs`    | `grep` — parallel, gitignore-aware regex (or `literal`) search; deterministic sort+truncate             |
+| `src/tools/find.rs`    | `find` — sequential, gitignore-aware glob search over files **and** dirs; deterministic sort+truncate    |
+| `src/tools/bash.rs`    | `bash` — `sh -c` execution with timeout and head/tail output truncation (process-group kill on timeout) |
 | `src/tools/beyond.rs`  | `fork`/`sync`/`logs` — shell out to the `beyond` platform CLI                                            |
 | `src/tools/exec.rs`    | `CommandRunner` trait + `RealRunner` — the process-execution seam shared by `bash`/`beyond` tools        |
 | `benches/search.rs`    | Criterion macro-bench: `grep` (1 vs auto threads) and `find` (sequential) over a 5,000-file tree         |

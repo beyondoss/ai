@@ -55,6 +55,260 @@ fn serve_cmd(bin: &str, base: &str, session_file: &str) -> Command {
     c
 }
 
+fn serve_dir_cmd(bin: &str, base: &str, session_dir: &str) -> Command {
+    let mut c = Command::new(bin);
+    c.args([
+        "serve",
+        "--gateway-url",
+        base,
+        "--key",
+        "bai_v1.test",
+        "--model",
+        "claude-test",
+        "--session-dir",
+        session_dir,
+    ])
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
+    c
+}
+
+#[test]
+fn serve_follow_up_steers_an_in_flight_run() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+
+    // turn 1 runs a 1s sleep (keeps the run in flight long enough to steer), turn 2 ends the turn —
+    // at which point the queued follow-up is injected — and turn 3 answers the follow-up.
+    let turn1 = turn_tool_use(
+        "toolu_s",
+        "bash",
+        &json!({ "command": "sleep 1" }).to_string(),
+    );
+    let (base, _bodies) = spawn_model_server(vec![
+        turn1,
+        turn_text("done with the first part"),
+        turn_text("done with the follow-up"),
+    ]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "start" })).unwrap();
+    stdin.flush().unwrap();
+    // Queue a follow-up while the first turn's sleep is running.
+    std::thread::sleep(Duration::from_millis(300));
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "follow_up", "id": "f1", "message": "now the second thing" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+
+    let frames = read_until_response(&mut stdout, "prompt");
+    // The follow-up was acknowledged...
+    assert!(
+        frames
+            .iter()
+            .any(|f| f["command"] == "follow_up" && f["success"] == true),
+        "follow_up should be acknowledged: {frames:#?}"
+    );
+    // ...and a `steered` event fired as it was injected.
+    assert!(
+        frames
+            .iter()
+            .any(|f| f["type"] == "event" && f["event"]["kind"] == "steered"),
+        "a steered event should appear: {frames:#?}"
+    );
+
+    // The transcript holds the follow-up text and the second answer.
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_messages");
+    let dump = frames.last().unwrap()["data"]["messages"].to_string();
+    assert!(dump.contains("now the second thing"));
+    assert!(dump.contains("done with the follow-up"));
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_injects_project_instructions_into_system_prompt() {
+    // A `CLAUDE.md` in the working directory must reach the model: the agent assembles it into the
+    // system prompt. The mock server records the request body, so we assert the marker is present.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("CLAUDE.md"), "PROJECT-MARKER-9182").unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+
+    let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut cmd = serve_cmd(bin, &base, &session_file);
+    cmd.current_dir(dir.path()); // CLAUDE.md is discovered relative to cwd
+    let mut child = cmd.spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+    drop(stdin);
+    child.wait().unwrap();
+
+    let recorded = bodies.lock().unwrap();
+    assert!(
+        recorded.iter().any(|b| b.contains("PROJECT-MARKER-9182")),
+        "project CLAUDE.md must be injected into the system prompt; bodies: {recorded:#?}"
+    );
+}
+
+#[test]
+fn serve_repo_lists_switches_and_forks_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_dir = dir.path().join("sessions").to_string_lossy().into_owned();
+
+    // Two text turns: one per prompt.
+    let (base, _bodies) = spawn_model_server(vec![turn_text("first answer"), turn_text("second")]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_dir_cmd(bin, &base, &session_dir).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    // Read the `ready` banner to learn the first session's id.
+    let mut ready = String::new();
+    stdout.read_line(&mut ready).unwrap();
+    let ready: Value = serde_json::from_str(ready.trim()).unwrap();
+    let first_id = ready["session_id"].as_str().unwrap().to_string();
+
+    // Prompt in session 1.
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    // Start a second session.
+    writeln!(stdin, "{}", json!({ "type": "new_session", "id": "n" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "new_session");
+    let second_id = frames.last().unwrap()["data"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(first_id, second_id, "new_session must mint a new id");
+
+    // Prompt in session 2.
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "yo" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    // List shows both, newest first.
+    writeln!(stdin, "{}", json!({ "type": "list_sessions" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "list_sessions");
+    let sessions = frames.last().unwrap()["data"]["sessions"]
+        .as_array()
+        .unwrap();
+    assert!(
+        sessions.len() >= 2,
+        "both sessions should be listed: {sessions:#?}"
+    );
+
+    // Switch back to session 1 and confirm its transcript is restored.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "switch_session", "session_id": first_id })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "switch_session");
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_messages");
+    let dump = frames.last().unwrap()["data"]["messages"].to_string();
+    assert!(
+        dump.contains("first answer"),
+        "switched-to session must restore its transcript: {dump}"
+    );
+
+    // Fork the current session; the fork gets a new id.
+    writeln!(stdin, "{}", json!({ "type": "fork" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "fork");
+    let fork_id = frames.last().unwrap()["data"]["session_id"]
+        .as_str()
+        .unwrap();
+    assert_ne!(fork_id, first_id, "a fork is a distinct session");
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_abort_cancels_an_in_flight_prompt() {
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir
+        .path()
+        .join("session.json")
+        .to_string_lossy()
+        .into_owned();
+
+    // The model asks to run a 30s shell sleep; the run will be aborted mid-tool, so a second turn is
+    // never requested.
+    let turn1 = turn_tool_use(
+        "toolu_b",
+        "bash",
+        &json!({ "command": "sleep 30" }).to_string(),
+    );
+    let (base, _bodies) = spawn_model_server(vec![turn1]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "run a long sleep" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+
+    // Give the run time to reach the tool, then abort.
+    std::thread::sleep(Duration::from_millis(500));
+    writeln!(stdin, "{}", json!({ "type": "abort", "id": "a1" })).unwrap();
+    stdin.flush().unwrap();
+
+    // The prompt response must come back promptly (well under the 30s sleep) and report failure.
+    let start = Instant::now();
+    let frames = read_until_response(&mut stdout, "prompt");
+    assert!(
+        start.elapsed() < Duration::from_secs(15),
+        "abort must cancel the in-flight prompt promptly, took {:?}",
+        start.elapsed()
+    );
+    let resp = frames.last().unwrap();
+    assert_eq!(resp["command"], "prompt");
+    assert_eq!(resp["success"], false, "an aborted prompt reports failure");
+    assert!(
+        frames
+            .iter()
+            .any(|f| f["type"] == "response" && f["command"] == "abort" && f["success"] == true),
+        "the abort command should have been acknowledged: {frames:#?}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
 #[test]
 fn serve_streams_events_and_reattaches() {
     let dir = tempfile::tempdir().unwrap();

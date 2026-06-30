@@ -20,19 +20,30 @@
 
 pub mod agent;
 pub mod client;
+pub mod compaction;
 pub mod dialect;
 pub mod error;
+pub mod hooks;
 pub mod message;
 pub mod mock;
 pub mod session;
+pub mod steering;
 pub mod tool;
 pub mod transport;
 
 pub use agent::{Agent, AgentEvent};
 pub use client::GatewayClient;
+pub use compaction::CompactionConfig;
 pub use error::{Error, Result, ToolError};
-pub use message::{ContentBlock, Message, Role, StopReason, StreamEvent, ToolDef};
+pub use hooks::{AgentHooks, NoHooks};
+pub use message::{
+    ContentBlock, ImageSource, Message, Role, StopReason, StreamEvent, TokenUsage, ToolDef,
+};
 pub use mock::MockTransport;
 pub use session::Session;
+pub use steering::Steering;
 pub use tool::{Tool, ToolRegistry};
 pub use transport::{ModelRequest, ModelTransport};
+// Re-exported because it appears in `Agent::run_events_cancellable`'s signature — callers shouldn't
+// need a direct `tokio-util` dependency to drive a cancellable run.
+pub use tokio_util::sync::CancellationToken;

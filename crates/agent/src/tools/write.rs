@@ -27,7 +27,10 @@ impl Tool for Write {
     }
 
     fn write_target(&self, input: &Value) -> Option<String> {
-        input.get("path").and_then(Value::as_str).map(str::to_string)
+        input
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::to_string)
     }
 
     async fn run(&self, input: Value) -> Result<String, ToolError> {

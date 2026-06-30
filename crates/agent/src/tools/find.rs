@@ -55,10 +55,12 @@ pub fn search(job: &FindJob) -> (Vec<PathBuf>, bool) {
             break;
         }
         let Ok(entry) = entry else { continue };
-        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+        let path = entry.path();
+        // Skip the search root itself, but match both files *and* directories — `find "node_modules"`
+        // or any directory-name pattern would otherwise return nothing.
+        if path == job.root {
             continue;
         }
-        let path = entry.path();
         let candidate = if job.basename_only {
             path.file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -168,6 +170,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn matches_directories_too() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("node_modules")).unwrap();
+        std::fs::write(dir.path().join("node_modules/pkg.json"), "").unwrap();
+        let out = Find
+            .run(json!({ "pattern": "node_modules", "path": dir.path().to_str().unwrap() }))
+            .await
+            .unwrap();
+        assert!(
+            out.contains("node_modules"),
+            "directory-name searches must return the directory: {out}"
+        );
+    }
+
+    #[tokio::test]
     async fn no_match_is_reported() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "").unwrap();
@@ -191,10 +208,7 @@ mod tests {
                 .unwrap()
         };
         let out = run_once().await;
-        let order: Vec<&str> = out
-            .lines()
-            .filter_map(|l| l.rsplit('/').next())
-            .collect();
+        let order: Vec<&str> = out.lines().filter_map(|l| l.rsplit('/').next()).collect();
         assert_eq!(order, vec!["a.rs", "m.rs", "z.rs"]);
         assert_eq!(out, run_once().await);
     }

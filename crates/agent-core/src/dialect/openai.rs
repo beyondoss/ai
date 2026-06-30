@@ -11,7 +11,8 @@
 use serde_json::{Map, Value, json};
 
 use super::StreamDecoder;
-use crate::message::{ContentBlock, Role, StopReason, StreamEvent};
+use crate::error::{Error, Result};
+use crate::message::{ContentBlock, Role, StopReason, StreamEvent, TokenUsage};
 use crate::transport::ModelRequest;
 
 fn text_of(blocks: &[ContentBlock]) -> String {
@@ -94,6 +95,12 @@ pub fn build_body(req: &ModelRequest) -> Value {
     map.insert("stream".into(), json!(true));
     // Ask for a trailing usage chunk so token accounting works on the streaming path.
     map.insert("stream_options".into(), json!({ "include_usage": true }));
+    // Prompt-cache affinity: OpenAI routes automatic prefix-cache hits by `prompt_cache_key`, so a
+    // stable per-conversation key keeps a session pinned to a warm cache node. (OpenAI caches prefixes
+    // automatically — there are no explicit breakpoints to set, only this routing hint.)
+    if let Some(key) = &req.cache_key {
+        map.insert("prompt_cache_key".into(), json!(key));
+    }
     map.insert("messages".into(), Value::Array(messages));
     if !req.tools.is_empty() {
         let tools: Vec<Value> = req
@@ -129,20 +136,20 @@ enum Open {
 /// until `finish()` so it lands after the trailing usage chunk.
 pub struct Decoder {
     started: bool,
+    saw_finish: bool,
     open: Open,
     stop_reason: StopReason,
-    input_tokens: u32,
-    output_tokens: u32,
+    usage: TokenUsage,
 }
 
 impl Default for Decoder {
     fn default() -> Self {
         Self {
             started: false,
+            saw_finish: false,
             open: Open::None,
             stop_reason: StopReason::EndTurn,
-            input_tokens: 0,
-            output_tokens: 0,
+            usage: TokenUsage::default(),
         }
     }
 }
@@ -166,18 +173,30 @@ impl StreamDecoder for Decoder {
 
         // Trailing usage-only chunk (choices empty).
         if let Some(usage) = data.get("usage").filter(|u| !u.is_null()) {
-            self.input_tokens = usage
+            let cached = usage
+                .get("prompt_tokens_details")
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32;
+            let prompt = usage
                 .get("prompt_tokens")
                 .and_then(Value::as_u64)
                 .unwrap_or(0) as u32;
-            self.output_tokens = usage
+            // OpenAI's `prompt_tokens` is the *whole* prompt including cached tokens; bill the
+            // uncached remainder as `input_tokens` and report the cache hit separately so accounting
+            // doesn't double-count.
+            self.usage.cache_read_tokens = cached;
+            self.usage.input_tokens = prompt.saturating_sub(cached);
+            self.usage.output_tokens = usage
                 .get("completion_tokens")
                 .and_then(Value::as_u64)
                 .unwrap_or(0) as u32;
-            out.push(StreamEvent::Usage {
-                input_tokens: self.input_tokens,
-                output_tokens: self.output_tokens,
-            });
+            self.usage.reasoning_tokens = usage
+                .get("completion_tokens_details")
+                .and_then(|d| d.get("reasoning_tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32;
+            out.push(StreamEvent::Usage(self.usage));
         }
 
         let Some(choice) = data.get("choices").and_then(|c| c.get(0)) else {
@@ -232,6 +251,7 @@ impl StreamDecoder for Decoder {
 
         // Finish reason closes the open block and records why we stopped (MessageStop is held).
         if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+            self.saw_finish = true;
             self.stop_reason = map_finish_reason(Some(reason));
             self.close_open(&mut out);
         }
@@ -239,14 +259,20 @@ impl StreamDecoder for Decoder {
         out
     }
 
-    fn finish(&mut self) -> Vec<StreamEvent> {
-        if self.started {
-            vec![StreamEvent::MessageStop {
-                stop_reason: self.stop_reason,
-            }]
-        } else {
-            Vec::new()
+    fn finish(&mut self) -> Result<Vec<StreamEvent>> {
+        if !self.started {
+            return Ok(Vec::new());
         }
+        // A started stream that never delivered a `finish_reason` was truncated mid-flight; don't let
+        // the partial turn pass as a clean completion.
+        if !self.saw_finish {
+            return Err(Error::Transport(
+                "OpenAI stream ended before finish_reason".into(),
+            ));
+        }
+        Ok(vec![StreamEvent::MessageStop {
+            stop_reason: self.stop_reason,
+        }])
     }
 }
 
@@ -309,6 +335,14 @@ mod tests {
         assert_eq!(body["stream_options"]["include_usage"], true);
     }
 
+    #[test]
+    fn sets_prompt_cache_key_when_present() {
+        let req = ModelRequest::new("gpt-4o", vec![Message::user("hi")], 64)
+            .with_cache_key("session-abc");
+        let body = build_body(&req);
+        assert_eq!(body["prompt_cache_key"], "session-abc");
+    }
+
     // A recorded text + tool_call streamed response (trailing usage chunk + [DONE]).
     const FIXTURE: &str = r#"
 data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
@@ -353,14 +387,52 @@ data: [DONE]
                     partial_json: "\"SF\"}".into()
                 },
                 StreamEvent::ContentBlockStop,
-                StreamEvent::Usage {
+                StreamEvent::Usage(TokenUsage {
                     input_tokens: 24,
-                    output_tokens: 31
-                },
+                    output_tokens: 31,
+                    ..Default::default()
+                }),
                 StreamEvent::MessageStop {
                     stop_reason: StopReason::ToolUse
                 },
             ]
         );
+    }
+
+    #[test]
+    fn separates_cached_from_uncached_input() {
+        const CACHED: &str = r#"
+data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":900},"completion_tokens_details":{"reasoning_tokens":12}}}
+
+data: [DONE]
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, CACHED).unwrap();
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::Usage(u) => Some(*u),
+                _ => None,
+            })
+            .expect("a usage event");
+        assert_eq!(usage.input_tokens, 100); // 1000 prompt - 900 cached
+        assert_eq!(usage.cache_read_tokens, 900);
+        assert_eq!(usage.output_tokens, 20);
+        assert_eq!(usage.reasoning_tokens, 12);
+    }
+
+    #[test]
+    fn truncated_stream_is_rejected() {
+        // Content but no `finish_reason`.
+        const TRUNCATED: &str = r#"
+data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"partial"},"finish_reason":null}]}
+"#;
+        let mut dec = Decoder::default();
+        let err = decode_sse(&mut dec, TRUNCATED).unwrap_err();
+        assert!(matches!(err, Error::Transport(_)));
     }
 }

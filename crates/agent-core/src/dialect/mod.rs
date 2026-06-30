@@ -66,9 +66,11 @@ pub trait StreamDecoder: Send {
     fn push(&mut self, data: &Value) -> Vec<StreamEvent>;
 
     /// Called once at end-of-stream. Flushes any held terminal event (OpenAI defers `MessageStop`
-    /// until the stream closes so it can land after the trailing usage chunk).
-    fn finish(&mut self) -> Vec<StreamEvent> {
-        Vec::new()
+    /// until the stream closes so it can land after the trailing usage chunk), and is the decoder's
+    /// chance to reject a stream that ended *before* its terminal marker — a truncated stream
+    /// otherwise completes as a clean `EndTurn`/0-usage turn, indistinguishable from success.
+    fn finish(&mut self) -> Result<Vec<StreamEvent>> {
+        Ok(Vec::new())
     }
 }
 
@@ -80,7 +82,7 @@ pub fn decode_sse(decoder: &mut dyn StreamDecoder, raw: &str) -> Result<Vec<Stre
     for line in raw.lines() {
         out.extend(push_sse_line(decoder, line)?);
     }
-    out.extend(decoder.finish());
+    out.extend(decoder.finish()?);
     Ok(out)
 }
 
@@ -99,7 +101,35 @@ pub fn push_sse_line(decoder: &mut dyn StreamDecoder, line: &str) -> Result<Vec<
     }
     let v: Value = serde_json::from_str(payload)
         .map_err(|e| Error::Transport(format!("malformed SSE json: {e}")))?;
+    // A provider can report a failure *in-band* mid-stream — Anthropic as `{"type":"error",…}`
+    // (preceded by an `event: error` line we don't see here), OpenAI as a bare `{"error":{…}}` chunk.
+    // Surface it as a transport error; otherwise it falls through every decoder's catch-all arm and
+    // the turn ends silently as a successful-looking `EndTurn` with no content and no usage.
+    if let Some(msg) = sse_error(&v) {
+        return Err(Error::Transport(format!("provider stream error: {msg}")));
+    }
     Ok(decoder.push(&v))
+}
+
+/// Extract a provider error message from an SSE `data:` payload, if it is one. Handles both the
+/// Anthropic (`{"type":"error","error":{"message":…}}`) and OpenAI (`{"error":{"message":…}}`)
+/// shapes. Returns `None` for ordinary stream events.
+fn sse_error(v: &Value) -> Option<String> {
+    let is_anthropic_error = v.get("type").and_then(Value::as_str) == Some("error");
+    let err = v.get("error")?;
+    if !is_anthropic_error && !err.is_object() {
+        return None;
+    }
+    let msg = err
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| err.as_str())
+        .unwrap_or("unknown provider error");
+    let kind = err.get("type").and_then(Value::as_str);
+    Some(match kind {
+        Some(kind) => format!("{kind}: {msg}"),
+        None => msg.to_string(),
+    })
 }
 
 #[cfg(test)]

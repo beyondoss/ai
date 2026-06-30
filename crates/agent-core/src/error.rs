@@ -24,15 +24,19 @@ pub enum Error {
     /// The model transport failed (network, decode, gateway error).
     #[error("transport error: {0}")]
     Transport(String),
+    /// The run was cancelled (a client `abort`, or the caller dropping its cancellation token). Not a
+    /// failure — the user asked to stop — but distinct from a clean completion so callers can tell.
+    #[error("run cancelled")]
+    Cancelled,
     // Note: an unknown tool is *not* an `Error`. The loop turns it into an error `tool_result`
     // (`is_error: true`) the model can react to next turn, never aborting the run — so there is no
     // fatal `UnknownTool` variant by design.
     /// The loop hit its step ceiling without the model ending its turn.
     #[error("reached max steps ({0}) without completion")]
     MaxSteps(u32),
-    /// A streamed tool call carried malformed JSON arguments.
-    #[error("malformed tool-call arguments: {0}")]
-    MalformedToolInput(String),
+    // Note: a streamed tool call whose arguments never parse as JSON is *not* an `Error`. The loop
+    // keeps the tool_use block and feeds back a malformed-arguments error `tool_result` the model can
+    // correct, never aborting the run — so there is no fatal `MalformedToolInput` variant by design.
 }
 
 /// Crate result alias.

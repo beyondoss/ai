@@ -7,47 +7,76 @@
 use serde_json::{Map, Value, json};
 
 use super::StreamDecoder;
-use crate::message::{StopReason, StreamEvent};
+use crate::error::{Error, Result};
+use crate::message::{StopReason, StreamEvent, TokenUsage};
 use crate::transport::ModelRequest;
 
 /// Build the streaming request body. `system` is hoisted to a top-level field (Anthropic keeps it
 /// out of `messages`); `messages` and `tools` serialize straight from the internal model.
 ///
-/// Two prompt-cache breakpoints are stamped in (see [`mark_cache_breakpoint`]/[`mark_last_tool`]).
-/// An agent loop re-sends an ever-growing prefix — tools, then system, then the whole prior
-/// conversation — on every turn; without caching each turn re-bills that entire prefix at full input
-/// price, an O(n²) token cost over a `max_steps`-deep run. Anthropic caches the request prefix up to
-/// each `cache_control` mark (reads cost ~10% of input tokens), so we anchor one breakpoint on the
-/// fixed tool block and roll a second one onto the last message to capture the conversation so far.
+/// Three prompt-cache breakpoints are stamped in. An agent loop re-sends an ever-growing prefix —
+/// tools, then system, then the whole prior conversation — on every turn; without caching each turn
+/// re-bills that entire prefix at full input price, an O(n²) token cost over a `max_steps`-deep run.
+/// Anthropic caches the request prefix up to each `cache_control` mark (reads cost ~10% of input
+/// tokens), so we anchor one breakpoint on the fixed tool block, one on the system prompt (a stable
+/// anchor that survives Anthropic's ~20-block breakpoint lookback on tool-heavy turns), and roll a
+/// third onto the last message to capture the conversation so far. The TTL is 5 min, or 1 hour when
+/// `cache_long` is set (see [`cache_control`]).
 pub fn build_body(req: &ModelRequest) -> Value {
     let mut map = Map::new();
     map.insert("model".into(), Value::String(req.model.clone()));
     map.insert("max_tokens".into(), Value::from(req.max_tokens));
     map.insert("stream".into(), Value::Bool(true));
 
+    let cc = cache_control(req.cache_long);
+
     // Rolling breakpoint: cache the conversation prefix (tools + system + every prior message) up to
     // the final block, so next turn the whole accumulated transcript is a cache read, not a re-bill.
     let mut messages = serde_json::to_value(req.messages.as_ref()).unwrap_or(Value::Null);
-    mark_cache_breakpoint(&mut messages);
+    mark_last_block(&mut messages, &cc);
     map.insert("messages".into(), messages);
 
     if let Some(system) = &req.system {
-        map.insert("system".into(), Value::String(system.clone()));
+        // System as a single cached text block — a *dedicated* third breakpoint. Anthropic's
+        // breakpoint lookback only walks back ~20 content blocks; on a tool-heavy turn (N tool_use +
+        // N tool_result blocks) the rolling message breakpoint can fall outside that window, so this
+        // stable anchor keeps the (large, fixed) system prompt a cache read.
+        map.insert(
+            "system".into(),
+            json!([{ "type": "text", "text": system, "cache_control": cc }]),
+        );
+    }
+    if let Some(thinking) = &req.thinking {
+        // Extended thinking. Anthropic requires `max_tokens > budget_tokens` and forbids `temperature`
+        // alongside it (we never set temperature), so this is the whole knob.
+        map.insert(
+            "thinking".into(),
+            json!({ "type": "enabled", "budget_tokens": thinking.budget_tokens }),
+        );
     }
     if !req.tools.is_empty() {
         // Anchor breakpoint: the tool definitions (ten JSON schemas) are identical every turn and sit
         // at the front of the cache order, so this entry stays warm even when the rolling message
         // breakpoint is rewritten each turn. Requires stable tool ordering — see `definitions()`.
         let mut tools = serde_json::to_value(req.tools.as_ref()).unwrap_or(Value::Null);
-        mark_last_tool(&mut tools);
+        mark_last_tool(&mut tools, &cc);
         map.insert("tools".into(), tools);
     }
     Value::Object(map)
 }
 
-/// Stamp an ephemeral cache breakpoint onto the last content block of the last message. No-op if the
-/// history is empty or the final message carries no content blocks.
-fn mark_cache_breakpoint(messages: &mut Value) {
+/// The `cache_control` object to stamp on a breakpoint: ephemeral, with the 1-hour TTL when `long`.
+fn cache_control(long: bool) -> Value {
+    if long {
+        json!({ "type": "ephemeral", "ttl": "1h" })
+    } else {
+        json!({ "type": "ephemeral" })
+    }
+}
+
+/// Stamp a cache breakpoint onto the last content block of the last message. No-op if the history is
+/// empty or the final message carries no content blocks.
+fn mark_last_block(messages: &mut Value, cc: &Value) {
     if let Some(block) = messages
         .as_array_mut()
         .and_then(|msgs| msgs.last_mut())
@@ -56,18 +85,18 @@ fn mark_cache_breakpoint(messages: &mut Value) {
         .and_then(|content| content.last_mut())
         .and_then(Value::as_object_mut)
     {
-        block.insert("cache_control".into(), json!({ "type": "ephemeral" }));
+        block.insert("cache_control".into(), cc.clone());
     }
 }
 
-/// Stamp an ephemeral cache breakpoint onto the last tool definition.
-fn mark_last_tool(tools: &mut Value) {
+/// Stamp a cache breakpoint onto the last tool definition.
+fn mark_last_tool(tools: &mut Value, cc: &Value) {
     if let Some(tool) = tools
         .as_array_mut()
         .and_then(|t| t.last_mut())
         .and_then(Value::as_object_mut)
     {
-        tool.insert("cache_control".into(), json!({ "type": "ephemeral" }));
+        tool.insert("cache_control".into(), cc.clone());
     }
 }
 
@@ -77,17 +106,21 @@ fn map_stop_reason(s: Option<&str>) -> StopReason {
         Some("tool_use") => StopReason::ToolUse,
         Some("max_tokens") => StopReason::MaxTokens,
         Some("stop_sequence") => StopReason::StopSequence,
+        Some("refusal") => StopReason::Refusal,
         _ => StopReason::Other,
     }
 }
 
-/// Decodes Anthropic SSE. Tracks token counts (input from `message_start`, output from
-/// `message_delta`) and the stop reason, emitting a single `Usage` + `MessageStop` at `message_stop`.
+/// Decodes Anthropic SSE. Tracks token usage (input + cache reads/writes from `message_start`,
+/// output from `message_delta`) and the stop reason, emitting a single `Usage` + `MessageStop` at
+/// `message_stop`. `saw_start`/`saw_stop` let `finish` reject a stream truncated before its terminal
+/// `message_stop`.
 #[derive(Default)]
 pub struct Decoder {
-    input_tokens: u32,
-    output_tokens: u32,
+    usage: TokenUsage,
     stop_reason: StopReason,
+    saw_start: bool,
+    saw_stop: bool,
 }
 
 impl StreamDecoder for Decoder {
@@ -95,20 +128,31 @@ impl StreamDecoder for Decoder {
         let kind = data.get("type").and_then(Value::as_str).unwrap_or("");
         match kind {
             "message_start" => {
+                self.saw_start = true;
                 let usage = data.get("message").and_then(|m| m.get("usage"));
-                self.input_tokens = u32_at(usage, "input_tokens");
-                self.output_tokens = u32_at(usage, "output_tokens");
+                self.usage.input_tokens = u32_at(usage, "input_tokens");
+                self.usage.output_tokens = u32_at(usage, "output_tokens");
+                // Cache accounting is reported only on `message_start`; capturing it is what makes the
+                // prompt-cache breakpoints we stamp in `build_body` observable.
+                self.usage.cache_read_tokens = u32_at(usage, "cache_read_input_tokens");
+                self.usage.cache_write_tokens = u32_at(usage, "cache_creation_input_tokens");
                 vec![StreamEvent::MessageStart]
             }
             "content_block_start" => {
                 let block = data.get("content_block");
-                if block.and_then(|b| b.get("type")).and_then(Value::as_str) == Some("tool_use") {
-                    let id = str_at(block, "id").to_string();
-                    let name = str_at(block, "name").to_string();
-                    vec![StreamEvent::ToolUseStart { id, name }]
-                } else {
-                    // A text block opening carries no event in our model — text accrues via deltas.
-                    Vec::new()
+                match block.and_then(|b| b.get("type")).and_then(Value::as_str) {
+                    Some("tool_use") => {
+                        let id = str_at(block, "id").to_string();
+                        let name = str_at(block, "name").to_string();
+                        vec![StreamEvent::ToolUseStart { id, name }]
+                    }
+                    // A redacted-thinking block is fully delivered here (no deltas follow): its opaque
+                    // `data` must be replayed verbatim so the model keeps reasoning continuity.
+                    Some("redacted_thinking") => vec![StreamEvent::RedactedThinking {
+                        data: str_at(block, "data").to_string(),
+                    }],
+                    // Text and (clear) thinking blocks open empty and accrue via deltas — no event.
+                    _ => Vec::new(),
                 }
             }
             "content_block_delta" => {
@@ -117,6 +161,16 @@ impl StreamDecoder for Decoder {
                     Some("text_delta") => {
                         vec![StreamEvent::TextDelta {
                             text: str_at(delta, "text").to_string(),
+                        }]
+                    }
+                    Some("thinking_delta") => {
+                        vec![StreamEvent::ThinkingDelta {
+                            text: str_at(delta, "thinking").to_string(),
+                        }]
+                    }
+                    Some("signature_delta") => {
+                        vec![StreamEvent::SignatureDelta {
+                            signature: str_at(delta, "signature").to_string(),
                         }]
                     }
                     Some("input_json_delta") => {
@@ -137,21 +191,33 @@ impl StreamDecoder for Decoder {
                 );
                 let out = u32_at(data.get("usage"), "output_tokens");
                 if out > 0 {
-                    self.output_tokens = out;
+                    self.usage.output_tokens = out;
                 }
                 Vec::new()
             }
-            "message_stop" => vec![
-                StreamEvent::Usage {
-                    input_tokens: self.input_tokens,
-                    output_tokens: self.output_tokens,
-                },
-                StreamEvent::MessageStop {
-                    stop_reason: self.stop_reason,
-                },
-            ],
+            "message_stop" => {
+                self.saw_stop = true;
+                vec![
+                    StreamEvent::Usage(self.usage),
+                    StreamEvent::MessageStop {
+                        stop_reason: self.stop_reason,
+                    },
+                ]
+            }
             _ => Vec::new(),
         }
+    }
+
+    fn finish(&mut self) -> Result<Vec<StreamEvent>> {
+        // A stream that opened (`message_start`) but never delivered `message_stop` was truncated
+        // mid-flight — a dropped connection or a gateway cut. Reject it rather than let the partial
+        // turn pass as a clean completion.
+        if self.saw_start && !self.saw_stop {
+            return Err(Error::Transport(
+                "Anthropic stream ended before message_stop".into(),
+            ));
+        }
+        Ok(Vec::new())
     }
 }
 
@@ -186,7 +252,10 @@ mod tests {
         let body = build_body(&req);
         assert_eq!(body["model"], "claude-opus-4-8");
         assert_eq!(body["stream"], true);
-        assert_eq!(body["system"], "be brief");
+        // System is a cached text-block array (a dedicated breakpoint), not a bare string.
+        assert_eq!(body["system"][0]["type"], "text");
+        assert_eq!(body["system"][0]["text"], "be brief");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"][0]["type"], "text");
         assert_eq!(body["tools"][0]["name"], "read");
@@ -197,7 +266,10 @@ mod tests {
     fn build_body_stamps_cache_breakpoints() {
         let req = ModelRequest::new(
             "claude-opus-4-8",
-            vec![Message::user("hi"), Message::tool_result("tu_1", "out", false)],
+            vec![
+                Message::user("hi"),
+                Message::tool_result("tu_1", "out", false),
+            ],
             256,
         )
         .with_tools(vec![
@@ -217,11 +289,35 @@ mod tests {
         assert!(body["tools"][0].get("cache_control").is_none());
         assert_eq!(body["tools"][1]["cache_control"]["type"], "ephemeral");
         // Rolling breakpoint on the last block of the last message, and nowhere earlier.
-        assert!(body["messages"][0]["content"][0].get("cache_control").is_none());
+        assert!(
+            body["messages"][0]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
         assert_eq!(
             body["messages"][1]["content"][0]["cache_control"]["type"],
             "ephemeral"
         );
+    }
+
+    #[test]
+    fn image_block_serializes_to_anthropic_source_shape() {
+        use crate::message::ImageSource;
+        let req = ModelRequest::new(
+            "claude-opus-4-8",
+            vec![Message::user_with_images(
+                "what is this?",
+                vec![ImageSource::base64("image/png", "AAAA")],
+            )],
+            256,
+        );
+        let body = build_body(&req);
+        let content = &body["messages"][0]["content"];
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["type"], "base64");
+        assert_eq!(content[1]["source"]["media_type"], "image/png");
+        assert_eq!(content[1]["source"]["data"], "AAAA");
     }
 
     #[test]
@@ -302,14 +398,203 @@ data: {"type":"message_stop"}
                     partial_json: "\"SF\"}".into()
                 },
                 StreamEvent::ContentBlockStop,
-                StreamEvent::Usage {
+                StreamEvent::Usage(TokenUsage {
                     input_tokens: 24,
-                    output_tokens: 31
-                },
+                    output_tokens: 31,
+                    ..Default::default()
+                }),
                 StreamEvent::MessageStop {
                     stop_reason: StopReason::ToolUse
                 },
             ]
         );
+    }
+
+    #[test]
+    fn captures_cache_usage_from_message_start() {
+        const CACHED: &str = r#"
+event: message_start
+data: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":12,"cache_read_input_tokens":900,"cache_creation_input_tokens":40,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}
+
+event: message_stop
+data: {"type":"message_stop"}
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, CACHED).unwrap();
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::Usage(u) => Some(*u),
+                _ => None,
+            })
+            .expect("a usage event");
+        assert_eq!(usage.input_tokens, 12);
+        assert_eq!(usage.output_tokens, 7);
+        assert_eq!(usage.cache_read_tokens, 900);
+        assert_eq!(usage.cache_write_tokens, 40);
+    }
+
+    #[test]
+    fn long_retention_sets_1h_ttl_on_breakpoints() {
+        let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 256)
+            .with_system("sys")
+            .with_tools(vec![ToolDef {
+                name: "read".into(),
+                description: "d".into(),
+                input_schema: json!({ "type": "object" }),
+            }])
+            .with_cache_long(true);
+        let body = build_body(&req);
+        assert_eq!(body["system"][0]["cache_control"]["ttl"], "1h");
+        assert_eq!(body["tools"][0]["cache_control"]["ttl"], "1h");
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"]["ttl"],
+            "1h"
+        );
+    }
+
+    #[test]
+    fn build_body_emits_thinking_config() {
+        let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 8192)
+            .with_thinking(4096);
+        let body = build_body(&req);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 4096);
+    }
+
+    #[test]
+    fn thinking_block_round_trips_into_body_for_replay() {
+        // A prior assistant turn with a signed thinking block must replay verbatim — Anthropic rejects
+        // a tool turn whose thinking block is missing or unsigned.
+        let req = ModelRequest::new(
+            "claude-opus-4-8",
+            vec![
+                Message::user("think then answer"),
+                Message::assistant(vec![
+                    ContentBlock::Thinking {
+                        text: "let me reason".into(),
+                        signature: "sig-abc".into(),
+                    },
+                    ContentBlock::Text {
+                        text: "answer".into(),
+                    },
+                ]),
+                Message::user("again"),
+            ],
+            8192,
+        );
+        let body = build_body(&req);
+        let block = &body["messages"][1]["content"][0];
+        assert_eq!(block["type"], "thinking");
+        assert_eq!(block["thinking"], "let me reason");
+        assert_eq!(block["signature"], "sig-abc");
+    }
+
+    #[test]
+    fn decodes_thinking_then_text_stream() {
+        const THINKING: &str = r#"
+event: message_start
+data: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":5,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"step one"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"SIG"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"answer"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9}}
+
+event: message_stop
+data: {"type":"message_stop"}
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, THINKING).unwrap();
+        assert!(events.contains(&StreamEvent::ThinkingDelta {
+            text: "step one".into()
+        }));
+        assert!(events.contains(&StreamEvent::SignatureDelta {
+            signature: "SIG".into()
+        }));
+    }
+
+    #[test]
+    fn refusal_stop_reason_is_distinct() {
+        const REFUSED: &str = r#"
+event: message_start
+data: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":5,"output_tokens":1}}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":2}}
+
+event: message_stop
+data: {"type":"message_stop"}
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, REFUSED).unwrap();
+        assert!(events.contains(&StreamEvent::MessageStop {
+            stop_reason: StopReason::Refusal
+        }));
+    }
+
+    #[test]
+    fn truncated_stream_is_rejected() {
+        // Opens but never delivers `message_stop`.
+        const TRUNCATED: &str = r#"
+event: message_start
+data: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":5,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+"#;
+        let mut dec = Decoder::default();
+        let err = decode_sse(&mut dec, TRUNCATED).unwrap_err();
+        assert!(matches!(err, Error::Transport(_)));
+    }
+
+    #[test]
+    fn mid_stream_error_event_surfaces() {
+        const ERRORED: &str = r#"
+event: message_start
+data: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":5,"output_tokens":1}}}
+
+event: error
+data: {"type":"error","error":{"type":"overloaded_error","message":"server overloaded"}}
+"#;
+        let mut dec = Decoder::default();
+        let err = decode_sse(&mut dec, ERRORED).unwrap_err();
+        match err {
+            Error::Transport(msg) => {
+                assert!(msg.contains("overloaded"), "got: {msg}");
+            }
+            other => panic!("expected transport error, got {other:?}"),
+        }
     }
 }

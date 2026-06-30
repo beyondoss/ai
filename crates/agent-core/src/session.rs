@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::message::Message;
+use crate::message::{Message, TokenUsage};
 
 /// The state of one agent run.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -26,10 +26,25 @@ pub struct Session {
     pub messages: Arc<Vec<Message>>,
     /// Completed loop iterations (model turn + tool dispatch).
     pub steps: u32,
-    /// Cumulative input tokens reported by the model.
+    /// Cumulative uncached input tokens reported by the model.
     pub input_tokens: u64,
     /// Cumulative output tokens reported by the model.
     pub output_tokens: u64,
+    /// Cumulative input tokens served from the prompt cache. The signal that the cache breakpoints
+    /// the Anthropic dialect stamps are actually hitting.
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    /// Cumulative input tokens written to the prompt cache.
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+    /// Cumulative reasoning/thinking tokens billed separately by the provider.
+    #[serde(default)]
+    pub reasoning_tokens: u64,
+    /// Input tokens of the most recent turn (cached + uncached) — the live context size, which the
+    /// cumulative totals above cannot express. The compaction trigger reads this against the model's
+    /// context window.
+    #[serde(default)]
+    pub last_input_tokens: u32,
 }
 
 /// Serialize the shared history as a plain `[Message]` array — the `Arc`/`Vec` wrapper is an
@@ -68,10 +83,18 @@ impl Session {
         self
     }
 
-    /// Fold a turn's token usage into the running totals.
-    pub fn record_usage(&mut self, input_tokens: u32, output_tokens: u32) {
-        self.input_tokens += u64::from(input_tokens);
-        self.output_tokens += u64::from(output_tokens);
+    /// Fold a turn's token usage into the running totals and record the live context size.
+    pub fn record_usage(&mut self, usage: TokenUsage) {
+        self.input_tokens += u64::from(usage.input_tokens);
+        self.output_tokens += u64::from(usage.output_tokens);
+        self.cache_read_tokens += u64::from(usage.cache_read_tokens);
+        self.cache_write_tokens += u64::from(usage.cache_write_tokens);
+        self.reasoning_tokens += u64::from(usage.reasoning_tokens);
+        // The whole prompt the model just saw = uncached input + everything served from / written to
+        // cache. This is the current context size (the cumulative sums above can't express it) and is
+        // what the compaction trigger compares against the model's context window.
+        self.last_input_tokens =
+            usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens;
     }
 }
 
@@ -84,13 +107,29 @@ mod tests {
         let mut s = Session::new();
         s.user("hello");
         s.steps = 2;
-        s.record_usage(10, 5);
-        s.record_usage(3, 7);
+        s.record_usage(TokenUsage {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_tokens: 100,
+            cache_write_tokens: 20,
+            reasoning_tokens: 4,
+        });
+        s.record_usage(TokenUsage {
+            input_tokens: 3,
+            output_tokens: 7,
+            cache_read_tokens: 200,
+            ..Default::default()
+        });
         let json = serde_json::to_string(&s).unwrap();
         let back: Session = serde_json::from_str(&json).unwrap();
         assert_eq!(back.messages.len(), 1);
         assert_eq!(back.steps, 2);
         assert_eq!(back.input_tokens, 13);
         assert_eq!(back.output_tokens, 12);
+        assert_eq!(back.cache_read_tokens, 300);
+        assert_eq!(back.cache_write_tokens, 20);
+        assert_eq!(back.reasoning_tokens, 4);
+        // Live context size = last turn's input + cache read + cache write (3 + 200 + 0).
+        assert_eq!(back.last_input_tokens, 203);
     }
 }

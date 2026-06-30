@@ -25,6 +25,8 @@ use clap::{Parser, Subcommand};
 const DEFAULT_MODEL: &str = "claude-opus-4-8";
 /// Default gateway base URL.
 const DEFAULT_GATEWAY: &str = "http://ai.internal";
+/// Default context window (tokens) the loop compacts against. Sized for a 200k-context Claude model.
+const DEFAULT_CONTEXT_WINDOW: u32 = 200_000;
 
 const SYSTEM_PROMPT: &str = "You are the Beyond coding agent. You operate inside a real working \
 directory with tools: read, write, edit, bash, ls, grep, find. Use them to accomplish the user's \
@@ -67,12 +69,33 @@ enum Command {
         /// Virtual key (`bai_v1…`) or BYO provider key. Required; or set `AI_AGENT_KEY`.
         #[arg(long, env = "AI_AGENT_KEY")]
         key: Option<String>,
-        /// Persist/restore session state here so a later `serve` reattaches with the transcript.
+        /// Persist one session to this JSONL file so a later `serve` reattaches with the transcript.
         #[arg(long, env = "AI_AGENT_SESSION_FILE")]
         session_file: Option<String>,
+        /// Persist many sessions under this directory (enables list/switch/fork/name commands).
+        #[arg(long, env = "AI_AGENT_SESSION_DIR")]
+        session_dir: Option<String>,
         /// Max loop iterations per prompt before bailing.
         #[arg(long, default_value_t = 24)]
         max_steps: u32,
+        /// Replace the built-in base system prompt entirely.
+        #[arg(long, env = "AI_AGENT_SYSTEM_PROMPT")]
+        system_prompt: Option<String>,
+        /// Append extra instructions after the base system prompt.
+        #[arg(long, env = "AI_AGENT_APPEND_SYSTEM_PROMPT")]
+        append_system_prompt: Option<String>,
+        /// Do not discover/inject AGENTS.md / CLAUDE.md project-instruction files.
+        #[arg(long, default_value_t = false)]
+        no_context_files: bool,
+        /// Model context window (tokens); the loop summarizes older turns to stay below it.
+        #[arg(long, env = "AI_AGENT_CONTEXT_WINDOW", default_value_t = DEFAULT_CONTEXT_WINDOW)]
+        context_window: u32,
+        /// Use the 1-hour prompt-cache TTL (vs 5 minutes); helps when turns are spaced out.
+        #[arg(long, default_value_t = false)]
+        cache_long: bool,
+        /// Enable extended thinking with this token budget (must be below the per-turn max tokens).
+        #[arg(long)]
+        thinking: Option<u32>,
     },
     /// List the tools the agent advertises to the model.
     Tools,
@@ -99,7 +122,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             gateway_url,
             key,
             session_file,
+            session_dir,
             max_steps,
+            system_prompt,
+            append_system_prompt,
+            no_context_files,
+            context_window,
+            cache_long,
+            thinking,
         } => {
             let key = key
                 .ok_or("no gateway key: pass --key or set AI_AGENT_KEY (a bai_v1… virtual key)")?;
@@ -108,8 +138,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 key,
                 model: model.unwrap_or_else(|| DEFAULT_MODEL.to_string()),
                 max_steps,
-                system: SYSTEM_PROMPT.to_string(),
+                system: system_prompt.unwrap_or_else(|| SYSTEM_PROMPT.to_string()),
+                append_system: append_system_prompt,
+                context_files: !no_context_files,
                 session_file,
+                session_dir,
+                context_window,
+                cache_long,
+                thinking,
             })
             .await?;
         }
@@ -134,10 +170,21 @@ async fn run_task(
     let key =
         key.ok_or("no gateway key: pass --key or set AI_AGENT_KEY (a bai_v1… virtual key)")?;
 
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let system = beyond_ai_agent::resources::build_system_prompt(
+        &beyond_ai_agent::resources::PromptOptions {
+            base: SYSTEM_PROMPT,
+            append: None,
+            cwd: &cwd,
+            include_context_files: true,
+            include_skills: true,
+        },
+    );
+
     let client = GatewayClient::new(gateway, key)?;
     let agent = Agent::new(Arc::new(client), model)
         .with_tools(tools::default_registry())
-        .with_system(SYSTEM_PROMPT)
+        .with_system(system)
         .with_max_steps(max_steps);
 
     let mut session = Session::new();

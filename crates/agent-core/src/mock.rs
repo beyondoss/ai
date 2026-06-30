@@ -32,12 +32,18 @@ impl MockTransport {
     pub fn requests(&self) -> Vec<ModelRequest> {
         // Recover the data on a poisoned lock (a panicked test thread) rather than silently
         // returning an empty vec, which would mask the real failure behind a confusing assertion.
-        self.requests.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// How many turns the loop has consumed.
     pub fn calls(&self) -> usize {
-        self.requests.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 }
 

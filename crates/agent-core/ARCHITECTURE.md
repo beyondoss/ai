@@ -8,6 +8,30 @@ executor — its only network dependency is a `ModelTransport` trait it never im
 production except via the included `GatewayClient`, an HTTP client that speaks OpenAI/Anthropic wire to
 a Beyond gateway base URL.
 
+## Capabilities at a glance
+
+The loop has grown well past a single-shot tool-caller; these are the load-bearing seams (each has a
+builder on `Agent` and is exercised by unit tests):
+
+- **Cancellation** — `run_events_cancellable(.., cancel)` races the model stream and the tool-dispatch
+  phase against a `CancellationToken`; a trip returns `Error::Cancelled`, drops the stream (reqwest
+  aborts the request), and drops in-flight tool futures (a `bash` subprocess dies via `kill_on_drop`).
+- **Steering** — `run_events_steered(.., steering)` drains a `Steering` queue at each would-stop
+  boundary and injects the messages as new user turns, so a client can extend/redirect a live run.
+- **Hooks** — `AgentHooks` (`with_hooks`) gates (`before_tool_call` → block reason) and rewrites
+  (`after_tool_call`) tool calls; the permission/redaction seam. Defaults to `NoHooks`.
+- **Compaction** — when the live prompt crosses `context_window − reserve` (or the provider rejects an
+  overflow), [`compaction`](src/compaction.rs) summarizes the prefix via one model call and splices a
+  summary in, keeping recent turns verbatim (`Agent::compact`, auto-trigger, compact-and-retry).
+- **Thinking** — `ContentBlock::Thinking`/`RedactedThinking` + `ThinkingDelta`/`SignatureDelta` stream
+  events; signatures replay verbatim (Anthropic requires it with tools). `with_thinking(budget)`.
+- **Transport resilience** — `GatewayClient` retries transient failures (429/5xx/connection, honoring
+  `Retry-After`) up to the first byte; a mid-stream `event: error` or truncated stream surfaces as
+  `Error::Transport` (the SSE decoder's `finish` returns `Result`).
+- **Cache observability** — `StreamEvent::Usage` carries `TokenUsage` (input/output + cache-read/write
+  + reasoning); both decoders populate it, and `Session` folds the cumulative totals + `last_input_tokens`.
+- **Lifecycle events** — `AgentEvent` adds `AgentStart`/`TurnStart`/`Steered`/`AgentEnd`/`Compacted`/`Error`.
+
 ## What this crate is not
 
 It ships **zero concrete `Tool` implementations** — `Read`/`Write`/`Edit`/`Bash`/`fork`/`sync`/`logs`
@@ -44,9 +68,14 @@ Session.messages (Arc, shared) ──► ModelRequest ──► ModelTransport::
                                                           (loop back to ModelRequest)
 
 Error exits (no session mutation for the failed turn):
+  cancel tripped              ──► Err(Cancelled)                [user abort; mid-stream or mid-tool]
   session.steps >= max_steps  ──► Err(MaxSteps)                [checked before the request is built]
-  stream() / stream item Err  ──► Err(Transport(..))            [network, non-2xx, bad UTF-8, bad SSE json]
-  bad_tool_args present       ──► Err(MalformedToolInput(..))   [Accumulator::finish, after stream ends]
+  stream() / stream item Err  ──► Err(Transport(..))            [network/non-2xx (after retries), bad UTF-8/SSE,
+                                                                 mid-stream `event: error`, truncated stream]
+
+Recoverable (no error): a streamed tool call whose JSON args never parse keeps its `tool_use` block
+(with an empty `{}` input) and is fed back as an error `tool_result` the model can correct — the run
+continues rather than aborting.
 ```
 
 ### Bytes to `StreamEvent` (`GatewayClient` + `dialect`)
@@ -77,12 +106,13 @@ dialect-blind.
 | `Dialect`         | Which wire shape (`/v1/messages` vs `/v1/chat/completions`) a model id maps to    | Not which *provider* serves the request — that's gateway routing on the virtual key |
 | `ModelTransport`  | The loop's only network seam; turns a `ModelRequest` into an `EventStream`        | Not the gateway client specifically — `MockTransport` is the other implementor |
 | `Session`         | One run's message history + step/token counters, Arc-shared, serde round-trips   | Not multi-session storage — one `Session` is one conversation |
-| `ToolRegistry`    | Name → `Arc<dyn Tool>` lookup the loop dispatches against                          | Not a sandbox or permission system — any registered tool runs unconditionally on a model-supplied name match |
+| `ToolRegistry`    | Name → `Arc<dyn Tool>` lookup the loop dispatches against                          | Not a permission system itself — gating is the `AgentHooks::before_tool_call` seam |
+| `AgentHooks`      | Interception around each tool call: `before_tool_call` (block) / `after_tool_call` (rewrite) | Not a sandbox — it decides per call; defaults to `NoHooks` |
 | `ToolError`       | A tool's own failure → an error `tool_result` fed back to the model                | Not a loop-aborting error — the run continues             |
-| `Error`           | A loop/transport failure → `run`/`run_events` returns `Err`, the in-flight turn is discarded | Not surfaced to the model — there's no turn to attach it to |
-| `StreamEvent`      | The normalized unit both dialect decoders emit; what `Accumulator` folds          | Not the wire format — it's the post-translation internal shape |
-| `ContentBlock`     | One piece of a `Message` (`Text` / `ToolUse` / `ToolResult`)                       | Not a streaming unit — it's the assembled, turn-final form  |
-| `AgentEvent`       | The full observation surface (`Stream`/`ToolStart`/`ToolEnd`/`TurnEnd`)            | Not exposed by `Agent::run` — that filters to `Stream` only |
+| `Error`           | A loop/transport failure → `run`/`run_events` returns `Err`, the in-flight turn is discarded | `Cancelled` is a user abort, not a fault; malformed tool args are recoverable, not an error |
+| `StreamEvent`      | The normalized unit both dialect decoders emit; what `Accumulator` folds (text/thinking/tool/usage) | Not the wire format — it's the post-translation internal shape |
+| `ContentBlock`     | One piece of a `Message` (`Text`/`Thinking`/`RedactedThinking`/`ToolUse`/`ToolResult`/`Image`) | Not a streaming unit — it's the assembled, turn-final form  |
+| `AgentEvent`       | The full observation surface (`AgentStart`/`TurnStart`/`Stream`/`ToolStart`/`ToolEnd`/`TurnEnd`/`Steered`/`Compacted`/`AgentEnd`/`Error`) | Not exposed by `Agent::run` — that filters to `Stream` only |
 | `max_steps`        | Loop-iteration ceiling; one step = one model turn (tool dispatch doesn't increment it again) | Not a token or wall-clock budget                |
 
 ## Core Mechanism
@@ -92,11 +122,12 @@ dialect-blind.
 `Accumulator` folds a `StreamEvent` sequence into `Vec<ContentBlock>` + stop reason + token counts:
 text deltas accrue into a `String` buffer; a `ToolUseStart` flushes any open text run and opens a
 `(id, name, json-buffer)` tuple; `InputJsonDelta` fragments append to that buffer; `ContentBlockStop`
-finalizes whichever is open (parsing the buffered JSON, or `{}` if it was empty). If the buffered tool
-arguments never parse as JSON, the *first* failure is held in `bad_tool_args` rather than raised
-immediately — `Accumulator::finish()` (called once the stream ends) fails the whole turn with
-`Error::MalformedToolInput` instead of handing the tool a `null`-input call it can only report as an
-opaque "missing field" error. See `agent.rs:296-335`.
+finalizes whichever is open (parsing the buffered JSON, or `{}` if it was empty). A thinking block
+accrues `(text, signature)` from `ThinkingDelta`/`SignatureDelta` and flushes to a `Thinking` block.
+If the buffered tool arguments never parse as JSON, the tool call is recorded in `Turn::malformed`
+and its `ToolUse` block keeps a wire-valid empty `{}` input; the loop then feeds an error
+`tool_result` ("arguments were not valid JSON") back to the model so it can correct, rather than
+aborting the run.
 
 Edge case: `stop_reason` defaults to `StopReason::EndTurn` and usage defaults to `0`/`0` if the stream
 never delivers a `MessageStop`/`Usage` event before closing cleanly (e.g. a non-conformant upstream) —
@@ -160,11 +191,11 @@ socket that splits a write inside a 4-byte emoji (`tests/client_socket.rs`).
   [check steps]──steps≥max_steps──► Err(MaxSteps)                            │
         │ steps<max_steps                                                    │
         ▼                                                                    │
-  [request built] ──stream()/stream item Err──► Err(Transport)               │
+  [request built] ──stream()/stream item Err──► Err(Transport) (after retries) │
         │ stream exhausts cleanly                                            │
         ▼                                                                    │
-  [turn assembled] ──bad_tool_args──► Err(MalformedToolInput)                │
-        │ ok                                                                 │
+  [turn assembled] (malformed tool args → recoverable error result, not fatal) │
+        │                                                                    │
         ▼                                                                    │
   [pushed to session, steps+=1, TurnEnd sunk]                                │
         │                                                                    │
@@ -178,9 +209,9 @@ socket that splits a write inside a 4-byte emoji (`tests/client_socket.rs`).
 | ---------------- | ----------------------------------- | ---------------------- | ----------------------- | -------------------------------------------------------------------- |
 | (loop top)       | iteration begins                    | Err(MaxSteps)          | `steps >= max_steps`    | No request sent; session unchanged                                  |
 | (loop top)       | iteration begins                    | request built          | `steps < max_steps`     | `ModelRequest` cloned (Arc pointers) from session + cached tool defs |
-| request built    | `transport.stream()` / stream item  | Err(Transport)         | network/HTTP/decode err | Turn discarded; nothing pushed; error returned from `run`/`run_events` |
-| request built    | stream exhausts                     | turn assembled         | `bad_tool_args.is_none()` | `Accumulator::finish()` returns `Turn`                              |
-| request built    | stream exhausts                     | Err(MalformedToolInput) | `bad_tool_args.is_some()` | Turn discarded; assistant message never pushed                      |
+| request built    | `transport.stream()` / stream item  | Err(Transport)         | network/HTTP/decode err (after retries), mid-stream `event: error`, truncated stream | Turn discarded; an `Error` event is sunk; error returned from `run`/`run_events` |
+| request built    | stream exhausts                     | turn assembled         | always                  | `Accumulator::finish()` returns `Turn`; malformed tool args become recoverable error `tool_result`s |
+| any await point  | `cancel` tripped                    | Err(Cancelled)         | client abort            | Stream/tool futures dropped (HTTP + subprocess killed); no `Error` event (not a fault) |
 | turn assembled   | —                                    | turn pushed            | —                        | `session.push(assistant)`, `record_usage`, `steps += 1`, `TurnEnd` sunk |
 | turn pushed      | no tool_use blocks / `stop_reason != ToolUse` | done (`Ok`)    | —                        | Returns to caller; session ends on the assistant turn                |
 | turn pushed      | `tool_use` blocks present, `ToolUse` | dispatching tools      | —                        | `ToolStart` sunk per call, in call order                            |
@@ -196,7 +227,8 @@ socket that splits a write inside a 4-byte emoji (`tests/client_socket.rs`).
 | none open   | `ToolUseStart`        | tool open   | Opens `(id, name, "")`                                    |
 | tool open   | `InputJsonDelta`      | tool open   | Appends to the JSON argument buffer                        |
 | text open   | `ContentBlockStop`    | none open   | Flushes text block                                          |
-| tool open   | `ContentBlockStop`    | none open   | Parses the JSON buffer; on parse failure, records `bad_tool_args` (first only) and pushes `ToolUse` with `Value::Null` input — but the turn still fails in `finish()` |
+| tool open   | `ContentBlockStop`    | none open   | Parses the JSON buffer; on parse failure, records the call in `Turn::malformed` and pushes `ToolUse` with a wire-valid empty `{}` input (the loop then feeds back a recoverable error result) |
+| thinking open | `ContentBlockStop`  | none open   | Flushes a `Thinking { text, signature }` block (from `ThinkingDelta`/`SignatureDelta`) |
 
 ## Why It Behaves This Way
 
@@ -246,30 +278,34 @@ be at least its upstream's, so `READ_TIMEOUT` mirrors the gateway's `read_timeou
 applied between reads (not as a `Client::timeout` over the whole response) so a long-but-healthy stream
 is never killed mid-flight.
 
-### Why the Anthropic body stamps two prompt-cache breakpoints
+### Why the Anthropic body stamps three prompt-cache breakpoints
 
 An agent loop re-sends an ever-growing prefix every turn — tools, then system, then the entire prior
 conversation — in request order. Without prompt caching each turn re-bills that whole prefix at full
 input-token price: an O(n²) token cost over a `max_steps`-deep run, on the very history this crate
 already keeps O(1) *in memory* via `Arc`/COW (the wire cost was the half left unoptimized).
-`anthropic::build_body` marks `cache_control: {"type":"ephemeral"}` at two points (Anthropic caches the
-request prefix up to each mark; cache reads cost ~10% of input tokens):
+`anthropic::build_body` marks `cache_control` (ephemeral; `ttl: "1h"` when `cache_long`) at three points
+(Anthropic caches the request prefix up to each mark; cache reads cost ~10% of input tokens):
 
-- an **anchor** on the last tool definition — the ten JSON schemas are byte-identical every turn and sit
+- an **anchor** on the last tool definition — the JSON schemas are byte-identical every turn and sit
   first in the cache order, so this entry stays warm independently of the rolling one;
+- a **system** breakpoint on the (array-wrapped) system prompt — a stable anchor that survives
+  Anthropic's ~20-block breakpoint lookback on tool-heavy turns, when the rolling mark falls outside it;
 - a **rolling** breakpoint on the last message block — caches `tools + system + conversation-so-far`, so
   next turn the whole accumulated transcript is a cache read instead of a re-bill.
 
 Cache hits require a byte-identical prefix, so `ToolRegistry::definitions()` sorts by name (`tool.rs`):
 `HashMap` iteration order would otherwise cold-miss the anchor after every process restart / `serve`
-reattach. The OpenAI dialect needs no breakpoints — its provider caches prefixes automatically.
+reattach. The decoder reads `cache_read_input_tokens`/`cache_creation_input_tokens` back into
+`TokenUsage`, so hits are observable. The OpenAI dialect needs no breakpoints — its provider caches
+prefixes automatically — but sets `prompt_cache_key` (from `cache_key`) for cache-node affinity.
 
-### Why malformed streamed tool arguments fail the turn instead of dispatching with null
+### Why malformed streamed tool arguments are recoverable, not fatal
 
-Handing a tool `Value::Null` input lets it fail, but only with an opaque "missing field" error that
-hides the real problem (a transport/decode bug, not a model mistake). Treating it as a protocol failure
-— `Error::MalformedToolInput` — fails the turn before any tool runs and surfaces the actual offending
-buffer to the caller.
+A streamed tool call whose JSON args never parse is a protocol glitch, not a model mistake the model
+can't recover from. Rather than abort the run, the loop keeps the `tool_use` block (with a wire-valid
+empty `{}` input so the next request doesn't 400) and feeds back an error `tool_result` naming the
+problem, which the model corrects on the next turn — the same shape as any other recoverable tool error.
 
 ### Why dialect selection is a model-id prefix check, not configuration
 
@@ -287,7 +323,10 @@ selection mechanism — adding a model never requires touching the gateway.
   `Error::Transport`, never silently treated as a successful empty stream.
 - UTF-8 validity of each framed SSE line (`Error::Transport("invalid UTF-8 in SSE stream")`).
 - JSON well-formedness of each SSE `data:` payload (`Error::Transport("malformed SSE json")`).
-- JSON well-formedness of a streamed tool call's assembled arguments (`Error::MalformedToolInput`).
+- JSON well-formedness of a streamed tool call's assembled arguments — a parse failure is *not* fatal;
+  it becomes a recoverable error `tool_result` (`Turn::malformed`).
+- in-band provider errors (`event: error`) and streams truncated before their terminal marker
+  (`Error::Transport`).
 
 **What passes through unchecked:**
 
@@ -318,13 +357,16 @@ selection mechanism — adding a model never requires touching the gateway.
 | File                          | What It Does                                                                                                   |
 | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
 | `lib.rs`                       | Crate root: module list, public re-exports, and the crate-wide `#![cfg_attr(test, allow(...))]` panic-free gate |
-| `agent.rs`                     | `Agent` config + `run`/`run_events` loop, `Accumulator` (StreamEvent → ContentBlock), concurrent tool dispatch  |
-| `message.rs`                   | `Role`/`ContentBlock`/`Message`/`ToolDef`/`StopReason`/`StreamEvent` — the dialect-agnostic internal model       |
+| `agent.rs`                     | `Agent` config + `run`/`run_events`/`run_events_cancellable`/`run_events_steered` loop, `Accumulator`, concurrent tool dispatch, hooks, auto-compaction + overflow retry |
+| `message.rs`                   | `Role`/`ContentBlock`(+ `Thinking`/`RedactedThinking`/`Image`)/`Message`/`ToolDef`/`StopReason`/`StreamEvent`/`TokenUsage` — the internal model |
+| `compaction.rs`                | Context compaction: trigger, cut-point search, summary-prompt build, file-op extraction (the network-free half of `Agent::compact`) |
+| `hooks.rs`                     | `AgentHooks` interception trait (`before_tool_call`/`after_tool_call`) + `NoHooks` default                       |
+| `steering.rs`                  | `Steering` — a shared queue of follow-up messages injected at would-stop boundaries                             |
 | `tool.rs`                      | `Tool` trait + `ToolRegistry` (name-keyed `Arc<dyn Tool>` map, last-registration-wins)                          |
-| `transport.rs`                 | `ModelRequest`, `ModelTransport` trait, `EventStream` alias — the loop's sole network-facing dependency          |
-| `client.rs`                    | `GatewayClient`: the production `ModelTransport`; HTTP POST + chunked-SSE byte framing into whole UTF-8 lines    |
+| `transport.rs`                 | `ModelRequest` (system/tools/thinking/cache_key/cache_long), `ModelTransport` trait, `EventStream` alias         |
+| `client.rs`                    | `GatewayClient`: production `ModelTransport`; retry-with-backoff, chunked-SSE byte framing into whole UTF-8 lines |
 | `dialect/mod.rs`                | `Dialect` enum (model-id → wire selection), `StreamDecoder` trait, SSE line-splitting (`push_sse_line`/`decode_sse`) |
-| `dialect/anthropic.rs`         | `/v1/messages` body builder (+ two prompt-cache breakpoints) + decoder — near-identity, since the internal model is Anthropic-shaped |
+| `dialect/anthropic.rs`         | `/v1/messages` body builder (+ three prompt-cache breakpoints, thinking config) + decoder (text/thinking/tool/cache-usage; in-band error + truncation detection) |
 | `dialect/openai.rs`            | `/v1/chat/completions` body builder + decoder — real translation: flattened messages, string-encoded tool args, synthesized block-stop events |
 | `session.rs`                   | `Session`: Arc-shared copy-on-write message history + step/token counters, serde round-trippable                |
 | `error.rs`                     | `Error` (loop/transport, aborts the run) and `ToolError` (tool failure, becomes an error `tool_result`)         |
@@ -351,7 +393,7 @@ selection mechanism — adding a model never requires touching the gateway.
 | SSE chunk splits a multi-byte UTF-8 char                  | Raw bytes buffered across chunks; decoding waits for the newline, so the split is invisible                            | Transparent — no error (regression-tested over a real socket)            |
 | SSE-framed line isn't valid UTF-8                          | `Error::Transport("invalid UTF-8 in SSE stream: …")` from inside the event stream                                      | Stream item `Err`; in-progress turn discarded, error returned             |
 | SSE `data:` payload isn't valid JSON                        | `Error::Transport("malformed SSE json: …")`                                                                              | Same as above                                                              |
-| Streamed tool-call JSON never completes/parses              | `Accumulator::finish()` returns `Error::MalformedToolInput(raw_buffer)` instead of dispatching with `null` input        | Turn discarded before any tool runs; assistant message never pushed       |
+| Streamed tool-call JSON never completes/parses              | The `tool_use` block keeps an empty `{}` input; the loop feeds back an error `tool_result` naming the bad buffer | Run continues; model corrects on the next turn (recoverable, not fatal)   |
 | Model calls an unregistered tool name                      | That call's result becomes `("unknown tool: {name}", is_error: true)`                                                   | Not fatal — fed back as an error `tool_result` the model sees next turn   |
 | A registered tool's `run()` returns `Err`                  | The error's `Display` text becomes `ToolResult.content` with `is_error: true`                                          | Not fatal — same as above                                                  |
 | Stream ends cleanly without a `MessageStop`/`Usage` event   | `stop_reason` defaults to `EndTurn`, token counts default to `0` — the turn looks like a normal completion             | Silent — no error surfaced; usage accounting is simply incomplete for that turn |

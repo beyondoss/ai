@@ -43,7 +43,10 @@ impl Tool for Edit {
     }
 
     fn write_target(&self, input: &Value) -> Option<String> {
-        input.get("path").and_then(Value::as_str).map(str::to_string)
+        input
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::to_string)
     }
 
     async fn run(&self, input: Value) -> Result<String, ToolError> {
@@ -56,33 +59,66 @@ impl Tool for Edit {
             .get("replace_all")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-
-        let mut content = std::fs::read_to_string(path)
-            .map_err(|e| ToolError::Execution(format!("read {path}: {e}")))?;
-        let mut applied = 0usize;
-        for (old, new) in &edits {
-            let count = content.matches(old.as_str()).count();
-            if count == 0 {
-                return Err(ToolError::InvalidInput(format!(
-                    "`old_string` not found in {path}: {old:?}"
-                )));
-            }
-            if count > 1 && !(replace_all && edits.len() == 1) {
-                return Err(ToolError::InvalidInput(format!(
-                    "`old_string` is not unique in {path} ({count} matches): {old:?}; add surrounding context"
-                )));
-            }
-            // Replace once per edit (or all, only for the single-edit replace_all form).
-            content = if replace_all && edits.len() == 1 {
-                applied += count;
-                content.replace(old.as_str(), new)
-            } else {
-                applied += 1;
-                content.replacen(old.as_str(), new, 1)
-            };
+        if replace_all && edits.len() != 1 {
+            return Err(ToolError::InvalidInput(
+                "`replace_all` applies only to a single edit".into(),
+            ));
         }
-        super::write_atomic(path, content.as_bytes())
+
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| ToolError::Execution(format!("read {path}: {e}")))?;
+        // Match in a normalized LF space with the BOM stripped, then restore the file's original
+        // line endings + BOM on write. A CRLF file whose `old_string` uses `\n` (the common case)
+        // would otherwise never match — a silent, unrecoverable failure.
+        let had_bom = raw.starts_with('\u{feff}');
+        let body = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
+        let had_crlf = body.contains("\r\n");
+        let working = body.replace("\r\n", "\n");
+
+        // Resolve every edit to byte ranges against the *original* text (not the running result), so
+        // multi-edit semantics are order-independent and an earlier edit's output can't accidentally
+        // match a later `old_string`.
+        let mut ranges: Vec<(usize, usize, String)> = Vec::new();
+        for (old, new) in &edits {
+            let old = old.replace("\r\n", "\n");
+            let new = new.replace("\r\n", "\n");
+            for start in find_positions(&working, &old, replace_all)
+                .map_err(|msg| ToolError::InvalidInput(format!("{msg} in {path}")))?
+            {
+                ranges.push((start, start + old.len(), new.clone()));
+            }
+        }
+
+        // Reject overlapping edits rather than silently corrupting.
+        ranges.sort_by_key(|r| r.0);
+        for pair in ranges.windows(2) {
+            if pair[0].1 > pair[1].0 {
+                return Err(ToolError::InvalidInput(format!(
+                    "edits overlap in {path}; they must touch disjoint regions"
+                )));
+            }
+        }
+
+        // Splice the replacements in a single pass.
+        let mut out = String::with_capacity(working.len());
+        let mut cursor = 0;
+        for (start, end, new) in &ranges {
+            out.push_str(&working[cursor..*start]);
+            out.push_str(new);
+            cursor = *end;
+        }
+        out.push_str(&working[cursor..]);
+
+        if out == working {
+            return Err(ToolError::InvalidInput(format!(
+                "edit made no changes to {path}"
+            )));
+        }
+
+        let restored = restore(out, had_crlf, had_bom);
+        super::write_atomic(path, restored.as_bytes())
             .map_err(|e| ToolError::Execution(format!("write {path}: {e}")))?;
+        let applied = ranges.len();
         Ok(format!(
             "edited {path} ({applied} replacement{})",
             if applied == 1 { "" } else { "s" }
@@ -90,9 +126,45 @@ impl Tool for Edit {
     }
 }
 
-/// Accept either the `edits` array form (pi-style) or the single old_string/new_string form.
+/// Byte offsets in `working` where `old` should be replaced. Errors if `old` is empty, absent, or
+/// (without `replace_all`) ambiguous. Matches are exact in the LF-normalized space.
+fn find_positions(working: &str, old: &str, replace_all: bool) -> Result<Vec<usize>, String> {
+    if old.is_empty() {
+        return Err("`old_string` is empty".into());
+    }
+    let positions: Vec<usize> = working.match_indices(old).map(|(i, _)| i).collect();
+    match positions.len() {
+        0 => Err(format!("`old_string` not found: {old:?}")),
+        n if n > 1 && !replace_all => Err(format!(
+            "`old_string` is not unique ({n} matches): {old:?}; add surrounding context"
+        )),
+        _ => Ok(positions),
+    }
+}
+
+/// Restore the file's original line endings (LF → CRLF) and a leading BOM after editing in LF space.
+fn restore(out: String, had_crlf: bool, had_bom: bool) -> String {
+    let body = if had_crlf {
+        out.replace('\n', "\r\n")
+    } else {
+        out
+    };
+    if had_bom {
+        format!("\u{feff}{body}")
+    } else {
+        body
+    }
+}
+
+/// Accept either the `edits` array form (pi-style) or the single old_string/new_string form. Also
+/// recovers the case where a model sends `edits` as a JSON-encoded *string* instead of an array.
 fn parse_edits(input: &Value) -> Result<Vec<(String, String)>, ToolError> {
-    if let Some(arr) = input.get("edits").and_then(Value::as_array) {
+    // Some models emit `edits` as a JSON string; parse it back into a value first.
+    let edits_value = match input.get("edits") {
+        Some(Value::String(s)) => serde_json::from_str::<Value>(s).ok(),
+        other => other.cloned(),
+    };
+    if let Some(arr) = edits_value.as_ref().and_then(Value::as_array) {
         if arr.is_empty() {
             return Err(ToolError::InvalidInput("`edits` is empty".into()));
         }
@@ -190,14 +262,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn matches_across_crlf_line_endings() {
+        // A CRLF file edited with an `\n`-joined `old_string` must still match, and the file must keep
+        // its CRLF endings after the edit.
+        let f = write_tmp("line one\r\nline two\r\nline three\r\n");
+        let p = f.path().to_str().unwrap();
+        Edit.run(json!({
+            "path": p,
+            "old_string": "line one\nline two",
+            "new_string": "line one\nLINE TWO",
+        }))
+        .await
+        .unwrap();
+        let result = std::fs::read_to_string(p).unwrap();
+        assert_eq!(result, "line one\r\nLINE TWO\r\nline three\r\n");
+    }
+
+    #[tokio::test]
+    async fn rejects_overlapping_edits() {
+        let f = write_tmp("abcdef");
+        let err = Edit
+            .run(json!({
+                "path": f.path().to_str().unwrap(),
+                "edits": [
+                    { "old_string": "abcd", "new_string": "X" },
+                    { "old_string": "cdef", "new_string": "Y" }
+                ]
+            }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn rejects_no_op_edit() {
+        let f = write_tmp("hello world");
+        let err = Edit
+            .run(json!({
+                "path": f.path().to_str().unwrap(),
+                "old_string": "hello",
+                "new_string": "hello",
+            }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn recovers_edits_sent_as_json_string() {
+        let f = write_tmp("foo and bar");
+        let p = f.path().to_str().unwrap();
+        // `edits` as a JSON-encoded string rather than an array.
+        Edit.run(json!({
+            "path": p,
+            "edits": "[{\"old_string\":\"foo\",\"new_string\":\"baz\"}]",
+        }))
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(p).unwrap(), "baz and bar");
+    }
+
+    #[tokio::test]
+    async fn matches_independent_of_application_order() {
+        // edit1's output ("bar") must not be matched by a later edit; matching against the original
+        // keeps this deterministic.
+        let f = write_tmp("foo bar");
+        let p = f.path().to_str().unwrap();
+        Edit.run(json!({
+            "path": p,
+            "edits": [
+                { "old_string": "foo", "new_string": "bar" },
+                { "old_string": "bar", "new_string": "qux" }
+            ]
+        }))
+        .await
+        .unwrap();
+        // Second edit targets the *original* "bar", not the "bar" produced by the first edit.
+        assert_eq!(std::fs::read_to_string(p).unwrap(), "bar qux");
+    }
+
+    #[tokio::test]
     async fn leaves_no_temp_file_behind() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("f.txt");
         std::fs::write(&path, "the quick brown fox").unwrap();
-        Edit.run(json!({ "path": path.to_str().unwrap(), "old_string": "quick", "new_string": "slow" }))
-            .await
-            .unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "the slow brown fox");
+        Edit.run(
+            json!({ "path": path.to_str().unwrap(), "old_string": "quick", "new_string": "slow" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "the slow brown fox"
+        );
         // The atomic write (shared with `write`'s tool) must not leave its sibling temp behind.
         let temps: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()

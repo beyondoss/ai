@@ -13,6 +13,13 @@ use futures::stream::BoxStream;
 use crate::error::Result;
 use crate::message::{Message, StreamEvent, ToolDef};
 
+/// Extended-thinking request config. Presence asks the model to think before answering; `budget_tokens`
+/// caps the thinking spend (and must be below `max_tokens`).
+#[derive(Debug, Clone, Copy)]
+pub struct ThinkingConfig {
+    pub budget_tokens: u32,
+}
+
 /// One model request: the conversation so far plus the tools the model may call this turn.
 #[derive(Debug, Clone)]
 pub struct ModelRequest {
@@ -29,6 +36,15 @@ pub struct ModelRequest {
     pub tools: Arc<[ToolDef]>,
     /// Output token ceiling for the turn.
     pub max_tokens: u32,
+    /// Extended thinking, when requested. `None` leaves it off (the default).
+    pub thinking: Option<ThinkingConfig>,
+    /// A stable per-conversation cache key, for prompt-cache affinity. OpenAI routes cache hits by
+    /// `prompt_cache_key`; supplying a consistent value keeps a session pinned to a warm cache node.
+    pub cache_key: Option<String>,
+    /// Use the 1-hour prompt-cache TTL instead of the default 5 minutes. Worth it for a long-running
+    /// agent that may pause more than 5 minutes between turns (a slow tool, a thinking user), at a
+    /// higher cache-write price.
+    pub cache_long: bool,
 }
 
 impl ModelRequest {
@@ -44,6 +60,9 @@ impl ModelRequest {
             messages: messages.into(),
             tools: Vec::new().into(),
             max_tokens,
+            thinking: None,
+            cache_key: None,
+            cache_long: false,
         }
     }
 
@@ -57,6 +76,24 @@ impl ModelRequest {
     /// Builder-style: attach a system prompt.
     pub fn with_system(mut self, system: impl Into<String>) -> Self {
         self.system = Some(system.into());
+        self
+    }
+
+    /// Builder-style: request extended thinking with the given token budget.
+    pub fn with_thinking(mut self, budget_tokens: u32) -> Self {
+        self.thinking = Some(ThinkingConfig { budget_tokens });
+        self
+    }
+
+    /// Builder-style: set the prompt-cache affinity key (a stable per-conversation id).
+    pub fn with_cache_key(mut self, key: impl Into<String>) -> Self {
+        self.cache_key = Some(key.into());
+        self
+    }
+
+    /// Builder-style: opt into the 1-hour prompt-cache TTL.
+    pub fn with_cache_long(mut self, long: bool) -> Self {
+        self.cache_long = long;
         self
     }
 }

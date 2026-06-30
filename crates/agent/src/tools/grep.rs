@@ -166,6 +166,7 @@ impl Tool for Grep {
                 "path": { "type": "string", "description": "Directory or file to search (default \".\")." },
                 "glob": { "type": "string", "description": "Only search files matching this glob." },
                 "ignore_case": { "type": "boolean", "description": "Case-insensitive (default false)." },
+                "literal": { "type": "boolean", "description": "Treat `pattern` as a literal string, not a regex (default false)." },
                 "limit": { "type": "integer", "description": "Max matches to report (default 100)." }
             },
             "required": ["pattern"]
@@ -188,7 +189,20 @@ impl Tool for Grep {
             .map(|n| n as usize)
             .unwrap_or(DEFAULT_LIMIT);
 
-        let re = RegexBuilder::new(pattern)
+        // `literal` searches for the pattern verbatim (regex-escaped), so a model can grep for
+        // `a.b(c)` or `Vec<T>` without escaping the regex metacharacters itself.
+        let literal = input
+            .get("literal")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let escaped;
+        let effective = if literal {
+            escaped = regex::escape(pattern);
+            escaped.as_str()
+        } else {
+            pattern
+        };
+        let re = RegexBuilder::new(effective)
             .case_insensitive(ignore_case)
             .build()
             .map_err(|e| ToolError::InvalidInput(format!("bad regex: {e}")))?;
@@ -227,6 +241,26 @@ impl Tool for Grep {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn literal_mode_searches_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "call a.b(c) here\nand axbc too\n").unwrap();
+        // As a regex `a.b(c)` matches `axbc`; literal mode must match only the verbatim text.
+        let out = Grep
+            .run(json!({
+                "pattern": "a.b(c)",
+                "literal": true,
+                "path": dir.path().to_str().unwrap()
+            }))
+            .await
+            .unwrap();
+        assert!(out.contains("call a.b(c)"));
+        assert!(
+            !out.contains("axbc"),
+            "literal mode must not regex-match: {out}"
+        );
+    }
 
     #[tokio::test]
     async fn finds_matches_with_path_and_line() {
