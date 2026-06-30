@@ -7,6 +7,7 @@
 //! The loop is dialect-blind (both wire dialects normalize to the same `StreamEvent` sequence) and
 //! network-blind (it depends only on [`ModelTransport`], so tests drive it with `MockTransport`).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -179,6 +180,12 @@ impl Agent {
             // blocks are emitted/collected in call order after the join, never interleaved by
             // whichever tool happened to finish first.
             //
+            // Calls aren't always independent, though: two calls that write the same path (the model
+            // batching two `edit`s against one file) would otherwise race on disk. `Tool::write_target`
+            // flags the path a call would mutate; calls sharing a target are grouped and run
+            // sequentially, in call order, within that group, while distinct groups still run
+            // concurrently against each other.
+            //
             // All results are gathered into *one* user message rather than one message per result:
             // both Anthropic and the internal model carry a turn's tool results as multiple blocks on
             // a single `user` turn, and Anthropic rejects consecutive same-role messages — N separate
@@ -190,21 +197,42 @@ impl Agent {
                     input: input.clone(),
                 });
             }
-            let runs = calls.iter().map(|(_, name, input)| {
-                let tool = self.tools.get(name);
-                let name = name.clone();
-                let input = input.clone();
+            let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+            for (i, (_, name, input)) in calls.iter().enumerate() {
+                let key = self
+                    .tools
+                    .get(name)
+                    .and_then(|t| t.write_target(input))
+                    .map(|path| format!("path:{path}"))
+                    .unwrap_or_else(|| format!("solo:{i}"));
+                groups.entry(key).or_default().push(i);
+            }
+            let this = self;
+            let group_runs = groups.into_values().map(|indices| {
+                let calls = &calls;
                 async move {
-                    match tool {
-                        Some(tool) => match tool.run(input).await {
-                            Ok(out) => (out, false),
-                            Err(e) => (e.to_string(), true),
-                        },
-                        None => (format!("unknown tool: {name}"), true),
+                    let mut out = Vec::with_capacity(indices.len());
+                    for i in indices {
+                        let (_, name, input) = &calls[i];
+                        let result = match this.tools.get(name) {
+                            Some(tool) => match tool.run(input.clone()).await {
+                                Ok(o) => (o, false),
+                                Err(e) => (e.to_string(), true),
+                            },
+                            None => (format!("unknown tool: {name}"), true),
+                        };
+                        out.push((i, result));
                     }
+                    out
                 }
             });
-            let results = futures::future::join_all(runs).await;
+            let mut results: Vec<(String, bool)> =
+                (0..calls.len()).map(|_| (String::new(), false)).collect();
+            for group in futures::future::join_all(group_runs).await {
+                for (i, result) in group {
+                    results[i] = result;
+                }
+            }
             let mut result_blocks = Vec::with_capacity(calls.len());
             for ((id, name, _), (content, is_error)) in calls.iter().zip(results) {
                 sink(AgentEvent::ToolEnd {
@@ -552,6 +580,90 @@ mod tests {
             }
             other => panic!("expected two ordered tool_result messages, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn same_write_target_calls_run_sequentially() {
+        // Two calls that report the same `write_target` (the model batching two `edit`s against one
+        // file) must not race on disk: each tool independently reads-modifies-writes, so unordered
+        // execution could drop one write or interleave both. A tool that records start/end markers
+        // around a yield point proves the loop serializes same-target calls — if it didn't, the second
+        // call's "start" would land before the first's "end".
+        struct RecordingTool {
+            id: &'static str,
+            log: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+        #[async_trait]
+        impl Tool for RecordingTool {
+            fn name(&self) -> &str {
+                self.id
+            }
+            fn description(&self) -> &str {
+                "records start/end order"
+            }
+            fn input_schema(&self) -> Value {
+                json!({ "type": "object" })
+            }
+            fn write_target(&self, input: &Value) -> Option<String> {
+                input.get("path").and_then(Value::as_str).map(str::to_string)
+            }
+            async fn run(
+                &self,
+                _input: Value,
+            ) -> std::result::Result<String, crate::error::ToolError> {
+                self.log.lock().unwrap().push(format!("start:{}", self.id));
+                tokio::task::yield_now().await;
+                self.log.lock().unwrap().push(format!("end:{}", self.id));
+                Ok(self.id.to_string())
+            }
+        }
+
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(RecordingTool {
+            id: "edit",
+            log: log.clone(),
+        }));
+        tools.register(Arc::new(RecordingTool {
+            id: "write",
+            log: log.clone(),
+        }));
+
+        // Two different tools, both targeting "foo.rs" — `write_target` groups by path, not tool name.
+        let two_calls = vec![
+            StreamEvent::MessageStart,
+            StreamEvent::ToolUseStart {
+                id: "a".into(),
+                name: "edit".into(),
+            },
+            StreamEvent::InputJsonDelta {
+                partial_json: r#"{"path":"foo.rs"}"#.into(),
+            },
+            StreamEvent::ContentBlockStop,
+            StreamEvent::ToolUseStart {
+                id: "b".into(),
+                name: "write".into(),
+            },
+            StreamEvent::InputJsonDelta {
+                partial_json: r#"{"path":"foo.rs"}"#.into(),
+            },
+            StreamEvent::ContentBlockStop,
+            StreamEvent::MessageStop {
+                stop_reason: StopReason::ToolUse,
+            },
+        ];
+        let (agent, _mock) = agent_with(vec![two_calls, turn::text("done")], tools);
+
+        let mut session = Session::new();
+        session.user("go");
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        // Call order ("edit" before "write") must be preserved, and neither call's "start" may land
+        // between the other's "start" and "end" — i.e. no interleaving.
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec!["start:edit", "end:edit", "start:write", "end:write"],
+        );
     }
 
     #[tokio::test]

@@ -270,11 +270,23 @@ async fn write_frame(out: &mut tokio::io::Stdout, line: &str) -> std::io::Result
     out.flush().await
 }
 
+/// Load the session persisted at `path`, or a fresh one if there isn't one yet. A missing file is the
+/// expected first-run case and stays silent; a file that exists but fails to read or parse (corrupt
+/// JSON, a schema change across a deploy, a permissions error) is a real failure that would otherwise
+/// silently present as an empty session with no trace of what happened to the prior transcript — so
+/// that case is logged, matching `save_session`'s error reporting below.
 fn load_session(path: &str) -> Session {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    match std::fs::read_to_string(path) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
+            eprintln!("serve: failed to parse session file {path}: {e}; starting a fresh session");
+            Session::default()
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Session::default(),
+        Err(e) => {
+            eprintln!("serve: failed to read session file {path}: {e}; starting a fresh session");
+            Session::default()
+        }
+    }
 }
 
 /// Persist the session to `path` atomically. Returns the error so the caller can surface a failed
@@ -283,8 +295,8 @@ fn load_session(path: &str) -> Session {
 /// Writes to a sibling temp file then `rename`s it over `path`: `rename(2)` is atomic on a single
 /// filesystem, so a reader (or a later reattach) ever sees either the old transcript or the new one,
 /// never a half-written file. A bare `std::fs::write` truncates in place — a kill mid-write would
-/// leave corrupt JSON, which `load_session` then silently discards as an empty session, losing the
-/// whole transcript the session file exists to preserve.
+/// leave corrupt JSON, which `load_session` then falls back to an empty session for (logging the
+/// failure), losing the whole transcript the session file exists to preserve.
 fn save_session(path: &str, session: &Session) -> std::io::Result<()> {
     let s = serde_json::to_string(session)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -306,4 +318,40 @@ fn make_id() -> String {
         .unwrap_or(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     format!("sess_{nanos:x}_{seq:x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_session_missing_file_is_a_silent_fresh_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no-such-session.json");
+        let session = load_session(path.to_str().unwrap());
+        assert_eq!(session.messages.len(), 0);
+    }
+
+    #[test]
+    fn load_session_corrupt_file_degrades_to_fresh_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt.json");
+        std::fs::write(&path, "{not valid json").unwrap();
+        // Must not panic, and must not be mistaken for a real (empty) transcript — the caller logs
+        // this case (see `load_session`) precisely because it's distinguishable from "no file yet".
+        let session = load_session(path.to_str().unwrap());
+        assert_eq!(session.messages.len(), 0);
+    }
+
+    #[test]
+    fn load_session_round_trips_a_saved_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let mut session = Session::new();
+        session.user("hello");
+        save_session(path.to_str().unwrap(), &session).unwrap();
+
+        let loaded = load_session(path.to_str().unwrap());
+        assert_eq!(loaded.messages.len(), 1);
+    }
 }

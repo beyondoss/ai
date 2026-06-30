@@ -32,6 +32,17 @@ pub trait Tool: Send + Sync {
     /// aborting the run.
     async fn run(&self, input: Value) -> Result<String, ToolError>;
 
+    /// The filesystem path this call would write to, if any. The loop runs a turn's tool calls
+    /// concurrently (see `Agent::run_events`), but two calls that write the *same* path — e.g. the
+    /// model batches two `edit`s against one file — must not race: each tool independently
+    /// reads-modifies-writes, so unordered execution can silently drop one write or interleave both
+    /// into a corrupt file. Returning the target path here makes the loop run same-path calls
+    /// sequentially, in call order, instead. Read-only tools (and tools whose input has no path) keep
+    /// the default `None` and stay fully concurrent.
+    fn write_target(&self, _input: &Value) -> Option<String> {
+        None
+    }
+
     /// The advertised definition sent to the model. Derived from the accessors; override only if a
     /// tool needs a non-default shape.
     fn definition(&self) -> ToolDef {
