@@ -9,14 +9,17 @@
 // agent-core crate roots). Production paths stay panic-free per the workspace lints.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+// mimalloc, matching `edge`/`logfwd`/`orchestrator`/`tunnel` (the fleet default); it also fixes
+// musl's slow multithreaded malloc, which matters for the static musl build of this CLI.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::io::Write as _;
 use std::sync::Arc;
 
 use agent_core::{Agent, GatewayClient, Session, StreamEvent};
+use beyond_ai_agent::{serve, tools};
 use clap::{Parser, Subcommand};
-
-mod serve;
-mod tools;
 
 /// Default model when neither `--model` nor `AI_AGENT_MODEL` is set.
 const DEFAULT_MODEL: &str = "claude-opus-4-8";

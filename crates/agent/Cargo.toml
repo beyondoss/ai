@@ -23,6 +23,11 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+# Global allocator — mimalloc, the fleet default (cf. `edge`). Floor bumped to 0.1.52 so we pull
+# libmimalloc-sys >= 0.1.49, which bundles and defaults to mimalloc **v3** (the `v2` feature is an
+# opt-*out*; we don't set it). Also sidesteps musl's slow multithreaded malloc for the static build.
+mimalloc = { version = "0.1.52", default-features = false }
+
 # Coding tools: gitignore-aware walking (ripgrep's `ignore`), regex search (`grep`), glob matching
 # (`find`) — the same crates ripgrep/fd are built on.
 globset = "0.4"
@@ -32,3 +37,10 @@ regex = "1"
 [dev-dependencies]
 # Scratch files/dirs for the file-tool tests.
 tempfile = "3"
+# Macro-bench harness for the search tools (matches the gateway's `criterion` pin). The
+# saved-baseline comparison tracks the parallel-walk speedup over time.
+criterion = "0.5"
+
+[[bench]]
+name = "search"
+harness = false
