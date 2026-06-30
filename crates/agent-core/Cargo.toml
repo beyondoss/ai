@@ -23,6 +23,12 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+# The default model transport (`client::GatewayClient`) speaks HTTP to the gateway. `async-stream`
+# turns the chunked SSE body into a `Stream<StreamEvent>` without hand-rolling a poll state machine.
+# reqwest mirrors the gateway crate's pins (rustls, no OpenSSL) plus `stream` for the SSE body.
+async-stream = "0.3"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
+
 [dev-dependencies]
 # Async test runtime for the `Tool`/loop tests. The library itself is runtime-agnostic — it pulls in
 # no executor, only the `futures` stream traits — so the runtime lives in dev-deps.
