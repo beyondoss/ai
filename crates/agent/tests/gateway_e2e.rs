@@ -12,35 +12,13 @@
 
 mod common;
 
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use common::{free_port, spawn_model_server, turn_text, turn_tool_use, wait_for_port};
+use common::{
+    DEV_PUBKEY_B64, DEV_TOKEN, free_port, gateway_bin, spawn_model_server, turn_text,
+    turn_tool_use, wait_for_port,
+};
 use serde_json::json;
-
-/// Deterministic dev signing public key (standard base64), for `[signing_keys] 1 = …`.
-const DEV_PUBKEY_B64: &str = "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=";
-/// The matching dev `bai_v1` token (tenant 1 / vpc 1, kid 1).
-const DEV_TOKEN: &str = "bai_v1.1.AQAAAAAAAAABAAAAAAAAAA.WrWcPbklu91PS-4WuR6GnBNF3h4nROpH0EQQlfJf06f7_lEnlQOCSBimhH2JMwXFJgw40BniTB7-yIdFnpldDw";
-
-/// Locate the gateway binary (built beside the agent binary); build it on demand if absent.
-fn gateway_bin() -> PathBuf {
-    let agent = PathBuf::from(env!("CARGO_BIN_EXE_beyond-ai-agent"));
-    let dir = agent.parent().unwrap();
-    let gw = dir.join("beyond-ai");
-    if !gw.exists() {
-        let mut args = vec!["build", "-q", "-p", "beyond-ai", "--bin", "beyond-ai"];
-        if agent.to_string_lossy().contains("/release/") {
-            args.push("--release");
-        }
-        let status = Command::new(env!("CARGO"))
-            .args(&args)
-            .status()
-            .expect("build gateway");
-        assert!(status.success(), "failed to build the gateway binary");
-    }
-    gw
-}
 
 #[test]
 fn agent_through_real_gateway_to_mock_upstream() {

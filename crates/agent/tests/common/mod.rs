@@ -1,12 +1,39 @@
-//! Shared test helpers: a mock model server speaking Anthropic SSE.
+//! Shared test helpers: a mock model server speaking Anthropic SSE, port helpers, and a locator for
+//! the gateway binary.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, dead_code)]
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use serde_json::{Value, json};
+
+/// Deterministic dev signing public key (standard base64), for a gateway `[signing_keys] 1 = …`.
+pub const DEV_PUBKEY_B64: &str = "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=";
+/// The matching dev `bai_v1` token (tenant 1 / vpc 1, kid 1).
+pub const DEV_TOKEN: &str = "bai_v1.1.AQAAAAAAAAABAAAAAAAAAA.WrWcPbklu91PS-4WuR6GnBNF3h4nROpH0EQQlfJf06f7_lEnlQOCSBimhH2JMwXFJgw40BniTB7-yIdFnpldDw";
+
+/// Locate the gateway binary (built beside the agent binary); build it on demand if absent.
+pub fn gateway_bin() -> PathBuf {
+    let agent = PathBuf::from(env!("CARGO_BIN_EXE_beyond-ai-agent"));
+    let dir = agent.parent().unwrap();
+    let gw = dir.join("beyond-ai");
+    if !gw.exists() {
+        let mut args = vec!["build", "-q", "-p", "beyond-ai", "--bin", "beyond-ai"];
+        if agent.to_string_lossy().contains("/release/") {
+            args.push("--release");
+        }
+        let status = Command::new(env!("CARGO"))
+            .args(&args)
+            .status()
+            .expect("build gateway");
+        assert!(status.success(), "failed to build the gateway binary");
+    }
+    gw
+}
 
 /// An Anthropic SSE turn that calls one tool with the given JSON-argument string.
 pub fn turn_tool_use(id: &str, name: &str, args_json: &str) -> String {
