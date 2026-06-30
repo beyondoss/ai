@@ -17,6 +17,17 @@ run = "cargo build --release"
 description = "Mint a deterministic DEV-ONLY signing pubkey + bai_v1 token (fixed seed) for wiring up the dev config. Not for production."
 run = "cargo run -p beyond-ai --example mint_dev_key"
 
+[tasks."build:agent"]
+run = "cargo build -p beyond-ai-agent"
+
+[tasks."run:agent"]
+description = "Run the agent harness CLI (e.g. `mise run run:agent -- tools`)."
+run = "cargo run -p beyond-ai-agent --"
+
+[tasks."test:unit:agent"]
+description = "Unit tests for the agent harness core (messages, tool registry, session)."
+run = "cargo test -p beyond-ai-agent-core"
+
 [tasks."check:rs"]
 run = "cargo clippy --all-targets -- -D warnings"
 

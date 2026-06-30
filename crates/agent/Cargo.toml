@@ -1,0 +1,24 @@
+[package]
+name = "beyond-ai-agent"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Beyond agent harness — CLI (one-shot `run` and headless `serve`)"
+
+[[bin]]
+name = "beyond-ai-agent"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The harness core. Depended on by package name; imported as `agent_core` (its lib name).
+async-trait.workspace = true
+beyond-ai-agent-core = { path = "../agent-core" }
+clap.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
