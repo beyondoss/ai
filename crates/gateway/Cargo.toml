@@ -1,0 +1,77 @@
+[package]
+name = "beyond-ai"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Beyond AI gateway — egress L7 proxy to LLM providers"
+
+[lib]
+name = "beyond_ai"
+path = "src/lib.rs"
+
+[[bin]]
+name = "beyond-ai"
+path = "src/main.rs"
+
+# Inherit the workspace lint gates (`unsafe_code = "forbid"`, denied panic surface, …). They bind
+# every target in this crate — lib, bin, tests, benches — see the rationale in the root manifest.
+[lints]
+workspace = true
+
+[dependencies]
+# slipstream is published — consume it from crates.io, aliased to `store` so the code's
+# `use store::...` is unchanged. No path deps into the `beyond` repo: this crate builds standalone.
+store = { package = "beyond-slipstream", version = "0.1.0" }
+
+pingora = { version = "0.8", default-features = false, features = ["rustls"] }
+pingora-core = "0.8"
+pingora-limits = "0.8"
+pingora-proxy = "0.8"
+
+arc-swap = "1"
+arrayvec = "0.7"
+async-trait = "0.1"
+base64.workspace = true
+bytes.workspace = true
+clap.workspace = true
+ed25519-dalek = "2.2"
+figment.workspace = true
+getrandom = "0.3"
+# The types Pingora's `ServeHttp` trait speaks (`Response<Vec<u8>>`); pin to the same 1.x already in
+# the tree via Pingora so the admin app can name them directly.
+http = "1"
+memchr = "2"
+prometheus = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+zeroize = "1"
+
+[dev-dependencies]
+# Bench harnesses. Best tool per job: `divan` for the unit micro-bench (it measures allocations
+# natively via AllocProfiler, alongside timing); `criterion` for the e2e macro-bench (`async_tokio`
+# drives the round-trips, and its saved-baseline comparison tracks latency/RPS over time).
+criterion = { version = "0.5", features = ["async_tokio"] }
+divan = "0.1"
+http-body-util = "0.1"
+# `http2` + hyper-util's `server-auto` let the mock upstream serve H1 *and* H2 on one TLS listener
+# (protocol chosen by ALPN), so the concurrency bench can drive the gateway's H2 path. `rcgen` mints a
+# throwaway self-signed cert for that listener; `tokio-rustls` terminates TLS in front of hyper.
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
+rcgen = "0.13"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+tokio-rustls = "0.26"
+
+[[bench]]
+name = "unit"
+harness = false
+
+[[bench]]
+name = "e2e"
+harness = false

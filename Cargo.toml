@@ -1,33 +1,28 @@
-[package]
-name = "beyond-ai"
-version = "0.1.0"
+[workspace]
+members = ["crates/*"]
+# Edition-2024 members want the v3 feature resolver; a virtual workspace doesn't inherit it from a
+# member, so it's declared here explicitly.
+resolver = "3"
+
+[workspace.package]
 edition = "2024"
 license = "MIT"
 rust-version = "1.85"
-description = "Beyond AI gateway — egress L7 proxy to LLM providers"
 
-[lib]
-name = "beyond_ai"
-path = "src/lib.rs"
-
-[[bin]]
-name = "beyond-ai"
-path = "src/main.rs"
-
-# `[lints]` binds every target in the crate — lib, bin, tests, benches. That matters: a crate-level
-# `#![deny(...)]` attribute only covers the unit it's written in, so the binary root (`main.rs`)
-# would otherwise escape the library's denies. Declaring them here closes that gap structurally.
-[lints.rust]
+# Lints live at the workspace level so every crate root in the tree inherits them via
+# `[lints] workspace = true`. That matters: a crate-level `#![deny(...)]` attribute only covers the
+# unit it's written in, so a binary root (`main.rs`) would otherwise escape the library's denies.
+# Declaring them here closes that gap structurally, for every member.
+[workspace.lints.rust]
 unsafe_code = "forbid"
 unused_must_use = "deny"
 
-# Panic surface: a stray `.unwrap()`/`.expect()`/`panic!`/`todo!` in a request path is a worker
-# crash, not an error response. Deny them so a new one is a hard CI failure (mise `check:rs` runs
-# clippy with `-D warnings`). These are clippy *restriction* lints (allow-by-default); naming them
-# here turns them on. The handful of genuine boot-time invariants carry a local
-# `#[allow(clippy::expect_used)]` with a SAFETY-style note; test/bench targets allow them wholesale
-# at the file head (asserting a precondition with `.unwrap()` is the point of a test).
-[lints.clippy]
+# Panic surface: a stray `.unwrap()`/`.expect()`/`panic!`/`todo!` in a request or agent-loop path is
+# a worker crash, not an error response. Deny them so a new one is a hard CI failure (clippy runs with
+# `-D warnings`). These are clippy *restriction* lints (allow-by-default); naming them here turns them
+# on. Genuine boot-time invariants carry a local `#[allow(clippy::expect_used)]` with a SAFETY note;
+# test/bench targets allow them wholesale (asserting a precondition with `.unwrap()` is the point).
+[workspace.lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
@@ -35,63 +30,21 @@ todo = "deny"
 unimplemented = "deny"
 
 # Release builds wrap arithmetic silently by default; turn that into a panic so an overflow on a
-# size/count never goes unnoticed. Negligible cost for a proxy (arithmetic isn't the bottleneck).
+# size/count never goes unnoticed. Profiles only take effect at the workspace root.
 [profile.release]
 overflow-checks = true
 
-[dependencies]
-# slipstream is published — consume it from crates.io, aliased to `store` so the code's
-# `use store::...` is unchanged. No path deps into the `beyond` repo: this crate builds standalone.
-store = { package = "beyond-slipstream", version = "0.1.0" }
-
-pingora = { version = "0.8", default-features = false, features = ["rustls"] }
-pingora-core = "0.8"
-pingora-limits = "0.8"
-pingora-proxy = "0.8"
-
-arc-swap = "1"
-arrayvec = "0.7"
-async-trait = "0.1"
+# Shared dependency versions. Members opt in with `<dep>.workspace = true`, so the version is pinned
+# once for the whole tree. Only deps used (or expected to be used) by more than one crate live here;
+# crate-specific deps stay in that crate's manifest.
+[workspace.dependencies]
 base64 = "0.22"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
-ed25519-dalek = "2.2"
 figment = { version = "0.10", features = ["toml", "env"] }
-getrandom = "0.3"
-# The types Pingora's `ServeHttp` trait speaks (`Response<Vec<u8>>`); pin to the same 1.x already in
-# the tree via Pingora so the admin app can name them directly.
-http = "1"
-memchr = "2"
-prometheus = "0.13"
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-zeroize = "1"
-
-[dev-dependencies]
-# Bench harnesses. Best tool per job: `divan` for the unit micro-bench (it measures allocations
-# natively via AllocProfiler, alongside timing); `criterion` for the e2e macro-bench (`async_tokio`
-# drives the round-trips, and its saved-baseline comparison tracks latency/RPS over time).
-criterion = { version = "0.5", features = ["async_tokio"] }
-divan = "0.1"
-http-body-util = "0.1"
-# `http2` + hyper-util's `server-auto` let the mock upstream serve H1 *and* H2 on one TLS listener
-# (protocol chosen by ALPN), so the concurrency bench can drive the gateway's H2 path. `rcgen` mints a
-# throwaway self-signed cert for that listener; `tokio-rustls` terminates TLS in front of hyper.
-hyper = { version = "1", features = ["server", "http1", "http2"] }
-hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
-rcgen = "0.13"
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
-tokio-rustls = "0.26"
-
-[[bench]]
-name = "unit"
-harness = false
-
-[[bench]]
-name = "e2e"
-harness = false
