@@ -665,7 +665,12 @@ impl ProxyHttp for AiProxy {
                 *body = Some(Bytes::from(maybe_inject_stream_usage(buf)));
             } else {
                 // Withhold — the bytes are buffered above; nothing goes upstream until end-of-stream.
-                *body = None;
+                // Use an *empty* chunk, not `None`: pingora derives end-of-body as
+                // `end_of_body || data.is_none()` (proxy_h1.rs / proxy_h2.rs), so withholding with
+                // `None` would signal end-of-body on the *first* withheld chunk and forward a truncated
+                // (empty) body — silently dropping every request body that spans more than one chunk.
+                // An empty `Some` is recognized as "nothing to write yet" without ending the body.
+                *body = Some(Bytes::new());
             }
         }
 

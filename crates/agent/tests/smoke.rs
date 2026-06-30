@@ -1,38 +1,78 @@
-//! Live smoke: the real `beyond-ai-agent` binary → the real `beyond-ai` gateway → **real Anthropic**.
+//! Live smoke: the real `beyond-ai-agent` binary → the real `beyond-ai` gateway → a **real provider**.
 //!
-//! Ignored by default (bills a tiny real request). Run with a key present:
+//! Ignored by default (bills tiny real requests). The gateway routes a bare `/v1/messages` to
+//! Anthropic and `/v1/chat/completions` to OpenAI by dialect, so one gateway with the right pool key
+//! serves either — which lets the provider-agnostic tests run the *same* body against **every provider
+//! whose key is present** (see [`PROVIDERS`] / [`available`]). Each test skips a provider whose key is
+//! unset rather than failing. Run with whatever keys you have:
 //!
-//!   ANTHROPIC_API_KEY=sk-ant-… mise run test:smoke:agent
-//!   ANTHROPIC_API_KEY=sk-ant-… cargo test -p beyond-ai-agent --test smoke -- --ignored --nocapture
+//!   mise run test:smoke:agent          # auto-loads .env (ANTHROPIC_API_KEY, OPENAI_API_KEY, …)
+//!   ANTHROPIC_API_KEY=… OPENAI_API_KEY=… cargo test -p beyond-ai-agent --test smoke -- --ignored --nocapture
 //!
-//! This is the one test that validates the dialect decoder against a *real* provider's SSE: the
-//! gateway boots with the caller's Anthropic key as the managed pool key (and the dev signing key),
-//! then the agent — holding only a `bai_v1` virtual key — drives a real tool round-trip through it.
-//! A model-not-found is a stale model id, not a harness bug (adjust `MODEL`).
+//! These validate the dialect decoders against *real* provider SSE: the gateway boots with the
+//! caller's key as the managed pool key (and the dev signing key), then the agent — holding only a
+//! `bai_v1` virtual key — drives real round-trips through it. A model-not-found is a stale model id,
+//! not a harness bug (adjust the provider's `model`).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 
 use common::{DEV_PUBKEY_B64, DEV_TOKEN, free_port, gateway_bin, wait_for_port};
 use serde_json::{Value, json};
 
-/// Cheapest small Anthropic model (matches the gateway's own smoke test).
-const MODEL: &str = "claude-haiku-4-5";
+/// A live provider profile: the env var holding its key, the gateway pool-key name (= the provider
+/// path segment the dialect routes to), and a cheap small model that is both tool- and vision-capable.
+struct Provider {
+    /// Human label for skip/assert messages.
+    name: &'static str,
+    /// Env var holding the real upstream key.
+    env: &'static str,
+    /// Gateway pool-key name = provider path segment (`anthropic` → `/v1/messages`, `openai` →
+    /// `/v1/chat/completions`).
+    pool: &'static str,
+    /// A cheap small chat model on this provider (tool- and vision-capable).
+    model: &'static str,
+}
+
+/// The providers the shared (provider-agnostic) smokes run against. Add a row to cover a new provider.
+const PROVIDERS: &[Provider] = &[
+    Provider {
+        name: "anthropic",
+        env: "ANTHROPIC_API_KEY",
+        pool: "anthropic",
+        model: "claude-haiku-4-5",
+    },
+    Provider {
+        name: "openai",
+        env: "OPENAI_API_KEY",
+        pool: "openai",
+        model: "gpt-4o-mini",
+    },
+];
+
 /// A model whose prompt-cache activates at a ~3k-token prefix — `claude-haiku-4-5` has a higher
-/// cache-activation threshold, so the cache test uses this to validate hits end-to-end.
+/// cache-activation threshold, so the (Anthropic-specific) cache test uses this to validate hits.
 const CACHING_MODEL: &str = "claude-sonnet-4-5";
 
 fn env_key(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
-/// Boot the real gateway in `dir`, fronting REAL Anthropic with `anthropic_key` as the managed pool
-/// key (and the dev signing key). Returns its port and the child handle (kill it when done).
-fn boot_gateway(dir: &Path, anthropic_key: &str) -> (u16, Child) {
+/// The providers whose key is set; the rest are skipped (not failed) by the shared tests.
+fn available() -> Vec<&'static Provider> {
+    PROVIDERS
+        .iter()
+        .filter(|p| env_key(p.env).is_some())
+        .collect()
+}
+
+/// Boot the real gateway in `dir`, fronting a REAL upstream with `key` as the managed pool key for
+/// `pool` (and the dev signing key). Returns its port and the child handle (kill it when done).
+fn boot_gateway(dir: &Path, pool: &str, key: &str) -> (u16, Child) {
     let gw_port = free_port();
     let metrics_port = free_port();
     let config = format!(
@@ -41,7 +81,7 @@ fn boot_gateway(dir: &Path, anthropic_key: &str) -> (u16, Child) {
          nats_url = \"nats://127.0.0.1:59321\"\n\
          config_bucket = \"ai-gateway\"\n\
          upstream_tls = true\n\
-         \n[pool_keys]\nanthropic = \"{anthropic_key}\"\n\
+         \n[pool_keys]\n{pool} = \"{key}\"\n\
          \n[signing_keys]\n1 = \"{DEV_PUBKEY_B64}\"\n"
     );
     let config_path = dir.join("gateway.toml");
@@ -105,136 +145,127 @@ fn serve_child(gw_port: u16, cwd: &Path, model: &str, extra: &[&str]) -> Child {
         .expect("spawn agent serve")
 }
 
-#[test]
-#[ignore = "live provider smoke; run via `mise run test:smoke:agent` with ANTHROPIC_API_KEY set"]
-fn smoke_agent_through_gateway_to_real_anthropic() {
-    let Some(anthropic_key) = env_key("ANTHROPIC_API_KEY") else {
-        eprintln!("smoke[agent]: ANTHROPIC_API_KEY unset — skipping");
-        return;
-    };
-
-    // A file the agent must read with its `read` tool, then echo back — proves a live tool round-trip.
-    let dir = tempfile::tempdir().unwrap();
-    let token = "PINEAPPLE-7493";
-    std::fs::write(dir.path().join("marker.txt"), format!("{token}\n")).unwrap();
-
-    // Gateway → REAL Anthropic (no authority override, real TLS upstream). Managed pool key = the
-    // caller's real key; the agent presents only the dev virtual key.
-    let gw_port = free_port();
-    let metrics_port = free_port();
-    let config = format!(
-        "listen = \"127.0.0.1:{gw_port}\"\n\
-         metrics_listen = \"127.0.0.1:{metrics_port}\"\n\
-         nats_url = \"nats://127.0.0.1:59321\"\n\
-         config_bucket = \"ai-gateway\"\n\
-         upstream_tls = true\n\
-         \n[pool_keys]\nanthropic = \"{anthropic_key}\"\n\
-         \n[signing_keys]\n1 = \"{DEV_PUBKEY_B64}\"\n"
-    );
-    let config_path = dir.path().join("gateway.toml");
-    std::fs::write(&config_path, config).unwrap();
-
-    let mut gateway = Command::new(gateway_bin())
-        .arg("run")
-        .arg("-c")
-        .arg(&config_path)
-        .env("AI_LOG", "warn")
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn gateway");
-    wait_for_port(gw_port);
-
+/// Boot a gateway for `provider` and run the agent `run` one-shot with `prompt` in `cwd`. Returns the
+/// process output (the gateway is killed before returning). The caller must have confirmed the key is
+/// set (via [`available`]).
+fn run_oneshot(provider: &Provider, cwd: &Path, prompt: &str) -> Output {
+    let key = env_key(provider.env).expect("provider key present");
+    let (gw_port, mut gateway) = boot_gateway(cwd, provider.pool, &key);
     let output = Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
         .args([
             "run",
-            "Use the read tool to read the file marker.txt in the current directory, then reply with ONLY the exact token it contains.",
+            prompt,
             "--gateway-url",
             &format!("http://127.0.0.1:{gw_port}"),
             "--key",
             DEV_TOKEN,
             "--model",
-            MODEL,
+            provider.model,
             "--max-steps",
             "6",
         ])
-        .current_dir(dir.path())
+        .current_dir(cwd)
         .output()
         .expect("spawn agent");
-
     let _ = gateway.kill();
     let _ = gateway.wait();
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    eprintln!("--- agent stdout ---\n{stdout}\n--- agent stderr ---\n{stderr}");
-    assert!(
-        output.status.success(),
-        "agent failed against real Anthropic.\nstdout: {stdout}\nstderr: {stderr}"
-    );
-    assert!(
-        stdout.contains(token),
-        "real Claude should have read the file via the tool and echoed `{token}`.\nstdout: {stdout}"
-    );
+    output
 }
 
-/// Multimodal end-to-end: the `read` tool returns a real image as an attachment, the dialect encodes
-/// it into Anthropic's `tool_result` content-array shape, and **real Claude vision** sees it. The agent
-/// reads a solid-red PNG and must name the color — exercising the whole new image path live (read
-/// image detection → `ToolOutput.images` → `ContentBlock::ToolResult.images` → wire encoding → vision).
+/// Shared across providers: a live tool round-trip. The agent reads a file with its `read` tool and
+/// echoes the token back — proving tool-calling and the dialect decoder against each real provider.
 #[test]
-#[ignore = "live provider smoke; run via `mise run test:smoke:agent` with ANTHROPIC_API_KEY set"]
+#[ignore = "live provider smoke; run via `mise run test:smoke:agent` with a provider key set"]
+fn smoke_tool_round_trip() {
+    let providers = available();
+    if providers.is_empty() {
+        eprintln!("smoke[tool]: no provider key set — skipping");
+        return;
+    }
+    for p in providers {
+        let dir = tempfile::tempdir().unwrap();
+        let token = "PINEAPPLE-7493";
+        std::fs::write(dir.path().join("marker.txt"), format!("{token}\n")).unwrap();
+
+        let output = run_oneshot(
+            p,
+            dir.path(),
+            "Use the read tool to read the file marker.txt in the current directory, then reply with ONLY the exact token it contains.",
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!(
+            "--- [{}] tool stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+            p.name
+        );
+        assert!(
+            output.status.success(),
+            "[{}] agent run failed.\nstdout: {stdout}\nstderr: {stderr}",
+            p.name
+        );
+        assert!(
+            stdout.contains(token),
+            "[{}] should have read the file via the tool and echoed `{token}`.\nstdout: {stdout}",
+            p.name
+        );
+    }
+}
+
+/// Shared across providers: multimodal end-to-end. The `read` tool returns a real image as an
+/// attachment; the dialect encodes it (Anthropic content-array / OpenAI `image_url` fan-out) and the
+/// real provider's **vision** sees it. The agent reads a solid-red PNG and must name the colour —
+/// exercising the whole image path live (read image detection → `ToolOutput.images` →
+/// `ContentBlock::ToolResult.images` → wire encoding → vision). This is the only live coverage of the
+/// OpenAI-wire image path, which previously dropped images on the floor.
+#[test]
+#[ignore = "live provider smoke; run via `mise run test:smoke:agent` with a provider key set"]
 fn smoke_reads_an_image_and_describes_it() {
     use base64::Engine as _;
 
-    let Some(key) = env_key("ANTHROPIC_API_KEY") else {
-        eprintln!("smoke[image]: ANTHROPIC_API_KEY unset — skipping");
+    let providers = available();
+    if providers.is_empty() {
+        eprintln!("smoke[image]: no provider key set — skipping");
         return;
-    };
+    }
     // A 48x48 solid-red PNG (generated deterministically; no image crate needed).
     const RED_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAIAAADYYG7QAAAANklEQVR42u3OQQ0AAAgAoetfWls4H2wEoKlXEhISEhISEhISEhISEhISEhISEhISEhISEhK6s98T93mKDkyKAAAAAElFTkSuQmCC";
-    let dir = tempfile::tempdir().unwrap();
     let png = base64::engine::general_purpose::STANDARD
         .decode(RED_PNG_B64)
         .unwrap();
-    std::fs::write(dir.path().join("swatch.png"), png).unwrap();
 
-    let (gw_port, mut gateway) = boot_gateway(dir.path(), &key);
-    let output = Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
-        .args([
-            "run",
+    for p in providers {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("swatch.png"), &png).unwrap();
+
+        let output = run_oneshot(
+            p,
+            dir.path(),
             "Use the read tool to read the image file swatch.png in the current directory, then reply with ONLY the single dominant color word you see.",
-            "--gateway-url",
-            &format!("http://127.0.0.1:{gw_port}"),
-            "--key",
-            DEV_TOKEN,
-            "--model",
-            MODEL,
-            "--max-steps",
-            "6",
-        ])
-        .current_dir(dir.path())
-        .output()
-        .expect("spawn agent");
-    let _ = gateway.kill();
-    let _ = gateway.wait();
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    eprintln!("--- image stdout ---\n{stdout}\n--- image stderr ---\n{stderr}");
-    assert!(
-        output.status.success(),
-        "agent failed reading an image through the multimodal path.\nstdout: {stdout}\nstderr: {stderr}"
-    );
-    assert!(
-        stdout.to_lowercase().contains("red"),
-        "real Claude vision should have seen a red swatch via the read-tool image path.\nstdout: {stdout}"
-    );
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!(
+            "--- [{}] image stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+            p.name
+        );
+        assert!(
+            output.status.success(),
+            "[{}] agent failed reading an image through the multimodal path.\nstdout: {stdout}\nstderr: {stderr}",
+            p.name
+        );
+        assert!(
+            stdout.to_lowercase().contains("red"),
+            "[{}] real vision should have seen a red swatch via the read-tool image path.\nstdout: {stdout}",
+            p.name
+        );
+    }
 }
 
-/// Prompt caching actually *hits* against real Anthropic — not just that the body is accepted. A
-/// read-tool round-trip is two model turns: turn 1 writes the prefix cache, turn 2 (re-sending that
-/// prefix) reads it. The `prompt` response's usage must show both a cache write and a cache read.
+/// Anthropic-specific: prompt caching actually *hits* — not just that the body is accepted. (Anthropic
+/// caches via the explicit breakpoints we stamp and reports cache_write/cache_read; OpenAI's automatic
+/// prefix caching only kicks in past ~1k-token prefixes and reports only cached reads, so it isn't
+/// asserted here.) A read-tool round-trip is two turns: turn 1 writes the prefix cache, turn 2
+/// re-sends it and reads it.
 #[test]
 #[ignore = "live provider smoke; run via `mise run test:smoke:agent` with ANTHROPIC_API_KEY set"]
 fn smoke_prompt_cache_produces_hits() {
@@ -244,7 +275,7 @@ fn smoke_prompt_cache_produces_hits() {
     };
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("marker.txt"), "PINEAPPLE-7493\n").unwrap();
-    let (gw_port, mut gateway) = boot_gateway(dir.path(), &key);
+    let (gw_port, mut gateway) = boot_gateway(dir.path(), "anthropic", &key);
     let session_file = dir.path().join("s.jsonl");
 
     let mut child = serve_child(
@@ -289,9 +320,10 @@ fn smoke_prompt_cache_produces_hits() {
     );
 }
 
-/// Extended thinking + tools against real Anthropic. This is the correctness landmine: turn 2's
-/// request must replay turn 1's *signed* thinking block, or Anthropic 400s. A successful multi-turn
-/// tool round-trip with `--thinking` on proves the signature round-trips intact.
+/// Anthropic-specific: extended thinking + tools. The correctness landmine — turn 2's request must
+/// replay turn 1's *signed* thinking block, or Anthropic 400s. A successful multi-turn tool round-trip
+/// with `--thinking` on proves the signature round-trips intact. (OpenAI reasoning models use
+/// `reasoning_effort` and emit no replayable signature, so this is Anthropic-only.)
 #[test]
 #[ignore = "live provider smoke; run via `mise run test:smoke:agent` with ANTHROPIC_API_KEY set"]
 fn smoke_thinking_with_tools_replays_signature() {
@@ -302,9 +334,14 @@ fn smoke_thinking_with_tools_replays_signature() {
     let token = "PINEAPPLE-7493";
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("marker.txt"), format!("{token}\n")).unwrap();
-    let (gw_port, mut gateway) = boot_gateway(dir.path(), &key);
+    let (gw_port, mut gateway) = boot_gateway(dir.path(), "anthropic", &key);
 
-    let mut child = serve_child(gw_port, dir.path(), MODEL, &["--thinking", "2000"]);
+    let mut child = serve_child(
+        gw_port,
+        dir.path(),
+        "claude-haiku-4-5",
+        &["--thinking", "2000"],
+    );
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
