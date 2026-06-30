@@ -22,3 +22,13 @@ serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+# Coding tools: gitignore-aware walking (ripgrep's `ignore`), regex search (`grep`), glob matching
+# (`find`) — the same crates ripgrep/fd are built on.
+globset = "0.4"
+ignore = "0.4"
+regex = "1"
+
+[dev-dependencies]
+# Scratch files/dirs for the file-tool tests.
+tempfile = "3"

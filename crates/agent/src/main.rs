@@ -1,16 +1,29 @@
 //! Beyond agent harness — CLI.
 //!
-//! Scaffold. The command surface is the one the harness targets: a one-shot `run` and a headless
-//! `serve` (with an attachable control API, for remote control over SSH). Neither is wired to the
-//! agent loop yet — that arrives with the loop (M4), the coding tools (M6), and the control API
-//! (M7). `tools` is a working, no-network demo that the core links and the async `Tool` seam runs.
+//! `run` drives a one-shot coding task to completion through the gateway. `serve` (M7) will expose
+//! the headless control API. `tools` lists the advertised tool set. Model traffic always flows
+//! through the gateway (`AI_GATEWAY_URL`) authenticated with a `bai_v1` key (`AI_AGENT_KEY`).
 
+// Unit tests assert preconditions with `.unwrap()`; allow that under `test` (matches the gateway and
+// agent-core crate roots). Production paths stay panic-free per the workspace lints.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
+use std::io::Write as _;
 use std::sync::Arc;
 
-use agent_core::error::ToolError;
-use agent_core::{Tool, ToolRegistry};
+use agent_core::{Agent, GatewayClient, Session, StreamEvent};
 use clap::{Parser, Subcommand};
-use serde_json::{Value, json};
+
+mod tools;
+
+/// Default model when neither `--model` nor `AI_AGENT_MODEL` is set.
+const DEFAULT_MODEL: &str = "claude-opus-4-8";
+/// Default gateway base URL.
+const DEFAULT_GATEWAY: &str = "http://ai.internal";
+
+const SYSTEM_PROMPT: &str = "You are the Beyond coding agent. You operate inside a real working \
+directory with tools: read, write, edit, bash, ls, grep, find. Use them to accomplish the user's \
+task directly — inspect before you change, make minimal edits, and verify your work. Be concise.";
 
 #[derive(Parser)]
 #[command(name = "beyond-ai-agent", version, about = "Beyond agent harness")]
@@ -21,14 +34,26 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run a one-shot agent task to completion. (Agent loop lands in a later milestone.)
+    /// Run a one-shot agent task to completion, streaming output to stdout.
     Run {
         /// The task prompt for the agent.
         task: String,
+        /// Model id (default `claude-opus-4-8`, or `AI_AGENT_MODEL`).
+        #[arg(long, env = "AI_AGENT_MODEL")]
+        model: Option<String>,
+        /// Gateway base URL (default `http://ai.internal`, or `AI_GATEWAY_URL`).
+        #[arg(long, env = "AI_GATEWAY_URL")]
+        gateway_url: Option<String>,
+        /// Virtual key (`bai_v1…`) or BYO provider key. Required; or set `AI_AGENT_KEY`.
+        #[arg(long, env = "AI_AGENT_KEY")]
+        key: Option<String>,
+        /// Max loop iterations before bailing.
+        #[arg(long, default_value_t = 24)]
+        max_steps: u32,
     },
-    /// Run the headless agent server exposing an attachable control API. (Later milestone.)
+    /// Run the headless agent server exposing an attachable control API. (M7.)
     Serve,
-    /// List the tools the agent advertises to the model, and run one (no-network scaffold demo).
+    /// List the tools the agent advertises to the model.
     Tools,
 }
 
@@ -39,62 +64,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .try_init();
 
     match Cli::parse().command {
-        Command::Tools => demo_tools().await?,
-        Command::Run { task } => {
-            println!("scaffold: `run` is not wired yet (agent loop = M4, CLI = M6).");
-            println!("would drive the agent loop to completion for task: {task:?}");
+        Command::Run {
+            task,
+            model,
+            gateway_url,
+            key,
+            max_steps,
+        } => {
+            run_task(task, model, gateway_url, key, max_steps).await?;
         }
         Command::Serve => {
             println!("scaffold: `serve` is not wired yet (headless control API = M7).");
         }
+        Command::Tools => {
+            let reg = tools::default_registry();
+            println!("{} tools:\n", reg.len());
+            println!("{}", serde_json::to_string_pretty(&reg.definitions())?);
+        }
     }
     Ok(())
 }
 
-/// Build the agent's tool registry. As milestones land, the core Read/Write/Edit/Bash and the Beyond
-/// fork/sync/logs tools register here; today it carries a single placeholder.
-fn registry() -> ToolRegistry {
-    let mut reg = ToolRegistry::new();
-    reg.register(Arc::new(EchoTool));
-    reg
-}
+async fn run_task(
+    task: String,
+    model: Option<String>,
+    gateway_url: Option<String>,
+    key: Option<String>,
+    max_steps: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let gateway = gateway_url.unwrap_or_else(|| DEFAULT_GATEWAY.to_string());
+    let model = model.unwrap_or_else(|| DEFAULT_MODEL.to_string());
+    let key =
+        key.ok_or("no gateway key: pass --key or set AI_AGENT_KEY (a bai_v1… virtual key)")?;
 
-async fn demo_tools() -> Result<(), Box<dyn std::error::Error>> {
-    let reg = registry();
-    println!("{} tool(s) registered:\n", reg.len());
-    println!("{}", serde_json::to_string_pretty(&reg.definitions())?);
-    // Prove the async tool seam runs end to end — no network, no model.
-    if let Some(echo) = reg.get("echo") {
-        let out = echo.run(json!({ "text": "harness online" })).await?;
-        println!("\necho.run -> {out:?}");
-    }
-    Ok(())
-}
+    let client = GatewayClient::new(gateway, key)?;
+    let agent = Agent::new(Arc::new(client), model)
+        .with_tools(tools::default_registry())
+        .with_system(SYSTEM_PROMPT)
+        .with_max_steps(max_steps);
 
-/// Placeholder built-in so the scaffold demonstrates the registry + async tool path. Replaced by the
-/// real coding tools (Read/Write/Edit/Bash) in M6.
-struct EchoTool;
+    let mut session = Session::new();
+    session.user(task);
 
-#[async_trait::async_trait]
-impl Tool for EchoTool {
-    fn name(&self) -> &str {
-        "echo"
-    }
-    fn description(&self) -> &str {
-        "Echo the `text` argument back (scaffold placeholder)."
-    }
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": { "text": { "type": "string" } },
-            "required": ["text"],
+    // Render assistant text live; surface tool activity on its own line.
+    agent
+        .run(&mut session, |ev| match ev {
+            StreamEvent::TextDelta { text } => {
+                print!("{text}");
+                let _ = std::io::stdout().flush();
+            }
+            StreamEvent::ToolUseStart { name, .. } => {
+                println!("\n[tool: {name}]");
+            }
+            _ => {}
         })
-    }
-    async fn run(&self, input: Value) -> Result<String, ToolError> {
-        input
-            .get("text")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| ToolError::InvalidInput("missing `text`".into()))
-    }
+        .await?;
+
+    println!();
+    eprintln!(
+        "[done in {} step(s); {} in / {} out tokens]",
+        session.steps, session.input_tokens, session.output_tokens
+    );
+    Ok(())
 }
