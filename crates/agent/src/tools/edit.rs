@@ -188,4 +188,22 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput(_)));
     }
+
+    #[tokio::test]
+    async fn leaves_no_temp_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "the quick brown fox").unwrap();
+        Edit.run(json!({ "path": path.to_str().unwrap(), "old_string": "quick", "new_string": "slow" }))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "the slow brown fox");
+        // The atomic write (shared with `write`'s tool) must not leave its sibling temp behind.
+        let temps: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(temps.is_empty(), "atomic write left a temp file behind");
+    }
 }

@@ -678,6 +678,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_group_concurrency_is_capped() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        // A tool that tracks how many instances of itself are in flight at once. Proves two things
+        // about `MAX_CONCURRENT_TOOL_GROUPS`: that calls actually overlap (not silently serialized),
+        // and that overlap never exceeds the cap even when a turn batches well more calls than it.
+        struct CountingTool {
+            in_flight: Arc<AtomicUsize>,
+            max_seen: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl Tool for CountingTool {
+            fn name(&self) -> &str {
+                "count"
+            }
+            fn description(&self) -> &str {
+                "tracks concurrent in-flight calls"
+            }
+            fn input_schema(&self) -> Value {
+                json!({ "type": "object" })
+            }
+            async fn run(
+                &self,
+                _input: Value,
+            ) -> std::result::Result<String, crate::error::ToolError> {
+                let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_seen.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                Ok(String::new())
+            }
+        }
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(CountingTool {
+            in_flight: in_flight.clone(),
+            max_seen: max_seen.clone(),
+        }));
+
+        // One assistant turn batching far more calls than MAX_CONCURRENT_TOOL_GROUPS — all to the
+        // same read-only tool, so each call is its own group (no `write_target`) and nothing
+        // serializes them except the concurrency cap itself.
+        const N: usize = 20;
+        let mut many_calls = vec![StreamEvent::MessageStart];
+        for i in 0..N {
+            many_calls.push(StreamEvent::ToolUseStart {
+                id: format!("c{i}"),
+                name: "count".into(),
+            });
+            many_calls.push(StreamEvent::ContentBlockStop);
+        }
+        many_calls.push(StreamEvent::MessageStop {
+            stop_reason: StopReason::ToolUse,
+        });
+
+        let (agent, _mock) = agent_with(vec![many_calls, turn::text("done")], tools);
+        let mut session = Session::new();
+        session.user("go");
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        // Every call's result landed, in call order — proves the cap's index reassembly
+        // (`results[i]`) doesn't drop or scramble a result when more groups queue behind the cap
+        // than can run at once.
+        assert_eq!(session.messages[2].content.len(), N);
+        for (i, block) in session.messages[2].content.iter().enumerate() {
+            match block {
+                ContentBlock::ToolResult { tool_use_id, .. } => {
+                    assert_eq!(tool_use_id, &format!("c{i}"));
+                }
+                other => panic!("expected ToolResult, got {other:?}"),
+            }
+        }
+
+        // The cap was actually exercised, not accidentally serial...
+        let max = max_seen.load(Ordering::SeqCst);
+        assert!(max > 1, "calls ran fully serially — concurrency isn't happening at all");
+        // ...and never exceeded MAX_CONCURRENT_TOOL_GROUPS, even with N=20 calls in flight.
+        assert!(
+            max <= MAX_CONCURRENT_TOOL_GROUPS,
+            "observed {max} calls in flight at once, exceeding the cap of {MAX_CONCURRENT_TOOL_GROUPS}"
+        );
+    }
+
+    #[tokio::test]
     async fn unknown_tool_yields_error_result() {
         let (agent, _mock) = agent_with(
             vec![

@@ -176,6 +176,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn definitions_are_sorted_by_name() {
+        struct Named(&'static str);
+        #[async_trait]
+        impl Tool for Named {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn description(&self) -> &str {
+                "stand-in for sort-order testing"
+            }
+            fn input_schema(&self) -> Value {
+                json!({ "type": "object" })
+            }
+            async fn run(&self, _: Value) -> Result<String, ToolError> {
+                Ok(self.0.into())
+            }
+        }
+        let mut reg = ToolRegistry::new();
+        // Registered out of name order — `definitions()` must still come back sorted: the Anthropic
+        // dialect anchors a prompt-cache breakpoint on the *last* tool definition, and a cache hit
+        // needs a byte-identical prefix across turns and process restarts, which `HashMap` iteration
+        // order alone doesn't guarantee.
+        for name in ["write", "bash", "edit", "read"] {
+            reg.register(Arc::new(Named(name)));
+        }
+        let names: Vec<String> = reg.definitions().into_iter().map(|d| d.name).collect();
+        assert_eq!(names, vec!["bash", "edit", "read", "write"]);
+    }
+
     #[tokio::test]
     async fn echo_runs() {
         let out = EchoTool.run(json!({ "text": "hi" })).await.unwrap();

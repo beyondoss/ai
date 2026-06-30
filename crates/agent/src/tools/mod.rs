@@ -63,6 +63,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn write_atomic_cleans_up_temp_on_rename_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        // A regular file can't be `rename`d over an existing directory (EISDIR) — forces the rename
+        // failure path without relying on permissions or a second filesystem.
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+
+        assert!(write_atomic(target.to_str().unwrap(), b"new content").is_err());
+
+        // The sibling temp file must not survive a failed rename — `write_atomic` removes it
+        // explicitly on the failure path rather than leaving litter behind.
+        let temps: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(temps.is_empty(), "failed rename left a temp file behind");
+        // The original target is untouched by the failed write.
+        assert!(target.is_dir());
+    }
+
+    #[test]
     fn default_registry_has_coding_and_beyond_tools() {
         let reg = default_registry();
         // pi's coding tools …
