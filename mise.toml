@@ -54,6 +54,13 @@ if [ -f .env ]; then set -a; . ./.env; set +a; fi
 cargo test -p beyond-ai --test smoke -- --ignored --nocapture
 """
 
+[tasks."test:smoke:agent"]
+description = "Live agent smoke: the real agent binary → real gateway → REAL Anthropic. Auto-loads .env; needs ANTHROPIC_API_KEY. Skips if unset. Bills a tiny real request."
+run = """
+if [ -f .env ]; then set -a; . ./.env; set +a; fi
+cargo test -p beyond-ai-agent --test smoke -- --ignored --nocapture
+"""
+
 [tasks."bench:unit"]
 description = "divan micro-benchmarks of the IO-free hot paths (key/peek/usage/route/deny): timing + native allocation counts."
 run = "cargo bench --bench unit"
