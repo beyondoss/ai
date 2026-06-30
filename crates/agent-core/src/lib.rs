@@ -18,6 +18,7 @@
 // job is to assert a precondition holds, so `.unwrap()` *is* the assertion — allow it under `test`.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+pub mod dialect;
 pub mod error;
 pub mod message;
 pub mod session;

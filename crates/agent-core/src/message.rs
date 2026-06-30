@@ -101,10 +101,11 @@ pub struct ToolDef {
 }
 
 /// Why the model ended a turn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {
     /// Natural end of the assistant's turn.
+    #[default]
     EndTurn,
     /// The model wants to call one or more tools; the loop should dispatch and continue.
     ToolUse,
