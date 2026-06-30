@@ -5,9 +5,9 @@ Route LLM traffic through one internal proxy. Apps use their stock OpenAI or Ant
 ## Quick Start
 
 ```sh
-cp config.example.toml config.toml
+cp crates/gateway/config.example.toml config.toml
 # Set at minimum: signing_keys and one pool key
-AI_POOL_KEY_OPENAI=sk-... cargo run --release
+AI_POOL_KEY_OPENAI=sk-... cargo run -p beyond-ai --release
 ```
 
 Point any OpenAI-wire SDK at `http://ai.internal` with a virtual key:

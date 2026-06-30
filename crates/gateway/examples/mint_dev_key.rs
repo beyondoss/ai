@@ -52,7 +52,10 @@ fn main() {
     let mut ring = Keyring::new();
     ring.insert(KID, verifying_key);
     let recovered = ring.verify(&token).expect("dev token must verify");
-    assert_eq!(recovered, vk, "verified identity must match minted identity");
+    assert_eq!(
+        recovered, vk,
+        "verified identity must match minted identity"
+    );
 
     println!("SIGNING_PUBKEY_B64={pubkey_b64}");
     println!("KID={KID}");

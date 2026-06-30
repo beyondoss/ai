@@ -2,8 +2,8 @@
 #
 # Multi-stage build for the Beyond AI gateway (`beyond-ai`).
 #
-# Built from this crate's root (it's a single standalone crate — no workspace,
-# all deps come from crates.io):
+# Built from the workspace root. The repo is a Cargo workspace; this image builds
+# only the `beyond-ai` member (`crates/gateway`). All deps come from crates.io:
 #
 #     docker build -t beyond-ai .
 #
@@ -46,12 +46,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     cargo chef cook --release --recipe-path recipe.json
 
-# Now copy the full source and build just the gateway binary.
+# Now copy the full source and build just the gateway member of the workspace.
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
-    cargo build --release --bin beyond-ai \
+    cargo build --release -p beyond-ai --bin beyond-ai \
     && cp /app/target/release/beyond-ai /usr/local/bin/beyond-ai
 
 # ---------------------------------------------------------------------------
