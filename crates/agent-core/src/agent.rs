@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
+use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::error::{Error, Result};
@@ -17,6 +18,31 @@ use crate::message::{ContentBlock, Message, StopReason, StreamEvent};
 use crate::session::Session;
 use crate::tool::ToolRegistry;
 use crate::transport::{ModelRequest, ModelTransport};
+
+/// An observable event from a run: a streamed model event, a tool-invocation boundary, or a turn
+/// boundary. The headless server serializes these to its clients; [`Agent::run`] exposes only the
+/// `Stream` events.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentEvent {
+    /// A streamed model event (text/tool deltas, usage, stop).
+    Stream(StreamEvent),
+    /// A tool is about to run, with the arguments the model supplied.
+    ToolStart {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    /// A tool finished (or errored); `result` is what's fed back to the model.
+    ToolEnd {
+        id: String,
+        name: String,
+        result: String,
+        is_error: bool,
+    },
+    /// One model turn completed.
+    TurnEnd { stop_reason: StopReason, step: u32 },
+}
 
 /// Default per-turn output token ceiling.
 const DEFAULT_MAX_TOKENS: u32 = 4096;
@@ -78,6 +104,21 @@ impl Agent {
     where
         F: FnMut(&StreamEvent),
     {
+        self.run_events(session, move |ev| {
+            if let AgentEvent::Stream(s) = &ev {
+                on_event(s);
+            }
+        })
+        .await
+    }
+
+    /// Drive the loop to completion, emitting an [`AgentEvent`] for every streamed model event, tool
+    /// invocation, and turn boundary — the full observation surface the headless server streams to
+    /// its clients. Returns when the model ends its turn without tools, or [`Error::MaxSteps`].
+    pub async fn run_events<F>(&self, session: &mut Session, mut sink: F) -> Result<()>
+    where
+        F: FnMut(AgentEvent),
+    {
         loop {
             if session.steps >= self.max_steps {
                 return Err(Error::MaxSteps(self.max_steps));
@@ -93,10 +134,17 @@ impl Agent {
                 req = req.with_system(system.clone());
             }
 
-            let turn = self.run_turn(req, &mut on_event).await?;
+            let turn = {
+                let mut emit = |ev: StreamEvent| sink(AgentEvent::Stream(ev));
+                self.run_turn(req, &mut emit).await?
+            };
             session.push(Message::assistant(turn.blocks));
             session.record_usage(turn.input_tokens, turn.output_tokens);
             session.steps += 1;
+            sink(AgentEvent::TurnEnd {
+                stop_reason: turn.stop_reason,
+                step: session.steps,
+            });
 
             // Collect the tool calls the assistant just made.
             let calls: Vec<(String, String, Value)> = session
@@ -116,6 +164,11 @@ impl Agent {
             // Run each tool and feed results back as a user turn. A tool's own failure becomes an
             // error `tool_result`, not an aborted run — the model can react to it next turn.
             for (id, name, input) in calls {
+                sink(AgentEvent::ToolStart {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                });
                 let (content, is_error) = match self.tools.get(&name) {
                     Some(tool) => match tool.run(input).await {
                         Ok(out) => (out, false),
@@ -123,21 +176,24 @@ impl Agent {
                     },
                     None => (format!("unknown tool: {name}"), true),
                 };
+                sink(AgentEvent::ToolEnd {
+                    id: id.clone(),
+                    name: name.clone(),
+                    result: content.clone(),
+                    is_error,
+                });
                 session.push(Message::tool_result(id, content, is_error));
             }
         }
     }
 
     /// Stream and assemble a single model turn into content blocks + accounting.
-    async fn run_turn<F>(&self, req: ModelRequest, on_event: &mut F) -> Result<Turn>
-    where
-        F: FnMut(&StreamEvent),
-    {
+    async fn run_turn(&self, req: ModelRequest, emit: &mut dyn FnMut(StreamEvent)) -> Result<Turn> {
         let mut stream = self.transport.stream(req).await?;
         let mut acc = Accumulator::default();
         while let Some(ev) = stream.next().await {
             let ev = ev?;
-            on_event(&ev);
+            emit(ev.clone());
             acc.apply(ev);
         }
         Ok(acc.finish())

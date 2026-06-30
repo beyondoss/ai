@@ -30,9 +30,16 @@ Everything above the wire is testable with mocks because of two trait boundaries
 - **`Tool`** — tests register a mock (`EchoTool`) to exercise dispatch without a real capability.
 - **`ModelTransport`** — tests replay scripted `StreamEvent`s to exercise the loop without a network.
 
+## Observation surface
+
+`Agent::run` exposes only streamed model events (`FnMut(&StreamEvent)`); `Agent::run_events` exposes
+the full [`AgentEvent`] stream — `Stream(StreamEvent)`, `ToolStart`/`ToolEnd` (tool boundaries), and
+`TurnEnd`. The headless `serve` in the `beyond-ai-agent` crate serializes these to its clients.
+
 ## Milestone status
 
-Scaffolded: the type model, the `Tool`/`ToolRegistry` seam, the `ModelTransport` seam, `Session`,
-and errors — all unit-tested. **Not yet built:** the wire dialect adapters (OpenAI + Anthropic), the
-HTTP-to-gateway transport, the agent loop itself, and the `serve` control API. See the repo plan for
-the milestone sequence (M2–M8).
+Built and tested: the type model, the `Tool`/`ToolRegistry` seam, the `ModelTransport` seam +
+`GatewayClient` HTTP transport, `MockTransport`, the OpenAI/Anthropic wire dialects, the agent loop
+(`run`/`run_events`), and `Session`. The coding tools, the `run` CLI, and the headless `serve`
+control protocol live in the `beyond-ai-agent` crate. Remaining: the Beyond platform tools
+(fork/sync/logs) and the full gateway e2e (M8).

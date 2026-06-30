@@ -28,7 +28,7 @@ pub mod session;
 pub mod tool;
 pub mod transport;
 
-pub use agent::Agent;
+pub use agent::{Agent, AgentEvent};
 pub use client::GatewayClient;
 pub use error::{Error, Result, ToolError};
 pub use message::{ContentBlock, Message, Role, StopReason, StreamEvent, ToolDef};
