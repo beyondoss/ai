@@ -24,9 +24,9 @@ pub enum Error {
     /// The model transport failed (network, decode, gateway error).
     #[error("transport error: {0}")]
     Transport(String),
-    /// The model asked for a tool that isn't registered.
-    #[error("unknown tool: {name}")]
-    UnknownTool { name: String },
+    // Note: an unknown tool is *not* an `Error`. The loop turns it into an error `tool_result`
+    // (`is_error: true`) the model can react to next turn, never aborting the run — so there is no
+    // fatal `UnknownTool` variant by design.
     /// The loop hit its step ceiling without the model ending its turn.
     #[error("reached max steps ({0}) without completion")]
     MaxSteps(u32),

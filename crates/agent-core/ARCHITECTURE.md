@@ -1,46 +1,326 @@
-# Beyond Agent Harness — Core Architecture
+# agent-core Architecture
 
-`beyond-ai-agent-core` (lib `agent_core`) is the runtime-agnostic core of the Beyond agent harness,
-modeled on [Pi](https://github.com/badlogic/pi-mono) (`pi-agent-core` + the dialect half of `pi-ai`)
-and ported to Rust. It holds **no** HTTP, provider, or executor code, so it unit-tests without a
-network or a live model — the same discipline the gateway uses to keep its logic testable without
-Pingora.
+`agent_core` (package `beyond-ai-agent-core`) takes a [`Session`](src/session.rs) (message history)
+and an [`Agent`](src/agent.rs) config (model, tools, transport) and drives the model-turn / tool-call
+loop to completion, mutating the session in place and emitting an [`AgentEvent`](src/agent.rs) per
+streamed token, tool boundary, and turn boundary. It contains no HTTP server, no provider SDK, and no
+executor — its only network dependency is a `ModelTransport` trait it never implements itself in
+production except via the included `GatewayClient`, an HTTP client that speaks OpenAI/Anthropic wire to
+a Beyond gateway base URL.
 
-## The Beyond twist
+## What this crate is not
 
-The model layer never manages provider keys or endpoints. It speaks OpenAI/Anthropic **wire** to the
-Beyond gateway, which owns routing, auth, and metering. So the only part of `pi-ai` worth porting is
-the **dialect-agnostic message model**; provider selection is the gateway's job. The agent crate has
-**no dependency on the gateway crate** — its sole contract is HTTP wire to a base URL.
+It ships **zero concrete `Tool` implementations** — `Read`/`Write`/`Edit`/`Bash`/`fork`/`sync`/`logs`
+all live in `crates/agent`. It has **no dependency on the gateway crate** — `GatewayClient`'s entire
+contract is "POST dialect JSON to a base URL, get SSE back"; routing, provider auth, and metering are
+the gateway's job. This split is what lets the loop, the dialect adapters, and the tool dispatch logic
+run as pure unit tests with `MockTransport` — no network, no live model, no gateway binary.
 
-## Modules
+## Data Flow
 
-| Module      | Type                 | Role                                                                                                                                                                                                                                    |
-| ----------- | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `message`   | data                 | Dialect-agnostic conversation model: `Role`, `ContentBlock` (`Text`/`ToolUse`/`ToolResult`), `Message`, `ToolDef`, `StreamEvent`, `StopReason`. The single internal representation; wire adapters map it to/from each provider's shape. |
-| `tool`      | seam (extensibility) | `Tool` trait + `ToolRegistry`. Capabilities are registered values — the core four (Read/Write/Edit/Bash) and Beyond primitives (fork/sync/logs) are all just tools. Last-registration-wins lets an extension override a built-in.       |
-| `transport` | seam (network)       | `ModelRequest` + `ModelTransport` trait returning an `EventStream` of `StreamEvent`s. The loop depends only on this; the real gateway client and the test `MockTransport` both implement it.                                            |
-| `session`   | data                 | `Session`: message history + token/step counters. `serde`-serializable so a headless run persists and a client can reattach.                                                                                                            |
-| `error`     | data                 | `Error` (loop/transport) and `ToolError` (a tool's own failure → an error `tool_result`, not an aborted run).                                                                                                                           |
+### The turn loop (`Agent::run_events`)
 
-## The two seams
+```
+Session.messages (Arc, shared) ──► ModelRequest ──► ModelTransport::stream() ──► EventStream<StreamEvent>
+       ▲                                                                                  │
+       │                                                                     Accumulator::apply (fold)
+       │                                                                                  │
+       │                                                                  Turn{blocks, stop_reason, usage}
+       │                                                                                  │
+       │                                                       session.push(Message::assistant(blocks))
+       │                                                              session.steps += 1; sink(TurnEnd)
+       │                                                                                  │
+       │                                              stop_reason != ToolUse, or no tool_use blocks?
+       │                                                              │                              │
+       │                                                             Yes                             No
+       │                                                              │                              │
+       │                                                          return Ok(())          sink(ToolStart) × N (call order)
+       │                                                                                              │
+       │                                                                     join_all([tool.run(input); N])  ◄── concurrent
+       │                                                                                              │
+       │                                                              sink(ToolEnd) × N (call order, post-join)
+       │                                                                                              │
+       └──────────────────────────────── session.push(Message::tool_results([ToolResult; N])) ◄──── one `user` turn
+                                                          (loop back to ModelRequest)
 
-Everything above the wire is testable with mocks because of two trait boundaries:
+Error exits (no session mutation for the failed turn):
+  session.steps >= max_steps  ──► Err(MaxSteps)                [checked before the request is built]
+  stream() / stream item Err  ──► Err(Transport(..))            [network, non-2xx, bad UTF-8, bad SSE json]
+  bad_tool_args present       ──► Err(MalformedToolInput(..))   [Accumulator::finish, after stream ends]
+```
 
-- **`Tool`** — tests register a mock (`EchoTool`) to exercise dispatch without a real capability.
-- **`ModelTransport`** — tests replay scripted `StreamEvent`s to exercise the loop without a network.
+### Bytes to `StreamEvent` (`GatewayClient` + `dialect`)
 
-## Observation surface
+```
+TCP chunks (Bytes) ──► Vec<u8> byte buffer ──split on '\n'──► whole UTF-8 line ──► push_sse_line()
+                                                                                          │
+                                                                     strip "data:" prefix; skip blank/
+                                                                     comment/`event:`/`[DONE]` lines
+                                                                                          │
+                                                                    serde_json::from_str(payload) → Value
+                                                                                          │
+                                                                    Dialect::Decoder::push(&Value)
+                                                                                          │
+                                                                          0..N StreamEvent
+```
 
-`Agent::run` exposes only streamed model events (`FnMut(&StreamEvent)`); `Agent::run_events` exposes
-the full [`AgentEvent`] stream — `Stream(StreamEvent)`, `ToolStart`/`ToolEnd` (tool boundaries), and
-`TurnEnd`. The headless `serve` in the `beyond-ai-agent` crate serializes these to its clients.
+Anthropic emits an explicit `content_block_stop` per block; OpenAI doesn't, so its decoder synthesizes
+`ContentBlockStop` when a tool call's `id` arrives (closing the prior block) or `finish_reason` shows
+up, and defers `MessageStop` to `Decoder::finish()` so it lands after the trailing usage-only chunk.
+Both decoders produce the identical `StreamEvent` sequence shape — the loop's `Accumulator` is
+dialect-blind.
 
-## Milestone status
+## Concepts & Terminology
 
-Complete. Built and tested: the type model, the `Tool`/`ToolRegistry` seam, the `ModelTransport`
-seam + `GatewayClient` HTTP transport, `MockTransport`, the OpenAI/Anthropic wire dialects, the agent
-loop (`run`/`run_events`), and `Session`. The coding tools (read/write/edit/bash/ls/grep/find), the
-Beyond platform tools (fork/sync/logs), the `run` CLI, and the headless `serve` control protocol live
-in the `beyond-ai-agent` crate. End-to-end proven against the real `beyond-ai` gateway binary
-(auth + key-swap + routing) through to a mock upstream.
+| Term              | What It Controls                                                                 | NOT                                                          |
+| ----------------- | ---------------------------------------------------------------------------------- | ------------------------------------------------------------- |
+| `Dialect`         | Which wire shape (`/v1/messages` vs `/v1/chat/completions`) a model id maps to    | Not which *provider* serves the request — that's gateway routing on the virtual key |
+| `ModelTransport`  | The loop's only network seam; turns a `ModelRequest` into an `EventStream`        | Not the gateway client specifically — `MockTransport` is the other implementor |
+| `Session`         | One run's message history + step/token counters, Arc-shared, serde round-trips   | Not multi-session storage — one `Session` is one conversation |
+| `ToolRegistry`    | Name → `Arc<dyn Tool>` lookup the loop dispatches against                          | Not a sandbox or permission system — any registered tool runs unconditionally on a model-supplied name match |
+| `ToolError`       | A tool's own failure → an error `tool_result` fed back to the model                | Not a loop-aborting error — the run continues             |
+| `Error`           | A loop/transport failure → `run`/`run_events` returns `Err`, the in-flight turn is discarded | Not surfaced to the model — there's no turn to attach it to |
+| `StreamEvent`      | The normalized unit both dialect decoders emit; what `Accumulator` folds          | Not the wire format — it's the post-translation internal shape |
+| `ContentBlock`     | One piece of a `Message` (`Text` / `ToolUse` / `ToolResult`)                       | Not a streaming unit — it's the assembled, turn-final form  |
+| `AgentEvent`       | The full observation surface (`Stream`/`ToolStart`/`ToolEnd`/`TurnEnd`)            | Not exposed by `Agent::run` — that filters to `Stream` only |
+| `max_steps`        | Loop-iteration ceiling; one step = one model turn (tool dispatch doesn't increment it again) | Not a token or wall-clock budget                |
+
+## Core Mechanism
+
+### Accumulating a turn (`agent.rs::Accumulator`)
+
+`Accumulator` folds a `StreamEvent` sequence into `Vec<ContentBlock>` + stop reason + token counts:
+text deltas accrue into a `String` buffer; a `ToolUseStart` flushes any open text run and opens a
+`(id, name, json-buffer)` tuple; `InputJsonDelta` fragments append to that buffer; `ContentBlockStop`
+finalizes whichever is open (parsing the buffered JSON, or `{}` if it was empty). If the buffered tool
+arguments never parse as JSON, the *first* failure is held in `bad_tool_args` rather than raised
+immediately — `Accumulator::finish()` (called once the stream ends) fails the whole turn with
+`Error::MalformedToolInput` instead of handing the tool a `null`-input call it can only report as an
+opaque "missing field" error. See `agent.rs:296-335`.
+
+Edge case: `stop_reason` defaults to `StopReason::EndTurn` and usage defaults to `0`/`0` if the stream
+never delivers a `MessageStop`/`Usage` event before closing cleanly (e.g. a non-conformant upstream) —
+the turn completes as if the model ended normally, with no token accounting, rather than erroring.
+
+### Concurrent tool dispatch
+
+Once an assistant turn's `tool_uses()` are collected, all of a turn's calls are launched via
+`futures::future::join_all` and awaited together (`agent.rs:193-207`) — not run one at a time. The
+transcript stays deterministic regardless of which tool finishes first: every `ToolStart` is sunk
+*before* the join (in call order), and every `ToolEnd` + `ToolResult` block is sunk and collected
+*after* the join, zipped back against the original `calls` order — so the wall-clock savings never
+leak into transcript ordering.
+
+All of a turn's results are folded into **one** `Message::tool_results([...])` user turn, not one
+message per result (`message.rs:85-94`). Anthropic carries a turn's tool results as multiple blocks on
+a single `user` turn and rejects two consecutive same-role messages, so N separate `user` messages
+would 400 the next request whenever the model batched more than one tool call.
+
+### Session history sharing
+
+`Session.messages` is `Arc<Vec<Message>>`. `Session::push` mutates via `Arc::make_mut` — in place when
+the session solely owns the `Arc` (the steady state between turns), cloning only if a still-live
+`ModelRequest` snapshot holds the same pointer. `ModelRequest::messages` and `Agent::tool_defs` are
+both `Arc`-shared for the same reason: building a request clones a pointer, not a deep copy of a
+history that grows every step (an O(n²) cost over a long run otherwise) or a tool-definition list with
+embedded JSON Schemas. `tool_defs` specifically is computed once in `Agent::with_tools`, not rebuilt
+per turn. See `agent.rs:tests::request_snapshots_are_isolated_across_turns` for the isolation guarantee
+this depends on: an in-flight request's message snapshot must not retroactively see a later turn's
+appends.
+
+### SSE byte framing
+
+`GatewayClient::stream` buffers raw `Vec<u8>`, not a per-chunk lossy-decoded `String`. A TCP/HTTP chunk
+boundary can land inside a multi-byte UTF-8 character; `from_utf8_lossy` per chunk would replace each
+half with `U+FFFD`, silently corrupting non-ASCII tool arguments or prose. Since `\n` (0x0A) never
+appears inside a UTF-8 multi-byte sequence, every newline-terminated line is guaranteed whole UTF-8 —
+only the unterminated tail is buffered across chunks (`client.rs:83-113`). Verified against a real
+socket that splits a write inside a 4-byte emoji (`tests/client_socket.rs`).
+
+## State Machine
+
+### Loop-level (`Agent::run_events`)
+
+```
+        ┌────────────────────────────────────────────────────────────────────┐
+        │                                                                    │
+        ▼                                                                    │
+  [check steps]──steps≥max_steps──► Err(MaxSteps)                            │
+        │ steps<max_steps                                                    │
+        ▼                                                                    │
+  [request built] ──stream()/stream item Err──► Err(Transport)               │
+        │ stream exhausts cleanly                                            │
+        ▼                                                                    │
+  [turn assembled] ──bad_tool_args──► Err(MalformedToolInput)                │
+        │ ok                                                                 │
+        ▼                                                                    │
+  [pushed to session, steps+=1, TurnEnd sunk]                                │
+        │                                                                    │
+        ├──stop_reason≠ToolUse OR no tool_use blocks──► Ok(()) [done]        │
+        │                                                                    │
+        └──ToolUse + calls present──► [dispatch tools concurrently] ─────────┘
+              ToolStart×N (pre-join) → join_all → ToolEnd×N + tool_results pushed
+```
+
+| From             | Event                              | To                     | Guard                  | What Actually Happens                                              |
+| ---------------- | ----------------------------------- | ---------------------- | ----------------------- | -------------------------------------------------------------------- |
+| (loop top)       | iteration begins                    | Err(MaxSteps)          | `steps >= max_steps`    | No request sent; session unchanged                                  |
+| (loop top)       | iteration begins                    | request built          | `steps < max_steps`     | `ModelRequest` cloned (Arc pointers) from session + cached tool defs |
+| request built    | `transport.stream()` / stream item  | Err(Transport)         | network/HTTP/decode err | Turn discarded; nothing pushed; error returned from `run`/`run_events` |
+| request built    | stream exhausts                     | turn assembled         | `bad_tool_args.is_none()` | `Accumulator::finish()` returns `Turn`                              |
+| request built    | stream exhausts                     | Err(MalformedToolInput) | `bad_tool_args.is_some()` | Turn discarded; assistant message never pushed                      |
+| turn assembled   | —                                    | turn pushed            | —                        | `session.push(assistant)`, `record_usage`, `steps += 1`, `TurnEnd` sunk |
+| turn pushed      | no tool_use blocks / `stop_reason != ToolUse` | done (`Ok`)    | —                        | Returns to caller; session ends on the assistant turn                |
+| turn pushed      | `tool_use` blocks present, `ToolUse` | dispatching tools      | —                        | `ToolStart` sunk per call, in call order                            |
+| dispatching tools | `join_all` resolves                | (loop top, next iter)  | —                        | `ToolEnd` sunk + one `tool_results` user message pushed, in call order |
+
+### Per-block accumulation (`Accumulator`)
+
+| From        | Event                | To          | What Actually Happens                                  |
+| ----------- | --------------------- | ----------- | --------------------------------------------------------- |
+| none open   | `TextDelta`           | text open   | Appends to the text buffer                               |
+| text open   | `TextDelta`           | text open   | Appends                                                    |
+| text open   | `ToolUseStart`        | tool open   | Flushes the text buffer as a `ContentBlock::Text`         |
+| none open   | `ToolUseStart`        | tool open   | Opens `(id, name, "")`                                    |
+| tool open   | `InputJsonDelta`      | tool open   | Appends to the JSON argument buffer                        |
+| text open   | `ContentBlockStop`    | none open   | Flushes text block                                          |
+| tool open   | `ContentBlockStop`    | none open   | Parses the JSON buffer; on parse failure, records `bad_tool_args` (first only) and pushes `ToolUse` with `Value::Null` input — but the turn still fails in `finish()` |
+
+## Why It Behaves This Way
+
+### Why tool calls run concurrently but the transcript stays ordered
+
+Tools are I/O-bound (file reads, shell commands, the `beyond` CLI) and a model routinely batches
+independent calls in one turn. Running them serially makes the tool phase the sum of their latencies;
+`join_all` collapses it to the slowest member. Determinism is preserved by separating *when results
+become available* (whichever order, via the join) from *when they're observed* (always re-zipped
+against the original `calls` order before sinking/pushing) — see `agent.rs:tests::independent_tool_calls_run_concurrently`,
+which deadlocks under serial dispatch by design, to prove the concurrency.
+
+### Why tool results batch into one user message
+
+Both the internal model and Anthropic's wire carry a turn's tool results as multiple blocks on a
+single `user` message; Anthropic additionally rejects two consecutive same-role messages. A turn that
+calls N>1 tools, fed back as N separate `user` messages, would 400 on the very next request. Folding
+them into one message isn't a style choice — it's required by the wire contract on the dialect this
+crate's vocabulary is modeled on.
+
+### Why session history and tool defs are `Arc`-shared with copy-on-write
+
+A naive `Vec<Message>` cloned into every `ModelRequest` is an O(n²) cost over a long-running session
+(each of n turns deep-copies a history of average size n/2). Sharing via `Arc` makes building a request
+a pointer clone; `Arc::make_mut` on `push` keeps appends in-place in the common case (no live request
+still holds the old snapshot) and falls back to a real clone only when one does — which is also what
+*must* happen for request-snapshot isolation: a request built from turn 3's history must not silently
+see turn 4's appended tool results.
+
+### Why the SSE client buffers bytes instead of decoding each chunk independently
+
+A chunk boundary from the underlying TCP stream can fall inside a multi-byte UTF-8 character. Decoding
+each chunk independently with `from_utf8_lossy` would replace the split character's bytes with
+`U+FFFD` on both sides — a silent, undetectable corruption of tool arguments or assistant prose. Lines
+are the unit of decoding instead of chunks because `\n` is guaranteed never to occur inside a UTF-8
+multi-byte sequence, so a whole line is always whole UTF-8.
+
+### Why the read timeout is 600s and only an idle timeout
+
+This client sits downstream of the Beyond gateway, which applies its own 600s idle read timeout to the
+*provider* connection — the gateway can legitimately hold this connection open with no bytes for up to
+600s while waiting on a slow provider (e.g. an extended-thinking gap). A downstream hop's patience must
+be at least its upstream's, so `READ_TIMEOUT` mirrors the gateway's `read_timeout_secs` exactly, and is
+applied between reads (not as a `Client::timeout` over the whole response) so a long-but-healthy stream
+is never killed mid-flight.
+
+### Why malformed streamed tool arguments fail the turn instead of dispatching with null
+
+Handing a tool `Value::Null` input lets it fail, but only with an opaque "missing field" error that
+hides the real problem (a transport/decode bug, not a model mistake). Treating it as a protocol failure
+— `Error::MalformedToolInput` — fails the turn before any tool runs and surfaces the actual offending
+buffer to the caller.
+
+### Why dialect selection is a model-id prefix check, not configuration
+
+The gateway relays bytes verbatim; it doesn't translate dialects. Per the "Beyond twist," provider
+*selection* (which upstream serves a request) is the gateway's job via the virtual key, but wire
+*shape* (`/v1/messages` vs `/v1/chat/completions`) is this crate's job, because the gateway has no
+opinion on it. `Dialect::for_model` (`claude*`/`*anthropic*` → Anthropic, else OpenAI) is the entire
+selection mechanism — adding a model never requires touching the gateway.
+
+## Trust Boundaries
+
+**What the system verifies (rejects if invalid):**
+
+- HTTP status: a non-2xx response from the gateway is read as text and surfaced as
+  `Error::Transport`, never silently treated as a successful empty stream.
+- UTF-8 validity of each framed SSE line (`Error::Transport("invalid UTF-8 in SSE stream")`).
+- JSON well-formedness of each SSE `data:` payload (`Error::Transport("malformed SSE json")`).
+- JSON well-formedness of a streamed tool call's assembled arguments (`Error::MalformedToolInput`).
+
+**What passes through unchecked:**
+
+- The model-supplied tool `name`/`input` pair: the loop looks the name up in the `ToolRegistry` and,
+  if present, hands `input` to that tool's `run()` with **no schema validation against the advertised
+  `input_schema`** at the loop layer — each `Tool` impl is solely responsible for validating its own
+  arguments (see `EchoTool` checking `input.get("text")` itself).
+- The remote gateway's identity beyond TLS trust-store validation via `rustls` defaults — there's no
+  certificate pinning, no response signing, nothing that distinguishes "the real gateway" from "anything
+  that answers on `base_url` with a 2xx and parseable SSE."
+- `ToolError`'s `Display` text (including a wrapped `std::io::Error`'s message, which can contain
+  filesystem paths) is fed back to the model verbatim as `ToolResult.content` — no redaction.
+- The `api_key` is sent as a bearer token over whatever scheme `base_url` specifies; the client itself
+  doesn't require or enforce `https://`.
+
+**Why these boundaries are where they are:**
+
+- Provider auth, key-swap, and routing are explicitly the gateway's job (the "Beyond twist" in the
+  crate's design) — this crate's contract ends at "valid HTTP wire to a base URL," so it has no basis
+  to verify gateway identity beyond what `rustls`'s trust store already does.
+- Tool input validation is pushed to each `Tool` because the registry is generic over an open-ended,
+  pluggable set of capabilities (`crates/agent` registers 10; nothing stops a caller registering more)
+  — there's no single schema the loop could enforce centrally beyond "is this valid JSON," which the
+  `Accumulator` already does.
+
+## Package Structure
+
+| File                          | What It Does                                                                                                   |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
+| `lib.rs`                       | Crate root: module list, public re-exports, and the crate-wide `#![cfg_attr(test, allow(...))]` panic-free gate |
+| `agent.rs`                     | `Agent` config + `run`/`run_events` loop, `Accumulator` (StreamEvent → ContentBlock), concurrent tool dispatch  |
+| `message.rs`                   | `Role`/`ContentBlock`/`Message`/`ToolDef`/`StopReason`/`StreamEvent` — the dialect-agnostic internal model       |
+| `tool.rs`                      | `Tool` trait + `ToolRegistry` (name-keyed `Arc<dyn Tool>` map, last-registration-wins)                          |
+| `transport.rs`                 | `ModelRequest`, `ModelTransport` trait, `EventStream` alias — the loop's sole network-facing dependency          |
+| `client.rs`                    | `GatewayClient`: the production `ModelTransport`; HTTP POST + chunked-SSE byte framing into whole UTF-8 lines    |
+| `dialect/mod.rs`                | `Dialect` enum (model-id → wire selection), `StreamDecoder` trait, SSE line-splitting (`push_sse_line`/`decode_sse`) |
+| `dialect/anthropic.rs`         | `/v1/messages` body builder + decoder — near-identity, since the internal model is Anthropic-shaped              |
+| `dialect/openai.rs`            | `/v1/chat/completions` body builder + decoder — real translation: flattened messages, string-encoded tool args, synthesized block-stop events |
+| `session.rs`                   | `Session`: Arc-shared copy-on-write message history + step/token counters, serde round-trippable                |
+| `error.rs`                     | `Error` (loop/transport, aborts the run) and `ToolError` (tool failure, becomes an error `tool_result`)         |
+| `mock.rs`                      | `MockTransport` + `turn::{text, tool_call}` builders — scripted, no-network loop testing                        |
+| `tests/client_socket.rs`       | `GatewayClient` over a real TCP socket: SSE decode, UTF-8 chunk-split reassembly, HTTP-error surfacing            |
+
+## Configuration
+
+| Setting                          | Default | What It Controls                                                                                     |
+| ---------------------------------- | ------- | --------------------------------------------------------------------------------------------------------- |
+| `DEFAULT_MAX_TOKENS` / `Agent::with_max_tokens` | 4096    | Per-turn output token ceiling (`max_tokens` in every dialect's request body)                          |
+| `DEFAULT_MAX_STEPS` / `Agent::with_max_steps`   | 24      | Loop-iteration ceiling; once `session.steps` reaches it, the *next* iteration returns `Error::MaxSteps` before sending a request — a runaway-tool-call backstop |
+| `Agent::with_system`              | `None`  | System prompt; hoisted to each dialect's native system field (Anthropic top-level `system`, OpenAI leading `system` message) |
+| `Agent::with_tools`               | empty   | The tool set advertised to the model; definitions + JSON Schemas computed once here, shared via `Arc<[ToolDef]>` for the agent's lifetime |
+| `CONNECT_TIMEOUT` (`client.rs`)   | 10s     | TCP+TLS handshake cap to the gateway; mirrors the gateway's own upstream `connect_timeout_secs`        |
+| `READ_TIMEOUT` (`client.rs`)      | 600s    | Idle timeout *between* reads on the streaming body (not total stream duration); sized to the gateway's own upstream `read_timeout_secs` |
+
+## Failure Modes
+
+| Failure                                                  | What Actually Happens                                                                                              | Recovery                                                                 |
+| ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| `session.steps` reaches `max_steps`                       | `run_events` returns `Error::MaxSteps(n)` before another request is sent; session retains every completed turn        | Caller persists/inspects `Session`; can raise `max_steps` and resume     |
+| Gateway returns non-2xx                                   | Body read as text; `Error::Transport("gateway returned {status}: {detail}")` returned from `stream()`                  | First `run`/`run_events` call errors; session has no partial turn       |
+| SSE chunk splits a multi-byte UTF-8 char                  | Raw bytes buffered across chunks; decoding waits for the newline, so the split is invisible                            | Transparent — no error (regression-tested over a real socket)            |
+| SSE-framed line isn't valid UTF-8                          | `Error::Transport("invalid UTF-8 in SSE stream: …")` from inside the event stream                                      | Stream item `Err`; in-progress turn discarded, error returned             |
+| SSE `data:` payload isn't valid JSON                        | `Error::Transport("malformed SSE json: …")`                                                                              | Same as above                                                              |
+| Streamed tool-call JSON never completes/parses              | `Accumulator::finish()` returns `Error::MalformedToolInput(raw_buffer)` instead of dispatching with `null` input        | Turn discarded before any tool runs; assistant message never pushed       |
+| Model calls an unregistered tool name                      | That call's result becomes `("unknown tool: {name}", is_error: true)`                                                   | Not fatal — fed back as an error `tool_result` the model sees next turn   |
+| A registered tool's `run()` returns `Err`                  | The error's `Display` text becomes `ToolResult.content` with `is_error: true`                                          | Not fatal — same as above                                                  |
+| Stream ends cleanly without a `MessageStop`/`Usage` event   | `stop_reason` defaults to `EndTurn`, token counts default to `0` — the turn looks like a normal completion             | Silent — no error surfaced; usage accounting is simply incomplete for that turn |
+| Gateway holds the connection open with no bytes for >600s   | `reqwest`'s idle read timeout fires; the in-flight request errors                                                       | Surfaces as a transport `Error`; no automatic retry in this crate          |
+| A `Mutex` in `MockTransport` is poisoned by a panicked test thread | `.unwrap_or_else(|e| e.into_inner())` recovers the data instead of returning an empty/misleading state           | Test-only path — this crate holds no `Mutex` outside `mock.rs`            |

@@ -77,12 +77,34 @@ impl Tool for Edit {
                 content.replacen(old.as_str(), new, 1)
             };
         }
-        std::fs::write(path, content)
+        write_atomic(path, &content)
             .map_err(|e| ToolError::Execution(format!("write {path}: {e}")))?;
         Ok(format!(
             "edited {path} ({applied} replacement{})",
             if applied == 1 { "" } else { "s" }
         ))
+    }
+}
+
+/// Overwrite `path` atomically: write a sibling temp file, then `rename` it over the target.
+/// `rename(2)` is atomic on a single filesystem, so a concurrent reader — or a crash mid-write —
+/// sees either the original file or the fully-edited one, never a half-written source file. A bare
+/// `std::fs::write` truncates in place and would leave a partial file if the process died between
+/// truncation and the final byte. The temp file is a sibling (same directory) so the rename stays
+/// within one filesystem.
+fn write_atomic(path: &str, content: &str) -> std::io::Result<()> {
+    let p = std::path::Path::new(path);
+    let tmp = match p.file_name() {
+        Some(name) => p.with_file_name(format!(".{}.tmp", name.to_string_lossy())),
+        None => return Err(std::io::Error::other(format!("invalid path: {path}"))),
+    };
+    std::fs::write(&tmp, content)?;
+    match std::fs::rename(&tmp, p) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp); // don't leave the temp behind on failure
+            Err(e)
+        }
     }
 }
 

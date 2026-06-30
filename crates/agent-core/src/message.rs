@@ -82,6 +82,17 @@ impl Message {
         }
     }
 
+    /// A user turn carrying the results of a batch of tool calls — one `ToolResult` block each, on a
+    /// single message. The model returns all of a turn's tool results on one `user` turn, and
+    /// Anthropic rejects consecutive same-role messages, so a turn that called N tools must fold its N
+    /// results into one message rather than emit N separate ones.
+    pub fn tool_results(blocks: Vec<ContentBlock>) -> Self {
+        Self {
+            role: Role::User,
+            content: blocks,
+        }
+    }
+
     /// The `ToolUse` blocks in this message, if any (what the loop dispatches each step).
     pub fn tool_uses(&self) -> impl Iterator<Item = (&str, &str, &Value)> {
         self.content.iter().filter_map(|b| match b {

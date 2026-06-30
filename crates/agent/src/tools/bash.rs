@@ -96,22 +96,29 @@ impl Tool for Bash {
     }
 }
 
-/// Keep the head and tail of oversized output; the middle is what's least useful to the model.
+/// Keep the head and tail of oversized output; the middle is what's least useful to the model. The
+/// `half` budget is in bytes (matching the `MAX_OUTPUT` byte check), snapped to char boundaries so we
+/// never slice mid-codepoint — one pass per end, no intermediate allocations.
 fn truncate(s: String) -> String {
     if s.len() <= MAX_OUTPUT {
         return s;
     }
     let half = MAX_OUTPUT / 2;
-    let head: String = s.chars().take(half).collect();
-    let tail: String = s
-        .chars()
-        .rev()
-        .take(half)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
-    format!("{head}\n… (output truncated) …\n{tail}")
+    // Head: largest char boundary <= half.
+    let mut head_end = half.min(s.len());
+    while !s.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    // Tail: smallest char boundary >= len - half.
+    let mut tail_start = s.len() - half;
+    while !s.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!(
+        "{}\n… (output truncated) …\n{}",
+        &s[..head_end],
+        &s[tail_start..]
+    )
 }
 
 #[cfg(test)]

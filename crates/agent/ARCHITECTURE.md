@@ -1,0 +1,364 @@
+# Beyond Agent Harness — CLI & Tools Architecture
+
+`beyond-ai-agent` (lib `beyond_ai_agent`, bin `beyond-ai-agent`) takes a task prompt or a stream of
+NDJSON commands on stdin and turns them into a running coding agent: it drives
+[`agent_core::Agent`](../agent-core/ARCHITECTURE.md) through a fixed set of ten tools (file I/O,
+search, shell, Beyond-platform) and streams the model's text and tool activity back out — to stdout
+for a one-shot `run`, or as NDJSON event frames for a headless `serve` session. It holds no provider
+keys and makes no provider-specific decisions; all model traffic is one HTTP POST per turn to a
+Beyond gateway, authenticated with a `bai_v1` virtual key (or a BYO key the gateway forwards as-is).
+
+This crate is the "everything above the wire" layer. `agent_core` owns the message model, the loop,
+and the two seams (`Tool`, `ModelTransport`); this crate is the concrete `Tool` implementations, the
+CLI, and the `serve` control protocol built on top of them.
+
+---
+
+## Data Flow
+
+### `run` — one-shot CLI
+
+```
+beyond-ai-agent run "<task>"
+   │
+   ▼
+Session::new() + user(task)
+   │
+   ▼
+Agent::run (agent_core loop; see agent-core/ARCHITECTURE.md for the loop itself)
+   │  each step:
+   │   ├─ POST one model turn → gateway → provider ──── network/4xx/5xx ──► Error::Transport, exit ≠0
+   │   ├─ StreamEvent::TextDelta   ───────────────────────────────────────► stdout (printed live)
+   │   ├─ StreamEvent::ToolUseStart ──────────────────────────────────────► stdout "\n[tool: name]"
+   │   └─ assistant turn carries tool_use blocks → ToolRegistry.get(name)
+   │        │
+   │        ├─ found    → tool.run(input) → Ok(text) / Err(ToolError) ──► tool_result (is_error?)
+   │        └─ not found → "unknown tool: <name>" ───────────────────────► tool_result, is_error=true
+   │
+   ▼ (model ends its turn without a tool_use, or session.steps == max_steps)
+stdout: trailing newline
+stderr: "[done in N step(s); X in / Y out tokens]"   (or the propagated Error::MaxSteps / Error::Transport)
+```
+
+### `serve` — headless NDJSON control protocol
+
+```
+stdin (one JSON command per line)              stdout (one JSON frame per line, single writer task)
+  │                                                   ▲
+  ▼                                                   │
+serve() boot: load --session-file or Session::new()   │
+  │                                                    ├── {"type":"ready", session_id, model}
+  ▼                                                    │
+loop over stdin lines ──────────────────────────────► │
+  │                                                    │
+  ├─ {"type":"prompt", message} ─────────────────────► event* (Stream / ToolStart / ToolEnd / TurnEnd)
+  │     session.user(message)                          response{command:"prompt", success, data:{steps,
+  │     Agent::run_events(session, |ev| tx.send(ev))            input_tokens, output_tokens}}
+  │     save_session(--session-file)  [write error → stderr only, turn still reports success]
+  │
+  ├─ {"type":"get_state"} ───────────────────────────► response{data:{session_id, model, steps,
+  │                                                              message_count, input/output_tokens}}
+  ├─ {"type":"get_messages"} ────────────────────────► response{data:{messages:[...]}}
+  ├─ {"type":"new_session"} ─────────────────────────► response{data:{session_id}}  (fresh Session,
+  │                                                              persisted if --session-file is set)
+  └─ invalid JSON / unknown "type" ──────────────────► response{success:false, error}
+
+stdin EOF  →  out_tx dropped → writer drains queued frames → process exits Ok(())
+stdout write fails (broken pipe) → writer task exits its loop → next emit! observes a closed
+                                     channel → main loop breaks → process exits Ok(())
+```
+
+A `prompt`'s tool calls are NOT shown above as a separate fan-out: `agent_core::Agent::run_events`
+runs every tool the model batched in one turn **concurrently** (`futures::join_all`), but always
+emits `ToolStart` for all of them up front, then `ToolEnd`s in original call order after the join —
+so the NDJSON stream a client sees is deterministic regardless of which tool finishes first.
+
+---
+
+## Concepts & Terminology
+
+| Term                          | What It Controls                                                                                 | NOT                                                                               |
+| ------------------------------ | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| **Tool**                       | A registered capability the model invokes by name + JSON input (`agent_core::Tool` impl)          | Not necessarily a subprocess — only `bash`/`fork`/`sync`/`logs` shell out; the rest touch the filesystem in-process |
+| **`ToolRegistry`**              | The name → `Tool` map advertised to the model every turn (`default_registry()`, fixed at 10)      | Not per-session or hot-reloadable — one registry is built once at `Agent` construction and reused for the process's life |
+| **`CommandRunner`**             | The seam between a tool and real process execution (`exec.rs`)                                    | Not a sandbox — `RealRunner` execs `sh -c …` / `beyond …` with the host process's full ambient privilege |
+| **`Session`**                   | Message history + step/token counters; optionally `serde`-persisted to `--session-file`           | Not multi-session — one `serve` process holds exactly one active `Session` at a time |
+| **`AgentEvent`**                | `Stream`/`ToolStart`/`ToolEnd`/`TurnEnd` boundaries streamed as `event` frames during a `prompt`   | Not the terminal answer — the `response` frame (success/data/error) is separate and always comes last |
+| **Virtual key** (`bai_v1…`)     | The bearer token this crate forwards to the gateway on every request                                | Not verified or interpreted here — Ed25519 signature check and deny-set live entirely in the gateway |
+| **`max_steps`**                 | Ceiling on loop iterations per `run` invocation, or per `prompt` in `serve` (CLI default 24)        | Not a token budget — `max_tokens` (agent_core's fixed 4096/turn) has no CLI flag in this crate |
+| **`HARD_CAP`** (grep/find)      | OOM guard: walk quits once 10,000 matches/paths are collected, before `limit` truncation runs       | Not the reported limit — `limit` (default 100/1000) is the user-facing cap; `HARD_CAP` is a backstop far above it |
+
+---
+
+## Core Mechanism
+
+### Tool dispatch
+
+`tools::default_registry()` assembles a fixed, hard-coded set of ten tools — there is no
+configuration surface in this crate to add, remove, or reorder them. Each `Tool` is a stateless
+(or `Arc<dyn CommandRunner>`-holding) value; `agent_core::Agent::run_events` looks tools up by the
+name the model used and calls `run(input)`, converting `Err(ToolError)` into an error `tool_result`
+rather than aborting the run (see `agent_core/ARCHITECTURE.md`). That error/success split is what
+each tool actually produces:
+
+| Tool         | `ToolError::InvalidInput` when…                                  | `ToolError::Execution` when…                                |
+| ------------ | ------------------------------------------------------------------ | --------------------------------------------------------------- |
+| `read`       | missing `path`                                                     | file unreadable (missing, not UTF-8, permission denied)         |
+| `write`      | missing `path`/`content`                                           | `mkdir`/`write` syscall fails                                   |
+| `edit`       | `old_string` matches 0 or >1 times (without single-edit `replace_all`); malformed `edits` | file unreadable/unwritable |
+| `ls`         | —                                                                   | `read_dir` fails                                                 |
+| `grep`/`find`| bad regex / bad glob                                                | the `spawn_blocking` task itself panics (walk failures are swallowed per-entry) |
+| `bash`       | missing `command`                                                  | spawn failure, or timeout (`timed_out`)                          |
+| `fork`/`sync`/`logs` | missing `app` (fork only)                                  | `beyond` spawn failure, timeout, or non-zero exit                |
+
+### File tools — direct, synchronous, in-process
+
+`read`, `write`, `edit`, and `ls` call `std::fs` directly inside their `async fn run` — no
+`spawn_blocking`, no async I/O crate. A single stat/read/write syscall is sub-millisecond, so the
+cost of a thread hop would dominate the work itself; these tools accept blocking the async task
+briefly rather than pay that overhead, consistent with "do less work" over reflexive parallelism.
+
+- **`read`** numbers every line (`{lineno:>6}\t{line}`), 1-based `offset`, default `limit` 2000,
+  appends a `"… (truncated …)"` marker if more remains.
+- **`write`** creates parent directories (`create_dir_all`) before writing; always overwrites.
+- **`edit`** accepts either an `edits: [{old_string,new_string}]` array (applied in order) or a
+  single `old_string`/`new_string` pair. Each `old_string` must match **exactly once** in the current
+  content unless it's a single-edit call with `replace_all: true` — uniqueness is the only safety
+  check; there is no diff/dry-run, the file is rewritten on success.
+- **`ls`** sorts directories first, then alphabetically; dot-entries are hidden unless `all: true`.
+
+### Search tools — gitignore-aware tree walks, deterministic output
+
+`grep` and `find` both walk with `ignore::WalkBuilder` (the crate behind ripgrep/fd — respects
+`.gitignore`, `hidden(false)` includes dotfiles) and run their walk inside `tokio::task::spawn_blocking`
+because, unlike the file tools, their cost scales with the size of the tree, not a single syscall.
+
+They diverge on parallelism, and the divergence is **measured, not assumed**:
+
+| Tool   | Walk strategy                              | 5,000-file benchmark (`benches/search.rs`)              |
+| ------ | --------------------------------------------- | ----------------------------------------------------------- |
+| `grep` | `ignore::WalkParallel` (`threads: 0` = ≈ CPU count) | single-threaded: **29.1 ms** (171 Kelem/s) → auto-threaded: **7.68 ms** (651 Kelem/s) — **3.8× faster** |
+| `find` | sequential `WalkBuilder::build()`             | **3.10 ms** (1.61 Melem/s) sequential only — the module doc records that a parallel version regressed ~2× on this tree |
+
+`grep`'s per-file work (read the file, regex-scan every line) is expensive enough that overlapping
+files across threads wins outright. `find`'s per-file work is a single glob test against a path —
+cheap enough that `WalkParallel`'s thread-coordination overhead costs more than it saves, so it stays
+sequential. This is the Theory-of-Constraints rule applied literally: parallelize the walk only where
+the walked work, not the traversal, is the bottleneck.
+
+`find` also disambiguates what it's matching against based on the pattern: a pattern with no `/`
+(e.g. `*.rs`) matches against the basename only; a pattern containing `/` matches the full path, with
+a `**/` prefix implicitly added unless the pattern already starts with `**/` or `/` — so
+`src/*.rs` actually matches `**/src/*.rs` (any `src/` directory at any depth), not just a top-level one.
+
+Both tools collect into a `Vec`, **sort by path** (`grep` then by line), and `truncate(limit)` —
+so which results survive a `limit` cutoff is the lexicographically-smallest set, not whatever order
+threads happened to finish in (`grep.rs:Lab — output_is_path_sorted_and_deterministic` and the
+matching `find` test assert this byte-for-byte across repeated runs). A `HARD_CAP` of 10,000
+collected items is an OOM guard for pathological patterns; if it trips, the *output* still gets
+sorted+truncated deterministically, but which items entered the collected set before the cap tripped
+can vary — the tool flags this in its trailing `"… limit reached"` line either way.
+
+`grep` additionally clips any single match line to 500 bytes at a UTF-8 char boundary
+(`clip()` in `grep.rs`) so one absurdly long line can't blow the model's context.
+
+### Shell tools — a shared `CommandRunner` seam
+
+`bash` and the Beyond tools (`fork`/`sync`/`logs`) don't touch the filesystem directly; they both
+go through `tools::exec::CommandRunner`, implemented for production by `RealRunner`
+(`tokio::process::Command` with `kill_on_drop(true)` + `tokio::time::timeout`) and by recording test
+doubles in each tool's `#[cfg(test)]` module. This is the same seam pattern as `agent_core`'s
+`Tool`/`ModelTransport` traits — it's what lets `fork_builds_argv`/`sync_builds_argv`/etc. assert the
+exact argv without a live Beyond control plane.
+
+- **`bash`**: `sh -c "<command>"`, default 120 s timeout (`timeout_ms` overridable). A timeout returns
+  `ToolError::Execution` immediately (the command's partial output is discarded). Otherwise stdout+
+  stderr are combined and `[exit code N]` is appended for a non-zero exit, or `[killed]` if the
+  process died with no exit code (killed by a signal) — then the combined text is truncated to
+  ~30,000 bytes keeping the **head and tail** (`truncate()` in `bash.rs`) — the middle of a long log
+  is least useful to the model; the start (what ran) and the end (the result/exit status) are kept.
+- **`fork`/`sync`/`logs`**: each builds a `beyond <subcommand> [args…]` argv (e.g.
+  `["fork", app, "--name", name]`) and runs it through the same runner with a fixed 120 s timeout.
+  Non-zero exit becomes `ToolError::Execution` (unlike `bash`, which reports a non-zero exit as text
+  rather than failing the tool call). The `beyond` CLI itself lives outside this repo — these tools
+  are tested only at the argv level.
+
+---
+
+## State Machine — `serve` session lifecycle
+
+```
+ spawn ──► Booting ──writer task up + "ready" frame sent──► Ready
+                                                                │
+                                  stdin "prompt" line           │ stdin "get_state"/"get_messages" line
+                                                                ▼                        │
+                                                          RunningTurn                     │ (no transition)
+                                                    (Agent::run_events;                  │
+                                                     ≤ max_steps iterations)              │
+                                                                │                          │
+                                        turn ends / MaxSteps / transport error             │
+                                                                ▼                          ▼
+                                                              Ready ◄─────────────────────┘
+                                                                │
+                                                    stdin "new_session" line
+                                                                ▼
+                                                  Ready (fresh Session, new session_id)
+                                                                │
+                                          stdin EOF  or  stdout write fails
+                                                                ▼
+                                                             Closed
+```
+
+| From          | Event                                | To           | Guard                      | What Actually Happens                                                                 |
+| ------------- | --------------------------------------- | ------------ | ----------------------------- | ------------------------------------------------------------------------------------------ |
+| Booting       | writer task spawned, `ready` frame sent | Ready        | `out_tx.send` succeeds        | `Session` loaded from `--session-file` (or `Session::new()`); `session_id` minted          |
+| Ready         | `{"type":"prompt"}`                     | RunningTurn  | —                              | message pushed as a user turn; `Agent::run_events` streams `event` frames live             |
+| RunningTurn   | model ends turn (no more `tool_use`)    | Ready        | —                              | session saved to `--session-file` (if set); `response{success:true, data:{steps,…}}`       |
+| RunningTurn   | `Error::MaxSteps` / transport error     | Ready        | —                              | session still saved; `response{success:false, error}` — the process keeps serving          |
+| Ready         | `{"type":"new_session"}`                | Ready        | —                              | `Session::new()` replaces history; new `session_id`; persisted if `--session-file` is set  |
+| Ready         | invalid JSON / unknown `type`           | Ready        | —                              | `response{success:false, error}`; loop continues, no state change                          |
+| Ready/RunningTurn | stdin EOF                           | Closed       | —                              | `out_tx` dropped → writer drains its queue → awaited → process returns `Ok(())`            |
+| any           | stdout write fails (broken pipe)        | Closed       | —                              | writer task `break`s its receive loop; the next `emit!` send fails → main loop `break`s    |
+
+---
+
+## Why It Behaves This Way
+
+### Why a single writer task with an unbounded channel
+
+`Agent::run_events`'s event sink is a synchronous `FnMut` — the producer can't `.await` mid-callback
+to apply backpressure. A bounded channel would force `try_send`, which silently drops frames on
+backpressure and corrupts the NDJSON stream for a protocol where every frame matters. The channel is
+unbounded instead, with the backlog naturally bounded by one in-flight turn's events (capped by
+`max_steps`); if a client stops reading, stdout's write eventually fails and the writer tears down,
+surfacing the stall as a closed session rather than masking it with dropped frames or unbounded
+buffering. Every frame — events and responses — flows through this one task, so output is FIFO and
+never interleaves even though tool execution itself is concurrent.
+
+### Why tool results batch into one user message, not one per tool
+
+(Enforced in `agent_core`, but it constrains how this crate's tools must behave.) Anthropic rejects
+consecutive same-role messages; if a model batches N tool calls in one turn and the loop emitted N
+separate `user` messages, the next request would 400 whenever N > 1. All of a turn's `tool_result`
+blocks are gathered onto a single `user` message instead — which is also why `ToolStart` events are
+emitted for the whole batch up front, then `ToolEnd`s after the concurrent join: the transcript order
+must stay deterministic regardless of which tool actually finishes first.
+
+### Why `edit` demands a unique match
+
+A non-unique `old_string` means the model under-specified the change — `edit` refuses rather than
+guessing which occurrence was meant, forcing the model to add surrounding context (or pass
+`replace_all` for the explicit bulk case) before any byte of the file is touched. This trades one
+extra round-trip for never silently editing the wrong occurrence.
+
+### Why grep is parallel and find is sequential
+
+See the Core Mechanism numbers above — this isn't a stylistic choice, it's the benchmark result.
+`grep`'s bottleneck is per-file regex scanning (parallel walk gave 3.8×); `find`'s bottleneck is the
+directory traversal itself, and its per-file cost (one glob test) is too cheap to amortize
+`WalkParallel`'s thread-coordination overhead. Applying the same "parallelize it" instinct to both
+would have made `find` slower, not faster — the Theory-of-Constraints discipline of profiling before
+optimizing, then only investing in the part that's actually the bottleneck.
+
+### Why this crate never holds a provider key
+
+Model traffic always flows through the Beyond gateway; this crate's only network code is
+`GatewayClient` (in `agent_core`), which sends a Bearer token and lets the gateway decide
+authentication, routing, and key-swapping. Centralizing that in the gateway means this crate (and
+every other agent harness) doesn't duplicate Ed25519 verification, deny-set checks, or per-provider
+auth schemes — it just forwards a token and trusts the gateway's response.
+
+---
+
+## Trust Boundaries
+
+**What this crate checks before acting:**
+
+- `edit`'s `old_string` must match exactly once (or be an explicit single-edit `replace_all`).
+- Each tool's required JSON fields (`path`, `command`, `pattern`, …) — checked ad hoc per tool, not
+  against `input_schema()`; the schema is advisory to the model, not enforced before `run()`.
+- Regex/glob patterns are compiled before use; a bad pattern is `ToolError::InvalidInput`, not a panic.
+
+**What passes through unchecked:**
+
+- **File paths.** No workspace-root containment check anywhere in `read`/`write`/`edit`/`ls`/`grep`/
+  `find` — the agent can touch any path the OS-level process can reach (`../../etc/passwd` works if
+  the model asks for it).
+- **Shell commands.** `bash` execs whatever string the model supplies via `sh -c` with no allowlist,
+  no sandboxing, and no resource limits beyond a wall-clock timeout — full ambient privilege of the
+  host process.
+- **The gateway key.** `--key`/`AI_AGENT_KEY` is forwarded as a Bearer token without inspection;
+  signature verification and deny-set checks happen entirely in the gateway (see
+  `agent-core/ARCHITECTURE.md` and the gateway's own `ARCHITECTURE.md`).
+- **The session file.** `load_session` swallows any read or parse failure (`.ok()` chains) and
+  silently returns an empty `Session::default()` — a corrupted or tampered session file is not
+  surfaced as an error, just silent transcript loss.
+- **`serve`'s stdin.** Any process that can write to this process's stdin has full control — there is
+  no per-command authentication; trust is established once, by whoever spawned the process (e.g. an
+  authenticated SSH pipe).
+
+**Why these boundaries are where they are:** the agent is built to act as a fully trusted local
+actor with the same authority as whoever launched it (`main.rs`'s system prompt: "You operate inside
+a real working directory"). Containment, when it's needed, happens one layer up — e.g. the `fork`
+tool's isolated Beyond branch, or running the whole process inside a constrained
+container/VM — not by this crate restricting its own tools.
+
+---
+
+## Package Structure
+
+| File                  | What It Does                                                                                          |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `src/main.rs`          | CLI entry point (`run`/`serve`/`tools` subcommands); `DEFAULT_MODEL`, `DEFAULT_GATEWAY`, `SYSTEM_PROMPT`; renders streamed text + `[tool: name]` markers to stdout for `run` |
+| `src/lib.rs`           | Library root; re-exports `serve` and `tools` so integration tests/benches drive them without spawning the binary |
+| `src/serve.rs`         | NDJSON control protocol: single stdout-writer task, command dispatch, `--session-file` persistence    |
+| `src/tools/mod.rs`     | `default_registry()` — assembles the fixed 10-tool `ToolRegistry`                                      |
+| `src/tools/read.rs`    | `read` — line-numbered file read with `offset`/`limit`                                                  |
+| `src/tools/write.rs`   | `write` — create/overwrite a file, creating parent directories                                          |
+| `src/tools/edit.rs`    | `edit` — exact-string replacement, unique-match-or-`replace_all`                                        |
+| `src/tools/ls.rs`      | `ls` — directory listing, directories-first sort, dotfile filtering                                     |
+| `src/tools/grep.rs`    | `grep` — parallel, gitignore-aware regex search; deterministic sort+truncate                            |
+| `src/tools/find.rs`    | `find` — sequential, gitignore-aware glob search; deterministic sort+truncate                           |
+| `src/tools/bash.rs`    | `bash` — `sh -c` execution with timeout and head/tail output truncation                                 |
+| `src/tools/beyond.rs`  | `fork`/`sync`/`logs` — shell out to the `beyond` platform CLI                                            |
+| `src/tools/exec.rs`    | `CommandRunner` trait + `RealRunner` — the process-execution seam shared by `bash`/`beyond` tools        |
+| `benches/search.rs`    | Criterion macro-bench: `grep` (1 vs auto threads) and `find` (sequential) over a 5,000-file tree         |
+| `tests/common/mod.rs`  | Shared test harness: mock Anthropic-SSE model server, gateway binary locator, port/connection helpers    |
+| `tests/run_e2e.rs`     | `run` binary against a mock model server (no gateway in the loop)                                        |
+| `tests/serve_e2e.rs`   | `serve` binary: NDJSON protocol round-trip, tool-call event streaming, session reattach                  |
+| `tests/gateway_e2e.rs` | `run` binary → real gateway binary → mock upstream (proves key-swap + the virtual key never reaches upstream) |
+| `tests/smoke.rs`       | Ignored-by-default live test: real gateway → real Anthropic (`mise run test:smoke:agent`)                 |
+
+---
+
+## Configuration
+
+| Variable / Flag                          | Default               | What It Controls                                                                          |
+| ------------------------------------------- | ------------------------ | ---------------------------------------------------------------------------------------------- |
+| `--model` / `AI_AGENT_MODEL`                | `claude-opus-4-8`       | Model id sent in each `ModelRequest`; selects the wire dialect (`agent_core::Dialect::for_model`) |
+| `--gateway-url` / `AI_GATEWAY_URL`          | `http://ai.internal`    | Base URL `GatewayClient` posts completions to                                                   |
+| `--key` / `AI_AGENT_KEY`                    | none (required)         | Bearer token sent to the gateway — a `bai_v1…` virtual key, or a BYO provider key forwarded as-is |
+| `--max-steps`                               | `24`                     | Ceiling on loop iterations (`run`) or per-`prompt` iterations (`serve`) before `Error::MaxSteps`  |
+| `--session-file` / `AI_AGENT_SESSION_FILE`  | none (in-memory only)   | `serve`-only: path the `Session` is serialized to after every turn; required for reattach         |
+| `timeout_ms` (per-call, `bash` tool input)  | `120000`                 | Wall-clock ceiling for one `bash` invocation                                                     |
+| `RUST_LOG` (`tracing_subscriber::EnvFilter::from_default_env`) | unset (no logs) | Verbosity of `tracing` spans/events emitted by the binary's subscriber                          |
+
+Not configurable from this crate: `max_tokens` (fixed at `agent_core`'s default, 4096/turn) and the
+tool set itself (always the same 10 tools from `default_registry()` — no enable/disable flag).
+
+---
+
+## Failure Modes
+
+| Failure                                                  | What Actually Happens                                                                                          | Recovery                                                          |
+| ----------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| Gateway unreachable / non-2xx response                      | `Error::Transport`; `run` exits non-zero printing the error; `serve`'s `prompt` returns `response{success:false}`, process stays up | Caller retries the command — no built-in retry in this crate           |
+| Tool execution fails (bad path, non-zero exit, regex error) | `ToolError` → an error `tool_result`, fed back to the model next turn; the run does **not** abort                    | Model sees the error text and can adjust its next call                |
+| `bash` command exceeds `timeout_ms`; `beyond` exceeds 120 s | `RealRunner` returns `timed_out:true`; tool turns it into `ToolError::Execution`                                     | Surfaced to the model as a tool error, same as any other failure       |
+| Model never stops requesting tools                          | `session.steps >= max_steps` → `Error::MaxSteps`; `run` exits non-zero; `serve` returns a failed `response` but keeps serving | Caller issues a fresh `prompt`, or `new_session`                       |
+| Malformed JSON on `serve`'s stdin                            | Parsed as `Value`, fails → `response{success:false, error:"invalid JSON: …"}`; loop continues                       | Client resends a valid command                                         |
+| `serve`'s stdout write fails (broken pipe)                  | Writer task exits its loop; the next `emit!` send observes the closed channel and `break`s the main loop; process exits `Ok(())` | None by design — a client must reconnect via a new process             |
+| Session file unreadable/corrupt at `serve` startup           | `load_session` swallows the error and returns a fresh empty `Session` — no error surfaced                            | None automatic — prior transcript is silently lost                     |
+| Session file write fails after a turn                       | Logged to stderr only (`eprintln!`); the in-memory session and the turn's `response` still report success            | None automatic — operator must notice the stderr line                  |
+| `edit`'s `old_string` matches 0 or >1 times (no `replace_all`) | `ToolError::InvalidInput`; the file is **not** modified                                                            | Model adds more surrounding context and retries                        |
+| `grep`/`find` hit `HARD_CAP` (10,000 collected items)        | Walk quits early; output is still sorted+truncated deterministically, but which items entered the set before the cap can vary | Model narrows the `pattern`/`glob` and retries                         |

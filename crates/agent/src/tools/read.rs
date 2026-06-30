@@ -1,5 +1,7 @@
 //! `read` — read a file, optionally a line range, with line numbers.
 
+use std::io::{BufRead, BufReader};
+
 use agent_core::ToolError;
 use agent_core::tool::Tool;
 use async_trait::async_trait;
@@ -36,11 +38,6 @@ impl Tool for Read {
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing `path`".into()))?;
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| ToolError::Execution(format!("read {path}: {e}")))?;
-        if content.is_empty() {
-            return Ok("(empty file)".into());
-        }
 
         let offset = input
             .get("offset")
@@ -53,21 +50,48 @@ impl Tool for Read {
             .map(|n| n as usize)
             .unwrap_or(DEFAULT_LIMIT);
 
+        // Stream the file line-by-line rather than slurping it whole: a windowed read
+        // (`offset`/`limit`) into a huge file shouldn't allocate the entire file first — we hold at
+        // most one line plus the bounded output window.
+        let file =
+            std::fs::File::open(path).map_err(|e| ToolError::Execution(format!("read {path}: {e}")))?;
+        let mut reader = BufReader::new(file);
+
         let mut out = String::new();
+        let mut lineno = 0usize;
         let mut shown = 0usize;
-        for (i, line) in content.lines().enumerate() {
-            let lineno = i + 1;
+        let mut truncated = false;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = reader
+                .read_line(&mut line)
+                .map_err(|e| ToolError::Execution(format!("read {path}: {e}")))?;
+            if n == 0 {
+                break; // EOF
+            }
+            lineno += 1;
             if lineno < offset {
                 continue;
             }
             if shown >= limit {
-                out.push_str(&format!(
-                    "… (truncated at {limit} lines; pass a larger `limit` to see more)\n"
-                ));
+                truncated = true;
                 break;
             }
-            out.push_str(&format!("{lineno:>6}\t{line}\n"));
+            // `read_line` keeps the trailing `\n`; trim it so our own framing is exact.
+            let text = line.strip_suffix('\n').unwrap_or(&line);
+            let text = text.strip_suffix('\r').unwrap_or(text);
+            out.push_str(&format!("{lineno:>6}\t{text}\n"));
             shown += 1;
+        }
+
+        if lineno == 0 {
+            return Ok("(empty file)".into());
+        }
+        if truncated {
+            out.push_str(&format!(
+                "… (truncated at {limit} lines; pass a larger `limit` to see more)\n"
+            ));
         }
         Ok(out)
     }

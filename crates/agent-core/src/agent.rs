@@ -168,16 +168,21 @@ impl Agent {
                 return Ok(()); // model ended its turn — done.
             }
 
-            // Run the tools and feed results back as a user turn. A tool's own failure becomes an
-            // error `tool_result`, not an aborted run — the model can react to it next turn.
+            // Run the tools and feed results back as a single user turn. A tool's own failure becomes
+            // an error `tool_result`, not an aborted run — the model can react to it next turn.
             //
             // The calls run concurrently: tools are I/O-bound (file reads, shell commands, the
             // `beyond` CLI), and a model routinely batches independent ones in a single turn, so
             // overlapping them collapses the tool phase from the sum of their latencies to its slowest
             // member. The transcript stays deterministic regardless of finish order — every
             // `ToolStart` is emitted up front in call order, and the `ToolEnd`s and `tool_result`
-            // messages are emitted/appended in call order after the join, never interleaved by
+            // blocks are emitted/collected in call order after the join, never interleaved by
             // whichever tool happened to finish first.
+            //
+            // All results are gathered into *one* user message rather than one message per result:
+            // both Anthropic and the internal model carry a turn's tool results as multiple blocks on
+            // a single `user` turn, and Anthropic rejects consecutive same-role messages — N separate
+            // `user` messages would 400 the next request whenever the model batched N>1 tools.
             for (id, name, input) in &calls {
                 sink(AgentEvent::ToolStart {
                     id: id.clone(),
@@ -200,6 +205,7 @@ impl Agent {
                 }
             });
             let results = futures::future::join_all(runs).await;
+            let mut result_blocks = Vec::with_capacity(calls.len());
             for ((id, name, _), (content, is_error)) in calls.iter().zip(results) {
                 sink(AgentEvent::ToolEnd {
                     id: id.clone(),
@@ -207,8 +213,13 @@ impl Agent {
                     result: content.clone(),
                     is_error,
                 });
-                session.push(Message::tool_result(id.clone(), content, is_error));
+                result_blocks.push(ContentBlock::ToolResult {
+                    tool_use_id: id.clone(),
+                    content,
+                    is_error,
+                });
             }
+            session.push(Message::tool_results(result_blocks));
         }
     }
 
@@ -326,6 +337,7 @@ impl Accumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::Role;
     use crate::mock::{MockTransport, turn};
     use crate::tool::Tool;
     use async_trait::async_trait;
@@ -514,12 +526,14 @@ mod tests {
             .expect("tools did not run concurrently (barrier deadlock under serial dispatch)")
             .unwrap();
 
-        // Results fed back in call order, one user message per result (the existing transcript shape):
-        // user, assistant(2× tool_use), user(tool_result a), user(tool_result b), assistant(text).
-        assert_eq!(session.messages.len(), 5);
+        // Results fed back in call order on a *single* user turn (Anthropic rejects consecutive
+        // same-role messages): user, assistant(2× tool_use), user(2× tool_result), assistant(text).
+        assert_eq!(session.messages.len(), 4);
+        assert_eq!(session.messages[2].role, Role::User);
+        assert_eq!(session.messages[2].content.len(), 2);
         match (
             &session.messages[2].content[0],
-            &session.messages[3].content[0],
+            &session.messages[2].content[1],
         ) {
             (
                 ContentBlock::ToolResult {

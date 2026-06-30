@@ -132,19 +132,29 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
 
         match ctype.as_str() {
             "prompt" => {
-                let message = cmd
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
+                // A `prompt` with no (or non-string) `message` is a malformed command: running an
+                // empty user turn would spend a model call on nothing and still report success.
+                let Some(message) = cmd.get("message").and_then(Value::as_str) else {
+                    emit!(response(
+                        id,
+                        "prompt",
+                        false,
+                        None,
+                        Some("missing `message`"),
+                    ));
+                    continue;
+                };
                 session.user(message);
                 let tx = out_tx.clone();
                 let result = agent
                     .run_events(&mut session, move |ev| {
                         // Best-effort: a sync sink can't break the control loop. If the writer is
                         // gone the send fails here and the terminal response send below detects it
-                        // via `emit!` and stops the loop.
-                        let _ = tx.send(event_frame(ev));
+                        // via `emit!` and stops the loop. An unserializable event is skipped rather
+                        // than emitted as a malformed frame (see `event_frame`).
+                        if let Some(frame) = event_frame(ev) {
+                            let _ = tx.send(frame);
+                        }
                     })
                     .await;
 
@@ -240,14 +250,17 @@ fn response(
     Value::Object(m)
 }
 
-/// Wrap an `AgentEvent` in an `event` frame.
-fn event_frame(ev: AgentEvent) -> Value {
+/// Wrap an `AgentEvent` in an `event` frame, or `None` if it can't be serialized. Returning `None`
+/// (and skipping the frame) rather than emitting `{type:"event"}` with no `event` field keeps a
+/// serialization bug from putting a malformed frame on the wire that a client would silently mis-read.
+fn event_frame(ev: AgentEvent) -> Option<Value> {
+    let event = serde_json::to_value(&ev)
+        .inspect_err(|e| eprintln!("serve: failed to serialize agent event: {e}"))
+        .ok()?;
     let mut m = Map::new();
     m.insert("type".into(), json!("event"));
-    if let Ok(v) = serde_json::to_value(&ev) {
-        m.insert("event".into(), v);
-    }
-    Value::Object(m)
+    m.insert("event".into(), event);
+    Some(Value::Object(m))
 }
 
 /// Write one newline-delimited frame to stdout and flush it.
@@ -264,12 +277,20 @@ fn load_session(path: &str) -> Session {
         .unwrap_or_default()
 }
 
-/// Persist the session to `path`. Returns the error so the caller can surface a failed write
-/// (read-only path, full disk) instead of silently losing the transcript.
+/// Persist the session to `path` atomically. Returns the error so the caller can surface a failed
+/// write (read-only path, full disk) instead of silently losing the transcript.
+///
+/// Writes to a sibling temp file then `rename`s it over `path`: `rename(2)` is atomic on a single
+/// filesystem, so a reader (or a later reattach) ever sees either the old transcript or the new one,
+/// never a half-written file. A bare `std::fs::write` truncates in place — a kill mid-write would
+/// leave corrupt JSON, which `load_session` then silently discards as an empty session, losing the
+/// whole transcript the session file exists to preserve.
 fn save_session(path: &str, session: &Session) -> std::io::Result<()> {
     let s = serde_json::to_string(session)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(path, s)
+    let tmp = format!("{path}.tmp");
+    std::fs::write(&tmp, s)?;
+    std::fs::rename(&tmp, path)
 }
 
 /// A short session id, unique within a process. The nanosecond timestamp orders ids roughly by
