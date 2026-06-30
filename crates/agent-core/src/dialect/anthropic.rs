@@ -19,7 +19,7 @@ pub fn build_body(req: &ModelRequest) -> Value {
     map.insert("stream".into(), Value::Bool(true));
     map.insert(
         "messages".into(),
-        serde_json::to_value(&req.messages).unwrap_or(Value::Null),
+        serde_json::to_value(req.messages.as_ref()).unwrap_or(Value::Null),
     );
     if let Some(system) = &req.system {
         map.insert("system".into(), Value::String(system.clone()));
@@ -27,7 +27,7 @@ pub fn build_body(req: &ModelRequest) -> Value {
     if !req.tools.is_empty() {
         map.insert(
             "tools".into(),
-            serde_json::to_value(&req.tools).unwrap_or(Value::Null),
+            serde_json::to_value(req.tools.as_ref()).unwrap_or(Value::Null),
         );
     }
     Value::Object(map)

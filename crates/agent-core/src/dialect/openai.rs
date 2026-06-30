@@ -31,7 +31,7 @@ pub fn build_body(req: &ModelRequest) -> Value {
         messages.push(json!({ "role": "system", "content": system }));
     }
 
-    for m in &req.messages {
+    for m in req.messages.iter() {
         match m.role {
             Role::System => {
                 messages.push(json!({ "role": "system", "content": text_of(&m.content) }))

@@ -179,7 +179,8 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 emit!(response(id, "get_state", true, Some(data), None));
             }
             "get_messages" => {
-                let messages = serde_json::to_value(&session.messages).unwrap_or(Value::Null);
+                let messages =
+                    serde_json::to_value(session.messages.as_ref()).unwrap_or(Value::Null);
                 emit!(response(
                     id,
                     "get_messages",

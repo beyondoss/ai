@@ -14,7 +14,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::error::{Error, Result};
-use crate::message::{ContentBlock, Message, StopReason, StreamEvent};
+use crate::message::{ContentBlock, Message, StopReason, StreamEvent, ToolDef};
 use crate::session::Session;
 use crate::tool::ToolRegistry;
 use crate::transport::{ModelRequest, ModelTransport};
@@ -54,6 +54,10 @@ const DEFAULT_MAX_STEPS: u32 = 24;
 pub struct Agent {
     transport: Arc<dyn ModelTransport>,
     tools: ToolRegistry,
+    /// The advertised tool definitions, computed once from `tools`. The set is fixed for the agent's
+    /// life, so we build it (and its JSON schemas) at configuration time rather than rebuilding it on
+    /// every turn; each request clones the `Arc`, not the definitions.
+    tool_defs: Arc<[ToolDef]>,
     model: String,
     system: Option<String>,
     max_tokens: u32,
@@ -66,6 +70,7 @@ impl Agent {
         Self {
             transport,
             tools: ToolRegistry::new(),
+            tool_defs: Vec::new().into(),
             model: model.into(),
             system: None,
             max_tokens: DEFAULT_MAX_TOKENS,
@@ -73,8 +78,10 @@ impl Agent {
         }
     }
 
-    /// Set the tools the model may call.
+    /// Set the tools the model may call. The advertised definitions are computed here, once, so the
+    /// loop doesn't rebuild them (and their JSON schemas) every turn.
     pub fn with_tools(mut self, tools: ToolRegistry) -> Self {
+        self.tool_defs = tools.definitions().into();
         self.tools = tools;
         self
     }
@@ -129,7 +136,7 @@ impl Agent {
                 session.messages.clone(),
                 self.max_tokens,
             )
-            .with_tools(self.tools.definitions());
+            .with_tools(self.tool_defs.clone());
             if let Some(system) = &self.system {
                 req = req.with_system(system.clone());
             }
@@ -161,28 +168,46 @@ impl Agent {
                 return Ok(()); // model ended its turn — done.
             }
 
-            // Run each tool and feed results back as a user turn. A tool's own failure becomes an
+            // Run the tools and feed results back as a user turn. A tool's own failure becomes an
             // error `tool_result`, not an aborted run — the model can react to it next turn.
-            for (id, name, input) in calls {
+            //
+            // The calls run concurrently: tools are I/O-bound (file reads, shell commands, the
+            // `beyond` CLI), and a model routinely batches independent ones in a single turn, so
+            // overlapping them collapses the tool phase from the sum of their latencies to its slowest
+            // member. The transcript stays deterministic regardless of finish order — every
+            // `ToolStart` is emitted up front in call order, and the `ToolEnd`s and `tool_result`
+            // messages are emitted/appended in call order after the join, never interleaved by
+            // whichever tool happened to finish first.
+            for (id, name, input) in &calls {
                 sink(AgentEvent::ToolStart {
                     id: id.clone(),
                     name: name.clone(),
                     input: input.clone(),
                 });
-                let (content, is_error) = match self.tools.get(&name) {
-                    Some(tool) => match tool.run(input).await {
-                        Ok(out) => (out, false),
-                        Err(e) => (e.to_string(), true),
-                    },
-                    None => (format!("unknown tool: {name}"), true),
-                };
+            }
+            let runs = calls.iter().map(|(_, name, input)| {
+                let tool = self.tools.get(name);
+                let name = name.clone();
+                let input = input.clone();
+                async move {
+                    match tool {
+                        Some(tool) => match tool.run(input).await {
+                            Ok(out) => (out, false),
+                            Err(e) => (e.to_string(), true),
+                        },
+                        None => (format!("unknown tool: {name}"), true),
+                    }
+                }
+            });
+            let results = futures::future::join_all(runs).await;
+            for ((id, name, _), (content, is_error)) in calls.iter().zip(results) {
                 sink(AgentEvent::ToolEnd {
                     id: id.clone(),
                     name: name.clone(),
                     result: content.clone(),
                     is_error,
                 });
-                session.push(Message::tool_result(id, content, is_error));
+                session.push(Message::tool_result(id.clone(), content, is_error));
             }
         }
     }
@@ -392,6 +417,127 @@ mod tests {
                 .iter()
                 .any(|m| matches!(m.content.first(), Some(ContentBlock::ToolResult { .. })))
         );
+    }
+
+    #[tokio::test]
+    async fn request_snapshots_are_isolated_across_turns() {
+        // History is shared via `Arc`, so copy-on-write in `Session::push` must keep each request's
+        // snapshot frozen: a later turn appending tool results must not retroactively mutate the
+        // messages an earlier request was built from.
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        let (agent, mock) = agent_with(
+            vec![
+                turn::tool_call("tu_1", "echo", r#"{"text":"pong"}"#),
+                turn::text("done"),
+            ],
+            tools,
+        );
+        let mut session = Session::new();
+        session.user("say pong");
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        let reqs = mock.requests();
+        // First request carried only the seed user turn; the second saw more (assistant + result).
+        assert_eq!(reqs[0].messages.len(), 1);
+        assert!(reqs[1].messages.len() > reqs[0].messages.len());
+    }
+
+    #[tokio::test]
+    async fn independent_tool_calls_run_concurrently() {
+        use std::time::Duration;
+        use tokio::sync::Barrier;
+
+        // A tool that blocks on a shared 2-party barrier: it only returns once *both* tools are in
+        // flight. Under serial dispatch the first call would wait forever for the second to start, so
+        // the run completing at all proves the calls overlap.
+        struct BarrierTool {
+            id: &'static str,
+            barrier: Arc<Barrier>,
+        }
+        #[async_trait]
+        impl Tool for BarrierTool {
+            fn name(&self) -> &str {
+                self.id
+            }
+            fn description(&self) -> &str {
+                "waits on a shared barrier"
+            }
+            fn input_schema(&self) -> Value {
+                json!({ "type": "object" })
+            }
+            async fn run(
+                &self,
+                _input: Value,
+            ) -> std::result::Result<String, crate::error::ToolError> {
+                self.barrier.wait().await;
+                Ok(self.id.to_string())
+            }
+        }
+
+        let barrier = Arc::new(Barrier::new(2));
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(BarrierTool {
+            id: "t1",
+            barrier: barrier.clone(),
+        }));
+        tools.register(Arc::new(BarrierTool {
+            id: "t2",
+            barrier: barrier.clone(),
+        }));
+
+        // One assistant turn that asks for both tools, then a turn that ends the conversation.
+        let two_calls = vec![
+            StreamEvent::MessageStart,
+            StreamEvent::ToolUseStart {
+                id: "a".into(),
+                name: "t1".into(),
+            },
+            StreamEvent::ContentBlockStop,
+            StreamEvent::ToolUseStart {
+                id: "b".into(),
+                name: "t2".into(),
+            },
+            StreamEvent::ContentBlockStop,
+            StreamEvent::MessageStop {
+                stop_reason: StopReason::ToolUse,
+            },
+        ];
+        let (agent, _mock) = agent_with(vec![two_calls, turn::text("done")], tools);
+
+        let mut session = Session::new();
+        session.user("go");
+        // Serial execution would deadlock on the barrier; bound the test so a regression fails fast
+        // instead of hanging.
+        tokio::time::timeout(Duration::from_secs(5), agent.run(&mut session, |_| {}))
+            .await
+            .expect("tools did not run concurrently (barrier deadlock under serial dispatch)")
+            .unwrap();
+
+        // Results fed back in call order, one user message per result (the existing transcript shape):
+        // user, assistant(2× tool_use), user(tool_result a), user(tool_result b), assistant(text).
+        assert_eq!(session.messages.len(), 5);
+        match (
+            &session.messages[2].content[0],
+            &session.messages[3].content[0],
+        ) {
+            (
+                ContentBlock::ToolResult {
+                    tool_use_id: a,
+                    content: ca,
+                    ..
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: b,
+                    content: cb,
+                    ..
+                },
+            ) => {
+                assert_eq!((a.as_str(), ca.as_str()), ("a", "t1"));
+                assert_eq!((b.as_str(), cb.as_str()), ("b", "t2"));
+            }
+            other => panic!("expected two ordered tool_result messages, got {other:?}"),
+        }
     }
 
     #[tokio::test]

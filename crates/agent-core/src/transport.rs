@@ -5,6 +5,8 @@
 //! Beyond gateway, and a `MockTransport` that replays scripted events so the loop is testable with
 //! no network. Keeping the trait here, free of any client, is what makes that possible.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 
@@ -18,29 +20,37 @@ pub struct ModelRequest {
     pub model: String,
     /// Optional system prompt (kept separate from `messages` — both wire dialects treat it specially).
     pub system: Option<String>,
-    /// Conversation history.
-    pub messages: Vec<Message>,
-    /// Tools advertised to the model this turn.
-    pub tools: Vec<ToolDef>,
+    /// Conversation history. An `Arc<Vec<…>>` shared with the `Session` it came from: building a
+    /// request clones the pointer, not the (growing) message list.
+    pub messages: Arc<Vec<Message>>,
+    /// Tools advertised to the model this turn. An `Arc<[…]>` because the set is fixed for the run:
+    /// the agent computes it once and hands the same slice to every turn's request by cloning the
+    /// pointer, not the (schema-bearing) definitions.
+    pub tools: Arc<[ToolDef]>,
     /// Output token ceiling for the turn.
     pub max_tokens: u32,
 }
 
 impl ModelRequest {
     /// A request with no system prompt and no tools — the minimal shape.
-    pub fn new(model: impl Into<String>, messages: Vec<Message>, max_tokens: u32) -> Self {
+    pub fn new(
+        model: impl Into<String>,
+        messages: impl Into<Arc<Vec<Message>>>,
+        max_tokens: u32,
+    ) -> Self {
         Self {
             model: model.into(),
             system: None,
-            messages,
-            tools: Vec::new(),
+            messages: messages.into(),
+            tools: Vec::new().into(),
             max_tokens,
         }
     }
 
-    /// Builder-style: attach the tools advertised for this turn.
-    pub fn with_tools(mut self, tools: Vec<ToolDef>) -> Self {
-        self.tools = tools;
+    /// Builder-style: attach the tools advertised for this turn. Accepts anything convertible into
+    /// `Arc<[ToolDef]>` (a `Vec<ToolDef>`, or an `Arc<[ToolDef]>` cloned from a cache).
+    pub fn with_tools(mut self, tools: impl Into<Arc<[ToolDef]>>) -> Self {
+        self.tools = tools.into();
         self
     }
 
