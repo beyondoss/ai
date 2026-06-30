@@ -78,9 +78,14 @@ impl ToolRegistry {
         self.tools.get(name).cloned()
     }
 
-    /// The definitions to advertise to the model, in no particular order.
+    /// The definitions to advertise to the model, **sorted by name**. The order must be stable across
+    /// calls (and process restarts): the Anthropic dialect marks a prompt-cache breakpoint on the tool
+    /// block, and a cache hit needs a byte-identical prefix — `HashMap` iteration order would cold-miss
+    /// the cache after every `serve` reattach.
     pub fn definitions(&self) -> Vec<ToolDef> {
-        self.tools.values().map(|t| t.definition()).collect()
+        let mut defs: Vec<ToolDef> = self.tools.values().map(|t| t.definition()).collect();
+        defs.sort_by(|a, b| a.name.cmp(&b.name));
+        defs
     }
 
     /// Number of registered tools.

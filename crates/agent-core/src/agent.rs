@@ -49,6 +49,12 @@ pub enum AgentEvent {
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 /// Default ceiling on loop iterations before bailing — a runaway-tool-call backstop.
 const DEFAULT_MAX_STEPS: u32 = 24;
+/// Cap on tool-call groups dispatched concurrently within one turn. A model usually batches a
+/// handful, but nothing bounds how many it requests; without a cap a turn asking for dozens of
+/// `bash`/`grep` calls would spawn that many subprocesses / parallel walks at once (and `grep` itself
+/// fans out over CPU cores, compounding it). The cap throttles in-flight groups; results scatter by
+/// index, so the call-order transcript is unaffected — only peak concurrency is bounded.
+const MAX_CONCURRENT_TOOL_GROUPS: usize = 8;
 
 /// A configured agent: a model, a transport, a tool set, and loop bounds. Cheap to clone-construct;
 /// `run` borrows it so one agent can drive many sessions.
@@ -228,7 +234,12 @@ impl Agent {
             });
             let mut results: Vec<(String, bool)> =
                 (0..calls.len()).map(|_| (String::new(), false)).collect();
-            for group in futures::future::join_all(group_runs).await {
+            // Bound how many groups run at once. `buffer_unordered` is safe here because each group
+            // yields its results tagged with their original call index `i`; cross-group completion
+            // order never reaches the transcript, which is rebuilt in call order below.
+            let mut group_stream =
+                futures::stream::iter(group_runs).buffer_unordered(MAX_CONCURRENT_TOOL_GROUPS);
+            while let Some(group) = group_stream.next().await {
                 for (i, result) in group {
                     results[i] = result;
                 }

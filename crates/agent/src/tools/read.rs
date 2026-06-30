@@ -9,8 +9,51 @@ use serde_json::{Value, json};
 
 /// Default cap on returned lines when no `limit` is given (keeps large files from flooding context).
 const DEFAULT_LIMIT: usize = 2000;
+/// Cap on bytes kept per line. Streaming by line already bounds memory to one line, but a file with a
+/// single pathological line (a minified bundle, a one-line JSON/CSV blob) is one unbounded line — so
+/// cap each line and drain the overflow without storing it, the way `grep` clips long match lines.
+const MAX_LINE_BYTES: usize = 4000;
 
 pub struct Read;
+
+/// Read one line into `buf` (without the trailing newline), keeping at most `cap` bytes; bytes beyond
+/// `cap` are consumed from the stream but discarded, so a single huge line can't balloon memory.
+/// Returns `(bytes_consumed, truncated)`; `bytes_consumed == 0` means EOF.
+fn read_line_capped(
+    reader: &mut impl BufRead,
+    buf: &mut Vec<u8>,
+    cap: usize,
+) -> std::io::Result<(usize, bool)> {
+    buf.clear();
+    let mut consumed = 0usize;
+    let mut truncated = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            break; // EOF
+        }
+        match available.iter().position(|&b| b == b'\n') {
+            Some(pos) => {
+                let want = pos; // bytes before the newline
+                let take = want.min(cap.saturating_sub(buf.len()));
+                buf.extend_from_slice(&available[..take]);
+                truncated |= take < want;
+                reader.consume(pos + 1);
+                consumed += pos + 1;
+                break;
+            }
+            None => {
+                let want = available.len();
+                let take = want.min(cap.saturating_sub(buf.len()));
+                buf.extend_from_slice(&available[..take]);
+                truncated |= take < want;
+                reader.consume(want);
+                consumed += want;
+            }
+        }
+    }
+    Ok((consumed, truncated))
+}
 
 #[async_trait]
 impl Tool for Read {
@@ -61,27 +104,30 @@ impl Tool for Read {
         let mut lineno = 0usize;
         let mut shown = 0usize;
         let mut truncated = false;
-        let mut line = String::new();
+        let mut line: Vec<u8> = Vec::new();
         loop {
-            line.clear();
-            let n = reader
-                .read_line(&mut line)
+            let (n, line_clipped) = read_line_capped(&mut reader, &mut line, MAX_LINE_BYTES)
                 .map_err(|e| ToolError::Execution(format!("read {path}: {e}")))?;
             if n == 0 {
                 break; // EOF
             }
             lineno += 1;
             if lineno < offset {
-                continue;
+                continue; // skipped lines are still drained, so memory stays bounded
             }
             if shown >= limit {
                 truncated = true;
                 break;
             }
-            // `read_line` keeps the trailing `\n`; trim it so our own framing is exact.
-            let text = line.strip_suffix('\n').unwrap_or(&line);
-            let text = text.strip_suffix('\r').unwrap_or(text);
-            out.push_str(&format!("{lineno:>6}\t{text}\n"));
+            // `read_line_capped` already stripped the trailing `\n`; strip a `\r` too. A capped line
+            // may end mid-codepoint, so decode lossily rather than erroring on the split byte.
+            let kept = line.strip_suffix(b"\r").unwrap_or(&line);
+            let text = String::from_utf8_lossy(kept);
+            if line_clipped {
+                out.push_str(&format!("{lineno:>6}\t{text}… [line truncated]\n"));
+            } else {
+                out.push_str(&format!("{lineno:>6}\t{text}\n"));
+            }
             shown += 1;
         }
 
@@ -138,5 +184,22 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Execution(_)));
+    }
+
+    #[tokio::test]
+    async fn caps_a_pathological_single_line() {
+        // One line far larger than the per-line cap, followed by a normal line: the giant line is
+        // clipped (with a marker) and the file's line structure is still tracked past it.
+        let huge = "x".repeat(MAX_LINE_BYTES * 4);
+        let f = tmp_file(&format!("{huge}\nnext\n"));
+        let out = Read
+            .run(json!({ "path": f.path().to_str().unwrap() }))
+            .await
+            .unwrap();
+        // The stored line is bounded, not the full 16k — the cap plus the framing/marker overhead.
+        assert!(out.len() < MAX_LINE_BYTES * 2, "line was not capped: {} bytes", out.len());
+        assert!(out.contains("[line truncated]"));
+        // The next line is read correctly as line 2 (overflow was drained, not mis-parsed).
+        assert!(out.contains("     2\tnext"));
     }
 }

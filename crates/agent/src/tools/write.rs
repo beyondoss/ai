@@ -46,7 +46,10 @@ impl Tool for Write {
                 })?;
             }
         }
-        std::fs::write(path, content)
+        // Atomic temp-file + rename: an overwrite killed mid-write must not leave a half-written
+        // file — the same guarantee `edit` makes (and which `serve` reattach depends on for the
+        // session file). `create_dir_all` above ensures the sibling temp's directory exists.
+        super::write_atomic(path, content.as_bytes())
             .map_err(|e| ToolError::Execution(format!("write {path}: {e}")))?;
         Ok(format!("wrote {} bytes to {path}", content.len()))
     }
@@ -72,5 +75,24 @@ mod tests {
     async fn missing_content_is_invalid_input() {
         let err = Write.run(json!({ "path": "/tmp/x" })).await.unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn overwrites_existing_file_and_leaves_no_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "old contents").unwrap();
+        Write
+            .run(json!({ "path": path.to_str().unwrap(), "content": "new" }))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        // The atomic write must not leave its sibling temp behind.
+        let temps: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(temps.is_empty(), "atomic write left a temp file behind");
     }
 }

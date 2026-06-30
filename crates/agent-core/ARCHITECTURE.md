@@ -36,7 +36,7 @@ Session.messages (Arc, shared) ──► ModelRequest ──► ModelTransport::
        │                                                              │                              │
        │                                                          return Ok(())          sink(ToolStart) × N (call order)
        │                                                                                              │
-       │                                                                     join_all([tool.run(input); N])  ◄── concurrent
+       │                                            group by write_target → buffer_unordered(≤8 groups)  ◄── bounded; same-path serial
        │                                                                                              │
        │                                                              sink(ToolEnd) × N (call order, post-join)
        │                                                                                              │
@@ -104,12 +104,24 @@ the turn completes as if the model ended normally, with no token accounting, rat
 
 ### Concurrent tool dispatch
 
-Once an assistant turn's `tool_uses()` are collected, all of a turn's calls are launched via
-`futures::future::join_all` and awaited together (`agent.rs:193-207`) — not run one at a time. The
-transcript stays deterministic regardless of which tool finishes first: every `ToolStart` is sunk
-*before* the join (in call order), and every `ToolEnd` + `ToolResult` block is sunk and collected
-*after* the join, zipped back against the original `calls` order — so the wall-clock savings never
-leak into transcript ordering.
+Once an assistant turn's `tool_uses()` are collected, the calls are dispatched concurrently — but with
+two guards, so concurrency never costs correctness:
+
+- **Same-path calls are serialized.** Each call is grouped by `Tool::write_target(input)` (the path it
+  would mutate, or a unique `solo:<i>` key for read-only/path-less calls). Calls sharing a target run
+  *sequentially in call order* within their group, because two tools that read-modify-write the same
+  file (the model batching two `edit`s on one source) would otherwise race and drop or interleave a
+  write. Distinct groups still run concurrently against each other.
+- **Concurrency is bounded.** Groups are run through `futures::stream::buffer_unordered` with a cap of
+  `MAX_CONCURRENT_TOOL_GROUPS` (8), so a turn requesting dozens of `bash`/`grep` calls can't spawn that
+  many subprocesses / parallel walks at once (`grep` itself fans out over CPU cores, which would
+  compound). `buffer_unordered` is safe despite its name: each group yields results tagged with their
+  original call index `i`, scattered into a pre-sized `results[i]` — cross-group completion order never
+  reaches the transcript.
+
+The transcript stays deterministic regardless of which tool finishes first: every `ToolStart` is sunk
+*before* dispatch (in call order), and every `ToolEnd` + `ToolResult` block is rebuilt in call order
+*after* the groups resolve — so the wall-clock savings never leak into transcript ordering.
 
 All of a turn's results are folded into **one** `Message::tool_results([...])` user turn, not one
 message per result (`message.rs:85-94`). Anthropic carries a turn's tool results as multiple blocks on
@@ -158,8 +170,8 @@ socket that splits a write inside a 4-byte emoji (`tests/client_socket.rs`).
         │                                                                    │
         ├──stop_reason≠ToolUse OR no tool_use blocks──► Ok(()) [done]        │
         │                                                                    │
-        └──ToolUse + calls present──► [dispatch tools concurrently] ─────────┘
-              ToolStart×N (pre-join) → join_all → ToolEnd×N + tool_results pushed
+        └──ToolUse + calls present──► [dispatch tools: grouped, bounded] ────┘
+              ToolStart×N → group by write_target → buffer_unordered(≤8) → ToolEnd×N + tool_results pushed
 ```
 
 | From             | Event                              | To                     | Guard                  | What Actually Happens                                              |
@@ -172,7 +184,7 @@ socket that splits a write inside a 4-byte emoji (`tests/client_socket.rs`).
 | turn assembled   | —                                    | turn pushed            | —                        | `session.push(assistant)`, `record_usage`, `steps += 1`, `TurnEnd` sunk |
 | turn pushed      | no tool_use blocks / `stop_reason != ToolUse` | done (`Ok`)    | —                        | Returns to caller; session ends on the assistant turn                |
 | turn pushed      | `tool_use` blocks present, `ToolUse` | dispatching tools      | —                        | `ToolStart` sunk per call, in call order                            |
-| dispatching tools | `join_all` resolves                | (loop top, next iter)  | —                        | `ToolEnd` sunk + one `tool_results` user message pushed, in call order |
+| dispatching tools | all groups resolve (`buffer_unordered`) | (loop top, next iter)  | —                        | `ToolEnd` sunk + one `tool_results` user message pushed, in call order |
 
 ### Per-block accumulation (`Accumulator`)
 
@@ -192,10 +204,13 @@ socket that splits a write inside a 4-byte emoji (`tests/client_socket.rs`).
 
 Tools are I/O-bound (file reads, shell commands, the `beyond` CLI) and a model routinely batches
 independent calls in one turn. Running them serially makes the tool phase the sum of their latencies;
-`join_all` collapses it to the slowest member. Determinism is preserved by separating *when results
-become available* (whichever order, via the join) from *when they're observed* (always re-zipped
-against the original `calls` order before sinking/pushing) — see `agent.rs:tests::independent_tool_calls_run_concurrently`,
-which deadlocks under serial dispatch by design, to prove the concurrency.
+overlapping them (up to `MAX_CONCURRENT_TOOL_GROUPS`) collapses it toward the slowest member.
+Determinism is preserved by separating *when results become available* (whichever order, via
+`buffer_unordered`) from *when they're observed* (each group's results carry their original call index
+`i` and are scattered into a pre-sized `results` vec, then the transcript is rebuilt in `calls` order)
+— see `agent.rs:tests::independent_tool_calls_run_concurrently`, which deadlocks under serial dispatch
+by design to prove the concurrency, and `same_write_target_calls_run_sequentially`, which proves
+same-path calls *don't* overlap.
 
 ### Why tool results batch into one user message
 
@@ -230,6 +245,24 @@ This client sits downstream of the Beyond gateway, which applies its own 600s id
 be at least its upstream's, so `READ_TIMEOUT` mirrors the gateway's `read_timeout_secs` exactly, and is
 applied between reads (not as a `Client::timeout` over the whole response) so a long-but-healthy stream
 is never killed mid-flight.
+
+### Why the Anthropic body stamps two prompt-cache breakpoints
+
+An agent loop re-sends an ever-growing prefix every turn — tools, then system, then the entire prior
+conversation — in request order. Without prompt caching each turn re-bills that whole prefix at full
+input-token price: an O(n²) token cost over a `max_steps`-deep run, on the very history this crate
+already keeps O(1) *in memory* via `Arc`/COW (the wire cost was the half left unoptimized).
+`anthropic::build_body` marks `cache_control: {"type":"ephemeral"}` at two points (Anthropic caches the
+request prefix up to each mark; cache reads cost ~10% of input tokens):
+
+- an **anchor** on the last tool definition — the ten JSON schemas are byte-identical every turn and sit
+  first in the cache order, so this entry stays warm independently of the rolling one;
+- a **rolling** breakpoint on the last message block — caches `tools + system + conversation-so-far`, so
+  next turn the whole accumulated transcript is a cache read instead of a re-bill.
+
+Cache hits require a byte-identical prefix, so `ToolRegistry::definitions()` sorts by name (`tool.rs`):
+`HashMap` iteration order would otherwise cold-miss the anchor after every process restart / `serve`
+reattach. The OpenAI dialect needs no breakpoints — its provider caches prefixes automatically.
 
 ### Why malformed streamed tool arguments fail the turn instead of dispatching with null
 
@@ -291,7 +324,7 @@ selection mechanism — adding a model never requires touching the gateway.
 | `transport.rs`                 | `ModelRequest`, `ModelTransport` trait, `EventStream` alias — the loop's sole network-facing dependency          |
 | `client.rs`                    | `GatewayClient`: the production `ModelTransport`; HTTP POST + chunked-SSE byte framing into whole UTF-8 lines    |
 | `dialect/mod.rs`                | `Dialect` enum (model-id → wire selection), `StreamDecoder` trait, SSE line-splitting (`push_sse_line`/`decode_sse`) |
-| `dialect/anthropic.rs`         | `/v1/messages` body builder + decoder — near-identity, since the internal model is Anthropic-shaped              |
+| `dialect/anthropic.rs`         | `/v1/messages` body builder (+ two prompt-cache breakpoints) + decoder — near-identity, since the internal model is Anthropic-shaped |
 | `dialect/openai.rs`            | `/v1/chat/completions` body builder + decoder — real translation: flattened messages, string-encoded tool args, synthesized block-stop events |
 | `session.rs`                   | `Session`: Arc-shared copy-on-write message history + step/token counters, serde round-trippable                |
 | `error.rs`                     | `Error` (loop/transport, aborts the run) and `ToolError` (tool failure, becomes an error `tool_result`)         |

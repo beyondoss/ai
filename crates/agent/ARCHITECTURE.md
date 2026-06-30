@@ -69,9 +69,10 @@ stdout write fails (broken pipe) → writer task exits its loop → next emit! o
 ```
 
 A `prompt`'s tool calls are NOT shown above as a separate fan-out: `agent_core::Agent::run_events`
-runs every tool the model batched in one turn **concurrently** (`futures::join_all`), but always
-emits `ToolStart` for all of them up front, then `ToolEnd`s in original call order after the join —
-so the NDJSON stream a client sees is deterministic regardless of which tool finishes first.
+runs the tools the model batched in one turn **concurrently but bounded** (grouped by write-target so
+same-path calls serialize, then `buffer_unordered` over ≤8 groups — see `agent-core/ARCHITECTURE.md`),
+yet always emits `ToolStart` for all of them up front, then `ToolEnd`s in original call order — so the
+NDJSON stream a client sees is deterministic regardless of which tool finishes first.
 
 ---
 
@@ -103,7 +104,7 @@ each tool actually produces:
 
 | Tool         | `ToolError::InvalidInput` when…                                  | `ToolError::Execution` when…                                |
 | ------------ | ------------------------------------------------------------------ | --------------------------------------------------------------- |
-| `read`       | missing `path`                                                     | file unreadable (missing, not UTF-8, permission denied)         |
+| `read`       | missing `path`                                                     | file unreadable (missing, permission denied) — non-UTF-8 bytes decode lossily, not an error |
 | `write`      | missing `path`/`content`                                           | `mkdir`/`write` syscall fails                                   |
 | `edit`       | `old_string` matches 0 or >1 times (without single-edit `replace_all`); malformed `edits` | file unreadable/unwritable |
 | `ls`         | —                                                                   | `read_dir` fails                                                 |
@@ -119,8 +120,14 @@ cost of a thread hop would dominate the work itself; these tools accept blocking
 briefly rather than pay that overhead, consistent with "do less work" over reflexive parallelism.
 
 - **`read`** numbers every line (`{lineno:>6}\t{line}`), 1-based `offset`, default `limit` 2000,
-  appends a `"… (truncated …)"` marker if more remains.
-- **`write`** creates parent directories (`create_dir_all`) before writing; always overwrites.
+  appends a `"… (truncated …)"` marker if more lines remain. It streams line-by-line and caps each
+  line at `MAX_LINE_BYTES` (4000) — bytes past the cap are drained but not stored, so one pathological
+  single line (a minified bundle) can't balloon memory; a capped line gets a `"… [line truncated]"`
+  marker. Line bytes decode lossily (`from_utf8_lossy`), so a non-UTF-8 file reads with replacement
+  chars rather than erroring.
+- **`write`** creates parent directories (`create_dir_all`), then writes **atomically** (sibling temp
+  file + `rename`, shared with `edit` via `tools::write_atomic`) so a kill mid-write can't leave a
+  half-written file; always overwrites.
 - **`edit`** accepts either an `edits: [{old_string,new_string}]` array (applied in order) or a
   single `old_string`/`new_string` pair. Each `old_string` must match **exactly once** in the current
   content unless it's a single-edit call with `replace_all: true` — uniqueness is the only safety
@@ -290,9 +297,11 @@ auth schemes — it just forwards a token and trusts the gateway's response.
 - **The gateway key.** `--key`/`AI_AGENT_KEY` is forwarded as a Bearer token without inspection;
   signature verification and deny-set checks happen entirely in the gateway (see
   `agent-core/ARCHITECTURE.md` and the gateway's own `ARCHITECTURE.md`).
-- **The session file.** `load_session` swallows any read or parse failure (`.ok()` chains) and
-  silently returns an empty `Session::default()` — a corrupted or tampered session file is not
-  surfaced as an error, just silent transcript loss.
+- **The session file.** `load_session` distinguishes a missing file (the expected first-run case,
+  silent) from a file that exists but fails to read or parse (corrupt JSON, a schema change across a
+  deploy, a permissions error): the latter is **logged to stderr** before falling back to an empty
+  `Session::default()`. The fallback still means a corrupt/tampered file loses the prior transcript —
+  but it's no longer silent, matching `save_session`'s error reporting.
 - **`serve`'s stdin.** Any process that can write to this process's stdin has full control — there is
   no per-command authentication; trust is established once, by whoever spawned the process (e.g. an
   authenticated SSH pipe).
@@ -358,7 +367,7 @@ tool set itself (always the same 10 tools from `default_registry()` — no enabl
 | Model never stops requesting tools                          | `session.steps >= max_steps` → `Error::MaxSteps`; `run` exits non-zero; `serve` returns a failed `response` but keeps serving | Caller issues a fresh `prompt`, or `new_session`                       |
 | Malformed JSON on `serve`'s stdin                            | Parsed as `Value`, fails → `response{success:false, error:"invalid JSON: …"}`; loop continues                       | Client resends a valid command                                         |
 | `serve`'s stdout write fails (broken pipe)                  | Writer task exits its loop; the next `emit!` send observes the closed channel and `break`s the main loop; process exits `Ok(())` | None by design — a client must reconnect via a new process             |
-| Session file unreadable/corrupt at `serve` startup           | `load_session` swallows the error and returns a fresh empty `Session` — no error surfaced                            | None automatic — prior transcript is silently lost                     |
+| Session file unreadable/corrupt at `serve` startup           | `load_session` logs the read/parse failure to stderr, then falls back to a fresh empty `Session` (a missing file stays silent — expected first run) | None automatic — prior transcript is lost, but the failure is logged |
 | Session file write fails after a turn                       | Logged to stderr only (`eprintln!`); the in-memory session and the turn's `response` still report success            | None automatic — operator must notice the stderr line                  |
 | `edit`'s `old_string` matches 0 or >1 times (no `replace_all`) | `ToolError::InvalidInput`; the file is **not** modified                                                            | Model adds more surrounding context and retries                        |
 | `grep`/`find` hit `HARD_CAP` (10,000 collected items)        | Walk quits early; output is still sorted+truncated deterministically, but which items entered the set before the cap can vary | Model narrows the `pattern`/`glob` and retries                         |

@@ -7,6 +7,7 @@
 //! memory on pathological patterns; if it trips, which matches survive truncation may vary (flagged
 //! in the output). The blocking walk runs on `spawn_blocking` so it never stalls the async runtime.
 
+use std::io::BufRead;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -84,16 +85,31 @@ pub fn search(job: &GrepJob, threads: usize) -> (Vec<(PathBuf, usize, String)>, 
                         return WalkState::Continue;
                     }
                 }
-                // Skip non-UTF8 / binary files silently.
-                let Ok(content) = std::fs::read_to_string(path) else {
+                // Stream the file line-by-line rather than slurping it whole: a large committed file
+                // (fixtures, lockfiles, vendored sources) shouldn't be fully buffered, and the walk
+                // runs ≈CPU-count of these workers at once. Hold at most one line plus the matches.
+                let Ok(file) = std::fs::File::open(path) else {
                     return WalkState::Continue;
                 };
-                // Scan the whole file into a local Vec, then push once — one lock per matching file,
-                // not per matching line.
+                let mut reader = std::io::BufReader::new(file);
+                // Scan into a local Vec, then push once — one lock per matching file, not per line.
                 let mut local = Vec::new();
-                for (i, line) in content.lines().enumerate() {
+                let mut lineno = 0usize;
+                let mut buf = String::new();
+                loop {
+                    buf.clear();
+                    // A read error mid-file (invalid UTF-8 / binary) skips the whole file, dropping
+                    // any matches gathered so far — same outcome as the prior whole-file read.
+                    match reader.read_line(&mut buf) {
+                        Ok(0) => break, // EOF
+                        Ok(_) => {}
+                        Err(_) => return WalkState::Continue,
+                    }
+                    lineno += 1;
+                    let line = buf.strip_suffix('\n').unwrap_or(&buf);
+                    let line = line.strip_suffix('\r').unwrap_or(line);
                     if re.is_match(line) {
-                        local.push((path.to_path_buf(), i + 1, clip(line)));
+                        local.push((path.to_path_buf(), lineno, clip(line)));
                     }
                 }
                 if !local.is_empty() {

@@ -4,7 +4,7 @@
 //! `tool_use`/`tool_result`), so the request mapping is nearly an identity and the SSE decoder is a
 //! direct translation of Anthropic's `content_block_*` / `message_*` events.
 
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 use super::StreamDecoder;
 use crate::message::{StopReason, StreamEvent};
@@ -12,25 +12,63 @@ use crate::transport::ModelRequest;
 
 /// Build the streaming request body. `system` is hoisted to a top-level field (Anthropic keeps it
 /// out of `messages`); `messages` and `tools` serialize straight from the internal model.
+///
+/// Two prompt-cache breakpoints are stamped in (see [`mark_cache_breakpoint`]/[`mark_last_tool`]).
+/// An agent loop re-sends an ever-growing prefix — tools, then system, then the whole prior
+/// conversation — on every turn; without caching each turn re-bills that entire prefix at full input
+/// price, an O(n²) token cost over a `max_steps`-deep run. Anthropic caches the request prefix up to
+/// each `cache_control` mark (reads cost ~10% of input tokens), so we anchor one breakpoint on the
+/// fixed tool block and roll a second one onto the last message to capture the conversation so far.
 pub fn build_body(req: &ModelRequest) -> Value {
     let mut map = Map::new();
     map.insert("model".into(), Value::String(req.model.clone()));
     map.insert("max_tokens".into(), Value::from(req.max_tokens));
     map.insert("stream".into(), Value::Bool(true));
-    map.insert(
-        "messages".into(),
-        serde_json::to_value(req.messages.as_ref()).unwrap_or(Value::Null),
-    );
+
+    // Rolling breakpoint: cache the conversation prefix (tools + system + every prior message) up to
+    // the final block, so next turn the whole accumulated transcript is a cache read, not a re-bill.
+    let mut messages = serde_json::to_value(req.messages.as_ref()).unwrap_or(Value::Null);
+    mark_cache_breakpoint(&mut messages);
+    map.insert("messages".into(), messages);
+
     if let Some(system) = &req.system {
         map.insert("system".into(), Value::String(system.clone()));
     }
     if !req.tools.is_empty() {
-        map.insert(
-            "tools".into(),
-            serde_json::to_value(req.tools.as_ref()).unwrap_or(Value::Null),
-        );
+        // Anchor breakpoint: the tool definitions (ten JSON schemas) are identical every turn and sit
+        // at the front of the cache order, so this entry stays warm even when the rolling message
+        // breakpoint is rewritten each turn. Requires stable tool ordering — see `definitions()`.
+        let mut tools = serde_json::to_value(req.tools.as_ref()).unwrap_or(Value::Null);
+        mark_last_tool(&mut tools);
+        map.insert("tools".into(), tools);
     }
     Value::Object(map)
+}
+
+/// Stamp an ephemeral cache breakpoint onto the last content block of the last message. No-op if the
+/// history is empty or the final message carries no content blocks.
+fn mark_cache_breakpoint(messages: &mut Value) {
+    if let Some(block) = messages
+        .as_array_mut()
+        .and_then(|msgs| msgs.last_mut())
+        .and_then(|m| m.get_mut("content"))
+        .and_then(Value::as_array_mut)
+        .and_then(|content| content.last_mut())
+        .and_then(Value::as_object_mut)
+    {
+        block.insert("cache_control".into(), json!({ "type": "ephemeral" }));
+    }
+}
+
+/// Stamp an ephemeral cache breakpoint onto the last tool definition.
+fn mark_last_tool(tools: &mut Value) {
+    if let Some(tool) = tools
+        .as_array_mut()
+        .and_then(|t| t.last_mut())
+        .and_then(Value::as_object_mut)
+    {
+        tool.insert("cache_control".into(), json!({ "type": "ephemeral" }));
+    }
 }
 
 fn map_stop_reason(s: Option<&str>) -> StopReason {
@@ -153,6 +191,37 @@ mod tests {
         assert_eq!(body["messages"][0]["content"][0]["type"], "text");
         assert_eq!(body["tools"][0]["name"], "read");
         assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
+    }
+
+    #[test]
+    fn build_body_stamps_cache_breakpoints() {
+        let req = ModelRequest::new(
+            "claude-opus-4-8",
+            vec![Message::user("hi"), Message::tool_result("tu_1", "out", false)],
+            256,
+        )
+        .with_tools(vec![
+            ToolDef {
+                name: "read".into(),
+                description: "read a file".into(),
+                input_schema: json!({ "type": "object" }),
+            },
+            ToolDef {
+                name: "write".into(),
+                description: "write a file".into(),
+                input_schema: json!({ "type": "object" }),
+            },
+        ]);
+        let body = build_body(&req);
+        // Anchor breakpoint on the last (only the last) tool definition.
+        assert!(body["tools"][0].get("cache_control").is_none());
+        assert_eq!(body["tools"][1]["cache_control"]["type"], "ephemeral");
+        // Rolling breakpoint on the last block of the last message, and nowhere earlier.
+        assert!(body["messages"][0]["content"][0].get("cache_control").is_none());
+        assert_eq!(
+            body["messages"][1]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
     }
 
     #[test]

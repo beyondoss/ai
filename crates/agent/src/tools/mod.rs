@@ -17,6 +17,30 @@ pub mod ls;
 pub mod read;
 pub mod write;
 
+/// Overwrite `path` atomically: write a sibling temp file, then `rename` it over the target.
+/// `rename(2)` is atomic within one filesystem, so a concurrent reader — or a crash mid-write — sees
+/// either the original file or the fully-written one, never a half-written file. The temp file is a
+/// sibling (same directory) so the rename stays on one filesystem. A bare `std::fs::write` truncates
+/// in place and would leave a partial file if the process died between truncation and the last byte.
+///
+/// Shared by `write` and `edit`: both replace whole files and must not leave a corrupt intermediate
+/// state that a later read (or `serve` reattach) would observe.
+pub(crate) fn write_atomic(path: &str, content: &[u8]) -> std::io::Result<()> {
+    let p = std::path::Path::new(path);
+    let tmp = match p.file_name() {
+        Some(name) => p.with_file_name(format!(".{}.tmp", name.to_string_lossy())),
+        None => return Err(std::io::Error::other(format!("invalid path: {path}"))),
+    };
+    std::fs::write(&tmp, content)?;
+    match std::fs::rename(&tmp, p) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp); // don't leave the temp behind on failure
+            Err(e)
+        }
+    }
+}
+
 /// The default tool set: pi's seven coding tools (read, write, edit, bash, ls, grep, find) plus the
 /// Beyond platform tools (fork, sync, logs).
 pub fn default_registry() -> ToolRegistry {
