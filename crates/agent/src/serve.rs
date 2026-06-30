@@ -53,20 +53,56 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
 
     // One writer task owns stdout; every frame (events + responses) is serialized through it in FIFO
     // order, so output never interleaves.
+    //
+    // The channel is intentionally unbounded. The event `sink` (see `Agent::run_events`) is a
+    // synchronous `FnMut`, so the producer cannot `.await` to apply backpressure; a bounded channel
+    // would force `try_send`, which silently drops frames and corrupts the event stream — unacceptable
+    // for a protocol. In practice the backlog is bounded by one in-flight turn's events (capped by
+    // `max_steps`), drained concurrently by the writer as fast as stdout accepts. If a client stops
+    // reading, stdout's write eventually fails and the writer tears down (below), surfacing the stall
+    // rather than masking it.
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Value>();
     let writer = tokio::spawn(async move {
         let mut out = tokio::io::stdout();
         while let Some(frame) = out_rx.recv().await {
-            if let Ok(line) = serde_json::to_string(&frame) {
-                let _ = out.write_all(line.as_bytes()).await;
-                let _ = out.write_all(b"\n").await;
-                let _ = out.flush().await;
+            // A frame we built ourselves failing to serialize is a bug, not bad input — skip it
+            // rather than tearing down the whole stream.
+            let line = match serde_json::to_string(&frame) {
+                Ok(line) => line,
+                Err(e) => {
+                    eprintln!("serve: failed to serialize output frame: {e}");
+                    continue;
+                }
+            };
+            // stdout is the only sink. If it breaks (client hung up, broken pipe) there is nothing
+            // left to do but stop; dropping `out_rx` here makes every sender observe the closure and
+            // halt the control loop instead of writing into a dead pipe forever.
+            if let Err(e) = write_frame(&mut out, &line).await {
+                eprintln!("serve: stdout write failed, shutting down writer: {e}");
+                break;
             }
         }
     });
 
-    // Announce readiness so a client can sync before issuing commands.
-    let _ = out_tx.send(json!({ "type": "ready", "session_id": session_id, "model": cfg.model }));
+    // Sends a frame through the writer; if the writer has shut down (stdout closed), stop the control
+    // loop — there is no way to deliver any further response, so continuing would only swallow output.
+    macro_rules! emit {
+        ($frame:expr) => {
+            if out_tx.send($frame).is_err() {
+                break;
+            }
+        };
+    }
+
+    // Announce readiness so a client can sync before issuing commands. If this already fails the
+    // writer never started; there is nothing to serve.
+    if out_tx
+        .send(json!({ "type": "ready", "session_id": session_id, "model": cfg.model }))
+        .is_err()
+    {
+        let _ = writer.await;
+        return Ok(());
+    }
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     while let Some(line) = lines.next_line().await? {
@@ -77,7 +113,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
         let cmd: Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(e) => {
-                let _ = out_tx.send(response(
+                emit!(response(
                     None,
                     "?",
                     false,
@@ -105,12 +141,17 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 let tx = out_tx.clone();
                 let result = agent
                     .run_events(&mut session, move |ev| {
+                        // Best-effort: a sync sink can't break the control loop. If the writer is
+                        // gone the send fails here and the terminal response send below detects it
+                        // via `emit!` and stops the loop.
                         let _ = tx.send(event_frame(ev));
                     })
                     .await;
 
                 if let Some(path) = &cfg.session_file {
-                    save_session(path, &session);
+                    if let Err(e) = save_session(path, &session) {
+                        eprintln!("serve: failed to persist session to {path}: {e}");
+                    }
                 }
                 let frame = match result {
                     Ok(()) => response(
@@ -124,7 +165,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     ),
                     Err(e) => response(id.clone(), "prompt", false, None, Some(&e.to_string())),
                 };
-                let _ = out_tx.send(frame);
+                emit!(frame);
             }
             "get_state" => {
                 let data = json!({
@@ -135,11 +176,11 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     "input_tokens": session.input_tokens,
                     "output_tokens": session.output_tokens,
                 });
-                let _ = out_tx.send(response(id, "get_state", true, Some(data), None));
+                emit!(response(id, "get_state", true, Some(data), None));
             }
             "get_messages" => {
                 let messages = serde_json::to_value(&session.messages).unwrap_or(Value::Null);
-                let _ = out_tx.send(response(
+                emit!(response(
                     id,
                     "get_messages",
                     true,
@@ -151,9 +192,11 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 session = Session::new();
                 session_id = make_id();
                 if let Some(path) = &cfg.session_file {
-                    save_session(path, &session);
+                    if let Err(e) = save_session(path, &session) {
+                        eprintln!("serve: failed to persist session to {path}: {e}");
+                    }
                 }
-                let _ = out_tx.send(response(
+                emit!(response(
                     id,
                     "new_session",
                     true,
@@ -162,7 +205,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 ));
             }
             other => {
-                let _ = out_tx.send(response(id, other, false, None, Some("unknown command")));
+                emit!(response(id, other, false, None, Some("unknown command")));
             }
         }
     }
@@ -206,6 +249,13 @@ fn event_frame(ev: AgentEvent) -> Value {
     Value::Object(m)
 }
 
+/// Write one newline-delimited frame to stdout and flush it.
+async fn write_frame(out: &mut tokio::io::Stdout, line: &str) -> std::io::Result<()> {
+    out.write_all(line.as_bytes()).await?;
+    out.write_all(b"\n").await?;
+    out.flush().await
+}
+
 fn load_session(path: &str) -> Session {
     std::fs::read_to_string(path)
         .ok()
@@ -213,17 +263,25 @@ fn load_session(path: &str) -> Session {
         .unwrap_or_default()
 }
 
-fn save_session(path: &str, session: &Session) {
-    if let Ok(s) = serde_json::to_string(session) {
-        let _ = std::fs::write(path, s);
-    }
+/// Persist the session to `path`. Returns the error so the caller can surface a failed write
+/// (read-only path, full disk) instead of silently losing the transcript.
+fn save_session(path: &str, session: &Session) -> std::io::Result<()> {
+    let s = serde_json::to_string(session)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    std::fs::write(path, s)
 }
 
-/// A short, monotonic-ish session id (no extra deps; uniqueness across a process is sufficient).
+/// A short session id, unique within a process. The nanosecond timestamp orders ids roughly by
+/// creation, and the process-local counter guarantees uniqueness even for ids minted in the same
+/// nanosecond (or if the clock is unavailable and `nanos` falls back to 0).
 fn make_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("sess_{nanos:x}")
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("sess_{nanos:x}_{seq:x}")
 }
