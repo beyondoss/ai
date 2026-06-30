@@ -78,20 +78,28 @@ pub trait StreamDecoder: Send {
 pub fn decode_sse(decoder: &mut dyn StreamDecoder, raw: &str) -> Result<Vec<StreamEvent>> {
     let mut out = Vec::new();
     for line in raw.lines() {
-        let line = line.trim_end_matches('\r');
-        let Some(payload) = line.strip_prefix("data:") else {
-            continue;
-        };
-        let payload = payload.trim();
-        if payload.is_empty() || payload == "[DONE]" {
-            continue;
-        }
-        let v: Value = serde_json::from_str(payload)
-            .map_err(|e| Error::Transport(format!("malformed SSE json: {e}")))?;
-        out.extend(decoder.push(&v));
+        out.extend(push_sse_line(decoder, line)?);
     }
     out.extend(decoder.finish());
     Ok(out)
+}
+
+/// Feed a single SSE line to the decoder, returning any events it produced. Non-`data:` lines
+/// (comments, `event:`, blanks) and the OpenAI `[DONE]` sentinel produce nothing. This is the
+/// incremental entry point the streaming HTTP client drives line-by-line off the socket; the caller
+/// is responsible for calling [`StreamDecoder::finish`] once the stream closes.
+pub fn push_sse_line(decoder: &mut dyn StreamDecoder, line: &str) -> Result<Vec<StreamEvent>> {
+    let line = line.trim_end_matches('\r');
+    let Some(payload) = line.strip_prefix("data:") else {
+        return Ok(Vec::new());
+    };
+    let payload = payload.trim();
+    if payload.is_empty() || payload == "[DONE]" {
+        return Ok(Vec::new());
+    }
+    let v: Value = serde_json::from_str(payload)
+        .map_err(|e| Error::Transport(format!("malformed SSE json: {e}")))?;
+    Ok(decoder.push(&v))
 }
 
 #[cfg(test)]

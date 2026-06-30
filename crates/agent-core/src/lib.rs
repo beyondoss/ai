@@ -18,15 +18,21 @@
 // job is to assert a precondition holds, so `.unwrap()` *is* the assertion — allow it under `test`.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+pub mod agent;
+pub mod client;
 pub mod dialect;
 pub mod error;
 pub mod message;
+pub mod mock;
 pub mod session;
 pub mod tool;
 pub mod transport;
 
+pub use agent::Agent;
+pub use client::GatewayClient;
 pub use error::{Error, Result, ToolError};
 pub use message::{ContentBlock, Message, Role, StopReason, StreamEvent, ToolDef};
+pub use mock::MockTransport;
 pub use session::Session;
 pub use tool::{Tool, ToolRegistry};
 pub use transport::{ModelRequest, ModelTransport};
