@@ -38,8 +38,9 @@ the full [`AgentEvent`] stream — `Stream(StreamEvent)`, `ToolStart`/`ToolEnd` 
 
 ## Milestone status
 
-Built and tested: the type model, the `Tool`/`ToolRegistry` seam, the `ModelTransport` seam +
-`GatewayClient` HTTP transport, `MockTransport`, the OpenAI/Anthropic wire dialects, the agent loop
-(`run`/`run_events`), and `Session`. The coding tools, the `run` CLI, and the headless `serve`
-control protocol live in the `beyond-ai-agent` crate. Remaining: the Beyond platform tools
-(fork/sync/logs) and the full gateway e2e (M8).
+Complete. Built and tested: the type model, the `Tool`/`ToolRegistry` seam, the `ModelTransport`
+seam + `GatewayClient` HTTP transport, `MockTransport`, the OpenAI/Anthropic wire dialects, the agent
+loop (`run`/`run_events`), and `Session`. The coding tools (read/write/edit/bash/ls/grep/find), the
+Beyond platform tools (fork/sync/logs), the `run` CLI, and the headless `serve` control protocol live
+in the `beyond-ai-agent` crate. End-to-end proven against the real `beyond-ai` gateway binary
+(auth + key-swap + routing) through to a mock upstream.
