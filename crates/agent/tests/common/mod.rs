@@ -49,15 +49,17 @@ fn read_http_request(stream: &mut TcpStream) -> String {
                         .map(|v| v.trim().parse::<usize>().unwrap_or(0))
                 })
                 .unwrap_or(0);
-            let mut body = buf[pos + 4..].to_vec();
-            while body.len() < len {
+            // Keep reading until the full body has arrived, then return the WHOLE raw request
+            // (headers + body) so callers can assert on both (e.g. a swapped-in pool key).
+            let need = pos + 4 + len;
+            while buf.len() < need {
                 let n = stream.read(&mut tmp).unwrap_or(0);
                 if n == 0 {
                     break;
                 }
-                body.extend_from_slice(&tmp[..n]);
+                buf.extend_from_slice(&tmp[..n]);
             }
-            return String::from_utf8_lossy(&body).into_owned();
+            return String::from_utf8_lossy(&buf).into_owned();
         }
         let n = stream.read(&mut tmp).unwrap_or(0);
         if n == 0 {
@@ -67,18 +69,18 @@ fn read_http_request(stream: &mut TcpStream) -> String {
     }
 }
 
-/// Spawn a model server answering `responses` in order, recording each request body. Returns the
-/// base URL and the shared record of request bodies.
+/// Spawn a model server answering `responses` in order, recording each full raw request (headers +
+/// body). Returns the base URL and the shared record of requests.
 pub fn spawn_model_server(responses: Vec<String>) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    let bodies = Arc::new(Mutex::new(Vec::new()));
-    let recorder = bodies.clone();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let recorder = requests.clone();
     thread::spawn(move || {
         for resp in responses {
             if let Ok((mut stream, _)) = listener.accept() {
-                let body = read_http_request(&mut stream);
-                recorder.lock().unwrap().push(body);
+                let req = read_http_request(&mut stream);
+                recorder.lock().unwrap().push(req);
                 let http = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{resp}"
                 );
@@ -87,5 +89,26 @@ pub fn spawn_model_server(responses: Vec<String>) -> (String, Arc<Mutex<Vec<Stri
             }
         }
     });
-    (format!("http://{addr}"), bodies)
+    (format!("http://{addr}"), requests)
+}
+
+/// A free localhost port (bind `:0`, read it back, release). A subprocess must bind it promptly;
+/// there's a small TOCTOU window, acceptable for tests.
+pub fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// Block until `port` accepts a TCP connection, or panic after ~5s.
+pub fn wait_for_port(port: u16) {
+    for _ in 0..500 {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return;
+        }
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("port {port} never came up");
 }

@@ -1,8 +1,14 @@
 # beyond/ai
 
-Route LLM traffic through one internal proxy. Apps use their stock OpenAI or Anthropic SDK unchanged — the gateway authenticates, swaps in the real provider key, and meters every token.
+Open-source AI at Beyond — a Cargo workspace:
 
-## Quick Start
+- **`crates/gateway`** (`beyond-ai`) — the LLM egress gateway. Route LLM traffic through one internal proxy; apps use their stock OpenAI or Anthropic SDK unchanged — the gateway authenticates, swaps in the real provider key, and meters every token.
+- **`crates/agent-core`** (`beyond-ai-agent-core`) — the agent harness core: a runtime/network-agnostic tool-calling loop (modeled on [pi](https://github.com/badlogic/pi-mono)), the OpenAI/Anthropic wire dialects, and the `ModelTransport`/`Tool` seams. Routes all model traffic through the gateway.
+- **`crates/agent`** (`beyond-ai-agent`) — the agent CLI: `run` (one-shot coding task) and `serve` (headless control protocol over stdio, for remote control over SSH). Ships the coding tools (read/write/edit/bash/ls/grep/find) plus the Beyond platform tools (fork/sync/logs).
+
+The gateway is the unified model API: the agent speaks OpenAI/Anthropic wire to it with a `bai_v1` key and never holds a provider key. See each crate's `ARCHITECTURE.md`.
+
+## Gateway Quick Start
 
 ```sh
 cp crates/gateway/config.example.toml config.toml
@@ -22,6 +28,23 @@ Or pass your own provider key directly (BYO — forwarded unchanged, no swap):
 ```python
 client = OpenAI(base_url="http://ai.internal/v1", api_key="sk-your-openai-key")
 ```
+
+## Agent Quick Start
+
+The agent harness routes through the gateway. Point it at a running gateway with a `bai_v1` key:
+
+```sh
+# One-shot coding task
+AI_GATEWAY_URL=http://ai.internal AI_AGENT_KEY=bai_v1... \
+  cargo run -p beyond-ai-agent -- run "add a CHANGELOG entry for the latest release"
+
+# Headless server — drive it over stdio (e.g. an SSH pipe); newline-delimited JSON
+AI_GATEWAY_URL=http://ai.internal AI_AGENT_KEY=bai_v1... \
+  cargo run -p beyond-ai-agent -- serve --session-file /tmp/agent.json
+# then: {"type":"prompt","message":"…"} → streamed event frames, then a response
+```
+
+Tools: `read`, `write`, `edit`, `bash`, `ls`, `grep`, `find` (pi's coding set) plus `fork`, `sync`, `logs` (Beyond platform). See [crates/agent-core/ARCHITECTURE.md](crates/agent-core/ARCHITECTURE.md).
 
 ## What It Does
 
