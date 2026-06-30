@@ -30,26 +30,29 @@ impl MockTransport {
 
     /// The requests the loop has sent so far, in order (for asserting what the loop fed back).
     pub fn requests(&self) -> Vec<ModelRequest> {
-        self.requests.lock().map(|r| r.clone()).unwrap_or_default()
+        // Recover the data on a poisoned lock (a panicked test thread) rather than silently
+        // returning an empty vec, which would mask the real failure behind a confusing assertion.
+        self.requests.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// How many turns the loop has consumed.
     pub fn calls(&self) -> usize {
-        self.requests.lock().map(|r| r.len()).unwrap_or(0)
+        self.requests.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 }
 
 #[async_trait]
 impl ModelTransport for MockTransport {
     async fn stream(&self, req: ModelRequest) -> Result<EventStream> {
-        if let Ok(mut reqs) = self.requests.lock() {
-            reqs.push(req);
-        }
+        self.requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(req);
         let turn = self
             .turns
             .lock()
-            .ok()
-            .and_then(|mut t| t.pop_front())
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front()
             .ok_or_else(|| Error::Transport("MockTransport: no more scripted turns".into()))?;
         Ok(Box::pin(futures::stream::iter(turn.into_iter().map(Ok))))
     }

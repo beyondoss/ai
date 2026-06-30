@@ -196,7 +196,7 @@ impl Agent {
             emit(ev.clone());
             acc.apply(ev);
         }
-        Ok(acc.finish())
+        acc.finish()
     }
 }
 
@@ -219,6 +219,9 @@ struct Accumulator {
     stop_reason: StopReason,
     input_tokens: u32,
     output_tokens: u32,
+    /// The first tool-call argument buffer that failed to parse, if any. Held until `finish` so the
+    /// turn fails with [`Error::MalformedToolInput`] rather than handing a tool `null` arguments.
+    bad_tool_args: Option<String>,
 }
 
 impl Accumulator {
@@ -260,7 +263,18 @@ impl Accumulator {
             let input = if args.trim().is_empty() {
                 json!({})
             } else {
-                serde_json::from_str(&args).unwrap_or(Value::Null)
+                match serde_json::from_str(&args) {
+                    Ok(v) => v,
+                    // Malformed arguments from the stream are a protocol failure, not a tool failure:
+                    // record the offending buffer and fail the turn in `finish` rather than dispatch a
+                    // tool with `null` input and let it report an opaque "missing field" error.
+                    Err(_) => {
+                        if self.bad_tool_args.is_none() {
+                            self.bad_tool_args = Some(args);
+                        }
+                        Value::Null
+                    }
+                }
             };
             self.blocks.push(ContentBlock::ToolUse { id, name, input });
         } else {
@@ -268,16 +282,19 @@ impl Accumulator {
         }
     }
 
-    fn finish(mut self) -> Turn {
+    fn finish(mut self) -> Result<Turn> {
         // A stream that ended without a trailing ContentBlockStop (or with leftover text) still
         // contributes its text.
         self.flush_block();
-        Turn {
+        if let Some(args) = self.bad_tool_args {
+            return Err(Error::MalformedToolInput(args));
+        }
+        Ok(Turn {
             blocks: self.blocks,
             stop_reason: self.stop_reason,
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
-        }
+        })
     }
 }
 
@@ -419,6 +436,32 @@ mod tests {
             ContentBlock::ToolResult { is_error, .. } => assert!(is_error),
             other => panic!("expected error tool_result, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn malformed_tool_args_fail_the_turn() {
+        // The stream opens a tool call but its argument fragments never form valid JSON.
+        let turn = vec![
+            StreamEvent::MessageStart,
+            StreamEvent::ToolUseStart {
+                id: "tu_1".into(),
+                name: "echo".into(),
+            },
+            StreamEvent::InputJsonDelta {
+                partial_json: r#"{"text":"#.into(), // truncated — not parseable
+            },
+            StreamEvent::ContentBlockStop,
+            StreamEvent::MessageStop {
+                stop_reason: StopReason::ToolUse,
+            },
+        ];
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        let (agent, _mock) = agent_with(vec![turn], tools);
+        let mut session = Session::new();
+        session.user("go");
+        let err = agent.run(&mut session, |_| {}).await.unwrap_err();
+        assert!(matches!(err, Error::MalformedToolInput(_)));
     }
 
     #[tokio::test]
