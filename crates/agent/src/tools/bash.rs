@@ -96,9 +96,7 @@ impl Bash {
                 }
             };
             let sink: ChunkSink<'_> = &sink;
-            self.runner
-                .run_streaming("sh", &args, cwd, dur, sink)
-                .await
+            self.runner.run_streaming("sh", &args, cwd, dur, sink).await
         }
         .map_err(|e| ToolError::Execution(format!("spawn failed: {e}")))?;
 
@@ -374,7 +372,10 @@ mod tests {
         assert!(out.contains("[Showing lines"), "range marker present");
         assert!(out.contains("Full output:"), "full-output path present");
         assert!(out.contains("4999"), "tail kept (the last line is present)");
-        assert!(!out.starts_with("0\n1\n"), "head dropped (tail truncation, not head+tail)");
+        assert!(
+            !out.starts_with("0\n1\n"),
+            "head dropped (tail truncation, not head+tail)"
+        );
     }
 
     #[tokio::test]

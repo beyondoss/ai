@@ -7,9 +7,7 @@
 //! memory on pathological patterns; if it trips, which matches survive truncation may vary (flagged
 //! in the output). The blocking walk runs on `spawn_blocking` so it never stalls the async runtime.
 
-use std::collections::VecDeque;
-use std::io::BufRead;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,8 +16,9 @@ use agent_core::tool::Tool;
 use agent_core::{ToolError, ToolOutput};
 use async_trait::async_trait;
 use globset::{Glob, GlobMatcher};
+use grep_regex::{RegexMatcher, RegexMatcherBuilder};
+use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
 use ignore::{WalkBuilder, WalkState};
-use regex::{Regex, RegexBuilder};
 use serde_json::{Value, json};
 
 /// Default cap on reported matches.
@@ -39,10 +38,11 @@ pub struct Grep;
 /// One reported line: its path, line number, text, and whether it is a match (vs a context line).
 type Hit = (PathBuf, usize, String, bool);
 
-/// A prepared grep: compiled regex, optional file glob, search root, the report cap, and how many
-/// lines of context to show around each match (`before`/`after`, like ripgrep's `-B`/`-A`/`-C`).
+/// A prepared grep: ripgrep's regex matcher, an optional file glob, the search root, the report cap,
+/// and how many lines of context to show around each match (`before`/`after`, like ripgrep's
+/// `-B`/`-A`/`-C`).
 pub struct GrepJob {
-    re: Regex,
+    matcher: RegexMatcher,
     glob: Option<GlobMatcher>,
     root: PathBuf,
     limit: usize,
@@ -51,16 +51,36 @@ pub struct GrepJob {
 }
 
 impl GrepJob {
-    /// Assemble a job from already-compiled matchers, with no surrounding context.
-    pub fn new(re: Regex, glob: Option<GlobMatcher>, root: PathBuf, limit: usize) -> Self {
-        Self {
-            re,
+    /// Compile a job. `literal` regex-escapes the pattern (verbatim search); `ignore_case` folds case.
+    /// Returns the regex error message on a bad pattern.
+    pub fn new(
+        pattern: &str,
+        literal: bool,
+        ignore_case: bool,
+        glob: Option<GlobMatcher>,
+        root: PathBuf,
+        limit: usize,
+    ) -> Result<Self, String> {
+        let escaped;
+        let effective = if literal {
+            escaped = regex::escape(pattern);
+            escaped.as_str()
+        } else {
+            pattern
+        };
+        let matcher = RegexMatcherBuilder::new()
+            .case_insensitive(ignore_case)
+            .line_terminator(Some(b'\n'))
+            .build(effective)
+            .map_err(|e| format!("bad regex: {e}"))?;
+        Ok(Self {
+            matcher,
             glob,
             root,
             limit,
             before: 0,
             after: 0,
-        }
+        })
     }
 
     /// Show `before` lines before and `after` lines after each match (clamped to [`MAX_CONTEXT`]).
@@ -87,10 +107,18 @@ pub fn search(job: &GrepJob, threads: usize) -> (Vec<Hit>, bool) {
         .run(|| {
             let collected = Arc::clone(&collected);
             let total = Arc::clone(&total);
-            let re = &job.re;
+            let matcher = &job.matcher;
             let glob = &job.glob;
-            let before = job.before;
-            let after = job.after;
+            // One `Searcher` per worker thread (it carries reusable line buffers): ripgrep's engine —
+            // byte-oriented, so non-UTF-8 files search correctly (a `BufReader::read_line` loop would
+            // error out and silently drop them); binary files quit cleanly on a NUL; large files are
+            // mmap'd; line counting is SIMD-accelerated. `before`/`after` context is built in.
+            let mut searcher = SearcherBuilder::new()
+                .line_number(true)
+                .before_context(job.before)
+                .after_context(job.after)
+                .binary_detection(BinaryDetection::quit(b'\x00'))
+                .build();
             Box::new(move |entry| {
                 if total.load(Ordering::Relaxed) >= HARD_CAP {
                     return WalkState::Quit;
@@ -107,62 +135,23 @@ pub fn search(job: &GrepJob, threads: usize) -> (Vec<Hit>, bool) {
                         return WalkState::Continue;
                     }
                 }
-                // Stream the file line-by-line rather than slurping it whole: a large committed file
-                // (fixtures, lockfiles, vendored sources) shouldn't be fully buffered, and the walk
-                // runs ≈CPU-count of these workers at once. Hold at most one line plus the matches.
-                let Ok(file) = std::fs::File::open(path) else {
-                    return WalkState::Continue;
+                // Collect this file's hits into one local sink, then push once — one lock per matching
+                // file. An I/O error (unreadable file) skips it, like the prior behavior.
+                let mut sink = Collector {
+                    path,
+                    hits: Vec::new(),
+                    matches: 0,
                 };
-                let mut reader = std::io::BufReader::new(file);
-                // Scan into a local Vec, then push once — one lock per matching file, not per line.
-                // Context tracking: `ring` holds the last `before` not-yet-emitted lines (candidate
-                // before-context for the next match); `after_remaining` counts down the after-context
-                // owed to the most recent match. Every line is emitted at most once, so windows never
-                // duplicate a line shared by two nearby matches.
-                let mut local: Vec<Hit> = Vec::new();
-                let mut ring: VecDeque<(usize, String)> = VecDeque::new();
-                let mut after_remaining = 0usize;
-                let mut match_count = 0usize;
-                let mut lineno = 0usize;
-                let mut buf = String::new();
-                loop {
-                    buf.clear();
-                    // A read error mid-file (invalid UTF-8 / binary) skips the whole file, dropping
-                    // any matches gathered so far — same outcome as the prior whole-file read.
-                    match reader.read_line(&mut buf) {
-                        Ok(0) => break, // EOF
-                        Ok(_) => {}
-                        Err(_) => return WalkState::Continue,
-                    }
-                    lineno += 1;
-                    let line = buf.strip_suffix('\n').unwrap_or(&buf);
-                    let line = line.strip_suffix('\r').unwrap_or(line);
-                    if re.is_match(line) {
-                        // Flush the buffered before-context, then the match itself.
-                        for (ln, txt) in ring.drain(..) {
-                            local.push((path.to_path_buf(), ln, txt, false));
-                        }
-                        local.push((path.to_path_buf(), lineno, clip(line), true));
-                        match_count += 1;
-                        after_remaining = after;
-                    } else if after_remaining > 0 {
-                        // After-context owed to the preceding match.
-                        local.push((path.to_path_buf(), lineno, clip(line), false));
-                        after_remaining -= 1;
-                    } else if before > 0 {
-                        // A candidate before-context line for a later match — keep only the last `before`.
-                        if ring.len() == before {
-                            ring.pop_front();
-                        }
-                        ring.push_back((lineno, clip(line)));
-                    }
+                if searcher.search_path(matcher, path, &mut sink).is_err() {
+                    return WalkState::Continue;
                 }
-                if !local.is_empty() {
+                if !sink.hits.is_empty() {
+                    let matches = sink.matches;
                     if let Ok(mut guard) = collected.lock() {
-                        guard.extend(local);
+                        guard.extend(sink.hits);
                     }
                     // Only matches count toward the hard cap (context is bounded per match).
-                    if total.fetch_add(match_count, Ordering::Relaxed) + match_count >= HARD_CAP {
+                    if total.fetch_add(matches, Ordering::Relaxed) + matches >= HARD_CAP {
                         return WalkState::Quit;
                     }
                 }
@@ -200,6 +189,46 @@ pub fn search(job: &GrepJob, threads: usize) -> (Vec<Hit>, bool) {
         }
     }
     (hits, truncated)
+}
+
+/// A [`Sink`] that gathers one file's matches and context lines. `matched`/`context` are called by the
+/// searcher with byte-accurate line numbers; bytes are decoded lossily so non-UTF-8 files still yield
+/// readable, matchable text instead of being dropped.
+struct Collector<'a> {
+    path: &'a Path,
+    hits: Vec<Hit>,
+    matches: usize,
+}
+
+impl Sink for Collector<'_> {
+    type Error = std::io::Error;
+
+    fn matched(&mut self, _searcher: &Searcher, m: &SinkMatch<'_>) -> std::io::Result<bool> {
+        let lineno = m.line_number().map(|n| n as usize).unwrap_or(0);
+        let text = String::from_utf8_lossy(m.bytes());
+        self.hits
+            .push((self.path.to_path_buf(), lineno, clip(trim_eol(&text)), true));
+        self.matches += 1;
+        Ok(true)
+    }
+
+    fn context(&mut self, _searcher: &Searcher, c: &SinkContext<'_>) -> std::io::Result<bool> {
+        let lineno = c.line_number().map(|n| n as usize).unwrap_or(0);
+        let text = String::from_utf8_lossy(c.bytes());
+        self.hits.push((
+            self.path.to_path_buf(),
+            lineno,
+            clip(trim_eol(&text)),
+            false,
+        ));
+        Ok(true)
+    }
+}
+
+/// Strip a trailing `\n` and then a trailing `\r` (the searcher hands us the line terminator).
+fn trim_eol(s: &str) -> &str {
+    let s = s.strip_suffix('\n').unwrap_or(s);
+    s.strip_suffix('\r').unwrap_or(s)
 }
 
 /// Clip a long line to `MAX_LINE` bytes at a UTF-8 char boundary (never panics mid-codepoint).
@@ -271,17 +300,6 @@ impl Tool for Grep {
             .get("literal")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let escaped;
-        let effective = if literal {
-            escaped = regex::escape(pattern);
-            escaped.as_str()
-        } else {
-            pattern
-        };
-        let re = RegexBuilder::new(effective)
-            .case_insensitive(ignore_case)
-            .build()
-            .map_err(|e| ToolError::InvalidInput(format!("bad regex: {e}")))?;
         let glob = match input.get("glob").and_then(Value::as_str) {
             Some(g) => Some(
                 Glob::new(g)
@@ -292,7 +310,16 @@ impl Tool for Grep {
         };
 
         let no_match = format!("no matches for {pattern:?}");
-        let job = GrepJob::new(re, glob, PathBuf::from(root), limit).with_context(before, after);
+        let job = GrepJob::new(
+            pattern,
+            literal,
+            ignore_case,
+            glob,
+            PathBuf::from(root),
+            limit,
+        )
+        .map_err(ToolError::InvalidInput)?
+        .with_context(before, after);
         // The walk blocks (its own thread pool, synchronous reads); keep it off the async runtime.
         let (matches, truncated) = tokio::task::spawn_blocking(move || search(&job, 0))
             .await
@@ -466,5 +493,44 @@ mod tests {
         // The three lexicographically-smallest files, deterministically.
         assert!(out.contains("f00.txt") && out.contains("f01.txt") && out.contains("f02.txt"));
         assert!(!out.contains("f03.txt"));
+    }
+
+    #[tokio::test]
+    async fn searches_non_utf8_files() {
+        // A file with an invalid UTF-8 byte (0xE9, latin-1 'é') around an ASCII match. The old
+        // `BufReader::read_line` loop errored on the bad byte and silently dropped the whole file; the
+        // byte-oriented ripgrep engine finds the match and decodes the line lossily. This is the
+        // correctness regression vs pi's `rg` that the rewrite fixes.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("latin1.txt"), b"caf\xe9 NEEDLE here\n").unwrap();
+        let out = Grep
+            .run(json!({ "pattern": "NEEDLE", "path": dir.path().to_str().unwrap() }))
+            .await
+            .unwrap()
+            .text;
+        assert!(
+            out.contains("NEEDLE"),
+            "must match inside a non-UTF-8 file: {out}"
+        );
+        assert!(out.contains("latin1.txt"));
+    }
+
+    #[tokio::test]
+    async fn skips_binary_files() {
+        // A NUL byte marks a file as binary; the searcher quits on it instead of emitting garbage
+        // (ripgrep's default). The adjacent text file still matches.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("blob.bin"), b"\x00\x00 NEEDLE \x00binary").unwrap();
+        std::fs::write(dir.path().join("text.txt"), b"NEEDLE in text\n").unwrap();
+        let out = Grep
+            .run(json!({ "pattern": "NEEDLE", "path": dir.path().to_str().unwrap() }))
+            .await
+            .unwrap()
+            .text;
+        assert!(out.contains("text.txt"), "the text file must match: {out}");
+        assert!(
+            !out.contains("blob.bin"),
+            "the binary file must be skipped, not reported: {out}"
+        );
     }
 }

@@ -436,7 +436,8 @@ impl Agent {
             // Per-turn progress channel: every call gets a `ToolProgress` cloning `prog_tx`; the drain
             // loop below forwards each update to `sink` as it arrives. `futures`' mpsc keeps this
             // executor-agnostic (no tokio in the library).
-            let (prog_tx, mut prog_rx) = futures::channel::mpsc::unbounded::<crate::tool::ToolUpdate>();
+            let (prog_tx, mut prog_rx) =
+                futures::channel::mpsc::unbounded::<crate::tool::ToolUpdate>();
             let prog_tx = &prog_tx;
             let group_runs = groups.into_values().map(|indices| {
                 let calls = &calls;

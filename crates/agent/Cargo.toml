@@ -29,11 +29,16 @@ tracing-subscriber.workspace = true
 # opt-*out*; we don't set it). Also sidesteps musl's slow multithreaded malloc for the static build.
 mimalloc = { version = "0.1.52", default-features = false }
 
-# Coding tools: gitignore-aware walking (ripgrep's `ignore`), regex search (`grep`), glob matching
-# (`find`) — the same crates ripgrep/fd are built on.
+# Coding tools, built on ripgrep's own engine crates: gitignore-aware walking (`ignore`), the
+# line/byte searcher with binary detection + mmap (`grep-searcher`) driven by a regex matcher
+# (`grep-regex`), and glob matching (`globset`). `grep` links ripgrep's searcher in-process rather
+# than shelling out to `rg` (what pi does) — so it handles non-UTF-8/binary files correctly and skips
+# the subprocess spawn. `regex` remains for `regex::escape` (literal mode) and `find`'s needs.
 globset = "0.4"
 ignore = "0.4"
 regex = "1"
+grep-searcher = "0.1"
+grep-regex = "0.1"
 
 # `edit`'s fuzzy fallback matcher: NFKC folding so a model's reconstructed `old_string` (smart quotes,
 # full-width/ligature chars) still lands against the on-disk bytes.
@@ -45,9 +50,10 @@ base64 = "0.22"
 [dev-dependencies]
 # Scratch files/dirs for the file-tool tests.
 tempfile = "3"
-# Macro-bench harness for the search tools (matches the gateway's `criterion` pin). The
-# saved-baseline comparison tracks the parallel-walk speedup over time.
-criterion = "0.5"
+# Bench harness for the search tools. `divan` (the gateway's `bench:unit` pin) measures **allocations**
+# (via its `AllocProfiler` global allocator) alongside timing — so the search bench proves both the
+# speed and the allocation cost of our in-process engine vs shelling out to `rg` (pi's approach).
+divan = "0.1"
 
 [[bench]]
 name = "search"
