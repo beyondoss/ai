@@ -21,7 +21,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use agent_core::Tool;
-use beyond_ai_agent::tools::{find, grep, read};
+use beyond_ai_agent::tools::{edit, find, grep, read};
 use divan::Bencher;
 use globset::Glob;
 use tempfile::TempDir;
@@ -144,6 +144,26 @@ fn read_file(bencher: Bencher) {
             .block_on(read::Read.run(serde_json::json!({ "path": path, "limit": READ_LINES })))
             .unwrap();
         black_box(out.text.len());
+    });
+}
+
+/// `edit`'s fuzzy-fallback normalization over a large file — the allocation-heavy path (NFKC + fold +
+/// trailing-whitespace with an offset map back to the original). Fully on-thread, so alloc counting is
+/// exact. Watch the alloc bytes across the two-pass `Vec<usize>` → fused `Vec<u32>` change.
+#[divan::bench]
+fn edit_normalize(bencher: Bencher) {
+    // A realistic mostly-ASCII file with occasional trailing whitespace and a smart quote or two.
+    let mut src = String::with_capacity(READ_LINES * 56);
+    for i in 0..READ_LINES {
+        if i % 20 == 0 {
+            src.push_str(&format!("let s = \u{201c}line {i}\u{201d};   \n")); // smart quotes + trailing ws
+        } else {
+            src.push_str(&format!("    let x_{i} = compute(i, {i}) + adjust();\n"));
+        }
+    }
+    bencher.bench_local(|| {
+        let (norm, map) = edit::normalize_with_map(&src);
+        black_box((norm.len(), map.len()));
     });
 }
 

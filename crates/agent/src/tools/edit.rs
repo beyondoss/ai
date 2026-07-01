@@ -158,7 +158,7 @@ fn find_spans(working: &str, old: &str, replace_all: bool) -> Result<Vec<(usize,
     }
     let fuzzy: Vec<(usize, usize)> = norm_work
         .match_indices(&norm_old)
-        .map(|(i, _)| (map[i], map[i + norm_old.len()]))
+        .map(|(i, _)| (map[i] as usize, map[i + norm_old.len()] as usize))
         .collect();
     disambiguate(fuzzy, old, replace_all)
 }
@@ -200,56 +200,55 @@ fn fold_char(c: char) -> Option<char> {
 
 /// Normalize `orig` for fuzzy matching and return the result plus a byte-offset map back to `orig`:
 /// `map[i]` is the original byte offset that normalized byte `i` came from, with a trailing sentinel
-/// `map[norm.len()] == orig.len()`. Normalization is: per-scalar NFKC, then [`fold_char`], then a
-/// pass that drops per-line trailing whitespace (spaces/tabs immediately before a `\n` or EOF).
-fn normalize_with_map(orig: &str) -> (String, Vec<usize>) {
+/// `map[out.len()] == orig.len()`. Normalization is per-scalar NFKC, then [`fold_char`], then per-line
+/// trailing-whitespace stripping (spaces/tabs immediately before a `\n` or EOF).
+///
+/// Done in one pass, emitting straight into `out` + `map`. Candidate trailing whitespace is held in
+/// `pending` until a `\n`/EOF proves it trailing (drop) or another char proves it interior (flush), so
+/// no intermediate copy of the whole input is built — the prior two-pass allocated `a`, `a_map`, `out`,
+/// `out_map`, and a final string; this allocates `out` + `map` + a tiny `pending`. `map` is `u32`
+/// (half the width of the old `usize`): `edit` reads the whole file into a `String` first, so a >4 GiB
+/// file can't reach here.
+pub fn normalize_with_map(orig: &str) -> (String, Vec<u32>) {
     use unicode_normalization::UnicodeNormalization;
 
-    // Pass A: NFKC + fold, tracking the source byte offset of every emitted byte.
-    let mut a = Vec::<u8>::with_capacity(orig.len());
-    let mut a_map = Vec::<usize>::with_capacity(orig.len() + 1);
+    let mut out = String::with_capacity(orig.len());
+    let mut map = Vec::<u32>::with_capacity(orig.len() + 1);
+    // A held run of candidate trailing whitespace: (byte — always ASCII ' '/'\t', source offset).
+    let mut pending: Vec<(u8, u32)> = Vec::new();
     let mut buf = [0u8; 4];
+
     for (off, c) in orig.char_indices() {
+        let off = off as u32;
         for nc in c.nfkc() {
             let folded = fold_char(nc).unwrap_or(nc);
-            let s = folded.encode_utf8(&mut buf);
-            for &byte in s.as_bytes() {
-                a.push(byte);
-                a_map.push(off);
+            match folded {
+                // Whitespace: hold it — it's trailing only if a `\n`/EOF follows.
+                ' ' | '\t' => pending.push((folded as u8, off)),
+                // Newline: the held run was trailing → drop it.
+                '\n' => {
+                    pending.clear();
+                    out.push('\n');
+                    map.push(off);
+                }
+                // Any other char: the held run was interior → flush it, then emit the char.
+                _ => {
+                    for (b, o) in pending.drain(..) {
+                        out.push(b as char);
+                        map.push(o);
+                    }
+                    let s = folded.encode_utf8(&mut buf);
+                    out.push_str(s);
+                    for _ in 0..s.len() {
+                        map.push(off);
+                    }
+                }
             }
         }
     }
-    a_map.push(orig.len());
-
-    // Pass B: strip runs of spaces/tabs that are followed by `\n` or end-of-string. Only ASCII bytes
-    // are inspected, so working at the byte level keeps the UTF-8 valid.
-    let mut out = Vec::<u8>::with_capacity(a.len());
-    let mut out_map = Vec::<usize>::with_capacity(a_map.len());
-    let mut i = 0;
-    while i < a.len() {
-        if a[i] == b' ' || a[i] == b'\t' {
-            let mut j = i;
-            while j < a.len() && (a[j] == b' ' || a[j] == b'\t') {
-                j += 1;
-            }
-            if j == a.len() || a[j] == b'\n' {
-                i = j; // trailing run — drop it
-                continue;
-            }
-            out.extend_from_slice(&a[i..j]);
-            out_map.extend_from_slice(&a_map[i..j]);
-            i = j;
-            continue;
-        }
-        out.push(a[i]);
-        out_map.push(a_map[i]);
-        i += 1;
-    }
-    out_map.push(orig.len()); // sentinel
-    // `out` is built only from whole UTF-8 sequences copied out of `a` (we special-case ASCII bytes
-    // only), so it's already valid; `from_utf8_lossy` avoids a forbidden `expect` and never allocates
-    // a replacement here.
-    (String::from_utf8_lossy(&out).into_owned(), out_map)
+    // A trailing whitespace run at EOF is dropped (`pending` left unflushed).
+    map.push(orig.len() as u32); // sentinel
+    (out, map)
 }
 
 /// Restore the file's original line endings (LF → CRLF) and a leading BOM after editing in LF space.
