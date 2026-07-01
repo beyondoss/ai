@@ -15,35 +15,46 @@ use serde_json::Value;
 use crate::error::ToolError;
 use crate::message::{ImageSource, ToolDef};
 
-/// A sink a tool uses to emit incremental output *while it is still running* — a long shell command's
-/// streaming stdout, a large download's progress, a multi-step tool's stage updates. Each chunk
-/// surfaces to the run's observers as an `AgentEvent::ToolProgress` tagged with this call's id and
-/// name (pi's `tool_execution_update`). The loop hands one to every call; a tool that doesn't stream
-/// simply never calls [`emit`](ToolProgress::emit). Cloneable and `Send`, so a tool can hand it to a
-/// background read loop.
+/// One streamed progress update from a running tool: a **snapshot** of its output so far (not a delta
+/// — clients render the latest, matching pi's `tool_execution_update`/`partialResult` model) plus
+/// optional tool-specific `details` (e.g. bash's truncation info + full-output-file path).
+pub struct ToolUpdate {
+    pub id: String,
+    pub name: String,
+    /// The full accumulated output so far (a snapshot, not an incremental chunk).
+    pub snapshot: String,
+    /// Tool-specific structured detail (bash: `{ truncation, full_output_path }`). `None` when there's
+    /// nothing extra to report (e.g. the initial empty update).
+    pub details: Option<Value>,
+}
+
+/// A sink a tool uses to emit progress *while it is still running* — a long shell command's streaming
+/// output, a large download, a multi-step tool. Each update is a **snapshot** (the full output so far)
+/// that surfaces to the run's observers as an `AgentEvent::ToolProgress` (pi's `tool_execution_update`).
+/// The loop hands one to every call; a tool that doesn't stream simply never calls
+/// [`emit`](ToolProgress::emit). Cloneable and `Send`, so a tool can hand it to a background read loop.
 #[derive(Clone)]
 pub struct ToolProgress {
-    tx: UnboundedSender<(String, String, String)>, // (tool_use_id, tool_name, chunk)
+    tx: UnboundedSender<ToolUpdate>,
     id: String,
     name: String,
 }
 
 impl ToolProgress {
     /// Build a progress handle for one tool call. The loop constructs these; tools receive `&ToolProgress`.
-    pub(crate) fn new(
-        tx: UnboundedSender<(String, String, String)>,
-        id: String,
-        name: String,
-    ) -> Self {
+    pub(crate) fn new(tx: UnboundedSender<ToolUpdate>, id: String, name: String) -> Self {
         Self { tx, id, name }
     }
 
-    /// Emit a chunk of incremental output for this call. Best-effort: if the run has already finished
-    /// (the receiver is gone), the chunk is dropped rather than erroring.
-    pub fn emit(&self, chunk: impl Into<String>) {
-        let _ = self
-            .tx
-            .unbounded_send((self.id.clone(), self.name.clone(), chunk.into()));
+    /// Emit a progress snapshot (the full output so far) plus optional `details`. Best-effort: if the
+    /// run has already finished (the receiver is gone), the update is dropped rather than erroring.
+    pub fn emit(&self, snapshot: impl Into<String>, details: Option<Value>) {
+        let _ = self.tx.unbounded_send(ToolUpdate {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            snapshot: snapshot.into(),
+            details,
+        });
     }
 }
 

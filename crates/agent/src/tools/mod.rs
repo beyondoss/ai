@@ -14,6 +14,7 @@ pub mod exec;
 pub mod find;
 pub mod grep;
 pub mod ls;
+pub mod output;
 pub mod read;
 pub mod write;
 

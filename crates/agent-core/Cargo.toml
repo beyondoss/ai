@@ -29,7 +29,7 @@ tracing.workspace = true
 # turns the chunked SSE body into a `Stream<StreamEvent>` without hand-rolling a poll state machine.
 # reqwest mirrors the gateway crate's pins (rustls, no OpenSSL) plus `stream` for the SSE body.
 async-stream = "0.3"
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream"] }
 
 # Parse the HTTP-date form of a `Retry-After` header (`Wed, 21 Oct 2025 07:28:00 GMT`). A tiny,
 # dependency-free crate already in the build graph (hyper depends on it), so this adds nothing to

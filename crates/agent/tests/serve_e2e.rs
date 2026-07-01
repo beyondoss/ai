@@ -113,7 +113,7 @@ fn serve_streams_tool_progress_from_a_running_bash() {
     let progress_chunks: String = frames
         .iter()
         .filter(|f| f["type"] == "event" && f["event"]["kind"] == "tool_progress")
-        .filter_map(|f| f["event"]["chunk"].as_str())
+        .filter_map(|f| f["event"]["snapshot"].as_str())
         .collect();
 
     assert!(

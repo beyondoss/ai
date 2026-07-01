@@ -45,12 +45,15 @@ pub enum AgentEvent {
         name: String,
         input: Value,
     },
-    /// A chunk of incremental output from a still-running tool (pi's `tool_execution_update`). Emitted
-    /// by a tool via its [`ToolProgress`](crate::ToolProgress) sink, before the tool's `ToolEnd`.
+    /// A progress snapshot from a still-running tool (pi's `tool_execution_update`): the full output so
+    /// far (not a delta) plus optional tool-specific `details`. Emitted via the tool's
+    /// [`ToolProgress`](crate::ToolProgress) sink, before the tool's `ToolEnd`.
     ToolProgress {
         id: String,
         name: String,
-        chunk: String,
+        snapshot: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        details: Option<Value>,
     },
     /// A tool finished (or errored); `result` is what's fed back to the model.
     ToolEnd {
@@ -431,10 +434,9 @@ impl Agent {
             let this = self;
             let malformed = &malformed;
             // Per-turn progress channel: every call gets a `ToolProgress` cloning `prog_tx`; the drain
-            // loop below forwards each chunk to `sink` as it arrives. `futures`' mpsc keeps this
+            // loop below forwards each update to `sink` as it arrives. `futures`' mpsc keeps this
             // executor-agnostic (no tokio in the library).
-            let (prog_tx, mut prog_rx) =
-                futures::channel::mpsc::unbounded::<(String, String, String)>();
+            let (prog_tx, mut prog_rx) = futures::channel::mpsc::unbounded::<crate::tool::ToolUpdate>();
             let prog_tx = &prog_tx;
             let group_runs = groups.into_values().map(|indices| {
                 let calls = &calls;
@@ -516,8 +518,13 @@ impl Agent {
                     loop {
                         futures::select_biased! {
                             prog = prog_rx.next() => {
-                                if let Some((id, name, chunk)) = prog {
-                                    sink(AgentEvent::ToolProgress { id, name, chunk });
+                                if let Some(u) = prog {
+                                    sink(AgentEvent::ToolProgress {
+                                        id: u.id,
+                                        name: u.name,
+                                        snapshot: u.snapshot,
+                                        details: u.details,
+                                    });
                                 }
                             }
                             group = group_stream.next() => match group {
@@ -530,9 +537,14 @@ impl Agent {
                             }
                         }
                     }
-                    // Flush any chunks buffered between the final poll and group completion.
-                    while let Ok((id, name, chunk)) = prog_rx.try_recv() {
-                        sink(AgentEvent::ToolProgress { id, name, chunk });
+                    // Flush any updates buffered between the final poll and group completion.
+                    while let Ok(u) = prog_rx.try_recv() {
+                        sink(AgentEvent::ToolProgress {
+                            id: u.id,
+                            name: u.name,
+                            snapshot: u.snapshot,
+                            details: u.details,
+                        });
                     }
                 };
                 let cancelled = cancel.cancelled();
@@ -955,8 +967,8 @@ mod tests {
                 _: Value,
                 progress: &crate::tool::ToolProgress,
             ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
-                progress.emit("chunk-1");
-                progress.emit("chunk-2");
+                progress.emit("chunk-1", None);
+                progress.emit("chunk-2", None);
                 Ok("final".into())
             }
         }
@@ -975,7 +987,9 @@ mod tests {
         let mut log: Vec<String> = Vec::new();
         agent
             .run_events(&mut session, |ev| match ev {
-                AgentEvent::ToolProgress { chunk, .. } => log.push(format!("progress:{chunk}")),
+                AgentEvent::ToolProgress { snapshot, .. } => {
+                    log.push(format!("progress:{snapshot}"))
+                }
                 AgentEvent::ToolEnd { .. } => log.push("end".into()),
                 _ => {}
             })
