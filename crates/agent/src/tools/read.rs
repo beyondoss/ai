@@ -1,5 +1,6 @@
 //! `read` — read a file, optionally a line range, with line numbers.
 
+use std::fmt::Write as _;
 use std::io::{BufRead, BufReader};
 
 use agent_core::message::ImageSource;
@@ -141,11 +142,14 @@ impl Tool for Read {
             // may end mid-codepoint, so decode lossily rather than erroring on the split byte.
             let kept = line.strip_suffix(b"\r").unwrap_or(&line);
             let text = String::from_utf8_lossy(kept);
-            if line_clipped {
-                out.push_str(&format!("{lineno:>6}\t{text}… [line truncated]\n"));
+            // Write straight into `out` instead of allocating a `format!` temp String per line — a
+            // windowed read of a large file did one heap allocation for every line shown. `writeln!`
+            // into a `String` can't fail, so the `Result` is discarded.
+            let _ = if line_clipped {
+                writeln!(out, "{lineno:>6}\t{text}… [line truncated]")
             } else {
-                out.push_str(&format!("{lineno:>6}\t{text}\n"));
-            }
+                writeln!(out, "{lineno:>6}\t{text}")
+            };
             shown += 1;
         }
 

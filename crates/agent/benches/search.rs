@@ -20,7 +20,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
 
-use beyond_ai_agent::tools::{find, grep};
+use agent_core::Tool;
+use beyond_ai_agent::tools::{find, grep, read};
 use divan::Bencher;
 use globset::Glob;
 use tempfile::TempDir;
@@ -106,6 +107,43 @@ fn grep_dense(bencher: Bencher) {
     bencher.bench_local(|| {
         let (m, _) = grep::search(&job, 1);
         black_box(m.len());
+    });
+}
+
+const READ_LINES: usize = 3000;
+
+/// One large text file (`READ_LINES` lines), built once, for the `read` bench.
+fn big_file() -> &'static PathBuf {
+    static F: OnceLock<(TempDir, PathBuf)> = OnceLock::new();
+    &F.get_or_init(|| {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.txt");
+        let mut content = String::with_capacity(READ_LINES * 56);
+        for i in 0..READ_LINES {
+            content.push_str(&format!(
+                "line {i}: some source code content goes here for realism\n"
+            ));
+        }
+        std::fs::write(&path, content).unwrap();
+        (dir, path)
+    })
+    .1
+}
+
+/// `read` on a many-line file: the per-line output formatting is the hot path, and it's fully
+/// on-thread (synchronous file I/O), so divan's alloc counting is exact. Watch the alloc count across
+/// the `format!`-per-line → `write!`-into-buffer change.
+#[divan::bench]
+fn read_file(bencher: Bencher) {
+    let path = big_file().to_str().unwrap().to_string();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    bencher.bench_local(|| {
+        let out = rt
+            .block_on(read::Read.run(serde_json::json!({ "path": path, "limit": READ_LINES })))
+            .unwrap();
+        black_box(out.text.len());
     });
 }
 
