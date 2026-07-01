@@ -18,16 +18,22 @@ use regex::Regex;
 use serde_json::{Value, json};
 
 use super::exec::{ChunkSink, CommandRunner, RealRunner};
-use super::output::{OutputAccumulator, OutputSnapshot, format_output};
+use super::output::{OutputAccumulator, OutputSnapshot, TruncatedBy, format_output};
 
-/// Default command timeout (ms) when the model doesn't specify one.
-const DEFAULT_TIMEOUT_MS: u64 = 120_000;
+/// Default command timeout (ms) when the model doesn't specify one. The reference agent has no default
+/// at all — a command runs to completion unless the model explicitly sets `timeout_ms` — which SIGKILLs
+/// long builds/tests the model didn't think to extend. We deliberately deviate: this agent runs
+/// unattended on a homelab node with no one watching a hung shell, so a runaway/blocked command needs a
+/// backstop. 30 minutes is generous enough to never bite a real build/test/install, while still
+/// bounding a truly stuck command instead of leaving it to hang a turn forever.
+const DEFAULT_TIMEOUT_MS: u64 = 1_800_000;
 /// Minimum gap between streamed progress snapshots — pi's `BASH_UPDATE_THROTTLE_MS`. Keeps a chatty
 /// command from flooding the event stream; the final snapshot is always emitted regardless.
 const UPDATE_THROTTLE: Duration = Duration::from_millis(100);
 
 pub struct Bash {
     runner: Arc<dyn CommandRunner>,
+    default_timeout_ms: u64,
 }
 
 impl Bash {
@@ -35,13 +41,23 @@ impl Bash {
     pub fn real() -> Self {
         Self {
             runner: Arc::new(RealRunner),
+            default_timeout_ms: DEFAULT_TIMEOUT_MS,
         }
+    }
+
+    /// Builder-style: override the default timeout applied when the model omits `timeout_ms`.
+    pub fn with_default_timeout_ms(mut self, ms: u64) -> Self {
+        self.default_timeout_ms = ms;
+        self
     }
 
     /// A `bash` tool over a custom runner (tests inject one to capture the invocation).
     #[cfg(test)]
     pub fn with_runner(runner: Arc<dyn CommandRunner>) -> Self {
-        Self { runner }
+        Self {
+            runner,
+            default_timeout_ms: DEFAULT_TIMEOUT_MS,
+        }
     }
 
     /// Shared body for [`Tool::run`] and [`Tool::run_streaming`]. Raw output feeds one accumulator; when
@@ -60,7 +76,7 @@ impl Bash {
         let timeout_ms = input
             .get("timeout_ms")
             .and_then(Value::as_u64)
-            .unwrap_or(DEFAULT_TIMEOUT_MS);
+            .unwrap_or(self.default_timeout_ms);
         let args = vec!["-c".to_string(), command.to_string()];
         let dur = Duration::from_millis(timeout_ms);
 
@@ -123,15 +139,20 @@ impl Bash {
             emit_update(p, &snap);
         }
 
-        let text = clean(format_output(&snap, "(no output)"));
-
         if result.timed_out {
             let secs = timeout_ms / 1000;
+            // No "(no output)" placeholder here: an empty-output timeout should read as just the
+            // status line ("Command timed out after Ns"), not "(no output)" glued in front of it —
+            // matching the reference agent's abort/timeout formatting, which substitutes nothing for
+            // empty content on this path specifically (the success/exit-code path below keeps the
+            // placeholder, since there the empty case is a genuinely silent command, not an interrupt).
+            let text = clean(format_output(&snap, ""));
             return Err(ToolError::Execution(append_status(
                 &text,
                 &format!("Command timed out after {secs} seconds"),
             )));
         }
+        let text = clean(format_output(&snap, "(no output)"));
         match result.code {
             Some(0) | None => Ok(text.into()),
             // Non-zero exit is an error result that still carries the output — pi throws here too.
@@ -185,17 +206,38 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// Emit one streamed progress snapshot: the cleaned output so far, plus truncation + full-output-path
 /// details when the output has overflowed (pi's `onUpdate({content, details})`).
 fn emit_update(p: &ToolProgress, snap: &OutputSnapshot) {
-    let details = snap.truncation.truncated.then(|| {
+    p.emit(clean(snap.content.clone()), truncation_details(snap));
+}
+
+/// The `details` payload for a progress update: nested `{truncation: {...}, full_output_path}` —
+/// matching the reference agent's `{truncation, fullOutputPath}` shape structurally (field names stay
+/// snake_case: this is the only place in the whole wire protocol that would otherwise mix camelCase
+/// into an all-snake_case convention, and nothing here needs byte-for-byte pi compatibility, just the
+/// same information). The full `Truncation` record — not just the four fields this used to send — so a
+/// future client doesn't have to guess `truncated_by`/`last_line_partial`/`max_lines`/`max_bytes` from
+/// the others. `None` when the output was never truncated (nothing extra to report).
+fn truncation_details(snap: &OutputSnapshot) -> Option<Value> {
+    snap.truncation.truncated.then(|| {
+        let by = match snap.truncation.truncated_by {
+            Some(TruncatedBy::Lines) => Some("lines"),
+            Some(TruncatedBy::Bytes) => Some("bytes"),
+            None => None,
+        };
         json!({
-            "truncated": true,
-            "total_lines": snap.truncation.total_lines,
-            "total_bytes": snap.truncation.total_bytes,
-            "output_lines": snap.truncation.output_lines,
-            "output_bytes": snap.truncation.output_bytes,
+            "truncation": {
+                "truncated": true,
+                "truncated_by": by,
+                "total_lines": snap.truncation.total_lines,
+                "total_bytes": snap.truncation.total_bytes,
+                "output_lines": snap.truncation.output_lines,
+                "output_bytes": snap.truncation.output_bytes,
+                "last_line_partial": snap.truncation.last_line_partial,
+                "max_lines": snap.truncation.max_lines,
+                "max_bytes": snap.truncation.max_bytes,
+            },
             "full_output_path": snap.full_output_path,
         })
-    });
-    p.emit(clean(snap.content.clone()), details);
+    })
 }
 
 /// Append a status line (`exit code` / `timed out`) after the output, pi-style (`text\n\n<status>`).
@@ -245,11 +287,66 @@ fn clean(s: String) -> String {
 mod tests {
     use super::*;
     use crate::tools::exec::ExecResult;
+    use crate::tools::output::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, Truncation};
+
+    #[test]
+    fn truncation_details_nests_the_full_record_under_a_truncation_key() {
+        let snap = OutputSnapshot {
+            content: "tail".into(),
+            truncation: Truncation {
+                truncated: true,
+                truncated_by: Some(TruncatedBy::Lines),
+                total_lines: 2500,
+                total_bytes: 12345,
+                output_lines: 2000,
+                output_bytes: 9000,
+                last_line_partial: true,
+                max_lines: DEFAULT_MAX_LINES,
+                max_bytes: DEFAULT_MAX_BYTES,
+            },
+            full_output_path: Some("/tmp/pi-bash-abc.log".into()),
+            last_line_bytes: 4,
+        };
+        let details = truncation_details(&snap).expect("truncated snapshot must carry details");
+        assert_eq!(details["truncation"]["truncated"], true);
+        assert_eq!(details["truncation"]["truncated_by"], "lines");
+        assert_eq!(details["truncation"]["total_lines"], 2500);
+        assert_eq!(details["truncation"]["total_bytes"], 12345);
+        assert_eq!(details["truncation"]["output_lines"], 2000);
+        assert_eq!(details["truncation"]["output_bytes"], 9000);
+        assert_eq!(details["truncation"]["last_line_partial"], true);
+        assert_eq!(details["truncation"]["max_lines"], DEFAULT_MAX_LINES);
+        assert_eq!(details["truncation"]["max_bytes"], DEFAULT_MAX_BYTES);
+        assert_eq!(details["full_output_path"], "/tmp/pi-bash-abc.log");
+        // `full_output_path` is a sibling of `truncation`, not nested inside it.
+        assert!(details["truncation"].get("full_output_path").is_none());
+    }
+
+    #[test]
+    fn truncation_details_is_none_when_output_was_not_truncated() {
+        let snap = OutputSnapshot {
+            content: "all of it".into(),
+            truncation: Truncation {
+                truncated: false,
+                truncated_by: None,
+                total_lines: 3,
+                total_bytes: 9,
+                output_lines: 3,
+                output_bytes: 9,
+                last_line_partial: false,
+                max_lines: DEFAULT_MAX_LINES,
+                max_bytes: DEFAULT_MAX_BYTES,
+            },
+            full_output_path: None,
+            last_line_bytes: 3,
+        };
+        assert!(truncation_details(&snap).is_none());
+    }
 
     /// Records the last invocation and returns a canned result (a non-streaming runner: it never
     /// delivers chunks, so `bash` exercises its fallback-from-`ExecResult` path).
     struct RecordingRunner {
-        last: std::sync::Mutex<Option<(String, Vec<String>)>>,
+        last: std::sync::Mutex<Option<(String, Vec<String>, Duration)>>,
         result: ExecResult,
     }
 
@@ -260,9 +357,9 @@ mod tests {
             program: &str,
             args: &[String],
             _cwd: Option<&str>,
-            _t: Duration,
+            timeout: Duration,
         ) -> std::io::Result<ExecResult> {
-            *self.last.lock().unwrap() = Some((program.to_string(), args.to_vec()));
+            *self.last.lock().unwrap() = Some((program.to_string(), args.to_vec(), timeout));
             Ok(self.result.clone())
         }
     }
@@ -288,9 +385,38 @@ mod tests {
             .text;
         // pi does not trim: the command's output is shown as-is (trailing newline kept).
         assert_eq!(out, "hi\n");
-        let (prog, args) = runner.last.lock().unwrap().clone().unwrap();
+        let (prog, args, _timeout) = runner.last.lock().unwrap().clone().unwrap();
         assert_eq!(prog, "sh");
         assert_eq!(args, vec!["-c".to_string(), "echo hi".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn with_default_timeout_ms_overrides_the_default_when_the_model_omits_one() {
+        let runner = recording(ExecResult {
+            code: Some(0),
+            stdout: "hi\n".into(),
+            ..Default::default()
+        });
+        Bash::with_runner(runner.clone())
+            .run(json!({ "command": "echo hi" })) // no `timeout_ms` — the tool's default applies
+            .await
+            .unwrap();
+        let (_, _, timeout) = runner.last.lock().unwrap().clone().unwrap();
+        assert_eq!(timeout, Duration::from_millis(DEFAULT_TIMEOUT_MS));
+
+        // `Bash::with_runner` (the test constructor) always uses `DEFAULT_TIMEOUT_MS`; confirm
+        // `with_default_timeout_ms` actually changes what gets resolved when explicitly built.
+        let runner2 = recording(ExecResult {
+            code: Some(0),
+            ..Default::default()
+        });
+        Bash::with_runner(runner2.clone())
+            .with_default_timeout_ms(5_000)
+            .run(json!({ "command": "echo hi" }))
+            .await
+            .unwrap();
+        let (_, _, timeout2) = runner2.last.lock().unwrap().clone().unwrap();
+        assert_eq!(timeout2, Duration::from_millis(5_000));
     }
 
     #[tokio::test]
@@ -392,5 +518,28 @@ mod tests {
             panic!("expected Execution error")
         };
         assert!(msg.contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn empty_output_timeout_has_no_placeholder_glued_on() {
+        // A silent command that times out should read as just the status line, not
+        // "(no output)\n\nCommand timed out after Ns" — the "(no output)" placeholder is for the
+        // successful/exit-code paths, where an empty result is a genuinely silent command, not an
+        // interrupted one.
+        let runner = recording(ExecResult {
+            timed_out: true,
+            stdout: String::new(),
+            stderr: String::new(),
+            ..Default::default()
+        });
+        let err = Bash::with_runner(runner)
+            .run(json!({ "command": "sleep 10", "timeout_ms": 5000 }))
+            .await
+            .unwrap_err();
+        let ToolError::Execution(msg) = err else {
+            panic!("expected Execution error")
+        };
+        assert_eq!(msg, "Command timed out after 5 seconds");
+        assert!(!msg.contains("no output"));
     }
 }

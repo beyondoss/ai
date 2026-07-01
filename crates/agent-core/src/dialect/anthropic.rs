@@ -32,49 +32,71 @@ pub fn build_body(req: &ModelRequest) -> Value {
     // otherwise. Gate the request's `cache_long` opt-in on the model's capability so an unsupported
     // model silently falls back to the standard 5-minute TTL instead of erroring the turn.
     let long = req.cache_long && crate::models::capabilities(&req.model).supports_long_cache;
-    let cc = cache_control(long);
+    // `no_cache` skips every breakpoint below: a genuinely one-off request (no follow-up turn to read
+    // the cache back) would otherwise eat the ~1.25x cache-write premium for an entry nothing reads.
+    let cc = (!req.no_cache).then(|| cache_control(long));
 
     // Rolling breakpoint: cache the conversation prefix (tools + system + every prior message) up to
     // the final block, so next turn the whole accumulated transcript is a cache read, not a re-bill.
     let mut messages = serde_json::to_value(req.messages.as_ref()).unwrap_or(Value::Null);
     encode_tool_result_images(&mut messages);
-    mark_last_block(&mut messages, &cc);
+    if let Some(cc) = &cc {
+        mark_last_block(&mut messages, cc);
+    }
     map.insert("messages".into(), messages);
 
     if let Some(system) = &req.system {
         // System as a single cached text block — a *dedicated* third breakpoint. Anthropic's
         // breakpoint lookback only walks back ~20 content blocks; on a tool-heavy turn (N tool_use +
         // N tool_result blocks) the rolling message breakpoint can fall outside that window, so this
-        // stable anchor keeps the (large, fixed) system prompt a cache read.
+        // stable anchor keeps the (large, fixed) system prompt a cache read. `no_cache` drops the
+        // breakpoint but keeps the system block itself (still needed on the wire either way).
         map.insert(
             "system".into(),
-            json!([{ "type": "text", "text": system, "cache_control": cc }]),
+            match &cc {
+                Some(cc) => json!([{ "type": "text", "text": system, "cache_control": cc }]),
+                None => json!([{ "type": "text", "text": system }]),
+            },
         );
     }
     if let Some(thinking) = &req.thinking {
         // Extended thinking. Anthropic requires `max_tokens > budget_tokens` and forbids `temperature`
-        // alongside it (we never set temperature). Newer models take an *adaptive* shape (effort-based)
-        // rather than an explicit budget; the capability table says which. Every Claude we ship against
-        // today is `Budget` — the live-validated `enabled`+budget shape — so this preserves that path
-        // and only switches to `adaptive` for a model that requires it.
-        let block = match crate::models::capabilities(&req.model).thinking {
+        // alongside it (we never set temperature). Newer models (the capability table's `Adaptive`
+        // shape) take an effort-based shape instead of an explicit budget, with `output_config.effort`
+        // as a *sibling top-level request field*, not nested under `thinking` — a request-shape detail
+        // easy to get wrong. Both shapes explicitly set `display: "summarized"`: Anthropic's own API
+        // default for `adaptive` is "omitted" (no visible reasoning text at all), so leaving it unset
+        // on an adaptive model silently produces empty thinking output.
+        match crate::models::capabilities(&req.model).thinking {
             crate::models::ThinkingShape::Adaptive => {
-                let mut t = json!({ "type": "adaptive" });
+                map.insert(
+                    "thinking".into(),
+                    json!({ "type": "adaptive", "display": "summarized" }),
+                );
                 if let Some(effort) = req.reasoning_effort {
-                    t["output_config"] = json!({ "effort": effort.as_str() });
+                    map.insert("output_config".into(), json!({ "effort": effort.as_str() }));
                 }
-                t
             }
-            _ => json!({ "type": "enabled", "budget_tokens": thinking.budget_tokens }),
-        };
-        map.insert("thinking".into(), block);
+            _ => {
+                map.insert(
+                    "thinking".into(),
+                    json!({
+                        "type": "enabled",
+                        "budget_tokens": thinking.budget_tokens,
+                        "display": "summarized",
+                    }),
+                );
+            }
+        }
     }
     if !req.tools.is_empty() {
         // Anchor breakpoint: the tool definitions (ten JSON schemas) are identical every turn and sit
         // at the front of the cache order, so this entry stays warm even when the rolling message
         // breakpoint is rewritten each turn. Requires stable tool ordering — see `definitions()`.
         let mut tools = serde_json::to_value(req.tools.as_ref()).unwrap_or(Value::Null);
-        mark_last_tool(&mut tools, &cc);
+        if let Some(cc) = &cc {
+            mark_last_tool(&mut tools, cc);
+        }
         map.insert("tools".into(), tools);
     }
     // Constrain tool use only when the caller asked: an unset `tool_choice` emits nothing, leaving
@@ -186,7 +208,26 @@ fn map_stop_reason(s: Option<&str>) -> StopReason {
         // model meant to keep going. (A fully distinct `PauseTurn` variant that drives a resubmit would
         // need a `message.rs` enum change plus agent-loop handling — out of scope for this fix.)
         Some("pause_turn") => StopReason::Other,
-        _ => StopReason::Other,
+        // Content flagged by safety filters mid-generation — not yet a named variant in Anthropic's own
+        // SDK types, but a real terminal state the reference agent treats as an error, not a clean end.
+        // We don't have a distinct explanation to surface for it (unlike `refusal`, which carries one in
+        // `stop_details.explanation`), so it shares `Refusal`'s variant rather than earning a new one —
+        // both mean "the model was blocked from completing," and the loop already lets a caller tell
+        // either apart from a normal end-of-turn instead of reading it as success.
+        Some("sensitive") => StopReason::Refusal,
+        Some(other) => {
+            // A genuinely unrecognized value (Anthropic added a new terminal state we don't know about
+            // yet) silently collapsing into `Other` — which the loop treats identically to a normal
+            // `EndTurn` — would hide a real change in provider behavior. `warn!` so it's at least
+            // visible, without hard-failing the turn (the reference agent throws here; we're more
+            // conservative since a false-positive on this match would abort an otherwise-fine turn).
+            tracing::warn!(
+                stop_reason = other,
+                "unrecognized Anthropic stop_reason; treating as Other"
+            );
+            StopReason::Other
+        }
+        None => StopReason::Other,
     }
 }
 
@@ -211,10 +252,15 @@ impl StreamDecoder for Decoder {
                 let usage = data.get("message").and_then(|m| m.get("usage"));
                 self.usage.input_tokens = u32_at(usage, "input_tokens");
                 self.usage.output_tokens = u32_at(usage, "output_tokens");
-                // Cache accounting is reported only on `message_start`; capturing it is what makes the
-                // prompt-cache breakpoints we stamp in `build_body` observable.
+                // Cache accounting is reported only on `message_start` in the real API; capturing it
+                // is what makes the prompt-cache breakpoints we stamp in `build_body` observable.
                 self.usage.cache_read_tokens = u32_at(usage, "cache_read_input_tokens");
                 self.usage.cache_write_tokens = u32_at(usage, "cache_creation_input_tokens");
+                // The 1h/5m TTL split lives one level deeper, only when the provider breaks it out.
+                self.usage.cache_write_1h_tokens = usage
+                    .and_then(|u| u.get("cache_creation"))
+                    .map(|cc| u32_at(Some(cc), "ephemeral_1h_input_tokens"))
+                    .unwrap_or(0);
                 vec![StreamEvent::MessageStart]
             }
             "content_block_start" => {
@@ -272,6 +318,24 @@ impl StreamDecoder for Decoder {
                 let out = u32_at(usage, "output_tokens");
                 if out > 0 {
                     self.usage.output_tokens = out;
+                }
+                // Real Anthropic only reports cache fields on `message_start`, never here — but a
+                // proxy sitting in front of it could, and a stale `message_start`-only snapshot would
+                // then silently under/over-report the rest of the turn. Refresh only when present, so
+                // this is a no-op against the real API's actual behavior.
+                if let Some(read) = usage.and_then(|u| u.get("cache_read_input_tokens")) {
+                    if let Some(read) = read.as_u64() {
+                        self.usage.cache_read_tokens = read as u32;
+                    }
+                }
+                if let Some(write) = usage.and_then(|u| u.get("cache_creation_input_tokens")) {
+                    if let Some(write) = write.as_u64() {
+                        self.usage.cache_write_tokens = write as u32;
+                    }
+                }
+                if let Some(cc) = usage.and_then(|u| u.get("cache_creation")) {
+                    self.usage.cache_write_1h_tokens =
+                        u32_at(Some(cc), "ephemeral_1h_input_tokens");
                 }
                 // Reasoning tokens, when broken out separately, are still *included* in
                 // `output_tokens`; capture them so a caller can see the thinking share of the spend.
@@ -405,6 +469,35 @@ mod tests {
             body["messages"][1]["content"][0]["cache_control"]["type"],
             "ephemeral"
         );
+    }
+
+    #[test]
+    fn no_cache_skips_every_breakpoint() {
+        let req = ModelRequest::new(
+            "claude-opus-4-8",
+            vec![
+                Message::user("hi"),
+                Message::tool_result("tu_1", "out", false),
+            ],
+            256,
+        )
+        .with_system("be brief")
+        .with_tools(vec![ToolDef {
+            name: "read".into(),
+            description: "read a file".into(),
+            input_schema: json!({ "type": "object" }),
+        }])
+        .with_no_cache(true);
+        let body = build_body(&req);
+        assert!(body["tools"][0].get("cache_control").is_none());
+        assert!(
+            body["messages"][1]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
+        assert!(body["system"][0].get("cache_control").is_none());
+        // The system block itself is still present, just uncached.
+        assert_eq!(body["system"][0]["text"], "be brief");
     }
 
     #[test]
@@ -554,6 +647,60 @@ data: {"type":"message_stop"}
     }
 
     #[test]
+    fn captures_the_1h_cache_write_split_when_the_provider_breaks_it_out() {
+        const SSE: &str = r#"
+event: message_start
+data: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":12,"cache_read_input_tokens":900,"cache_creation_input_tokens":40,"cache_creation":{"ephemeral_5m_input_tokens":10,"ephemeral_1h_input_tokens":30},"output_tokens":1}}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}
+
+event: message_stop
+data: {"type":"message_stop"}
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, SSE).unwrap();
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::Usage(u) => Some(*u),
+                _ => None,
+            })
+            .expect("a usage event");
+        // The flat sum still includes both TTLs; the 1h-specific field breaks out just that share.
+        assert_eq!(usage.cache_write_tokens, 40);
+        assert_eq!(usage.cache_write_1h_tokens, 30);
+    }
+
+    #[test]
+    fn message_delta_refreshes_cache_counts_when_a_proxy_reports_them_there() {
+        // Real Anthropic only ever reports cache fields on `message_start` — this is a defensive
+        // refresh for a proxy that might report updated figures mid-stream, not something the real API
+        // does; the initial `message_start` value must still be a sane baseline either way.
+        const SSE: &str = r#"
+event: message_start
+data: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":12,"cache_read_input_tokens":100,"cache_creation_input_tokens":10,"output_tokens":1}}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5,"cache_read_input_tokens":150,"cache_creation_input_tokens":10,"cache_creation":{"ephemeral_1h_input_tokens":10}}}
+
+event: message_stop
+data: {"type":"message_stop"}
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, SSE).unwrap();
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::Usage(u) => Some(*u),
+                _ => None,
+            })
+            .expect("a usage event");
+        assert_eq!(usage.cache_read_tokens, 150); // refreshed from message_delta
+        assert_eq!(usage.cache_write_1h_tokens, 10);
+    }
+
+    #[test]
     fn captures_reasoning_tokens_from_message_delta() {
         const SSE: &str = r#"event: message_start
 data: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":10,"output_tokens":1}}}
@@ -641,11 +788,29 @@ data: {"type":"message_stop"}
 
     #[test]
     fn build_body_emits_thinking_config() {
-        let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 8192)
+        // claude-opus-4-5 predates the adaptive requirement — still the `Budget`/`enabled` shape.
+        let req = ModelRequest::new("claude-opus-4-5", vec![Message::user("hi")], 8192)
             .with_thinking(4096);
         let body = build_body(&req);
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["thinking"]["budget_tokens"], 4096);
+        assert_eq!(body["thinking"]["display"], "summarized");
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn build_body_emits_adaptive_thinking_config() {
+        // claude-opus-4-8 (our default model) requires the adaptive shape: `output_config.effort` is a
+        // sibling top-level field, not nested under `thinking`, and `display` must be set explicitly or
+        // Anthropic silently omits visible reasoning text.
+        let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 8192)
+            .with_thinking(4096)
+            .with_reasoning_effort(crate::transport::ReasoningEffort::High);
+        let body = build_body(&req);
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["thinking"]["display"], "summarized");
+        assert!(body["thinking"].get("budget_tokens").is_none());
+        assert_eq!(body["output_config"]["effort"], "high");
     }
 
     #[test]
@@ -783,6 +948,52 @@ data: {"type":"message_stop"}
         }));
         assert!(!events.contains(&StreamEvent::MessageStop {
             stop_reason: StopReason::EndTurn
+        }));
+    }
+
+    #[test]
+    fn sensitive_stop_reason_is_not_end_turn() {
+        // Content flagged by safety filters must not read as success either — it shares `Refusal`'s
+        // variant (no distinct explanation to surface, unlike an actual `refusal`) rather than
+        // silently collapsing into `Other`/`EndTurn`.
+        const FLAGGED: &str = r#"
+event: message_start
+data: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":5,"output_tokens":1}}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"sensitive"},"usage":{"output_tokens":2}}
+
+event: message_stop
+data: {"type":"message_stop"}
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, FLAGGED).unwrap();
+        assert!(events.contains(&StreamEvent::MessageStop {
+            stop_reason: StopReason::Refusal
+        }));
+        assert!(!events.contains(&StreamEvent::MessageStop {
+            stop_reason: StopReason::EndTurn
+        }));
+    }
+
+    #[test]
+    fn genuinely_unknown_stop_reason_falls_back_to_other_not_end_turn() {
+        // A value Anthropic might add later that we don't recognize yet must not be misread as a clean
+        // completion — it's conservatively `Other` (warn!-logged, not hard-failed; see `map_stop_reason`).
+        const NOVEL: &str = r#"
+event: message_start
+data: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":5,"output_tokens":1}}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"some_future_reason"},"usage":{"output_tokens":2}}
+
+event: message_stop
+data: {"type":"message_stop"}
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, NOVEL).unwrap();
+        assert!(events.contains(&StreamEvent::MessageStop {
+            stop_reason: StopReason::Other
         }));
     }
 

@@ -51,43 +51,81 @@ pub fn discover(cwd: &Path) -> Vec<Skill> {
 }
 
 /// Discover skills anywhere under `root`: walk the tree and load a `SKILL.md` at any depth (pi recurses
-/// rather than scanning one level). Once a directory yields its `SKILL.md` we stop descending into it —
-/// the manifest defines that skill's root, and anything nested is that skill's own resources.
+/// rather than scanning one level), plus any loose `*.md` file directly at the root (pi's other skill
+/// shape, for something too small to need its own directory). Once a directory yields its `SKILL.md` we
+/// stop descending into it — the manifest defines that skill's root, and anything nested is that
+/// skill's own resources.
 fn discover_in(root: &Path) -> Vec<Skill> {
     let mut out = Vec::new();
-    walk(root, 0, &mut out);
+    walk(root, &mut out);
+    for skill in loose_root_skills(root) {
+        out.push(skill);
+    }
     out
 }
 
-/// Recursive worker for [`discover_in`]. Skips hidden directories and does not follow symlinked
-/// directories, so a cyclic symlink (`a -> ..`) can't trap the walk.
-fn walk(dir: &Path, depth: usize, out: &mut Vec<Skill>) {
-    if depth > MAX_DEPTH {
-        return;
-    }
-    // A manifest here defines this directory as a skill root; load it and don't descend further.
-    let manifest = dir.join("SKILL.md");
-    if manifest.is_file() {
+/// Walk `root` for `SKILL.md` manifests, gitignore-aware — reuses the same `ignore` crate `grep`/`find`
+/// already depend on, rather than hand-rolling `.gitignore`/`.ignore` parsing, so a vendored or fixture
+/// directory carrying its own ignore file doesn't leak a stray `SKILL.md` into the prompt.
+/// `WalkBuilder`'s defaults already match the walk's prior hand-rolled semantics: hidden files/
+/// directories are skipped and symlinked directories are not followed (so a cyclic symlink can't trap
+/// the walk); `max_depth` reproduces the old sane-bound cutoff.
+fn walk(root: &Path, out: &mut Vec<Skill>) {
+    let mut candidates: Vec<PathBuf> = ignore::WalkBuilder::new(root)
+        .max_depth(Some(MAX_DEPTH))
+        // A skills root (`~/.claude/skills`, `<cwd>/.claude/skills`) is routinely *not* itself a git
+        // repository (or is a subdirectory of one where that fact is incidental) — `.gitignore` files
+        // placed within it should still be honored either way, not only when `require_git`'s default
+        // finds an enclosing `.git`.
+        .require_git(false)
+        .build()
+        .flatten() // missing/unreadable/inaccessible entries are the normal case, not an error
+        .filter(|entry| {
+            entry.file_name() == "SKILL.md" && entry.file_type().is_some_and(|t| t.is_file())
+        })
+        .map(ignore::DirEntry::into_path)
+        .collect();
+
+    // Shallowest first: a manifest nested inside an already-accepted skill's directory is that
+    // skill's own resource, not a separate skill — the original recursive walk stopped descending the
+    // instant it found one, which this reproduces by rejecting anything under an accepted skill root.
+    candidates.sort_by_key(|p| p.components().count());
+    let mut accepted_dirs: Vec<PathBuf> = Vec::new();
+    for manifest in candidates {
+        let Some(dir) = manifest.parent() else {
+            continue;
+        };
+        if accepted_dirs.iter().any(|a| dir.starts_with(a)) {
+            continue;
+        }
         if let Some(skill) = parse_skill(&manifest) {
             out.push(skill);
         }
-        return;
+        accepted_dirs.push(dir.to_path_buf());
     }
-    let Ok(entries) = fs::read_dir(dir) else {
-        return; // missing/unreadable dir is the normal case, not an error
+}
+
+/// Loose `*.md` files directly under `root` (not `SKILL.md`, which [`walk`] already handles, and not
+/// nested in a subdirectory — only the root's immediate children) — pi's second skill shape, for one
+/// small enough not to need its own directory and resources.
+fn loose_root_skills(root: &Path) -> Vec<Skill> {
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
     };
+    let mut out = Vec::new();
     for entry in entries.flatten() {
-        // `file_type` does not traverse symlinks, so a symlinked directory reads as a symlink (not a
-        // directory) and is skipped — that's what keeps cycles out of the walk.
-        let Ok(ft) = entry.file_type() else { continue };
-        if !ft.is_dir() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
             continue;
         }
-        if entry.file_name().to_string_lossy().starts_with('.') {
-            continue; // hidden directories (`.git`, `.cache`, …) never hold skills
+        if path.file_name().and_then(|n| n.to_str()) == Some("SKILL.md") {
+            continue; // a bare root-level SKILL.md is `walk`'s concern, not a loose skill file
         }
-        walk(&entry.path(), depth + 1, out);
+        if let Some(skill) = parse_skill(&path) {
+            out.push(skill);
+        }
     }
+    out
 }
 
 /// Parse a `SKILL.md`'s frontmatter into a [`Skill`]. Requires a non-empty `description`; falls back to
@@ -109,12 +147,45 @@ fn parse_skill(manifest: &Path) -> Option<Skill> {
         .get("disable-model-invocation")
         .map(|v| v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    for issue in validate_skill_name(&name) {
+        tracing::warn!(skill = %name, path = %manifest.display(), "{issue}");
+    }
     Some(Skill {
         name,
         description,
         path: manifest.to_path_buf(),
         disable_model_invocation,
     })
+}
+
+/// Cap matching the reference agent's `MAX_NAME_LENGTH`.
+const MAX_SKILL_NAME_LEN: usize = 64;
+
+/// Non-fatal format checks on a skill's declared `name` (lowercase alphanumeric + hyphens, no
+/// leading/trailing/consecutive hyphens, bounded length) — the same rules the reference agent enforces.
+/// A skill failing these is still discovered and usable; violations are only `warn!`-logged (see
+/// `parse_skill`), since nothing here reads or displays diagnostics for an operator to act on.
+fn validate_skill_name(name: &str) -> Vec<String> {
+    let mut issues = Vec::new();
+    if name.len() > MAX_SKILL_NAME_LEN {
+        issues.push(format!(
+            "skill name exceeds {MAX_SKILL_NAME_LEN} characters ({})",
+            name.len()
+        ));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        issues.push("skill name must be lowercase a-z, 0-9, and hyphens only".to_string());
+    }
+    if name.starts_with('-') || name.ends_with('-') {
+        issues.push("skill name must not start or end with a hyphen".to_string());
+    }
+    if name.contains("--") {
+        issues.push("skill name must not contain consecutive hyphens".to_string());
+    }
+    issues
 }
 
 /// Parse a leading `---`-fenced YAML frontmatter block into its top-level scalar keys. Dependency-free
@@ -189,6 +260,34 @@ pub fn find_by_name<'a>(skills: &'a [Skill], name: &str) -> Option<&'a Skill> {
     skills.iter().find(|s| s.name == name)
 }
 
+/// If `message` is a `/skill:name ...` explicit invocation of a known skill, expand it into that
+/// skill's full file contents (any trailing text after the name follows on its own paragraph);
+/// otherwise return the message unchanged. This is the one path that honors a skill flagged
+/// `disable-model-invocation` — that flag only keeps the model from *choosing* the skill on its own
+/// (see [`format_available`]), not from a user naming it directly. Distinct prefix from
+/// [`crate::prompts::expand_if_slash`]'s bare `/name`, so the two never collide; a caller should try
+/// this first and fall through to prompt-template expansion when it returns the message unchanged.
+pub fn expand_if_skill_invocation(message: &str, skills: &[Skill]) -> String {
+    let Some(rest) = message.strip_prefix("/skill:") else {
+        return message.to_string();
+    };
+    let (name, trailing) = match rest.split_once(char::is_whitespace) {
+        Some((n, t)) => (n, t.trim()),
+        None => (rest, ""),
+    };
+    let Some(skill) = find_by_name(skills, name) else {
+        return message.to_string();
+    };
+    let Ok(body) = fs::read_to_string(&skill.path) else {
+        return message.to_string();
+    };
+    if trailing.is_empty() {
+        body
+    } else {
+        format!("{body}\n\n{trailing}")
+    }
+}
+
 /// Render skills into the `<available_skills>` block injected into the system prompt. Tells the model
 /// each skill's name, what it's for, and where to read the full instructions when a task matches.
 /// Skills flagged `disable-model-invocation` are omitted here (the model must not auto-select them);
@@ -196,7 +295,9 @@ pub fn find_by_name<'a>(skills: &'a [Skill], name: &str) -> Option<&'a Skill> {
 pub fn format_available(skills: &[Skill]) -> String {
     let mut out = String::from(
         "<available_skills>\nThese skills extend your capabilities. When a task matches a skill's \
-         description, read its file for the full instructions before proceeding.\n",
+         description, read its file for the full instructions before proceeding. When a skill file \
+         references a relative path, resolve it against the skill directory (the parent of SKILL.md, \
+         or the loose skill file's own directory) and use that absolute path in tool commands.\n",
     );
     for s in skills.iter().filter(|s| !s.disable_model_invocation) {
         out.push_str(&format!(
@@ -251,6 +352,33 @@ mod tests {
     }
 
     #[test]
+    fn validate_skill_name_flags_bad_shapes_but_accepts_good_ones() {
+        assert!(validate_skill_name("lint").is_empty());
+        assert!(validate_skill_name("pdf-processing-v2").is_empty());
+        assert!(!validate_skill_name("Lint").is_empty()); // uppercase
+        assert!(!validate_skill_name("lint tool").is_empty()); // space
+        assert!(!validate_skill_name("-lint").is_empty()); // leading hyphen
+        assert!(!validate_skill_name("lint-").is_empty()); // trailing hyphen
+        assert!(!validate_skill_name("lint--tool").is_empty()); // consecutive hyphens
+        assert!(!validate_skill_name(&"a".repeat(65)).is_empty()); // too long
+    }
+
+    #[test]
+    fn a_badly_named_skill_is_still_discovered() {
+        // Non-fatal: format issues are warn!-logged (see `parse_skill`), not a rejection — the skill
+        // must still surface and be usable.
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(
+            tmp.path(),
+            "Bad_Name",
+            "---\nname: Bad_Name\ndescription: still works\n---\n",
+        );
+        let skills = discover_in(tmp.path());
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "Bad_Name");
+    }
+
+    #[test]
     fn skill_without_description_is_skipped() {
         let tmp = tempfile::tempdir().unwrap();
         write_skill(tmp.path(), "broken", "---\nname: broken\n---\n");
@@ -292,6 +420,119 @@ mod tests {
     }
 
     #[test]
+    fn gitignored_directories_are_not_walked() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join(".gitignore"), "vendor/\n").unwrap();
+        // A stray SKILL.md under an ignored directory (e.g. a vendored dependency's fixtures) must
+        // not surface — matching the reference agent's gitignore-aware discovery.
+        write_skill(
+            &tmp.path().join("vendor"),
+            "leaked",
+            "---\nname: leaked\ndescription: should not surface\n---\n",
+        );
+        write_skill(
+            tmp.path(),
+            "real",
+            "---\nname: real\ndescription: a real skill\n---\n",
+        );
+        let names: Vec<String> = discover_in(tmp.path())
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names, vec!["real".to_string()]);
+    }
+
+    #[test]
+    fn loose_root_level_md_file_is_a_skill() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A skill small enough not to need its own directory — a bare `*.md` file directly under the
+        // skills root, distinct from the `dir/SKILL.md` shape `write_skill` produces.
+        fs::write(
+            tmp.path().join("quick.md"),
+            "---\nname: quick\ndescription: A one-file skill\n---\nBody.",
+        )
+        .unwrap();
+        let skills = discover_in(tmp.path());
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "quick");
+        assert_eq!(skills[0].path, tmp.path().join("quick.md"));
+    }
+
+    #[test]
+    fn loose_root_level_scan_ignores_skill_md_itself() {
+        // A bare `SKILL.md` directly at the root is `walk`'s concern; the loose-`.md` scanner must not
+        // double-count it as a second skill.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("SKILL.md"),
+            "---\nname: root-skill\ndescription: at the very root\n---\n",
+        )
+        .unwrap();
+        let names: Vec<String> = discover_in(tmp.path())
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names, vec!["root-skill".to_string()]);
+    }
+
+    #[test]
+    fn expand_if_skill_invocation_reads_the_skill_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(
+            tmp.path(),
+            "lint",
+            "---\nname: lint\ndescription: Run the linter\n---\n\nRun `cargo clippy`.",
+        );
+        let skills = discover_in(tmp.path());
+        let expanded = expand_if_skill_invocation("/skill:lint", &skills);
+        assert!(expanded.contains("Run `cargo clippy`."));
+        assert!(!expanded.starts_with("/skill:"));
+    }
+
+    #[test]
+    fn expand_if_skill_invocation_appends_trailing_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(
+            tmp.path(),
+            "lint",
+            "---\nname: lint\ndescription: Run the linter\n---\n\nRun the linter.",
+        );
+        let skills = discover_in(tmp.path());
+        let expanded = expand_if_skill_invocation("/skill:lint only src/main.rs", &skills);
+        assert!(expanded.contains("Run the linter."));
+        assert!(expanded.ends_with("only src/main.rs"));
+    }
+
+    #[test]
+    fn expand_if_skill_invocation_bypasses_disable_model_invocation() {
+        // The flag hides a skill from the model's own judgment (`format_available`), not from an
+        // explicit `/skill:name` the user typed directly.
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(
+            tmp.path(),
+            "manual",
+            "---\nname: manual\ndescription: Explicit only\ndisable-model-invocation: true\n---\n\nManual body.",
+        );
+        let skills = discover_in(tmp.path());
+        let expanded = expand_if_skill_invocation("/skill:manual", &skills);
+        assert!(expanded.contains("Manual body."));
+    }
+
+    #[test]
+    fn expand_if_skill_invocation_passes_through_unmatched_input() {
+        // Not a `/skill:` message at all.
+        assert_eq!(
+            expand_if_skill_invocation("plain message", &[]),
+            "plain message"
+        );
+        // `/skill:` prefix but no such skill — unchanged, not an error.
+        assert_eq!(
+            expand_if_skill_invocation("/skill:nope", &[]),
+            "/skill:nope"
+        );
+    }
+
+    #[test]
     fn disable_model_invocation_is_parsed_hidden_but_findable() {
         let tmp = tempfile::tempdir().unwrap();
         write_skill(
@@ -319,5 +560,8 @@ mod tests {
         assert!(rendered.contains("<available_skills>"));
         assert!(rendered.contains("lint — Run the linter"));
         assert!(rendered.contains("/x/.claude/skills/lint/SKILL.md"));
+        // The model needs to be told how to resolve a relative path a skill file references, or it
+        // may hand a tool a path relative to the wrong directory.
+        assert!(rendered.contains("resolve it against the skill directory"));
     }
 }

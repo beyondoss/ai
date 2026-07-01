@@ -44,12 +44,12 @@ http = "1"
 memchr = "2"
 prometheus = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
-# Global allocator. jemalloc under a memory cgroup uncharges freed pages promptly (MADV_DONTNEED);
-# matches `compute/instd`. See the rationale at the `#[global_allocator]` in `main.rs`.
-tikv-jemallocator = "0.6"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# Global allocator. jemalloc under a memory cgroup uncharges freed pages promptly (MADV_DONTNEED);
+# matches `compute/instd`. See the rationale at the `#[global_allocator]` in `main.rs`.
+tikv-jemallocator = "0.6"
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

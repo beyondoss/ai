@@ -18,11 +18,13 @@
 //! (the supported hook), feeding each chunk to a streaming structural scanner (`peek::ModelScanner`,
 //! O(1) memory) — never withholding or buffering it.
 //!
-//! One deliberate exception to the no-buffer rule: a **managed** OpenAI chat/responses request is
+//! One deliberate exception to the no-buffer rule: a **managed** OpenAI Chat Completions request is
 //! buffered and gets `stream_options.include_usage` injected when it streams without it — otherwise
 //! OpenAI emits no usage chunk and the request couldn't be metered. We can't set that option in a
 //! client SDK we don't control, so the gateway guarantees it, out of the box. Scoped to exactly that
-//! path (managed + OpenAI dialect + streaming-capable); BYO and everything else stay pure passthrough.
+//! path (managed + OpenAI dialect + chat/completions); BYO and everything else stay pure passthrough.
+//! The Responses API needs no such injection — it always reports usage on its terminal event — so it
+//! stays pure passthrough too (see `is_streamable_path`).
 //!
 //! Auth branches on key format: `bai_…` is a managed virtual key (verify → deny-check → swap to
 //! the pool key); anything else is a **BYO** request — the user's own provider token, passed
@@ -116,11 +118,11 @@ pub struct RequestCtx {
     /// success (the provider answered — a `429` is a healthy throttle, not a breaker trip), and a
     /// `None` here with an upstream error → failure (connect/read failed before any response).
     upstream_status: Option<u16>,
-    /// Managed OpenAI chat/responses request: buffer the body and inject
+    /// Managed OpenAI chat/completions request: buffer the body and inject
     /// `stream_options.include_usage` if it streams without it, so the usage chunk (hence the
     /// billable token count) is guaranteed. The single, deliberate exception to "never buffer the
-    /// request body" — scoped to the managed OpenAI streaming-capable path and bounded by
-    /// `MAX_REQUEST_BODY`. BYO and every other request still stream straight through.
+    /// request body" — scoped to the managed OpenAI chat/completions path (see `is_streamable_path`)
+    /// and bounded by `MAX_REQUEST_BODY`. BYO and every other request still stream straight through.
     inject_eligible: bool,
     /// Accumulated request body — populated only when `inject_eligible`; otherwise stays empty and
     /// the body is never buffered.
@@ -207,13 +209,16 @@ fn dialect_for_path(path: &str) -> Dialect {
     }
 }
 
-/// Whether the **forwarded** (provider-native) path targets an OpenAI streaming-capable endpoint —
-/// chat completions or the Responses API. Checked by *suffix*, so it holds regardless of the
-/// provider's mount prefix (`/v1/chat/completions`, `/openai/v1/chat/completions`,
-/// `/inference/v1/chat/completions`, …). Only these get buffered for `stream_options.include_usage`
-/// injection — embeddings and everything else never stream, so there's nothing to meter.
+/// Whether the **forwarded** (provider-native) path targets the OpenAI Chat Completions endpoint.
+/// Checked by *suffix*, so it holds regardless of the provider's mount prefix
+/// (`/v1/chat/completions`, `/openai/v1/chat/completions`, `/inference/v1/chat/completions`, …). Only
+/// this gets buffered for `stream_options.include_usage` injection — **not** `/v1/responses`: the
+/// Responses API has no `stream_options` field at all (it always reports usage on the terminal
+/// `response.completed` event, streaming or not), so splicing this chat-completions-only fragment into
+/// a Responses body would inject a field the API doesn't recognize. Embeddings and everything else
+/// never stream, so there's nothing to meter there either.
 fn is_streamable_path(forward_path: &str) -> bool {
-    forward_path.ends_with("/chat/completions") || forward_path.ends_with("/responses")
+    forward_path.ends_with("/chat/completions")
 }
 
 /// Splice `stream_options.include_usage` into a buffered OpenAI chat body when it streams without it
@@ -413,7 +418,7 @@ impl ProxyHttp for AiProxy {
             (0, 0, false)
         };
 
-        // Mark OpenAI managed chat/responses streams for body buffering + `stream_options` injection
+        // Mark OpenAI managed chat/completions streams for body buffering + `stream_options` injection
         // (handled in `request_body_filter`). Scoped tight: managed only (BYO stays pure
         // passthrough), OpenAI dialect only, streaming-capable paths only — so everything else still
         // streams through untouched. Checked on the forwarded path (suffix), so it's prefix-agnostic.
@@ -982,14 +987,17 @@ mod tests {
 
     #[test]
     fn is_streamable_path_matches_generation_suffixes_across_prefixes() {
-        // Only chat-completions / responses get buffered for `stream_options.include_usage`
-        // injection. The check is by *suffix* so it holds whatever mount prefix the provider uses;
-        // a mismatch here either skips injection on a streamable path (lost usage) or needlessly
-        // buffers a non-streaming one.
+        // Only chat-completions gets buffered for `stream_options.include_usage` injection. The
+        // check is by *suffix* so it holds whatever mount prefix the provider uses; a mismatch here
+        // either skips injection on a streamable path (lost usage) or needlessly buffers a
+        // non-streaming one.
         assert!(is_streamable_path("/v1/chat/completions"));
         assert!(is_streamable_path("/openai/v1/chat/completions"));
         assert!(is_streamable_path("/inference/v1/chat/completions"));
-        assert!(is_streamable_path("/v1/responses"));
+        // The Responses API must NOT be buffered/injected: it has no `stream_options` field, always
+        // reports usage on its terminal event regardless, and splicing this fragment into its body
+        // would inject a field the API doesn't recognize.
+        assert!(!is_streamable_path("/v1/responses"));
         // Non-streaming endpoints must not be buffered.
         assert!(!is_streamable_path("/v1/embeddings"));
         assert!(!is_streamable_path("/v1/messages"));

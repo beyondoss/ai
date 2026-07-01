@@ -48,7 +48,7 @@ impl Tool for Edit {
         input
             .get("path")
             .and_then(Value::as_str)
-            .map(str::to_string)
+            .map(super::canonical_write_target)
     }
 
     async fn run(&self, input: Value) -> Result<ToolOutput, ToolError> {
@@ -145,14 +145,30 @@ fn find_spans(working: &str, old: &str, replace_all: bool) -> Result<Vec<(usize,
         .match_indices(old)
         .map(|(i, _)| (i, i + old.len()))
         .collect();
-    if !exact.is_empty() {
-        return disambiguate(exact, old, replace_all);
-    }
 
-    // Fuzzy fallback: normalize both sides, search in normalized space, map matches back via the
-    // normalized→original byte-offset table.
+    // Normalize both sides once, up front — the ambiguity check below needs it even when an exact
+    // match wins, not only on the fuzzy-fallback path.
     let (norm_work, map) = normalize_with_map(working);
     let norm_old = normalize_with_map(old).0;
+
+    if !exact.is_empty() {
+        // Prefer exact spans for the actual splice — preserves every byte around the match instead of
+        // rewriting the whole line from normalized text (see the module docs). But the *uniqueness*
+        // check must still count in normalized space: every exact match is trivially also a fuzzy
+        // match, so a near-duplicate that only fuzzy-matches (a curly-quoted twin of an ASCII-quoted
+        // exact hit, say) is still a real ambiguity — it just doesn't show up in `exact`. Matches the
+        // reference agent's `countOccurrences`, which always counts in normalized space regardless of
+        // which candidate would eventually win.
+        let fuzzy_count = if norm_old.is_empty() {
+            exact.len()
+        } else {
+            norm_work.matches(norm_old.as_str()).count()
+        };
+        return disambiguate(exact, fuzzy_count, old, replace_all);
+    }
+
+    // Fuzzy fallback: no exact match anywhere, so search — and splice — in normalized space, mapping
+    // matches back via the normalized→original byte-offset table.
     if norm_old.is_empty() {
         return Err(format!("`old_string` not found: {old:?}"));
     }
@@ -160,19 +176,23 @@ fn find_spans(working: &str, old: &str, replace_all: bool) -> Result<Vec<(usize,
         .match_indices(&norm_old)
         .map(|(i, _)| (map[i] as usize, map[i + norm_old.len()] as usize))
         .collect();
-    disambiguate(fuzzy, old, replace_all)
+    let count = fuzzy.len();
+    disambiguate(fuzzy, count, old, replace_all)
 }
 
-/// Apply the uniqueness/absence rules shared by the exact and fuzzy passes.
+/// Apply the uniqueness/absence rules shared by the exact and fuzzy passes. `spans` is what would
+/// actually be spliced; `fuzzy_count` is how many matches exist in normalized space — the two differ
+/// exactly when an exact match won but a fuzzy-only near-duplicate also exists elsewhere.
 fn disambiguate(
     spans: Vec<(usize, usize)>,
+    fuzzy_count: usize,
     old: &str,
     replace_all: bool,
 ) -> Result<Vec<(usize, usize)>, String> {
     match spans.len() {
         0 => Err(format!("`old_string` not found: {old:?}")),
-        n if n > 1 && !replace_all => Err(format!(
-            "`old_string` is not unique ({n} matches): {old:?}; add surrounding context"
+        _ if fuzzy_count > 1 && !replace_all => Err(format!(
+            "`old_string` is not unique ({fuzzy_count} matches): {old:?}; add surrounding context"
         )),
         _ => Ok(spans),
     }
@@ -493,18 +513,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_match_still_preferred_over_fuzzy() {
-        // Both an exact and a fuzzy candidate exist; exact must win (and stay unique).
+    async fn exact_and_fuzzy_duplicate_together_are_ambiguous() {
+        // An ASCII-quoted exact match and a curly-quoted near-duplicate both fold to the same
+        // normalized text — a real ambiguity, even though only one is byte-exact. The reference
+        // agent's `countOccurrences` always counts in normalized space regardless of which candidate
+        // would eventually win, so this must be rejected rather than silently picking the exact one.
         let f = write_tmp("'a' and \u{2018}a\u{2019}");
+        let p = f.path().to_str().unwrap();
+        let err = Edit
+            .run(json!({ "path": p, "old_string": "'a'", "new_string": "X" }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn exact_match_wins_and_preserves_surrounding_bytes_when_unambiguous() {
+        // Exactly one occurrence in both exact and fuzzy space: not ambiguous, and the exact span is
+        // used for the splice — every byte around the match is untouched rather than the whole line
+        // being rewritten from normalized text.
+        let f = write_tmp("'a' and something else");
         let p = f.path().to_str().unwrap();
         Edit.run(json!({ "path": p, "old_string": "'a'", "new_string": "X" }))
             .await
             .unwrap();
-        // Only the ASCII-quoted occurrence changed; the curly-quoted one is untouched.
-        assert_eq!(
-            std::fs::read_to_string(p).unwrap(),
-            "X and \u{2018}a\u{2019}"
-        );
+        assert_eq!(std::fs::read_to_string(p).unwrap(), "X and something else");
     }
 
     #[tokio::test]

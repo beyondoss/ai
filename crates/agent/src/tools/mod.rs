@@ -42,9 +42,52 @@ pub(crate) fn write_atomic(path: &str, content: &[u8]) -> std::io::Result<()> {
     }
 }
 
+/// Canonicalize a path for use as a same-file grouping key (`Tool::write_target`): two same-turn calls
+/// naming the same underlying file — `./foo.rs`, `foo.rs`, or a symlink alias — must land on one key so
+/// the loop serializes them instead of racing two concurrent read-modify-writes on one file.
+///
+/// Real canonicalization (`std::fs::canonicalize`) resolves symlinks and `.`/`..` against the actual
+/// filesystem, but fails with `NotFound` for a path that doesn't exist yet — exactly `write`'s common
+/// case (creating a new file). The fallback below only resolves `.`/`..` *lexically* and makes the
+/// result absolute (joined against the process cwd), so differently-spelled references to a
+/// not-yet-created file still normalize to the same key; it just can't resolve a symlink it can't stat.
+///
+/// Never fails outright: a pathological input (e.g. one that can't even be joined) falls back to the
+/// original string unchanged, which only degrades grouping (calls that should serialize might not) —
+/// strictly no worse than today's un-canonicalized behavior, never a new correctness hazard.
+pub(crate) fn canonical_write_target(path: &str) -> String {
+    if let Ok(real) = std::fs::canonicalize(path) {
+        return real.display().to_string();
+    }
+    let p = std::path::Path::new(path);
+    let mut normalized = if p.is_absolute() {
+        std::path::PathBuf::new()
+    } else {
+        std::env::current_dir().unwrap_or_default()
+    };
+    for component in p.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized.display().to_string()
+}
+
 /// The default tool set: pi's seven coding tools (read, write, edit, bash, ls, grep, find) plus the
 /// Beyond platform tools (fork, sync, logs).
 pub fn default_registry() -> ToolRegistry {
+    default_registry_with(None)
+}
+
+/// Like [`default_registry`], overriding `bash`'s default timeout (applied when the model omits
+/// `timeout_ms`) when `bash_timeout_ms` is `Some` — an operator-tunable knob (`--bash-timeout-ms`),
+/// distinct from `default_registry`'s fixed default so callers that don't need the override (the
+/// `tools` listing command, tests) don't have to pass one.
+pub fn default_registry_with(bash_timeout_ms: Option<u64>) -> ToolRegistry {
     let mut reg = ToolRegistry::new();
     reg.register(Arc::new(read::Read));
     reg.register(Arc::new(write::Write));
@@ -52,7 +95,11 @@ pub fn default_registry() -> ToolRegistry {
     reg.register(Arc::new(ls::Ls));
     reg.register(Arc::new(grep::Grep));
     reg.register(Arc::new(find::Find));
-    reg.register(Arc::new(bash::Bash::real()));
+    let bash = match bash_timeout_ms {
+        Some(ms) => bash::Bash::real().with_default_timeout_ms(ms),
+        None => bash::Bash::real(),
+    };
+    reg.register(Arc::new(bash));
     reg.register(Arc::new(beyond::Fork::real()));
     reg.register(Arc::new(beyond::Sync::real()));
     reg.register(Arc::new(beyond::Logs::real()));
@@ -86,6 +133,45 @@ mod tests {
     }
 
     #[test]
+    fn canonical_write_target_unifies_spellings_of_an_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().canonicalize().unwrap().join("foo.rs");
+        std::fs::write(&real, b"fn main() {}").unwrap();
+
+        let dotted = dir.path().join("./foo.rs");
+        let via_parent = dir.path().join("sub/../foo.rs");
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+
+        let a = canonical_write_target(real.to_str().unwrap());
+        let b = canonical_write_target(dotted.to_str().unwrap());
+        let c = canonical_write_target(via_parent.to_str().unwrap());
+        assert_eq!(a, b, "absolute vs `./`-prefixed spelling must match");
+        assert_eq!(a, c, "a path through `..` must resolve to the same key");
+    }
+
+    #[test]
+    fn canonical_write_target_falls_back_to_lexical_normalization_when_the_file_is_new() {
+        // `write` routinely targets a path that doesn't exist yet — `canonicalize` fails (NotFound),
+        // so the grouping key must still unify spellings without touching the filesystem. Uses
+        // absolute paths (rather than `std::env::set_current_dir`, which is process-global and unsafe
+        // to mutate from a test that may run in parallel with others) so the relative-path branch of
+        // `canonical_write_target` isn't exercised here, only the `.`/`..` lexical resolution.
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+
+        let a = canonical_write_target(base.join("brand-new.rs").to_str().unwrap());
+        let b = canonical_write_target(base.join("./brand-new.rs").to_str().unwrap());
+        let c = canonical_write_target(base.join("sub/../brand-new.rs").to_str().unwrap());
+
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+        assert!(
+            std::path::Path::new(&a).is_absolute(),
+            "fallback must still produce an absolute key: {a}"
+        );
+    }
+
+    #[test]
     fn default_registry_has_coding_and_beyond_tools() {
         let reg = default_registry();
         // pi's coding tools …
@@ -97,5 +183,17 @@ mod tests {
             assert!(reg.get(name).is_some(), "missing beyond tool: {name}");
         }
         assert_eq!(reg.len(), 10);
+    }
+
+    #[test]
+    fn default_registry_with_none_matches_default_registry() {
+        // `default_registry()` must genuinely delegate to `default_registry_with(None)`, not just
+        // happen to look similar — same tool set either way.
+        assert_eq!(default_registry().len(), default_registry_with(None).len());
+        for name in [
+            "read", "write", "edit", "bash", "ls", "grep", "find", "fork", "sync", "logs",
+        ] {
+            assert!(default_registry_with(None).get(name).is_some());
+        }
     }
 }

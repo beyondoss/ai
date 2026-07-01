@@ -152,6 +152,63 @@ async fn smoke_openai() {
 
 #[tokio::test]
 #[ignore = "live provider smoke; run via `mise run test:smoke` with API keys set"]
+async fn smoke_openai_responses_usage_is_metered() {
+    // Track B ported a gateway-side fix for the Responses API's nested usage shape
+    // (`response.completed.response.usage`, not Chat Completions' top-level `usage` field). The unit
+    // test for that parser is real, but nothing had watched the *actual* gateway meter a *real*
+    // Responses-routed call end to end — this is that proof: a real call must produce a non-zero
+    // token count on the gateway's own metrics, not a silent zero-token row (which
+    // `ai_usage_parse_errors_total` would also flag, since a managed 2xx with no parseable usage is
+    // exactly the failure mode this guards against).
+    let Some(key) = env_key("OPENAI_API_KEY") else {
+        eprintln!("smoke[openai-responses]: OPENAI_API_KEY unset — skipping");
+        return;
+    };
+    let nats = Nats::start().await;
+    let (gw, vkey) = managed_gateway(&nats, "openai", &key).await;
+    let client = reqwest::Client::new();
+
+    let before = gw.metrics().await;
+    let before_output = parse_metric(&before, "ai_tokens_total", "output");
+    let before_errors = parse_metric(&before, "ai_usage_parse_errors_total", "");
+
+    // A real Responses API request (not Chat Completions): flat `input` array, `max_output_tokens`,
+    // streamed — the exact shape `dialect::openai_responses::build_body` sends.
+    let body = r#"{"model":"gpt-4o-mini","input":[{"role":"user","content":[{"type":"input_text","text":"Reply with the single word: ping"}]}],"max_output_tokens":16,"stream":true,"store":false}"#;
+    let resp = client
+        .post(format!("{}/openai/v1/responses", gw.url()))
+        .header("authorization", format!("Bearer {vkey}"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("request to gateway");
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    assert!(
+        status.is_success(),
+        "smoke[openai-responses]: expected 2xx, got {status}. body: {text}"
+    );
+    assert!(
+        text.contains("response.completed"),
+        "smoke[openai-responses]: {status} but no terminal event in body: {text}"
+    );
+
+    // The gateway must have parsed a non-zero output-token count from the *nested* usage shape — the
+    // whole point of the fix under test.
+    wait_for_metric(&gw, "ai_tokens_total", "output", before_output + 1.0).await;
+    let after_errors = parse_metric(&gw.metrics().await, "ai_usage_parse_errors_total", "");
+    assert_eq!(
+        after_errors, before_errors,
+        "a real Responses call must not log a usage-parse failure"
+    );
+    eprintln!(
+        "smoke[openai-responses]: OK ({status}) — real Responses API call, usage metered correctly"
+    );
+}
+
+#[tokio::test]
+#[ignore = "live provider smoke; run via `mise run test:smoke` with API keys set"]
 async fn smoke_groq() {
     // Groq mounts under `/openai/v1`; the client sends `/groq/openai/v1/...` and the gateway strips
     // `/groq` and forwards the rest verbatim. The highest-value non-`/v1` native-path case.

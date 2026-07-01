@@ -12,9 +12,83 @@
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::message::{ContentBlock, Message, Role};
 use crate::session::Session;
 use crate::transport::ModelRequest;
+
+/// Why a compaction fired — carried on [`crate::agent::AgentEvent::Compacted`] and folded into
+/// [`CompactionProvenance`], so a persisted session (or a client watching the event stream) can tell
+/// *why* a round happened, not just that one did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionReason {
+    /// The live prompt crossed the configured threshold (`should_compact`'s automatic trigger).
+    Threshold,
+    /// The provider rejected a request for exceeding the context window; this is the recovery.
+    Overflow,
+    /// An explicit request (a headless client's manual `compact` command).
+    Manual,
+}
+
+/// What compaction has recorded about this session so far, folded forward across every round.
+/// [`Session::compaction`] carries one of these; each successful [`crate::agent::Agent::compact`] call
+/// replaces it with the merged result of [`merge_file_ops`].
+///
+/// This exists because `apply_summary` is *deliberately* destructive — it physically replaces the
+/// summarized prefix with a summary message, matching this project's flat-history simplification — so
+/// once a round's raw messages are gone, anything not captured here is gone with them. Without folding
+/// file-ops forward, `extract_file_ops` on the next round only ever sees *new* activity (the old
+/// messages, and their `ToolUse` blocks, no longer exist to scan), so a second or third compaction
+/// would silently lose the first round's file awareness entirely.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CompactionProvenance {
+    /// Files read (or listed) across every compaction round so far, deduped, oldest-first.
+    #[serde(default)]
+    pub read_files: Vec<String>,
+    /// Files written or edited across every compaction round so far, deduped, oldest-first.
+    #[serde(default)]
+    pub modified_files: Vec<String>,
+    /// How many times this session has been compacted.
+    #[serde(default)]
+    pub compactions: u32,
+    /// Why the most recent compaction fired. `None` until the first one.
+    #[serde(default)]
+    pub last_reason: Option<CompactionReason>,
+}
+
+/// Fold `previous`'s file-ops forward with whatever [`extract_file_ops`] finds in `messages` (the
+/// current round's prefix), deduping by path and keeping first-seen order, and record `reason` as the
+/// new `last_reason`. `messages` is the *whole* current-round prefix, including a leading
+/// prior-summary message if there is one — that message carries no `ToolUse` blocks (it's prose), so
+/// scanning it contributes nothing and this naturally reduces to "previous provenance + this round's
+/// new activity" without needing to slice it off.
+pub fn merge_file_ops(
+    previous: &CompactionProvenance,
+    messages: &[Message],
+    reason: CompactionReason,
+) -> CompactionProvenance {
+    let (new_read, new_modified) = extract_file_ops(messages);
+    let mut read = previous.read_files.clone();
+    for path in new_read {
+        if !read.contains(&path) {
+            read.push(path);
+        }
+    }
+    let mut modified = previous.modified_files.clone();
+    for path in new_modified {
+        if !modified.contains(&path) {
+            modified.push(path);
+        }
+    }
+    CompactionProvenance {
+        read_files: read,
+        modified_files: modified,
+        compactions: previous.compactions.saturating_add(1),
+        last_reason: Some(reason),
+    }
+}
 
 /// Tunables for automatic compaction.
 #[derive(Debug, Clone, Copy)]
@@ -67,6 +141,19 @@ drop earlier decisions or context just because they are not repeated in the new 
 ## Constraints\n## Progress\n### Done\n### In Progress\n### Blocked\n## Key Decisions\n## Next Steps\n\
 ## Critical Context";
 
+/// The instruction used when the cut point falls *inside* an in-progress turn (see [`is_split_turn`]):
+/// the prefix being summarized ends mid-tool-dispatch, so its concluding response — and the context
+/// for it — lives in the kept suffix, not here. A generic "summarize this closed-off history" framing
+/// (`SUMMARY_INSTRUCTION`) would ask the model to describe a turn as finished when it isn't; this asks
+/// it to preserve the *original request* and *progress so far* instead, framed as still-open context
+/// for whatever the kept suffix does next.
+pub const SPLIT_TURN_INSTRUCTION: &str = "This is the PREFIX of a turn that was too large to keep. \
+The SUFFIX (recent work) is retained.\n\nSummarize the prefix to provide context for the retained \
+suffix:\n\n## Original Request\n[What did the user ask for in this turn?]\n\n## Early Progress\n- \
+[Key decisions and work done in the prefix]\n\n## Context for Suffix\n- [Information needed to \
+understand the retained recent work]\n\nBe concise. Focus on what's needed to understand the kept \
+suffix.";
+
 /// Prefix marking a message as a compaction summary, so a later compaction recognizes it and updates
 /// it incrementally instead of re-summarizing it. Created by [`apply_summary`], detected by
 /// [`previous_summary`].
@@ -109,12 +196,28 @@ pub fn should_compact(session: &Session, cfg: &CompactionConfig) -> bool {
 }
 
 /// Choose the first message index to keep verbatim. Walks back from the end accumulating estimated
-/// tokens until ~`keep_recent_tokens` is covered, then snaps **back** to the nearest assistant
-/// message so the post-compaction history is `[summary(user), assistant, user, …]` — valid
-/// alternation, and never cutting between an assistant's `tool_use` and its `tool_result`.
+/// tokens until ~`keep_recent_tokens` is covered, then snaps to the nearest assistant message —
+/// **forward** (at or after that point) when one exists, so the kept suffix never retains *more*
+/// than the budget, only ever less. (An earlier version of this always snapped backward, which could
+/// pull in a whole extra message's worth of tokens ahead of the accumulation point — unbounded if
+/// that message happened to be a large tool result.)
+///
+/// Forward-snapping can run off the end of the array when the accumulation point lands on the very
+/// last message and it isn't an assistant message (routinely true: `should_compact` is checked right
+/// after a tool-dispatch turn appends a `user` tool-result message, before the next assistant turn
+/// exists yet). Rather than decline to compact entirely in that case, this falls back to snapping
+/// backward instead — some valid boundary is required for the post-compaction alternation to hold,
+/// and retaining slightly more than the budget for one round beats not compacting at all.
+///
+/// Either direction is equally safe against splitting a `tool_use`/`tool_result` pair *in this
+/// codebase's message model specifically*: roles strictly alternate (the loop never emits two
+/// consecutive same-role messages — Anthropic rejects that), so a pair always spans exactly
+/// `messages[k]` (assistant) / `messages[k+1]` (user), and landing the boundary on the assistant
+/// message immediately before *or* immediately after a tool-result message never lands mid-pair. The
+/// post-compaction history is `[summary(user), assistant, user, …]` — valid alternation either way.
 ///
 /// Returns `None` when there isn't a worthwhile prefix to summarize (too short, or no clean
-/// boundary) — the caller then leaves the conversation untouched.
+/// boundary at all) — the caller then leaves the conversation untouched.
 pub fn find_cut(messages: &[Message], keep_recent_tokens: u32) -> Option<usize> {
     let n = messages.len();
     // Need at least a couple of turns to bother — a summary plus a kept suffix.
@@ -130,14 +233,21 @@ pub fn find_cut(messages: &[Message], keep_recent_tokens: u32) -> Option<usize> 
         }
         idx -= 1;
     }
-    // Snap back to the nearest assistant message — the suffix must start with one so it follows the
-    // summary (a user message) cleanly, and so a kept assistant `tool_use` keeps its `tool_result`.
-    let mut first_kept = idx;
-    while first_kept > 0 && messages[first_kept].role != Role::Assistant {
-        first_kept -= 1;
+    let mut forward = idx;
+    while forward < n && messages[forward].role != Role::Assistant {
+        forward += 1;
     }
+    let first_kept = if forward < n {
+        forward
+    } else {
+        let mut backward = idx;
+        while backward > 0 && messages[backward].role != Role::Assistant {
+            backward -= 1;
+        }
+        backward
+    };
     // Leave a non-trivial prefix to summarize, and require a real assistant boundary.
-    if first_kept == 0 || messages[first_kept].role != Role::Assistant {
+    if first_kept == 0 || first_kept >= n || messages[first_kept].role != Role::Assistant {
         return None;
     }
     Some(first_kept)
@@ -235,6 +345,29 @@ pub fn previous_summary(prefix: &[Message]) -> Option<&str> {
     Some(body.trim_start())
 }
 
+/// Whether `prefix` (what's about to be summarized) ends *mid-turn* — its cut point falls inside an
+/// in-progress tool-dispatch sequence rather than at a genuine turn boundary. `find_cut` always snaps
+/// to an assistant message, but that assistant message can be a **continuation** of dispatching
+/// several tool calls for one earlier user request, not necessarily the first response to a fresh one
+/// — in which case the request that motivated `prefix`'s trailing work is itself inside `prefix`,
+/// summarized away, while the *conclusion* of that same turn lives in the kept suffix.
+///
+/// Detected by shape: a mid-turn tool round-trip always ends with a user message containing only
+/// `ToolResult` blocks (no free text) in this message model — the loop appends exactly that after
+/// dispatching a batch of tool calls, before the assistant's next (possibly still-mid-turn) response.
+pub fn is_split_turn(prefix: &[Message]) -> bool {
+    match prefix.last() {
+        Some(m) => {
+            m.role == Role::User
+                && !m.content.is_empty()
+                && m.content
+                    .iter()
+                    .all(|b| matches!(b, ContentBlock::ToolResult { .. }))
+        }
+        None => false,
+    }
+}
+
 /// Build the (network-free) summarization request: the rendered prefix plus the structured
 /// instruction and file-op tags, as a single user turn. One self-contained message sidesteps any
 /// role-alternation constraints, and capping tool results keeps the prompt well under the window.
@@ -243,8 +376,17 @@ pub fn previous_summary(prefix: &[Message]) -> Option<&str> {
 /// the previous summary is presented verbatim, only the activity since it is rendered as transcript,
 /// and the model is asked to merge them — so successive compactions don't re-summarize (and lose) the
 /// same early context over and over.
-pub fn summary_request(model: &str, prefix: &[Message], max_tokens: u32) -> ModelRequest {
-    let (read, modified) = extract_file_ops(prefix);
+///
+/// `file_ops` is the *already-merged* provenance (see [`merge_file_ops`]) — the read/modified-file
+/// tags embedded in the prompt reflect every round so far, not just this one's new activity, so the
+/// model doesn't lose file awareness the previous round recorded.
+pub fn summary_request(
+    model: &str,
+    prefix: &[Message],
+    max_tokens: u32,
+    file_ops: &CompactionProvenance,
+) -> ModelRequest {
+    let (read, modified) = (&file_ops.read_files, &file_ops.modified_files);
 
     let mut prompt = String::new();
     let instruction = match previous_summary(prefix) {
@@ -260,7 +402,11 @@ pub fn summary_request(model: &str, prefix: &[Message], max_tokens: u32) -> Mode
         None => {
             prompt.push_str(&render_prefix(prefix));
             prompt.push_str("\n\n");
-            SUMMARY_INSTRUCTION
+            if is_split_turn(prefix) {
+                SPLIT_TURN_INSTRUCTION
+            } else {
+                SUMMARY_INSTRUCTION
+            }
         }
     };
     if !read.is_empty() {
@@ -344,6 +490,71 @@ mod tests {
     }
 
     #[test]
+    fn find_cut_snaps_forward_never_retaining_more_than_the_budget() {
+        // `convo()`: [0 user, 1 assistant(tool_use read), 2 user(tool_result), 3 assistant(tool_use
+        // edit), 4 user(tool_result "edited"), 5 assistant(text "done")]. Budget 2: accumulating from
+        // the end, message 5 ("done", ~1 token) isn't enough alone, so the walk continues to message 4
+        // ("edited", ~1 token) — cumulative 2, stop at idx=4, a *user* (tool_result) message.
+        let messages = convo();
+        let cut = find_cut(&messages, 2).expect("a cut");
+        // Forward-snap lands on message 5 (the next assistant boundary *after* idx=4) — the
+        // tool_use/tool_result pair at [3, 4] is fully summarized, not partially retained. A prior
+        // backward-snapping implementation would have landed on message 3 instead, retaining both
+        // messages 3 and 4 — strictly more than the 2-token budget asked for.
+        assert_eq!(cut, 5);
+        assert_eq!(messages[cut].role, Role::Assistant);
+        // The kept suffix (from `cut` onward) never exceeds the budget by more than the one boundary
+        // message itself — unlike backward-snap, it can't additionally pull in an *earlier* sibling
+        // message (here, message 3) ahead of the accumulation point.
+        let kept_tokens: u32 = messages[cut..].iter().map(estimate_message_tokens).sum();
+        assert!(kept_tokens <= 2, "kept {kept_tokens} tokens, budget was 2");
+    }
+
+    #[test]
+    fn find_cut_never_splits_a_tool_use_tool_result_pair() {
+        // A longer conversation with several tool round-trips — for every budget size, the chosen cut
+        // must never leave a `tool_result` on the kept side without its originating `tool_use` (or
+        // vice versa), regardless of which side of a pair the raw accumulation index landed on.
+        let mut messages = vec![Message::user("start")];
+        for i in 0..8 {
+            messages.push(Message::assistant(vec![ContentBlock::ToolUse {
+                id: i.to_string(),
+                name: "read".into(),
+                input: json!({ "path": format!("f{i}.rs") }),
+            }]));
+            messages.push(Message::tool_result(
+                i.to_string(),
+                format!("contents of f{i}"),
+                false,
+            ));
+        }
+        messages.push(Message::assistant(vec![ContentBlock::Text {
+            text: "done".into(),
+        }]));
+
+        for budget in [1u32, 3, 5, 8, 12, 20, 50] {
+            let Some(cut) = find_cut(&messages, budget) else {
+                continue;
+            };
+            assert_eq!(
+                messages[cut].role,
+                Role::Assistant,
+                "budget {budget}: cut must land on an assistant boundary"
+            );
+            // If a tool_result is kept, its tool_use (the immediately preceding message) must be too.
+            for (i, m) in messages.iter().enumerate().skip(cut) {
+                if matches!(m.content.first(), Some(ContentBlock::ToolResult { .. })) {
+                    assert!(
+                        i > 0 && i > cut,
+                        "budget {budget}: tool_result at {i} is kept but its tool_use at {} is not",
+                        i.saturating_sub(1)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn find_cut_declines_short_conversations() {
         assert!(find_cut(&convo()[..3], 1).is_none());
     }
@@ -366,8 +577,19 @@ mod tests {
                 input: json!({ "path": "a.rs" }),
             }]),
             Message::tool_result("1", &big, false),
+            // A concluding assistant response — without this the prefix ends on a bare tool_result,
+            // which `is_split_turn` (correctly) reads as an in-progress turn and would swap in
+            // `SPLIT_TURN_INSTRUCTION` instead of the generic template this test is exercising.
+            Message::assistant(vec![ContentBlock::Text {
+                text: "done".into(),
+            }]),
         ];
-        let req = summary_request("claude-test", &messages, 512);
+        let file_ops = merge_file_ops(
+            &CompactionProvenance::default(),
+            &messages,
+            CompactionReason::Manual,
+        );
+        let req = summary_request("claude-test", &messages, 512, &file_ops);
         let text = match &req.messages[0].content[0] {
             ContentBlock::Text { text } => text,
             other => panic!("expected text, got {other:?}"),
@@ -398,7 +620,12 @@ mod tests {
             Some("Previous summary body about task X")
         );
 
-        let req = summary_request("claude-test", &prefix, 512);
+        let file_ops = merge_file_ops(
+            &CompactionProvenance::default(),
+            &prefix,
+            CompactionReason::Manual,
+        );
+        let req = summary_request("claude-test", &prefix, 512, &file_ops);
         let ContentBlock::Text { text } = &req.messages[0].content[0] else {
             panic!("expected text");
         };
@@ -412,8 +639,133 @@ mod tests {
     }
 
     #[test]
+    fn file_ops_fold_forward_across_successive_compactions() {
+        // Round 1: the model read/edited round1.rs. Round 1's provenance records that.
+        let round1_prefix = vec![
+            Message::user("task"),
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "1".into(),
+                name: "read".into(),
+                input: json!({ "path": "round1.rs" }),
+            }]),
+            Message::tool_result("1", "contents", false),
+        ];
+        let round1_ops = merge_file_ops(
+            &CompactionProvenance::default(),
+            &round1_prefix,
+            CompactionReason::Threshold,
+        );
+        assert_eq!(round1_ops.read_files, vec!["round1.rs"]);
+        assert_eq!(round1_ops.compactions, 1);
+
+        // Round 2's prefix — as `apply_summary` would leave it — starts with round 1's summary
+        // message (prose, no `ToolUse` blocks) followed by *new* activity referencing a *different*
+        // file, round2.rs. If file-ops didn't fold forward, this round's provenance would only ever
+        // contain round2.rs — round1.rs would have silently vanished the moment its raw `ToolUse`
+        // message was replaced by the round-1 summary.
+        let round2_prefix = vec![
+            Message::user(format!("{SUMMARY_MARKER}\n\nRound 1 summary")),
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "2".into(),
+                name: "edit".into(),
+                input: json!({ "path": "round2.rs" }),
+            }]),
+            Message::tool_result("2", "edited", false),
+        ];
+        let round2_ops = merge_file_ops(&round1_ops, &round2_prefix, CompactionReason::Threshold);
+
+        // Both rounds' files survive, in first-seen order — round1.rs isn't lost, and round2.rs isn't
+        // just tacked on without it.
+        assert_eq!(round2_ops.read_files, vec!["round1.rs"]);
+        assert_eq!(round2_ops.modified_files, vec!["round2.rs"]);
+        assert_eq!(round2_ops.compactions, 2);
+
+        // The summarization prompt itself carries the *merged* tags, not just this round's activity —
+        // the model doing the summarizing sees the full file history, not a truncated one.
+        let req = summary_request("claude-test", &round2_prefix, 512, &round2_ops);
+        let ContentBlock::Text { text } = &req.messages[0].content[0] else {
+            panic!("expected text");
+        };
+        assert!(
+            text.contains("round1.rs"),
+            "round 1's file must survive: {text}"
+        );
+        assert!(text.contains("round2.rs"));
+    }
+
+    #[test]
+    fn merge_file_ops_dedupes_a_path_seen_again_in_a_later_round() {
+        let previous = CompactionProvenance {
+            read_files: vec!["a.rs".into()],
+            modified_files: vec![],
+            compactions: 1,
+            last_reason: Some(CompactionReason::Threshold),
+        };
+        let messages = vec![Message::assistant(vec![ContentBlock::ToolUse {
+            id: "1".into(),
+            name: "read".into(),
+            input: json!({ "path": "a.rs" }), // the same file, read again
+        }])];
+        let merged = merge_file_ops(&previous, &messages, CompactionReason::Manual);
+        assert_eq!(merged.read_files, vec!["a.rs"]); // not duplicated
+        assert_eq!(merged.last_reason, Some(CompactionReason::Manual));
+    }
+
+    #[test]
     fn previous_summary_is_none_for_a_normal_prefix() {
         assert!(previous_summary(&convo()).is_none());
+    }
+
+    #[test]
+    fn is_split_turn_detects_a_prefix_ending_mid_tool_dispatch() {
+        // `convo()` ends with `assistant(Text "done")` — a genuine turn conclusion, not mid-dispatch.
+        assert!(!is_split_turn(&convo()));
+
+        // Cut the same conversation off one message earlier — right after a tool_result, before the
+        // assistant's concluding response. That's exactly the split-turn shape: the trailing message
+        // is a tool-results-only user message with the turn's actual conclusion (and the original
+        // request that motivated it) elsewhere.
+        let messages = convo();
+        assert!(is_split_turn(&messages[..messages.len() - 1]));
+
+        // An empty prefix, or one ending on a genuine user text turn, isn't split.
+        assert!(!is_split_turn(&[]));
+        assert!(!is_split_turn(&[Message::user("hello")]));
+    }
+
+    #[test]
+    fn summary_request_uses_the_split_turn_instruction_when_the_cut_is_mid_turn() {
+        let messages = convo();
+        let prefix = &messages[..messages.len() - 1]; // ends on a bare tool_result — split-turn shape
+        let file_ops = merge_file_ops(
+            &CompactionProvenance::default(),
+            prefix,
+            CompactionReason::Threshold,
+        );
+        let req = summary_request("claude-test", prefix, 512, &file_ops);
+        let ContentBlock::Text { text } = &req.messages[0].content[0] else {
+            panic!("expected text");
+        };
+        assert!(text.contains("## Original Request"));
+        assert!(text.contains("## Early Progress"));
+        assert!(text.contains("## Context for Suffix"));
+        assert!(!text.contains("## Goal")); // the generic template's heading must not also appear
+    }
+
+    #[test]
+    fn summary_request_uses_the_generic_instruction_when_the_cut_is_a_clean_boundary() {
+        let messages = convo(); // ends on a genuine assistant conclusion — not split
+        let file_ops = merge_file_ops(
+            &CompactionProvenance::default(),
+            &messages,
+            CompactionReason::Threshold,
+        );
+        let req = summary_request("claude-test", &messages, 512, &file_ops);
+        let ContentBlock::Text { text } = &req.messages[0].content[0] else {
+            panic!("expected text");
+        };
+        assert!(text.contains("## Goal"));
+        assert!(!text.contains("## Original Request"));
     }
 
     #[test]

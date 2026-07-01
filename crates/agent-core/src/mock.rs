@@ -13,15 +13,30 @@ use crate::error::{Error, Result};
 use crate::message::StreamEvent;
 use crate::transport::{EventStream, ModelRequest, ModelTransport};
 
-/// A transport that yields pre-scripted turns. Construct with one `Vec<StreamEvent>` per model turn.
+/// A transport that yields pre-scripted turns. Construct with one `Vec<StreamEvent>` per model turn
+/// ([`new`](Self::new)), or — to script a turn that fails partway through, e.g. to exercise the loop's
+/// mid-stream retry — one `Vec<Result<StreamEvent, Error>>` per turn ([`scripted`](Self::scripted)).
 pub struct MockTransport {
-    turns: Mutex<VecDeque<Vec<StreamEvent>>>,
+    turns: Mutex<VecDeque<Vec<Result<StreamEvent>>>>,
     requests: Mutex<Vec<ModelRequest>>,
 }
 
 impl MockTransport {
-    /// Script the transport with the turns it will return, in order.
+    /// Script the transport with the turns it will return, in order. Every event succeeds; for a turn
+    /// that fails partway through, use [`scripted`](Self::scripted) instead.
     pub fn new(turns: Vec<Vec<StreamEvent>>) -> Self {
+        Self::scripted(
+            turns
+                .into_iter()
+                .map(|t| t.into_iter().map(Ok).collect())
+                .collect(),
+        )
+    }
+
+    /// Script the transport with turns whose individual events may themselves be errors — a stream
+    /// that starts fine and then dies partway through (a truncated connection, an in-band
+    /// `overloaded_error`), the shape `run_turn`'s mid-stream retry needs to exercise.
+    pub fn scripted(turns: Vec<Vec<Result<StreamEvent>>>) -> Self {
         Self {
             turns: Mutex::new(turns.into()),
             requests: Mutex::new(Vec::new()),
@@ -60,7 +75,7 @@ impl ModelTransport for MockTransport {
             .unwrap_or_else(|e| e.into_inner())
             .pop_front()
             .ok_or_else(|| Error::Transport("MockTransport: no more scripted turns".into()))?;
-        Ok(Box::pin(futures::stream::iter(turn.into_iter().map(Ok))))
+        Ok(Box::pin(futures::stream::iter(turn)))
     }
 }
 

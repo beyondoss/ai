@@ -205,10 +205,19 @@ pub struct TokenUsage {
     /// `cache_read_input_tokens` / OpenAI `prompt_tokens_details.cached_tokens`.
     #[serde(default)]
     pub cache_read_tokens: u32,
-    /// Input tokens written to the prompt cache this turn (~125% of input price). Anthropic
-    /// `cache_creation_input_tokens`.
+    /// Input tokens written to the prompt cache this turn (~125% of input price), across both TTLs.
+    /// Anthropic `cache_creation_input_tokens` — the flat sum `cache_write_1h_tokens` is already
+    /// included in.
     #[serde(default)]
     pub cache_write_tokens: u32,
+    /// Of `cache_write_tokens`, how many used the 1-hour TTL specifically (Anthropic
+    /// `cache_creation.ephemeral_1h_input_tokens`) rather than the default 5-minute one. `0` when the
+    /// provider doesn't break this out (OpenAI has no TTL concept) or `cache_long` wasn't requested.
+    /// Low-stakes granularity (pricing itself is out of scope for this agent — the gateway meters and
+    /// a downstream consumer prices), but distinguishes "the long-TTL breakpoint is actually landing"
+    /// from "everything's on the default TTL," which the flat sum alone can't.
+    #[serde(default)]
+    pub cache_write_1h_tokens: u32,
     /// Reasoning/thinking tokens reported separately by the provider (OpenAI
     /// `completion_tokens_details.reasoning_tokens`); 0 when folded into `output_tokens`.
     #[serde(default)]

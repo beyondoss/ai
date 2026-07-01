@@ -384,3 +384,171 @@ fn smoke_thinking_with_tools_replays_signature() {
         "the transcript should contain a thinking block (proves replay was exercised): {dump}"
     );
 }
+
+/// Anthropic-specific: the `adaptive` thinking shape (generation-6+ models — `claude-opus-4-8` is our
+/// own default). Distinct from [`smoke_thinking_with_tools_replays_signature`], which only exercises
+/// the older `Budget`/`enabled` shape via `claude-haiku-4-5` — neither model id proves the other's wire
+/// shape is correct, so both need live coverage. A successful multi-turn tool round-trip with thinking
+/// on proves the `{type:"adaptive", display}` + sibling `output_config`/`thinking` body shape (see
+/// `dialect::anthropic::build_body`) is accepted, and that a signed adaptive thinking block replays.
+#[test]
+#[ignore = "live provider smoke; run via `mise run test:smoke:agent` with ANTHROPIC_API_KEY set"]
+fn smoke_adaptive_thinking_with_tools_replays_signature() {
+    let Some(key) = env_key("ANTHROPIC_API_KEY") else {
+        eprintln!("smoke[adaptive-thinking]: ANTHROPIC_API_KEY unset — skipping");
+        return;
+    };
+    let token = "MANGOSTEEN-2081";
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("marker.txt"), format!("{token}\n")).unwrap();
+    let (gw_port, mut gateway) = boot_gateway(dir.path(), "anthropic", &key);
+
+    let mut child = serve_child(
+        gw_port,
+        dir.path(),
+        "claude-opus-4-8",
+        &["--thinking", "2000"],
+    );
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "Use the read tool to read marker.txt in the current directory, then reply with ONLY the token it contains." })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "prompt");
+
+    // Pull the transcript to confirm the token was echoed (and a thinking block was produced).
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let msg_frames = read_until_response(&mut stdout, "get_messages");
+    drop(stdin);
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    let _ = child.wait();
+
+    let resp = frames
+        .iter()
+        .rev()
+        .find(|f| f["type"] == "response" && f["command"] == "prompt")
+        .expect("a prompt response");
+    let dump = msg_frames.last().unwrap()["data"]["messages"].to_string();
+    eprintln!("--- adaptive thinking transcript ---\n{dump}");
+    // Success here means the adaptive-shaped request was accepted — the regression this test guards
+    // against ("Adaptive" resolving to the wrong shape) would 400 on turn 1 before any tool call.
+    assert_eq!(
+        resp["success"], true,
+        "adaptive thinking+tools must not error on the request shape: {resp}"
+    );
+    assert!(
+        dump.contains(token),
+        "the agent should have read the file and echoed `{token}` with adaptive thinking on: {dump}"
+    );
+    // Unlike `Budget`-shape thinking (always emits a block when enabled), `adaptive` lets the model
+    // itself decide *whether* to think at all — a trivial single-tool-call task may legitimately
+    // produce none. When it does think, that's the more interesting case (it proves the signed block
+    // replayed cleanly into turn 2 without a 400), so still check it — just don't fail the run over the
+    // model's own judgment call on a task this simple.
+    if dump.contains("\"thinking\"") {
+        eprintln!(
+            "adaptive thinking: model produced a visible thinking block; signature replay exercised"
+        );
+    } else {
+        eprintln!(
+            "adaptive thinking: model chose not to think for this trivial task (adaptive's own call) — shape acceptance still verified"
+        );
+    }
+}
+
+/// OpenAI-specific: the Responses API dialect (`dialect::openai_responses`), live. Every native
+/// OpenAI id now routes through `/v1/responses` instead of `/v1/chat/completions` (see
+/// `models::ApiKind`) — this is the only live coverage of that path. `--reasoning-effort` requests
+/// `include:["reasoning.encrypted_content"]`, so turn 2's request carries turn 1's *replayed*
+/// reasoning item; a successful multi-turn tool round-trip proves both the request shape (flat tools,
+/// `input` array, `max_output_tokens`) and the reasoning-item replay are accepted by the real API.
+#[test]
+#[ignore = "live provider smoke; run via `mise run test:smoke:agent` with OPENAI_API_KEY set"]
+fn smoke_openai_responses_reasoning_replays_signature() {
+    let Some(key) = env_key("OPENAI_API_KEY") else {
+        eprintln!("smoke[responses-reasoning]: OPENAI_API_KEY unset — skipping");
+        return;
+    };
+    let token = "STARFRUIT-6614";
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("marker.txt"), format!("{token}\n")).unwrap();
+    let (gw_port, mut gateway) = boot_gateway(dir.path(), "openai", &key);
+
+    let mut child = serve_child(
+        gw_port,
+        dir.path(),
+        "gpt-5-mini",
+        &["--reasoning-effort", "low"],
+    );
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "Use the read tool to read marker.txt in the current directory, then reply with ONLY the token it contains." })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "prompt");
+
+    // A second turn forces a follow-up request that must replay turn 1's reasoning item (if any) —
+    // the correctness landmine this test guards: a malformed replay would 400 here, not on turn 1.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "Now reply with ONLY the word done." })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames2 = read_until_response(&mut stdout, "prompt");
+
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let msg_frames = read_until_response(&mut stdout, "get_messages");
+    drop(stdin);
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    let _ = child.wait();
+
+    let resp1 = frames
+        .iter()
+        .rev()
+        .find(|f| f["type"] == "response" && f["command"] == "prompt")
+        .expect("a turn-1 prompt response");
+    let resp2 = frames2
+        .iter()
+        .rev()
+        .find(|f| f["type"] == "response" && f["command"] == "prompt")
+        .expect("a turn-2 prompt response");
+    let dump = msg_frames.last().unwrap()["data"]["messages"].to_string();
+    eprintln!("--- openai responses reasoning transcript ---\n{dump}");
+    assert_eq!(
+        resp1["success"], true,
+        "turn 1 (Responses API request shape) must not error: {resp1}"
+    );
+    assert!(
+        dump.contains(token),
+        "the agent should have read the file and echoed `{token}`: {dump}"
+    );
+    // Success on turn 2 means any reasoning item captured on turn 1 replayed cleanly — the whole
+    // point of this test (a malformed replay 400s here, not on turn 1).
+    assert_eq!(
+        resp2["success"], true,
+        "turn 2 must not 400 on reasoning-item replay: {resp2}"
+    );
+    if dump.contains("\"thinking\"") {
+        eprintln!("openai responses: a reasoning block was captured and replayed across turns");
+    } else {
+        eprintln!(
+            "openai responses: model produced no visible reasoning summary for this trivial task — shape acceptance still verified"
+        );
+    }
+}

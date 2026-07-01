@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::StreamExt;
 use futures::future::{Either, select};
@@ -16,7 +17,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::compaction::{self, CompactionConfig};
+use crate::compaction::{self, CompactionConfig, CompactionReason};
 use crate::error::{Error, Result};
 use crate::hooks::{AgentHooks, NoHooks};
 use crate::message::{
@@ -72,6 +73,11 @@ pub enum AgentEvent {
     Compacted {
         messages_before: usize,
         messages_after: usize,
+        /// Why this compaction fired — the full folded-forward provenance (file-ops, round count)
+        /// lands on `Session::compaction`, not duplicated onto every event.
+        reason: CompactionReason,
+        /// Estimated input tokens at the moment this compaction fired (before the reset).
+        tokens_before: u32,
     },
     /// The run is ending abnormally (transport failure after retries, malformed SSE, or the step
     /// ceiling). A terminal marker on the event stream so a streaming client sees *why* a run stopped
@@ -89,6 +95,17 @@ const DEFAULT_MAX_STEPS: u32 = 24;
 /// fans out over CPU cores, compounding it). The cap throttles in-flight groups; results scatter by
 /// index, so the call-order transcript is unaffected — only peak concurrency is bounded.
 const MAX_CONCURRENT_TOOL_GROUPS: usize = 8;
+/// How many times to restart a turn whose stream dies *after* the request already succeeded — a
+/// truncated stream (dropped connection, gateway cut) or an in-band `overloaded_error` event. Distinct
+/// from `client.rs`'s retry, which only covers a failure *before* the first byte; once events start
+/// flowing that layer deliberately stops retrying (a mid-stream drop there would replay partial
+/// output), so this is the only place that can recover from this failure class today.
+const MAX_MID_STREAM_RETRIES: u32 = 3;
+/// Base of the exponential backoff between mid-stream retries (`BASE · 2^(attempt-1)`). Mirrors
+/// `client.rs`'s shape but kept separate — a different layer, a different failure class, no shared state.
+const MID_STREAM_BASE_BACKOFF: Duration = Duration::from_millis(250);
+/// Ceiling on a single mid-stream retry wait.
+const MID_STREAM_MAX_BACKOFF: Duration = Duration::from_secs(5);
 
 /// A configured agent: a model, a transport, a tool set, and loop bounds. Cheap to clone-construct;
 /// `run` borrows it so one agent can drive many sessions.
@@ -295,7 +312,8 @@ impl Agent {
             // Proactive compaction: once the live prompt crosses the threshold, summarize the prefix
             // before building the next request so the run never walks into the context wall.
             if self.compaction.enabled && compaction::should_compact(session, &self.compaction) {
-                self.compact(session, &cancel, &mut sink).await?;
+                self.compact(session, CompactionReason::Threshold, &cancel, &mut sink)
+                    .await?;
             }
 
             sink(AgentEvent::TurnStart {
@@ -335,7 +353,10 @@ impl Agent {
                 // The provider rejected the request for exceeding its context window. Compact once and
                 // retry the same turn; if it still overflows (or there's nothing to compact), give up.
                 Err(e) if is_context_overflow(&e) && !overflow_recovered => {
-                    if self.compact(session, &cancel, &mut sink).await? {
+                    if self
+                        .compact(session, CompactionReason::Overflow, &cancel, &mut sink)
+                        .await?
+                    {
                         overflow_recovered = true;
                         continue;
                     }
@@ -439,9 +460,11 @@ impl Agent {
             let (prog_tx, mut prog_rx) =
                 futures::channel::mpsc::unbounded::<crate::tool::ToolUpdate>();
             let prog_tx = &prog_tx;
+            let cancel_ref = &cancel;
             let group_runs = groups.into_values().map(|indices| {
                 let calls = &calls;
                 let prog_tx = prog_tx.clone();
+                let cancel = cancel_ref.clone();
                 async move {
                     let mut out = Vec::with_capacity(indices.len());
                     for i in indices {
@@ -472,6 +495,7 @@ impl Agent {
                                     prog_tx.clone(),
                                     id.clone(),
                                     name.clone(),
+                                    cancel.clone(),
                                 );
                                 let (text, images, is_error, terminate) =
                                     match this.tools.get(name) {
@@ -603,11 +627,36 @@ impl Agent {
         }
     }
 
-    /// Stream and assemble a single model turn into content blocks + accounting. Racing each
-    /// `stream.next()` against `cancel` means a tripped token interrupts even a model that has gone
-    /// quiet (a blocked read would otherwise hang for the full idle timeout); dropping `stream` on
-    /// cancel aborts the underlying HTTP request.
+    /// Stream and assemble a single model turn, restarting from scratch when the stream dies mid-flight
+    /// (see [`is_retryable_mid_stream`]) rather than surfacing that as a fatal error. Each attempt runs
+    /// in [`run_turn_once`] with its own fresh [`Accumulator`] — a retried attempt never resumes a
+    /// dead attempt's partial blocks, so the `Turn` this returns can't blend a half-formed tool call
+    /// from a failed connection into what actually gets applied to the session. A cancellation always
+    /// propagates immediately; only the mid-stream-failure class is retried.
     async fn run_turn(
+        &self,
+        req: ModelRequest,
+        emit: &mut dyn FnMut(StreamEvent),
+        cancel: &CancellationToken,
+    ) -> Result<Turn> {
+        let mut attempt = 0u32;
+        loop {
+            match self.run_turn_once(req.clone(), emit, cancel).await {
+                Ok(turn) => return Ok(turn),
+                Err(e) if attempt < MAX_MID_STREAM_RETRIES && is_retryable_mid_stream(&e) => {
+                    attempt += 1;
+                    futures_timer::Delay::new(mid_stream_backoff(attempt)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// One streaming attempt over a fresh connection. Racing each `stream.next()` against `cancel`
+    /// means a tripped token interrupts even a model that has gone quiet (a blocked read would
+    /// otherwise hang for the full idle timeout); dropping `stream` on cancel aborts the underlying
+    /// HTTP request.
+    async fn run_turn_once(
         &self,
         req: ModelRequest,
         emit: &mut dyn FnMut(StreamEvent),
@@ -635,12 +684,14 @@ impl Agent {
 
     /// Summarize the conversation prefix in place, keeping the recent turns verbatim. Makes one
     /// summarization model call (silently — its tokens aren't surfaced as assistant output), splices
-    /// the summary into `session`, and emits an [`AgentEvent::Compacted`]. Returns `false` (a no-op)
+    /// the summary into `session`, folds this round's file-ops into `session.compaction` (see
+    /// [`CompactionProvenance`]), and emits an [`AgentEvent::Compacted`]. Returns `false` (a no-op)
     /// when there's no worthwhile prefix to summarize or the model returns an empty summary. Exposed
-    /// so a headless server can offer a manual `compact` command.
+    /// so a headless server can offer a manual `compact` command (pass [`CompactionReason::Manual`]).
     pub async fn compact(
         &self,
         session: &mut Session,
+        reason: CompactionReason,
         cancel: &CancellationToken,
         sink: &mut dyn FnMut(AgentEvent),
     ) -> Result<bool> {
@@ -650,9 +701,15 @@ impl Agent {
             return Ok(false);
         };
         let before = session.messages.len();
+        let tokens_before = session.last_input_tokens;
         let prefix: Vec<Message> = session.messages[..first_kept].to_vec();
-        let req =
-            compaction::summary_request(&self.model, &prefix, self.compaction.summary_max_tokens);
+        let file_ops = compaction::merge_file_ops(&session.compaction, &prefix, reason);
+        let req = compaction::summary_request(
+            &self.model,
+            &prefix,
+            self.compaction.summary_max_tokens,
+            &file_ops,
+        );
         let turn = self.run_turn(req, &mut |_| {}, cancel).await?;
         let summary: String = turn
             .blocks
@@ -666,11 +723,42 @@ impl Agent {
             return Ok(false);
         }
         compaction::apply_summary(session, first_kept, &summary);
+        session.compaction = file_ops;
         sink(AgentEvent::Compacted {
             messages_before: before,
             messages_after: session.messages.len(),
+            reason,
+            tokens_before,
         });
         Ok(true)
+    }
+
+    /// Summarize an abandoned tree branch's messages (Track L2/L3: a headless server calls this from
+    /// its branch-navigation command, on messages its session store's `abandoned_by_switch` returned,
+    /// *before* actually switching branches). The network-calling half of branch summarization; the
+    /// pure request-building lives in [`crate::branch_summary::branch_summary_request`], and
+    /// persisting the result is the caller's job — this only returns the summary text, mirroring
+    /// [`Self::compact`]'s network/storage split but without touching `session` (a branch summary
+    /// doesn't rewrite the *active* conversation the way a compaction summary does).
+    pub async fn summarize_branch(
+        &self,
+        messages: &[Message],
+        cancel: &CancellationToken,
+    ) -> Result<String> {
+        let req = crate::branch_summary::branch_summary_request(
+            &self.model,
+            messages,
+            self.compaction.summary_max_tokens,
+        );
+        let turn = self.run_turn(req, &mut |_| {}, cancel).await?;
+        Ok(turn
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect())
     }
 }
 
@@ -688,6 +776,33 @@ fn is_context_overflow(e: &Error) -> bool {
                 || m.contains("exceed")
                 || m.contains("maximum")
                 || m.contains("window")))
+}
+
+/// Whether a transport error is the "stream died after the request already succeeded" class worth
+/// restarting the turn for: a decoder's own truncated-stream rejection (both dialects' `finish()` say
+/// "…stream ended before…" — see `dialect::anthropic::Decoder::finish`,
+/// `dialect::openai::Decoder::finish`) or an in-band `overloaded_error` event (`dialect::sse_error`
+/// prefixes it `"provider stream error: "`, matched by substring since the exact wrapping is an
+/// implementation detail this shouldn't couple to). A context-overflow rejection is deliberately
+/// excluded — that's a *different* signal already handled by compact-and-retry, not this path — and
+/// retrying it here would just fail identically-shaped again without compacting first.
+fn is_retryable_mid_stream(e: &Error) -> bool {
+    let Error::Transport(msg) = e else {
+        return false;
+    };
+    if is_context_overflow(e) {
+        return false;
+    }
+    let m = msg.to_ascii_lowercase();
+    m.contains("stream ended before") || m.contains("overloaded")
+}
+
+/// Exponential backoff for a mid-stream retry: `MID_STREAM_BASE_BACKOFF · 2^(attempt-1)`, capped at
+/// `MID_STREAM_MAX_BACKOFF`. `attempt` is 1-based (the first retry backs off by the base amount).
+fn mid_stream_backoff(attempt: u32) -> Duration {
+    MID_STREAM_BASE_BACKOFF
+        .saturating_mul(1u32 << attempt.saturating_sub(1).min(16))
+        .min(MID_STREAM_MAX_BACKOFF)
 }
 
 /// The assembled result of one model turn.
@@ -900,6 +1015,131 @@ mod tests {
                 .iter()
                 .any(|m| matches!(m.content.first(), Some(ContentBlock::ToolResult { .. })))
         );
+    }
+
+    #[tokio::test]
+    async fn mid_stream_failure_retries_with_a_clean_turn_not_a_resumed_one() {
+        // Attempt 1 dies mid-tool-call: a `ToolUseStart` and a *partial* argument fragment stream in,
+        // then the connection dies before `ContentBlockStop`/`MessageStop` — never reaching
+        // `Accumulator::finish`, so that attempt's half-formed tool call is dropped, not returned.
+        // Attempt 2 (the retry) streams the *same* call with its *complete*, different argument bytes.
+        // If the retry ever resumed attempt 1's accumulator instead of starting fresh, the dispatched
+        // tool call would see attempt 1's leftover partial JSON (`{"tex`, invalid) rather than attempt
+        // 2's full one (`{"text":"pong"}`, valid) — this asserts the tool actually ran with the latter.
+        let mock = Arc::new(MockTransport::scripted(vec![
+            vec![
+                Ok(StreamEvent::MessageStart),
+                Ok(StreamEvent::ToolUseStart {
+                    id: "tu_1".into(),
+                    name: "echo".into(),
+                }),
+                Ok(StreamEvent::InputJsonDelta {
+                    partial_json: "{\"tex".into(),
+                }),
+                Err(Error::Transport(
+                    "Anthropic stream ended before message_stop".into(),
+                )),
+            ],
+            vec![
+                Ok(StreamEvent::MessageStart),
+                Ok(StreamEvent::ToolUseStart {
+                    id: "tu_1".into(),
+                    name: "echo".into(),
+                }),
+                Ok(StreamEvent::InputJsonDelta {
+                    partial_json: "{\"text\":\"pong\"}".into(),
+                }),
+                Ok(StreamEvent::ContentBlockStop),
+                Ok(StreamEvent::MessageStop {
+                    stop_reason: StopReason::ToolUse,
+                }),
+            ],
+            turn::text("done").into_iter().map(Ok).collect(),
+        ]));
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8")
+            .with_tools(tools)
+            .with_max_steps(8);
+        let mut session = Session::new();
+        session.user("say pong");
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        // 3 transport calls: the failed attempt, its successful retry, and the follow-up text turn —
+        // the retry is invisible to `session.steps` (2: the tool turn + the text turn), matching a
+        // normal two-step run with no trace of the failed attempt in loop-visible state.
+        assert_eq!(mock.calls(), 3);
+        assert_eq!(session.steps, 2);
+        assert_eq!(session.messages.len(), 4); // user, assistant(tool_use), user(tool_result), assistant(text)
+        assert_eq!(
+            session.messages[1].content,
+            vec![ContentBlock::ToolUse {
+                id: "tu_1".into(),
+                name: "echo".into(),
+                input: json!({ "text": "pong" }),
+            }]
+        );
+        // The tool actually ran against the retry's complete, valid arguments — not an error result
+        // from attempt 1's truncated `{"tex` fragment.
+        assert_eq!(
+            session.messages[2].content,
+            vec![ContentBlock::ToolResult {
+                tool_use_id: "tu_1".into(),
+                content: "pong".into(),
+                is_error: false,
+                images: Vec::new(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn non_retryable_mid_stream_error_fails_the_run_immediately() {
+        // A generic transport error (not the "stream ended before…"/"overloaded" shapes) must not
+        // retry — only one scripted turn exists, so a retry attempt would exhaust the mock and this
+        // test would fail with a *different* error ("no more scripted turns") if retry logic were
+        // over-broad.
+        let mock = Arc::new(MockTransport::scripted(vec![vec![
+            Ok(StreamEvent::MessageStart),
+            Err(Error::Transport(
+                "gateway returned 400: invalid request".into(),
+            )),
+        ]]));
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8").with_max_steps(8);
+        let mut session = Session::new();
+        session.user("hi");
+        let err = agent.run(&mut session, |_| {}).await.unwrap_err();
+        assert!(matches!(err, Error::Transport(msg) if msg.contains("400")));
+        assert_eq!(mock.calls(), 1, "a non-retryable error must not retry");
+    }
+
+    #[test]
+    fn is_retryable_mid_stream_matches_both_dialects_truncation_and_overload() {
+        assert!(is_retryable_mid_stream(&Error::Transport(
+            "Anthropic stream ended before message_stop".into()
+        )));
+        assert!(is_retryable_mid_stream(&Error::Transport(
+            "OpenAI stream ended before finish_reason".into()
+        )));
+        assert!(is_retryable_mid_stream(&Error::Transport(
+            "provider stream error: overloaded_error: Overloaded".into()
+        )));
+        // Context overflow is a *different* signal (compact-and-retry owns it) — must not double up.
+        assert!(!is_retryable_mid_stream(&Error::Transport(
+            "prompt is too long: 250000 tokens > 200000 maximum".into()
+        )));
+        // An unrelated transport error, and a non-Transport error, are never retryable.
+        assert!(!is_retryable_mid_stream(&Error::Transport(
+            "gateway returned 401: unauthorized".into()
+        )));
+        assert!(!is_retryable_mid_stream(&Error::Cancelled));
+    }
+
+    #[test]
+    fn mid_stream_backoff_is_exponential_and_capped() {
+        assert_eq!(mid_stream_backoff(1), MID_STREAM_BASE_BACKOFF);
+        assert_eq!(mid_stream_backoff(2), MID_STREAM_BASE_BACKOFF * 2);
+        assert_eq!(mid_stream_backoff(3), MID_STREAM_BASE_BACKOFF * 4);
+        assert_eq!(mid_stream_backoff(20), MID_STREAM_MAX_BACKOFF); // saturates, never overflows
     }
 
     #[tokio::test]
@@ -1499,6 +1739,92 @@ mod tests {
             &session.messages[0].content[0],
             ContentBlock::Text { text } if text.contains("compacted")
         ));
+    }
+
+    #[tokio::test]
+    async fn auto_compaction_records_provenance_on_the_session() {
+        // A registered tool named "read" (not "echo") so `extract_file_ops` — keyed on tool name —
+        // actually picks up a file reference from the compacted turns.
+        struct ReadLikeTool;
+        #[async_trait]
+        impl Tool for ReadLikeTool {
+            fn name(&self) -> &str {
+                "read"
+            }
+            fn description(&self) -> &str {
+                "d"
+            }
+            fn input_schema(&self) -> Value {
+                json!({ "type": "object" })
+            }
+            async fn run(
+                &self,
+                _: Value,
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+                Ok("contents".into())
+            }
+        }
+
+        fn big_read_turn(id: &str) -> Vec<StreamEvent> {
+            vec![
+                StreamEvent::MessageStart,
+                StreamEvent::ToolUseStart {
+                    id: id.into(),
+                    name: "read".into(),
+                },
+                StreamEvent::InputJsonDelta {
+                    partial_json: r#"{"path":"tracked.rs"}"#.into(),
+                },
+                StreamEvent::ContentBlockStop,
+                StreamEvent::Usage(TokenUsage {
+                    input_tokens: 95,
+                    output_tokens: 5,
+                    ..Default::default()
+                }),
+                StreamEvent::MessageStop {
+                    stop_reason: StopReason::ToolUse,
+                },
+            ]
+        }
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(ReadLikeTool));
+        let mock = Arc::new(MockTransport::new(vec![
+            big_read_turn("t1"),
+            big_read_turn("t2"),
+            turn::text("## Goal\nsummary of earlier work"),
+            turn::text("all done"),
+        ]));
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8")
+            .with_tools(tools)
+            .with_max_steps(12)
+            .with_compaction(CompactionConfig {
+                context_window: 100,
+                reserve_tokens: 10,
+                keep_recent_tokens: 1,
+                summary_max_tokens: 256,
+                enabled: true,
+            });
+        let mut session = Session::new();
+        session.user("seed task with enough text to fill several estimated tokens here please");
+
+        let mut reason_seen = None;
+        agent
+            .run_events(&mut session, |ev| {
+                if let AgentEvent::Compacted { reason, .. } = ev {
+                    reason_seen = Some(reason);
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(reason_seen, Some(CompactionReason::Threshold));
+        assert_eq!(session.compaction.compactions, 1);
+        assert_eq!(
+            session.compaction.last_reason,
+            Some(CompactionReason::Threshold)
+        );
+        assert_eq!(session.compaction.read_files, vec!["tracked.rs"]);
     }
 
     #[tokio::test]

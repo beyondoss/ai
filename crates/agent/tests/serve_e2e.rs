@@ -442,6 +442,268 @@ fn serve_abort_cancels_an_in_flight_prompt() {
     child.wait().unwrap();
 }
 
+/// Extract every persisted message's `id` field, in file order, by parsing the session file's raw
+/// JSONL directly — the RPC surface itself only exposes leaf ids (via `list_branches`), not every
+/// interior message's id, so a client that wants to fork mid-history needs another source for those
+/// (this test stands in for one) until a future extension teaches `get_messages` to include them.
+fn message_ids(session_file: &str) -> Vec<String> {
+    std::fs::read_to_string(session_file)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|v| v["type"] == "message")
+        .filter_map(|v| v["id"].as_str().map(str::to_string))
+        .collect()
+}
+
+#[test]
+fn serve_switch_branch_summarizes_abandoned_activity_and_navigates() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+
+    // Two turns build a linear history, a third is the branch-summarization call `switch_branch`
+    // triggers, a fourth answers the prompt issued after navigating back.
+    let (base, _bodies) = spawn_model_server(vec![
+        turn_text("first answer"),
+        turn_text("second answer"),
+        turn_text("recap: explored a dead end"),
+        turn_text("continued from the original branch"),
+    ]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "first" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "second" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    // A single, unbranched history reports exactly one branch, 4 messages deep.
+    writeln!(stdin, "{}", json!({ "type": "list_branches" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "list_branches");
+    let branches = frames.last().unwrap()["data"]["branches"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(branches.len(), 1, "no branching yet: {branches:#?}");
+    assert_eq!(branches[0]["is_active"], true);
+    assert_eq!(branches[0]["message_count"], 4);
+
+    // Navigate back to the first turn's assistant reply (message index 1), abandoning the second
+    // turn's user+assistant messages.
+    let ids = message_ids(&session_file);
+    assert_eq!(ids.len(), 4, "expected 4 persisted messages: {ids:?}");
+    let rewind_to = ids[1].clone();
+    let abandoned_tip = ids[3].clone();
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "switch_branch", "target_id": rewind_to })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "switch_branch");
+    let resp = frames.last().unwrap();
+    assert_eq!(resp["success"], true, "switch_branch failed: {resp:#?}");
+    assert_eq!(resp["data"]["target_id"], rewind_to);
+
+    // The active transcript is now just the first turn.
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_messages");
+    let dump = frames.last().unwrap()["data"]["messages"].to_string();
+    assert!(dump.contains("first answer"));
+    assert!(
+        !dump.contains("second answer"),
+        "the abandoned turn must not appear on the restored branch: {dump}"
+    );
+
+    // Two branches now exist: the abandoned one (inactive, still 4 deep) and the active one (2 deep).
+    writeln!(stdin, "{}", json!({ "type": "list_branches" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "list_branches");
+    let branches = frames.last().unwrap()["data"]["branches"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(branches.len(), 2, "expected two branches: {branches:#?}");
+    let abandoned = branches
+        .iter()
+        .find(|b| b["leaf_id"] == json!(abandoned_tip))
+        .expect("the old tip should still be listed as a branch");
+    assert_eq!(abandoned["is_active"], false);
+    assert_eq!(abandoned["message_count"], 4);
+    let active = branches.iter().find(|b| b["is_active"] == true).unwrap();
+    assert_eq!(active["message_count"], 2);
+
+    // The abandoned branch's summary was generated (consuming the 3rd mock response) and persisted.
+    let raw = std::fs::read_to_string(&session_file).unwrap();
+    assert!(
+        raw.contains("recap: explored a dead end"),
+        "the branch summary should be persisted in the session file:\n{raw}"
+    );
+    assert!(raw.contains("\"branch_summary\""));
+
+    // Continuing from the restored branch forks a *new* line of history off it, not a resumption of
+    // the abandoned one.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "continue" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_messages");
+    let dump = frames.last().unwrap()["data"]["messages"].to_string();
+    assert!(dump.contains("continued from the original branch"));
+    assert!(!dump.contains("second answer"));
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_get_messages_ids_enable_forking_from_any_point() {
+    // Closes the gap `list_branches` alone leaves: it only ever reports a branch's *leaf*, so a
+    // client that wants to fork from an arbitrary point in the middle of the visible transcript needs
+    // ids from somewhere else. This proves `get_messages`'s tagged ids are real, usable
+    // `switch_branch` targets — not just present, but round-trip through the actual RPC surface.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+
+    let (base, _bodies) = spawn_model_server(vec![
+        turn_text("first answer"),
+        turn_text("second answer"),
+        turn_text("forked from message index 1"),
+    ]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "first" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "second" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_messages");
+    let messages = frames.last().unwrap()["data"]["messages"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(messages.len(), 4, "expected 4 messages: {messages:#?}");
+    let ids: Vec<String> = messages
+        .iter()
+        .map(|m| {
+            m["id"]
+                .as_str()
+                .expect("every message should be tagged with an id")
+                .to_string()
+        })
+        .collect();
+    // All four ids are distinct.
+    let unique: std::collections::HashSet<&String> = ids.iter().collect();
+    assert_eq!(
+        unique.len(),
+        4,
+        "message ids should all be distinct: {ids:?}"
+    );
+
+    // Fork from message index 1 (the first turn's assistant reply) — a point `list_branches` alone
+    // could never have named, since it only reports the (single, so far) branch's leaf.
+    // `summarize:false`: the summarization path itself is covered by
+    // `serve_switch_branch_summarizes_abandoned_activity_and_navigates`; this test is about ids, not
+    // that, and skipping it keeps the mock response count matched to what's actually queued.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "switch_branch", "target_id": ids[1], "summarize": false })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "switch_branch");
+    assert_eq!(frames.last().unwrap()["success"], true);
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "continue from here" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_messages");
+    let dump = frames.last().unwrap()["data"]["messages"].to_string();
+    assert!(dump.contains("forked from message index 1"));
+    assert!(
+        !dump.contains("second answer"),
+        "forking from index 1 must not carry over the second turn: {dump}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_switch_branch_rejects_unknown_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![turn_text("hi")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "switch_branch", "target_id": "does-not-exist" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "switch_branch");
+    assert_eq!(frames.last().unwrap()["success"], false);
+
+    writeln!(stdin, "{}", json!({ "type": "switch_branch" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "switch_branch");
+    assert_eq!(frames.last().unwrap()["success"], false);
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
 #[test]
 fn serve_streams_events_and_reattaches() {
     let dir = tempfile::tempdir().unwrap();

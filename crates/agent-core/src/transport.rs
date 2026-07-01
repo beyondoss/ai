@@ -98,6 +98,12 @@ pub struct ModelRequest {
     /// agent that may pause more than 5 minutes between turns (a slow tool, a thinking user), at a
     /// higher cache-write price.
     pub cache_long: bool,
+    /// Skip prompt-cache breakpoint stamping entirely (Anthropic's `cache_control`; equivalently
+    /// OpenAI's `prompt_cache_key`/`prompt_cache_retention`). A cache write costs ~1.25x the input-token
+    /// price up front; that only pays off if a later turn reads it back. A genuinely one-off,
+    /// non-conversational request (no follow-up turn to amortize the write against) should opt out
+    /// rather than eating that premium for a cache entry nothing will ever read.
+    pub no_cache: bool,
 }
 
 impl ModelRequest {
@@ -118,6 +124,7 @@ impl ModelRequest {
             tool_choice: None,
             cache_key: None,
             cache_long: false,
+            no_cache: false,
         }
     }
 
@@ -162,6 +169,13 @@ impl ModelRequest {
     /// Builder-style: opt into the 1-hour prompt-cache TTL.
     pub fn with_cache_long(mut self, long: bool) -> Self {
         self.cache_long = long;
+        self
+    }
+
+    /// Builder-style: skip prompt-cache breakpoint stamping entirely, for a one-off request with no
+    /// follow-up turn to amortize the cache-write premium against.
+    pub fn with_no_cache(mut self, no_cache: bool) -> Self {
+        self.no_cache = no_cache;
         self
     }
 }

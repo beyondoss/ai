@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::message::{Message, TokenUsage};
+use crate::compaction::CompactionProvenance;
+use crate::message::{ContentBlock, Message, TokenUsage};
 
 /// The state of one agent run.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -37,6 +38,10 @@ pub struct Session {
     /// Cumulative input tokens written to the prompt cache.
     #[serde(default)]
     pub cache_write_tokens: u64,
+    /// Of `cache_write_tokens`, how many used the 1-hour TTL specifically — see
+    /// [`TokenUsage::cache_write_1h_tokens`].
+    #[serde(default)]
+    pub cache_write_1h_tokens: u64,
     /// Cumulative reasoning/thinking tokens billed separately by the provider.
     #[serde(default)]
     pub reasoning_tokens: u64,
@@ -45,6 +50,12 @@ pub struct Session {
     /// context window.
     #[serde(default)]
     pub last_input_tokens: u32,
+    /// What compaction has recorded about this session so far — folded forward across every round
+    /// (see [`CompactionProvenance`]), since `apply_summary` physically replaces the summarized
+    /// messages and anything not captured here is lost with them. Default (all-empty, `compactions:
+    /// 0`) for a session that's never been compacted, so older persisted sessions round-trip unchanged.
+    #[serde(default)]
+    pub compaction: CompactionProvenance,
 }
 
 /// Serialize the shared history as a plain `[Message]` array — the `Arc`/`Vec` wrapper is an
@@ -83,12 +94,30 @@ impl Session {
         self
     }
 
+    /// Drop every `Thinking`/`RedactedThinking` block from history. A signed thinking block is only
+    /// valid for replay to the model that produced it — Anthropic can reject a later turn that replays
+    /// one to a *different* model — so a mid-session model switch (`set_model`) must scrub them rather
+    /// than risk the next turn erroring. Coarser than tracking per-message model provenance (there is
+    /// none today), but correct: the reasoning trace is lost, never silently misapplied.
+    pub fn strip_thinking_blocks(&mut self) {
+        let messages = Arc::make_mut(&mut self.messages);
+        for message in messages.iter_mut() {
+            message.content.retain(|block| {
+                !matches!(
+                    block,
+                    ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. }
+                )
+            });
+        }
+    }
+
     /// Fold a turn's token usage into the running totals and record the live context size.
     pub fn record_usage(&mut self, usage: TokenUsage) {
         self.input_tokens += u64::from(usage.input_tokens);
         self.output_tokens += u64::from(usage.output_tokens);
         self.cache_read_tokens += u64::from(usage.cache_read_tokens);
         self.cache_write_tokens += u64::from(usage.cache_write_tokens);
+        self.cache_write_1h_tokens += u64::from(usage.cache_write_1h_tokens);
         self.reasoning_tokens += u64::from(usage.reasoning_tokens);
         // The whole prompt the model just saw = uncached input + everything served from / written to
         // cache. This is the current context size (the cumulative sums above can't express it) and is
@@ -103,6 +132,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn strip_thinking_blocks_drops_thinking_and_redacted_keeps_the_rest() {
+        let mut s = Session::new();
+        s.push(Message::user("think then answer"));
+        s.push(Message::assistant(vec![
+            ContentBlock::Thinking {
+                text: "let me reason".into(),
+                signature: "sig-abc".into(),
+            },
+            ContentBlock::RedactedThinking {
+                data: "opaque".into(),
+            },
+            ContentBlock::Text {
+                text: "answer".into(),
+            },
+        ]));
+        s.strip_thinking_blocks();
+        assert_eq!(s.messages[0].content.len(), 1); // user text untouched
+        assert_eq!(s.messages[1].content.len(), 1); // only the Text block survives
+        assert_eq!(
+            s.messages[1].content[0],
+            ContentBlock::Text {
+                text: "answer".into()
+            }
+        );
+    }
+
+    #[test]
     fn round_trips_through_json() {
         let mut s = Session::new();
         s.user("hello");
@@ -113,6 +169,7 @@ mod tests {
             cache_read_tokens: 100,
             cache_write_tokens: 20,
             reasoning_tokens: 4,
+            ..Default::default()
         });
         s.record_usage(TokenUsage {
             input_tokens: 3,

@@ -4,30 +4,38 @@
 //! how to (a) build a streaming request body from a [`ModelRequest`] and (b) decode that provider's
 //! SSE stream into the dialect-agnostic [`StreamEvent`] sequence the loop consumes.
 //!
-//! Selection is by model id: Claude speaks Anthropic (`/v1/messages`); everything else speaks the
-//! OpenAI wire (`/v1/chat/completions`), which is the lingua franca for the gateway's other providers.
+//! Selection is by model id: Claude speaks Anthropic (`/v1/messages`); every native OpenAI id (see
+//! [`crate::models::ApiKind`]) speaks the Responses API (`/v1/responses`); everything else (every
+//! third-party OpenAI-compatible provider) speaks Chat Completions (`/v1/chat/completions`), the
+//! lingua franca for the gateway's other providers.
 
 use serde_json::Value;
 
 use crate::error::{Error, Result};
 use crate::message::StreamEvent;
+use crate::models::ApiKind;
 use crate::transport::ModelRequest;
 
 pub mod anthropic;
 pub mod openai;
+pub mod openai_responses;
 
 /// Which provider wire a model speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dialect {
     Anthropic,
     OpenAi,
+    OpenAiResponses,
 }
 
 impl Dialect {
-    /// Pick the dialect for a model id. Claude → Anthropic; everything else → OpenAI wire.
+    /// Pick the dialect for a model id. Claude → Anthropic; a native OpenAI id (per the capability
+    /// table's [`ApiKind`]) → the Responses API; everything else → Chat Completions.
     pub fn for_model(model: &str) -> Self {
         if model.starts_with("claude") || model.contains("anthropic") {
             Dialect::Anthropic
+        } else if crate::models::capabilities(model).api == ApiKind::Responses {
+            Dialect::OpenAiResponses
         } else {
             Dialect::OpenAi
         }
@@ -39,6 +47,7 @@ impl Dialect {
         match self {
             Dialect::Anthropic => "/v1/messages",
             Dialect::OpenAi => "/v1/chat/completions",
+            Dialect::OpenAiResponses => "/v1/responses",
         }
     }
 
@@ -47,6 +56,7 @@ impl Dialect {
         match self {
             Dialect::Anthropic => anthropic::build_body(req),
             Dialect::OpenAi => openai::build_body(req),
+            Dialect::OpenAiResponses => openai_responses::build_body(req),
         }
     }
 
@@ -55,6 +65,7 @@ impl Dialect {
         match self {
             Dialect::Anthropic => Box::<anthropic::Decoder>::default(),
             Dialect::OpenAi => Box::<openai::Decoder>::default(),
+            Dialect::OpenAiResponses => Box::<openai_responses::Decoder>::default(),
         }
     }
 }
@@ -111,13 +122,40 @@ pub fn push_sse_line(decoder: &mut dyn StreamDecoder, line: &str) -> Result<Vec<
     Ok(decoder.push(&v))
 }
 
-/// Extract a provider error message from an SSE `data:` payload, if it is one. Handles both the
-/// Anthropic (`{"type":"error","error":{"message":…}}`) and OpenAI (`{"error":{"message":…}}`)
-/// shapes. Returns `None` for ordinary stream events.
+/// Extract a provider error message from an SSE `data:` payload, if it is one. Handles three shapes:
+/// Anthropic's `{"type":"error","error":{"message":…}}`, OpenAI Chat Completions' bare
+/// `{"error":{"message":…}}`, and the OpenAI Responses API's flat `{"type":"error","code":…,
+/// "message":…}` (no nested `error` object — a genuinely different shape from the other two, since
+/// Responses streams a top-level `error` *event* rather than an in-band error field). Returns `None`
+/// for ordinary stream events.
 fn sse_error(v: &Value) -> Option<String> {
-    let is_anthropic_error = v.get("type").and_then(Value::as_str) == Some("error");
+    let is_typed_error = v.get("type").and_then(Value::as_str) == Some("error");
+    if is_typed_error {
+        // Anthropic's nested shape, if present; otherwise fall through to the Responses flat shape.
+        if let Some(err) = v.get("error").filter(|e| e.is_object()) {
+            let msg = err
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown provider error");
+            let kind = err.get("type").and_then(Value::as_str);
+            return Some(match kind {
+                Some(kind) => format!("{kind}: {msg}"),
+                None => msg.to_string(),
+            });
+        }
+        let msg = v
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown provider error");
+        let code = v.get("code").and_then(Value::as_str);
+        return Some(match code {
+            Some(code) => format!("{code}: {msg}"),
+            None => msg.to_string(),
+        });
+    }
+    // OpenAI Chat Completions' bare shape: an `error` object with no `type:"error"` envelope.
     let err = v.get("error")?;
-    if !is_anthropic_error && !err.is_object() {
+    if !err.is_object() {
         return None;
     }
     let msg = err
@@ -139,8 +177,42 @@ mod tests {
     #[test]
     fn dialect_selection_by_model() {
         assert_eq!(Dialect::for_model("claude-opus-4-8"), Dialect::Anthropic);
-        assert_eq!(Dialect::for_model("gpt-4o"), Dialect::OpenAi);
+        // Native OpenAI ids speak the Responses API now (see `models::ApiKind`).
+        assert_eq!(Dialect::for_model("gpt-4o"), Dialect::OpenAiResponses);
+        assert_eq!(Dialect::for_model("o3-mini"), Dialect::OpenAiResponses);
+        // Third-party OpenAI-compatible ids stay on Chat Completions.
         assert_eq!(Dialect::for_model("llama-3.1-70b"), Dialect::OpenAi);
         assert_eq!(Dialect::for_model("anthropic/claude"), Dialect::Anthropic);
+    }
+
+    #[test]
+    fn endpoint_paths_by_dialect() {
+        assert_eq!(Dialect::Anthropic.endpoint_path(), "/v1/messages");
+        assert_eq!(Dialect::OpenAi.endpoint_path(), "/v1/chat/completions");
+        assert_eq!(Dialect::OpenAiResponses.endpoint_path(), "/v1/responses");
+    }
+
+    #[test]
+    fn sse_error_recognizes_all_three_shapes() {
+        use serde_json::json;
+        // Anthropic nested shape.
+        assert_eq!(
+            sse_error(
+                &json!({"type":"error","error":{"type":"overloaded_error","message":"busy"}})
+            ),
+            Some("overloaded_error: busy".to_string())
+        );
+        // OpenAI Chat Completions bare shape.
+        assert_eq!(
+            sse_error(&json!({"error":{"type":"server_error","message":"boom"}})),
+            Some("server_error: boom".to_string())
+        );
+        // OpenAI Responses flat shape: no nested `error` object.
+        assert_eq!(
+            sse_error(&json!({"type":"error","code":"rate_limit_exceeded","message":"slow down"})),
+            Some("rate_limit_exceeded: slow down".to_string())
+        );
+        // Ordinary events are not errors.
+        assert_eq!(sse_error(&json!({"type":"message_start"})), None);
     }
 }

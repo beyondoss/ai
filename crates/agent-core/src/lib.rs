@@ -19,6 +19,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod agent;
+pub mod branch_summary;
 pub mod client;
 pub mod compaction;
 pub mod dialect;
@@ -33,8 +34,11 @@ pub mod tool;
 pub mod transport;
 
 pub use agent::{Agent, AgentEvent};
+pub use branch_summary::{
+    BRANCH_SUMMARY_INSTRUCTION, BRANCH_SUMMARY_MARKER, branch_summary_request,
+};
 pub use client::GatewayClient;
-pub use compaction::CompactionConfig;
+pub use compaction::{CompactionConfig, CompactionProvenance, CompactionReason};
 pub use error::{Error, Result, ToolError};
 pub use hooks::{AgentHooks, NoHooks};
 pub use message::{

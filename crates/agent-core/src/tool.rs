@@ -11,6 +11,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::channel::mpsc::UnboundedSender;
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use crate::error::ToolError;
 use crate::message::{ImageSource, ToolDef};
@@ -33,17 +34,37 @@ pub struct ToolUpdate {
 /// that surfaces to the run's observers as an `AgentEvent::ToolProgress` (pi's `tool_execution_update`).
 /// The loop hands one to every call; a tool that doesn't stream simply never calls
 /// [`emit`](ToolProgress::emit). Cloneable and `Send`, so a tool can hand it to a background read loop.
+///
+/// Also carries the run's cancellation token (see [`is_cancelled`](ToolProgress::is_cancelled)) — a
+/// **deliberate** choice over adding a signal parameter to [`Tool::run`]/[`Tool::run_streaming`]. The
+/// loop already cancels a tool by racing its future against the token and dropping it on a trip (a
+/// `bash` subprocess dies via `kill_on_drop`), so the trait seams stay minimal; this only gives a
+/// long-running *streaming* tool — the one kind of tool that does real work between yield points and so
+/// can't rely on the drop alone happening promptly — a way to check in on its own schedule and wind
+/// down early (flush what it has, stop polling a subprocess for more output) rather than being cut off
+/// mid-operation with no chance to finalize partial state.
 #[derive(Clone)]
 pub struct ToolProgress {
     tx: UnboundedSender<ToolUpdate>,
     id: String,
     name: String,
+    cancel: CancellationToken,
 }
 
 impl ToolProgress {
     /// Build a progress handle for one tool call. The loop constructs these; tools receive `&ToolProgress`.
-    pub(crate) fn new(tx: UnboundedSender<ToolUpdate>, id: String, name: String) -> Self {
-        Self { tx, id, name }
+    pub(crate) fn new(
+        tx: UnboundedSender<ToolUpdate>,
+        id: String,
+        name: String,
+        cancel: CancellationToken,
+    ) -> Self {
+        Self {
+            tx,
+            id,
+            name,
+            cancel,
+        }
     }
 
     /// Emit a progress snapshot (the full output so far) plus optional `details`. Best-effort: if the
@@ -55,6 +76,14 @@ impl ToolProgress {
             snapshot: snapshot.into(),
             details,
         });
+    }
+
+    /// Whether the run has been cancelled. A streaming tool doing real work between yield points (a
+    /// polling loop reading subprocess output, say) can check this to wind down cooperatively — flush
+    /// what it has and return — instead of relying solely on the loop dropping its future, which cuts
+    /// it off with no chance to finalize partial state.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
     }
 }
 
@@ -325,5 +354,16 @@ mod tests {
         assert_eq!(out.text, "hi");
         let err = EchoTool.run(json!({})).await;
         assert!(matches!(err, Err(ToolError::InvalidInput(_))));
+    }
+
+    #[test]
+    fn tool_progress_reflects_cancellation() {
+        let (tx, _rx) = futures::channel::mpsc::unbounded();
+        let cancel = CancellationToken::new();
+        let progress = ToolProgress::new(tx, "id".into(), "name".into(), cancel.clone());
+        assert!(!progress.is_cancelled());
+        cancel.cancel();
+        // A clone made *before* the trip still observes it — the token is shared, not snapshotted.
+        assert!(progress.is_cancelled());
     }
 }

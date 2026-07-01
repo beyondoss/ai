@@ -201,8 +201,13 @@ impl OutputAccumulator {
         } else if !self.spill_failed {
             // Pre-spill: keep the complete bytes in memory so a later spill can flush them whole.
             self.raw_buffer.extend_from_slice(data);
-            // Spill once the buffered output outgrows the rolling cap.
-            if self.total_bytes as usize > self.rolling_cap {
+            // Spill once the buffered output outgrows the rolling cap *or* the line count outgrows the
+            // display limit — a long, low-byte/high-line-count command (many short lines) would
+            // otherwise never trip the byte-only check and so never get a `full_output_path` to point
+            // at, even once it's already well past what the tail can show.
+            if self.total_bytes as usize > self.rolling_cap
+                || self.total_lines() > self.max_lines as u64
+            {
                 self.ensure_temp_file();
             }
         }
@@ -656,6 +661,32 @@ mod tests {
         assert_eq!(read_temp(&path), full);
         // Display content is bounded, not the whole 300 KiB.
         assert!(snap.content.len() <= DEFAULT_MAX_BYTES);
+    }
+
+    #[test]
+    fn line_count_alone_triggers_a_spill_well_under_the_byte_cap() {
+        // Many short lines: total bytes stay far under the rolling byte cap, but the line count alone
+        // must still trigger a spill — a long, low-byte/high-line-count command shouldn't go without a
+        // `full_output_path` just because it never got big.
+        let mut acc = OutputAccumulator::with_prefix("pi-bash");
+        let mut full = Vec::new();
+        for n in 0..(DEFAULT_MAX_LINES as u32 + 500) {
+            let line = format!("{n}\n").into_bytes();
+            full.extend_from_slice(&line);
+            acc.append(&line);
+        }
+        assert!(
+            full.len() < DEFAULT_MAX_BYTES,
+            "test setup: total bytes ({}) must stay under the byte cap ({DEFAULT_MAX_BYTES})",
+            full.len()
+        );
+        acc.finish();
+        let snap = acc.snapshot(true);
+        let path = snap
+            .full_output_path
+            .clone()
+            .expect("line count alone must trigger a spill");
+        assert_eq!(read_temp(&path), full);
     }
 
     #[test]

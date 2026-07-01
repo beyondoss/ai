@@ -22,6 +22,12 @@ pub struct PromptOptions<'a> {
     pub include_context_files: bool,
     /// Whether to discover and advertise skills.
     pub include_skills: bool,
+    /// Whether `cwd` is a trusted project (an explicit `--trust-project`/RPC override, or recorded in
+    /// `TrustStore`). Gates the *project-local* `SYSTEM.md` override only — an untrusted checkout can't
+    /// replace the agent's identity just by shipping the file (see `crate::trust_store`). The user-global
+    /// `~/.claude/SYSTEM.md` override is unaffected either way: it's the operator's own machine, not
+    /// something a repo checkout controls.
+    pub project_trusted: bool,
 }
 
 /// Build the full system prompt for a session. Pulls in project instruction files (global +
@@ -30,18 +36,28 @@ pub fn build_system_prompt(opts: &PromptOptions) -> String {
     // An on-disk `SYSTEM.md` (project `<cwd>/.claude/`, else user `~/.claude/`) replaces the built-in
     // base entirely — that's how a project pins its own agent identity (pi's resource-loader does the
     // same). Absent one, the caller-supplied `base` stands.
-    let mut s = system_prompt_override(opts.cwd).unwrap_or_else(|| opts.base.to_string());
+    let mut s = system_prompt_override(opts.cwd, opts.project_trusted)
+        .unwrap_or_else(|| opts.base.to_string());
     if let Some(extra) = opts.append {
         s.push_str("\n\n");
         s.push_str(extra);
     }
 
     if opts.include_context_files {
-        for (path, body) in load_context_files(opts.cwd) {
-            s.push_str(&format!(
-                "\n\n<project_instructions path=\"{path}\">\n{}\n</project_instructions>",
-                body.trim()
-            ));
+        let files = load_context_files(opts.cwd);
+        if !files.is_empty() {
+            // Wrapped in an outer `<project_context>` element (matching the reference agent) so the
+            // model sees these as a distinct, labeled section rather than bare instruction blocks
+            // floating in the prompt.
+            s.push_str("\n\n<project_context>\n\n");
+            s.push_str("Project-specific instructions and guidelines:\n\n");
+            for (path, body) in files {
+                s.push_str(&format!(
+                    "<project_instructions path=\"{path}\">\n{}\n</project_instructions>\n\n",
+                    body.trim()
+                ));
+            }
+            s.push_str("</project_context>");
         }
     }
 
@@ -61,10 +77,16 @@ pub fn build_system_prompt(opts: &PromptOptions) -> String {
     s
 }
 
-/// A `SYSTEM.md` override: project-local (`<cwd>/.claude/SYSTEM.md`) takes precedence over the user
-/// one (`~/.claude/SYSTEM.md`). Returns its raw contents, or `None` when neither exists / is blank.
-fn system_prompt_override(cwd: &Path) -> Option<String> {
-    let mut candidates = vec![cwd.join(".claude/SYSTEM.md")];
+/// A `SYSTEM.md` override: project-local (`<cwd>/.claude/SYSTEM.md`, only when `project_trusted`) takes
+/// precedence over the user one (`~/.claude/SYSTEM.md`, always eligible — it's the operator's own
+/// machine). Returns its raw contents, or `None` when neither exists / is blank / the project one
+/// exists but isn't trusted (falls through to the global candidate exactly as if the project file were
+/// simply absent — no different fallback than the untrusted-file-doesn't-exist case).
+fn system_prompt_override(cwd: &Path, project_trusted: bool) -> Option<String> {
+    let mut candidates = Vec::new();
+    if project_trusted {
+        candidates.push(cwd.join(".claude/SYSTEM.md"));
+    }
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
         candidates.push(home.join(".claude/SYSTEM.md"));
     }
@@ -139,15 +161,51 @@ fn today() -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-/// The host's UTC offset in seconds at `now`, read from the system zoneinfo (`/etc/localtime`). We have
-/// no date crate and `unsafe_code` is forbidden (so no libc `localtime`); parsing the TZif file is the
-/// dependency-free, safe way to get the local offset. Any problem — missing file, unknown format —
-/// degrades to `0` (UTC), which is correct, just not local.
+/// The host's UTC offset in seconds at `now`. We have no date crate and `unsafe_code` is forbidden (so
+/// no libc `localtime`); parsing a TZif file is the dependency-free, safe way to get the local offset.
+/// `TZ` takes precedence over the system zoneinfo (`/etc/localtime`) when it names a resolvable zone —
+/// the precedence every libc/ICU implementation uses, and the one that matters in a container: `TZ` is
+/// routinely set to override a base image whose `/etc/localtime` is still UTC. Any problem — `TZ`
+/// unset/unresolvable, missing file, unknown format — degrades to `0` (UTC), which is correct, just not
+/// local.
 fn local_utc_offset(now: i64) -> i64 {
-    fs::read("/etc/localtime")
-        .ok()
-        .and_then(|data| tzif_offset(&data, now))
+    tz_env_offset(now)
+        .or_else(|| {
+            fs::read("/etc/localtime")
+                .ok()
+                .and_then(|data| tzif_offset(&data, now))
+        })
         .unwrap_or(0)
+}
+
+/// The offset from the `TZ` environment variable, if set to a resolvable zone. `TZ` unset falls
+/// through to `None` so the caller tries `/etc/localtime` next.
+fn tz_env_offset(now: i64) -> Option<i64> {
+    let tz = std::env::var("TZ").ok()?;
+    tz_string_offset(&tz, now)
+}
+
+/// Resolve a `TZ`-style value — an IANA zone name (e.g. `America/New_York`, optionally `:`-prefixed per
+/// POSIX convention) or an absolute zoneinfo path — to its UTC offset at `now`. The form containers/CI
+/// set almost universally. A raw POSIX offset-rule string (`EST5EDT,M3.2.0,M11.1.0`) isn't parsed (no
+/// rule-transition logic here, just TZif files); empty-but-for-the-`:`, or naming something we can't
+/// resolve to a real zoneinfo file, falls through to `None`.
+///
+/// Split from [`tz_env_offset`] so the zone-resolution logic is unit-testable without mutating the
+/// process's environment — `std::env::set_var` is unsafe to call from a test that may run in parallel
+/// with others reading `TZ`.
+fn tz_string_offset(tz: &str, now: i64) -> Option<i64> {
+    let zone = tz.strip_prefix(':').unwrap_or(tz);
+    if zone.is_empty() {
+        return Some(0); // POSIX: an empty TZ value means UTC
+    }
+    let path = if zone.starts_with('/') {
+        PathBuf::from(zone)
+    } else {
+        Path::new("/usr/share/zoneinfo").join(zone)
+    };
+    let data = fs::read(path).ok()?;
+    tzif_offset(&data, now)
 }
 
 /// Extract the UTC offset applicable at `now` from a TZif (RFC 8536) blob. A v2/v3 file carries a
@@ -318,7 +376,7 @@ mod tests {
     }
 
     #[test]
-    fn system_md_overrides_base_prompt() {
+    fn system_md_overrides_base_prompt_when_trusted() {
         let tmp = tempfile::tempdir().unwrap();
         let claude_dir = tmp.path().join(".claude");
         fs::create_dir_all(&claude_dir).unwrap();
@@ -330,12 +388,35 @@ mod tests {
             cwd: tmp.path(),
             include_context_files: false,
             include_skills: false,
+            project_trusted: true,
         });
         assert!(prompt.contains("OVERRIDE IDENTITY"));
         assert!(
             !prompt.contains("DEFAULT IDENTITY"),
-            "on-disk SYSTEM.md must replace the built-in base"
+            "a trusted project's on-disk SYSTEM.md must replace the built-in base"
         );
+    }
+
+    #[test]
+    fn system_md_is_ignored_when_project_is_untrusted() {
+        // The whole point of the trust gate: an untrusted checkout can't hijack the agent's identity
+        // just by shipping a `.claude/SYSTEM.md` — it falls through exactly as if the file were
+        // absent, not a different (or erroring) fallback.
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(claude_dir.join("SYSTEM.md"), "MALICIOUS OVERRIDE").unwrap();
+
+        let prompt = build_system_prompt(&PromptOptions {
+            base: "DEFAULT IDENTITY",
+            append: None,
+            cwd: tmp.path(),
+            include_context_files: false,
+            include_skills: false,
+            project_trusted: false,
+        });
+        assert!(prompt.contains("DEFAULT IDENTITY"));
+        assert!(!prompt.contains("MALICIOUS OVERRIDE"));
     }
 
     #[test]
@@ -360,6 +441,33 @@ mod tests {
     }
 
     #[test]
+    fn tz_string_offset_resolves_a_real_iana_zone() {
+        // UTC's zoneinfo file exists on essentially every Linux distro (including this test machine's)
+        // and has a fixed 0 offset — a reliable resolvable-zone case without hardcoding a path.
+        assert_eq!(tz_string_offset("UTC", 1_700_000_000), Some(0));
+        // POSIX `:`-prefix convention (explicitly "this is a file reference") resolves the same way.
+        assert_eq!(tz_string_offset(":UTC", 1_700_000_000), Some(0));
+    }
+
+    #[test]
+    fn tz_string_offset_empty_value_is_utc() {
+        // POSIX: an empty `TZ` value means UTC.
+        assert_eq!(tz_string_offset("", 1_700_000_000), Some(0));
+        assert_eq!(tz_string_offset(":", 1_700_000_000), Some(0));
+    }
+
+    #[test]
+    fn tz_string_offset_falls_through_on_unresolvable_value() {
+        // A raw POSIX offset-rule string isn't parsed (no rule-transition logic here) — falls through
+        // to `None` so the caller tries `/etc/localtime` next, rather than erroring the date entirely.
+        assert_eq!(
+            tz_string_offset("EST5EDT,M3.2.0,M11.1.0", 1_700_000_000),
+            None
+        );
+        assert_eq!(tz_string_offset("Not/A/Real/Zone", 1_700_000_000), None);
+    }
+
+    #[test]
     fn system_prompt_includes_project_instructions_and_env() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("CLAUDE.md"), "Be excellent.").unwrap();
@@ -369,12 +477,39 @@ mod tests {
             cwd: tmp.path(),
             include_context_files: true,
             include_skills: false,
+            project_trusted: false,
         });
         assert!(prompt.contains("You are an agent."));
         assert!(prompt.contains("Stay terse."));
+        assert!(prompt.contains("<project_context>"));
+        assert!(prompt.contains("</project_context>"));
         assert!(prompt.contains("<project_instructions"));
         assert!(prompt.contains("Be excellent."));
         assert!(prompt.contains("Current date:"));
         assert!(prompt.contains("Current working directory:"));
+        // The instructions block must be nested *inside* the wrapper, not just present somewhere.
+        let wrapper_start = prompt.find("<project_context>").unwrap();
+        let wrapper_end = prompt.find("</project_context>").unwrap();
+        let instructions_pos = prompt.find("<project_instructions").unwrap();
+        assert!(instructions_pos > wrapper_start && instructions_pos < wrapper_end);
+    }
+
+    #[test]
+    fn project_context_wrapper_is_absent_when_context_files_are_disabled() {
+        // `include_context_files: false` skips `load_context_files` entirely — the one way to prove
+        // the wrapper is conditional without depending on `$HOME/.claude` being empty (which this test
+        // can't safely control: mutating `HOME` via `std::env::set_var` is unsafe to do from a test
+        // that may run in parallel with others, and this repo's own `~/.claude/CLAUDE.md` genuinely
+        // exists on a real dev machine, so an empty-tempdir-cwd variant of this test would be flaky).
+        let tmp = tempfile::tempdir().unwrap();
+        let prompt = build_system_prompt(&PromptOptions {
+            base: "You are an agent.",
+            append: None,
+            cwd: tmp.path(),
+            include_context_files: false,
+            include_skills: false,
+            project_trusted: false,
+        });
+        assert!(!prompt.contains("<project_context>"));
     }
 }

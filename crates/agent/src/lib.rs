@@ -14,3 +14,4 @@ pub mod serve;
 pub mod session_store;
 pub mod skills;
 pub mod tools;
+pub mod trust_store;

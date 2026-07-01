@@ -21,8 +21,8 @@ pub struct Usage {
 // `#[serde(default)]` so a missing or partial `usage` block reads as zeros, matching the prior
 // pointer-with-`unwrap_or(0)` behavior.
 
-/// OpenAI `usage` block (chat/completions + responses). `prompt`/`completion` map to in/out; cached
-/// input rides in `prompt_tokens_details.cached_tokens`. No cache-write concept on the OpenAI wire.
+/// OpenAI `usage` block (chat/completions). `prompt`/`completion` map to in/out; cached input rides
+/// in `prompt_tokens_details.cached_tokens`. No cache-write concept on the OpenAI wire.
 #[derive(Deserialize, Default)]
 struct OpenAiUsage {
     #[serde(default)]
@@ -45,6 +45,36 @@ impl From<OpenAiUsage> for Usage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
             cache_read_tokens: u.prompt_tokens_details.cached_tokens,
+            cache_write_tokens: 0,
+        }
+    }
+}
+
+/// The Responses API's `usage` block — nested under `response.completed.response.usage`, not
+/// top-level like chat/completions, and named `input_tokens`/`output_tokens` (Anthropic-style) rather
+/// than `prompt_tokens`/`completion_tokens`.
+#[derive(Deserialize, Default)]
+struct OpenAiResponsesUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    input_tokens_details: OpenAiResponsesInputDetails,
+}
+
+#[derive(Deserialize, Default)]
+struct OpenAiResponsesInputDetails {
+    #[serde(default)]
+    cached_tokens: u64,
+}
+
+impl From<OpenAiResponsesUsage> for Usage {
+    fn from(u: OpenAiResponsesUsage) -> Self {
+        Usage {
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+            cache_read_tokens: u.input_tokens_details.cached_tokens,
             cache_write_tokens: 0,
         }
     }
@@ -105,17 +135,26 @@ fn sse_data_lines(sse: &[u8]) -> impl Iterator<Item = &[u8]> + '_ {
     })
 }
 
-/// OpenAI streaming (requires `stream_options.include_usage`): the penultimate chunk carries a
-/// top-level `usage` object. Last one with usage wins.
+/// OpenAI streaming: chat/completions (requires `stream_options.include_usage`) carries a top-level
+/// `usage` object on the penultimate chunk; the Responses API carries it nested under
+/// `response.completed.response.usage` instead, with no top-level `usage` key at all — so both shapes
+/// are checked per line. Last one with usage wins.
 pub fn openai_stream(sse: &[u8]) -> Option<Usage> {
+    #[derive(Deserialize)]
+    struct ResponsesEnvelope {
+        usage: Option<OpenAiResponsesUsage>,
+    }
     #[derive(Deserialize)]
     struct Chunk {
         usage: Option<OpenAiUsage>,
+        response: Option<ResponsesEnvelope>,
     }
     let mut found = None;
     for line in sse_data_lines(sse) {
         if let Ok(chunk) = serde_json::from_slice::<Chunk>(line) {
             if let Some(u) = chunk.usage {
+                found = Some(Usage::from(u));
+            } else if let Some(u) = chunk.response.and_then(|r| r.usage) {
                 found = Some(Usage::from(u));
             }
         }
@@ -204,6 +243,28 @@ mod tests {
                 input_tokens: 5,
                 output_tokens: 9,
                 cache_read_tokens: 0,
+                cache_write_tokens: 0
+            }
+        );
+    }
+
+    #[test]
+    fn openai_responses_streaming_nested_usage() {
+        // The Responses API has no top-level `usage` chunk at all — it rides nested under
+        // `response.completed.response.usage`, with Anthropic-style field names
+        // (`input_tokens`/`output_tokens`, not `prompt_tokens`/`completion_tokens`). Before this fix
+        // `openai_stream` only ever checked the top-level field and would silently meter zero tokens
+        // for every Responses-routed call.
+        let sse = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n\
+                    data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\
+                    \"usage\":{\"input_tokens\":50,\"output_tokens\":20,\
+                    \"input_tokens_details\":{\"cached_tokens\":10}}}}\n\n";
+        assert_eq!(
+            openai_stream(sse).unwrap(),
+            Usage {
+                input_tokens: 50,
+                output_tokens: 20,
+                cache_read_tokens: 10,
                 cache_write_tokens: 0
             }
         );

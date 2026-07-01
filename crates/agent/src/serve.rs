@@ -13,7 +13,8 @@
 //!   - `{type:"prompt", message}`        run a turn; streams `event` frames, then a `response`
 //!   - `{type:"abort"}`                  cancel the in-flight `prompt` (if any), else a no-op ack
 //!   - `{type:"get_state"}`              → `data: {session_id, model, steps, message_count, title, …}`
-//!   - `{type:"get_messages"}`           → `data: {messages: [...]}`
+//!   - `{type:"get_messages"}`           → `data: {messages: [...]}` (each tagged with its tree `id`
+//!     when persistence is configured, so a client can fork from any point via `switch_branch`)
 //!   - `{type:"new_session"}`            start a fresh session → `data: {session_id}`
 //!   - `{type:"list_sessions"}`          (repo mode) → `data: {sessions: [SessionMeta…]}`
 //!   - `{type:"switch_session", session_id}` (repo mode) load another session
@@ -26,6 +27,9 @@
 //!   - `{type:"set_model", model}`       switch the model for subsequent prompts → `data: {model}`
 //!   - `{type:"set_thinking", budget}`   set/clear the thinking budget (integer, or `null` to disable)
 //!   - `{type:"get_available_models"}`   → `data: {models: […]}` (a known, non-exhaustive id list)
+//!   - `{type:"list_branches"}`          → `data: {branches: [BranchInfo…]}` (the session's tree)
+//!   - `{type:"switch_branch", target_id, summarize?}` navigate to another point in the tree,
+//!     summarizing the abandoned branch's activity first unless `summarize:false`
 //!
 //! While a `prompt` runs, the loop keeps reading stdin so an `abort` can cancel it, or `steer` /
 //! `follow_up` (with a `message`) can queue input: a `steer` is injected mid-run at the next tool
@@ -43,7 +47,9 @@ use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
-use crate::session_store::{SessionMeta, SessionRepo, SessionStore};
+use crate::session_store::{
+    BranchInfo, BranchSummaryDetails, SessionMeta, SessionRepo, SessionStore,
+};
 use crate::tools;
 
 /// Options for the headless server (mirrors `run`, plus persistence).
@@ -65,12 +71,38 @@ pub struct ServeConfig {
     /// commands (`list_sessions`, `switch_session`, `fork`, `set_session_name`).
     pub session_dir: Option<String>,
     /// The model's context window in tokens — the budget the loop compacts against to stay below.
-    pub context_window: u32,
+    /// `None` defers to the model's own capability-table window (`Agent::new`'s default), so switching
+    /// to a model with a different real window (via `set_model`) gets that model's true budget instead
+    /// of a stale operator-supplied number. `Some` pins a fixed budget that survives model switches.
+    pub context_window: Option<u32>,
     /// Use the 1-hour prompt-cache TTL (vs the default 5 minutes) — useful when turns are spaced out.
     pub cache_long: bool,
     /// Extended-thinking token budget, when enabled (`None` leaves thinking off). Must be below the
     /// per-turn `max_tokens`.
     pub thinking: Option<u32>,
+    /// Reasoning effort for models driven by an effort level rather than a token budget (OpenAI
+    /// reasoning models, Anthropic adaptive-thinking models). `None` leaves the provider default.
+    /// Fixed for the process — unlike `thinking`, there's no `set_reasoning_effort` RPC command.
+    pub reasoning_effort: Option<agent_core::ReasoningEffort>,
+    /// Trust the working directory for this run only, so a project-local `.claude/SYSTEM.md` is
+    /// honored even if the directory isn't in the persisted allowlist (`agent trust <path>`). See
+    /// `crate::trust_store`.
+    pub trust_project: bool,
+    /// Compaction headroom (tokens) reserved below the context window. `None` keeps
+    /// `CompactionConfig::default()`'s value.
+    pub compaction_reserve_tokens: Option<u32>,
+    /// Roughly how many tokens of recent conversation compaction keeps verbatim. `None` keeps
+    /// `CompactionConfig::default()`'s value.
+    pub compaction_keep_recent_tokens: Option<u32>,
+    /// How many times to retry a gateway request that fails before the first response byte arrives.
+    /// `None` keeps the client's built-in default.
+    pub retry_max_retries: Option<u32>,
+    /// Base of the exponential backoff between those retries. `None` keeps the client's built-in
+    /// default.
+    pub retry_base_delay_ms: Option<std::time::Duration>,
+    /// Default `bash` command timeout when the model omits `timeout_ms`. `None` keeps the tool's
+    /// built-in default.
+    pub bash_timeout_ms: Option<u64>,
 }
 
 /// Where the server persists sessions: a multi-session [`SessionRepo`] (`--session-dir`), a single
@@ -222,6 +254,79 @@ impl Persistence {
         }
         Ok(())
     }
+
+    /// Every branch in the current session's tree (empty unless persistence is configured — a
+    /// pure in-memory session, with no `--session-file`/`--session-dir`, has no tree to report).
+    fn list_branches(&self) -> Vec<BranchInfo> {
+        self.store
+            .as_ref()
+            .map(SessionStore::list_branches)
+            .unwrap_or_default()
+    }
+
+    /// Ids of the active path's messages, root-first — parallel to the live `Session.messages` when
+    /// persistence is configured; empty in pure in-memory mode (nothing to id). What `get_messages`
+    /// tags each message with, and what a client names as `switch_branch`'s `target_id`.
+    fn active_ids(&self) -> &[String] {
+        self.store
+            .as_ref()
+            .map(SessionStore::active_ids)
+            .unwrap_or(&[])
+    }
+
+    /// Switch the active branch to `target_id`. When `summarize` and the branch being left behind has
+    /// unsummarized activity (see `SessionStore::abandoned_by_switch`), generates a summary via
+    /// `agent` and persists it *before* switching — mirroring pi's `navigateTree`. A summarization
+    /// failure (a network error, or the model returning nothing) is logged and the switch proceeds
+    /// anyway: losing the recap is far better than being unable to navigate away from a branch at all.
+    async fn switch_branch(
+        &mut self,
+        agent: &Agent,
+        target_id: &str,
+        summarize: bool,
+    ) -> std::io::Result<Session> {
+        let store = self.store.as_mut().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "no session persistence configured (start serve with --session-file or --session-dir)",
+            )
+        })?;
+
+        if summarize {
+            let abandoned = store.abandoned_by_switch(target_id);
+            if !abandoned.is_empty() {
+                if let Some(from_id) = store.active_ids().last().cloned() {
+                    match agent
+                        .summarize_branch(&abandoned, &CancellationToken::new())
+                        .await
+                    {
+                        Ok(summary) if !summary.trim().is_empty() => {
+                            let (read_files, modified_files) =
+                                agent_core::compaction::extract_file_ops(&abandoned);
+                            let details = BranchSummaryDetails {
+                                read_files,
+                                modified_files,
+                                summarized_messages: abandoned.len() as u64,
+                            };
+                            if let Err(e) = store.record_branch_summary(summary, from_id, details) {
+                                eprintln!("serve: failed to persist branch summary: {e}");
+                            }
+                        }
+                        Ok(_) => {} // empty summary — nothing worth recording
+                        Err(e) => {
+                            eprintln!("serve: branch summarization failed, switching anyway: {e}")
+                        }
+                    }
+                }
+            }
+        }
+
+        let messages = store.switch_active(target_id)?;
+        self.meta = store.meta().clone();
+        let mut session = Session::new();
+        session.messages = Arc::new(messages);
+        Ok(session)
+    }
 }
 
 fn not_in_repo_mode() -> std::io::Error {
@@ -238,12 +343,15 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
     // Assemble the system prompt from the base identity + this repo's project instructions + skills +
     // environment, so the agent behaves like it belongs in the working directory.
     let cwd = std::env::current_dir().unwrap_or_default();
+    let project_trusted =
+        cfg.trust_project || crate::trust_store::TrustStore::open_default().is_trusted(&cwd);
     let system = crate::resources::build_system_prompt(&crate::resources::PromptOptions {
         base: &cfg.system,
         append: cfg.append_system.as_deref(),
         cwd: &cwd,
         include_context_files: cfg.context_files,
         include_skills: true,
+        project_trusted,
     });
 
     // Slash-command prompt templates (`/name args`) and discoverable skills, for `get_commands` and
@@ -253,7 +361,13 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
 
     // Keep the transport in an `Arc` we can clone: `set_model`/`set_thinking` rebuild the `Agent` at
     // runtime (a new model id picks a new dialect), and each rebuild reuses this one HTTP client.
-    let client = Arc::new(GatewayClient::new(cfg.gateway.clone(), cfg.key.clone())?);
+    let client = GatewayClient::new(cfg.gateway.clone(), cfg.key.clone())?.with_retry(
+        cfg.retry_max_retries
+            .unwrap_or(agent_core::client::MAX_RETRIES),
+        cfg.retry_base_delay_ms
+            .unwrap_or(agent_core::client::BASE_BACKOFF),
+    );
+    let client = Arc::new(client);
 
     // The model and thinking budget are runtime-switchable; everything else (transport, tools, system
     // prompt, loop bounds, cache settings) is fixed for the process. `build_agent` folds the mutable
@@ -364,8 +478,11 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     ));
                     continue;
                 };
-                // Expand a `/name args` slash command from a prompt template (no-op otherwise).
-                let message = crate::prompts::expand_if_slash(message, &prompt_templates);
+                // Expand an explicit `/skill:name` invocation first (its own prefix, so it can't
+                // collide with a `/name` prompt template), then fall through to prompt-template
+                // expansion — a no-op on whichever message reaches it unmatched.
+                let message = crate::skills::expand_if_skill_invocation(message, &skills);
+                let message = crate::prompts::expand_if_slash(&message, &prompt_templates);
                 // Optional image attachments: `images: [{media_type, data}]` (base64). Builds a
                 // multimodal user turn; absent or empty → a plain text turn.
                 let images = parse_images(cmd.get("images"));
@@ -497,8 +614,24 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 emit!(response(id, "get_state", true, Some(data), None));
             }
             "get_messages" => {
-                let messages =
+                // Tag each message with its tree id when persistence tracks one (parallel to
+                // `session.messages` — see `Persistence::active_ids`), so a client can pick a
+                // `target_id` for `switch_branch` from anywhere in the visible transcript, not only
+                // from a branch's leaf (which is all `list_branches` alone can offer). A length
+                // mismatch (in-memory mode, or a transient inconsistency) leaves messages untagged
+                // rather than mistagging them.
+                let msg_ids = persistence.active_ids();
+                let mut messages =
                     serde_json::to_value(session.messages.as_ref()).unwrap_or(Value::Null);
+                if let Value::Array(arr) = &mut messages {
+                    if arr.len() == msg_ids.len() {
+                        for (m, mid) in arr.iter_mut().zip(msg_ids) {
+                            if let Value::Object(obj) = m {
+                                obj.insert("id".into(), json!(mid));
+                            }
+                        }
+                    }
+                }
                 emit!(response(
                     id,
                     "get_messages",
@@ -599,11 +732,16 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 // Manual compaction (no run in flight here). Streams a `compacted` event if it cuts.
                 let tx = out_tx.clone();
                 let result = agent
-                    .compact(&mut session, &CancellationToken::new(), &mut |ev| {
-                        if let Some(frame) = event_frame(ev) {
-                            let _ = tx.send(frame);
-                        }
-                    })
+                    .compact(
+                        &mut session,
+                        agent_core::CompactionReason::Manual,
+                        &CancellationToken::new(),
+                        &mut |ev| {
+                            if let Some(frame) = event_frame(ev) {
+                                let _ = tx.send(frame);
+                            }
+                        },
+                    )
                     .await;
                 match result {
                     Ok(did) => {
@@ -660,7 +798,10 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
             "set_model" => match cmd.get("model").and_then(Value::as_str) {
                 Some(model) => {
                     // Rebuild the agent so subsequent prompts use the new model (and, via the id, its
-                    // dialect + capabilities). The session transcript is untouched.
+                    // dialect + capabilities). A signed thinking block is only valid for replay to the
+                    // model that produced it, so scrub any thinking history before the switch — history
+                    // is otherwise untouched.
+                    session.strip_thinking_blocks();
                     current_model = model.to_string();
                     agent = build_agent(
                         client.clone(),
@@ -745,6 +886,55 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     None,
                 ));
             }
+            "list_branches" => {
+                emit!(response(
+                    id,
+                    "list_branches",
+                    true,
+                    Some(json!({ "branches": persistence.list_branches() })),
+                    None,
+                ));
+            }
+            "switch_branch" => match cmd.get("target_id").and_then(Value::as_str) {
+                Some(target_id) => {
+                    // Defaults to summarizing the abandoned branch's activity (mirroring pi's
+                    // `navigateTree`); a client can pass `summarize:false` for a quick, cheap switch.
+                    let summarize = cmd
+                        .get("summarize")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true);
+                    let target_id = target_id.to_string();
+                    match persistence
+                        .switch_branch(&agent, &target_id, summarize)
+                        .await
+                    {
+                        Ok(s) => {
+                            session = s;
+                            emit!(response(
+                                id,
+                                "switch_branch",
+                                true,
+                                Some(json!({ "target_id": target_id })),
+                                None,
+                            ));
+                        }
+                        Err(e) => emit!(response(
+                            id,
+                            "switch_branch",
+                            false,
+                            None,
+                            Some(&e.to_string())
+                        )),
+                    }
+                }
+                None => emit!(response(
+                    id,
+                    "switch_branch",
+                    false,
+                    None,
+                    Some("missing `target_id`")
+                )),
+            },
             other => {
                 emit!(response(id, other, false, None, Some("unknown command")));
             }
@@ -759,8 +949,11 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
 /// Build the [`Agent`] for the current model + thinking budget. Called once at startup and again on
 /// every `set_model`/`set_thinking`, so a client can re-tune the run without restarting `serve`. The
 /// transport, tools, system prompt, loop bounds, and cache settings are the same each time; only the
-/// model id and thinking budget vary. The context window stays as configured (`--context-window`): a
-/// model switch changes the dialect, not the operator's compaction budget.
+/// model id and thinking budget vary. Compaction's `context_window` defaults to `model`'s own
+/// capabilities; an explicit `--context-window` overrides that and stays pinned across a model switch
+/// (the operator's compaction budget, not the dialect's) — left unset, each switch picks up the *new*
+/// model's real window instead of a stale operator number. `reserve_tokens`/`keep_recent_tokens`
+/// default to `CompactionConfig::default()`, overridable independently of `context_window`.
 fn build_agent(
     transport: Arc<GatewayClient>,
     system: &str,
@@ -769,16 +962,32 @@ fn build_agent(
     thinking: Option<u32>,
     cache_key: &str,
 ) -> Agent {
+    let mut compaction = agent_core::CompactionConfig {
+        context_window: cfg
+            .context_window
+            .unwrap_or_else(|| agent_core::capabilities(model).context_window),
+        ..agent_core::CompactionConfig::default()
+    };
+    if let Some(reserve) = cfg.compaction_reserve_tokens {
+        compaction.reserve_tokens = reserve;
+    }
+    if let Some(keep_recent) = cfg.compaction_keep_recent_tokens {
+        compaction.keep_recent_tokens = keep_recent;
+    }
+
     let mut agent = Agent::new(transport, model.to_string())
-        .with_tools(tools::default_registry())
+        .with_tools(tools::default_registry_with(cfg.bash_timeout_ms))
         .with_system(system.to_string())
         .with_max_steps(cfg.max_steps)
-        .with_context_window(cfg.context_window)
+        .with_compaction(compaction)
         // Pin this session to a warm prompt-cache node via its stable id.
         .with_cache_key(cache_key.to_string())
         .with_cache_long(cfg.cache_long);
     if let Some(budget) = thinking {
         agent = agent.with_thinking(budget);
+    }
+    if let Some(effort) = cfg.reasoning_effort {
+        agent = agent.with_reasoning_effort(effort);
     }
     agent
 }
@@ -846,6 +1055,7 @@ fn session_stats(session: &Session) -> Value {
         "output_tokens": session.output_tokens,
         "cache_read_tokens": session.cache_read_tokens,
         "cache_write_tokens": session.cache_write_tokens,
+        "cache_write_1h_tokens": session.cache_write_1h_tokens,
         "reasoning_tokens": session.reasoning_tokens,
         "last_input_tokens": session.last_input_tokens,
     })

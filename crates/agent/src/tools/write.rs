@@ -30,7 +30,7 @@ impl Tool for Write {
         input
             .get("path")
             .and_then(Value::as_str)
-            .map(str::to_string)
+            .map(super::canonical_write_target)
     }
 
     async fn run(&self, input: Value) -> Result<ToolOutput, ToolError> {

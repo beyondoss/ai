@@ -15,6 +15,42 @@ use crate::error::{Error, Result};
 use crate::message::{ContentBlock, Role, StopReason, StreamEvent, TokenUsage};
 use crate::transport::{ModelRequest, ToolChoice};
 
+/// This assistant turn's reasoning text and the wire field name to replay it under, if it carried a
+/// `Thinking` block with a non-empty `signature` (the decoder only ever produces one — see
+/// `Decoder::reasoning_field`; multiple blocks would be joined, matching the reference agent). `None`
+/// when there's no thinking to replay, or its signature is empty (never captured with a field to
+/// replay it on, so nowhere safe to put it).
+fn assistant_reasoning(content: &[ContentBlock]) -> Option<(&str, String)> {
+    let mut field: Option<&str> = None;
+    let mut text = String::new();
+    for b in content {
+        if let ContentBlock::Thinking { text: t, signature } = b {
+            if field.is_none() && !signature.is_empty() {
+                field = Some(signature.as_str());
+            }
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(t);
+        }
+    }
+    field.map(|f| (f, text))
+}
+
+/// OpenAI's `prompt_cache_key` cap — a key longer than this is rejected by the API. Shared with the
+/// Responses dialect (`super::openai_responses`), which has the identical limit.
+pub(super) const PROMPT_CACHE_KEY_MAX_LEN: usize = 64;
+
+/// Clamp a prompt-cache key to OpenAI's length limit, truncating on a char boundary (not a byte one —
+/// a session id is expected to be ASCII, but this stays correct if it ever isn't). Shared with the
+/// Responses dialect.
+pub(super) fn clamp_prompt_cache_key(key: &str) -> &str {
+    match key.char_indices().nth(PROMPT_CACHE_KEY_MAX_LEN) {
+        Some((byte_idx, _)) => &key[..byte_idx],
+        None => key,
+    }
+}
+
 fn text_of(blocks: &[ContentBlock]) -> String {
     blocks
         .iter()
@@ -133,6 +169,12 @@ pub fn build_body(req: &ModelRequest) -> Value {
                 if !tool_calls.is_empty() {
                     msg.insert("tool_calls".into(), Value::Array(tool_calls));
                 }
+                // Replay a prior reasoning turn under the exact field name the decoder captured it
+                // from (see `Decoder::reasoning_field`) — different endpoints only accept it back on
+                // that one field.
+                if let Some((field, text)) = assistant_reasoning(&m.content) {
+                    msg.insert(field.to_string(), json!(text));
+                }
                 messages.push(Value::Object(msg));
             }
         }
@@ -161,9 +203,18 @@ pub fn build_body(req: &ModelRequest) -> Value {
     map.insert("stream_options".into(), json!({ "include_usage": true }));
     // Prompt-cache affinity: OpenAI routes automatic prefix-cache hits by `prompt_cache_key`, so a
     // stable per-conversation key keeps a session pinned to a warm cache node. (OpenAI caches prefixes
-    // automatically — there are no explicit breakpoints to set, only this routing hint.)
+    // automatically — there are no explicit breakpoints to set, only this routing hint.) The key has a
+    // hard length cap; a caller-supplied key over it would otherwise 400 the request.
     if let Some(key) = &req.cache_key {
-        map.insert("prompt_cache_key".into(), json!(key));
+        map.insert(
+            "prompt_cache_key".into(),
+            json!(clamp_prompt_cache_key(key)),
+        );
+    }
+    // Opt into the 24h cache-retention tier (vs the default, shorter one) when the caller asked and the
+    // model's capability entry allows it — mirrors the Anthropic dialect's `cache_long` gating.
+    if req.cache_long && caps.supports_long_cache {
+        map.insert("prompt_cache_retention".into(), json!("24h"));
     }
     map.insert("messages".into(), Value::Array(messages));
     if !req.tools.is_empty() {
@@ -209,8 +260,16 @@ fn map_finish_reason(s: Option<&str>) -> StopReason {
 enum Open {
     None,
     Text,
+    Thinking,
     Tool,
 }
+
+/// The delta field names different OpenAI-compatible endpoints use for reasoning content:
+/// `reasoning_content` (llama.cpp and most providers), `reasoning` (a few others), `reasoning_text`
+/// (a third convention). Checked in this order; first-seen field for a stream wins even if a provider
+/// later echoes the same text on a second field (observed on some gateways) — using both would double
+/// the visible reasoning.
+const REASONING_FIELDS: [&str; 3] = ["reasoning_content", "reasoning", "reasoning_text"];
 
 /// Decodes OpenAI SSE. Synthesizes the block-stop boundaries OpenAI omits and holds `MessageStop`
 /// until `finish()` so it lands after the trailing usage chunk.
@@ -220,6 +279,10 @@ pub struct Decoder {
     open: Open,
     stop_reason: StopReason,
     usage: TokenUsage,
+    /// Which [`REASONING_FIELDS`] entry this stream's reasoning arrives on, once known — remembered
+    /// as the `Thinking` block's `signature` so a later replay (`build_body`) sends it back under the
+    /// exact field name this provider expects (some accept only one of the three).
+    reasoning_field: Option<&'static str>,
 }
 
 impl Default for Decoder {
@@ -230,6 +293,7 @@ impl Default for Decoder {
             open: Open::None,
             stop_reason: StopReason::EndTurn,
             usage: TokenUsage::default(),
+            reasoning_field: None,
         }
     }
 }
@@ -284,9 +348,46 @@ impl StreamDecoder for Decoder {
         };
         let delta = choice.get("delta");
 
+        // Reasoning/thinking content, if this endpoint sends any (see `REASONING_FIELDS`). Checked
+        // before plain text so a reasoning-then-answer turn closes the thinking block cleanly when
+        // text starts, mirroring the Anthropic decoder's thinking-then-text shape.
+        let reasoning_delta = if let Some(field) = self.reasoning_field {
+            delta.and_then(|d| d.get(field)).and_then(Value::as_str)
+        } else {
+            let mut found = None;
+            for field in REASONING_FIELDS {
+                if let Some(text) = delta
+                    .and_then(|d| d.get(field))
+                    .and_then(Value::as_str)
+                    .filter(|t| !t.is_empty())
+                {
+                    self.reasoning_field = Some(field);
+                    found = Some(text);
+                    break;
+                }
+            }
+            found
+        };
+        if let Some(text) = reasoning_delta.filter(|t| !t.is_empty()) {
+            if self.open == Open::None {
+                self.open = Open::Thinking;
+                // The field name becomes the signature once, at the start of the block — `finish`
+                // doesn't need it again, and the accumulator just appends onto one signature string.
+                out.push(StreamEvent::SignatureDelta {
+                    signature: self.reasoning_field.unwrap_or_default().to_string(),
+                });
+            }
+            out.push(StreamEvent::ThinkingDelta {
+                text: text.to_string(),
+            });
+        }
+
         // Plain text content.
         if let Some(text) = delta.and_then(|d| d.get("content")).and_then(Value::as_str) {
             if !text.is_empty() {
+                if self.open == Open::Thinking {
+                    self.close_open(&mut out);
+                }
                 if self.open == Open::None {
                     self.open = Open::Text;
                 }
@@ -649,5 +750,123 @@ data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"partial"},"f
         let mut dec = Decoder::default();
         let err = decode_sse(&mut dec, TRUNCATED).unwrap_err();
         assert!(matches!(err, Error::Transport(_)));
+    }
+
+    #[test]
+    fn decodes_reasoning_content_then_text_and_tool_call() {
+        // `reasoning_content` (llama.cpp / most OpenAI-compatible endpoints): a thinking block should
+        // open, close when text starts, and the field name becomes the block's replay signature.
+        const REASONING: &str = r#"
+data: {"choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"Let me "},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{"reasoning_content":"think."},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{"content":"Answer."},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, REASONING).unwrap();
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::MessageStart,
+                StreamEvent::SignatureDelta {
+                    signature: "reasoning_content".into()
+                },
+                StreamEvent::ThinkingDelta {
+                    text: "Let me ".into()
+                },
+                StreamEvent::ThinkingDelta {
+                    text: "think.".into()
+                },
+                StreamEvent::ContentBlockStop, // thinking closes when text starts
+                StreamEvent::TextDelta {
+                    text: "Answer.".into()
+                },
+                StreamEvent::ContentBlockStop,
+                StreamEvent::MessageStop {
+                    stop_reason: StopReason::EndTurn
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn reasoning_field_wins_first_seen_even_if_a_second_field_also_appears() {
+        // Some gateways (e.g. chutes.ai per the reference agent) echo the same text on both
+        // `reasoning_content` and `reasoning` at once — only the first-seen field should count, or the
+        // text would be duplicated.
+        const DUAL: &str = r#"
+data: {"choices":[{"index":0,"delta":{"reasoning_content":"dup","reasoning":"dup"},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{"reasoning":"-should-be-ignored"},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, DUAL).unwrap();
+        let thinking_text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ThinkingDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thinking_text, "dup");
+    }
+
+    #[test]
+    fn assistant_reasoning_block_replays_under_its_captured_field_name() {
+        let req = ModelRequest::new(
+            "some-oss-reasoning-model",
+            vec![
+                Message::user("solve it"),
+                Message::assistant(vec![
+                    ContentBlock::Thinking {
+                        text: "step one".into(),
+                        signature: "reasoning".into(),
+                    },
+                    ContentBlock::Text { text: "42".into() },
+                ]),
+            ],
+            64,
+        );
+        let body = build_body(&req);
+        assert_eq!(body["messages"][1]["reasoning"], "step one");
+        assert_eq!(body["messages"][1]["content"], "42");
+        // Never invented a field this decoder didn't actually see.
+        assert!(body["messages"][1].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn cache_long_emits_24h_retention_when_supported() {
+        let req = ModelRequest::new("gpt-4o", vec![Message::user("hi")], 64).with_cache_long(true);
+        let body = build_body(&req);
+        assert_eq!(body["prompt_cache_retention"], "24h");
+
+        // Off by default.
+        let req = ModelRequest::new("gpt-4o", vec![Message::user("hi")], 64);
+        assert!(build_body(&req).get("prompt_cache_retention").is_none());
+    }
+
+    #[test]
+    fn prompt_cache_key_is_clamped_to_64_chars() {
+        let long_key = "k".repeat(200);
+        let req = ModelRequest::new("gpt-4o", vec![Message::user("hi")], 64)
+            .with_cache_key(long_key.clone());
+        let body = build_body(&req);
+        let key = body["prompt_cache_key"].as_str().unwrap();
+        assert_eq!(key.len(), 64);
+        assert_eq!(key, &long_key[..64]);
+
+        // A short key passes through untouched.
+        let req =
+            ModelRequest::new("gpt-4o", vec![Message::user("hi")], 64).with_cache_key("short-id");
+        assert_eq!(build_body(&req)["prompt_cache_key"], "short-id");
     }
 }
