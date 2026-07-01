@@ -93,6 +93,22 @@ fn grep_rg_subprocess(bencher: Bencher) {
     });
 }
 
+/// High match-density: a pattern on (nearly) every line, so many hits share one file — the case where
+/// per-hit path allocation dominates. Collects up to the hard cap (~10k hits over ~200 files), so the
+/// alloc columns expose the `Hit` path representation. **Single-threaded on purpose**: divan's alloc
+/// profiler counts the measured thread, so the parallel walk would leave worker-thread allocs
+/// unattributed; `threads=1` keeps every allocation on-thread for a clean number to compare across the
+/// `PathBuf` → `Arc<Path>` change.
+#[divan::bench]
+fn grep_dense(bencher: Bencher) {
+    let root = tree();
+    let job = grep::GrepJob::new("ordinary", false, false, None, root.clone(), 100).unwrap();
+    bencher.bench_local(|| {
+        let (m, _) = grep::search(&job, 1);
+        black_box(m.len());
+    });
+}
+
 /// Our in-process find (fd's `ignore` walk). Sequential — parallelizing regressed on this tree (its
 /// per-file work is too cheap to amortize thread overhead).
 #[divan::bench]

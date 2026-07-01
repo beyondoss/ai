@@ -35,8 +35,10 @@ const MAX_CONTEXT: usize = 100;
 
 pub struct Grep;
 
-/// One reported line: its path, line number, text, and whether it is a match (vs a context line).
-type Hit = (PathBuf, usize, String, bool);
+/// One reported line: its path, line number, text, and whether it is a match (vs a context line). The
+/// path is an `Arc<Path>` so a file with many matches allocates the path **once** and each hit is a
+/// refcount bump, not a fresh `PathBuf` per hit.
+type Hit = (Arc<Path>, usize, String, bool);
 
 /// A prepared grep: ripgrep's regex matcher, an optional file glob, the search root, the report cap,
 /// and how many lines of context to show around each match (`before`/`after`, like ripgrep's
@@ -137,8 +139,10 @@ pub fn search(job: &GrepJob, threads: usize) -> (Vec<Hit>, bool) {
                 }
                 // Collect this file's hits into one local sink, then push once — one lock per matching
                 // file. An I/O error (unreadable file) skips it, like the prior behavior.
+                // One `Arc<Path>` allocation for this file; every hit clones the pointer (refcount
+                // bump), so a match-dense file no longer pays a `PathBuf` per hit.
                 let mut sink = Collector {
-                    path,
+                    path: Arc::from(path),
                     hits: Vec::new(),
                     matches: 0,
                 };
@@ -194,20 +198,20 @@ pub fn search(job: &GrepJob, threads: usize) -> (Vec<Hit>, bool) {
 /// A [`Sink`] that gathers one file's matches and context lines. `matched`/`context` are called by the
 /// searcher with byte-accurate line numbers; bytes are decoded lossily so non-UTF-8 files still yield
 /// readable, matchable text instead of being dropped.
-struct Collector<'a> {
-    path: &'a Path,
+struct Collector {
+    path: Arc<Path>,
     hits: Vec<Hit>,
     matches: usize,
 }
 
-impl Sink for Collector<'_> {
+impl Sink for Collector {
     type Error = std::io::Error;
 
     fn matched(&mut self, _searcher: &Searcher, m: &SinkMatch<'_>) -> std::io::Result<bool> {
         let lineno = m.line_number().map(|n| n as usize).unwrap_or(0);
         let text = String::from_utf8_lossy(m.bytes());
         self.hits
-            .push((self.path.to_path_buf(), lineno, clip(trim_eol(&text)), true));
+            .push((self.path.clone(), lineno, clip(trim_eol(&text)), true));
         self.matches += 1;
         Ok(true)
     }
@@ -215,12 +219,8 @@ impl Sink for Collector<'_> {
     fn context(&mut self, _searcher: &Searcher, c: &SinkContext<'_>) -> std::io::Result<bool> {
         let lineno = c.line_number().map(|n| n as usize).unwrap_or(0);
         let text = String::from_utf8_lossy(c.bytes());
-        self.hits.push((
-            self.path.to_path_buf(),
-            lineno,
-            clip(trim_eol(&text)),
-            false,
-        ));
+        self.hits
+            .push((self.path.clone(), lineno, clip(trim_eol(&text)), false));
         Ok(true)
     }
 }
