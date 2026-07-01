@@ -73,15 +73,26 @@ fn available() -> Vec<&'static Provider> {
 /// Boot the real gateway in `dir`, fronting a REAL upstream with `key` as the managed pool key for
 /// `pool` (and the dev signing key). Returns its port and the child handle (kill it when done).
 fn boot_gateway(dir: &Path, pool: &str, key: &str) -> (u16, Child) {
+    boot_gateway_pools(dir, &[(pool, key)])
+}
+
+/// Like [`boot_gateway`] but registers *several* pool keys, so a single gateway can front more than
+/// one real provider at once — needed to exercise a cross-provider `set_model` switch (Anthropic →
+/// OpenAI) through one gateway, where each dialect's request routes to its own pool.
+fn boot_gateway_pools(dir: &Path, pools: &[(&str, &str)]) -> (u16, Child) {
     let gw_port = free_port();
     let metrics_port = free_port();
+    let pool_keys: String = pools
+        .iter()
+        .map(|(pool, key)| format!("{pool} = \"{key}\"\n"))
+        .collect();
     let config = format!(
         "listen = \"127.0.0.1:{gw_port}\"\n\
          metrics_listen = \"127.0.0.1:{metrics_port}\"\n\
          nats_url = \"nats://127.0.0.1:59321\"\n\
          config_bucket = \"ai-gateway\"\n\
          upstream_tls = true\n\
-         \n[pool_keys]\n{pool} = \"{key}\"\n\
+         \n[pool_keys]\n{pool_keys}\
          \n[signing_keys]\n1 = \"{DEV_PUBKEY_B64}\"\n"
     );
     let config_path = dir.join("gateway.toml");
@@ -622,97 +633,112 @@ fn smoke_chat_completions_dialect_tool_round_trip() {
 /// model's own 200k window still applies on the wire, so nothing 400s — only our local threshold
 /// fires). We drive a few real tool-call turns and assert a `Compacted` event was emitted.
 ///
-/// Anthropic-only by construction (uses `claude-haiku-4-5`), but compaction lives in `agent_core`
-/// above the dialect, so proving it on one provider proves the mechanism.
+/// Compaction lives in `agent_core` above the dialect, so it's provider-agnostic — but the
+/// summarization call still round-trips each provider's wire, so run it against every provider with a
+/// key (the `--context-window` pin is the same regardless of the model's real window).
 #[test]
-#[ignore = "live provider smoke; run via `mise run test:smoke:agent` with ANTHROPIC_API_KEY set"]
+#[ignore = "live provider smoke; run via `mise run test:smoke:agent` with a provider key set"]
 fn smoke_auto_compaction_fires_live() {
-    let Some(key) = env_key("ANTHROPIC_API_KEY") else {
-        eprintln!("smoke[compaction]: ANTHROPIC_API_KEY unset — skipping");
+    let providers = available();
+    if providers.is_empty() {
+        eprintln!("smoke[compaction]: no provider key set — skipping");
         return;
-    };
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("marker.txt"), "PINEAPPLE-7493\n").unwrap();
-    let (gw_port, mut gateway) = boot_gateway(dir.path(), "anthropic", &key);
-
-    // A tiny window with almost no reserve/keep-recent: the system prompt + tool schemas alone push
-    // `last_input_tokens` past `context_window - reserve` after the first real turn, so the *next*
-    // turn compacts its prefix. The model's real window is untouched, so no request 400s.
-    let mut child = serve_child(
-        gw_port,
-        dir.path(),
-        "claude-haiku-4-5",
-        &[
-            "--context-window",
-            "2000",
-            "--compaction-reserve-tokens",
-            "200",
-            "--compaction-keep-recent-tokens",
-            "200",
-        ],
-    );
-    let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
-
-    // Drive several turns; scan every frame across all of them for a `compacted` event. Turn 1 writes
-    // the prefix; a later turn crosses the threshold at its start and compacts.
-    let mut saw_compaction = false;
-    let mut all_frames: Vec<Value> = Vec::new();
-    for prompt in [
-        "Use the read tool to read marker.txt in the current directory, then reply with ONLY the token it contains.",
-        "Use the read tool to read marker.txt again, then reply with ONLY the token.",
-        "Read marker.txt one more time with the read tool and reply with ONLY the token.",
-    ] {
-        writeln!(stdin, "{}", json!({ "type": "prompt", "message": prompt })).unwrap();
-        stdin.flush().unwrap();
-        let frames = read_until_response(&mut stdout, "prompt");
-        if frames
-            .iter()
-            .any(|f| f["type"] == "event" && f["event"]["kind"] == "compacted")
-        {
-            saw_compaction = true;
-        }
-        all_frames.extend(frames);
-        if saw_compaction {
-            break;
-        }
     }
-    drop(stdin);
-    let _ = gateway.kill();
-    let _ = gateway.wait();
-    let _ = child.wait();
+    for p in providers {
+        let key = env_key(p.env).expect("provider key present");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("marker.txt"), "PINEAPPLE-7493\n").unwrap();
+        let (gw_port, mut gateway) = boot_gateway(dir.path(), p.pool, &key);
 
-    let compacted_events: Vec<&Value> = all_frames
-        .iter()
-        .filter(|f| f["type"] == "event" && f["event"]["kind"] == "compacted")
-        .collect();
-    eprintln!("--- compaction events ---\n{compacted_events:?}");
-    assert!(
-        saw_compaction,
-        "auto-compaction should have fired against the real model with a pinned tiny context window \
-         — no `Compacted` event was seen across the driven turns"
-    );
-    // It fired via the auto-*threshold* trigger (not an overflow-retry or a manual `compact`), it
-    // recorded a real pre-compaction context size, and it never *grew* the history. (Note: the count
-    // needn't strictly shrink — compaction replaces the summarized prefix with one summary message, so
-    // when `find_cut` picks a minimal 1-message boundary on a short conversation the count is
-    // unchanged; the load-bearing proof is that the threshold trigger engaged against a live model.)
-    let ev = &compacted_events[0]["event"];
-    assert_eq!(
-        ev["reason"], "threshold",
-        "the live trigger must be the proactive threshold, not overflow/manual: {ev}"
-    );
-    let tokens_before = ev["tokens_before"].as_u64().unwrap_or(0);
-    assert!(
-        tokens_before > 0,
-        "compaction should record the real pre-compaction context size: {ev}"
-    );
-    let before = ev["messages_before"].as_u64().unwrap_or(0);
-    let after = ev["messages_after"].as_u64().unwrap_or(u64::MAX);
-    assert!(
-        after <= before,
-        "compaction must never grow the history (before={before}, after={after}): {ev}"
-    );
+        // A tiny window with almost no reserve/keep-recent: the system prompt + tool schemas alone push
+        // `last_input_tokens` past `context_window - reserve` after the first real turn, so the *next*
+        // turn compacts its prefix. The model's real window is untouched, so no request 400s. The
+        // threshold (window − reserve = 900) sits below *both* providers' real prompt size for a read
+        // round-trip — OpenAI's tokenizer counts the same system+tools prompt at ~1.3k tokens vs
+        // Anthropic's ~2.5k, so a 1800 threshold would clear on Anthropic but never on OpenAI.
+        let mut child = serve_child(
+            gw_port,
+            dir.path(),
+            p.model,
+            &[
+                "--context-window",
+                "1000",
+                "--compaction-reserve-tokens",
+                "100",
+                "--compaction-keep-recent-tokens",
+                "100",
+            ],
+        );
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+        // Drive several turns; scan every frame across all of them for a `compacted` event. Turn 1
+        // writes the prefix; a later turn crosses the threshold at its start and compacts.
+        let mut saw_compaction = false;
+        let mut all_frames: Vec<Value> = Vec::new();
+        for prompt in [
+            "Use the read tool to read marker.txt in the current directory, then reply with ONLY the token it contains.",
+            "Use the read tool to read marker.txt again, then reply with ONLY the token.",
+            "Read marker.txt one more time with the read tool and reply with ONLY the token.",
+        ] {
+            writeln!(stdin, "{}", json!({ "type": "prompt", "message": prompt })).unwrap();
+            stdin.flush().unwrap();
+            let frames = read_until_response(&mut stdout, "prompt");
+            if frames
+                .iter()
+                .any(|f| f["type"] == "event" && f["event"]["kind"] == "compacted")
+            {
+                saw_compaction = true;
+            }
+            all_frames.extend(frames);
+            if saw_compaction {
+                break;
+            }
+        }
+        drop(stdin);
+        let _ = gateway.kill();
+        let _ = gateway.wait();
+        let _ = child.wait();
+
+        let compacted_events: Vec<&Value> = all_frames
+            .iter()
+            .filter(|f| f["type"] == "event" && f["event"]["kind"] == "compacted")
+            .collect();
+        eprintln!(
+            "--- [{}] compaction events ---\n{compacted_events:?}",
+            p.name
+        );
+        assert!(
+            saw_compaction,
+            "[{}] auto-compaction should have fired against the real model with a pinned tiny context \
+             window — no `Compacted` event was seen across the driven turns",
+            p.name
+        );
+        // It fired via the auto-*threshold* trigger (not an overflow-retry or a manual `compact`), it
+        // recorded a real pre-compaction context size, and it never *grew* the history. (Note: the
+        // count needn't strictly shrink — compaction replaces the summarized prefix with one summary
+        // message, so when `find_cut` picks a minimal 1-message boundary on a short conversation the
+        // count is unchanged; the load-bearing proof is that the threshold trigger engaged live.)
+        let ev = &compacted_events[0]["event"];
+        assert_eq!(
+            ev["reason"], "threshold",
+            "[{}] the live trigger must be the proactive threshold, not overflow/manual: {ev}",
+            p.name
+        );
+        let tokens_before = ev["tokens_before"].as_u64().unwrap_or(0);
+        assert!(
+            tokens_before > 0,
+            "[{}] compaction should record the real pre-compaction context size: {ev}",
+            p.name
+        );
+        let before = ev["messages_before"].as_u64().unwrap_or(0);
+        let after = ev["messages_after"].as_u64().unwrap_or(u64::MAX);
+        assert!(
+            after <= before,
+            "[{}] compaction must never grow the history (before={before}, after={after}): {ev}",
+            p.name
+        );
+    }
 }
 
 /// `Error::MaxSteps` is reached against a **real** model, and `run` surfaces it as a non-zero exit —
@@ -774,4 +800,508 @@ fn smoke_max_steps_halts_a_live_run() {
             p.name
         );
     }
+}
+
+/// Shared across providers: the model batches **two** tool calls in **one** turn, and the concurrent
+/// grouped-dispatch path (`agent_core`'s flagship mechanism — bounded `buffer_unordered`, same-write-
+/// target serialization, in-call-order transcript rebuild, all N results folded into one
+/// `tool_result` user turn) round-trips on the real provider wire. Every other smoke prompt is
+/// deliberately single-tool, so this is the only live proof that a real multi-block `tool_result` turn
+/// (the shape Anthropic *requires* and the Responses/ChatCompletions dialects each encode differently)
+/// is accepted end-to-end. Two independent reads reliably elicit a single batched turn from a capable
+/// model; the load-bearing assertion is that some assistant message carries ≥2 `tool_use` blocks.
+#[test]
+#[ignore = "live provider smoke; run via `mise run test:smoke:agent` with a provider key set"]
+fn smoke_concurrent_multi_tool_calls_round_trip() {
+    let providers = available();
+    if providers.is_empty() {
+        eprintln!("smoke[multi-tool]: no provider key set — skipping");
+        return;
+    }
+    for p in providers {
+        let key = env_key(p.env).expect("provider key present");
+        let alpha = "APRICOT-1121";
+        let beta = "DAMSON-8420";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("alpha.txt"), format!("{alpha}\n")).unwrap();
+        std::fs::write(dir.path().join("beta.txt"), format!("{beta}\n")).unwrap();
+        let (gw_port, mut gateway) = boot_gateway(dir.path(), p.pool, &key);
+
+        let mut child = serve_child(gw_port, dir.path(), p.model, &[]);
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+        writeln!(
+            stdin,
+            "{}",
+            json!({ "type": "prompt", "message": "Using the read tool, read BOTH files alpha.txt and beta.txt in the current directory (issue both reads together), then reply with ONLY the two tokens they contain, separated by a single space." })
+        )
+        .unwrap();
+        stdin.flush().unwrap();
+        let frames = read_until_response(&mut stdout, "prompt");
+
+        writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+        stdin.flush().unwrap();
+        let msg_frames = read_until_response(&mut stdout, "get_messages");
+        drop(stdin);
+        let _ = gateway.kill();
+        let _ = gateway.wait();
+        let _ = child.wait();
+
+        let resp = frames
+            .iter()
+            .rev()
+            .find(|f| f["type"] == "response" && f["command"] == "prompt")
+            .expect("a prompt response");
+        assert_eq!(
+            resp["success"], true,
+            "[{}] the run should succeed: {resp}",
+            p.name
+        );
+
+        let messages = &msg_frames.last().unwrap()["data"]["messages"];
+        let dump = messages.to_string();
+        eprintln!("--- [{}] multi-tool transcript ---\n{dump}", p.name);
+        // Both tokens were read and echoed.
+        assert!(
+            dump.contains(alpha) && dump.contains(beta),
+            "[{}] both files should have been read and both tokens echoed.\n{dump}",
+            p.name
+        );
+        // The load-bearing proof: at least one assistant turn carried ≥2 `tool_use` blocks, i.e. the
+        // model batched them and the concurrent-dispatch + single-`tool_result`-turn path handled it.
+        let max_tool_uses_in_a_turn = messages
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .iter()
+            .filter(|m| m["role"] == "assistant")
+            .map(|m| {
+                m["content"]
+                    .as_array()
+                    .map(|blocks| blocks.iter().filter(|b| b["type"] == "tool_use").count())
+                    .unwrap_or(0)
+            })
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_tool_uses_in_a_turn >= 2,
+            "[{}] expected some assistant turn to batch ≥2 tool_use blocks (concurrent dispatch path); \
+             the most any single turn had was {max_tool_uses_in_a_turn}.\n{dump}",
+            p.name
+        );
+    }
+}
+
+/// `abort` cancels a **live** in-flight run — dropping a real `reqwest` stream and killing a real
+/// `bash` subprocess (`kill_on_drop`), then leaving `serve` alive for the next command. The mock test
+/// (`serve_abort_cancels_an_in_flight_prompt`) can't prove the real-network + real-subprocess cleanup;
+/// this does. A `bash sleep 30` gives a wide mid-run window; the aborted prompt must return failure
+/// well under 30s, and a follow-up `get_state` must still answer (the process survived the abort).
+#[test]
+#[ignore = "live provider smoke; run via `mise run test:smoke:agent` with a provider key set"]
+fn smoke_abort_cancels_a_live_run() {
+    use std::time::{Duration, Instant};
+
+    let providers = available();
+    if providers.is_empty() {
+        eprintln!("smoke[abort]: no provider key set — skipping");
+        return;
+    }
+    for p in providers {
+        let key = env_key(p.env).expect("provider key present");
+        let dir = tempfile::tempdir().unwrap();
+        let (gw_port, mut gateway) = boot_gateway(dir.path(), p.pool, &key);
+
+        let mut child = serve_child(gw_port, dir.path(), p.model, &[]);
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+        writeln!(
+            stdin,
+            "{}",
+            json!({ "type": "prompt", "message": "Run this exact shell command with the bash tool: sleep 30. Do not do anything else first." })
+        )
+        .unwrap();
+        stdin.flush().unwrap();
+
+        // Wait for the run to actually reach the bash tool (a real turn: request → stream → tool
+        // start), then abort — so this exercises the mid-tool cancellation path against a live
+        // subprocess.
+        std::thread::sleep(Duration::from_secs(4));
+        writeln!(stdin, "{}", json!({ "type": "abort", "id": "a1" })).unwrap();
+        stdin.flush().unwrap();
+
+        let start = Instant::now();
+        let frames = read_until_response(&mut stdout, "prompt");
+        let elapsed = start.elapsed();
+        eprintln!("--- [{}] abort frames ---\n{frames:#?}", p.name);
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "[{}] abort must cancel the in-flight prompt promptly (well under the 30s sleep), took {elapsed:?}",
+            p.name
+        );
+        let resp = frames
+            .iter()
+            .rev()
+            .find(|f| f["type"] == "response" && f["command"] == "prompt")
+            .expect("a prompt response");
+        assert_eq!(
+            resp["success"], false,
+            "[{}] an aborted prompt reports failure: {resp}",
+            p.name
+        );
+        assert!(
+            frames.iter().any(|f| f["type"] == "response"
+                && f["command"] == "abort"
+                && f["success"] == true),
+            "[{}] the abort command should have been acknowledged: {frames:#?}",
+            p.name
+        );
+
+        // The process must still be serving: a `get_state` after the abort answers.
+        writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
+        stdin.flush().unwrap();
+        let state = read_until_response(&mut stdout, "get_state");
+        assert!(
+            state.iter().any(|f| f["type"] == "response"
+                && f["command"] == "get_state"
+                && f["success"] == true),
+            "[{}] serve must stay alive and answer after an abort: {state:#?}",
+            p.name
+        );
+
+        drop(stdin);
+        let _ = gateway.kill();
+        let _ = gateway.wait();
+        let _ = child.wait();
+    }
+}
+
+/// A `follow_up` queued **mid-run** against a live model is injected at the stop boundary as a fresh
+/// user turn and answered — proving the `Steering` two-lane machinery works against a real streaming
+/// stream, not just `MockTransport` (`serve_follow_up_steers_an_in_flight_run`). A `bash sleep` holds
+/// the first turn open long enough to queue the follow-up; the load-bearing, model-wording-independent
+/// assertions are that the follow-up is acknowledged, a `steered` event fires, and the injected text
+/// lands in the transcript as a real user turn.
+#[test]
+#[ignore = "live provider smoke; run via `mise run test:smoke:agent` with a provider key set"]
+fn smoke_follow_up_injects_into_a_live_run() {
+    use std::time::Duration;
+
+    let providers = available();
+    if providers.is_empty() {
+        eprintln!("smoke[follow-up]: no provider key set — skipping");
+        return;
+    }
+    for p in providers {
+        let key = env_key(p.env).expect("provider key present");
+        let dir = tempfile::tempdir().unwrap();
+        let (gw_port, mut gateway) = boot_gateway(dir.path(), p.pool, &key);
+
+        let mut child = serve_child(gw_port, dir.path(), p.model, &[]);
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+        let follow_up_marker = "LINGONBERRY-5567";
+        writeln!(
+            stdin,
+            "{}",
+            json!({ "type": "prompt", "message": "Run this exact shell command with the bash tool: sleep 5. After it finishes, reply with ONLY the word FIRST." })
+        )
+        .unwrap();
+        stdin.flush().unwrap();
+
+        // Queue the follow-up while the first turn's sleep is running (a wide window in the 5s sleep).
+        std::thread::sleep(Duration::from_secs(2));
+        writeln!(
+            stdin,
+            "{}",
+            json!({ "type": "follow_up", "id": "f1", "message": format!("Now reply with ONLY this exact token: {follow_up_marker}") })
+        )
+        .unwrap();
+        stdin.flush().unwrap();
+
+        let frames = read_until_response(&mut stdout, "prompt");
+        eprintln!("--- [{}] follow-up frames ---\n{frames:#?}", p.name);
+        assert!(
+            frames.iter().any(|f| f["type"] == "response"
+                && f["command"] == "follow_up"
+                && f["success"] == true),
+            "[{}] the follow_up should be acknowledged: {frames:#?}",
+            p.name
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|f| f["type"] == "event" && f["event"]["kind"] == "steered"),
+            "[{}] a `steered` event should fire as the follow-up is injected: {frames:#?}",
+            p.name
+        );
+
+        writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+        stdin.flush().unwrap();
+        let msg_frames = read_until_response(&mut stdout, "get_messages");
+        drop(stdin);
+        let _ = gateway.kill();
+        let _ = gateway.wait();
+        let _ = child.wait();
+
+        let dump = msg_frames.last().unwrap()["data"]["messages"].to_string();
+        assert!(
+            dump.contains(follow_up_marker),
+            "[{}] the follow-up text should have been injected as a real user turn: {dump}",
+            p.name
+        );
+    }
+}
+
+/// A `switch_branch` with `summarize: true` triggers a **real** model summarization of the abandoned
+/// branch (`agent_core::branch_summary_request` → a live model call), which is then persisted. The
+/// mock test (`serve_switch_branch_summarizes_abandoned_activity_and_navigates`) proves the tree
+/// plumbing; this proves the real summarization round-trip produces non-empty, persisted content and
+/// that navigation still lands. Runs against every provider with a key — branch summarization lives in
+/// `agent_core` above the dialect, but the summarization request still round-trips each provider's wire.
+#[test]
+#[ignore = "live provider smoke; run via `mise run test:smoke:agent` with a provider key set"]
+fn smoke_branch_summary_generated_live() {
+    let providers = available();
+    if providers.is_empty() {
+        eprintln!("smoke[branch-summary]: no provider key set — skipping");
+        return;
+    }
+    for p in providers {
+        let key = env_key(p.env).expect("provider key present");
+        let dir = tempfile::tempdir().unwrap();
+        let session_file = dir.path().join("s.jsonl");
+        let (gw_port, mut gateway) = boot_gateway(dir.path(), p.pool, &key);
+
+        let mut child = serve_child(
+            gw_port,
+            dir.path(),
+            p.model,
+            &["--session-file", session_file.to_str().unwrap()],
+        );
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+        // Build a two-turn linear history (no tools — keep it cheap and deterministic).
+        for msg in [
+            "Reply with ONLY the word ONE.",
+            "Reply with ONLY the word TWO.",
+        ] {
+            writeln!(stdin, "{}", json!({ "type": "prompt", "message": msg })).unwrap();
+            stdin.flush().unwrap();
+            read_until_response(&mut stdout, "prompt");
+        }
+
+        // Tagged message ids come back on `get_messages`; navigate back to the first assistant reply,
+        // summarizing the abandoned second turn.
+        writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+        stdin.flush().unwrap();
+        let msg_frames = read_until_response(&mut stdout, "get_messages");
+        let messages = msg_frames.last().unwrap()["data"]["messages"]
+            .as_array()
+            .expect("messages array")
+            .clone();
+        let ids: Vec<String> = messages
+            .iter()
+            .filter_map(|m| m["id"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(
+            ids.len(),
+            messages.len(),
+            "[{}] every message should be tagged with an id for branch navigation: {messages:#?}",
+            p.name
+        );
+        assert!(
+            ids.len() >= 4,
+            "[{}] expected ≥4 messages of history: {ids:?}",
+            p.name
+        );
+        let rewind_to = ids[1].clone();
+
+        writeln!(
+            stdin,
+            "{}",
+            json!({ "type": "switch_branch", "target_id": rewind_to, "summarize": true })
+        )
+        .unwrap();
+        stdin.flush().unwrap();
+        let frames = read_until_response(&mut stdout, "switch_branch");
+        drop(stdin);
+        let _ = gateway.kill();
+        let _ = gateway.wait();
+        let _ = child.wait();
+
+        let resp = frames
+            .iter()
+            .rev()
+            .find(|f| f["type"] == "response" && f["command"] == "switch_branch")
+            .expect("a switch_branch response");
+        eprintln!("--- [{}] switch_branch response ---\n{resp}", p.name);
+        assert_eq!(
+            resp["success"], true,
+            "[{}] switch_branch (with live summarization) should succeed: {resp}",
+            p.name
+        );
+        assert_eq!(resp["data"]["target_id"], rewind_to);
+
+        // The real summary was generated and persisted as a `branch_summary` entry with non-empty text.
+        let raw = std::fs::read_to_string(&session_file).unwrap();
+        let summary_line = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .find(|v| v["type"] == "branch_summary")
+            .expect("a persisted branch_summary entry");
+        eprintln!("--- [{}] branch_summary entry ---\n{summary_line}", p.name);
+        let summary_text = summary_line["summary"]
+            .as_str()
+            .or_else(|| summary_line["text"].as_str())
+            .unwrap_or("");
+        assert!(
+            !summary_text.trim().is_empty(),
+            "[{}] the live branch summary must be non-empty: {summary_line}",
+            p.name
+        );
+    }
+}
+
+/// Cross-provider `set_model` scrubs a signed thinking history so the next request doesn't 400 —
+/// live, through one gateway fronting **both** providers. `agent-core/ARCHITECTURE.md` calls this out
+/// as a correctness landmine: a signed thinking/reasoning block is only replayable to the model that
+/// produced it, so `set_model` calls `strip_thinking_blocks()` before switching. `MockTransport` never
+/// produces a *real* signed block, so only a live test proves the scrub actually prevents a 400 when a
+/// conversation started on Anthropic (with `--thinking`, which emits a signed block) continues on an
+/// OpenAI (Responses-dialect) model. Needs both keys; skips otherwise.
+#[test]
+#[ignore = "live provider smoke; run via `mise run test:smoke:agent` with BOTH ANTHROPIC_API_KEY and OPENAI_API_KEY set"]
+fn smoke_set_model_scrubs_thinking_across_providers() {
+    let (Some(akey), Some(okey)) = (env_key("ANTHROPIC_API_KEY"), env_key("OPENAI_API_KEY")) else {
+        eprintln!(
+            "smoke[set-model]: needs BOTH ANTHROPIC_API_KEY and OPENAI_API_KEY — skipping (this is the only cross-provider smoke)"
+        );
+        return;
+    };
+    let token = "TAMARILLO-4408";
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("marker.txt"), format!("{token}\n")).unwrap();
+    // One gateway, two pools: Anthropic (`/v1/messages`) and OpenAI (`/v1/responses`) route by dialect.
+    let (gw_port, mut gateway) =
+        boot_gateway_pools(dir.path(), &[("anthropic", &akey), ("openai", &okey)]);
+
+    // Start on Anthropic with thinking on so turn 1 produces a *signed* thinking block.
+    let mut child = serve_child(
+        gw_port,
+        dir.path(),
+        "claude-haiku-4-5",
+        &["--thinking", "2000"],
+    );
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "Use the read tool to read marker.txt in the current directory, then reply with ONLY the token it contains." })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let turn1 = read_until_response(&mut stdout, "prompt");
+
+    // Capture the signed thinking blocks turn 1 produced. Their Anthropic signatures are the exact
+    // strings `set_model` must scrub — asserting *these specific values* disappear is robust against
+    // the new provider later producing its own (differently-signed) reasoning block.
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let before = read_until_response(&mut stdout, "get_messages");
+    let before_msgs = before.last().unwrap()["data"]["messages"].clone();
+    let anthropic_sigs: Vec<String> = before_msgs
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m["content"].as_array())
+        .flatten()
+        .filter(|b| b["type"] == "thinking")
+        .filter_map(|b| b["signature"].as_str().map(str::to_string))
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    // Switch to a native OpenAI model (different provider *and* dialect). This scrubs thinking history.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_model", "model": "gpt-5-mini" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let switch = read_until_response(&mut stdout, "set_model");
+
+    // Inspect the history *immediately after the switch, before turn 2* — so no new OpenAI reasoning
+    // block is present yet and the scrub is observed cleanly.
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let mid = read_until_response(&mut stdout, "get_messages");
+    let mid_dump = mid.last().unwrap()["data"]["messages"].to_string();
+
+    // A second turn now runs on OpenAI. If an Anthropic-signed thinking block had survived into this
+    // request, the real OpenAI endpoint would 400 — so success here *is* the scrub working live.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "Reply with ONLY the word done." })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let turn2 = read_until_response(&mut stdout, "prompt");
+    drop(stdin);
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    let _ = child.wait();
+
+    let resp1 = turn1
+        .iter()
+        .rev()
+        .find(|f| f["type"] == "response" && f["command"] == "prompt")
+        .expect("a turn-1 prompt response");
+    let sm = switch
+        .iter()
+        .rev()
+        .find(|f| f["type"] == "response" && f["command"] == "set_model")
+        .expect("a set_model response");
+    let resp2 = turn2
+        .iter()
+        .rev()
+        .find(|f| f["type"] == "response" && f["command"] == "prompt")
+        .expect("a turn-2 prompt response");
+    eprintln!(
+        "--- set_model cross-provider ---\nanthropic_sigs: {anthropic_sigs:?}\nmid: {mid_dump}"
+    );
+
+    assert_eq!(
+        resp1["success"], true,
+        "turn 1 (Anthropic + thinking) should succeed: {resp1}"
+    );
+    assert!(
+        !anthropic_sigs.is_empty(),
+        "turn 1 must have produced a signed thinking block for the scrub to matter: {before_msgs}"
+    );
+    assert_eq!(sm["success"], true, "set_model should succeed: {sm}");
+    assert_eq!(sm["data"]["model"], "gpt-5-mini");
+    // The exact Anthropic-signed thinking blocks are gone after the switch (checked before turn 2 adds
+    // any new provider reasoning), and no thinking block at all remains in the post-switch history.
+    for sig in &anthropic_sigs {
+        assert!(
+            !mid_dump.contains(sig.as_str()),
+            "set_model must scrub the Anthropic-signed thinking block before switching providers; \
+             signature still present: {sig}\nmid: {mid_dump}"
+        );
+    }
+    assert!(
+        !mid_dump.contains("\"thinking\""),
+        "no thinking block should remain in the history immediately after the cross-provider switch: {mid_dump}"
+    );
+    assert_eq!(
+        resp2["success"], true,
+        "turn 2 on OpenAI must NOT 400 — proving the Anthropic-signed thinking block was scrubbed: {resp2}"
+    );
 }
