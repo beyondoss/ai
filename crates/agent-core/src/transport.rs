@@ -23,7 +23,11 @@ pub struct ThinkingConfig {
 /// A provider-neutral reasoning effort level. Maps to OpenAI's `reasoning_effort` parameter on
 /// reasoning models (o-series, gpt-5), and to the `output_config.effort` field of Anthropic's
 /// adaptive-thinking shape on models that take it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `PartialOrd`/`Ord` follow declaration order (`Minimal` lowest, `XHigh` highest) — depended on by
+/// [`crate::models::clamp_reasoning_effort`] to clamp a requested level up/down to whatever a specific
+/// model actually accepts on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ReasoningEffort {
     Minimal,
     Low,

@@ -68,9 +68,9 @@ const VERSION: u32 = 1;
 
 /// How many characters of the first user message a listing preview keeps.
 const PREVIEW_MAX: usize = 80;
-/// How many characters of accumulated user-message text a listing's `search_text` keeps — enough to
-/// substring-match a session by topic without opening every transcript, capped so a huge session
-/// doesn't bloat every listing response.
+/// How many characters of accumulated user-*and*-assistant-message text a listing's `search_text`
+/// keeps — enough to substring-match a session by topic without opening every transcript, capped so a
+/// huge session doesn't bloat every listing response.
 const SEARCH_TEXT_MAX_CHARS: usize = 2_000;
 
 /// Stable identity + metadata for one session, persisted as the file's header line.
@@ -129,10 +129,11 @@ pub struct SessionMeta {
     /// or when the session has no user text yet (e.g. empty, or only tool-result turns so far).
     #[serde(skip)]
     pub preview: Option<String>,
-    /// User-message text accumulated across the whole session (not just the first message), space-
-    /// joined and truncated to [`SEARCH_TEXT_MAX_CHARS`] — a broader surface than `preview` for a
-    /// client to substring/fuzzy-match a session by topic without opening every transcript. Empty
-    /// outside of a listing, or when the session has no user text yet.
+    /// User *and* assistant message text accumulated across the whole session (not just the first
+    /// message, and not just the user's side of it — matching pi's own `allMessagesText`), space-joined
+    /// and truncated to [`SEARCH_TEXT_MAX_CHARS`] — a broader surface than `preview` for a client to
+    /// substring/fuzzy-match a session by topic (including something only the assistant said) without
+    /// opening every transcript. Empty outside of a listing, or when the session has no text yet.
     #[serde(skip)]
     pub search_text: String,
 }
@@ -208,6 +209,13 @@ enum Entry {
         /// for the same reason as `id`.
         #[serde(default)]
         parent_id: Option<String>,
+        /// Unix seconds this message was appended — the content-derived source for a listing's
+        /// `updated_at` (preferred over the file's OS mtime, which a copy/restore/sync elsewhere can
+        /// leave stale or wrong without the content itself having changed). `0` (via `#[serde(default)]`)
+        /// on a legacy file written before this field existed; a reader treats that as "unknown" and
+        /// falls back to mtime, exactly as if the field were absent.
+        #[serde(default)]
+        timestamp: u64,
         #[serde(flatten)]
         message: Message,
     },
@@ -254,6 +262,38 @@ enum Entry {
         /// neighboring `Message` entry purely so this record is self-describing without needing to
         /// cross-reference it.
         summary: String,
+    },
+    /// A record that the active model changed, anchored to whatever message was the tip at the moment
+    /// it did — see [`SessionStore::record_model_change`]/[`SessionStore::model_at`]. `parent_id` here
+    /// means "this change applies immediately *after* this message", not "chain the tip here": unlike
+    /// `Leaf`/`BranchSummary`, this entry never redirects `self.active` — a plain O(1) append, purely a
+    /// lookup record consulted when navigating to a specific point in the tree (`switch_branch`) to
+    /// recover whatever model was actually active on that branch, rather than silently continuing with
+    /// whatever the process's current global setting happens to be.
+    ModelChange {
+        id: String,
+        parent_id: Option<String>,
+        model: String,
+    },
+    /// Same idea as [`Entry::ModelChange`], for the portable `agent_core::ThinkingLevel` (not a raw
+    /// budget override — see [`SessionStore::record_thinking_level_change`]/
+    /// [`SessionStore::thinking_level_at`]).
+    ThinkingLevelChange {
+        id: String,
+        parent_id: Option<String>,
+        level: String,
+    },
+    /// A session rename — see [`SessionStore::set_title`]. Unlike `ModelChange`/`ThinkingLevelChange`,
+    /// this isn't anchored/branch-scoped: a rename applies to the whole session regardless of which
+    /// branch is active, so the most recent one *anywhere in the file* wins (matching pi's own
+    /// `session_info` entries) rather than being looked up per tree point. `id`/`parent_id` still chain
+    /// like every other entry, purely for on-disk provenance/ordering — neither is consulted when
+    /// resolving the effective title. Replaces the old behavior of rewriting the whole file (with every
+    /// message in it) just to update the header's `title` field.
+    TitleChange {
+        id: String,
+        parent_id: Option<String>,
+        title: String,
     },
 }
 
@@ -303,6 +343,13 @@ pub struct BranchInfo {
 struct Node {
     parent_id: Option<String>,
     message: Message,
+    /// Unix seconds this message was actually appended, from [`Entry::Message`]'s own `timestamp`
+    /// field — `0` for a node with no recorded timestamp (a legacy file written before this field
+    /// existed, or a branch-summary-materialized node, which doesn't carry one). See
+    /// [`read_listing`]'s `updated_at` computation for why this exists: a content-derived signal,
+    /// preferred over the file's OS mtime, which a copy/restore/sync that doesn't preserve it exactly
+    /// can leave stale or wrong.
+    timestamp: u64,
 }
 
 /// One node in the session's tree, as reported by [`SessionStore::tree`] — every message (not just the
@@ -388,6 +435,13 @@ pub struct SessionStore {
     /// [`Self::branch_summary_details_within`]) rather than losing them once the prose-only message is
     /// all that's left to scan.
     branch_summary_details: HashMap<String, BranchSummaryDetails>,
+    /// The model in effect immediately after each message id (`None` = before the session's first
+    /// message) — the last [`Entry::ModelChange`] anchored there, if any. See
+    /// [`Self::record_model_change`]/[`Self::model_at`].
+    model_changes: HashMap<Option<String>, String>,
+    /// Same idea as `model_changes`, for the portable thinking level (see [`Entry::ThinkingLevelChange`]/
+    /// [`Self::record_thinking_level_change`]/[`Self::thinking_level_at`]).
+    level_changes: HashMap<Option<String>, String>,
 }
 
 impl SessionStore {
@@ -417,6 +471,8 @@ impl SessionStore {
             nodes: HashMap::new(),
             active: Vec::new(),
             branch_summary_details: HashMap::new(),
+            model_changes: HashMap::new(),
+            level_changes: HashMap::new(),
         })
     }
 
@@ -435,6 +491,8 @@ impl SessionStore {
         let mut tip: Option<String> = None;
         let mut next_synth: u64 = 0;
         let mut branch_summary_details: HashMap<String, BranchSummaryDetails> = HashMap::new();
+        let mut model_changes: HashMap<Option<String>, String> = HashMap::new();
+        let mut level_changes: HashMap<Option<String>, String> = HashMap::new();
 
         let mut reader = BufReader::new(file);
         let mut raw = Vec::new();
@@ -467,6 +525,7 @@ impl SessionStore {
                 Ok(Entry::Message {
                     id,
                     parent_id,
+                    timestamp,
                     message,
                 }) => {
                     // Legacy (pre-tree) migration: a *missing* id is the actual legacy signal — only
@@ -487,7 +546,14 @@ impl SessionStore {
                     } else {
                         parent_id
                     };
-                    nodes.insert(id.clone(), Node { parent_id, message });
+                    nodes.insert(
+                        id.clone(),
+                        Node {
+                            parent_id,
+                            message,
+                            timestamp,
+                        },
+                    );
                     tip = Some(id);
                 }
                 Ok(Entry::Leaf { target_id, .. }) => tip = Some(target_id),
@@ -506,6 +572,11 @@ impl SessionStore {
                         Node {
                             parent_id,
                             message: branch_summary_message(&summary),
+                            // `Entry::BranchSummary` carries no timestamp of its own (out of scope for
+                            // now — see `Node::timestamp`'s doc comment); `read_listing`'s `updated_at`
+                            // computation treats this as "no signal" and falls through to whatever else
+                            // it finds (a later real message, or mtime).
+                            timestamp: 0,
                         },
                     );
                     branch_summary_details.insert(id.clone(), details);
@@ -515,6 +586,26 @@ impl SessionStore {
                 // entry in the file is the real, live message this compaction produced, so this one
                 // must never itself move the tip.
                 Ok(Entry::Compaction { .. }) => {}
+                // Neither moves the tip — a pure lookup record, last-write-wins per anchor (see
+                // `Entry::ModelChange`'s doc comment).
+                Ok(Entry::ModelChange {
+                    parent_id, model, ..
+                }) => {
+                    model_changes.insert(parent_id, model);
+                }
+                Ok(Entry::ThinkingLevelChange {
+                    parent_id, level, ..
+                }) => {
+                    level_changes.insert(parent_id, level);
+                }
+                // Whole-session-scoped, not anchored to `parent_id` — the most recent one in file order
+                // wins, regardless of tree position. `meta` is always `Some` by the time a `TitleChange`
+                // is read, since the header entry is always first.
+                Ok(Entry::TitleChange { title, .. }) => {
+                    if let Some(m) = &mut meta {
+                        m.title = Some(title);
+                    }
+                }
                 // A line that read fully (valid UTF-8, under the size cap) but failed to deserialize as
                 // an `Entry` — a bad line *other* than a torn final write (disk bit rot, a manual edit,
                 // a future `Entry` variant an older binary doesn't know about yet). Unlike the
@@ -548,6 +639,8 @@ impl SessionStore {
                 nodes,
                 active,
                 branch_summary_details,
+                model_changes,
+                level_changes,
             },
             session,
         ))
@@ -589,11 +682,13 @@ impl SessionStore {
         let mut parent = self.active.last().cloned();
         for msg in &messages[self.persisted..] {
             let id = new_id();
+            let timestamp = now_secs();
             write_line(
                 &mut buf,
                 &Entry::Message {
                     id: Some(id.clone()),
                     parent_id: parent.clone(),
+                    timestamp,
                     message: msg.clone(),
                 },
             )?;
@@ -602,6 +697,7 @@ impl SessionStore {
                 Node {
                     parent_id: parent.clone(),
                     message: msg.clone(),
+                    timestamp,
                 },
             ));
             parent = Some(id);
@@ -659,6 +755,7 @@ impl SessionStore {
                 Node {
                     parent_id: parent.clone(),
                     message: m.clone(),
+                    timestamp: now_secs(),
                 },
             ));
             new_active.push(id.clone());
@@ -698,6 +795,11 @@ impl SessionStore {
                 &Entry::Message {
                     id: Some(id.clone()),
                     parent_id: node.parent_id.clone(),
+                    // Preserved nodes write back their own original timestamp — they're being
+                    // physically relocated during the rewrite, not newly created, so re-stamping
+                    // `now_secs()` here would make old content look freshly updated. Freshly
+                    // constructed `new_nodes` above already carry their own real `now_secs()`.
+                    timestamp: node.timestamp,
                     message: node.message.clone(),
                 },
             )?;
@@ -781,6 +883,7 @@ impl SessionStore {
                 Node {
                     parent_id: parent.clone(),
                     message: m.clone(),
+                    timestamp: now_secs(),
                 },
             ));
             parent = Some(id);
@@ -818,6 +921,7 @@ impl SessionStore {
                 &Entry::Message {
                     id: Some(id.clone()),
                     parent_id: node.parent_id.clone(),
+                    timestamp: node.timestamp,
                     message: node.message.clone(),
                 },
             )?;
@@ -942,6 +1046,47 @@ impl SessionStore {
             .collect();
         branches.sort_by(|a, b| a.leaf_id.cmp(&b.leaf_id));
         branches
+    }
+
+    /// The full root-to-leaf message chain of every abandoned branch (every leaf *except* the active
+    /// tip) — the full-content counterpart of [`Self::list_branches`] (which carries only a preview),
+    /// for a caller (HTML export) that wants to render every branch's actual conversation, not just
+    /// the active path. Each entry is `(shared_prefix_len, messages)`: `messages` is the *whole*
+    /// root-to-leaf chain, and `shared_prefix_len` is how many of its leading messages are identical
+    /// (by id, positionally) to the active path's own leading messages — so a caller can render only
+    /// the part that actually diverges, prefixed with a note of where it forked, rather than
+    /// duplicating content already shown as the main transcript. Order is by leaf id, matching
+    /// `list_branches`.
+    pub fn abandoned_branches(&self) -> Vec<(usize, Vec<Message>)> {
+        let parents: HashSet<&str> = self
+            .nodes
+            .values()
+            .filter_map(|n| n.parent_id.as_deref())
+            .collect();
+        let active_tip = self.active.last().map(String::as_str);
+        let mut leaf_ids: Vec<&str> = self
+            .nodes
+            .keys()
+            .map(String::as_str)
+            .filter(|id| !parents.contains(id) && Some(*id) != active_tip)
+            .collect();
+        leaf_ids.sort();
+        leaf_ids
+            .into_iter()
+            .map(|id| {
+                let path = path_from_root(&self.nodes, Some(id));
+                let shared = path
+                    .iter()
+                    .zip(self.active.iter())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                let messages = path
+                    .iter()
+                    .map(|mid| self.nodes[mid].message.clone())
+                    .collect();
+                (shared, messages)
+            })
+            .collect()
     }
 
     /// Every node in the session's tree — every message on every branch, not just the active path
@@ -1069,6 +1214,9 @@ impl SessionStore {
             Node {
                 parent_id: Some(target_id.to_string()),
                 message: branch_summary_message(&summary),
+                // No content-derived timestamp for a materialized branch summary — same scope
+                // boundary as the `Entry::BranchSummary` arm in `open()`.
+                timestamp: 0,
             },
         );
         self.branch_summary_details
@@ -1083,15 +1231,63 @@ impl SessionStore {
         Ok(messages)
     }
 
-    /// Set (and persist) the session title. The title lives in the header so the repo listing can read
-    /// it cheaply, so this rewrites the file (titles change rarely); pass the current messages.
-    pub fn set_title(
-        &mut self,
-        title: impl Into<String>,
-        messages: &[Message],
-    ) -> std::io::Result<()> {
-        self.meta.title = Some(title.into());
-        self.rewrite(messages)
+    /// Record that the active model changed to `model`, anchored to the current active tip — an O(1)
+    /// append (see [`Entry::ModelChange`]'s doc comment), not a rewrite. Call only when the model
+    /// actually changed (the caller compares against its own current value first) — recording a no-op
+    /// change would just bloat the file with a redundant entry.
+    pub fn record_model_change(&mut self, model: &str) -> std::io::Result<()> {
+        let anchor = self.active.last().cloned();
+        let entry = Entry::ModelChange {
+            id: new_id(),
+            parent_id: anchor.clone(),
+            model: model.to_string(),
+        };
+        append_line(&self.path, &entry)?;
+        self.model_changes.insert(anchor, model.to_string());
+        Ok(())
+    }
+
+    /// Same idea as [`Self::record_model_change`], for the portable thinking level (`level` is
+    /// [`agent_core::ThinkingLevel::as_str`]'s wire string, e.g. `"high"`).
+    pub fn record_thinking_level_change(&mut self, level: &str) -> std::io::Result<()> {
+        let anchor = self.active.last().cloned();
+        let entry = Entry::ThinkingLevelChange {
+            id: new_id(),
+            parent_id: anchor.clone(),
+            level: level.to_string(),
+        };
+        append_line(&self.path, &entry)?;
+        self.level_changes.insert(anchor, level.to_string());
+        Ok(())
+    }
+
+    /// The model recorded as active at `target_id` — the most recent [`Entry::ModelChange`] anchored at
+    /// `target_id` itself or any of its ancestors back to the root, if any were ever recorded on this
+    /// branch. `None` means no change was ever recorded reaching this point — the caller should keep
+    /// whatever model is already active (there's nothing branch-specific to restore).
+    pub fn model_at(&self, target_id: &str) -> Option<&str> {
+        change_at(&self.nodes, &self.model_changes, target_id)
+    }
+
+    /// Same idea as [`Self::model_at`], for the portable thinking level.
+    pub fn thinking_level_at(&self, target_id: &str) -> Option<&str> {
+        change_at(&self.nodes, &self.level_changes, target_id)
+    }
+
+    /// Set (and persist) the session title — an O(1) append (see [`Entry::TitleChange`]'s doc
+    /// comment), not a rewrite of the whole file. A rename used to cost a full rewrite (every message
+    /// in the session) just to update the header's `title` field; renaming a long session is now as
+    /// cheap as renaming a brand-new one.
+    pub fn set_title(&mut self, title: impl Into<String>) -> std::io::Result<()> {
+        let title = title.into();
+        let entry = Entry::TitleChange {
+            id: new_id(),
+            parent_id: self.active.last().cloned(),
+            title: title.clone(),
+        };
+        append_line(&self.path, &entry)?;
+        self.meta.title = Some(title);
+        Ok(())
     }
 }
 
@@ -1282,6 +1478,44 @@ impl SessionRepo {
         Ok((store, session))
     }
 
+    /// Fork session `id` at an arbitrary tree entry `entry_id` — anywhere in the *whole* tree, on or
+    /// off whatever the active path currently is, unlike [`fork`](Self::fork)'s active-path-only
+    /// `upto` count. Mirrors pi's `createBranchedSession(leafId)`: `before` (pi's `position:"before"`)
+    /// excludes `entry_id` itself from the forked prefix — forking right before a message the caller
+    /// wants to redo, rather than keep; `false` (pi's `"at"`, the default) includes it. Errors
+    /// (`NotFound`) if `entry_id` names no known message in `id`'s tree.
+    pub fn fork_at_entry(
+        &self,
+        id: &str,
+        entry_id: &str,
+        before: bool,
+    ) -> std::io::Result<(SessionStore, Session)> {
+        let (src, _src_session) = self.open_id(id)?;
+        if !src.nodes.contains_key(entry_id) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no message with id {entry_id} in session {id}"),
+            ));
+        }
+        let mut meta = SessionMeta::new(src.meta.cwd.clone(), src.meta.model.clone());
+        meta.parent = Some(id.to_string());
+        meta.title = src.meta.title.clone();
+
+        let mut store = self.create(meta)?;
+        let mut path = path_from_root(&src.nodes, Some(entry_id));
+        if before {
+            path.pop();
+        }
+        let prefix: Vec<Message> = path
+            .iter()
+            .map(|id| src.nodes[id].message.clone())
+            .collect();
+        store.rewrite(&prefix)?;
+        let mut session = Session::new();
+        session.messages = Arc::new(prefix);
+        Ok((store, session))
+    }
+
     fn find_path(&self, id: &str) -> Option<PathBuf> {
         fs::read_dir(&self.dir).ok()?.flatten().find_map(|e| {
             let path = e.path();
@@ -1405,7 +1639,7 @@ fn scan_listings(
 /// a file that isn't a readable session (no/invalid header, or an unreadable version), matching `list`'s
 /// skip semantics.
 fn read_listing(path: &Path) -> Option<SessionMeta> {
-    let updated_at = mtime_secs(path);
+    let mtime = mtime_secs(path);
     let file = File::open(path).ok()?;
     let mut reader = BufReader::new(file);
     let mut header = String::new();
@@ -1416,6 +1650,8 @@ fn read_listing(path: &Path) -> Option<SessionMeta> {
         Entry::Session(m) => migrate(m, path).ok()?,
         Entry::Message { .. } | Entry::Leaf { .. } | Entry::BranchSummary { .. } => return None,
         Entry::Compaction { .. } => return None,
+        Entry::ModelChange { .. } | Entry::ThinkingLevelChange { .. } => return None,
+        Entry::TitleChange { .. } => return None,
     };
 
     // A streaming line count, not a tree walk: it counts every `Message` line in the file, which for a
@@ -1426,6 +1662,11 @@ fn read_listing(path: &Path) -> Option<SessionMeta> {
     let mut preview = None;
     let mut search_text = String::new();
     let mut search_chars = 0usize;
+    // The most recent stamped `Entry::Message` timestamp seen — preferred over `mtime` below when
+    // any message actually carries one (see `Entry::Message::timestamp`'s doc comment). `0` means
+    // "no stamped message seen" (an all-legacy file, or one with no message lines at all), in which
+    // case `mtime` is the only signal available.
+    let mut max_message_timestamp = 0u64;
     let mut raw = Vec::new();
     loop {
         // Same lenient, skip-just-this-line recovery as `SessionStore::open` (see its comment):
@@ -1450,12 +1691,21 @@ fn read_listing(path: &Path) -> Option<SessionMeta> {
             continue;
         }
         match serde_json::from_str::<Entry>(line) {
-            Ok(Entry::Message { message, .. }) => {
+            Ok(Entry::Message {
+                message, timestamp, ..
+            }) => {
                 message_count += 1;
+                max_message_timestamp = max_message_timestamp.max(timestamp);
                 if let Some(text) = first_user_text(&message) {
                     if preview.is_none() {
                         preview = Some(preview_of(text));
                     }
+                }
+                // The search corpus is broader than the preview: every user *and* assistant message's
+                // text (not just the first user turn) — matching pi's own `allMessagesText`, so a
+                // session is findable by something only the assistant said (a file path it named, an
+                // error it printed), not only by what the user typed.
+                if let Some(text) = message_search_text(&message) {
                     if search_chars < SEARCH_TEXT_MAX_CHARS {
                         if !search_text.is_empty() {
                             search_text.push(' ');
@@ -1468,12 +1718,18 @@ fn read_listing(path: &Path) -> Option<SessionMeta> {
                     }
                 }
             }
-            // A stray header mid-file (or a branch-navigation/summary/compaction-provenance marker) is
-            // ignored.
+            // A stray header mid-file (or a branch-navigation/summary/compaction-provenance/model-or-
+            // thinking-level-change marker) is ignored.
             Ok(Entry::Session(_))
             | Ok(Entry::Leaf { .. })
             | Ok(Entry::BranchSummary { .. })
-            | Ok(Entry::Compaction { .. }) => {}
+            | Ok(Entry::Compaction { .. })
+            | Ok(Entry::ModelChange { .. })
+            | Ok(Entry::ThinkingLevelChange { .. }) => {}
+            // Whole-session-scoped: the most recent one anywhere in the file wins.
+            Ok(Entry::TitleChange { title, .. }) => {
+                meta.title = Some(title);
+            }
             // A fully-read line that failed to deserialize — skip just this one and keep scanning,
             // same relaxed recovery as `SessionStore::open` (see its comment): we know this line's
             // exact boundaries, so one bad line (anywhere in the file, not only a torn tail) no longer
@@ -1484,7 +1740,13 @@ fn read_listing(path: &Path) -> Option<SessionMeta> {
         }
     }
 
-    meta.updated_at = updated_at;
+    // Content-derived timestamp preferred over the file's OS mtime; mtime is only a fallback for a
+    // legacy file with no stamped message (see `Entry::Message::timestamp`'s doc comment).
+    meta.updated_at = if max_message_timestamp > 0 {
+        max_message_timestamp
+    } else {
+        mtime
+    };
     meta.message_count = message_count;
     meta.preview = preview;
     meta.search_text = search_text;
@@ -1501,6 +1763,30 @@ fn first_user_text(msg: &Message) -> Option<&str> {
         ContentBlock::Text { text } => Some(text.as_str()),
         _ => None,
     })
+}
+
+/// Every plain-text block of a user *or* assistant message, space-joined — the broader search-corpus
+/// counterpart of [`first_user_text`] (which looks only at a `User` message's first block, for the
+/// one-line preview). `None` for a tool-result-only turn or a message with no text content at all
+/// (a pure tool-call turn), same as `first_user_text`.
+fn message_search_text(msg: &Message) -> Option<String> {
+    if msg.role != Role::User && msg.role != Role::Assistant {
+        return None;
+    }
+    let joined = msg
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if joined.is_empty() {
+        None
+    } else {
+        Some(joined)
+    }
 }
 
 /// A one-line, length-bounded preview: the first non-blank line of `text`, trimmed, truncated on a char
@@ -1621,6 +1907,54 @@ fn write_line(w: &mut impl Write, entry: &Entry) -> std::io::Result<()> {
     // Defensive: a serialized line must be one physical line.
     debug_assert!(!serde_json::to_string(&v).unwrap_or_default().contains('\n'));
     writeln!(w, "{}", Value::to_string(&v))
+}
+
+/// Append one entry to the session file — an O(1) write, not a rewrite. Same durability posture as
+/// every other append in this module (flush + `sync_all`; the parent directory's own dentry is
+/// unchanged by an append, so no directory fsync is needed here either).
+fn append_line(path: &Path, entry: &Entry) -> std::io::Result<()> {
+    let mut buf = Vec::new();
+    write_line(&mut buf, entry)?;
+    let mut f = OpenOptions::new().append(true).open(path)?;
+    f.write_all(&buf)?;
+    f.flush()?;
+    f.sync_all()
+}
+
+/// Look up the most recent entry in `changes` (keyed by anchor message id, `None` = before the first
+/// message) that was already in effect **at** `target_id` — walking its *strict* ancestor path
+/// root-first (deliberately excluding `target_id` itself) and keeping the last match, so a change
+/// recorded further from the root always wins over an earlier one.
+///
+/// Excluding `target_id` itself is the crux: a change anchored *at* some message `X` means "this
+/// applies to whatever gets appended *after* `X`" (see `record_model_change`'s doc comment) — it
+/// describes `X`'s children, not `X` itself. Querying "what was active when switching to `X`" (the
+/// point of this function — restoring branch-local settings on `switch_branch`) must recover whatever
+/// was true *while `X` was being generated*, i.e. before that change, not after it. Concretely: switch
+/// to a message right before a `set_model` call and this must report the *old* model, not the new one
+/// the (abandoned, or not-yet-taken) next turn would have used.
+///
+/// Known limitation: if two different branches both grow from `X`, a change anchored at `X` is shared
+/// by both (the map has no notion of "which branch"), so a query against a *descendant* on the second
+/// branch can see a stale change actually made on the first. Restoring on `switch_branch` itself is
+/// unaffected (it only ever queries the target being switched *to*, never a descendant of it), so this
+/// only matters for a hypothetical future caller querying arbitrarily deep into a branch that grew
+/// after a restore — accepted as a documented edge case rather than the fuller (and here unwarranted)
+/// fix of threading these changes through the same per-branch chain messages use.
+fn change_at<'a>(
+    nodes: &HashMap<String, Node>,
+    changes: &'a HashMap<Option<String>, String>,
+    target_id: &str,
+) -> Option<&'a str> {
+    let mut last = changes.get(&None).map(String::as_str);
+    let path = path_from_root(nodes, Some(target_id));
+    let ancestors = path.len().saturating_sub(1); // exclude target_id itself
+    for id in &path[..ancestors] {
+        if let Some(v) = changes.get(&Some(id.clone())) {
+            last = Some(v.as_str());
+        }
+    }
+    last
 }
 
 fn now_secs() -> u64 {
@@ -2466,12 +2800,56 @@ mod tests {
         let mut session = Session::new();
         session.user("hi");
         store.append_new(&session.messages).unwrap();
-        store.set_title("My Session", &session.messages).unwrap();
+        store.set_title("My Session").unwrap();
         let metas = repo.list().unwrap();
         let found = metas.iter().find(|m| m.id == id).unwrap();
         assert_eq!(found.title.as_deref(), Some("My Session"));
         // A pure title rewrite drops no messages, so it leaves no compaction provenance.
         assert_eq!(found.compactions, 0);
+    }
+
+    #[test]
+    fn set_title_appends_rather_than_rewriting_the_file() {
+        // The whole point of Track M17: renaming must cost an O(1) append, not a rewrite of every
+        // message already on disk. Prove it directly — the bytes written before the rename are still
+        // there afterward, byte for byte, with the rename's line appended after them.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("hi");
+        store.append_new(&session.messages).unwrap();
+
+        let before = std::fs::read(&store.path).unwrap();
+        store.set_title("Renamed").unwrap();
+        let after = std::fs::read(&store.path).unwrap();
+
+        assert!(
+            after.starts_with(&before),
+            "a rename must only append — every byte written before it must survive unchanged"
+        );
+        assert!(
+            after.len() > before.len(),
+            "the rename must add at least the new TitleChange line"
+        );
+    }
+
+    #[test]
+    fn set_title_last_write_wins_and_survives_reopen() {
+        let dir = tmpdir();
+        let path = dir.path().join("s.jsonl");
+        let mut store = SessionStore::create(path.clone(), SessionMeta::new("/w", "m")).unwrap();
+        store.set_title("First").unwrap();
+        store.set_title("Second").unwrap();
+        assert_eq!(store.meta().title.as_deref(), Some("Second"));
+
+        // Both `SessionStore::open` (the tree-building read) and `read_listing` (the cheap listing
+        // scan) must independently resolve the *last* rename, not the first.
+        let (reopened, _session) = SessionStore::open(path.clone()).unwrap();
+        assert_eq!(reopened.meta().title.as_deref(), Some("Second"));
+
+        let listed = read_listing(&path).unwrap();
+        assert_eq!(listed.title.as_deref(), Some("Second"));
     }
 
     #[test]
@@ -2584,7 +2962,71 @@ mod tests {
     }
 
     #[test]
-    fn search_text_is_capped_and_skips_non_user_content() {
+    fn updated_at_prefers_message_timestamp_over_a_stale_file_mtime() {
+        // A copy/restore/sync that doesn't preserve mtime exactly (or one that's simply wrong) must
+        // not make a session look stale, or falsely fresh, in a listing — the content itself carries
+        // the real signal now.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let id = store.meta().id.clone();
+        let path = repo.path_for(store.meta());
+        let mut session = Session::new();
+        session.user("hello");
+        store.append_new(&session.messages).unwrap();
+
+        // Stomp the file's mtime to something obviously wrong (year-2000-ish) — if `read_listing`
+        // were still trusting mtime, this would leak straight through into `updated_at`.
+        let bogus = std::time::UNIX_EPOCH + std::time::Duration::from_secs(946_684_800);
+        let file = fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(bogus).unwrap();
+        assert_eq!(mtime_secs(&path), 946_684_800, "mtime stomp didn't take");
+
+        let listings = repo.list().unwrap();
+        let l = listings.iter().find(|l| l.id == id).unwrap();
+        assert_ne!(
+            l.updated_at, 946_684_800,
+            "updated_at must not come from the (deliberately wrong) file mtime"
+        );
+        assert!(
+            l.updated_at >= now_secs().saturating_sub(60),
+            "updated_at should reflect the message's own recent timestamp, got {}",
+            l.updated_at
+        );
+    }
+
+    #[test]
+    fn updated_at_falls_back_to_mtime_for_a_legacy_file_with_no_stamped_message() {
+        // A file written before this field existed carries no `timestamp` on its `Entry::Message`
+        // lines at all (not even a `0` — the key is simply absent, same as `id`/`parent_id` on a
+        // pre-tree file). `#[serde(default)]` reads that as `0` ("unknown"), and `read_listing` must
+        // fall back to mtime exactly as if the feature didn't exist for this file.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let meta = SessionMeta::new("/w", "m");
+        let id = meta.id.clone();
+        let path = repo.path_for(&meta);
+        let lines = [
+            serde_json::to_string(&Entry::Session(meta)).unwrap(),
+            "{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}"
+                .to_string(),
+        ];
+        fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        let known_mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(946_684_800);
+        let file = fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(known_mtime).unwrap();
+
+        let listings = repo.list().unwrap();
+        let l = listings.iter().find(|l| l.id == id).unwrap();
+        assert_eq!(
+            l.updated_at, 946_684_800,
+            "with no stamped message, updated_at must fall back to file mtime"
+        );
+    }
+
+    #[test]
+    fn search_text_is_capped() {
         let dir = tmpdir();
         let repo = SessionRepo::open(dir.path()).unwrap();
         let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
@@ -2601,6 +3043,29 @@ mod tests {
             search_text.chars().count()
         );
         assert!(!search_text.contains("this must not appear"));
+    }
+
+    #[test]
+    fn search_text_includes_assistant_replies_not_just_user_turns() {
+        // The whole point of Track M18: a session must be findable by something only the *assistant*
+        // said — matching pi's own `allMessagesText` (which joins every user AND assistant message's
+        // text, not just the user's).
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("what's broken?");
+        session.push(Message::assistant(vec![ContentBlock::Text {
+            text: "the bug is in unique-marker-xyz.rs".into(),
+        }]));
+        store.append_new(&session.messages).unwrap();
+
+        let listings = repo.list().unwrap();
+        assert!(
+            listings[0].search_text.contains("unique-marker-xyz.rs"),
+            "search_text must include assistant text: {:?}",
+            listings[0].search_text
+        );
     }
 
     #[test]
@@ -2819,6 +3284,119 @@ mod tests {
     }
 
     #[test]
+    fn fork_at_entry_works_on_an_off_active_path_branch() {
+        // The whole point of `fork_at_entry` over `fork`'s `upto` count: it can target a message that
+        // isn't on the *current* active path at all, without first `switch_active`-ing to it.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("a");
+        session.user("b");
+        session.user("c");
+        store.append_new(&session.messages).unwrap();
+        let ids = store.active_ids().to_vec();
+
+        // Navigate back to the first message and fork off it with "d" — b/c fall off the active path.
+        let branch_root = store.switch_active(&ids[0]).unwrap();
+        let mut branch_session = Session::new();
+        branch_session.messages = Arc::new(branch_root);
+        branch_session.user("d");
+        store.append_new(&branch_session.messages).unwrap();
+        assert_eq!(store.active_ids().len(), 2); // [a, d]
+
+        let session_id = store.meta().id.clone();
+
+        // Fork "at" b (off-branch) — includes b itself.
+        let (forked, fsession) = repo.fork_at_entry(&session_id, &ids[1], false).unwrap();
+        assert_eq!(fsession.messages.len(), 2);
+        let dump = serde_json::to_string(fsession.messages.as_ref()).unwrap();
+        assert!(dump.contains("\"a\"") && dump.contains("\"b\""));
+        assert!(!dump.contains("\"c\"") && !dump.contains("\"d\""));
+        assert_eq!(forked.meta().parent.as_deref(), Some(session_id.as_str()));
+
+        // Fork "before" c (off-branch) — excludes c itself, same result as forking "at" b.
+        let (_, fsession_before) = repo.fork_at_entry(&session_id, &ids[2], true).unwrap();
+        assert_eq!(fsession_before.messages.len(), 2);
+        let dump = serde_json::to_string(fsession_before.messages.as_ref()).unwrap();
+        assert!(dump.contains("\"a\"") && dump.contains("\"b\""));
+        assert!(!dump.contains("\"c\""));
+
+        // Fork "at" c (off-branch) — includes c itself, the whole original a->b->c line.
+        let (_, fsession_at_c) = repo.fork_at_entry(&session_id, &ids[2], false).unwrap();
+        assert_eq!(fsession_at_c.messages.len(), 3);
+
+        // An unknown entry id is rejected, matching `switch_active`'s own NotFound convention.
+        match repo.fork_at_entry(&session_id, "does-not-exist", false) {
+            Ok(_) => panic!("expected NotFound for an unknown entry id"),
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
+        }
+    }
+
+    #[test]
+    fn model_and_thinking_level_changes_are_branch_scoped() {
+        // A model/thinking-level change recorded on one branch must not leak onto a sibling branch that
+        // never passed through the message it was anchored to — the whole point of H6. A change
+        // anchored *at* a message describes what applies *after* it (children), not the message itself
+        // — switching back to the exact anchor point must NOT see it (that's the point: recovering
+        // whatever was true *before* the change, e.g. before a `set_model` call).
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("a");
+        session.user("b");
+        store.append_new(&session.messages).unwrap();
+        let ids = store.active_ids().to_vec(); // [a, b]
+
+        // Recorded at the tip (b) — a "b"-anchored change, applying to whatever comes after b.
+        store.record_model_change("model-B").unwrap();
+        store.record_thinking_level_change("high").unwrap();
+        assert_eq!(
+            store.model_at(&ids[1]),
+            None,
+            "a change anchored AT b must not apply when querying b itself"
+        );
+        assert_eq!(store.thinking_level_at(&ids[1]), None);
+
+        // Continue past b with "c" — c is b's child, so it must see the change.
+        session.user("c");
+        store.append_new(&session.messages).unwrap();
+        let ids = store.active_ids().to_vec(); // [a, b, c]
+        assert_eq!(
+            store.model_at(&ids[2]),
+            Some("model-B"),
+            "b's own change must propagate forward to its child c"
+        );
+        assert_eq!(store.thinking_level_at(&ids[2]), Some("high"));
+
+        // Branch off *a* (not b) with a new message "d" — this branch never passes through b at all.
+        let branch_root = store.switch_active(&ids[0]).unwrap();
+        let mut branch_session = Session::new();
+        branch_session.messages = Arc::new(branch_root);
+        branch_session.user("d");
+        store.append_new(&branch_session.messages).unwrap();
+        let d_id = store.active_ids()[1].clone();
+
+        assert_eq!(
+            store.model_at(&d_id),
+            None,
+            "the model-B change lives on the a->b->c branch, not the a->d one"
+        );
+        assert_eq!(store.thinking_level_at(&d_id), None);
+        assert_eq!(
+            store.model_at(&ids[0]),
+            None,
+            "a itself has no change recorded strictly before it"
+        );
+
+        // Reopening the file must recover the same lookups from disk (not just in-memory state).
+        let (reopened, _) = repo.open_id(&store.meta().id.clone()).unwrap();
+        assert_eq!(reopened.model_at(&ids[2]), Some("model-B"));
+        assert_eq!(reopened.model_at(&d_id), None);
+    }
+
+    #[test]
     fn switch_active_rejects_unknown_id() {
         let dir = tmpdir();
         let repo = SessionRepo::open(dir.path()).unwrap();
@@ -2883,6 +3461,7 @@ mod tests {
             serde_json::to_string(&Entry::Message {
                 id: Some("m1".into()),
                 parent_id: None,
+                timestamp: 0,
                 message: Message::user("first"),
             })
             .unwrap(),
@@ -2891,6 +3470,7 @@ mod tests {
             serde_json::to_string(&Entry::Message {
                 id: Some("m2".into()),
                 parent_id: Some("m1".into()),
+                timestamp: 0,
                 message: Message::user("second"),
             })
             .unwrap(),
@@ -2899,6 +3479,7 @@ mod tests {
             serde_json::to_string(&Entry::Message {
                 id: Some("m3".into()),
                 parent_id: Some("m1".into()),
+                timestamp: 0,
                 message: Message::user("branched"),
             })
             .unwrap(),
@@ -3224,6 +3805,69 @@ mod tests {
     }
 
     #[test]
+    fn abandoned_branches_reports_the_full_off_path_chain_and_its_shared_prefix() {
+        // Build [a, b, c, d], switch back to `b`, and fork [a, b, e] off it — leaving [c, d] abandoned,
+        // rooted at `b`. `abandoned_branches` must report the *whole* [a, b, c, d] chain (not just
+        // [c, d]) alongside `shared_prefix_len: 2` (it shares [a, b] with the new active path
+        // [a, b, e]), so a caller can choose to skip re-rendering the shared prefix.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("a");
+        session.user("b");
+        session.user("c");
+        session.user("d");
+        store.append_new(&session.messages).unwrap();
+        let ids = store.active_ids().to_vec(); // [a, b, c, d]
+
+        let root = store.switch_active(&ids[1]).unwrap(); // back to b
+        let mut forked = Session::new();
+        forked.messages = Arc::new(root);
+        forked.user("e");
+        store.append_new(&forked.messages).unwrap(); // active path is now [a, b, e]
+
+        // A session with no branches at all reports nothing abandoned.
+        let fresh = repo.create(SessionMeta::new("/w2", "m")).unwrap();
+        assert!(fresh.abandoned_branches().is_empty());
+
+        let abandoned = store.abandoned_branches();
+        assert_eq!(
+            abandoned.len(),
+            1,
+            "exactly one abandoned leaf (d): {abandoned:?}"
+        );
+        let (shared, messages) = &abandoned[0];
+        assert_eq!(
+            *shared, 2,
+            "shares [a, b] with the new active path [a, b, e]"
+        );
+        assert_eq!(
+            messages.len(),
+            4,
+            "the whole [a, b, c, d] chain, not just the divergent suffix"
+        );
+        let texts: Vec<&str> = messages
+            .iter()
+            .map(|m| match &m.content[0] {
+                ContentBlock::Text { text } => text.as_str(),
+                other => panic!("expected a text block, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(texts, vec!["a", "b", "c", "d"]);
+
+        // The active leaf itself must never appear as an "abandoned" branch.
+        let active_tip = store.active_ids().last().cloned().unwrap();
+        assert_eq!(store.list_branches().len(), 2, "d (abandoned) + e (active)");
+        assert!(
+            store
+                .list_branches()
+                .iter()
+                .any(|b| b.leaf_id == active_tip && b.is_active)
+        );
+    }
+
+    #[test]
     fn torn_leaf_write_recovers_to_pre_switch_state() {
         // A crash mid-write during `switch_active`'s append (the `Leaf` marker) must not corrupt the
         // session — the same "only the last entry can be lost" crash-recovery contract
@@ -3309,6 +3953,7 @@ mod tests {
             serde_json::to_string(&Entry::Message {
                 id: Some("m1".into()),
                 parent_id: Some("m2".into()),
+                timestamp: 0,
                 message: Message::user("first"),
             })
             .unwrap(),
@@ -3317,6 +3962,7 @@ mod tests {
             serde_json::to_string(&Entry::Message {
                 id: Some("m2".into()),
                 parent_id: Some("m1".into()),
+                timestamp: 0,
                 message: Message::user("second"),
             })
             .unwrap(),

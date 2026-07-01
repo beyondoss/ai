@@ -17,6 +17,8 @@ use globset::{Glob, GlobMatcher};
 use ignore::WalkBuilder;
 use serde_json::{Value, json};
 
+use super::output::format_path;
+
 /// Default cap on reported paths.
 const DEFAULT_LIMIT: usize = 1000;
 /// Hard ceiling on paths collected before the walk bails — an OOM guard for huge trees. Far above any
@@ -134,7 +136,8 @@ impl Tool for Find {
             .compile_matcher();
 
         let no_match = format!("no files matching {pattern:?}");
-        let job = FindJob::new(matcher, basename_only, PathBuf::from(root), limit);
+        let root = PathBuf::from(root);
+        let job = FindJob::new(matcher, basename_only, root.clone(), limit);
         // The walk blocks (synchronous directory reads); keep it off the async runtime.
         let (paths, truncated) = tokio::task::spawn_blocking(move || search(&job))
             .await
@@ -145,10 +148,11 @@ impl Tool for Find {
         }
         // Write straight into `out` instead of allocating a `format!` temp String per path — same fix
         // as `read`/`ls`/`grep`'s formatting loops. `writeln!` into a `String` can't fail, so the
-        // `Result` is discarded.
+        // `Result` is discarded. Paths are reported relative to the search root (matching pi), not the
+        // full path straight from the walk entry — see `format_path`'s doc comment.
         let mut out = String::new();
         for path in &paths {
-            let _ = writeln!(out, "{}", path.display());
+            let _ = writeln!(out, "{}", format_path(path, &root));
         }
         // The byte cap is checked *before* the result-count marker, and takes priority when both would
         // otherwise fire — see `cap_listing_bytes`'s doc comment.
@@ -187,6 +191,27 @@ mod tests {
         assert!(out.contains("main.rs"));
         assert!(out.contains("lib.rs"));
         assert!(!out.contains("README.md"));
+    }
+
+    #[tokio::test]
+    async fn output_paths_are_relative_to_the_search_root_not_absolute() {
+        // Same fix as grep's: the prior behavior reported the full path straight from the walk entry
+        // (often absolute), costing the model extra tokens for a prefix it already knows and diverging
+        // from pi's documented "relative to search directory" contract.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "").unwrap();
+
+        let out = Find
+            .run(json!({ "pattern": "*.rs", "path": dir.path().to_str().unwrap() }))
+            .await
+            .unwrap()
+            .text;
+        assert_eq!(out.trim_end(), "src/main.rs", "got: {out}");
+        assert!(
+            !out.contains(dir.path().to_str().unwrap()),
+            "the search root's own absolute prefix must not appear in the output: {out}"
+        );
     }
 
     #[tokio::test]

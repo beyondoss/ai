@@ -69,6 +69,16 @@ impl Tool for Edit {
 
         let raw = std::fs::read_to_string(path)
             .map_err(|e| ToolError::Execution(format!("read {path}: {e}")))?;
+        // Fail fast on a read-only file before spending any match/diff work on it (fuzzy matching
+        // does NFKC normalization + ambiguity resolution — real CPU work, not free) — pi's own
+        // `access(path, W_OK)` pre-check, just via a metadata read instead of a syscall that doesn't
+        // exist on every platform Rust targets.
+        let writable = std::fs::metadata(path)
+            .map(|m| !m.permissions().readonly())
+            .unwrap_or(true); // a metadata read failing here is surfaced by the write attempt below
+        if !writable {
+            return Err(ToolError::Execution(format!("{path} is not writable")));
+        }
         // Match in a normalized LF space with the BOM stripped, then restore the file's original
         // line endings + BOM on write. A CRLF file whose `old_string` uses `\n` (the common case)
         // would otherwise never match — a silent, unrecoverable failure.
@@ -217,6 +227,17 @@ fn disambiguate(
 /// unicode dash family → `-`, and the assorted unicode spaces → a plain space. Returns `None` to keep
 /// the char unchanged. (NFKC, applied first by the caller, already folds e.g. nbsp → space; this
 /// catches the cases NFKC leaves alone, like curly quotes and em-dashes.)
+///
+/// Deliberately a superset of pi's own `normalizeForFuzzyMatch` (`edit-diff.ts`), not a port of its
+/// exact table: pi folds quotes `2018/2019/201A/201B` → `'` and `201C/201D/201E/201F` → `"`, dashes
+/// `2010–2015`/`2212` → `-`, and spaces `00A0`/`2002–200A`/`202F`/`205F`/`3000` → ` `. This adds the
+/// prime marks (`2032`/`2035` → `'`, `2033`/`2036` → `"` — a model quoting measurements or citing a
+/// reconstructed string sometimes reaches for a prime instead of an apostrophe), the small/fullwidth
+/// dash forms (`FE58`/`FE63`/`FF0D`), and widens the space range down to `2000`/`2001` (en/em quad)
+/// and to include `1680` (Ogham space mark). Every addition is the same kind of narrowly-scoped,
+/// single-family confusable pi's own set already folds — never two visually-distinct characters
+/// collapsed together — so broadening the net only helps a model's slightly-off `old_string` land; it
+/// can't make two genuinely different characters match each other.
 fn fold_char(c: char) -> Option<char> {
     Some(match c {
         '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' | '\u{2032}' | '\u{2035}' => '\'',
@@ -389,6 +410,32 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn rejects_a_read_only_file_before_doing_any_match_work() {
+        let f = write_tmp("the quick brown fox");
+        let p = f.path().to_str().unwrap();
+        let mut perms = std::fs::metadata(p).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(p, perms).unwrap();
+
+        // `old_string` doesn't even match — if the writability pre-check didn't fire first, this
+        // would fail with "not found" instead of "not writable", proving the check runs before any
+        // match/diff work rather than only surfacing at the final write.
+        let err = Edit
+            .run(json!({ "path": p, "old_string": "does not appear", "new_string": "x" }))
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::Execution(msg) => assert!(msg.contains("not writable"), "got: {msg}"),
+            other => panic!("expected Execution(\"... not writable\"), got {other:?}"),
+        }
+
+        // Restore write permission (owner-only, not world-writable) so the tempfile crate can clean
+        // up the file on drop.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
 
     #[tokio::test]

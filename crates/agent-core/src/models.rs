@@ -85,6 +85,21 @@ pub struct ModelCaps {
     pub supports_eager_tool_streaming: bool,
     /// Which OpenAI-wire API surface the model speaks (ignored for Anthropic ids). See [`ApiKind`].
     pub api: ApiKind,
+    /// The lowest [`crate::transport::ReasoningEffort`] this model's wire actually accepts — a request
+    /// below this floor is clamped up (e.g. `gpt-5.5-pro` rejects both `minimal` and `low`, so its floor
+    /// is `Medium`). Only consulted for a model that takes `reasoning_effort`/adaptive thinking at all;
+    /// meaningless (and unread) otherwise. See [`clamp_reasoning_effort`].
+    pub min_reasoning_effort: crate::transport::ReasoningEffort,
+    /// Whether this model's wire has a distinct `xhigh` tier at all. Several current OpenAI reasoning
+    /// models (o-series, bare/gpt-5.1-family gpt-5) and two Anthropic adaptive models (sonnet-4-6,
+    /// sonnet-5) top out at `high` — requesting `xhigh` there must clamp down to `high`, not send a
+    /// value the provider doesn't recognize. See [`clamp_reasoning_effort`].
+    pub supports_xhigh_reasoning: bool,
+    /// The Anthropic adaptive-thinking wire string for `xhigh`, once [`clamp_reasoning_effort`] has
+    /// confirmed the model supports it at all. Only `claude-opus-4-6` differs (`"max"` — pi: "effort
+    /// 'max' is only valid on Opus 4.6, while Opus 4.7+ and Fable 5 support 'xhigh'"); every other
+    /// adaptive-shape id sends the literal `"xhigh"`. Unread outside `ThinkingShape::Adaptive`.
+    pub adaptive_xhigh_effort_wire: &'static str,
 }
 
 impl ModelCaps {
@@ -102,8 +117,23 @@ impl ModelCaps {
             reasoning_disableable: false,
             supports_eager_tool_streaming: false,
             api: ApiKind::ChatCompletions,
+            min_reasoning_effort: crate::transport::ReasoningEffort::Minimal,
+            supports_xhigh_reasoning: true,
+            adaptive_xhigh_effort_wire: "xhigh",
         }
     }
+}
+
+/// Whether a `gpt-5.*` id's wire has a distinct `xhigh` reasoning tier. True from generation 5.2
+/// onward (`gpt-5.2`/`.3`/`.4`/`.5`, any suffix — codex/pro/spark/chat-latest all included); false for
+/// bare `gpt-5` and every `gpt-5.1` variant, none of which list `xhigh` in pi's live catalogue at all.
+/// Shared across all three `gpt-5` return sites below (chat-latest, the codex-spark special case, and
+/// the general bucket) rather than duplicated per branch.
+fn gpt5_supports_xhigh(m: &str) -> bool {
+    m.starts_with("gpt-5.2")
+        || m.starts_with("gpt-5.3")
+        || m.starts_with("gpt-5.4")
+        || m.starts_with("gpt-5.5")
 }
 
 /// Resolve a model id to its [`ModelCaps`]. Matching is by id prefix (most-specific first); unknown
@@ -143,6 +173,18 @@ pub fn capabilities(model: &str) -> ModelCaps {
             // `thinkingLevelMap: {"off": null}` — there's no "off" wire shape for it at all).
             let reasoning_disableable =
                 !(m.starts_with("claude-fable-5") || m.starts_with("fable-5"));
+            // sonnet-4-6/sonnet-5 carry no `thinkingLevelMap` at all in pi's catalogue, and an unmapped
+            // "xhigh" isn't a value their wire accepts — only opus-4-6/4-7/4-8 and fable-5 do (see
+            // `adaptive_xhigh_effort_wire`'s doc comment).
+            let supports_xhigh_reasoning =
+                !(m.starts_with("claude-sonnet-4-6") || m.starts_with("claude-sonnet-5"));
+            // Only opus-4-6 remaps xhigh to "max"; every other adaptive id that supports it sends the
+            // literal "xhigh" (the field's own default).
+            let adaptive_xhigh_effort_wire = if m.starts_with("claude-opus-4-6") {
+                "max"
+            } else {
+                "xhigh"
+            };
             return ModelCaps {
                 context_window: 1_000_000,
                 max_output,
@@ -154,6 +196,9 @@ pub fn capabilities(model: &str) -> ModelCaps {
                 reasoning_disableable,
                 supports_eager_tool_streaming: true,
                 api: ApiKind::ChatCompletions,
+                min_reasoning_effort: crate::transport::ReasoningEffort::Minimal,
+                supports_xhigh_reasoning,
+                adaptive_xhigh_effort_wire,
             };
         }
 
@@ -187,6 +232,9 @@ pub fn capabilities(model: &str) -> ModelCaps {
                 reasoning_disableable: false,
                 supports_eager_tool_streaming: true,
                 api: ApiKind::ChatCompletions,
+                min_reasoning_effort: crate::transport::ReasoningEffort::Minimal,
+                supports_xhigh_reasoning: true,
+                adaptive_xhigh_effort_wire: "xhigh",
             };
         }
 
@@ -208,6 +256,11 @@ pub fn capabilities(model: &str) -> ModelCaps {
             reasoning_disableable: true,
             supports_eager_tool_streaming: true,
             api: ApiKind::ChatCompletions,
+            // Budget-shape thinking sends a numeric `budget_tokens`, never a named effort string, so
+            // neither field below is ever read for this shape — left at their harmless defaults.
+            min_reasoning_effort: crate::transport::ReasoningEffort::Minimal,
+            supports_xhigh_reasoning: true,
+            adaptive_xhigh_effort_wire: "xhigh",
         };
     }
 
@@ -238,6 +291,11 @@ pub fn capabilities(model: &str) -> ModelCaps {
             reasoning_disableable: true,
             supports_eager_tool_streaming: false,
             api: ApiKind::Responses,
+            min_reasoning_effort: crate::transport::ReasoningEffort::Minimal,
+            // No o-series id carries a `thinkingLevelMap` at all in pi's catalogue, and an unmapped
+            // "xhigh" is excluded from `getSupportedThinkingLevels` — none of them accept it.
+            supports_xhigh_reasoning: false,
+            adaptive_xhigh_effort_wire: "xhigh", // unread: o-series never uses Adaptive shape.
         };
     }
 
@@ -263,6 +321,9 @@ pub fn capabilities(model: &str) -> ModelCaps {
                 reasoning_disableable: false,
                 supports_eager_tool_streaming: false,
                 api: ApiKind::Responses,
+                min_reasoning_effort: crate::transport::ReasoningEffort::Minimal,
+                supports_xhigh_reasoning: gpt5_supports_xhigh(&m),
+                adaptive_xhigh_effort_wire: "xhigh", // unread: this bucket never uses Adaptive shape.
             };
         }
         // "gpt-5.3-codex-spark" is a narrower model than the rest of the family — 128k context, 32k
@@ -280,6 +341,9 @@ pub fn capabilities(model: &str) -> ModelCaps {
                 reasoning_disableable: false,
                 supports_eager_tool_streaming: false,
                 api: ApiKind::Responses,
+                min_reasoning_effort: crate::transport::ReasoningEffort::Minimal,
+                supports_xhigh_reasoning: true,
+                adaptive_xhigh_effort_wire: "xhigh",
             };
         }
         // "-pro" ships a much larger 1.05M context — but only the 5.4/5.5 generation of it;
@@ -306,6 +370,16 @@ pub fn capabilities(model: &str) -> ModelCaps {
             "gpt-5.5",
         ];
         let reasoning_disableable = GPT5_DISABLE_CAPABLE.iter().any(|id| m == *id);
+        // gpt-5.5-pro excludes both "minimal" and "low" (floor: medium); gpt-5.5 excludes just
+        // "minimal" (floor: low) — pi's `thinkingLevelMap` nulls those out explicitly. Every earlier
+        // gpt-5 generation accepts the full ladder from minimal up.
+        let min_reasoning_effort = if m == "gpt-5.5-pro" {
+            crate::transport::ReasoningEffort::Medium
+        } else if m == "gpt-5.5" {
+            crate::transport::ReasoningEffort::Low
+        } else {
+            crate::transport::ReasoningEffort::Minimal
+        };
         return ModelCaps {
             context_window,
             max_output: 128_000,
@@ -317,6 +391,9 @@ pub fn capabilities(model: &str) -> ModelCaps {
             reasoning_disableable,
             supports_eager_tool_streaming: false,
             api: ApiKind::Responses,
+            min_reasoning_effort,
+            supports_xhigh_reasoning: gpt5_supports_xhigh(&m),
+            adaptive_xhigh_effort_wire: "xhigh", // unread: this bucket never uses Adaptive shape.
         };
     }
 
@@ -336,6 +413,10 @@ pub fn capabilities(model: &str) -> ModelCaps {
                 reasoning_disableable: false,
                 supports_eager_tool_streaming: false,
                 api: ApiKind::Responses,
+                // The gpt-4 family never takes `reasoning_effort` at all — these three are unread.
+                min_reasoning_effort: crate::transport::ReasoningEffort::Minimal,
+                supports_xhigh_reasoning: true,
+                adaptive_xhigh_effort_wire: "xhigh",
             };
         }
         // This one pinned snapshot caps output tighter (4096) than every other 4o-family id (16384).
@@ -351,6 +432,10 @@ pub fn capabilities(model: &str) -> ModelCaps {
                 reasoning_disableable: false,
                 supports_eager_tool_streaming: false,
                 api: ApiKind::Responses,
+                // The gpt-4 family never takes `reasoning_effort` at all — these three are unread.
+                min_reasoning_effort: crate::transport::ReasoningEffort::Minimal,
+                supports_xhigh_reasoning: true,
+                adaptive_xhigh_effort_wire: "xhigh",
             };
         }
         // Bare "gpt-4" (no suffix) is the original 8k-context model; 4-turbo caps output tighter than
@@ -377,6 +462,9 @@ pub fn capabilities(model: &str) -> ModelCaps {
             reasoning_disableable: false,
             supports_eager_tool_streaming: false,
             api: ApiKind::Responses,
+            min_reasoning_effort: crate::transport::ReasoningEffort::Minimal,
+            supports_xhigh_reasoning: true,
+            adaptive_xhigh_effort_wire: "xhigh",
         };
     }
 
@@ -487,6 +575,45 @@ fn budget_for_effort(effort: crate::transport::ReasoningEffort, max_output: u32)
         RE::XHigh => 32_000,
     };
     budget.min(max_output.saturating_sub(1).max(1))
+}
+
+/// Clamp a requested [`ReasoningEffort`](crate::transport::ReasoningEffort) to what `caps`'s model
+/// actually accepts on the wire — pi's `clampThinkingLevel`, specialized to the two edges every current
+/// model's exclusions actually trim (never a gap in the middle): a floor (`min_reasoning_effort`, e.g.
+/// `gpt-5.5-pro` rejects `minimal`/`low`) and an `xhigh` ceiling (`supports_xhigh_reasoning`, e.g.
+/// o-series/bare-gpt-5/gpt-5.1\* and Anthropic sonnet-4-6/sonnet-5 top out at `high`). Called by every
+/// dialect at the point it's about to put an effort string on the wire, rather than by
+/// [`thinking_for_level`], so a raw `with_reasoning_effort`/`--reasoning-effort` call (which never goes
+/// through `thinking_for_level`) is clamped too.
+pub fn clamp_reasoning_effort(
+    caps: &ModelCaps,
+    effort: crate::transport::ReasoningEffort,
+) -> crate::transport::ReasoningEffort {
+    use crate::transport::ReasoningEffort as RE;
+    let mut e = effort.max(caps.min_reasoning_effort);
+    if e == RE::XHigh && !caps.supports_xhigh_reasoning {
+        e = RE::High;
+    }
+    e
+}
+
+/// The Anthropic adaptive-thinking `output_config.effort` wire string for a (clamped) reasoning
+/// effort, mirroring pi's `mapThinkingLevelToEffort`: Anthropic's adaptive shape has no `minimal` tier
+/// at all (always sent as `"low"`), and `xhigh` is model-specific (`adaptive_xhigh_effort_wire`) —
+/// everything else is the effort's own name. Only meaningful for `ThinkingShape::Adaptive`; callers
+/// should clamp with [`clamp_reasoning_effort`] first so a model that doesn't support `xhigh` never
+/// reaches this function still holding it.
+pub fn anthropic_adaptive_effort_wire(
+    caps: &ModelCaps,
+    effort: crate::transport::ReasoningEffort,
+) -> &'static str {
+    use crate::transport::ReasoningEffort as RE;
+    match clamp_reasoning_effort(caps, effort) {
+        RE::Minimal | RE::Low => "low",
+        RE::Medium => "medium",
+        RE::High => "high",
+        RE::XHigh => caps.adaptive_xhigh_effort_wire,
+    }
 }
 
 /// Translate a portable `level` into the `(thinking_budget, reasoning_effort)` pair
@@ -955,5 +1082,119 @@ mod tests {
             "OpenAI reasoning models take no budget field"
         );
         assert_eq!(effort, Some(crate::transport::ReasoningEffort::Low));
+    }
+
+    #[test]
+    fn clamp_reasoning_effort_drops_unsupported_xhigh_to_high() {
+        use crate::transport::ReasoningEffort as RE;
+        // o-series, bare/early gpt-5 ids, and sonnet-4-6/sonnet-5 carry no `xhigh` wire value at all in
+        // pi's live catalogue — requesting it must clamp down to `high`, not send an invalid value.
+        for id in [
+            "o3",
+            "o1",
+            "gpt-5",
+            "gpt-5-mini",
+            "gpt-5-codex",
+            "gpt-5-pro",
+            "gpt-5.1",
+            "gpt-5.1-codex",
+            "gpt-5.1-chat-latest",
+            "claude-sonnet-4-6",
+            "claude-sonnet-5",
+        ] {
+            let caps = capabilities(id);
+            assert_eq!(
+                clamp_reasoning_effort(&caps, RE::XHigh),
+                RE::High,
+                "{id} should clamp xhigh down to high"
+            );
+        }
+        // gpt-5.2+ and opus-4-6/4-7/4-8/fable-5 do support xhigh — must pass through unclamped.
+        for id in [
+            "gpt-5.2",
+            "gpt-5.2-codex",
+            "gpt-5.3-codex",
+            "gpt-5.3-codex-spark",
+            "gpt-5.4",
+            "gpt-5.5",
+            "gpt-5.5-pro",
+            "claude-opus-4-6",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-fable-5",
+        ] {
+            let caps = capabilities(id);
+            assert_eq!(
+                clamp_reasoning_effort(&caps, RE::XHigh),
+                RE::XHigh,
+                "{id} should support xhigh"
+            );
+        }
+    }
+
+    #[test]
+    fn clamp_reasoning_effort_raises_below_a_models_floor() {
+        use crate::transport::ReasoningEffort as RE;
+        // gpt-5.5 excludes "minimal"; gpt-5.5-pro excludes "minimal" and "low" too.
+        let gpt55 = capabilities("gpt-5.5");
+        assert_eq!(clamp_reasoning_effort(&gpt55, RE::Minimal), RE::Low);
+        assert_eq!(clamp_reasoning_effort(&gpt55, RE::Low), RE::Low);
+        assert_eq!(clamp_reasoning_effort(&gpt55, RE::Medium), RE::Medium);
+
+        let gpt55_pro = capabilities("gpt-5.5-pro");
+        assert_eq!(clamp_reasoning_effort(&gpt55_pro, RE::Minimal), RE::Medium);
+        assert_eq!(clamp_reasoning_effort(&gpt55_pro, RE::Low), RE::Medium);
+        assert_eq!(clamp_reasoning_effort(&gpt55_pro, RE::Medium), RE::Medium);
+
+        // Every other reasoning model accepts minimal unclamped.
+        for id in ["o3", "gpt-5", "gpt-5.2", "claude-opus-4-8"] {
+            assert_eq!(
+                clamp_reasoning_effort(&capabilities(id), RE::Minimal),
+                RE::Minimal,
+                "{id} should accept minimal unclamped"
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_adaptive_effort_wire_matches_pi_map_thinking_level_to_effort() {
+        use crate::transport::ReasoningEffort as RE;
+        // Anthropic's adaptive shape has no "minimal" tier at all — always sent as "low", on every
+        // adaptive model, not just the ones with an explicit override.
+        for id in [
+            "claude-opus-4-6",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-sonnet-4-6",
+            "claude-sonnet-5",
+            "claude-fable-5",
+        ] {
+            let caps = capabilities(id);
+            assert_eq!(anthropic_adaptive_effort_wire(&caps, RE::Minimal), "low");
+            assert_eq!(anthropic_adaptive_effort_wire(&caps, RE::Low), "low");
+            assert_eq!(anthropic_adaptive_effort_wire(&caps, RE::Medium), "medium");
+            assert_eq!(anthropic_adaptive_effort_wire(&caps, RE::High), "high");
+        }
+        // xhigh is model-specific: opus-4-6 uniquely sends "max"; opus-4-7/4-8/fable-5 send "xhigh"
+        // literally; sonnet-4-6/sonnet-5 have already been clamped to High and so never reach "xhigh"
+        // as an input in practice, but the function must still degrade gracefully if it ever did.
+        assert_eq!(
+            anthropic_adaptive_effort_wire(&capabilities("claude-opus-4-6"), RE::XHigh),
+            "max"
+        );
+        for id in ["claude-opus-4-7", "claude-opus-4-8", "claude-fable-5"] {
+            assert_eq!(
+                anthropic_adaptive_effort_wire(&capabilities(id), RE::XHigh),
+                "xhigh",
+                "{id} should send xhigh literally"
+            );
+        }
+        for id in ["claude-sonnet-4-6", "claude-sonnet-5"] {
+            assert_eq!(
+                anthropic_adaptive_effort_wire(&capabilities(id), RE::XHigh),
+                "high",
+                "{id} has no xhigh wire value; must degrade to high"
+            );
+        }
     }
 }

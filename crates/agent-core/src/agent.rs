@@ -968,9 +968,14 @@ impl Agent {
             }
             Some(turn_start) => {
                 // Split turn: summarize the closed-off history and the in-progress turn's own prefix
-                // separately, concurrently, then stitch them together — rather than collapsing both
-                // under the split-turn template, which is written for a partial turn, not a whole
-                // conversation's worth of already-completed ones.
+                // separately, then stitch them together — rather than collapsing both under the
+                // split-turn template, which is written for a partial turn, not a whole conversation's
+                // worth of already-completed ones. The two calls run *sequentially*, not concurrently
+                // (pi originally ran them concurrently via `Promise.all`, then fixed exactly this in its
+                // own 13-commit-ahead history: "serialize split-turn compaction summaries... so
+                // single-concurrency local providers do not fail with 429 errors" — a self-hosted/local
+                // model behind a one-request-at-a-time server rejects the second of two simultaneous
+                // completions).
                 let turn_prefix_max_tokens = ((self.compaction.summary_max_tokens as f64)
                     * compaction::SPLIT_TURN_PREFIX_SCALE)
                     as u32;
@@ -1008,8 +1013,8 @@ impl Agent {
                     );
                     Ok::<_, Error>(turn_text(&self.run_turn(req, &mut |_| {}, cancel).await?))
                 };
-                let (history, turn_prefix) =
-                    futures::future::try_join(history, turn_prefix).await?;
+                let history = history.await?;
+                let turn_prefix = turn_prefix.await?;
                 compaction::merge_split_summary(&history, &turn_prefix)
             }
         };
@@ -1171,6 +1176,8 @@ const OVERFLOW_PATTERNS: &[&str] = &[
     // Anthropic
     "prompt is too long",
     "request_too_large",
+    // Amazon Bedrock
+    "input is too long for requested model",
     // OpenAI / OpenAI-compatible proxies
     "exceeds the context window",
     "exceeds the model's maximum context length",
@@ -1191,6 +1198,21 @@ const OVERFLOW_PATTERNS: &[&str] = &[
     // Cerebras
     "400 (no body)",
     "413 (no body)",
+    // GitHub Copilot
+    "exceeds the limit of",
+    // llama.cpp server
+    "exceeds the available context size",
+    // LM Studio
+    "greater than the context length",
+    // MiniMax
+    "context window exceeds limit",
+    // Kimi For Coding
+    "exceeded model token limit",
+    // z.ai — normally a silent overflow caught by `compaction::is_hard_overflow` instead (usage vs
+    // window, no error raised at all), but its non-standard `finish_reason` can also surface as text.
+    "model_context_window_exceeded",
+    // Ollama (explicit overflow error; some deployments truncate silently instead)
+    "prompt too long; exceeded",
     // Generic / already covered before this table existed
     "too many tokens",
     "context length exceeded",
@@ -1216,14 +1238,46 @@ fn is_context_overflow(e: &Error) -> bool {
                 || m.contains("window")))
 }
 
+/// In-band provider error *type* strings (`dialect::sse_error`'s `kind` — Anthropic's `error.type`,
+/// OpenAI's `error.type`) seen when a stream dies for a transient, worth-retrying reason. Deliberately
+/// **not** raw HTTP status codes ("429", "500", …): those already have a correct, separate retry path
+/// (`client.rs`'s pre-first-byte retry, on the real status code) — this function only ever sees
+/// mid-stream failures, where the connection already returned 200 and any "500" substring in a message
+/// is far more likely to be an unrelated number (a token count, a byte size) than a status code, so
+/// matching on it here would risk a false positive. Named error-type substrings carry no such
+/// ambiguity. Excludes types that mean "this request will never succeed" (`invalid_request_error`,
+/// `authentication_error`, `permission_error`, `insufficient_quota`, …) — those should fail immediately,
+/// not eat three silent retries.
+const MID_STREAM_RETRYABLE_ERROR_TYPES: &[&str] = &[
+    // Anthropic
+    "rate_limit_error",
+    "api_error",
+    "timeout_error",
+    // OpenAI / OpenAI-compatible
+    "rate_limit_exceeded",
+    "server_error",
+    "internal_error",
+    "service_unavailable",
+];
+
+/// Phrases a provider uses to explicitly say "this specific failure is safe to retry" — pi's own
+/// retry-guidance patterns (`"you can retry your request"` etc., seen from OpenAI Responses/Bedrock).
+const MID_STREAM_RETRY_GUIDANCE_PHRASES: &[&str] = &[
+    "you can retry your request",
+    "please retry your request",
+    "try your request again",
+];
+
 /// Whether a transport error is the "stream died after the request already succeeded" class worth
 /// restarting the turn for:
 /// - a decoder's own truncated-stream rejection (both dialects' `finish()` say "…stream ended
 ///   before…" — see `dialect::anthropic::Decoder::finish`, `dialect::openai::Decoder::finish`),
-/// - an in-band `overloaded_error` event (`dialect::sse_error` prefixes it `"provider stream error:
-///   "`, matched by substring since the exact wrapping is an implementation detail this shouldn't
-///   couple to), or
-/// - a genuine network failure hitting the response body after it started flowing — a connection
+/// - an in-band error event whose type is [`MID_STREAM_RETRYABLE_ERROR_TYPES`] (`overloaded_error`
+///   checked separately below since it predates the table; `dialect::sse_error` prefixes every in-band
+///   error `"provider stream error: "`, matched by substring since the exact wrapping is an
+///   implementation detail this shouldn't couple to) or carries one of
+///   [`MID_STREAM_RETRY_GUIDANCE_PHRASES`],
+/// - or a genuine network failure hitting the response body after it started flowing — a connection
 ///   reset, a read timeout, an unexpected EOF (tagged [`MID_STREAM_NETWORK_ERROR`] by the transport;
 ///   see that constant's doc comment for why a literal marker beats re-deriving the classification
 ///   from a library-specific error's `Display` text).
@@ -1231,7 +1285,14 @@ fn is_context_overflow(e: &Error) -> bool {
 /// A context-overflow rejection is deliberately excluded — that's a *different* signal already
 /// handled by compact-and-retry, not this path — and retrying it here would just fail
 /// identically-shaped again without compacting first.
-fn is_retryable_mid_stream(e: &Error) -> bool {
+///
+/// `pub` (not just `run_turn`-internal): the same classification is what should decide whether a whole
+/// *run* that ended in `Err` — after this per-turn layer already exhausted its own retries — is worth
+/// automatically re-invoking, which is a harness-level (`crates/agent`) concern, not this crate's. An
+/// error this function calls retryable looks exactly as transient one level up as it did here; only the
+/// case (`Error::MaxSteps`/`Error::Cancelled` already return `false` via the `let else` above) differs
+/// by being a legitimate stop, not a fault, either way.
+pub fn is_retryable_mid_stream(e: &Error) -> bool {
     let Error::Transport(msg) = e else {
         return false;
     };
@@ -1242,6 +1303,12 @@ fn is_retryable_mid_stream(e: &Error) -> bool {
     m.contains("stream ended before")
         || m.contains("overloaded")
         || msg.contains(MID_STREAM_NETWORK_ERROR)
+        || MID_STREAM_RETRYABLE_ERROR_TYPES
+            .iter()
+            .any(|p| m.contains(p))
+        || MID_STREAM_RETRY_GUIDANCE_PHRASES
+            .iter()
+            .any(|p| m.contains(p))
 }
 
 /// Exponential backoff for a mid-stream retry: `MID_STREAM_BASE_BACKOFF · 2^(attempt-1)`, capped at
@@ -1758,6 +1825,62 @@ mod tests {
     }
 
     #[test]
+    fn is_context_overflow_detects_bedrock() {
+        assert!(is_context_overflow(&Error::Transport(
+            "ValidationException: Input is too long for requested model.".into()
+        )));
+    }
+
+    #[test]
+    fn is_context_overflow_detects_github_copilot() {
+        assert!(is_context_overflow(&Error::Transport(
+            "prompt token count of 131072 exceeds the limit of 128000".into()
+        )));
+    }
+
+    #[test]
+    fn is_context_overflow_detects_llama_cpp() {
+        assert!(is_context_overflow(&Error::Transport(
+            "the request exceeds the available context size, try increasing it".into()
+        )));
+    }
+
+    #[test]
+    fn is_context_overflow_detects_lm_studio() {
+        assert!(is_context_overflow(&Error::Transport(
+            "tokens to keep from the initial prompt is greater than the context length".into()
+        )));
+    }
+
+    #[test]
+    fn is_context_overflow_detects_minimax() {
+        assert!(is_context_overflow(&Error::Transport(
+            "invalid params, context window exceeds limit".into()
+        )));
+    }
+
+    #[test]
+    fn is_context_overflow_detects_kimi() {
+        assert!(is_context_overflow(&Error::Transport(
+            "Your request exceeded model token limit: 131072 (requested: 200000)".into()
+        )));
+    }
+
+    #[test]
+    fn is_context_overflow_detects_zai() {
+        assert!(is_context_overflow(&Error::Transport(
+            "finish_reason: model_context_window_exceeded".into()
+        )));
+    }
+
+    #[test]
+    fn is_context_overflow_detects_ollama() {
+        assert!(is_context_overflow(&Error::Transport(
+            "prompt too long; exceeded max context length by 4096 tokens".into()
+        )));
+    }
+
+    #[test]
     fn is_context_overflow_excludes_bedrock_throttling_despite_too_many_tokens_substring() {
         // Bedrock's throttling message contains "too many tokens" — the same substring the generic
         // overflow pattern matches — but means "you're sending requests too fast," not "shrink the
@@ -1801,6 +1924,58 @@ mod tests {
             "gateway returned 401: unauthorized".into()
         )));
         assert!(!is_retryable_mid_stream(&Error::Cancelled));
+    }
+
+    #[test]
+    fn is_retryable_mid_stream_recognizes_named_in_band_error_types() {
+        // Anthropic and OpenAI in-band error *types* that mean "transient, safe to retry" — previously
+        // only `overloaded_error` was recognized; a `rate_limit_error`/`server_error`/etc mid-stream
+        // event hard-failed the run instead of retrying like pi does.
+        for msg in [
+            "provider stream error: rate_limit_error: slow down",
+            "provider stream error: api_error: internal error, please try again",
+            "provider stream error: timeout_error: request timed out",
+            "provider stream error: rate_limit_exceeded: slow down",
+            "provider stream error: server_error: boom",
+            "provider stream error: internal_error: boom",
+            "provider stream error: service_unavailable: try later",
+        ] {
+            assert!(
+                is_retryable_mid_stream(&Error::Transport(msg.into())),
+                "expected retryable: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_retryable_mid_stream_recognizes_explicit_retry_guidance_phrases() {
+        for msg in [
+            "provider stream error: server_error: you can retry your request.",
+            "please retry your request or contact support",
+            "an error occurred; try your request again",
+        ] {
+            assert!(
+                is_retryable_mid_stream(&Error::Transport(msg.into())),
+                "expected retryable: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_retryable_mid_stream_still_excludes_permanent_failures() {
+        // These in-band error types mean "this exact request will never succeed" — retrying would just
+        // burn `MAX_MID_STREAM_RETRIES` attempts for nothing.
+        for msg in [
+            "provider stream error: invalid_request_error: missing field 'model'",
+            "provider stream error: authentication_error: invalid api key",
+            "provider stream error: permission_error: not allowed",
+            "provider stream error: insufficient_quota: you exceeded your quota",
+        ] {
+            assert!(
+                !is_retryable_mid_stream(&Error::Transport(msg.into())),
+                "expected NOT retryable: {msg}"
+            );
+        }
     }
 
     #[test]
@@ -2994,6 +3169,88 @@ mod tests {
                     && text.contains("turn prefix summary text")),
             "expected the merged summary, got: {:?}",
             session.messages[0].content
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_runs_the_two_split_turn_summary_calls_sequentially_not_concurrently() {
+        // Regression for the exact bug pi fixed 13 commits after the last audit ("serialize split-turn
+        // compaction summaries... so single-concurrency local providers do not fail with 429 errors"):
+        // the history call and the turn-prefix call must never be in flight at the same time. A
+        // transport that tracks how many calls are simultaneously mid-`stream()` (sleeping, so a
+        // concurrently-dispatched second call has a real chance to overlap) catches a regression back
+        // to `futures::future::try_join`.
+        use std::collections::VecDeque;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct ConcurrencyTrackingTransport {
+            turns: Mutex<VecDeque<Vec<StreamEvent>>>,
+            current: AtomicUsize,
+            max_seen: AtomicUsize,
+        }
+        #[async_trait]
+        impl ModelTransport for ConcurrencyTrackingTransport {
+            async fn stream(&self, _req: ModelRequest) -> Result<crate::transport::EventStream> {
+                let now = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_seen.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                let turn = self
+                    .turns
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("no more scripted turns");
+                self.current.fetch_sub(1, Ordering::SeqCst);
+                Ok(Box::pin(futures::stream::iter(turn.into_iter().map(Ok))))
+            }
+        }
+
+        let session_messages = vec![
+            Message::user("first request"),
+            Message::assistant(vec![ContentBlock::Text {
+                text: "first done".into(),
+            }]),
+            Message::user("second request"),
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "1".into(),
+                name: "read".into(),
+                input: json!({ "path": "a.rs" }),
+            }]),
+            Message::tool_result("1", "contents of a.rs", false),
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "2".into(),
+                name: "edit".into(),
+                input: json!({ "path": "a.rs" }),
+            }]),
+            Message::tool_result("2", "edited", false),
+        ];
+        let mut session = Session::new();
+        session.messages = Arc::new(session_messages);
+
+        let transport = Arc::new(ConcurrencyTrackingTransport {
+            turns: Mutex::new(VecDeque::from(vec![
+                turn::text("history summary text"),
+                turn::text("turn prefix summary text"),
+            ])),
+            current: AtomicUsize::new(0),
+            max_seen: AtomicUsize::new(0),
+        });
+        let agent =
+            Agent::new(transport.clone(), "claude-opus-4-8").with_compaction(CompactionConfig {
+                keep_recent_tokens: 1,
+                ..CompactionConfig::default()
+            });
+        let cancel = CancellationToken::new();
+        agent
+            .compact(&mut session, CompactionReason::Manual, &cancel, &mut |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(
+            transport.max_seen.load(Ordering::SeqCst),
+            1,
+            "the history and turn-prefix summary calls must never be in flight at the same time"
         );
     }
 

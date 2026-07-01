@@ -226,6 +226,7 @@ pub fn build_body(req: &ModelRequest) -> Value {
     // relying on whatever the provider's own undocumented default does when the field is absent.
     if caps.reasoning_effort {
         if let Some(effort) = req.reasoning_effort {
+            let effort = crate::models::clamp_reasoning_effort(&caps, effort);
             map.insert("reasoning_effort".into(), json!(effort.as_str()));
         } else if caps.reasoning_disableable {
             map.insert("reasoning_effort".into(), json!("none"));

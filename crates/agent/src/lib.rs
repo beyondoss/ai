@@ -14,6 +14,7 @@ pub mod resources;
 pub mod serve;
 pub mod session_store;
 pub mod skills;
+pub mod timing;
 pub mod tools;
 #[cfg(test)]
 pub(crate) mod tracing_test;

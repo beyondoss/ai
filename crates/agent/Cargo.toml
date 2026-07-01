@@ -56,6 +56,12 @@ base64 = "0.22"
 # actually accepts are enabled.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 
+# `export_html`'s markdown rendering (headers/bold/lists/code fences) for message text — pure Rust, no
+# vendored JS. Deliberately not paired with a syntax-highlighting crate (e.g. `syntect`): that pulls in
+# several MB of bundled syntax/theme data and would slow every build of this CLI, including `run`/
+# `serve`, which never touch export — see export.rs's module doc comment.
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+
 [dev-dependencies]
 # Scratch files/dirs for the file-tool tests.
 # Bench harness for the search tools. `divan` (the gateway's `bench:unit` pin) measures **allocations**

@@ -22,16 +22,29 @@ pub struct PromptTemplate {
     pub body: String,
 }
 
-/// Discover prompt templates under the user and project roots; project shadows user by name.
-pub fn discover(cwd: &Path) -> Vec<PromptTemplate> {
-    discover_with_diagnostics(cwd).0
+/// Discover prompt templates under the user root, plus the project root when `project_trusted`;
+/// project shadows user by name.
+///
+/// The user root is **never** gated on `project_trusted`, mirroring [`crate::skills::discover`]: it's
+/// the operator's own machine-wide directory, not something the current (possibly untrusted) project
+/// checkout controls. `project_trusted` is a required parameter (not a bool a call site can forget to
+/// pass, or default away) precisely because it's load-bearing for the trust-injection fix this module
+/// shares with `skills.rs`: a project's own `.claude/prompts/*.md` is untrusted repo content, and its
+/// body is injected into the model's context the moment `/name` is invoked (see `expand_if_slash`) —
+/// skipping this gate would silently reopen exactly the prompt-injection vector already closed for
+/// skills.
+pub fn discover(cwd: &Path, project_trusted: bool) -> Vec<PromptTemplate> {
+    discover_with_diagnostics(cwd, project_trusted).0
 }
 
 /// Like [`discover`], but also reports name collisions — the same `/name` defined by more than one
 /// template file, silently shadowed by `discover` (the later root, or the later file within one root,
 /// wins) — as human-readable strings naming both paths, for `get_commands` to surface as a diagnostic
 /// rather than a client having no way to notice a template was shadowed.
-pub fn discover_with_diagnostics(cwd: &Path) -> (Vec<PromptTemplate>, Vec<String>) {
+pub fn discover_with_diagnostics(
+    cwd: &Path,
+    project_trusted: bool,
+) -> (Vec<PromptTemplate>, Vec<String>) {
     let mut found: Vec<PromptTemplate> = Vec::new();
     let mut origins: HashMap<String, PathBuf> = HashMap::new();
     let mut collisions: Vec<String> = Vec::new();
@@ -39,7 +52,9 @@ pub fn discover_with_diagnostics(cwd: &Path) -> (Vec<PromptTemplate>, Vec<String
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
         roots.push(home.join(".claude/prompts"));
     }
-    roots.push(cwd.join(".claude/prompts"));
+    if project_trusted {
+        roots.push(cwd.join(".claude/prompts"));
+    }
 
     for root in roots {
         let Ok(entries) = fs::read_dir(&root) else {
@@ -326,6 +341,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn untrusted_project_never_sees_project_prompt_templates() {
+        // `project_trusted` is a required parameter precisely so a call site can't forget it (see
+        // `discover`'s doc comment) — an untrusted project's own `.claude/prompts/*.md` must never be
+        // discovered (its body is injected into the model's context the moment `/name` is invoked),
+        // mirroring the fix already structural in `skills::discover`.
+        let tmp = tempfile::tempdir().unwrap();
+        let pdir = tmp.path().join(".claude/prompts");
+        fs::create_dir_all(&pdir).unwrap();
+        fs::write(
+            pdir.join("untrusted-only.md"),
+            "This body must never reach an untrusted project's model context.",
+        )
+        .unwrap();
+
+        let trusted = discover(tmp.path(), true);
+        assert!(
+            trusted.iter().any(|t| t.name == "untrusted-only"),
+            "sanity check: the template must be discoverable when trusted"
+        );
+
+        let untrusted = discover(tmp.path(), false);
+        assert!(
+            !untrusted.iter().any(|t| t.name == "untrusted-only"),
+            "an untrusted project's own prompt templates must not be discovered: {untrusted:?}"
+        );
+
+        // Expansion must fall through unchanged too — nothing to expand if it was never discovered.
+        assert_eq!(
+            expand_if_slash("/untrusted-only", &untrusted),
+            "/untrusted-only"
+        );
+    }
+
+    #[test]
     fn discovers_and_expands_template() {
         let tmp = tempfile::tempdir().unwrap();
         let pdir = tmp.path().join(".claude/prompts");
@@ -338,7 +387,7 @@ mod tests {
 
         // `discover` also scans the developer's real `~/.claude/prompts`; assert on our template by
         // name rather than the total count.
-        let templates = discover(tmp.path());
+        let templates = discover(tmp.path(), true);
         let fix = templates
             .iter()
             .find(|t| t.name == "fix")
@@ -362,7 +411,7 @@ mod tests {
         // in principle carry a same-named file — vanishingly unlikely for this fixture's name, and
         // consistent with how this module's other `discover` (not `discover_in`) tests already accept
         // scanning the real user root.
-        let (_, collisions) = discover_with_diagnostics(tmp.path());
+        let (_, collisions) = discover_with_diagnostics(tmp.path(), true);
         assert!(
             !collisions.iter().any(|c| c.contains("solo")),
             "got: {collisions:?}"

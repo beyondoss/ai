@@ -48,7 +48,7 @@ pub use message::{
 pub use mock::MockTransport;
 pub use models::{ModelCaps, ThinkingLevel, capabilities, thinking_for_level};
 pub use session::Session;
-pub use steering::Steering;
+pub use steering::{QueueMode, Steering};
 pub use tool::{Tool, ToolOutput, ToolProgress, ToolRegistry, ToolUpdate};
 pub use transport::{ModelRequest, ModelTransport, ReasoningEffort, ToolChoice};
 pub use write_lock::WriteLockRegistry;

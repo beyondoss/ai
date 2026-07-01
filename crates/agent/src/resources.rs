@@ -14,7 +14,9 @@ use crate::skills::{self, Skill};
 pub struct PromptOptions<'a> {
     /// The base agent identity/instructions. A `SYSTEM.md` on disk (project, then user) overrides it.
     pub base: &'a str,
-    /// Extra text appended after the base (e.g. `--append-system-prompt`).
+    /// Extra text appended after the base (e.g. `--append-system-prompt`). When `None`, an on-disk
+    /// `APPEND_SYSTEM.md` (project, then user — same discovery/trust order as `SYSTEM.md`) is used
+    /// instead, if one exists; an explicit `append` here wins outright rather than combining with it.
     pub append: Option<&'a str>,
     /// The working directory whose project-instruction files and skills to load.
     pub cwd: &'a Path,
@@ -25,11 +27,12 @@ pub struct PromptOptions<'a> {
     /// `false` to skip touching the developer's actual `~/.claude/skills`.
     pub include_skills: bool,
     /// Whether `cwd` is a trusted project (an explicit `--trust-project`/RPC override, or recorded in
-    /// `TrustStore`). Gates the *project-local* `SYSTEM.md` override and the project-local skills root
-    /// (`<cwd>/.claude/skills`, see `skills::discover`) — an untrusted checkout can't replace the
-    /// agent's identity or inject its own skills just by shipping the files (see `crate::trust_store`).
-    /// The user-global `~/.claude/SYSTEM.md` override and `~/.claude/skills` are unaffected either way:
-    /// they're the operator's own machine, not something a repo checkout controls.
+    /// `TrustStore`). Gates the *project-local* `SYSTEM.md`/`APPEND_SYSTEM.md` overrides and the
+    /// project-local skills root (`<cwd>/.claude/skills`, see `skills::discover`) — an untrusted
+    /// checkout can't replace or extend the agent's identity or inject its own skills just by shipping
+    /// the files (see `crate::trust_store`). The user-global `~/.claude/SYSTEM.md`/`APPEND_SYSTEM.md`
+    /// overrides and `~/.claude/skills` are unaffected either way: they're the operator's own machine,
+    /// not something a repo checkout controls.
     pub project_trusted: bool,
 }
 
@@ -54,9 +57,13 @@ pub fn build_static_system_prompt(opts: &PromptOptions) -> String {
     // same). Absent one, the caller-supplied `base` stands.
     let mut s = system_prompt_override(opts.cwd, opts.project_trusted)
         .unwrap_or_else(|| opts.base.to_string());
-    if let Some(extra) = opts.append {
+    let append = opts
+        .append
+        .map(str::to_string)
+        .or_else(|| append_system_prompt_override(opts.cwd, opts.project_trusted));
+    if let Some(extra) = append {
         s.push_str("\n\n");
-        s.push_str(extra);
+        s.push_str(&extra);
     }
 
     if opts.include_context_files {
@@ -105,12 +112,29 @@ pub fn dynamic_footer(cwd: &Path) -> String {
 /// exists but isn't trusted (falls through to the global candidate exactly as if the project file were
 /// simply absent — no different fallback than the untrusted-file-doesn't-exist case).
 fn system_prompt_override(cwd: &Path, project_trusted: bool) -> Option<String> {
+    discover_claude_file(cwd, project_trusted, "SYSTEM.md")
+}
+
+/// An `APPEND_SYSTEM.md` on disk (same project-then-user discovery/trust order as `SYSTEM.md`) is
+/// additive rather than a replacement: its contents are appended after the base/override system prompt.
+/// Only consulted when the caller didn't already supply an explicit `append` (e.g.
+/// `--append-system-prompt`) — an explicit override wins outright rather than combining with the
+/// on-disk file, matching pi's `resource-loader.ts` (`appendSystemPromptSource ?? discovered`).
+fn append_system_prompt_override(cwd: &Path, project_trusted: bool) -> Option<String> {
+    discover_claude_file(cwd, project_trusted, "APPEND_SYSTEM.md")
+}
+
+/// Shared project-then-user `.claude/<filename>` discovery: project-local (only when `project_trusted`)
+/// takes precedence over the user-global one (always eligible — it's the operator's own machine).
+/// Returns `None` when neither exists / is blank / the project one exists but isn't trusted (falls
+/// through to the global candidate exactly as if the project file were simply absent).
+fn discover_claude_file(cwd: &Path, project_trusted: bool, filename: &str) -> Option<String> {
     let mut candidates = Vec::new();
     if project_trusted {
-        candidates.push(cwd.join(".claude/SYSTEM.md"));
+        candidates.push(cwd.join(".claude").join(filename));
     }
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        candidates.push(home.join(".claude/SYSTEM.md"));
+        candidates.push(home.join(".claude").join(filename));
     }
     for path in candidates {
         if let Ok(body) = fs::read_to_string(&path) {
@@ -439,6 +463,68 @@ mod tests {
         });
         assert!(prompt.contains("DEFAULT IDENTITY"));
         assert!(!prompt.contains("MALICIOUS OVERRIDE"));
+    }
+
+    #[test]
+    fn append_system_md_is_appended_when_trusted_and_no_explicit_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(claude_dir.join("APPEND_SYSTEM.md"), "EXTRA HOUSE RULES").unwrap();
+
+        let prompt = build_system_prompt(&PromptOptions {
+            base: "DEFAULT IDENTITY",
+            append: None,
+            cwd: tmp.path(),
+            include_context_files: false,
+            include_skills: false,
+            project_trusted: true,
+        });
+        assert!(prompt.contains("DEFAULT IDENTITY"));
+        assert!(
+            prompt.contains("EXTRA HOUSE RULES"),
+            "a trusted project's on-disk APPEND_SYSTEM.md must be appended to the system prompt"
+        );
+    }
+
+    #[test]
+    fn append_system_md_is_ignored_when_project_is_untrusted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(claude_dir.join("APPEND_SYSTEM.md"), "MALICIOUS EXTRA RULES").unwrap();
+
+        let prompt = build_system_prompt(&PromptOptions {
+            base: "DEFAULT IDENTITY",
+            append: None,
+            cwd: tmp.path(),
+            include_context_files: false,
+            include_skills: false,
+            project_trusted: false,
+        });
+        assert!(!prompt.contains("MALICIOUS EXTRA RULES"));
+    }
+
+    #[test]
+    fn explicit_append_wins_outright_over_on_disk_append_system_md() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(claude_dir.join("APPEND_SYSTEM.md"), "ON-DISK APPEND").unwrap();
+
+        let prompt = build_system_prompt(&PromptOptions {
+            base: "DEFAULT IDENTITY",
+            append: Some("CLI APPEND"),
+            cwd: tmp.path(),
+            include_context_files: false,
+            include_skills: false,
+            project_trusted: true,
+        });
+        assert!(prompt.contains("CLI APPEND"));
+        assert!(
+            !prompt.contains("ON-DISK APPEND"),
+            "an explicit --append-system-prompt must win outright, not combine with the on-disk file"
+        );
     }
 
     #[test]

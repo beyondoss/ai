@@ -28,7 +28,14 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   next task or redirect a busy agent between tool turns without waiting for it to stop. A **refusal**
   (`StopReason::Refusal`) is a distinct terminal condition: the run ends immediately without draining
   either lane, since injecting a new turn right after a refusal would likely just be refused again — the
-  queue is left intact for whatever run reads the same `Steering` handle next.
+  queue is left intact for whatever run reads the same `Steering` handle next. How much of a lane one
+  drain call consumes is `QueueMode` (`Steering::set_mode`/`mode`): `OneAtATime` (the default, matching
+  pi's `PendingMessageQueue`) takes only the oldest queued message, leaving the rest queued for the
+  *next* drain point, so several messages queued in quick succession land as separate turns; `All`
+  folds everything queued into one injection (this crate's original behavior, still available).
+  `Steering::pending_count` peeks the combined depth of both lanes without draining either — pi's
+  `pendingMessageCount` — for a host surface (e.g. `serve`'s `get_state`) that wants to report queue
+  depth to a client.
 - **Graceful stop** — `Steering::request_stop` (pi's `shouldStopAfterTurn` equivalent) sets a flag
   checked at every turn boundary, *after* that turn's tool calls (if any) have already run and their
   results are committed to the session, but before the next model call would start. It wins over both
@@ -78,7 +85,13 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   reasoning_effort)` pair `with_thinking`/`with_reasoning_effort` need for a *specific* model — setting
   both together for `Adaptive` shape (the budget is a pure on/off gate there; `output_config.effort`
   carries the real depth), only `reasoning_effort` for OpenAI reasoning models, only a scaled budget for
-  `Budget` shape.
+  `Budget` shape. Whatever `ReasoningEffort` reaches a dialect — via `thinking_for_level` or a raw
+  `with_reasoning_effort`/`--reasoning-effort` call — is clamped there to what the specific model's wire
+  actually accepts (`models::clamp_reasoning_effort`): several OpenAI reasoning models (o-series, bare
+  gpt-5, every gpt-5.1 variant) and two Anthropic adaptive ids (sonnet-4-6, sonnet-5) have no `xhigh`
+  tier and clamp down to `high`; `gpt-5.5`/`gpt-5.5-pro` reject `minimal`(+`low`) and clamp up. Anthropic
+  adaptive additionally has no `minimal` wire tier at all (always sent as `"low"`) and remaps `xhigh` per
+  model (`"max"` on `claude-opus-4-6` uniquely; `"xhigh"` elsewhere) via `models::anthropic_adaptive_effort_wire`.
 - **Model capabilities** — [`models::capabilities`](src/models.rs) maps a model id (by prefix) to a
   minimal `ModelCaps` table (context window, max output, `max_tokens` vs `max_completion_tokens` field,
   long-cache support, vision, thinking shape, reasoning-effort, explicit-disable capability, eager
@@ -127,10 +140,17 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   `Retry-After`) up to the first byte; a mid-stream `event: error` or truncated stream surfaces as
   `Error::Transport` (the SSE decoder's `finish` returns `Result`), which `Agent::run_turn` retries with
   backoff (`is_retryable_mid_stream`, capped at `MAX_MID_STREAM_RETRIES`) from a fresh connection and
-  a fresh `Accumulator`, rather than resuming a dead attempt's partial blocks. `Agent::with_auto_retry`
-  (default enabled) disables this specific layer — a normally-retried failure surfaces on the very
-  first attempt instead — for debugging a flaky connection without several silent attempts first;
-  `GatewayClient`'s own pre-first-byte retry above is unaffected either way.
+  a fresh `Accumulator`, rather than resuming a dead attempt's partial blocks. Beyond the decoder's own
+  truncation rejection and a tagged network failure (`MID_STREAM_NETWORK_ERROR`),
+  `is_retryable_mid_stream` recognizes a table of named in-band provider error *types*
+  (`MID_STREAM_RETRYABLE_ERROR_TYPES` — Anthropic's `rate_limit_error`/`api_error`/`timeout_error`,
+  OpenAI's `rate_limit_exceeded`/`server_error`/`internal_error`/`service_unavailable`) and explicit
+  provider retry-guidance phrases (`MID_STREAM_RETRY_GUIDANCE_PHRASES`), deliberately keyed on names
+  rather than raw HTTP status-code substrings ("500" et al.) — a mid-stream failure never carries a
+  fresh status code to key on, and a bare digit substring risks matching an unrelated number in the
+  message. `Agent::with_auto_retry` (default enabled) disables this specific layer — a normally-retried
+  failure surfaces on the very first attempt instead — for debugging a flaky connection without several
+  silent attempts first; `GatewayClient`'s own pre-first-byte retry above is unaffected either way.
 - **Cache observability** — `StreamEvent::Usage` carries `TokenUsage` (input/output + cache-read/write
   - reasoning); both decoders populate it, and `Session` folds the cumulative totals + `last_input_tokens`.
 - **Lifecycle events** — `AgentEvent` adds `AgentStart`/`TurnStart`/`Steered`/`AgentEnd`/`Compacted`/`Error`.
@@ -155,6 +175,17 @@ adding one would mean taking on loading/sandboxing/versioning machinery with no 
 directly against this project's minimum-effective-abstraction bias. If a genuine need for third-party
 extensibility ever appears, revisit this as a deliberate, scoped addition rather than bolting hooks on
 piecemeal.
+
+Two specific extension points pi's harness has and this crate deliberately doesn't: an ephemeral
+per-request context transform (rewrite/prune the outbound message list for one call without persisting
+the change — pi's `transformContext`) and a before/after-provider-request seam (patch headers/timeout
+per call, mutate the raw wire payload, observe raw response status/headers). Both are real seams in
+pi's *extension* system specifically — they exist to let a runtime-loaded, third-party plugin reach
+into the request pipeline. Since this crate has no such plugin system (see above) and no first-party
+caller has ever needed either seam, adding them now would be exactly the same mistake: machinery with
+no concrete consumer. If a real need appears — a caller that wants to inject transient context, or
+observe/rewrite the wire below `ModelRequest`/`StreamEvent` — add the narrowest seam that call actually
+needs then, not a general-purpose hook ahead of time.
 
 ## Data Flow
 
@@ -505,7 +536,7 @@ cross-provider thinking history) degrades to plain text instead of erroring.
 | `compaction.rs`               | Context compaction: trigger, cut-point search, summary-prompt build, file-op extraction, and incremental update (`previous_summary`/`SUMMARY_MARKER` fold-forward) — the network-free half of `Agent::compact`                                                                                                                                                                             |
 | `models.rs`                   | `capabilities(model) -> ModelCaps`: minimal per-model wire table (max-tokens field, long-cache, vision, thinking shape, reasoning-effort, context window), matched by id prefix; consumed by the dialects and `Agent::new`                                                                                                                                                                 |
 | `hooks.rs`                    | `AgentHooks` interception trait (`before_tool_call`/`after_tool_call`, both cancellation-aware) + `NoHooks` default                                                                                                                                                                                                                                                                        |
-| `steering.rs`                 | `Steering` — two shared queues: `push_steer` (mid-run, folded onto the tool-results turn) and `push`/follow-up (injected at would-stop boundaries); plus `request_stop`/`take_stop_requested`, a graceful-stop flag checked at turn boundaries; `clear()` drops both lanes and the stop flag without returning them, for a caller about to swap in a different session's conversation     |
+| `steering.rs`                 | `Steering` — two shared queues: `push_steer` (mid-run, folded onto the tool-results turn) and `push`/follow-up (injected at would-stop boundaries); `pending_count` peeks the combined depth of both lanes without draining; plus `request_stop`/`take_stop_requested`, a graceful-stop flag checked at turn boundaries; `clear()` drops both lanes and the stop flag without returning them, for a caller about to swap in a different session's conversation     |
 | `write_lock.rs`               | `WriteLockRegistry` — a process-scoped, path-keyed async-mutex map (`Agent::with_write_locks`) extending same-path write exclusivity across `Agent` rebuilds (a `set_model`/`set_thinking` rebuild, or multiple sessions sharing one registry), layered on top of the per-turn write-target grouping below                                                                                |
 | `tool.rs`                     | `Tool` trait (`run -> ToolOutput`, optional streaming `run_streaming` + `ToolProgress` sink) + `ToolOutput { text, images, terminate }` + `ToolRegistry` (name-keyed `Arc<dyn Tool>` map, last-registration-wins, name-sorted `definitions`)                                                                                                                                               |
 | `transport.rs`                | `ModelRequest` (system/tools/thinking/`reasoning_effort`/`tool_choice`/cache_key/cache_long), `ReasoningEffort` + `ToolChoice` enums, `ModelTransport` trait, `EventStream` alias                                                                                                                                                                                                          |

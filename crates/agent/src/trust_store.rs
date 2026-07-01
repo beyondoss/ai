@@ -125,6 +125,22 @@ impl TrustStore {
         self.persist()
     }
 
+    /// Remove any exact-path entry for `dir` — trusted *or* untrusted — without recording a new one,
+    /// so `dir` reverts to inheriting whatever its nearest ancestor decides (or [`Trust::Unknown`] if
+    /// none does), rather than staying pinned to its own explicit grant/denial. Neither `trust` nor
+    /// `distrust` can express this: both always leave `dir` with *some* exact-path entry. Idempotent —
+    /// clearing an already-unset directory is a no-op, not an error. Mirrors pi's own
+    /// `ProjectTrustStore::setMany` accepting a `null` decision to delete an entry.
+    pub fn clear(&mut self, dir: &Path) -> std::io::Result<()> {
+        let key = canonical_key(dir);
+        let removed_trusted = self.trusted.remove(&key);
+        let removed_untrusted = self.untrusted.remove(&key);
+        if !removed_trusted && !removed_untrusted {
+            return Ok(());
+        }
+        self.persist()
+    }
+
     fn persist(&self) -> std::io::Result<()> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
@@ -283,5 +299,52 @@ mod tests {
         assert_eq!(store.lookup(&project), Trust::Untrusted);
         store.trust(&project).unwrap();
         assert_eq!(store.lookup(&project), Trust::Trusted);
+    }
+
+    #[test]
+    fn clear_reverts_to_inheriting_from_the_nearest_ancestor() {
+        // Neither `trust` nor `distrust` can express "no opinion, inherit from the parent" — both
+        // always leave an exact-path entry behind. `clear` removes it, so a subdirectory explicitly
+        // distrusted earlier goes back to following its trusted parent, rather than needing a
+        // `trust()` call that would instead pin it with its *own* explicit grant.
+        let dir = tempfile::tempdir().unwrap();
+        let code = dir.path().join("code");
+        let sub = code.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        let store_path = dir.path().join("trusted-projects.json");
+
+        let mut store = TrustStore::open(store_path);
+        store.trust(&code).unwrap();
+        store.distrust(&sub).unwrap();
+        assert_eq!(store.lookup(&sub), Trust::Untrusted);
+
+        store.clear(&sub).unwrap();
+        assert_eq!(
+            store.lookup(&sub),
+            Trust::Trusted,
+            "clearing the shadow reveals the inherited parent grant"
+        );
+
+        // Clearing the parent's own entry drops it all the way to Unknown (no ancestor left to
+        // inherit from).
+        store.clear(&code).unwrap();
+        assert_eq!(store.lookup(&code), Trust::Unknown);
+        assert_eq!(store.lookup(&sub), Trust::Unknown);
+    }
+
+    #[test]
+    fn clear_on_an_already_unset_directory_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let store_path = dir.path().join("trusted-projects.json");
+
+        let mut store = TrustStore::open(store_path.clone());
+        store.clear(&project).unwrap();
+        assert_eq!(store.lookup(&project), Trust::Unknown);
+        assert!(
+            !store_path.exists(),
+            "a no-op clear must not create the store file"
+        );
     }
 }

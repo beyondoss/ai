@@ -95,6 +95,12 @@ enum Command {
         /// not a permanent grant — see `agent trust` to record one.
         #[arg(long, default_value_t = false)]
         trust_project: bool,
+        /// Force `cwd` *untrusted* for this run only, overriding both `--trust-project` and the
+        /// persisted allowlist (`agent trust <path>`) — e.g. to test untrusted behavior against a
+        /// directory that's otherwise permanently trusted. Wins over `--trust-project` if both are
+        /// somehow given.
+        #[arg(long, default_value_t = false)]
+        force_untrusted: bool,
         /// Restrict the tool set to exactly these names (comma-separated), dropping everything else.
         /// Combine with `--exclude-tools` to carve one back out of the allow-list.
         #[arg(long, value_delimiter = ',')]
@@ -121,6 +127,12 @@ enum Command {
         /// command produces, for a one-shot run with no server involved.
         #[arg(long)]
         export: Option<String>,
+        /// Emit newline-delimited JSON to stdout instead of human-readable text: one leading session
+        /// header line, then one `AgentEvent` object per line (tool calls/results and turn boundaries
+        /// included, not just raw text deltas) — the same event shape `serve`'s NDJSON protocol streams,
+        /// for a scripting caller that wants structured output without spawning `serve`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// Run the headless agent server: a newline-delimited JSON control protocol over stdio.
     Serve {
@@ -179,6 +191,12 @@ enum Command {
         /// not a permanent grant — see `agent trust` to record one.
         #[arg(long, default_value_t = false)]
         trust_project: bool,
+        /// Force `cwd` *untrusted* for this session only, overriding both `--trust-project` and the
+        /// persisted allowlist (`agent trust <path>`) — e.g. to test untrusted behavior against a
+        /// directory that's otherwise permanently trusted. Wins over `--trust-project` if both are
+        /// somehow given.
+        #[arg(long, default_value_t = false)]
+        force_untrusted: bool,
         /// Compaction headroom (tokens) reserved below the context window before it fires. Defaults to
         /// `CompactionConfig::default()`'s 24,000.
         #[arg(long, env = "AI_AGENT_COMPACTION_RESERVE_TOKENS")]
@@ -210,6 +228,12 @@ enum Command {
         /// Register no tools at all — a pure-conversation session. Wins over `--tools`/`--exclude-tools`.
         #[arg(long, default_value_t = false)]
         no_tools: bool,
+        /// Restrict `cycle_model`'s candidate list to exactly these ids, in this order
+        /// (comma-separated) — e.g. `--models claude-opus-4-8,claude-sonnet-4-5,gpt-5`.
+        /// `set_model`/`get_available_models` are unaffected; empty/absent cycles the full known-model
+        /// list instead.
+        #[arg(long, env = "AI_AGENT_MODELS", value_delimiter = ',')]
+        models: Option<Vec<String>>,
     },
     /// List the tools the agent advertises to the model.
     Tools,
@@ -231,11 +255,36 @@ enum Command {
         /// The project directory to untrust. Defaults to the current directory.
         path: Option<String>,
     },
+    /// Remove `path`'s (default: the current directory) own trust/untrust entry, without recording a
+    /// new one — unlike `trust`/`untrust`, which always leave `path` pinned to its own explicit
+    /// grant or denial. `path` reverts to inheriting whatever its nearest trusted/untrusted ancestor
+    /// decides (or unknown, if none does). Idempotent.
+    ClearTrust {
+        /// The project directory to clear. Defaults to the current directory.
+        path: Option<String>,
+    },
+    /// Render an existing session's `.jsonl` file as a self-contained HTML transcript and exit — pure
+    /// offline rendering of what's already on disk, no gateway/key/model involved at all (unlike `run
+    /// --export`, which exports only after a live run completes). The same rendering `serve`'s
+    /// `export_html` RPC command and `run --export` use.
+    Export {
+        /// Path to the session's `.jsonl` file (as passed to `--session-file`, or one file inside a
+        /// `--session-dir` tree).
+        session: String,
+        /// Output HTML path. Defaults to `session-<timestamp>.html` in the current directory.
+        output: Option<String>,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Always stderr, never stdout: `serve`'s NDJSON control protocol and `run`'s streamed output both
+    // live on stdout, and a line-based client reading it can't tell a stray log line from a protocol
+    // frame. `RUST_LOG=debug` (or any filter admitting a `warn!`/`info!` already present on a live
+    // path — e.g. `session_store.rs`'s corrupt-line warning, `skills.rs`'s discovery warning) must
+    // never corrupt that stream.
     let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
 
@@ -247,12 +296,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             key,
             max_steps,
             trust_project,
+            force_untrusted,
             tools,
             exclude_tools,
             no_tools,
             session,
             r#continue,
             export,
+            json,
         } => {
             run_task(
                 tasks,
@@ -261,12 +312,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 key,
                 max_steps,
                 trust_project,
+                force_untrusted,
                 tools,
                 exclude_tools,
                 no_tools,
                 session,
                 r#continue,
                 export,
+                json,
             )
             .await?;
         }
@@ -286,6 +339,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             thinking,
             reasoning_effort,
             trust_project,
+            force_untrusted,
             compaction_reserve_tokens,
             compaction_keep_recent_tokens,
             retry_max_retries,
@@ -294,6 +348,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tools,
             exclude_tools,
             no_tools,
+            models,
         } => {
             let key = key
                 .ok_or("no gateway key: pass --key or set AI_AGENT_KEY (a bai_v1… virtual key)")?;
@@ -323,6 +378,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 thinking,
                 reasoning_effort,
                 trust_project,
+                force_untrusted,
                 compaction_reserve_tokens,
                 compaction_keep_recent_tokens,
                 retry_max_retries,
@@ -331,6 +387,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tools,
                 exclude_tools,
                 no_tools,
+                models: models.unwrap_or_default(),
             })
             .await?;
             // `serve` reads stdin via `tokio::io::stdin()`, which parks a dedicated blocking OS
@@ -371,6 +428,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut store = beyond_ai_agent::trust_store::TrustStore::open_default();
             store.distrust(&dir)?;
             println!("untrusted: {}", dir.display());
+        }
+        Command::ClearTrust { path } => {
+            let dir = match path {
+                Some(p) => PathBuf::from(p),
+                None => std::env::current_dir()?,
+            };
+            let mut store = beyond_ai_agent::trust_store::TrustStore::open_default();
+            store.clear(&dir)?;
+            println!("cleared: {}", dir.display());
+        }
+        Command::Export { session, output } => {
+            let (store, sess) =
+                beyond_ai_agent::session_store::SessionStore::open(PathBuf::from(&session))
+                    .map_err(|e| format!("failed to open session {session}: {e}"))?;
+            let branches = store.abandoned_branches();
+            let path = beyond_ai_agent::export::export_html(
+                store.meta(),
+                &sess.messages,
+                &branches,
+                output.as_deref(),
+            )?;
+            println!("Exported to: {}", path.display());
         }
     }
     Ok(())
@@ -422,9 +501,23 @@ fn read_stdin_if_piped() -> Option<String> {
     }
 }
 
-/// Stream one turn's assistant reply to stdout: text live, a `[tool: name]` marker when the model
-/// calls one, then a trailing blank line once the turn ends.
-async fn run_turn(agent: &Agent, session: &mut Session) -> agent_core::Result<()> {
+/// Stream one turn's assistant reply to stdout. In text mode (`json: false`): live text, a
+/// `[tool: name]` marker when the model calls one, then a trailing blank line once the turn ends. In
+/// JSON mode (`--json`): one `AgentEvent` object per line — the full observation surface (tool
+/// calls/results, turn boundaries, compaction), the same shape `serve`'s NDJSON protocol streams,
+/// rather than only the raw model-stream deltas `StreamEvent` carries.
+async fn run_turn(agent: &Agent, session: &mut Session, json: bool) -> agent_core::Result<()> {
+    if json {
+        agent
+            .run_events(session, |ev| {
+                if let Ok(line) = serde_json::to_string(&ev) {
+                    println!("{line}");
+                    let _ = std::io::stdout().flush();
+                }
+            })
+            .await?;
+        return Ok(());
+    }
     agent
         .run(session, |ev| match ev {
             StreamEvent::TextDelta { text } => {
@@ -449,6 +542,18 @@ async fn run_turn(agent: &Agent, session: &mut Session) -> agent_core::Result<()
     Ok(())
 }
 
+/// Expand an explicit `/skill:name` invocation first (its own prefix, so it can't collide with a
+/// `/name` prompt template), then fall through to prompt-template expansion — a no-op on whichever
+/// message reaches it unmatched. Mirrors `serve`'s own `"prompt"` handler exactly (see `serve.rs`).
+fn expand_message(
+    message: &str,
+    skills: &[beyond_ai_agent::skills::Skill],
+    prompt_templates: &[beyond_ai_agent::prompts::PromptTemplate],
+) -> String {
+    let message = beyond_ai_agent::skills::expand_if_skill_invocation(message, skills);
+    beyond_ai_agent::prompts::expand_if_slash(&message, prompt_templates)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_task(
     tasks: Vec<String>,
@@ -457,13 +562,16 @@ async fn run_task(
     key: Option<String>,
     max_steps: u32,
     trust_project: bool,
+    force_untrusted: bool,
     tools_allow: Option<Vec<String>>,
     tools_exclude: Option<Vec<String>>,
     no_tools: bool,
     session_path: Option<String>,
     continue_session: bool,
     export: Option<String>,
+    json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let mut timing = beyond_ai_agent::timing::StartupTiming::new();
     let cwd = canonical_cwd(&std::env::current_dir().unwrap_or_default());
 
     // Compose the first message from (in order) piped stdin, `@file` contents, then the first
@@ -487,14 +595,23 @@ async fn run_task(
         return Err("no task given: pass a message, an @file, or pipe input via stdin".into());
     }
     let initial_message = parts.join("");
+    timing.mark("compose initial message");
 
     let gateway = gateway_url.unwrap_or_else(|| DEFAULT_GATEWAY.to_string());
     let model = model.unwrap_or_else(|| DEFAULT_MODEL.to_string());
     let key =
         key.ok_or("no gateway key: pass --key or set AI_AGENT_KEY (a bai_v1… virtual key)")?;
 
-    let project_trusted =
-        trust_project || beyond_ai_agent::trust_store::TrustStore::open_default().is_trusted(&cwd);
+    let project_trusted = !force_untrusted
+        && (trust_project
+            || beyond_ai_agent::trust_store::TrustStore::open_default().is_trusted(&cwd));
+    // Discovered once, up front: a one-shot `run` has no `reload` to re-discover mid-process, unlike
+    // `serve`. `/skill:name` and `/name` prompt-template invocations are expanded here exactly like
+    // `serve`'s own "prompt" handler does — this was previously silently skipped in `run`, so a message
+    // starting with either was sent to the model as a literal, unexpanded string instead.
+    let skills = beyond_ai_agent::skills::discover(&cwd, project_trusted);
+    let prompt_templates = beyond_ai_agent::prompts::discover(&cwd, project_trusted);
+    timing.mark("discover skills/prompt templates");
     let mut registry = tools::default_registry();
     tools::apply_filter(
         &mut registry,
@@ -513,6 +630,7 @@ async fn run_task(
             project_trusted,
         },
     );
+    timing.mark("build system prompt");
 
     let client = GatewayClient::new(gateway, key)?;
     let agent = Agent::new(Arc::new(client), model.clone())
@@ -545,22 +663,45 @@ async fn run_task(
         .as_ref()
         .map(|s| s.meta().clone())
         .unwrap_or_else(|| SessionMeta::new(&cwd_str, &model));
+    timing.mark("open session");
+    timing.print();
 
-    session.user(initial_message);
-    run_turn(&agent, &mut session).await?;
+    if json {
+        // A leading header line so a `--json` consumer can identify the session before any event
+        // arrives — the same purpose `serve`'s persisted header line serves, just for a one-shot run
+        // with no server/control-protocol involved. `"kind"` matches `AgentEvent`'s own tag field, so
+        // every stdout line (header or event) discriminates on the same key.
+        println!(
+            "{}",
+            serde_json::json!({ "kind": "session", "id": meta.id, "model": meta.model, "cwd": meta.cwd })
+        );
+        let _ = std::io::stdout().flush();
+    }
+
+    session.user(expand_message(&initial_message, &skills, &prompt_templates));
+    run_turn(&agent, &mut session, json).await?;
     if let Some(store) = &mut store {
         store.append_new(&session.messages)?;
     }
     for message in messages {
-        session.user(message);
-        run_turn(&agent, &mut session).await?;
+        session.user(expand_message(&message, &skills, &prompt_templates));
+        run_turn(&agent, &mut session, json).await?;
         if let Some(store) = &mut store {
             store.append_new(&session.messages)?;
         }
     }
 
     if let Some(export) = export {
-        match beyond_ai_agent::export::export_html(&meta, &session.messages, Some(&export)) {
+        let branches = store
+            .as_ref()
+            .map(|s| s.abandoned_branches())
+            .unwrap_or_default();
+        match beyond_ai_agent::export::export_html(
+            &meta,
+            &session.messages,
+            &branches,
+            Some(&export),
+        ) {
             Ok(path) => eprintln!("[exported transcript to {}]", path.display()),
             Err(e) => eprintln!("[failed to export transcript: {e}]"),
         }

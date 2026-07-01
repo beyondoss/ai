@@ -18,22 +18,41 @@ The harness layers several capabilities over the bare tools + loop:
 
 - **Trust** ([`trust_store`](src/trust_store.rs)) — a tri-state, ancestor-inheriting allowlist
   (`~/.claude/trusted-projects.json`: `{trusted: [...], untrusted: [...]}`, most-specific directory
-  wins, untrusted checked first at each level) gates everything an untrusted repo's own files could use
-  to inject instructions: a project-local `SYSTEM.md` override, `AGENTS.md`/`CLAUDE.md` project
-  instructions, and discovered skills/prompt templates (including the `get_commands` listing and
-  `/skill:name`/`/name` invocation) are all only honored once the working directory is trusted —
-  `agent trust <path>` (persistent) or `--trust-project`/RPC (session-scoped). A legacy bare-array trust
-  file still parses (trusted-only), migrated to the tri-state shape on the next `trust`/`distrust` call.
+  wins, untrusted checked first at each level) gates the project-local `SYSTEM.md`/`APPEND_SYSTEM.md`
+  overrides and discovered skills/prompt templates (both `discover` calls take `project_trusted` as a
+  required parameter — `skills::discover`/`prompts::discover` — precisely so a call site can't forget the gate;
+  the `get_commands` listing and `/skill:name`/`/name` invocation inherit it from there) — all only
+  honored once the working directory is trusted, via `agent trust <path>` (persistent) or
+  `--trust-project`/RPC (session-scoped). `agent clear-trust <path>` removes a directory's own
+  trust/untrust entry without recording a new one (`TrustStore::clear`) — unlike `trust`/`untrust`,
+  which always leave it pinned to its own explicit grant or denial, this reverts it to inheriting
+  whatever its nearest ancestor decides, matching pi's own `ProjectTrustStore::setMany` accepting a
+  `null` decision to delete an entry. A legacy bare-array trust file still parses (trusted-only),
+  migrated to the tri-state shape on the next `trust`/`distrust`/`clear-trust` call.
+  **Not** gated by trust: `AGENTS.md`/`CLAUDE.md` project-instruction files
+  (`resources::load_context_files` takes no `project_trusted` parameter at all) — matching pi's own
+  `resource-loader.ts::loadProjectContextFiles`, which has no trust check either. Whether project
+  context files *should* be trust-gated is a separate design question both codebases currently answer
+  the same way (no); this is a factual note about current behavior, not a parity gap.
 - **System-prompt assembly** ([`resources`](src/resources.rs)) — split into a **static** half (base
-  identity, overridable by an on-disk `SYSTEM.md`: project `.claude/` when trusted, else user; project
-  instruction files, global then cwd→root, **one file per directory**, `AGENTS.md` winning over
-  `CLAUDE.md`, matched case-insensitively; discovered [`skills`](src/skills.rs) via
-  `<available_skills>`, read-on-demand) and a **dynamic** footer (current **local** date + cwd). `serve`
-  caches the static half — rebuilt only at startup and on `set_model`/`set_thinking`/an explicit
-  `reload` — and refreshes just the cheap dynamic footer before every `prompt`, so a long-running
-  process doesn't re-walk the filesystem every turn just for the date. CLI flags: `--system-prompt`
-  (replace), `--append-system-prompt`, `--no-context-files`. Skills are discovered recursively
-  (`SKILL.md` at any depth); a `disable-model-invocation` skill is omitted from the listing but still
+  identity, overridable by an on-disk `SYSTEM.md`: project `.claude/` when trusted, else user; then an
+  on-disk `APPEND_SYSTEM.md` — same project-then-user discovery/trust order, but *additive* rather than
+  a replacement, appended right after the base/override — consulted only when the caller didn't already
+  supply an explicit `append` (e.g. `--append-system-prompt` wins outright over the on-disk file rather
+  than combining with it, matching pi's `resource-loader.ts`); project instruction files, global then
+  cwd→root, **one file per directory**, `AGENTS.md` winning over `CLAUDE.md`, matched case-insensitively;
+  discovered [`skills`](src/skills.rs) via `<available_skills>`, read-on-demand) and a **dynamic** footer
+  (current **local** date + cwd). `serve` caches the static half — rebuilt only at startup and on
+  `set_model`/`set_thinking`/an explicit `reload` — and refreshes just the cheap dynamic footer before
+  every `prompt`, so a long-running process doesn't re-walk the filesystem every turn just for the date.
+  CLI flags: `--system-prompt` (replace), `--append-system-prompt`, `--no-context-files`. Skills are
+  discovered recursively (`SKILL.md` at any depth, following symlinked directories — matching pi's own
+  `skills.ts`, so a shared skills library symlinked into `.claude/skills` isn't invisible; a symlink
+  loop is caught by `walkdir`'s own detection, not an unbounded walk), honoring `.gitignore`/`.ignore`
+  (`WalkBuilder`'s own defaults) and `.fdignore` (registered explicitly via
+  `add_custom_ignore_filename` — the third file `skills.ts::IGNORE_FILE_NAMES` lists, which the
+  `ignore` crate doesn't honor by default); a `disable-model-invocation`
+  skill is omitted from the listing but still
   reachable by an explicit `/skill:name`, which strips the raw YAML frontmatter and wraps the body in a
   `<skill name="..." location="...">` tag rather than leaking the frontmatter verbatim. Both
   skill/prompt-template discovery report name collisions (`discover_with_diagnostics`) — the same name
@@ -64,10 +83,14 @@ The harness layers several capabilities over the bare tools + loop:
   reached through a symlink one time and its real path another still matches the same session instead
   of silently fragmenting into two; a path that can't be resolved (removed out from under the process)
   falls back to matching by the string as given, same as before this existed. `list` carries derived
-  `updated_at`/`message_count`/`preview`(first user message, truncated)/`search_text`(every user
-  message in the session, space-joined and capped at 2,000 chars — a broader substring-match surface
-  than `preview` alone) without opening each transcript fully beyond the single streaming scan `list`
-  already does, and resuming without an explicit session id picks the newest session matching the
+  `updated_at`(the newest stamped `Entry::Message::timestamp` found in the file, not the file's OS
+  mtime — a copy/restore/sync that doesn't preserve mtime exactly, or a wrong one, no longer makes a
+  session look stale or falsely fresh; mtime is only a fallback for a legacy file with no stamped
+  message at all)/`message_count`/`preview`(first user message, truncated)/`search_text`(every user *and*
+  assistant message in the session — matching pi's own `allMessagesText`, so a session is findable by
+  something only the assistant said — space-joined and capped at 2,000 chars — a broader substring-match
+  surface than `preview` alone) without opening each transcript fully beyond the single streaming scan
+  `list` already does, and resuming without an explicit session id picks the newest session matching the
   **current cwd**, not just the globally newest. These four fields are `#[serde(skip)]` on `SessionMeta`
   itself (so a stale scan value can never leak into the on-disk header, which reuses the same
   `Serialize` impl) — `SessionMeta::to_listing_json` re-inserts them for a listing response; `serve`'s
@@ -92,6 +115,27 @@ The harness layers several capabilities over the bare tools + loop:
   the next turn (not just a persisted-but-inert record). `list_branches` reports every **leaf** plus the
   active tip; `get_tree`/`SessionStore::tree()` reports **every node** on every branch (id, parent,
   role, a short preview of its own text) for a client that wants the full picture, not just the leaves.
+  `SessionRepo::fork_at_entry` forks from any of those nodes directly — on or off the *current* active
+  path — unlike `fork`'s own `upto`, a message-count prefix of just the active path; a client that wants
+  to fork an abandoned branch no longer has to `switch_active`/`switch_branch` to it first just to make
+  it forkable. `before: bool` excludes the target entry itself from the copied prefix (fork right before
+  it) instead of including it (the default).
+- **Branch-local model/thinking-level** — `set_model`/`cycle_model`/`set_reasoning_effort`/
+  `cycle_thinking_level` each append an O(1) `Entry::ModelChange`/`Entry::ThinkingLevelChange` record
+  anchored to the *current tip* (`SessionStore::record_model_change`/`record_thinking_level_change`) —
+  "everything appended after this message uses X" — rather than only mutating in-process state.
+  `switch_branch`'s RPC handler queries `model_at`/`thinking_level_at` for whatever it's switching *to*
+  and restores that (rebuilding the `Agent` if it differs from what's currently active), so a
+  `set_model` made on one branch doesn't leak backward into an earlier point being switched back to; the
+  model always resolves to something real (falling back to the session's own creation-time model if
+  nothing was ever recorded), the thinking level has no such baseline and is left alone when absent.
+  Deliberately *not* a full tree participant the way messages are (a change record never becomes the
+  active tip, and doesn't redirect what a new message's `parent_id` chains off) — a known, documented
+  edge case: two sibling branches that both grow from the same anchor point share one lookup entry, so a
+  query against a descendant on the second branch can see a stale change actually made on the first.
+  `switch_branch`'s own restoration is unaffected (it only ever queries the target being switched to,
+  never one of its descendants); the fuller fix (threading these through the same per-branch chain
+  messages use) is real but not warranted by any concrete case found so far.
 - **Expanded `serve` surface** — beyond `prompt`/`get_state`/`get_messages`/`new_session`: `abort`,
   `stop_after_turn` (graceful — the current turn's tool calls still finish and commit; only the *next*
   model call is skipped — see `agent_core::Steering::request_stop`), `steer` (mid-run, folded onto the
@@ -104,23 +148,49 @@ The harness layers several capabilities over the bare tools + loop:
   request's own `id`, while its parallel scan is in flight — throttled to roughly ten frames regardless
   of how many sessions exist, deterministically by `scanned`'s value so it stays stable despite the
   concurrent scan)/`switch_session`/`fork`/`get_fork_messages`(read-only fork
-  preview)/`set_session_name`/`export_html`(render the active session's transcript as one
-  self-contained HTML file, no server or client involved once written),
+  preview)/`set_session_name`(an O(1) `Entry::TitleChange` append, not a rewrite of the whole
+  file — a rename used to cost rewriting every message already on disk just to update the header's
+  `title` field; whole-session-scoped rather than branch-scoped like `ModelChange`/
+  `ThinkingLevelChange`, so the most recent rename anywhere in the file wins regardless of which
+  branch is active, matching pi's own `session_info` entries)/`export_html`(render the active session's transcript as one
+  self-contained HTML file, no server or client involved once written — plus every abandoned branch
+  (`SessionStore::abandoned_branches`), each as its own labeled section after the main transcript,
+  rendering only the part that diverges from the active path so the shared prefix isn't duplicated),
   `get_last_assistant_text`/`get_session_stats`/`get_commands`(+ collision diagnostics)/`reload`,
   `set_model`/`set_thinking`(raw budget override)/`set_reasoning_effort`(the portable
   `agent_core::ThinkingLevel`, correct for whichever mechanism the active model actually
-  uses)/`cycle_model`/`cycle_thinking_level`(advances the same portable level)/`set_auto_compaction`/
+  uses)/`cycle_model`(steps through `--models`'s scoped list when given — comma-separated ids, in order
+  — else the full `get_available_models` hint list; reports `scoped: bool` so a client knows which)/
+  `cycle_thinking_level`(advances the same portable level)/`set_auto_compaction`/
   `set_auto_retry`(toggle `agent_core::Agent::with_auto_retry` — off surfaces an otherwise-retried
   mid-stream failure on the first attempt, for debugging a flaky connection)
   (rebuild the `Agent` for subsequent prompts) / `get_available_models`, `list_branches`/`get_tree`/`switch_branch`
   (navigate the session's tree, optionally summarizing the abandoned branch first — `get_messages` tags
   each message with its tree `id` so a client can name any point as a `switch_branch` target, not only a
-  branch's leaf), and `bash`/`abort_bash` (run a host shell command directly, independent of the
+  branch's leaf; `get_messages`'s optional `since` — a tree id the client already has — returns only
+  what was appended after it, pi's own `get_entries({since})`, so a polling client doesn't have to
+  re-transfer the whole transcript every time; an unmatched `since` is an error, not a silent full
+  re-fetch), and `bash`/`abort_bash` (run a host shell command directly, independent of the
   model's own tool loop). A `prompt` emits an immediate `ack` frame the moment it's queued, and its
   terminal `response` reports `refused: bool` (a refusal is a distinct terminal condition — it doesn't
   drain queued steering); a `prompt` sent while another is in flight can carry
   `streaming_behavior: "steer"|"follow_up"` to be accepted and queued instead of rejected as busy. A
   `prompt` runs concurrently with stdin so `abort`/`stop_after_turn`/`steer`/`follow_up` land mid-turn.
+- **Whole-run auto-retry** — once `agent_core`'s own mid-stream retry (inside one model turn) is
+  exhausted, a `prompt` that still ends in a transient-looking `Err`
+  (`agent_core::agent::is_retryable_mid_stream`, exposed `pub` for exactly this — the classification is
+  identical one layer up) is automatically re-invoked against the *same* session — resuming from
+  wherever it left off, not restarting the turn or re-appending the user message — up to 3 more times
+  with exponential backoff (2/4/8s, capped at 30s; pi's `agent-session.ts` equivalent). Gated by the
+  same `current_auto_retry`/`set_auto_retry` flag as the mid-stream layer (one user-facing "retries
+  on/off" concept spanning two internal layers); never retries past a client disconnect or an explicit
+  `abort` (redundant with `is_retryable_mid_stream` already excluding `Error::Cancelled`, but checked
+  explicitly too). Each attempt persists whatever it produced (even a failed one may have committed a
+  tool round-trip before erroring) before deciding whether to retry, and emits an unsolicited
+  `auto_retry` frame just before its backoff sleep so a client can distinguish "still working, retrying
+  a hiccup" from silence. The backoff sleep itself isn't raced against `abort`/shutdown (both are only
+  read inside an attempt's own event loop) — bounded by the retry cap and backoff ceiling, so the
+  unresponsive window is short, not gapless.
 - **Stale-cwd detection** — `cwd_is_stale` compares a session's recorded `cwd` against reality: the
   directory no longer exists, or (since `switch_session`/`fork`/reattaching never change the process's
   actual working directory) it simply isn't where this process is running. Surfaced as `cwd_stale` on
@@ -149,11 +219,16 @@ The harness layers several capabilities over the bare tools + loop:
 beyond-ai-agent run "<task>"
    │
    ▼
-Session::new() + user(task)
+expand_if_skill_invocation → expand_if_slash (same expansion `serve`'s "prompt" handler applies —
+   │                          a `/skill:name` or `/name args` first message/arg is expanded before
+   │                          the model ever sees it; project-local skills/templates gated by
+   │                          `project_trusted` same as `serve`)
+   ▼
+Session::new() + user(expanded task)
    │
    ▼
-Agent::run (agent_core loop; see agent-core/ARCHITECTURE.md for the loop itself)
-   │  each step:
+Agent::run[_events] (agent_core loop; see agent-core/ARCHITECTURE.md for the loop itself)
+   │  each step, text mode (default) — Agent::run, StreamEvent only:
    │   ├─ POST one model turn → gateway → provider ──── network/4xx/5xx ──► Error::Transport, exit ≠0
    │   ├─ StreamEvent::TextDelta   ───────────────────────────────────────► stdout (printed live)
    │   ├─ StreamEvent::ToolUseStart ──────────────────────────────────────► stdout "\n[tool: name]"
@@ -161,9 +236,13 @@ Agent::run (agent_core loop; see agent-core/ARCHITECTURE.md for the loop itself)
    │        │
    │        ├─ found    → tool.run(input) → Ok(text) / Err(ToolError) ──► tool_result (is_error?)
    │        └─ not found → "unknown tool: <name>" ───────────────────────► tool_result, is_error=true
+   │  each step, `--json` — Agent::run_events, the full AgentEvent surface (same shape `serve` streams):
+   │   └─ every AgentEvent (AgentStart/TurnStart/Stream(..)/ToolStart/ToolProgress/ToolEnd/TurnEnd/
+   │        Compacted/AgentEnd/Error) ──► stdout, one `serde_json::to_string`-d object per line, flushed
+   │        immediately; a `{"kind":"session", id, model, cwd}` header line precedes the first event
    │
    ▼ (model ends its turn without a tool_use, or session.steps == max_steps)
-stdout: trailing newline
+stdout: trailing newline (text mode only — `--json` has no extra trailing line, just the event stream)
 stderr: "[done in N step(s); X in / Y out tokens]"   (or the propagated Error::MaxSteps / Error::Transport)
 ```
 
@@ -187,11 +266,16 @@ loop over stdin lines ───────────────────�
   │     (busy + streaming_behavior set → queued via Steering, acked, no ack/event/response above)
   │
   ├─ {"type":"get_state"} ───────────────────────────► response{data:{session_id, model, steps,
-  │                                                              message_count, input/output_tokens}}
-  ├─ {"type":"get_messages"} / {"type":"get_tree"} ──► response{data:{messages:[...]}} /
-  │                                                              response{data:{nodes:[TreeNode…]}}
-  ├─ {"type":"new_session"} ─────────────────────────► response{data:{session_id}}  (fresh Session;
-  │     steering.clear()                                        persisted per the open persistence mode)
+  │                                                              message_count, input/output_tokens,
+  │                                                              thinking_level, auto_compaction,
+  │                                                              auto_retry, queue_mode,
+  │                                                              pending_messages}}
+  ├─ {"type":"get_messages", since?} / {"type":"get_tree"} ──► response{data:{messages:[...]}} /
+  │     (since: only what's new)                                 response{data:{nodes:[TreeNode…]}}
+  ├─ {"type":"new_session"} ─────────────────────────► response{data:{session_id, parent}}  (fresh
+  │     steering.clear()                                        Session; persisted per the open mode;
+  │                                                              `parent` — repo mode only — is the
+  │                                                              lineage marker below)
   ├─ {"type":"bash", command, cwd?, timeout_ms?} ─────► tool_progress*/tool_end event frames, then
   │                                                              response{command:"bash", success, data}
   └─ invalid JSON / unknown "type" ──────────────────► response{success:false, error}
@@ -225,7 +309,7 @@ by every `build_agent` rebuild (`set_model`/`set_thinking`/`cycle_model`/`cycle_
 | **Tool**                    | A registered capability the model invokes by name + JSON input (`agent_core::Tool` impl)         | Not necessarily a subprocess — only `bash`/`fork`/`sync`/`logs` shell out; the rest touch the filesystem in-process             |
 | **`ToolRegistry`**          | The name → `Tool` map advertised to the model every turn (`default_registry_with(..)`, then `tools::apply_filter`'d by `--tools`/`--exclude-tools`/`--no-tools`) | Not per-session or hot-reloadable at runtime — filtering happens once when the process's registry is built, not per turn |
 | **`CommandRunner`**         | The seam between a tool and real process execution (`exec.rs`)                                   | Not a sandbox — `RealRunner` execs a resolved real `bash` (falling back to `sh`) / `beyond …` with the host process's full ambient privilege |
-| **`TrustStore`**            | Tri-state (trusted/untrusted/unknown), ancestor-inheriting allowlist gating `SYSTEM.md`/project-instruction/skill/prompt-template access | Not a sandbox or a permission system for tools — it only gates *which instructions the model sees*, not what it can do   |
+| **`TrustStore`**            | Tri-state (trusted/untrusted/unknown), ancestor-inheriting allowlist gating `SYSTEM.md`/skill/prompt-template access | Not a sandbox or a permission system for tools (only gates *which instructions the model sees*, not what it can do) — and not `AGENTS.md`/`CLAUDE.md` project-instruction files either, which have no trust gate at all (matching pi) |
 | **`Session`**               | Message history + step/token counters; optionally `serde`-persisted (single file or a `SessionRepo`) | Not multi-session by itself — one `serve` process holds exactly one *active* `Session`, though a repo can hold many on disk |
 | **`Steering`**               | The two-lane queue (`steer`/`follow_up`) a client injects mid-run or at a stop boundary, plus a graceful stop-request flag (`request_stop`/`stop_after_turn`); persistent across a whole `serve` process, not just one `prompt` call | Not drained on a refusal (a distinct terminal condition) — queues cleared only on `new_session`/`switch_session`/`fork`/`switch_branch`; the stop flag is *also* always cleared when the run it was set on returns, however it ends, so it can never bind to a later, unrelated run |
 | **`AgentEvent`**            | `Stream`/`ToolStart`/`ToolProgress`/`ToolEnd`/`TurnEnd`/`Steered` boundaries streamed as `event` frames during a `prompt` | Not the terminal answer — the `response` frame (success/data/error) is separate and always comes last, after an immediate `ack` frame |
@@ -253,7 +337,7 @@ split is what each tool actually produces:
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------- |
 | `read`               | missing `path`; offset past EOF; image cannot be downscaled to fit the 4.5 MB base64 budget                                          | file unreadable (missing, permission denied) — non-UTF-8 bytes decode lossily, not an error |
 | `write`              | missing `path`/`content`                                                                                                             | `mkdir`/`write` syscall fails                                                               |
-| `edit`               | `old_string` matches 0 or >1 times after exact+fuzzy (without single-edit `replace_all`); overlapping/no-op edits; malformed `edits` | file unreadable/unwritable                                                                  |
+| `edit`               | `old_string` matches 0 or >1 times after exact+fuzzy (without single-edit `replace_all`); overlapping/no-op edits; malformed `edits` | file unreadable/unwritable (writability is checked *before* any match/diff work — pi's own `access(path, W_OK)` pre-check — so a read-only file fails fast rather than after paying for fuzzy-matching's NFKC normalization) |
 | `ls`                 | —                                                                                                                                    | `read_dir` fails                                                                            |
 | `grep`/`find`        | bad regex / bad glob                                                                                                                 | the `spawn_blocking` task itself panics (walk failures are swallowed per-entry)             |
 | `bash`               | missing `command`                                                                                                                    | spawn failure, or timeout (`timed_out`)                                                     |
@@ -271,11 +355,21 @@ briefly rather than pay that overhead, consistent with "do less work" over refle
   `output::marker` bracket convention every truncating tool now shares) if more lines remain. It streams
   line-by-line and caps each line at `MAX_LINE_BYTES` (4000) — bytes past the cap are drained but not
   stored, so one pathological single line (a minified bundle) can't balloon memory; a capped line gets
-  a `"… [line truncated]"` marker. Line bytes decode lossily (`from_utf8_lossy`), so a non-UTF-8 file
-  reads with replacement chars rather than erroring. An **image** file skips text decoding entirely:
-  the extension gate decides *whether* to route into the image path (so a plain text read never pays
-  for an image-format probe), but the reported format comes from sniffing the real magic bytes
-  (`image::guess_format`) — a mislabeled extension still reports its true type. It's returned as a
+  a `"… [line truncated]"` marker — a **mid-line** clip, deliberately not pi's own `truncateHead`
+  (`truncate.ts`), which "never returns partial lines": there, a line that alone exceeds the byte budget
+  is either dropped from the output entirely, or — if it's the very first line — the *whole read* comes
+  back empty. Showing a clipped prefix instead means a model reading a single-giant-line file always
+  sees *something*, rather than nothing it can't distinguish from an empty file. Line bytes decode
+  lossily (`from_utf8_lossy`), so a non-UTF-8 file reads with replacement chars rather than erroring.
+  Every "N lines total" this tool reports (e.g. an
+  offset-past-EOF error) counts real content lines from its own line-at-a-time scan, independent of
+  whether the file ends with a trailing newline — a deliberate divergence from pi's own `read.ts`
+  (`textContent.split("\n").length`, which in JS yields a trailing empty-string element whenever the
+  file ends with `\n`, over-counting by one only in that case); matching that inconsistency isn't a
+  parity goal worth having. An **image** file skips text decoding entirely: sniffing the real magic
+  bytes (`image::guess_format`) always decides routing (an extension is only the fallback when
+  sniffing can't identify a format at all), and the reported format comes from that same sniff — a
+  mislabeled extension still reports its true type. It's returned as a
   base64 `ImageSource` attachment the multimodal model can see; one already under a 4.5 MB base64
   budget goes out as its original bytes/format unmodified, an oversized one has its Exif orientation
   applied first (`image::ImageDecoder::orientation`/`DynamicImage::apply_orientation` — generic across
@@ -290,12 +384,18 @@ briefly rather than pay that overhead, consistent with "do less work" over refle
 - **`edit`** accepts either an `edits: [{old_string,new_string}]` array (applied in order) or a
   single `old_string`/`new_string` pair. Each `old_string` must match **exactly once** in the current
   content unless it's a single-edit call with `replace_all: true` — uniqueness is the only safety
-  check; there is no diff/dry-run, the file is rewritten on success. Matching tries an **exact** hit
+  check; there is no diff/dry-run, the file is rewritten on success. Writability is checked before any of
+  that match/diff work runs — a read-only file fails fast rather than after paying for fuzzy-matching's
+  NFKC normalization (pi's own `access(path, W_OK)` pre-check). Matching tries an **exact** hit
   first, then a normalized **fuzzy fallback** (NFKC + folding smart quotes/dash family/unicode spaces +
   per-line trailing-whitespace), with hits mapped back to original byte offsets — so a model's
   `old_string` carrying a curly quote, em-dash, nbsp, or stray trailing space still lands instead of
-  failing "not found". Edits resolve to byte ranges against the _original_ text (order-independent,
-  overlap-rejected).
+  failing "not found". The fold table (`fold_char`) is a deliberate **superset** of pi's own
+  `normalizeForFuzzyMatch`, not a port of it — it additionally folds prime marks (`′`/`″`) toward
+  quotes, small/fullwidth dash forms, and a couple more unicode space code points — every addition the
+  same kind of narrowly-scoped, single-family confusable pi's own set already folds, so it only helps a
+  slightly-off `old_string` land and can never conflate two genuinely different characters. Edits
+  resolve to byte ranges against the _original_ text (order-independent, overlap-rejected).
 - **`ls`** sorts directories first, then alphabetically; dot-entries are hidden unless `all: true` —
   both deliberate divergences from the reference agent, kept rather than "fixed" to match it (dotfiles
   hidden by default cuts real noise like `.git`/editor swapfiles; directories-first is a UX improvement
@@ -478,21 +578,28 @@ auth schemes — it just forwards a token and trusts the gateway's response.
 - Each tool's required JSON fields (`path`, `command`, `pattern`, …) — checked ad hoc per tool, not
   against `input_schema()`; the schema is advisory to the model, not enforced before `run()`.
 - Regex/glob patterns are compiled before use; a bad pattern is `ToolError::InvalidInput`, not a panic.
-- **Project trust gates instruction sources, not tool execution.** An untrusted working directory's
-  own `.claude/SYSTEM.md`, `AGENTS.md`/`CLAUDE.md`, project-local skills (`<cwd>/.claude/skills`), and
-  prompt templates are none of: honored as a system-prompt override, injected into context, advertised
-  via `get_commands`, or invocable via `/skill:name`/`/name` — closing the obvious prompt-injection path
-  a hostile checkout could otherwise use (planting a `SKILL.md` a user innocently triggers). This is the
-  *only* thing trust gates: an untrusted repo's files can still be freely read/written/executed by the
-  tools above once the model decides to, exactly as trusted-repo files can. Trust gates *only* the
-  project-local root, never the user-global one (`~/.claude/skills`, `~/.claude/SYSTEM.md`) — those are
+- **Project trust gates *some* instruction sources, not tool execution.** An untrusted working
+  directory's own `.claude/SYSTEM.md`/`.claude/APPEND_SYSTEM.md`, project-local skills
+  (`<cwd>/.claude/skills`), and prompt
+  templates are none of: honored as a system-prompt override, injected into context, advertised via
+  `get_commands`, or invocable via `/skill:name`/`/name` — closing the obvious prompt-injection path a
+  hostile checkout could otherwise use (planting a `SKILL.md` a user innocently triggers). **Not**
+  gated: `AGENTS.md`/`CLAUDE.md` project-instruction files (`resources::load_context_files` takes no
+  `project_trusted` parameter at all) — these are injected into `<project_context>` regardless of
+  trust, matching pi's own `resource-loader.ts::loadProjectContextFiles` (which has no trust check
+  either). An untrusted repo's files can still be freely read/written/executed by the tools above once
+  the model decides to, exactly as trusted-repo files can — trust never gates *that*, only which
+  instruction sources are honored, and even there, only some of them. Trust gates *only* the
+  project-local root, never the user-global one (`~/.claude/skills`, `~/.claude/SYSTEM.md`,
+  `~/.claude/APPEND_SYSTEM.md`) — those are
   the operator's own machine, not something the current (possibly untrusted) project checkout controls,
-  so `skills::discover`/`discover_with_diagnostics` take `project_trusted` as a parameter that adds or
-  omits *only* the project root, and always scan the user root regardless. Trust alone doesn't make a
-  `SKILL.md`'s frontmatter cooperative, though — "trusted" means the operator opted the directory in,
-  not that every file in it is benign — so `skills::format_available` XML-escapes `name`/`description`/
-  `path` before writing them into the `<available_skills>` block, closing the narrower residual path of
-  a crafted description closing the tag early and forging a fake instruction block after it.
+  so `skills::discover`/`prompts::discover` (both `discover`/`discover_with_diagnostics` pairs) take
+  `project_trusted` as a *required* parameter that adds or omits *only* the project root, and always
+  scan the user root regardless. Trust alone doesn't make a `SKILL.md`'s frontmatter cooperative,
+  though — "trusted" means the operator opted the directory in, not that every file in it is benign —
+  so `skills::format_available` XML-escapes `name`/`description`/`path` before writing them into the
+  `<available_skills>` block, closing the narrower residual path of a crafted description closing the
+  tag early and forging a fake instruction block after it.
 
 **What passes through unchecked:**
 
@@ -529,16 +636,17 @@ container/VM — not by this crate restricting its own tools.
 
 | File                   | What It Does                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `src/main.rs`          | CLI entry point (`run`/`serve`/`tools`/`list-models`/`trust`/`untrust` subcommands — `list-models` prints `serve::available_models()`, no gateway/key needed, the same shape as `tools`); `DEFAULT_MODEL`, `DEFAULT_GATEWAY`, `default_system_prompt(&registry)` (generated from the actually-registered, filtered tool set); renders streamed text + `[tool: name]` markers (followed live by each `InputJsonDelta` fragment — a
-  growing preview of the call's arguments as they stream in, not just its name) to stdout for `run`; `run` composes its first message from piped stdin + `@file` references (`partition_tasks`/`read_file_refs`) + the first positional message, runs any further positional messages as separate sequential turns, and — via `--session <path>`/`--continue` (reusing `SessionStore`/`SessionRepo::resume_or_create`) — can persist and resume a transcript across invocations exactly like `serve`'s own repo/file modes; `run --export <path>` renders the finished transcript via `export::export_html`                                                                          |
+| `src/main.rs`          | CLI entry point (`run`/`serve`/`tools`/`list-models`/`trust`/`untrust`/`clear-trust`/`export` subcommands — `list-models` prints `serve::available_models()`, no gateway/key needed, the same shape as `tools`); `DEFAULT_MODEL`, `DEFAULT_GATEWAY`, `default_system_prompt(&registry)` (generated from the actually-registered, filtered tool set); renders streamed text + `[tool: name]` markers (followed live by each `InputJsonDelta` fragment — a
+  growing preview of the call's arguments as they stream in, not just its name) to stdout for `run` in its default text mode, or (`run --json`) one `AgentEvent` object per line via `run_events`/`serde_json::to_string` — the same full observation surface (tool calls/results, turn boundaries) `serve`'s NDJSON protocol streams, preceded by a `{"kind":"session", id, model, cwd}` header line — for a scripting caller that wants structured output without spawning `serve`; `run` composes its first message from piped stdin + `@file` references (`partition_tasks`/`read_file_refs`) + the first positional message, runs any further positional messages as separate sequential turns, and — via `--session <path>`/`--continue` (reusing `SessionStore`/`SessionRepo::resume_or_create`) — can persist and resume a transcript across invocations exactly like `serve`'s own repo/file modes; `run --export <path>` renders the finished transcript via `export::export_html` after a live run completes, while the standalone `export <session.jsonl> [output.html]` subcommand renders an *already-persisted* session file straight off disk — no gateway, key, or model involved at all (`SessionStore::open` + `export::export_html`)                                                                          |
 | `src/lib.rs`           | Library root; re-exports `serve`/`tools`/`resources`/`skills`/`prompts`/`session_store`/`trust_store`/`export` for tests/benches                                                                                                                                                                                                                                                                                                         |
 | `src/serve.rs`         | NDJSON control protocol: single stdout-writer task, `Persistence` (file/dir/none, default-per-cwd directory), a large command set (session/branch nav, `reload`, model/thinking/tool/auto-compaction tuning, `bash`/`abort_bash`, `export_html`) — see the module's own doc comment for the exhaustive list; prompt runs concurrently with stdin routing `steer`/`follow_up` (also accepted while idle, via a persistent `Steering` handle) |
-| `src/export.rs`        | `export_html`/`render_html` — renders a session's transcript as one self-contained, dependency-free HTML file (inline CSS, no JS, images inlined as data URIs); reuses `skills::xml_escape` for HTML-text escaping; shared by `serve`'s `export_html` RPC command and `run --export`                                                                                                                                                    |
-| `src/trust_store.rs`   | Tri-state (`Trust::{Trusted,Untrusted,Unknown}`), ancestor-inheriting trust allowlist (`~/.claude/trusted-projects.json`); legacy bare-array files still parse (trusted-only)                                                                                                                                                                                                                                                            |
-| `src/session_store.rs` | JSONL `SessionStore` (fsync'd append/atomic-rewrite/mid-file-corruption recovery, header metadata + durable `Entry::Compaction` provenance, version-migration guard, collision-safe ids) + multi-session `SessionRepo` (list-with-metadata, soft-delete-to-`.trash`, fork + read-only fork preview, `resume_or_create` — reopen the most recent session matching a `cwd` or make a fresh one, shared by `serve`'s startup reattach and `run --continue`); `default_session_dir`/`encode_cwd`/`canonical_cwd` — the `~/.claude/sessions/<encoded-cwd>/` convention and the symlink/trailing-separator-safe form every recorded `cwd` is passed through first, likewise shared; tree-shaped history (`id`/`parent_id` per message, `Leaf`/`BranchSummary`/`Compaction` entries, `switch_active_with_summary`/`list_branches`/`tree`/`abandoned_by_switch`, legacy migration, off-branch-preserving compaction); `SessionMeta::to_listing_json` — the derived listing fields (`updated_at`/`message_count`/`preview`/`search_text`) are `#[serde(skip)]` on the struct itself, so this is the only path that actually surfaces them as JSON |
-| `src/resources.rs`     | System-prompt assembly split into `build_static_system_prompt` (on-disk `SYSTEM.md` override, one-file-per-dir `AGENTS.md`>`CLAUDE.md` discovery, skill injection — expensive, cached) and `dynamic_footer` (local date/cwd — cheap, refreshed every turn); `build_system_prompt` composes both for a one-shot caller                                                                                                                   |
+| `src/export.rs`        | `export_html`/`render_html` — renders a session's transcript as one self-contained, dependency-free HTML file (inline CSS, no JS, images inlined as data URIs); also renders every abandoned branch (passed in as `SessionStore::abandoned_branches`'s output) as its own labeled section after the main transcript — only the divergent suffix, not the shared prefix already shown above; message text is rendered as markdown (`render_markdown`, `pulldown-cmark`, server-side at export time — not pi's client-side `marked`/`highlight.js`) with raw HTML defused to visible text and link/image URLs scheme-allow-listed (`sanitize_url`); a fenced ` ```diff ` block or diff-shaped tool-result content (`looks_like_diff`) gets per-line +/- coloring (`diff_html`) instead of real syntax highlighting, which is deliberately not implemented (would need a heavy crate like `syntect`, bloating every build of this CLI for a nice-to-have); reuses `skills::xml_escape` for HTML-text escaping; shared by `serve`'s `export_html` RPC command, `run --export`, and the standalone `export` subcommand                                                                                                                                                    |
+| `src/trust_store.rs`   | Tri-state (`Trust::{Trusted,Untrusted,Unknown}`), ancestor-inheriting trust allowlist (`~/.claude/trusted-projects.json`); `trust`/`distrust` record an explicit grant/denial, `clear` removes a directory's own entry (trusted *or* untrusted) without recording a new one, reverting it to inheriting its nearest ancestor's decision; legacy bare-array files still parse (trusted-only)                                                                                                                                                                                                                                                            |
+| `src/session_store.rs` | JSONL `SessionStore` (fsync'd append/atomic-rewrite/mid-file-corruption recovery, header metadata + durable `Entry::Compaction` provenance, version-migration guard, collision-safe ids) + multi-session `SessionRepo` (list-with-metadata, soft-delete-to-`.trash`, fork + read-only fork preview, `resume_or_create` — reopen the most recent session matching a `cwd` or make a fresh one, shared by `serve`'s startup reattach and `run --continue`); `default_session_dir`/`encode_cwd`/`canonical_cwd` — the `~/.claude/sessions/<encoded-cwd>/` convention and the symlink/trailing-separator-safe form every recorded `cwd` is passed through first, likewise shared; tree-shaped history (`id`/`parent_id` per message, `Leaf`/`BranchSummary`/`Compaction`/`ModelChange`/`ThinkingLevelChange`/`TitleChange` entries, `switch_active_with_summary`/`list_branches`/`tree`/`abandoned_by_switch`/`abandoned_branches`(every non-active leaf's full root-to-leaf message chain, plus how much of it is shared with the active path — for HTML export), legacy migration, off-branch-preserving compaction); `set_title` — an O(1) `TitleChange` append, not a rewrite, whole-session-scoped (most-recent-wins across the whole file) unlike the branch-scoped model/thinking-level changes; `SessionMeta::to_listing_json` — the derived listing fields (`updated_at`/`message_count`/`preview`/`search_text`) are `#[serde(skip)]` on the struct itself, so this is the only path that actually surfaces them as JSON |
+| `src/resources.rs`     | System-prompt assembly split into `build_static_system_prompt` (on-disk `SYSTEM.md` override + additive `APPEND_SYSTEM.md`, one-file-per-dir `AGENTS.md`>`CLAUDE.md` discovery, skill injection — expensive, cached) and `dynamic_footer` (local date/cwd — cheap, refreshed every turn); `build_system_prompt` composes both for a one-shot caller                                                                                                                   |
 | `src/skills.rs`        | Recursive skill discovery (`SKILL.md` frontmatter at any depth, `disable-model-invocation`, `/skill:` lookup — expands into a `<skill name=".." location="..">` tag with the frontmatter stripped, not the raw file) + `<available_skills>` rendering + `discover_with_diagnostics` (name-collision reporting); `project_trusted` gates only the project-local root, the user-global root is always scanned; `validate_skill_name`/`validate_skill_description` — non-fatal, `warn!`-logged shape/length checks (a bad `name`, or a `description` past 1024 chars) that never block discovery                |
 | `src/prompts.rs`       | `/name args` prompt-template discovery + bash-style expansion (quote-aware args, `$N`, `${@:N:L}` slices, `${N:-default}`, `description` frontmatter) + `discover_with_diagnostics` (name-collision reporting)                                                                                                                                                                                                                           |
+| `src/timing.rs`        | `StartupTiming` — `AI_AGENT_TIMING=1`-gated startup profiling (pi's own `PI_TIMING=1`/`timings.ts`); `mark(label)`/`print()` are no-ops (don't even read the clock) when unset, so it's safe to sprinkle through `run`/`serve`'s startup path unconditionally; prints to stderr only, never stdout                                                                                                                                      |
 | `src/tools/mod.rs`     | `default_registry_with(bash_timeout_ms)` — assembles the base 10-tool `ToolRegistry`; `apply_filter(&mut registry, tools, exclude_tools, no_tools)` — allow/deny-list/no-tools filtering applied once at process build time                                                                                                                                                                                                             |
 | `src/tools/read.rs`    | `read` — line-numbered read with `offset`/`limit`, byte budget, offset-past-EOF error, continuation hints; image files sniffed by magic bytes and downscaled/re-encoded (Lanczos3, PNG-then-JPEG, Exif orientation via `image`'s own generic decoder API — JPEG and WebP both) to fit a 4.5 MB base64 budget                                                                                                                            |
 | `src/tools/write.rs`   | `write` — create/overwrite a file, creating parent directories                                                                                                                                                                                                                                                                                                                                                                           |
@@ -569,10 +677,12 @@ container/VM — not by this crate restricting its own tools.
 | `--max-steps`                                                  | `agent_core::DEFAULT_MAX_STEPS` (50) | Ceiling on loop iterations (`run`) or per-`prompt` iterations (`serve`) before `Error::MaxSteps` (resumable with a fresh call)     |
 | `--tools` / `--exclude-tools` / `--no-tools` (+ `AI_AGENT_TOOLS`/`AI_AGENT_EXCLUDE_TOOLS` for `serve`) | none (full default registry) | Restrict/drop from the advertised tool set before the process's `Agent`/system prompt are built; `--no-tools` wins outright        |
 | `--trust-project`                                              | `false`                     | Trust the cwd for this run only (session-scoped), independent of `agent trust <path>`'s persistent allowlist                     |
+| `--force-untrusted`                                             | `false`                     | Force the cwd *untrusted* for this run only, overriding both `--trust-project` and a persisted `agent trust <path>` grant — pi's own `--no-approve`/`-na`; wins over `--trust-project` if both are given |
 | `--session-file` / `--session-dir` / `AI_AGENT_SESSION_FILE`   | per-cwd directory under `~/.claude/sessions/` | `serve`-only: where the `Session`/`SessionRepo` persists; `--no-session-persistence` opts out to pure in-memory                   |
 | `timeout_ms` (per-call, `bash` tool input)                     | `1_800_000` (30 min)        | Wall-clock ceiling for one `bash` invocation — deliberately long; this runs unattended with no one watching a hung shell           |
 | `--bash-timeout-ms` / `AI_AGENT_BASH_TIMEOUT_MS`                | same as above               | Overrides `bash`'s own default when the model omits `timeout_ms`                                                                  |
 | `RUST_LOG` (`tracing_subscriber::EnvFilter::from_default_env`) | unset (no logs)             | Verbosity of `tracing` spans/events emitted by the binary's subscriber                                                            |
+| `AI_AGENT_TIMING`                                              | unset (no timing output)    | `=1` prints a startup-timing breakdown (resource discovery, system-prompt build, session open, agent construction) to stderr just before the first turn/`ready` frame — pi's own `PI_TIMING=1`; every checkpoint is a zero-cost no-op when unset |
 
 Not configurable from this crate via a CLI flag: `max_tokens` (seeded model-aware by `agent_core`'s
 `Agent::new`, ≥4096/turn; `serve`'s `set_thinking`/`cycle_thinking_level` tune the thinking budget at
@@ -599,4 +709,4 @@ retry at runtime).
 | `grep`/`find` hit `HARD_CAP` (10,000 collected items)          | Walk quits early; output is still sorted+truncated deterministically, but which items entered the set before the cap can vary                       | Model narrows the `pattern`/`glob` and retries                       |
 | `grep`'s rendered output exceeds `MAX_OUTPUT_BYTES` (50 KiB)   | Truncated at a char boundary with its own marker; wins outright over the match-count marker if both would otherwise fire in the same response       | Model narrows the pattern/path/context and retries                   |
 | `read` on an image that can't fit the 4.5 MB base64 budget even after downscaling | `ToolError::InvalidInput` — refused rather than silently sending a payload the provider would reject                                                | Model resizes the source image itself, or narrows what it asks for   |
-| A working directory is untrusted                               | `SYSTEM.md`/project-instruction/skill/prompt-template sources from it are silently absent from the system prompt and `get_commands` — not an error  | `agent trust <path>` (persistent) or `--trust-project`/RPC (session) |
+| A working directory is untrusted                               | `SYSTEM.md`/skill/prompt-template sources from it are silently absent from the system prompt and `get_commands` — not an error (`AGENTS.md`/`CLAUDE.md` are unaffected either way — they're never trust-gated) | `agent trust <path>` (persistent) or `--trust-project`/RPC (session) |

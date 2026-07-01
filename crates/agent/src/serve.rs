@@ -21,10 +21,19 @@
 //!   - `{type:"stop_after_turn"}`        request a graceful stop at the next turn boundary — the
 //!     current turn's tool calls (if any) still finish and their results are committed, unlike
 //!     `abort`. A no-op ack when no `prompt` is in flight (never affects a *future* prompt).
-//!   - `{type:"get_state"}`              → `data: {session_id, model, steps, message_count, title, …}`
-//!   - `{type:"get_messages"}`           → `data: {messages: [...]}` (each tagged with its tree `id`
-//!     when persistence is configured, so a client can fork from any point via `switch_branch`)
-//!   - `{type:"new_session"}`            start a fresh session → `data: {session_id}`
+//!   - `{type:"get_state"}`              → `data: {session_id, model, steps, message_count, title,
+//!     thinking_level, auto_compaction, auto_retry, queue_mode, pending_messages, …}` — the last five
+//!     are the runtime-mutable settings and current steer/follow-up queue depth (`Steering::
+//!     pending_count`), so a client can render current settings without a second round trip
+//!   - `{type:"get_messages", since?}`   → `data: {messages: [...]}` (each tagged with its tree `id`
+//!     when persistence is configured, so a client can fork from any point via `switch_branch`);
+//!     `since` (a tree id the client already has) returns only the messages appended after it — pi's
+//!     own `get_entries({since})` — an error, not a silent full re-fetch, when `since` names no known
+//!     id (or persistence isn't configured, so nothing is tagged at all)
+//!   - `{type:"new_session"}`            start a fresh session → `data: {session_id, parent}` (repo
+//!     mode: `parent` is whatever session id was active immediately before this call — pi's own
+//!     `parentSession` lineage marker, provenance only, not a fork; `null` in single-file/in-memory
+//!     mode, where there's no *new* id to link)
 //!   - `{type:"list_sessions"}`          (repo mode) → `data: {sessions: [SessionMeta + updated_at/
 //!     message_count/preview/search_text…]}` (via `SessionMeta::to_listing_json` — those four fields are
 //!     `#[serde(skip)]` on the struct itself), this project's sessions only (matched by the default
@@ -35,9 +44,12 @@
 //!     `list_sessions`, across every project's own session directory, not just this one's — each entry's
 //!     own `cwd` field says which project it belongs to (pi's cross-project `listAll`)
 //!   - `{type:"switch_session", session_id}` (repo mode) load another session
-//!   - `{type:"fork", upto?}`            (repo mode) copy the prefix into a new session, switch to it
-//!   - `{type:"get_fork_messages", session_id?, upto?}` (repo mode) preview what `fork` would produce —
-//!     no new session, no switch
+//!   - `{type:"fork", upto?, target_id?, before?}` (repo mode) copy a prefix into a new session, switch
+//!     to it. `target_id` (any tree entry, on or off the active path) wins over `upto` (a message-count
+//!     prefix of just the active path) when given; `before:true` excludes `target_id` itself from the
+//!     copied prefix (fork right before it), the default `false` includes it.
+//!   - `{type:"get_fork_messages", session_id?, upto?, target_id?, before?}` (repo mode) preview what
+//!     `fork` would produce — no new session, no switch
 //!   - `{type:"set_session_name", title}` set the session's title
 //!   - `{type:"export_html", output_path?}` render the active session's transcript as a single
 //!     self-contained HTML file → `data: {path}`. `output_path` defaults to a timestamped
@@ -63,15 +75,29 @@
 //!     `xhigh` back to `off` → `data: {level, thinking, reasoning_effort}`
 //!   - `{type:"set_auto_compaction", enabled}` toggle threshold-triggered compaction (manual `compact`
 //!     is unaffected either way)
-//!   - `{type:"set_auto_retry", enabled}` toggle mid-stream transport-failure retry (on by default) —
-//!     off surfaces a normally-retried transient failure immediately, for debugging a flaky connection
-//!     rather than waiting through several silent attempts
+//!   - `{type:"set_auto_retry", enabled}` toggle transport-failure retry (on by default) — off surfaces
+//!     a normally-retried transient failure immediately, for debugging a flaky connection rather than
+//!     waiting through several silent attempts. Gates *two* layers as one user-facing concept: the
+//!     mid-stream retry inside a single model turn (`agent_core::Agent::with_auto_retry`), and, once
+//!     that's exhausted, automatically re-invoking the *whole* `prompt` run against the same session up
+//!     to 3 more times with backoff (2/4/8s) — pi's `agent-session.ts` auto-retry. Each whole-run retry
+//!     attempt emits an unsolicited `auto_retry` frame (`{type:"auto_retry", id, command:"prompt",
+//!     attempt, max_attempts, delay_ms, error}`) before its backoff sleep.
+//!   - `{type:"set_queue_mode", mode}` toggle how much of the steer/follow-up queue a single drain
+//!     point consumes (`agent_core::QueueMode`) — `"one_at_a_time"` (the default, matching pi): only
+//!     the oldest queued message is injected per mid-run/stop-boundary drain, the rest stays queued for
+//!     the next one; `"all"`: everything queued is folded into one injection. Takes effect immediately
+//!     (owned by the `Steering` handle itself, no `Agent` rebuild), including mid-run.
 //!   - `{type:"get_available_models"}`   → `data: {models: […]}` (a known, non-exhaustive id list)
 //!   - `{type:"list_branches"}`          → `data: {branches: [BranchInfo…]}` (the session's *leaves*)
 //!   - `{type:"get_tree"}`               → `data: {nodes: [TreeNode…]}` (every message on every
 //!     branch, not just the leaves `list_branches` reports)
 //!   - `{type:"switch_branch", target_id, summarize?}` navigate to another point in the tree,
-//!     summarizing the abandoned branch's activity first unless `summarize:false`
+//!     summarizing the abandoned branch's activity first unless `summarize:false` → `data: {target_id,
+//!     model, reasoning_effort}` — also restores whichever model/thinking-level was actually active at
+//!     `target_id` (a `set_model`/`cycle_model`/`set_reasoning_effort`/`cycle_thinking_level` made
+//!     *after* leaving that point doesn't leak backward into it), rebuilding the `Agent` if either
+//!     differs from what's currently active
 //!   - `{type:"bash", command, cwd?, timeout_ms?}` run a shell command directly — independent of the
 //!     model's own tool-call loop, and of any conversation/session state — streaming `tool_progress`/
 //!     `tool_end` events exactly like a model-invoked `bash` call. Rejected if `bash` isn't registered
@@ -94,9 +120,11 @@
 //! session's next turn can't leak into another.
 //!
 //! Frames (stdout) are `{type:"ack", id?, command}`, `{type:"response", id?, command, success, data?,
-//! error?}`, `{type:"event", event: <AgentEvent>}`, or `{type:"list_progress", id?, command, scanned,
+//! error?}`, `{type:"event", event: <AgentEvent>}`, `{type:"list_progress", id?, command, scanned,
 //! total}` — zero or more unsolicited progress updates a `list_sessions`/`list_all_sessions` scan emits
-//! while in flight, correlated to the request via the same `id` its eventual `response` carries.
+//! while in flight, correlated to the request via the same `id` its eventual `response` carries — or
+//! `{type:"auto_retry", id?, command:"prompt", attempt, max_attempts, delay_ms, error}`, one per
+//! whole-run auto-retry attempt (see `set_auto_retry` above), also correlated via `id`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -158,6 +186,12 @@ pub struct ServeConfig {
     /// honored even if the directory isn't in the persisted allowlist (`agent trust <path>`). See
     /// `crate::trust_store`.
     pub trust_project: bool,
+    /// Force the working directory *untrusted* for this run only, overriding both `trust_project` and
+    /// the persisted allowlist — pi's own `--no-approve`/`-na`. For a directory the operator has
+    /// permanently `agent trust`ed but wants to run against once as if it weren't (testing untrusted
+    /// behavior, or extra caution on a checkout that happens to live under an already-trusted parent).
+    /// Wins over `trust_project` if both are somehow set.
+    pub force_untrusted: bool,
     /// Compaction headroom (tokens) reserved below the context window. `None` keeps
     /// `CompactionConfig::default()`'s value.
     pub compaction_reserve_tokens: Option<u32>,
@@ -182,6 +216,11 @@ pub struct ServeConfig {
     pub exclude_tools: Option<Vec<String>>,
     /// Register no tools at all. Wins over `tools`/`exclude_tools`.
     pub no_tools: bool,
+    /// Restrict `cycle_model`'s candidate list to exactly these ids, in this order (`--models`,
+    /// comma-separated). `set_model`/`get_available_models` are unaffected — this only scopes what
+    /// `cycle_model` steps through, matching pi's `--models` flag (`resolveModelScope`/
+    /// `_scopedModels`). Empty or absent falls back to the full [`available_models`] list.
+    pub models: Vec<String>,
 }
 
 /// Waits for an OS shutdown request (SIGTERM, or SIGINT/Ctrl-C) so `serve` can drain in-flight work
@@ -413,10 +452,20 @@ impl Persistence {
 
     /// Start a fresh session. In repo mode this creates a new file (new id); in single-file mode it
     /// resets the existing file (keeping its id); in-memory it just mints new metadata.
+    ///
+    /// In repo mode, the fresh session's `parent` records whatever session id was active immediately
+    /// before this call — pi's own `parentSession` lineage marker on a `/new`-equivalent reset. It's
+    /// provenance only (no shared history, unlike an actual `fork`): a client browsing sessions can
+    /// still trace "this fresh one followed that one" in the same directory/conversation. Not recorded
+    /// in single-file mode (there's no *new* id to link — the file/id just gets cleared in place) or
+    /// in-memory mode (nothing persists a "previous" id anywhere a client could look it up later),
+    /// matching pi's own `this.persist ? previousSessionFile : undefined`.
     fn new_session(&mut self, model: &str) -> Session {
         let cwd = Self::cwd();
         if let Some(repo) = &self.repo {
-            match repo.create(SessionMeta::new(&cwd, model)) {
+            let mut meta = SessionMeta::new(&cwd, model);
+            meta.parent = Some(self.meta.id.clone());
+            match repo.create(meta) {
                 Ok(store) => {
                     self.meta = store.meta().clone();
                     self.store = Some(store);
@@ -442,29 +491,43 @@ impl Persistence {
         Ok(session)
     }
 
-    /// Fork the current session at `upto` messages into a new session and switch to it (repo mode).
-    fn fork(&mut self, upto: usize) -> std::io::Result<Session> {
+    /// Fork the current session into a new session and switch to it (repo mode). `entry_id`, when
+    /// given, forks at that specific tree entry — anywhere in the whole tree, on or off the active
+    /// path (`before` excludes the entry itself, matching pi's `position:"before"`/`"at"`) — otherwise
+    /// falls back to `upto`, a message-count prefix of the active path (the original, narrower form).
+    fn fork(
+        &mut self,
+        upto: usize,
+        entry_id: Option<&str>,
+        before: bool,
+    ) -> std::io::Result<Session> {
         let id = self.meta.id.clone();
-        let (store, session) = self
-            .repo
-            .as_ref()
-            .ok_or_else(not_in_repo_mode)?
-            .fork(&id, upto)?;
+        let repo = self.repo.as_ref().ok_or_else(not_in_repo_mode)?;
+        let (store, session) = match entry_id {
+            Some(entry_id) => repo.fork_at_entry(&id, entry_id, before)?,
+            None => repo.fork(&id, upto)?,
+        };
         self.meta = store.meta().clone();
         self.store = Some(store);
         Ok(session)
     }
 
-    /// Preview what forking `session_id` at `upto` messages would produce — the exact prefix `fork`
-    /// would copy — without creating a new session file or switching to it (repo mode only, like
-    /// `switch`/`fork`). A client browsing `list_sessions` uses this to preview a fork point before
-    /// committing to it.
+    /// Preview what forking `session_id` would produce — the exact prefix `fork` would copy — without
+    /// creating a new session file or switching to it (repo mode only, like `switch`/`fork`). Same
+    /// `entry_id`/`before`-vs-`upto` choice as `fork`. A client browsing `list_sessions` uses this to
+    /// preview a fork point before committing to it.
     fn fork_messages(
         &self,
         session_id: &str,
         upto: usize,
+        entry_id: Option<&str>,
+        before: bool,
     ) -> std::io::Result<Vec<agent_core::Message>> {
         let repo = self.repo.as_ref().ok_or_else(not_in_repo_mode)?;
+        if let Some(entry_id) = entry_id {
+            let (_, session) = repo.fork_at_entry(session_id, entry_id, before)?;
+            return Ok(session.messages.to_vec());
+        }
         let (_, session) = repo.open_id(session_id)?;
         let upto = upto.min(session.messages.len());
         Ok(session.messages[..upto].to_vec())
@@ -511,9 +574,9 @@ impl Persistence {
     }
 
     /// Set the current session's title.
-    fn set_title(&mut self, title: &str, messages: &[agent_core::Message]) -> std::io::Result<()> {
+    fn set_title(&mut self, title: &str) -> std::io::Result<()> {
         if let Some(store) = &mut self.store {
-            store.set_title(title, messages)?;
+            store.set_title(title)?;
             self.meta = store.meta().clone();
         }
         Ok(())
@@ -534,6 +597,15 @@ impl Persistence {
         self.store
             .as_ref()
             .map(SessionStore::tree)
+            .unwrap_or_default()
+    }
+
+    /// Every abandoned branch's full message chain, for `export_html` — see
+    /// `SessionStore::abandoned_branches` (empty unless persistence is configured).
+    fn abandoned_branches(&self) -> Vec<(usize, Vec<agent_core::Message>)> {
+        self.store
+            .as_ref()
+            .map(SessionStore::abandoned_branches)
             .unwrap_or_default()
     }
 
@@ -633,6 +705,48 @@ impl Persistence {
         session.messages = Arc::new(messages);
         Ok(session)
     }
+
+    /// Record that the active model changed — a no-op when persistence isn't configured (in-memory
+    /// mode has nothing to append to). The caller (`set_model`/`cycle_model`) only calls this once it
+    /// has already confirmed the model actually changed.
+    fn record_model_change(&mut self, model: &str) {
+        if let Some(store) = &mut self.store {
+            if let Err(e) = store.record_model_change(model) {
+                eprintln!("serve: failed to record model change: {e}");
+            }
+        }
+    }
+
+    /// Same idea as [`Self::record_model_change`], for the portable thinking level.
+    fn record_thinking_level_change(&mut self, level: &str) {
+        if let Some(store) = &mut self.store {
+            if let Err(e) = store.record_thinking_level_change(level) {
+                eprintln!("serve: failed to record thinking-level change: {e}");
+            }
+        }
+    }
+
+    /// The model/thinking-level to restore when switching to `target_id` (see
+    /// `SessionStore::model_at`/`thinking_level_at`). The model always resolves to *something* —
+    /// whatever `SessionStore::model_at` finds, or this session's own creation-time model
+    /// (`self.meta.model`) if nothing was ever recorded reaching that point — since every session has a
+    /// real starting model, "no change recorded yet" must restore that starting point, not be read as
+    /// "leave whatever's currently active alone" (which would wrongly keep a *later* branch's model
+    /// active after switching to an earlier point that predates it). The thinking level has no
+    /// equivalent creation-time baseline to fall back to (it isn't part of `SessionMeta`), so `None`
+    /// there genuinely does mean "nothing to restore, leave it as-is".
+    fn model_and_level_at(&self, target_id: &str) -> (String, Option<String>) {
+        let Some(store) = &self.store else {
+            return (self.meta.model.clone(), None);
+        };
+        (
+            store
+                .model_at(target_id)
+                .map(str::to_string)
+                .unwrap_or_else(|| self.meta.model.clone()),
+            store.thinking_level_at(target_id).map(str::to_string),
+        )
+    }
 }
 
 fn not_in_repo_mode() -> std::io::Error {
@@ -656,7 +770,9 @@ fn cwd_is_stale(meta_cwd: &str, actual_cwd: &std::path::Path) -> bool {
 
 /// Run the control loop until stdin closes.
 pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let mut timing = crate::timing::StartupTiming::new();
     let (mut persistence, mut session) = Persistence::open(&cfg)?;
+    timing.mark("open persistence");
 
     // Assemble the system prompt from the base identity + this repo's project instructions + skills +
     // environment, so the agent behaves like it belongs in the working directory. Split into a static
@@ -664,8 +780,8 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
     // and a cheap dynamic footer (current date/cwd, recomputed before every `prompt` via `full_system`)
     // so a long-running `serve` process doesn't re-walk the filesystem every turn just for the date.
     let cwd = crate::session_store::canonical_cwd(&std::env::current_dir().unwrap_or_default());
-    let mut project_trusted =
-        cfg.trust_project || crate::trust_store::TrustStore::open_default().is_trusted(&cwd);
+    let mut project_trusted = !cfg.force_untrusted
+        && (cfg.trust_project || crate::trust_store::TrustStore::open_default().is_trusted(&cwd));
     let mut static_system =
         crate::resources::build_static_system_prompt(&crate::resources::PromptOptions {
             base: &cfg.system,
@@ -675,6 +791,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
             include_skills: true,
             project_trusted,
         });
+    timing.mark("build static system prompt");
 
     // Slash-command prompt templates (`/name args`) and discoverable skills, for `get_commands` and
     // for expanding a `/name`/`/skill:name` prompt before it reaches the model.
@@ -691,13 +808,11 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
     // The `_with_diagnostics` variant also reports name collisions (the same `/name` or skill name
     // shadowed across roots), surfaced via `get_commands`'s `collisions` field rather than silently
     // resolved with no way for a client to notice.
-    let (mut prompt_templates, mut prompt_collisions) = if project_trusted {
-        crate::prompts::discover_with_diagnostics(&cwd)
-    } else {
-        (Vec::new(), Vec::new())
-    };
+    let (mut prompt_templates, mut prompt_collisions) =
+        crate::prompts::discover_with_diagnostics(&cwd, project_trusted);
     let (mut skills, mut skill_collisions) =
         crate::skills::discover_with_diagnostics(&cwd, project_trusted);
+    timing.mark("discover prompt templates/skills");
 
     // Keep the transport in an `Arc` we can clone: `set_model`/`set_thinking` rebuild the `Agent` at
     // runtime (a new model id picks a new dialect), and each rebuild reuses this one HTTP client.
@@ -713,6 +828,13 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
     // (transport, tools, system prompt, loop bounds, cache settings) is fixed for the process.
     // `build_agent` folds the mutable trio into a fresh `Agent` whenever any of them changes.
     let mut current_model = cfg.model.clone();
+    // `cycle_model`'s candidate list: the operator-scoped `--models` set when given, else the full
+    // known-model hint list. Fixed for the process, like `tools` — there's no runtime RPC to change it.
+    let cycle_models: Vec<String> = if cfg.models.is_empty() {
+        available_models().iter().map(|s| s.to_string()).collect()
+    } else {
+        cfg.models.clone()
+    };
     let mut current_thinking = cfg.thinking;
     // The portable thinking-depth level (see `agent_core::ThinkingLevel`) — the runtime-mutable
     // counterpart to `cfg.reasoning_effort`, seeded from it so a process started with
@@ -760,6 +882,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
         &write_locks,
         &checkpoint,
     );
+    timing.mark("build agent");
     // Persistent across every `prompt` call (not just the one currently in flight), so `steer`/
     // `follow_up` sent while idle queue for the *next* `prompt` instead of being rejected as an unknown
     // command. Cleared on every session switch (`new_session`/`switch_session`/`fork`/`switch_branch`)
@@ -818,6 +941,8 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
             }
         };
     }
+
+    timing.print();
 
     // Announce readiness so a client can sync before issuing commands. If this already fails the
     // writer never started; there is nothing to serve.
@@ -905,27 +1030,20 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 // Acknowledge immediately — the turn is queued and about to start — rather than
                 // leaving a client with no signal until the (possibly much later) terminal response.
                 emit!(ack(id.clone(), "prompt"));
-                let tx = out_tx.clone();
                 let cancel = CancellationToken::new();
                 // The sink sets this to the compaction's `tokens_before` when the loop compacts
                 // mid-run, so we know to non-destructively rewrite (not append) the persisted
                 // transcript afterwards. 0 doubles as "no compaction fired this run" — see
                 // `Persistence::persist`; in practice a real compaction's `tokens_before` is never
                 // legitimately 0 (`should_compact`/`compact` only ever fire once real usage has been
-                // recorded).
+                // recorded). Reset (not recreated) at the top of each retry attempt below, so the value
+                // read after the loop always reflects only the most recent attempt.
                 let tokens_before = Arc::new(AtomicU32::new(0));
-                let tokens_before_sink = tokens_before.clone();
                 // Whether the run's *last* turn ended in a refusal — set from every `TurnEnd`, so by
                 // the time the run returns it reflects only the final one (any refusal earlier in a
                 // multi-turn run is superseded once the model goes on to call tools or answer plainly).
+                // Also reset per retry attempt, for the same reason as `tokens_before`.
                 let refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let refused_sink = refused.clone();
-                // Live token/step counters a `get_state`/`get_session_stats` sent while this run is in
-                // flight can answer from (see the busy-loop's own arms for those types below) — seeded
-                // from the session's current totals, then kept current from the same events a streaming
-                // client already observes, so a poller gets real progress instead of a busy rejection.
-                let live_stats = Arc::new(LiveStats::from_session(&session));
-                let live_stats_sink = live_stats.clone();
 
                 // Drive the run while staying responsive to stdin: `abort` cancels it, `steer` queues a
                 // mid-run injection and `follow_up` a stop-boundary one; any other command is
@@ -933,216 +1051,279 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 // mid-run, cancel and drain. The block scopes the run's `&mut session` borrow so we can
                 // persist after.
                 let mut stdin_open = true;
-                let result = {
-                    let run = agent.run_events_steered(
-                        &mut session,
-                        move |ev| {
-                            if let AgentEvent::Compacted { tokens_before, .. } = ev {
-                                tokens_before_sink.store(tokens_before, Ordering::Relaxed);
-                            }
-                            if let AgentEvent::TurnEnd { stop_reason, step } = &ev {
-                                refused_sink
-                                    .store(*stop_reason == StopReason::Refusal, Ordering::Relaxed);
-                                live_stats_sink.set_steps(*step);
-                            }
-                            if let AgentEvent::Stream(StreamEvent::Usage(usage)) = &ev {
-                                live_stats_sink.record_usage(usage);
-                            }
-                            // Best-effort: a sync sink can't break the control loop. If the writer is
-                            // gone the send fails here and the terminal response send below detects it
-                            // via `emit!` and stops the loop. An unserializable event is skipped rather
-                            // than emitted as a malformed frame (see `event_frame`).
-                            if let Some(frame) = event_frame(ev) {
-                                let _ = tx.send(frame);
-                            }
-                        },
-                        cancel.clone(),
-                        steering.clone(),
-                    );
-                    tokio::pin!(run);
-                    loop {
-                        tokio::select! {
-                            biased;
-                            r = &mut run => break r,
-                            // A shutdown request mid-run gets the same treatment as stdin closing:
-                            // cancel and let the run unwind so the code below can persist before we
-                            // fall out of the outer loop (`!stdin_open` breaks it, further down).
-                            () = shutdown.wait() => {
-                                stdin_open = false;
-                                cancel.cancel();
-                            }
-                            // Drain and persist each mid-run checkpoint as it arrives (see
-                            // `ChannelCheckpoint`). `persistence` isn't touched by `run` itself (only
-                            // `session` is borrowed there), so reassigning it here is safe exactly like
-                            // `stdin_open`/`cancel` being mutated from a sibling branch above. Any
-                            // checkpoint left undrained when the run ends is harmless — the unconditional
-                            // full persist right after this loop (below) is a strict superset of it.
-                            Some(messages) = checkpoint_rx.recv() => {
-                                persistence = persist_messages_blocking(persistence, messages).await;
-                            }
-                            maybe_line = lines.next_line(), if stdin_open => match maybe_line {
-                                Ok(Some(l)) => {
-                                    let l = l.trim();
-                                    if l.is_empty() {
-                                        continue;
-                                    }
-                                    let c: Value = match serde_json::from_str(l) {
-                                        Ok(v) => v,
-                                        Err(e) => {
-                                            let _ = out_tx.send(response(None, "?", false, None, Some(&format!("invalid JSON: {e}"))));
-                                            continue;
-                                        }
-                                    };
-                                    let cid = c.get("id").and_then(Value::as_str).map(str::to_string);
-                                    match c.get("type").and_then(Value::as_str).unwrap_or("") {
-                                        "abort" => {
-                                            cancel.cancel();
-                                            let _ = out_tx.send(response(cid, "abort", true, None, None));
-                                        }
-                                        "stop_after_turn" => {
-                                            // Graceful, not a cancel: the current turn's tool calls (if
-                                            // any) still finish and their results are committed; the run
-                                            // just doesn't start another model call afterward. See
-                                            // `agent_core::Steering::request_stop`.
-                                            steering.request_stop();
-                                            let _ = out_tx.send(response(cid, "stop_after_turn", true, None, None));
-                                        }
-                                        cmd @ ("steer" | "follow_up") => {
-                                            match c.get("message").and_then(Value::as_str) {
-                                                Some(m) => {
-                                                    // `steer` redirects mid-run (injected at the next
-                                                    // tool turn); `follow_up` waits for the stop
-                                                    // boundary. Two separate lanes.
-                                                    if cmd == "steer" {
-                                                        steering.push_steer(m);
-                                                    } else {
-                                                        steering.push(m);
-                                                    }
-                                                    let _ = out_tx.send(response(cid, cmd, true, None, None));
-                                                }
-                                                None => {
-                                                    let _ = out_tx.send(response(cid, cmd, false, None, Some("missing `message`")));
-                                                }
-                                            }
-                                        }
-                                        // A `prompt` sent while busy is rejected by default (the
-                                        // session is borrowed by the in-flight run) — *unless* it
-                                        // carries `streaming_behavior: "steer"|"follow_up"`, in which
-                                        // case its `message` is routed through the same `Steering`
-                                        // queue as an explicit `steer`/`follow_up` command, rather than
-                                        // forcing the client to re-encode it as a different command type.
-                                        "prompt" => {
-                                            match (
-                                                c.get("streaming_behavior").and_then(Value::as_str),
-                                                c.get("message").and_then(Value::as_str),
-                                            ) {
-                                                (Some("steer"), Some(m)) => {
-                                                    steering.push_steer(m);
-                                                    let _ = out_tx.send(response(cid, "prompt", true, Some(json!({ "queued_as": "steer" })), None));
-                                                }
-                                                (Some("follow_up"), Some(m)) => {
-                                                    steering.push(m);
-                                                    let _ = out_tx.send(response(cid, "prompt", true, Some(json!({ "queued_as": "follow_up" })), None));
-                                                }
-                                                _ => {
-                                                    let _ = out_tx.send(response(cid, "prompt", false, None, Some("busy: a prompt is running; only `abort`/`steer`/`follow_up`, or a `prompt` with `streaming_behavior: \"steer\"|\"follow_up\"`, are accepted")));
-                                                }
-                                            }
-                                        }
-                                        // Read-only commands that don't need the `&mut Session` this
-                                        // run holds — answered live instead of rejected as busy, so a
-                                        // client polling for progress (tokens/steps so far) during a
-                                        // long tool-heavy turn isn't left with nothing until it ends.
-                                        // `get_state`/`get_session_stats` read `live_stats` (mirrored
-                                        // from this run's own events, see above) instead of `session`
-                                        // directly; `message_count` is `null` here specifically — it's
-                                        // the one `get_state` field that genuinely needs `&session` to
-                                        // report exactly, and a stale/guessed number would be worse
-                                        // than an honest "not available mid-run".
-                                        "get_state" => {
-                                            let mut data = live_stats.snapshot();
-                                            if let Value::Object(m) = &mut data {
-                                                m.insert("session_id".into(), json!(persistence.session_id()));
-                                                m.insert("model".into(), json!(current_model));
-                                                m.insert("message_count".into(), Value::Null);
-                                                m.insert("title".into(), json!(persistence.meta.title));
-                                                m.insert("cwd_stale".into(), json!(cwd_is_stale(&persistence.meta.cwd, &cwd)));
-                                            }
-                                            let _ = out_tx.send(response(cid, "get_state", true, Some(data), None));
-                                        }
-                                        "get_session_stats" => {
-                                            let _ = out_tx.send(response(cid, "get_session_stats", true, Some(live_stats.snapshot()), None));
-                                        }
-                                        "get_commands" => {
-                                            let mut commands: Vec<Value> = skills.iter().map(|s| {
-                                                json!({ "name": s.name, "source": "skill", "description": s.description })
-                                            }).collect();
-                                            commands.extend(prompt_templates.iter().map(|t| {
-                                                json!({ "name": t.name, "source": "prompt", "description": t.argument_hint })
-                                            }));
-                                            let collisions: Vec<&str> = skill_collisions.iter().chain(prompt_collisions.iter()).map(String::as_str).collect();
-                                            let _ = out_tx.send(response(cid, "get_commands", true, Some(json!({ "commands": commands, "collisions": collisions })), None));
-                                        }
-                                        "list_branches" => {
-                                            let _ = out_tx.send(response(cid, "list_branches", true, Some(json!({ "branches": persistence.list_branches() })), None));
-                                        }
-                                        "get_tree" => {
-                                            let _ = out_tx.send(response(cid, "get_tree", true, Some(json!({ "nodes": persistence.tree() })), None));
-                                        }
-                                        "list_sessions" => {
-                                            let progress_id = cid.clone();
-                                            let sessions: Vec<Value> = persistence
-                                                .list_with_progress(|scanned, total| {
-                                                    if should_report_scan_progress(scanned, total) {
-                                                        let _ = out_tx.send(list_progress_frame(progress_id.clone(), "list_sessions", scanned, total));
-                                                    }
-                                                })
-                                                .iter()
-                                                .map(SessionMeta::to_listing_json)
-                                                .collect();
-                                            let _ = out_tx.send(response(cid, "list_sessions", true, Some(json!({ "sessions": sessions })), None));
-                                        }
-                                        "list_all_sessions" => {
-                                            let progress_id = cid.clone();
-                                            match persistence.list_all_with_progress(|scanned, total| {
-                                                if should_report_scan_progress(scanned, total) {
-                                                    let _ = out_tx.send(list_progress_frame(progress_id.clone(), "list_all_sessions", scanned, total));
-                                                }
-                                            }) {
-                                                Ok(sessions) => {
-                                                    let sessions: Vec<Value> = sessions.iter().map(SessionMeta::to_listing_json).collect();
-                                                    let _ = out_tx.send(response(cid, "list_all_sessions", true, Some(json!({ "sessions": sessions })), None));
-                                                }
-                                                Err(e) => {
-                                                    let _ = out_tx.send(response(cid, "list_all_sessions", false, None, Some(&e.to_string())));
-                                                }
-                                            }
-                                        }
-                                        "get_available_models" => {
-                                            let _ = out_tx.send(response(cid, "get_available_models", true, Some(json!({ "models": available_models() })), None));
-                                        }
-                                        other => {
-                                            let _ = out_tx.send(response(cid, other, false, None, Some("busy: a prompt is running; only `abort`/`steer`/`follow_up`, or a handful of read-only commands (get_state/get_session_stats/get_commands/list_branches/get_tree/list_sessions/list_all_sessions/get_available_models), are accepted")));
-                                        }
-                                    }
+                // A run that ends in a transient-looking `Err` (the same classification `run_turn`'s own
+                // mid-stream retry uses — `agent_core::agent::is_retryable_mid_stream`, `pub` exactly for
+                // this) is automatically re-invoked against the *same* session — resuming from wherever
+                // it left off, not restarting the turn — up to `MAX_RUN_RETRIES` times with backoff.
+                // pi's `agent-session.ts` equivalent (`_prepareRetry`/`isRetryableAssistantError`); ours
+                // is gated by the same `current_auto_retry` toggle as the mid-stream layer below it (one
+                // user-facing "retries on/off" concept, even though internally it's two layers), and
+                // never retries past a client disconnect or an explicit `abort` (`is_retryable_mid_stream`
+                // already excludes `Error::Cancelled`, and `stdin_open`/`cancel.is_cancelled()` below are
+                // redundant, cheap belt-and-suspenders on top of that). The backoff sleep itself isn't
+                // raced against `abort`/shutdown — both are only read inside an attempt's own `select!`
+                // below — so a client abort during backoff takes effect once the next attempt's stdin
+                // read resumes, not instantly; bounded by `MAX_RUN_RETRIES`/`RUN_RETRY_MAX_BACKOFF`, this
+                // window is short enough not to be worth the much larger restructuring a truly gapless
+                // fix would need.
+                let mut retry_attempt: u32 = 0;
+                let result = 'retry: loop {
+                    tokens_before.store(0, Ordering::Relaxed);
+                    refused.store(false, Ordering::Relaxed);
+                    let tx = out_tx.clone();
+                    let tokens_before_sink = tokens_before.clone();
+                    let refused_sink = refused.clone();
+                    // Live token/step counters a `get_state`/`get_session_stats` sent while this run is in
+                    // flight can answer from (see the busy-loop's own arms for those types below) — seeded
+                    // fresh from the session's *current* totals every attempt (a retry may follow a partial,
+                    // already-persisted success from an earlier attempt in this same loop), then kept current
+                    // from the same events a streaming client already observes.
+                    let live_stats = Arc::new(LiveStats::from_session(&session));
+                    let live_stats_sink = live_stats.clone();
+
+                    let attempt_result = {
+                        let run = agent.run_events_steered(
+                            &mut session,
+                            move |ev| {
+                                if let AgentEvent::Compacted { tokens_before, .. } = ev {
+                                    tokens_before_sink.store(tokens_before, Ordering::Relaxed);
                                 }
-                                // stdin closed (or errored) mid-run: cancel and let the run unwind, then
-                                // we'll fall out of the outer loop below.
-                                Ok(None) | Err(_) => {
+                                if let AgentEvent::TurnEnd { stop_reason, step } = &ev {
+                                    refused_sink.store(
+                                        *stop_reason == StopReason::Refusal,
+                                        Ordering::Relaxed,
+                                    );
+                                    live_stats_sink.set_steps(*step);
+                                }
+                                if let AgentEvent::Stream(StreamEvent::Usage(usage)) = &ev {
+                                    live_stats_sink.record_usage(usage);
+                                }
+                                // Best-effort: a sync sink can't break the control loop. If the writer is
+                                // gone the send fails here and the terminal response send below detects it
+                                // via `emit!` and stops the loop. An unserializable event is skipped rather
+                                // than emitted as a malformed frame (see `event_frame`).
+                                if let Some(frame) = event_frame(ev) {
+                                    let _ = tx.send(frame);
+                                }
+                            },
+                            cancel.clone(),
+                            steering.clone(),
+                        );
+                        tokio::pin!(run);
+                        loop {
+                            tokio::select! {
+                                biased;
+                                r = &mut run => break r,
+                                // A shutdown request mid-run gets the same treatment as stdin closing:
+                                // cancel and let the run unwind so the code below can persist before we
+                                // fall out of the outer loop (`!stdin_open` breaks it, further down).
+                                () = shutdown.wait() => {
                                     stdin_open = false;
                                     cancel.cancel();
                                 }
+                                // Drain and persist each mid-run checkpoint as it arrives (see
+                                // `ChannelCheckpoint`). `persistence` isn't touched by `run` itself (only
+                                // `session` is borrowed there), so reassigning it here is safe exactly like
+                                // `stdin_open`/`cancel` being mutated from a sibling branch above. Any
+                                // checkpoint left undrained when the run ends is harmless — the unconditional
+                                // full persist right after this loop (below) is a strict superset of it.
+                                Some(messages) = checkpoint_rx.recv() => {
+                                    persistence = persist_messages_blocking(persistence, messages).await;
+                                }
+                                maybe_line = lines.next_line(), if stdin_open => match maybe_line {
+                                    Ok(Some(l)) => {
+                                        let l = l.trim();
+                                        if l.is_empty() {
+                                            continue;
+                                        }
+                                        let c: Value = match serde_json::from_str(l) {
+                                            Ok(v) => v,
+                                            Err(e) => {
+                                                let _ = out_tx.send(response(None, "?", false, None, Some(&format!("invalid JSON: {e}"))));
+                                                continue;
+                                            }
+                                        };
+                                        let cid = c.get("id").and_then(Value::as_str).map(str::to_string);
+                                        match c.get("type").and_then(Value::as_str).unwrap_or("") {
+                                            "abort" => {
+                                                cancel.cancel();
+                                                let _ = out_tx.send(response(cid, "abort", true, None, None));
+                                            }
+                                            "stop_after_turn" => {
+                                                // Graceful, not a cancel: the current turn's tool calls (if
+                                                // any) still finish and their results are committed; the run
+                                                // just doesn't start another model call afterward. See
+                                                // `agent_core::Steering::request_stop`.
+                                                steering.request_stop();
+                                                let _ = out_tx.send(response(cid, "stop_after_turn", true, None, None));
+                                            }
+                                            cmd @ ("steer" | "follow_up") => {
+                                                match c.get("message").and_then(Value::as_str) {
+                                                    Some(m) => {
+                                                        // `steer` redirects mid-run (injected at the next
+                                                        // tool turn); `follow_up` waits for the stop
+                                                        // boundary. Two separate lanes.
+                                                        if cmd == "steer" {
+                                                            steering.push_steer(m);
+                                                        } else {
+                                                            steering.push(m);
+                                                        }
+                                                        let _ = out_tx.send(response(cid, cmd, true, None, None));
+                                                    }
+                                                    None => {
+                                                        let _ = out_tx.send(response(cid, cmd, false, None, Some("missing `message`")));
+                                                    }
+                                                }
+                                            }
+                                            // A `prompt` sent while busy is rejected by default (the
+                                            // session is borrowed by the in-flight run) — *unless* it
+                                            // carries `streaming_behavior: "steer"|"follow_up"`, in which
+                                            // case its `message` is routed through the same `Steering`
+                                            // queue as an explicit `steer`/`follow_up` command, rather than
+                                            // forcing the client to re-encode it as a different command type.
+                                            "prompt" => {
+                                                match (
+                                                    c.get("streaming_behavior").and_then(Value::as_str),
+                                                    c.get("message").and_then(Value::as_str),
+                                                ) {
+                                                    (Some("steer"), Some(m)) => {
+                                                        steering.push_steer(m);
+                                                        let _ = out_tx.send(response(cid, "prompt", true, Some(json!({ "queued_as": "steer" })), None));
+                                                    }
+                                                    (Some("follow_up"), Some(m)) => {
+                                                        steering.push(m);
+                                                        let _ = out_tx.send(response(cid, "prompt", true, Some(json!({ "queued_as": "follow_up" })), None));
+                                                    }
+                                                    _ => {
+                                                        let _ = out_tx.send(response(cid, "prompt", false, None, Some("busy: a prompt is running; only `abort`/`steer`/`follow_up`, or a `prompt` with `streaming_behavior: \"steer\"|\"follow_up\"`, are accepted")));
+                                                    }
+                                                }
+                                            }
+                                            // Read-only commands that don't need the `&mut Session` this
+                                            // run holds — answered live instead of rejected as busy, so a
+                                            // client polling for progress (tokens/steps so far) during a
+                                            // long tool-heavy turn isn't left with nothing until it ends.
+                                            // `get_state`/`get_session_stats` read `live_stats` (mirrored
+                                            // from this run's own events, see above) instead of `session`
+                                            // directly; `message_count` is `null` here specifically — it's
+                                            // the one `get_state` field that genuinely needs `&session` to
+                                            // report exactly, and a stale/guessed number would be worse
+                                            // than an honest "not available mid-run".
+                                            "get_state" => {
+                                                let mut data = live_stats.snapshot();
+                                                if let Value::Object(m) = &mut data {
+                                                    m.insert("session_id".into(), json!(persistence.session_id()));
+                                                    m.insert("model".into(), json!(current_model));
+                                                    m.insert("message_count".into(), Value::Null);
+                                                    m.insert("title".into(), json!(persistence.meta.title));
+                                                    m.insert("cwd_stale".into(), json!(cwd_is_stale(&persistence.meta.cwd, &cwd)));
+                                                    if let Value::Object(rt) = runtime_settings(current_level, current_auto_compaction, current_auto_retry, &steering) {
+                                                        m.extend(rt);
+                                                    }
+                                                }
+                                                let _ = out_tx.send(response(cid, "get_state", true, Some(data), None));
+                                            }
+                                            "get_session_stats" => {
+                                                let _ = out_tx.send(response(cid, "get_session_stats", true, Some(live_stats.snapshot()), None));
+                                            }
+                                            "get_commands" => {
+                                                let mut commands: Vec<Value> = skills.iter().map(|s| {
+                                                    json!({ "name": s.name, "source": "skill", "description": s.description })
+                                                }).collect();
+                                                commands.extend(prompt_templates.iter().map(|t| {
+                                                    json!({ "name": t.name, "source": "prompt", "description": t.argument_hint })
+                                                }));
+                                                let collisions: Vec<&str> = skill_collisions.iter().chain(prompt_collisions.iter()).map(String::as_str).collect();
+                                                let _ = out_tx.send(response(cid, "get_commands", true, Some(json!({ "commands": commands, "collisions": collisions })), None));
+                                            }
+                                            "list_branches" => {
+                                                let _ = out_tx.send(response(cid, "list_branches", true, Some(json!({ "branches": persistence.list_branches() })), None));
+                                            }
+                                            "get_tree" => {
+                                                let _ = out_tx.send(response(cid, "get_tree", true, Some(json!({ "nodes": persistence.tree() })), None));
+                                            }
+                                            "list_sessions" => {
+                                                let progress_id = cid.clone();
+                                                let sessions: Vec<Value> = persistence
+                                                    .list_with_progress(|scanned, total| {
+                                                        if should_report_scan_progress(scanned, total) {
+                                                            let _ = out_tx.send(list_progress_frame(progress_id.clone(), "list_sessions", scanned, total));
+                                                        }
+                                                    })
+                                                    .iter()
+                                                    .map(SessionMeta::to_listing_json)
+                                                    .collect();
+                                                let _ = out_tx.send(response(cid, "list_sessions", true, Some(json!({ "sessions": sessions })), None));
+                                            }
+                                            "list_all_sessions" => {
+                                                let progress_id = cid.clone();
+                                                match persistence.list_all_with_progress(|scanned, total| {
+                                                    if should_report_scan_progress(scanned, total) {
+                                                        let _ = out_tx.send(list_progress_frame(progress_id.clone(), "list_all_sessions", scanned, total));
+                                                    }
+                                                }) {
+                                                    Ok(sessions) => {
+                                                        let sessions: Vec<Value> = sessions.iter().map(SessionMeta::to_listing_json).collect();
+                                                        let _ = out_tx.send(response(cid, "list_all_sessions", true, Some(json!({ "sessions": sessions })), None));
+                                                    }
+                                                    Err(e) => {
+                                                        let _ = out_tx.send(response(cid, "list_all_sessions", false, None, Some(&e.to_string())));
+                                                    }
+                                                }
+                                            }
+                                            "get_available_models" => {
+                                                let _ = out_tx.send(response(cid, "get_available_models", true, Some(json!({ "models": available_models() })), None));
+                                            }
+                                            other => {
+                                                let _ = out_tx.send(response(cid, other, false, None, Some("busy: a prompt is running; only `abort`/`steer`/`follow_up`, or a handful of read-only commands (get_state/get_session_stats/get_commands/list_branches/get_tree/list_sessions/list_all_sessions/get_available_models), are accepted")));
+                                            }
+                                        }
+                                    }
+                                    // stdin closed (or errored) mid-run: cancel and let the run unwind, then
+                                    // we'll fall out of the outer loop below.
+                                    Ok(None) | Err(_) => {
+                                        stdin_open = false;
+                                        cancel.cancel();
+                                    }
+                                }
                             }
                         }
+                    };
+
+                    // Persist whatever this attempt produced (even a failed one may have committed a tool
+                    // round-trip or two before the error) before deciding whether to retry.
+                    let compacted_tokens_before = match tokens_before.load(Ordering::Relaxed) {
+                        0 => None,
+                        n => Some(n),
+                    };
+                    persistence =
+                        persist_blocking(persistence, session.clone(), compacted_tokens_before)
+                            .await;
+
+                    match &attempt_result {
+                        Err(e)
+                            if current_auto_retry
+                                && stdin_open
+                                && !cancel.is_cancelled()
+                                && retry_attempt < MAX_RUN_RETRIES
+                                && agent_core::agent::is_retryable_mid_stream(e) =>
+                        {
+                            retry_attempt += 1;
+                            let delay = run_retry_backoff(retry_attempt);
+                            let _ = out_tx.send(auto_retry_frame(
+                                id.clone(),
+                                retry_attempt,
+                                MAX_RUN_RETRIES,
+                                delay.as_millis() as u64,
+                                &e.to_string(),
+                            ));
+                            tokio::time::sleep(delay).await;
+                            continue 'retry;
+                        }
+                        _ => break 'retry attempt_result,
                     }
                 };
 
-                let compacted_tokens_before = match tokens_before.load(Ordering::Relaxed) {
-                    0 => None,
-                    n => Some(n),
-                };
-                persistence =
-                    persist_blocking(persistence, session.clone(), compacted_tokens_before).await;
                 let frame = match result {
                     Ok(()) => {
                         let mut data = session_stats(&session);
@@ -1205,6 +1386,14 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                         "cwd_stale".into(),
                         json!(cwd_is_stale(&persistence.meta.cwd, &cwd)),
                     );
+                    if let Value::Object(rt) = runtime_settings(
+                        current_level,
+                        current_auto_compaction,
+                        current_auto_retry,
+                        &steering,
+                    ) {
+                        m.extend(rt);
+                    }
                 }
                 emit!(response(id, "get_state", true, Some(data), None));
             }
@@ -1227,6 +1416,31 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+                // `since`: return only what's new since a tree id the client already has — pi's own
+                // `get_entries({since})` — so a client polling for updates doesn't have to re-transfer
+                // the whole transcript every time. Unmatched, or given while nothing is tagged (a
+                // length mismatch, or in-memory-only mode with no ids at all), is an error: silently
+                // falling back to "everything" would look like a working incremental fetch that's
+                // actually just re-sending the full history, masking the bug instead of surfacing it.
+                if let Some(since) = cmd.get("since").and_then(Value::as_str) {
+                    match msg_ids.iter().position(|mid| mid == since) {
+                        Some(idx) => {
+                            if let Value::Array(arr) = &mut messages {
+                                *arr = arr.split_off(idx + 1);
+                            }
+                        }
+                        None => {
+                            emit!(response(
+                                id,
+                                "get_messages",
+                                false,
+                                None,
+                                Some(&format!("no message with id {since} in this session"))
+                            ));
+                            continue;
+                        }
+                    }
+                }
                 emit!(response(
                     id,
                     "get_messages",
@@ -1245,6 +1459,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     Some(json!({
                         "session_id": persistence.session_id(),
                         "cwd_stale": cwd_is_stale(&persistence.meta.cwd, &cwd),
+                        "parent": persistence.meta.parent,
                     })),
                     None,
                 ));
@@ -1339,12 +1554,17 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
             },
             "fork" => {
                 // `upto` messages to copy into the new session; absent = clone the whole session.
+                // `target_id`, when given, forks at that specific tree entry instead — anywhere in the
+                // whole tree, not just a message-count prefix of the active path (`before` excludes the
+                // entry itself); wins over `upto` if both are present.
                 let upto = cmd
                     .get("upto")
                     .and_then(Value::as_u64)
                     .map(|n| n as usize)
                     .unwrap_or(usize::MAX);
-                match persistence.fork(upto) {
+                let target_id = cmd.get("target_id").and_then(Value::as_str);
+                let before = cmd.get("before").and_then(Value::as_bool).unwrap_or(false);
+                match persistence.fork(upto, target_id, before) {
                     Ok(s) => {
                         session = s;
                         steering.clear();
@@ -1376,7 +1596,9 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     .and_then(Value::as_u64)
                     .map(|n| n as usize)
                     .unwrap_or(usize::MAX);
-                match persistence.fork_messages(&target_id, upto) {
+                let entry_id = cmd.get("target_id").and_then(Value::as_str);
+                let before = cmd.get("before").and_then(Value::as_bool).unwrap_or(false);
+                match persistence.fork_messages(&target_id, upto, entry_id, before) {
                     Ok(messages) => emit!(response(
                         id,
                         "get_fork_messages",
@@ -1395,8 +1617,13 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
             }
             "export_html" => {
                 let output_path = cmd.get("output_path").and_then(Value::as_str);
-                match crate::export::export_html(&persistence.meta, &session.messages, output_path)
-                {
+                let branches = persistence.abandoned_branches();
+                match crate::export::export_html(
+                    &persistence.meta,
+                    &session.messages,
+                    &branches,
+                    output_path,
+                ) {
                     Ok(path) => emit!(response(
                         id,
                         "export_html",
@@ -1414,7 +1641,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             "set_session_name" => match cmd.get("title").and_then(Value::as_str) {
-                Some(title) => match persistence.set_title(title, &session.messages) {
+                Some(title) => match persistence.set_title(title) {
                     Ok(()) => emit!(response(id, "set_session_name", true, None, None)),
                     Err(e) => emit!(response(
                         id,
@@ -1517,8 +1744,9 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 // changed (`agent trust`/`--trust-project` since startup), and project instructions,
                 // `SYSTEM.md`, and skills/prompt templates may have changed on disk. The per-turn
                 // `full_system` refresh alone only ever picks up the cheap date/cwd footer.
-                project_trusted = cfg.trust_project
-                    || crate::trust_store::TrustStore::open_default().is_trusted(&cwd);
+                project_trusted = !cfg.force_untrusted
+                    && (cfg.trust_project
+                        || crate::trust_store::TrustStore::open_default().is_trusted(&cwd));
                 static_system = crate::resources::build_static_system_prompt(
                     &crate::resources::PromptOptions {
                         base: &cfg.system,
@@ -1529,11 +1757,8 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                         project_trusted,
                     },
                 );
-                (prompt_templates, prompt_collisions) = if project_trusted {
-                    crate::prompts::discover_with_diagnostics(&cwd)
-                } else {
-                    (Vec::new(), Vec::new())
-                };
+                (prompt_templates, prompt_collisions) =
+                    crate::prompts::discover_with_diagnostics(&cwd, project_trusted);
                 (skills, skill_collisions) =
                     crate::skills::discover_with_diagnostics(&cwd, project_trusted);
                 agent.set_system(full_system(&static_system, &cwd));
@@ -1547,6 +1772,9 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     // anything back to that same model — scrub both from any message not already
                     // stamped with the model we're switching to.
                     session.scrub_cross_model_state(model);
+                    if model != current_model {
+                        persistence.record_model_change(model);
+                    }
                     current_model = model.to_string();
                     agent = build_agent(
                         client.clone(),
@@ -1651,6 +1879,9 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 };
                 match parsed {
                     Some(level) => {
+                        if level != current_level {
+                            persistence.record_thinking_level_change(level.as_str());
+                        }
                         current_level = level;
                         current_thinking = None;
                         agent = build_agent(
@@ -1692,18 +1923,20 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             "cycle_model" => {
-                // Advance through `available_models()`, wrapping — a quick way for a client to step
-                // through the known model list without needing its own copy of it. An id outside the
-                // list (a custom `set_model` the client issued directly) wraps to the first entry,
-                // same as "not found".
-                let models = available_models();
-                let next_idx = models
+                // Advance through `cycle_models` (the `--models`-scoped list, or the full known-model
+                // hint list when unscoped), wrapping — a quick way for a client to step through the
+                // candidate list without needing its own copy of it. An id outside the list (a custom
+                // `set_model` the client issued directly) wraps to the first entry, same as "not found".
+                let next_idx = cycle_models
                     .iter()
-                    .position(|m| *m == current_model)
-                    .map_or(0, |i| (i + 1) % models.len());
-                let next_model = models[next_idx];
-                session.scrub_cross_model_state(next_model);
-                current_model = next_model.to_string();
+                    .position(|m| m == &current_model)
+                    .map_or(0, |i| (i + 1) % cycle_models.len());
+                let next_model = cycle_models[next_idx].clone();
+                session.scrub_cross_model_state(&next_model);
+                if next_model != current_model {
+                    persistence.record_model_change(&next_model);
+                }
+                current_model = next_model;
                 agent = build_agent(
                     client.clone(),
                     &full_system(&static_system, &cwd),
@@ -1721,7 +1954,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     id,
                     "cycle_model",
                     true,
-                    Some(json!({ "model": current_model })),
+                    Some(json!({ "model": current_model, "scoped": !cfg.models.is_empty() })),
                     None,
                 ));
             }
@@ -1732,6 +1965,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 // new level actually resolves to for `current_model` specifically, so the response
                 // reflects reality rather than a number that may be meaningless for this model's shape.
                 current_level = current_level.next();
+                persistence.record_thinking_level_change(current_level.as_str());
                 current_thinking = None;
                 agent = build_agent(
                     client.clone(),
@@ -1826,6 +2060,41 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     Some("missing boolean `enabled`")
                 )),
             },
+            // Toggle how much of the steer/follow-up queue a single drain point consumes (see
+            // `agent_core::QueueMode`) — pi's default is `"one_at_a_time"`, one queued message per
+            // drain, leaving the rest queued for the next one; `"all"` folds everything queued into a
+            // single injection (this crate's original behavior). Owned entirely by the `Steering`
+            // handle itself (shared with the loop, no `Agent` rebuild needed), so this takes effect
+            // immediately, including mid-run.
+            "set_queue_mode" => match cmd.get("mode").and_then(Value::as_str) {
+                Some("one_at_a_time") => {
+                    steering.set_mode(agent_core::QueueMode::OneAtATime);
+                    emit!(response(
+                        id,
+                        "set_queue_mode",
+                        true,
+                        Some(json!({ "mode": "one_at_a_time" })),
+                        None,
+                    ));
+                }
+                Some("all") => {
+                    steering.set_mode(agent_core::QueueMode::All);
+                    emit!(response(
+                        id,
+                        "set_queue_mode",
+                        true,
+                        Some(json!({ "mode": "all" })),
+                        None,
+                    ));
+                }
+                _ => emit!(response(
+                    id,
+                    "set_queue_mode",
+                    false,
+                    None,
+                    Some("missing `mode`; expected \"one_at_a_time\" or \"all\"")
+                )),
+            },
             "get_available_models" => {
                 emit!(response(
                     id,
@@ -1869,11 +2138,55 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                         Ok(s) => {
                             session = s;
                             steering.clear();
+                            // Restore whichever model/thinking-level was actually active on this
+                            // branch, rather than silently continuing with the process's current
+                            // global setting (which may have since moved on via a `set_model`/
+                            // `cycle_thinking_level` made on a *different* branch). The model always
+                            // resolves to something real (falling back to the session's own
+                            // creation-time model — see `model_and_level_at`'s doc comment); the level
+                            // has no such baseline, so `None` there means nothing to restore.
+                            let (restored_model, restored_level) =
+                                persistence.model_and_level_at(&target_id);
+                            let mut rebuild_needed = false;
+                            if restored_model != current_model {
+                                session.scrub_cross_model_state(&restored_model);
+                                current_model = restored_model;
+                                rebuild_needed = true;
+                            }
+                            if let Some(level) = restored_level
+                                .as_deref()
+                                .and_then(agent_core::ThinkingLevel::parse)
+                            {
+                                if level != current_level {
+                                    current_level = level;
+                                    current_thinking = None;
+                                    rebuild_needed = true;
+                                }
+                            }
+                            if rebuild_needed {
+                                agent = build_agent(
+                                    client.clone(),
+                                    &full_system(&static_system, &cwd),
+                                    &cfg,
+                                    &current_model,
+                                    current_thinking,
+                                    current_level,
+                                    current_auto_compaction,
+                                    current_auto_retry,
+                                    persistence.session_id(),
+                                    &write_locks,
+                                    &checkpoint,
+                                );
+                            }
                             emit!(response(
                                 id,
                                 "switch_branch",
                                 true,
-                                Some(json!({ "target_id": target_id })),
+                                Some(json!({
+                                    "target_id": target_id,
+                                    "model": current_model,
+                                    "reasoning_effort": current_level.as_str(),
+                                })),
                                 None,
                             ));
                         }
@@ -2229,6 +2542,29 @@ fn session_stats(session: &Session) -> Value {
     })
 }
 
+/// The runtime-mutable settings and queue depth `get_state` reports — pi's `get_state` carries the
+/// same shape (`thinkingLevel`/`autoCompactionEnabled`/`steeringMode`/`followUpMode`/
+/// `pendingMessageCount`), so a client can render current settings and "N queued" without a second
+/// round trip. Answerable from the process's own mutable state, not `&Session`, so — like
+/// `session_stats` — it's available even mid-run (see the `prompt` arm's read-only-command handling).
+fn runtime_settings(
+    current_level: agent_core::ThinkingLevel,
+    current_auto_compaction: bool,
+    current_auto_retry: bool,
+    steering: &agent_core::Steering,
+) -> Value {
+    json!({
+        "thinking_level": current_level.as_str(),
+        "auto_compaction": current_auto_compaction,
+        "auto_retry": current_auto_retry,
+        "queue_mode": match steering.mode() {
+            agent_core::QueueMode::OneAtATime => "one_at_a_time",
+            agent_core::QueueMode::All => "all",
+        },
+        "pending_messages": steering.pending_count(),
+    })
+}
+
 /// A live mirror of [`Session`]'s token/step counters, updated from the event sink as a `prompt` runs —
 /// so `get_state`/`get_session_stats` can answer with real progress from *inside* the busy-loop
 /// (see the `prompt` arm), without the `&mut Session` the run itself holds exclusively for the turn's
@@ -2328,6 +2664,46 @@ fn list_progress_frame(id: Option<String>, command: &str, scanned: usize, total:
     m.insert("command".into(), json!(command));
     m.insert("scanned".into(), json!(scanned));
     m.insert("total".into(), json!(total));
+    Value::Object(m)
+}
+
+/// Ceiling on automatic whole-run retries after a `prompt` ends in a transient-looking error (see the
+/// `"prompt"` arm's retry loop) — pi's own default (`agent-session.ts`'s `maxRetries`).
+const MAX_RUN_RETRIES: u32 = 3;
+const RUN_RETRY_BASE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+const RUN_RETRY_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Exponential backoff for a whole-run retry: `RUN_RETRY_BASE_BACKOFF · 2^(attempt-1)`, capped at
+/// `RUN_RETRY_MAX_BACKOFF`. `attempt` is 1-based. Coarser than `agent_core`'s own
+/// `mid_stream_backoff` (250ms base/5s cap) — this gates a whole extra model turn's worth of retry,
+/// not a resumed stream, so pi's slower 2/4/8s cadence is the better fit.
+fn run_retry_backoff(attempt: u32) -> std::time::Duration {
+    RUN_RETRY_BASE_BACKOFF
+        .saturating_mul(1u32 << attempt.saturating_sub(1).min(16))
+        .min(RUN_RETRY_MAX_BACKOFF)
+}
+
+/// Build an `auto_retry` frame — an unsolicited notice that a `prompt`'s run failed with what looks
+/// like a transient error and is about to be automatically retried, correlated to the eventual
+/// `response` frame via the same request `id`. Sent once per attempt, immediately before the backoff
+/// sleep (not after — a client watching for retry activity shouldn't have to infer it from a gap).
+fn auto_retry_frame(
+    id: Option<String>,
+    attempt: u32,
+    max_attempts: u32,
+    delay_ms: u64,
+    error: &str,
+) -> Value {
+    let mut m = Map::new();
+    m.insert("type".into(), json!("auto_retry"));
+    if let Some(id) = id {
+        m.insert("id".into(), json!(id));
+    }
+    m.insert("command".into(), json!("prompt"));
+    m.insert("attempt".into(), json!(attempt));
+    m.insert("max_attempts".into(), json!(max_attempts));
+    m.insert("delay_ms".into(), json!(delay_ms));
+    m.insert("error".into(), json!(error));
     Value::Object(m)
 }
 

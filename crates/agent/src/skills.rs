@@ -92,11 +92,19 @@ fn discover_in(root: &Path) -> Vec<Skill> {
 /// already depend on, rather than hand-rolling `.gitignore`/`.ignore` parsing, so a vendored or fixture
 /// directory carrying its own ignore file doesn't leak a stray `SKILL.md` into the prompt.
 /// `WalkBuilder`'s defaults already match the walk's prior hand-rolled semantics: hidden files/
-/// directories are skipped and symlinked directories are not followed (so a cyclic symlink can't trap
-/// the walk); `max_depth` reproduces the old sane-bound cutoff.
+/// directories are skipped and `max_depth` reproduces the old sane-bound cutoff. Symlinked directories
+/// *are* followed (`follow_links(true)`, matching pi's own `skills.ts` — a shared skills library
+/// symlinked into `.claude/skills` is otherwise invisible): `walkdir` (which `ignore` wraps) detects a
+/// symlink loop and yields a single `Err` for that one path rather than hanging, and `.flatten()` below
+/// already discards `Err` entries as the normal "missing/unreadable" case, so a cyclic symlink still
+/// can't trap the walk. `.gitignore`/`.ignore` are already honored by `WalkBuilder`'s own defaults;
+/// `.fdignore` is registered explicitly (`add_custom_ignore_filename`) to match pi's own
+/// `skills.ts::IGNORE_FILE_NAMES`, which lists all three.
 fn walk(root: &Path, out: &mut Vec<Skill>) {
     let mut candidates: Vec<PathBuf> = ignore::WalkBuilder::new(root)
         .max_depth(Some(MAX_DEPTH))
+        .follow_links(true)
+        .add_custom_ignore_filename(".fdignore")
         // A skills root (`~/.claude/skills`, `<cwd>/.claude/skills`) is routinely *not* itself a git
         // repository (or is a subdirectory of one where that fact is incidental) — `.gitignore` files
         // placed within it should still be honored either way, not only when `require_git`'s default
@@ -628,6 +636,49 @@ mod tests {
     }
 
     #[test]
+    fn follows_a_symlinked_directory_into_discovery() {
+        // A shared skills library symlinked into the root (e.g. installed by a package manager)
+        // must still be discovered — matching pi's own `skills.ts`, which explicitly resolves and
+        // follows symlinked entries rather than skipping them.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("skills-root");
+        fs::create_dir_all(&root).unwrap();
+        let real = tmp.path().join("shared-library");
+        write_skill(
+            &real,
+            "shared",
+            "---\nname: shared\ndescription: A shared skill\n---\n",
+        );
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, root.join("shared-link")).unwrap();
+
+        let names: Vec<String> = discover_in(&root).into_iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["shared".to_string()]);
+    }
+
+    #[test]
+    fn a_symlink_cycle_does_not_hang_discovery() {
+        // `follow_links(true)` opens the door to a cyclic symlink; `walkdir` (which `ignore` wraps)
+        // detects the loop itself and yields one `Err` for that path rather than recursing forever —
+        // this must terminate (not hang) and still find a real skill placed alongside the cycle.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("skills-root");
+        fs::create_dir_all(&root).unwrap();
+        write_skill(
+            &root,
+            "real",
+            "---\nname: real\ndescription: A real skill\n---\n",
+        );
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&root, root.join("self-loop")).unwrap();
+
+        let names: Vec<String> = discover_in(&root).into_iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["real".to_string()]);
+    }
+
+    #[test]
     fn block_scalar_description_spans_lines() {
         let tmp = tempfile::tempdir().unwrap();
         write_skill(
@@ -660,6 +711,29 @@ mod tests {
         fs::write(tmp.path().join(".gitignore"), "vendor/\n").unwrap();
         // A stray SKILL.md under an ignored directory (e.g. a vendored dependency's fixtures) must
         // not surface — matching the reference agent's gitignore-aware discovery.
+        write_skill(
+            &tmp.path().join("vendor"),
+            "leaked",
+            "---\nname: leaked\ndescription: should not surface\n---\n",
+        );
+        write_skill(
+            tmp.path(),
+            "real",
+            "---\nname: real\ndescription: a real skill\n---\n",
+        );
+        let names: Vec<String> = discover_in(tmp.path())
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names, vec!["real".to_string()]);
+    }
+
+    #[test]
+    fn fdignored_directories_are_not_walked() {
+        // `.fdignore` (not `.gitignore`/`.ignore`, which `WalkBuilder` already honors by default) must
+        // also be respected — matching pi's own `skills.ts::IGNORE_FILE_NAMES`, which lists all three.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join(".fdignore"), "vendor/\n").unwrap();
         write_skill(
             &tmp.path().join("vendor"),
             "leaked",

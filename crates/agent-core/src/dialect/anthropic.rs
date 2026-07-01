@@ -46,6 +46,7 @@ pub fn build_body(req: &ModelRequest) -> Value {
     // (unlike the OpenAI dialects, which build each wire message from named fields rather than
     // serializing `Message` wholesale, so they never had this exposure).
     strip_model_id(&mut messages);
+    downgrade_unsigned_thinking(&mut messages);
     downgrade_unsupported_images(&mut messages, caps.supports_vision);
     encode_tool_result_images(&mut messages);
     if let Some(cc) = &cc {
@@ -82,7 +83,8 @@ pub fn build_body(req: &ModelRequest) -> Value {
                     json!({ "type": "adaptive", "display": "summarized" }),
                 );
                 if let Some(effort) = req.reasoning_effort {
-                    map.insert("output_config".into(), json!({ "effort": effort.as_str() }));
+                    let wire = crate::models::anthropic_adaptive_effort_wire(&caps, effort);
+                    map.insert("output_config".into(), json!({ "effort": wire }));
                 }
             }
             _ => {
@@ -168,6 +170,45 @@ fn mark_last_block(messages: &mut Value, cc: &Value) {
         .and_then(Value::as_object_mut)
     {
         block.insert("cache_control".into(), cc.clone());
+    }
+}
+
+/// Downgrade a `thinking` block with no (or empty) `signature` to a plain `text` block, matching pi's
+/// `convertMessages` (`anthropic-messages.ts`: "e.g., from an aborted stream"). Anthropic requires a
+/// signed thinking block to replay it verbatim on a later tool turn; our own architecture generally
+/// avoids persisting a partial/cancelled turn in the first place (narrowing the window this ever fires
+/// in versus pi), but a non-conformant proxy, or a bug that delivers `message_stop` before a thinking
+/// block's `signature_delta`, would otherwise send an empty `signature` Anthropic likely rejects rather
+/// than degrading gracefully. A no-op for the common case (every thinking block already signed).
+fn downgrade_unsigned_thinking(messages: &mut Value) {
+    let Some(msgs) = messages.as_array_mut() else {
+        return;
+    };
+    for m in msgs {
+        let Some(content) = m.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for block in content.iter_mut() {
+            let Some(obj) = block.as_object_mut() else {
+                continue;
+            };
+            if obj.get("type").and_then(Value::as_str) != Some("thinking") {
+                continue;
+            }
+            let signed = obj
+                .get("signature")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty());
+            if signed {
+                continue;
+            }
+            let text = obj
+                .get("thinking")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            *block = json!({ "type": "text", "text": text });
+        }
     }
 }
 
@@ -1050,6 +1091,28 @@ data: {"type":"message_stop"}
     }
 
     #[test]
+    fn adaptive_effort_wire_value_is_clamped_per_model() {
+        // opus-4-6 uniquely remaps xhigh to "max" (pi: "effort 'max' is only valid on Opus 4.6").
+        let req = ModelRequest::new("claude-opus-4-6", vec![Message::user("hi")], 8192)
+            .with_thinking(4096)
+            .with_reasoning_effort(crate::transport::ReasoningEffort::XHigh);
+        assert_eq!(build_body(&req)["output_config"]["effort"], "max");
+
+        // sonnet-4-6 has no xhigh wire value at all — must degrade to "high", not send "xhigh" and get
+        // rejected by Anthropic.
+        let req = ModelRequest::new("claude-sonnet-4-6", vec![Message::user("hi")], 8192)
+            .with_thinking(4096)
+            .with_reasoning_effort(crate::transport::ReasoningEffort::XHigh);
+        assert_eq!(build_body(&req)["output_config"]["effort"], "high");
+
+        // No adaptive model has a "minimal" wire tier — always collapses to "low".
+        let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 8192)
+            .with_thinking(4096)
+            .with_reasoning_effort(crate::transport::ReasoningEffort::Minimal);
+        assert_eq!(build_body(&req)["output_config"]["effort"], "low");
+    }
+
+    #[test]
     fn thinking_block_round_trips_into_body_for_replay() {
         // A prior assistant turn with a signed thinking block must replay verbatim — Anthropic rejects
         // a tool turn whose thinking block is missing or unsigned.
@@ -1075,6 +1138,38 @@ data: {"type":"message_stop"}
         assert_eq!(block["type"], "thinking");
         assert_eq!(block["thinking"], "let me reason");
         assert_eq!(block["signature"], "sig-abc");
+    }
+
+    #[test]
+    fn unsigned_thinking_block_downgrades_to_text_on_replay() {
+        // A thinking block with no (or empty) signature — e.g. from an aborted stream that never
+        // delivered its `signature_delta` — must not be replayed as a `thinking` block verbatim;
+        // Anthropic requires a signature to accept one on a later turn.
+        let req = ModelRequest::new(
+            "claude-opus-4-8",
+            vec![
+                Message::user("think then answer"),
+                Message::assistant(vec![
+                    ContentBlock::Thinking {
+                        text: "half-formed reasoning".into(),
+                        signature: String::new(),
+                    },
+                    ContentBlock::Text {
+                        text: "answer".into(),
+                    },
+                ]),
+                Message::user("again"),
+            ],
+            8192,
+        );
+        let body = build_body(&req);
+        let block = &body["messages"][1]["content"][0];
+        assert_eq!(block["type"], "text");
+        assert_eq!(block["text"], "half-formed reasoning");
+        assert!(block.get("signature").is_none());
+        // The following real text block is untouched.
+        assert_eq!(body["messages"][1]["content"][1]["type"], "text");
+        assert_eq!(body["messages"][1]["content"][1]["text"], "answer");
     }
 
     #[test]

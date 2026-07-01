@@ -99,10 +99,22 @@ impl Bash {
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing `command`".into()))?;
         let cwd = input.get("cwd").and_then(Value::as_str);
-        let timeout_ms = input
-            .get("timeout_ms")
-            .and_then(Value::as_u64)
-            .unwrap_or(self.default_timeout_ms);
+        // A present `timeout_ms` must be a positive integer — 0 would pass straight through as an
+        // instant, confusingly-worded timeout ("Command timed out after 0 seconds"), and a negative
+        // value previously fell silently back to the default instead of being rejected as the obvious
+        // caller mistake it is (matching pi's `resolveTimeoutMs` validation). A missing key still means
+        // "use the default", not an error.
+        let timeout_ms = match input.get("timeout_ms") {
+            None | Some(Value::Null) => self.default_timeout_ms,
+            Some(v) => match v.as_u64() {
+                Some(ms) if ms > 0 => ms,
+                _ => {
+                    return Err(ToolError::InvalidInput(format!(
+                        "`timeout_ms` must be a positive integer, got {v}"
+                    )));
+                }
+            },
+        };
         let args = vec!["-c".to_string(), command.to_string()];
         let dur = Duration::from_millis(timeout_ms);
 
@@ -461,6 +473,36 @@ mod tests {
             .unwrap();
         let (_, _, timeout2) = runner2.last.lock().unwrap().clone().unwrap();
         assert_eq!(timeout2, Duration::from_millis(5_000));
+    }
+
+    #[tokio::test]
+    async fn zero_or_negative_timeout_ms_is_rejected_not_silently_coerced() {
+        let runner = recording(ExecResult {
+            code: Some(0),
+            ..Default::default()
+        });
+        let bash = Bash::with_runner(runner.clone());
+
+        // 0 previously passed straight through as an instant, confusing timeout.
+        let err = bash
+            .run(json!({ "command": "echo hi", "timeout_ms": 0 }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidInput(_)), "got: {err:?}");
+
+        // A negative value previously fell silently back to the default instead of being rejected.
+        let err = bash
+            .run(json!({ "command": "echo hi", "timeout_ms": -100 }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidInput(_)), "got: {err:?}");
+
+        // Neither invalid call should have reached the runner at all.
+        assert!(runner.last.lock().unwrap().is_none());
+
+        // A missing `timeout_ms` still means "use the default" — not an error.
+        bash.run(json!({ "command": "echo hi" })).await.unwrap();
+        assert!(runner.last.lock().unwrap().is_some());
     }
 
     #[tokio::test]

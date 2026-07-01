@@ -21,9 +21,6 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Beta opt-in sent with thinking requests: lets the model interleave thinking between tool calls
 /// across a turn (and keeps fine-grained streaming of the thinking blocks).
 const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
-/// Prompt-caching beta opt-in. GA for current models, but sent explicitly so caching engages
-/// regardless of the `anthropic-version` default.
-const PROMPT_CACHING_BETA: &str = "prompt-caching-2024-07-31";
 /// Fallback streaming beta for a model whose tool definitions *don't* carry the per-tool
 /// `eager_input_streaming: true` marker (see `dialect::anthropic::mark_eager_tool_streaming`) — the two
 /// are mutually exclusive; no current model needs this branch, since every current id supports the
@@ -246,16 +243,18 @@ impl LineFramer {
     }
 }
 
-/// Comma-joined `anthropic-beta` opt-ins for a request. Prompt caching is GA but sent explicitly;
-/// interleaved thinking is added only for `Budget`-shape thinking requests; the fine-grained
-/// tool-streaming beta and each tool definition's own `eager_input_streaming` marker (see
+/// Comma-joined `anthropic-beta` opt-ins for a request, or empty when neither applies — prompt
+/// caching has been GA for a long time now and no longer needs (or accepts as meaningful) the old
+/// `prompt-caching-2024-07-31` opt-in header pi itself has already dropped, so this crate doesn't send
+/// it either. Interleaved thinking is added only for `Budget`-shape thinking requests; the
+/// fine-grained tool-streaming beta and each tool definition's own `eager_input_streaming` marker (see
 /// `dialect::anthropic::mark_eager_tool_streaming`) are mutually exclusive, so the beta only fires for a
 /// model that lacks the per-tool marker.
 fn anthropic_betas(
     needs_interleaved: bool,
     needs_fine_grained_tool_streaming: bool,
 ) -> Vec<&'static str> {
-    let mut betas = vec![PROMPT_CACHING_BETA];
+    let mut betas = Vec::new();
     if needs_interleaved {
         betas.push(INTERLEAVED_THINKING_BETA);
     }
@@ -293,7 +292,11 @@ async fn send_with_retry(
                 needs_interleaved_beta,
                 needs_fine_grained_tool_streaming_beta,
             );
-            builder = builder.header("anthropic-beta", betas.join(","));
+            // Omit the header entirely when nothing needs it, rather than sending an empty
+            // `anthropic-beta:` value — matching pi's own conditional-spread behavior.
+            if !betas.is_empty() {
+                builder = builder.header("anthropic-beta", betas.join(","));
+            }
         }
         match builder.send().await {
             Ok(resp) if resp.status().is_success() => return Ok(resp),
@@ -457,26 +460,23 @@ mod tests {
 
     #[test]
     fn anthropic_betas_are_mutually_exclusive_with_eager_tool_streaming() {
-        // Baseline: prompt caching only.
-        assert_eq!(anthropic_betas(false, false), vec![PROMPT_CACHING_BETA]);
+        // Baseline: neither beta needed — the stale prompt-caching-2024-07-31 opt-in is gone, so this
+        // is empty, not a single-element list.
+        assert_eq!(anthropic_betas(false, false), Vec::<&str>::new());
         // Interleaved thinking layers on top.
         assert_eq!(
             anthropic_betas(true, false),
-            vec![PROMPT_CACHING_BETA, INTERLEAVED_THINKING_BETA]
+            vec![INTERLEAVED_THINKING_BETA]
         );
         // The fine-grained tool-streaming beta only fires when the model lacks the per-tool
         // `eager_input_streaming` marker — never true for any current model, but exercised directly.
         assert_eq!(
             anthropic_betas(false, true),
-            vec![PROMPT_CACHING_BETA, FINE_GRAINED_TOOL_STREAMING_BETA]
+            vec![FINE_GRAINED_TOOL_STREAMING_BETA]
         );
         assert_eq!(
             anthropic_betas(true, true),
-            vec![
-                PROMPT_CACHING_BETA,
-                INTERLEAVED_THINKING_BETA,
-                FINE_GRAINED_TOOL_STREAMING_BETA
-            ]
+            vec![INTERLEAVED_THINKING_BETA, FINE_GRAINED_TOOL_STREAMING_BETA]
         );
     }
 

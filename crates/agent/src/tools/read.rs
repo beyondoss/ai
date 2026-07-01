@@ -28,11 +28,21 @@ const DEFAULT_LIMIT: usize = 2000;
 /// Cap on bytes kept per line. Streaming by line already bounds memory to one line, but a file with a
 /// single pathological line (a minified bundle, a one-line JSON/CSV blob) is one unbounded line — so
 /// cap each line and drain the overflow without storing it, the way `grep` clips long match lines.
+///
+/// Deliberately a **mid-line** clip (a `"… [line truncated]"` marker after the kept prefix), not pi's
+/// own `truncateHead` (`truncate.ts`), which "never returns partial lines": there, a line that alone
+/// exceeds the byte budget is either dropped from the output entirely (hit mid-scan) or, worse, the
+/// *whole read* comes back empty with `firstLineExceedsLimit: true` (hit on line one) — a model asking
+/// to read a single-giant-line file gets nothing useful at all. Showing a clipped prefix instead means
+/// the model always sees *something* of every line — better partial signal than an omission it can't
+/// tell apart from "this file has no line-one content."
 const MAX_LINE_BYTES: usize = 4000;
 /// Aggregate output budget: the line limit alone (2000 × up to 4000 bytes) could return ~8MB of
 /// mostly-long lines into context. Stop once the rendered output crosses this, telling the model how
-/// to continue.
-const MAX_OUTPUT_BYTES: usize = 256_000;
+/// to continue (the `offset=N` pagination already exists for exactly this, so a smaller budget here
+/// loses nothing — it just means one more `read` call). Shares `grep`/`find`/`ls`'s own budget
+/// ([`super::output::DEFAULT_MAX_BYTES`], pi's uniform 50KB) rather than a bespoke, 5x-larger constant.
+const MAX_OUTPUT_BYTES: usize = super::output::DEFAULT_MAX_BYTES;
 
 pub struct Read;
 
@@ -103,11 +113,17 @@ impl Tool for Read {
             .ok_or_else(|| ToolError::InvalidInput("missing `path`".into()))?;
 
         // An image file is returned as an attachment the multimodal model can see, not decoded as
-        // UTF-8 text (which would hand back garbage). The extension gate decides *whether* to take this
-        // path (so an ordinary text-file read never pays for an extra image-format probe); `read_image`
-        // then sniffs the real magic bytes to recover from a mislabeled extension.
-        if let Some(ext_format) = extension_image_format(path) {
-            return read_image(path, ext_format);
+        // UTF-8 text (which would hand back garbage). Routing is decided primarily by sniffing the
+        // real magic bytes (matching pi, which always probes regardless of extension) — a real image
+        // saved under a missing or wrong extension (an extensionless clipboard/screenshot temp file, a
+        // `.dat`) is still detected correctly, not silently UTF-8-decoded into garbage text. The
+        // extension only matters as a fallback when sniffing can't identify a format at all (a
+        // truncated/corrupt file whose header doesn't parse) — the file *shouldn't* also fail the read
+        // below, so may as well route it through the clearer "image, but unreadable" error instead of a
+        // confusing UTF-8-decode one. `read_image` re-sniffs internally too (for the *reported* format,
+        // once it has the full file, not just this prefix).
+        if let Some(format) = sniff_image_format(path).or_else(|| extension_image_format(path)) {
+            return read_image(path, format);
         }
 
         let offset = input
@@ -185,6 +201,17 @@ impl Tool for Read {
         }
         // An offset past the last line returns nothing useful — say so explicitly rather than handing
         // back a blank result the model can't interpret.
+        //
+        // `lineno` (and every "N lines total" this tool reports) counts real content lines only, via
+        // `read_line_capped`'s own line-at-a-time scan — a file ending `"a\nb\nc\n"` reports 3, the
+        // same as `"a\nb\nc"` with no trailing newline. This is a deliberate divergence from pi's own
+        // `read.ts`, which counts `textContent.split("\n").length`: in JS, `"a\nb\nc\n".split("\n")`
+        // yields 4 elements (a trailing empty string for the newline), so pi reports one *more* line
+        // than the file actually has whenever it ends with a newline, but the correct count when it
+        // doesn't — an inconsistency, not a convention worth matching. Every other line-oriented tool
+        // here (`grep`, editors, `wc -l`) already treats "N lines" as "N newline-terminated-or-final
+        // content lines," so keeping that same, trailing-newline-independent count is the more
+        // correct and more consistent choice, not a parity gap.
         if offset > lineno {
             return Err(ToolError::InvalidInput(format!(
                 "offset {offset} is beyond end of file ({lineno} lines total)"
@@ -208,10 +235,37 @@ impl Tool for Read {
     }
 }
 
+/// How many leading bytes are enough for `image::guess_format` to recognize any of our five supported
+/// formats: PNG's signature is 8 bytes, JPEG's SOI+marker is 2-3, GIF's is 6, BMP's is 2, and WebP's
+/// `RIFF....WEBP` header is 12 — 32 is comfortably past all of them with room to spare.
+const SNIFF_LEN: usize = 32;
+
+/// Peek the first [`SNIFF_LEN`] bytes of `path` and identify a real image by its magic bytes,
+/// regardless of what extension (if any) the file has — matching pi's `detectImageMimeType`, which
+/// always probes unconditionally rather than gating on the extension first. Only ever reports one of
+/// the five formats this tool actually knows how to encode/re-encode; any other format `guess_format`
+/// might recognize (TIFF, ICO, …) is treated the same as "not an image" here, since there's no
+/// supported path to serve it as an attachment. `None` on any read/probe failure (missing file, a
+/// directory, too few bytes, no recognizable header) — the caller falls back to the extension gate, or
+/// ultimately the ordinary text path.
+fn sniff_image_format(path: &str) -> Option<image::ImageFormat> {
+    use std::io::Read as _;
+    let mut buf = [0u8; SNIFF_LEN];
+    let mut f = std::fs::File::open(path).ok()?;
+    let n = f.read(&mut buf).ok()?;
+    match image::guess_format(&buf[..n]).ok()? {
+        format @ (image::ImageFormat::Png
+        | image::ImageFormat::Jpeg
+        | image::ImageFormat::Gif
+        | image::ImageFormat::WebP
+        | image::ImageFormat::Bmp) => Some(format),
+        _ => None,
+    }
+}
+
 /// The image format implied by a path's extension, or `None` if it isn't a recognized one. Used only
-/// to decide *whether* `read` should route to the attachment path at all — the actual format sent on
-/// the wire comes from sniffing the file's real magic bytes (see [`read_image`]), so a mislabeled
-/// extension (a `.jpg` that's actually a PNG) still reports its true format.
+/// as a fallback when [`sniff_image_format`] can't identify a format at all (a truncated/corrupt file);
+/// the actual format sent on the wire comes from sniffing the real magic bytes (see [`read_image`]).
 fn extension_image_format(path: &str) -> Option<image::ImageFormat> {
     let ext = std::path::Path::new(path)
         .extension()
@@ -460,6 +514,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn line_count_is_the_same_whether_or_not_the_file_ends_with_a_trailing_newline() {
+        // A deliberate divergence from pi's own `read.ts`, which counts
+        // `textContent.split("\n").length` — off by one whenever the file ends with a newline (JS's
+        // `split` yields a trailing empty-string element for it). Ours must report the same "3 lines
+        // total" for `"a\nb\nc\n"` and `"a\nb\nc"` — both really are 3 lines.
+        let with_trailing = tmp_file("a\nb\nc\n");
+        let without_trailing = tmp_file("a\nb\nc");
+
+        let err_with = Read
+            .run(json!({ "path": with_trailing.path().to_str().unwrap(), "offset": 99 }))
+            .await
+            .unwrap_err();
+        let err_without = Read
+            .run(json!({ "path": without_trailing.path().to_str().unwrap(), "offset": 99 }))
+            .await
+            .unwrap_err();
+        let msg_with = match err_with {
+            ToolError::InvalidInput(m) => m,
+            other => panic!("expected InvalidInput, got {other:?}"),
+        };
+        let msg_without = match err_without {
+            ToolError::InvalidInput(m) => m,
+            other => panic!("expected InvalidInput, got {other:?}"),
+        };
+        assert!(msg_with.contains("3 lines total"), "got: {msg_with}");
+        assert!(msg_without.contains("3 lines total"), "got: {msg_without}");
+    }
+
+    #[tokio::test]
     async fn truncation_reports_next_offset() {
         let f = tmp_file("a\nb\nc\nd\ne\n");
         let out = Read
@@ -494,6 +577,32 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Execution(_)));
+    }
+
+    #[tokio::test]
+    async fn output_byte_budget_matches_the_shared_50kb_cap_not_a_bespoke_larger_one() {
+        // `read`'s aggregate output budget used to be a bespoke 256KB constant, 5x pi's (and this
+        // crate's other tools': grep/find/ls all share `output::DEFAULT_MAX_BYTES`, 50KB) uniform
+        // budget. Enough short lines to blow well past 50KB but stay far under 256KB proves the smaller
+        // cap is actually the one enforced now, not vestigial dead code.
+        let line = "x".repeat(100); // + line number prefix + newline, comfortably short per line
+        let lines: Vec<String> = (0..1200).map(|_| line.clone()).collect(); // ~120KB of body
+        let f = tmp_file(&format!("{}\n", lines.join("\n")));
+        let out = Read
+            .run(json!({ "path": f.path().to_str().unwrap(), "limit": 100_000 }))
+            .await
+            .unwrap()
+            .text;
+        assert!(
+            out.len() < 150_000,
+            "expected truncation near the 50KB budget, got {} bytes",
+            out.len()
+        );
+        assert!(
+            out.contains("use offset="),
+            "must report a continuation offset: {}",
+            &out[out.len().saturating_sub(200)..]
+        );
     }
 
     #[tokio::test]
@@ -703,6 +812,37 @@ mod tests {
             out.images[0].media_type, "image/png",
             "sniffed format must win over the misleading .jpg extension"
         );
+    }
+
+    #[tokio::test]
+    async fn an_extensionless_image_is_still_detected_by_magic_bytes() {
+        // A real image with *no* recognized extension at all (e.g. a clipboard/screenshot temp file,
+        // or a plain `.dat`/no-extension name) — before this fix, only the extension gate decided
+        // *whether* to route into the image path at all, so this would previously fall through to the
+        // text path and get UTF-8-decoded as garbage instead of returned as an attachment.
+        let img = image::RgbImage::from_pixel(4, 4, image::Rgb([10, 20, 30]));
+        let mut png_bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut png_bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // No extension at all.
+        let path = dir.path().join("clipboard-image-temp");
+        std::fs::write(&path, &png_bytes).unwrap();
+
+        let out = Read
+            .run(json!({ "path": path.to_str().unwrap() }))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.images.len(),
+            1,
+            "an extensionless real image must still be detected and returned as an attachment"
+        );
+        assert_eq!(out.images[0].media_type, "image/png");
     }
 
     /// A minimal TIFF-structured IFD0 (one entry: orientation) — the same blob JPEG carries after its

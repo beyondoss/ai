@@ -121,6 +121,25 @@ pub fn cap_listing_bytes(out: &mut String, guidance: &str) -> bool {
     true
 }
 
+/// Format `path` (as yielded by walking `root`) the way pi's `grep.ts`/`find.ts` do: relative to `root`
+/// when `root` is a directory, or just the basename when `root` names a single file (the two would
+/// otherwise coincide, showing nothing meaningful beyond the name itself). Shared by `grep`/`find` —
+/// reporting the full (possibly deeply-nested, possibly absolute) path root-first costs the model extra
+/// tokens per line for a prefix it already knows (it's whatever `path` it just asked to search), and
+/// diverges from pi's documented "relative to search directory" contract.
+pub fn format_path<'a>(
+    path: &'a std::path::Path,
+    root: &std::path::Path,
+) -> std::borrow::Cow<'a, str> {
+    if !root.is_dir() {
+        return match path.file_name() {
+            Some(name) => name.to_string_lossy(),
+            None => path.to_string_lossy(),
+        };
+    }
+    path.strip_prefix(root).unwrap_or(path).to_string_lossy()
+}
+
 /// A unique-enough 16-hex-char (8-byte) token for temp-file names. It only needs to avoid collisions
 /// between concurrent commands, not be cryptographic — so we mix wall-clock nanos, the pid, and a
 /// per-process atomic counter through splitmix64 rather than pull in a CSPRNG.

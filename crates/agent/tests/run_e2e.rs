@@ -12,7 +12,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use serde_json::json;
+use serde_json::{Value, json};
 
 /// Build an Anthropic SSE turn that calls one tool with the given JSON-argument string.
 fn turn_tool_use(id: &str, name: &str, args_json: &str) -> String {
@@ -195,6 +195,98 @@ fn run_binary_performs_tool_round_trip() {
 }
 
 #[test]
+fn run_binary_json_mode_streams_structured_agent_events_not_text() {
+    // `--json` must emit a leading session header, then one `AgentEvent` object per line — the full
+    // observation surface (tool_start/tool_end included, not just raw text deltas) — instead of the
+    // human-readable `[tool: name]`/plain-text output the default text mode prints.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("hello.txt"), "secret-marker-42\n").unwrap();
+    let abs = dir.path().join("hello.txt").to_string_lossy().into_owned();
+
+    let turn1 = turn_tool_use("toolu_1", "read", &json!({ "path": abs }).to_string());
+    let turn2 = turn_text("I read the file.");
+    let (base, _bodies) = spawn_model_server(vec![turn1, turn2]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "read hello.txt and report it",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--max-steps",
+            "4",
+            "--json",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !stdout.contains("[tool:"),
+        "json mode must not print the text-mode tool marker: {stdout}"
+    );
+
+    let lines: Vec<Value> = stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("non-JSON line {l:?}: {e}")))
+        .collect();
+    assert!(!lines.is_empty(), "must emit at least the header line");
+
+    let header = &lines[0];
+    assert_eq!(header["kind"], "session");
+    assert!(header["id"].as_str().is_some_and(|s| !s.is_empty()));
+    assert_eq!(header["model"], "claude-test");
+
+    let kinds: Vec<&str> = lines[1..]
+        .iter()
+        .filter_map(|f| f["kind"].as_str())
+        .collect();
+    assert_eq!(
+        kinds.first(),
+        Some(&"agent_start"),
+        "kinds: {kinds:?}\nstdout: {stdout}"
+    );
+    assert!(kinds.contains(&"tool_start"), "kinds: {kinds:?}");
+    assert!(kinds.contains(&"tool_end"), "kinds: {kinds:?}");
+    assert!(
+        kinds.iter().filter(|k| **k == "turn_end").count() >= 2,
+        "two turns ran (tool call, then final text): {kinds:?}"
+    );
+    assert_eq!(
+        kinds.last(),
+        Some(&"agent_end"),
+        "kinds: {kinds:?}\nstdout: {stdout}"
+    );
+
+    // The final assistant text must still be present, just carried as a `stream`/`text_delta` event
+    // rather than printed as bare text.
+    let carries_final_text = lines.iter().any(|f| {
+        f["kind"] == "stream"
+            && f["type"] == "text_delta"
+            && f["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("I read the file."))
+    });
+    assert!(
+        carries_final_text,
+        "final assistant text must appear in a stream/text_delta event: {stdout}"
+    );
+}
+
+#[test]
 fn run_binary_prints_a_live_preview_of_streamed_tool_arguments() {
     // A real streaming response delivers a tool call's JSON arguments as several fragments, not one
     // whole string. Assembled in order right after the `[tool: name]` marker, they must read as the
@@ -237,6 +329,64 @@ fn run_binary_prints_a_live_preview_of_streamed_tool_arguments() {
         stdout.contains("[tool: unknown_preview_tool] {\"command\":\"echo hi\"}"),
         "the two fragments must render adjacently, in order, as the complete argument JSON: {stdout}"
     );
+}
+
+#[test]
+fn run_binary_prints_startup_timings_only_when_the_env_var_is_set() {
+    // Track L10: `AI_AGENT_TIMING=1` (pi's own `PI_TIMING=1`) turns on a startup-timing breakdown to
+    // stderr; unset, it must add nothing at all — and even enabled, it must never touch stdout, since
+    // that's the streamed-text protocol surface.
+    let (base, _bodies) = spawn_model_server(vec![turn_text("done")]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let args = [
+        "run",
+        "hi",
+        "--gateway-url",
+        &base,
+        "--key",
+        "bai_v1.test",
+        "--model",
+        "claude-test",
+    ];
+
+    let off = run_cmd(bin)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+    assert!(off.status.success());
+    assert!(
+        !String::from_utf8_lossy(&off.stderr).contains("Startup Timings"),
+        "must print nothing when unset: {}",
+        String::from_utf8_lossy(&off.stderr)
+    );
+
+    let (base2, _bodies2) = spawn_model_server(vec![turn_text("done")]);
+    let on = run_cmd(bin)
+        .args([
+            "run",
+            "hi",
+            "--gateway-url",
+            &base2,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+        ])
+        .env("AI_AGENT_TIMING", "1")
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+    assert!(on.status.success());
+    let stderr = String::from_utf8_lossy(&on.stderr);
+    assert!(stderr.contains("Startup Timings"), "stderr: {stderr}");
+    assert!(stderr.contains("TOTAL:"), "stderr: {stderr}");
+    let stdout = String::from_utf8_lossy(&on.stdout);
+    assert!(
+        !stdout.contains("Startup Timings"),
+        "timing output must never reach stdout: {stdout}"
+    );
+    assert!(stdout.contains("done"), "stdout: {stdout}");
 }
 
 #[test]
@@ -435,6 +585,157 @@ fn run_binary_errors_when_no_task_stdin_or_file_is_given() {
 }
 
 #[test]
+fn run_binary_expands_a_skill_invocation_in_the_first_message() {
+    // `serve` has always expanded `/skill:name`/`/name` invocations before sending them to the model;
+    // `run` (this one-shot binary) previously did not — a message starting with either was sent as a
+    // literal, unexpanded string. `--trust-project` is required for the project-local skill to be
+    // discovered at all (skill discovery is trust-gated; the untrusted-by-default case is covered by
+    // `serve_e2e.rs`'s own trust tests, not duplicated here).
+    let dir = tempfile::tempdir().unwrap();
+    let skill_dir = dir.path().join(".claude/skills/greet");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: greet\ndescription: a test skill\n---\nSKILL-BODY-MARKER-123",
+    )
+    .unwrap();
+    let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "/skill:greet",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--trust-project",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[0].contains("SKILL-BODY-MARKER-123"),
+        "the skill's body must be expanded into the first message: {}",
+        bodies[0]
+    );
+    assert!(
+        !bodies[0].contains("/skill:greet"),
+        "the raw, unexpanded invocation must not reach the model: {}",
+        bodies[0]
+    );
+}
+
+#[test]
+fn run_binary_force_untrusted_overrides_trust_project() {
+    // Track L8: `--force-untrusted` must win even when `--trust-project` is *also* given — the whole
+    // point is a way to force the untrusted codepath for one run regardless of anything else asking
+    // for trust.
+    let dir = tempfile::tempdir().unwrap();
+    let skill_dir = dir.path().join(".claude/skills/greet");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: greet\ndescription: a test skill\n---\nSKILL-BODY-MARKER-123",
+    )
+    .unwrap();
+    let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "/skill:greet",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--trust-project",
+            "--force-untrusted",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        !bodies[0].contains("SKILL-BODY-MARKER-123"),
+        "--force-untrusted must override --trust-project, so the skill must not expand: {}",
+        bodies[0]
+    );
+}
+
+#[test]
+fn run_binary_expands_a_prompt_template_in_the_first_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let prompt_dir = dir.path().join(".claude/prompts");
+    std::fs::create_dir_all(&prompt_dir).unwrap();
+    std::fs::write(
+        prompt_dir.join("fix.md"),
+        "Fix the bug in $1 — TEMPLATE-BODY-MARKER-456",
+    )
+    .unwrap();
+    let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "/fix foo.rs",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--trust-project",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[0].contains("TEMPLATE-BODY-MARKER-456") && bodies[0].contains("foo.rs"),
+        "the template's body, with its argument substituted, must reach the model: {}",
+        bodies[0]
+    );
+    assert!(
+        !bodies[0].contains("/fix foo.rs"),
+        "the raw, unexpanded invocation must not reach the model: {}",
+        bodies[0]
+    );
+}
+
+#[test]
 fn run_binary_list_models_prints_known_model_ids_with_no_gateway_or_key() {
     // A pure informational query — no `--gateway-url`/`--key` needed, matching `tools`'s own shape.
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
@@ -517,4 +818,63 @@ fn run_binary_session_flag_persists_and_resumes_across_invocations() {
     );
     assert!(bodies2[0].contains("first answer"));
     assert!(bodies2[0].contains("what was the marker?"));
+}
+
+#[test]
+fn export_subcommand_renders_an_existing_session_file_with_no_gateway_or_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl");
+
+    // Create a session file the ordinary way, with a real (fake) model server — this part still
+    // needs a gateway/key, exactly like any other `run`.
+    let (base, _bodies) = spawn_model_server(vec![turn_text("the answer is 42")]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let setup = run_cmd(bin)
+        .args([
+            "run",
+            "what is the answer?",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--session",
+            session_file.to_str().unwrap(),
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+    assert!(
+        setup.status.success(),
+        "session setup run failed.\nstderr: {}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+    assert!(session_file.exists());
+
+    // Now export that already-persisted session file directly — no --gateway-url/--key/--model at
+    // all, proving the export subcommand is pure offline rendering of what's on disk, unlike `run
+    // --export` (which only exports after a live model run completes).
+    let export_path = dir.path().join("transcript.html");
+    let output = Command::new(bin)
+        .args([
+            "export",
+            session_file.to_str().unwrap(),
+            export_path.to_str().unwrap(),
+        ])
+        .env("HOME", dir.path())
+        .output()
+        .expect("spawn binary");
+    assert!(
+        output.status.success(),
+        "export subcommand failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let html = std::fs::read_to_string(&export_path).expect("exported file must exist");
+    assert!(html.starts_with("<!DOCTYPE html>"));
+    assert!(html.contains("what is the answer?"));
+    assert!(html.contains("the answer is 42"));
 }

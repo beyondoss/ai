@@ -221,6 +221,82 @@ fn serve_follow_up_steers_an_in_flight_run() {
 }
 
 #[test]
+fn serve_get_messages_since_returns_only_what_was_appended_after_a_known_id() {
+    // Track M21: a client that already has messages through some tree id shouldn't have to
+    // re-transfer the whole transcript just to see what's new — pi's own `get_entries({since})`.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) =
+        spawn_model_server(vec![turn_text("first answer"), turn_text("second answer")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "first" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "second" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_messages");
+    let all = frames.last().unwrap()["data"]["messages"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        all.len(),
+        4,
+        "expected [first, first answer, second, second answer]: {all:#?}"
+    );
+    let first_answer_id = all[1]["id"].as_str().unwrap().to_string();
+
+    // Only what's new since the first turn's assistant reply: the second turn's user + assistant.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "get_messages", "since": first_answer_id })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_messages");
+    let resp = frames.last().unwrap();
+    assert_eq!(resp["success"], true, "{resp:#?}");
+    let since_messages = resp["data"]["messages"].as_array().unwrap();
+    assert_eq!(since_messages.len(), 2, "{since_messages:#?}");
+    assert!(since_messages[0]["content"].to_string().contains("second"));
+    assert!(
+        since_messages[1]["content"]
+            .to_string()
+            .contains("second answer")
+    );
+
+    // An unknown `since` id is an error, not a silent full re-fetch.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "get_messages", "since": "does-not-exist" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_messages");
+    let resp = frames.last().unwrap();
+    assert_eq!(resp["success"], false, "{resp:#?}");
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
 fn serve_stop_after_turn_ends_the_run_after_the_current_tool_call_completes() {
     use std::time::Duration;
 
@@ -378,6 +454,80 @@ fn serve_export_html_writes_a_self_contained_transcript() {
     assert!(html.starts_with("<!DOCTYPE html>"));
     assert!(html.contains("say hi"));
     assert!(html.contains("hello there"));
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_export_html_includes_abandoned_branches_not_just_the_active_path() {
+    // Track M19: an abandoned branch (created by rewinding via `switch_branch`) must still show up in
+    // the export — the whole point being that the old flat `export_html` silently dropped anything not
+    // on the active path.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) =
+        spawn_model_server(vec![turn_text("first answer"), turn_text("second answer")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "first" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "second" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    // Rewind to the first turn's assistant reply (message index 1), abandoning the second turn
+    // (indices 2, 3) without a summary, so its original text survives verbatim on disk.
+    let ids = message_ids(&session_file);
+    assert_eq!(ids.len(), 4, "expected 4 persisted messages: {ids:?}");
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "switch_branch", "target_id": ids[1], "summarize": false })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "switch_branch");
+
+    let output_path = dir.path().join("out.html").to_string_lossy().into_owned();
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "export_html", "output_path": output_path })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "export_html");
+    assert_eq!(frames.last().unwrap()["success"], true, "{frames:#?}");
+
+    let html = std::fs::read_to_string(&output_path).unwrap();
+    let split = html
+        .find("Other branches")
+        .unwrap_or_else(|| panic!("the abandoned branch must get its own section: {html}"));
+    let (active_section, branches_section) = html.split_at(split);
+    assert!(active_section.contains("first"), "the active path: {html}");
+    assert!(
+        active_section.contains("first answer"),
+        "the active path: {html}"
+    );
+    assert!(
+        !active_section.contains("second"),
+        "abandoned by the rewind, must not be on the active path: {active_section}"
+    );
+    assert!(
+        branches_section.contains("second answer"),
+        "the abandoned branch's own content must still appear, in its section: {branches_section}"
+    );
 
     drop(stdin);
     child.wait().unwrap();
@@ -565,6 +715,121 @@ fn serve_follow_up_queued_while_idle_is_picked_up_by_next_prompt() {
     let dump = frames.last().unwrap()["data"]["messages"].to_string();
     assert!(dump.contains("the queued question"));
     assert!(dump.contains("answered the queued follow-up"));
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_default_queue_mode_drains_queued_follow_ups_one_at_a_time() {
+    // pi's `PendingMessageQueue` default: several messages queued in quick succession land as
+    // *separate* turns, one at a time — not folded into a single injection. Two follow-ups queued
+    // while idle must reach the model server as two distinct requests (three total, including the
+    // initial prompt), each carrying exactly one of the two follow-up texts as its newest user turn.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+
+    let (base, bodies) = spawn_model_server(vec![
+        turn_text("first answer"),
+        turn_text("answered f1"),
+        turn_text("answered f2"),
+    ]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    for (id, msg) in [("f1", "first follow-up"), ("f2", "second follow-up")] {
+        writeln!(
+            stdin,
+            "{}",
+            json!({ "type": "follow_up", "id": id, "message": msg })
+        )
+        .unwrap();
+        stdin.flush().unwrap();
+        read_until_response(&mut stdout, "follow_up");
+    }
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "start" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "prompt");
+    assert_eq!(frames.last().unwrap()["success"], true, "got: {frames:#?}");
+
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(
+        bodies.len(),
+        3,
+        "initial prompt + one request per follow-up, not one merged request"
+    );
+    assert!(
+        bodies[1].contains("first follow-up") && !bodies[1].contains("second follow-up"),
+        "the second request should carry only the first follow-up: {}",
+        bodies[1]
+    );
+    assert!(
+        bodies[2].contains("first follow-up") && bodies[2].contains("second follow-up"),
+        "the third request replays history, so it sees both by then, but as separate turns: {}",
+        bodies[2]
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_set_queue_mode_all_folds_queued_follow_ups_into_one_injection() {
+    // The opt-in `"all"` mode (this crate's original behavior, before pi-parity default flipped it):
+    // both queued follow-ups are folded into the *same* next request, not drained one at a time.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+
+    let (base, bodies) =
+        spawn_model_server(vec![turn_text("first answer"), turn_text("answered both")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_queue_mode", "mode": "all" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "set_queue_mode");
+    assert_eq!(frames.last().unwrap()["success"], true, "got: {frames:#?}");
+    assert_eq!(frames.last().unwrap()["data"]["mode"], "all");
+
+    for (id, msg) in [("f1", "first follow-up"), ("f2", "second follow-up")] {
+        writeln!(
+            stdin,
+            "{}",
+            json!({ "type": "follow_up", "id": id, "message": msg })
+        )
+        .unwrap();
+        stdin.flush().unwrap();
+        read_until_response(&mut stdout, "follow_up");
+    }
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "start" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "prompt");
+    assert_eq!(frames.last().unwrap()["success"], true, "got: {frames:#?}");
+
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(
+        bodies.len(),
+        2,
+        "initial prompt + one request carrying BOTH follow-ups folded together"
+    );
+    assert!(
+        bodies[1].contains("first follow-up") && bodies[1].contains("second follow-up"),
+        "both follow-ups should reach the model in the same request: {}",
+        bodies[1]
+    );
 
     drop(stdin);
     child.wait().unwrap();
@@ -766,7 +1031,85 @@ fn serve_cycle_model_advances_and_wraps() {
     writeln!(stdin, "{}", json!({ "type": "cycle_model" })).unwrap();
     stdin.flush().unwrap();
     let frames = read_until_response(&mut stdout, "cycle_model");
-    assert_eq!(frames.last().unwrap()["data"]["model"], models[1]);
+    let last = frames.last().unwrap();
+    assert_eq!(last["data"]["model"], models[1]);
+    assert_eq!(
+        last["data"]["scoped"], false,
+        "no --models flag was given, so cycling the full list must report scoped: false"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_cycle_model_scoped_by_the_models_flag_ignores_the_rest_of_the_known_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = Command::new(bin)
+        .args([
+            "serve",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--session-file",
+            &session_file,
+            "--models",
+            "claude-opus-4-8,gpt-4o",
+        ])
+        .env("HOME", ISOLATED_HOME)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    // `get_available_models` must stay the full, unscoped list — `--models` only narrows `cycle_model`.
+    writeln!(stdin, "{}", json!({ "type": "get_available_models" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_available_models");
+    let all_models: Vec<String> = frames.last().unwrap()["data"]["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        all_models.len() > 2,
+        "the full known-model list must be larger than the 2-entry --models scope"
+    );
+
+    // Pin to the scoped list's first entry so cycling from a known position is unambiguous.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_model", "model": "claude-opus-4-8" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "set_model");
+
+    writeln!(stdin, "{}", json!({ "type": "cycle_model" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "cycle_model");
+    let last = frames.last().unwrap();
+    assert_eq!(last["data"]["model"], "gpt-4o");
+    assert_eq!(last["data"]["scoped"], true);
+
+    // Cycling again must wrap back to the scoped list's *first* entry, not fall through to whatever
+    // comes third in the full unscoped list.
+    writeln!(stdin, "{}", json!({ "type": "cycle_model" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "cycle_model");
+    assert_eq!(frames.last().unwrap()["data"]["model"], "claude-opus-4-8");
 
     drop(stdin);
     child.wait().unwrap();
@@ -1048,6 +1391,79 @@ fn serve_set_auto_retry_false_fails_immediately_instead_of_retrying_a_dropped_st
 }
 
 #[test]
+fn serve_auto_retries_a_whole_run_after_mid_stream_retry_is_exhausted() {
+    // agent-core's own mid-stream retry (`MAX_MID_STREAM_RETRIES = 3`) gives up after 1 initial + 3
+    // retried attempts, all against a stream that dies before `message_stop` — 4 requests total,
+    // exhausting that layer entirely and returning `Err` to `run_events_steered`. This is the whole-run
+    // auto-retry layer's job to pick up from there: automatically re-invoke the run against the same
+    // session one more time, which succeeds — a 5th request the model server actually sees, and no
+    // second user turn appended (still the same `prompt`).
+    let truncated = "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, bodies) = spawn_model_server(vec![
+        truncated.to_string(),
+        truncated.to_string(),
+        truncated.to_string(),
+        truncated.to_string(),
+        turn_text("recovered"),
+    ]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "prompt");
+
+    let auto_retry_frames: Vec<&Value> = frames
+        .iter()
+        .filter(|f| f.get("type").and_then(Value::as_str) == Some("auto_retry"))
+        .collect();
+    assert_eq!(
+        auto_retry_frames.len(),
+        1,
+        "expected exactly one auto_retry notice, got: {frames:#?}"
+    );
+    assert_eq!(auto_retry_frames[0]["attempt"], 1);
+    assert_eq!(auto_retry_frames[0]["max_attempts"], 3);
+    assert!(
+        auto_retry_frames[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("stream ended"),
+        "got: {auto_retry_frames:#?}"
+    );
+
+    let response = frames.last().unwrap();
+    assert_eq!(response["success"], true, "got: {response:#?}");
+    assert_eq!(
+        bodies.lock().unwrap().len(),
+        5,
+        "4 exhausted mid-stream attempts + 1 successful whole-run retry"
+    );
+
+    // The recovered turn's own text must have reached the transcript — proof the retry replayed the
+    // *same* user turn rather than silently dropping it or duplicating it.
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_messages");
+    let messages = &frames.last().unwrap()["data"]["messages"];
+    let dump = messages.to_string();
+    assert_eq!(
+        messages.as_array().unwrap().len(),
+        2,
+        "exactly one user turn + one assistant turn, no duplicate: {dump}"
+    );
+    assert!(dump.contains("recovered"), "got: {dump}");
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
 fn serve_injects_project_instructions_into_system_prompt() {
     // A `CLAUDE.md` in the working directory must reach the model: the agent assembles it into the
     // system prompt. The mock server records the request body, so we assert the marker is present.
@@ -1224,6 +1640,89 @@ fn serve_gates_skills_and_prompts_on_project_trust() {
         assert!(
             names.contains(&"bar"),
             "trusted project should list the prompt template: {names:?}"
+        );
+
+        drop(stdin);
+        child.wait().unwrap();
+    }
+}
+
+#[test]
+fn serve_force_untrusted_overrides_a_persisted_trust_grant() {
+    // Track L8: `--force-untrusted` must win even over a *persisted* `agent trust <path>` grant, not
+    // just the absence of `--trust-project` — the whole point is overriding an operator's standing
+    // trust decision for one run (testing untrusted behavior, or extra caution on a checkout that
+    // happens to live under an already-trusted parent).
+    let home = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let skill_dir = dir.path().join(".claude/skills/foo");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: foo\ndescription: a test skill\n---\nDo the foo thing.",
+    )
+    .unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+
+    // Persist trust for `dir` via the real `trust` subcommand — the same allowlist `serve` itself
+    // reads from, not a hand-rolled fixture.
+    let trust_output = Command::new(bin)
+        .args(["trust", dir.path().to_str().unwrap()])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(trust_output.status.success());
+
+    // Control: without --force-untrusted, the persisted trust is honored — the skill is visible.
+    {
+        let (base, _bodies) = spawn_model_server(vec![]);
+        let session_file = dir.path().join("s1.jsonl").to_string_lossy().into_owned();
+        let mut cmd = serve_cmd(bin, &base, &session_file);
+        cmd.current_dir(dir.path()).env("HOME", home.path());
+        let mut child = cmd.spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+        writeln!(stdin, "{}", json!({ "type": "get_commands" })).unwrap();
+        stdin.flush().unwrap();
+        let frames = read_until_response(&mut stdout, "get_commands");
+        let names: Vec<&str> = frames.last().unwrap()["data"]["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["name"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"foo"),
+            "the persisted trust grant should be honored: {names:?}"
+        );
+
+        drop(stdin);
+        child.wait().unwrap();
+    }
+
+    // With --force-untrusted: the same persisted trust grant must be overridden.
+    {
+        let (base, _bodies) = spawn_model_server(vec![]);
+        let session_file = dir.path().join("s2.jsonl").to_string_lossy().into_owned();
+        let mut cmd = serve_cmd(bin, &base, &session_file);
+        cmd.arg("--force-untrusted")
+            .current_dir(dir.path())
+            .env("HOME", home.path());
+        let mut child = cmd.spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+        writeln!(stdin, "{}", json!({ "type": "get_commands" })).unwrap();
+        stdin.flush().unwrap();
+        let frames = read_until_response(&mut stdout, "get_commands");
+        let commands = frames.last().unwrap()["data"]["commands"]
+            .as_array()
+            .unwrap();
+        assert!(
+            commands.is_empty(),
+            "--force-untrusted must override the persisted trust grant: {commands:?}"
         );
 
         drop(stdin);
@@ -1641,11 +2140,14 @@ fn serve_repo_lists_switches_and_forks_sessions() {
     writeln!(stdin, "{}", json!({ "type": "new_session", "id": "n" })).unwrap();
     stdin.flush().unwrap();
     let frames = read_until_response(&mut stdout, "new_session");
-    let second_id = frames.last().unwrap()["data"]["session_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let new_session_data = &frames.last().unwrap()["data"];
+    let second_id = new_session_data["session_id"].as_str().unwrap().to_string();
     assert_ne!(first_id, second_id, "new_session must mint a new id");
+    assert_eq!(
+        new_session_data["parent"], first_id,
+        "the fresh session's lineage marker must point back at whatever was active before it: \
+         {new_session_data:#?}"
+    );
 
     // Prompt in session 2.
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "yo" })).unwrap();
@@ -1682,6 +2184,16 @@ fn serve_repo_lists_switches_and_forks_sessions() {
     assert!(
         first_session["search_text"].is_string(),
         "search_text must be populated: {first_session:#?}"
+    );
+    // The lineage marker also persists to disk and survives into `list_sessions`, not just the
+    // `new_session` response.
+    let second_session = sessions
+        .iter()
+        .find(|s| s["id"] == second_id)
+        .expect("session 2 must be listed");
+    assert_eq!(
+        second_session["parent"], first_id,
+        "list_sessions must surface the persisted lineage marker too: {second_session:#?}"
     );
 
     // Switch back to session 1 and confirm its transcript is restored.
@@ -1751,6 +2263,111 @@ fn serve_repo_lists_switches_and_forks_sessions() {
         count_after_fork,
         count_before_fork + 1,
         "get_fork_messages must not itself have created a session"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_fork_by_target_id_reaches_an_off_active_path_branch() {
+    // `fork`'s `upto` count only ever copies a prefix of whatever is *currently* the active path — it
+    // has no way to reach a branch the client has since navigated away from. `target_id` does: fork
+    // directly from any tree entry, on or off the active path, without first `switch_branch`-ing to it
+    // (which would itself mutate the live session just to preview/fork from it).
+    let dir = tempfile::tempdir().unwrap();
+    let session_dir = dir.path().join("sessions").to_string_lossy().into_owned();
+
+    let (base, _bodies) = spawn_model_server(vec![
+        turn_text("a-reply"), // prompt "a"
+        turn_text("b-reply"), // prompt "b"
+        turn_text("c-reply"), // prompt "c"
+        turn_text("d-reply"), // prompt "d", after switching back to a's leaf
+    ]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_dir_cmd(bin, &base, &session_dir).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    for msg in ["a", "b", "c"] {
+        writeln!(stdin, "{}", json!({ "type": "prompt", "message": msg })).unwrap();
+        stdin.flush().unwrap();
+        read_until_response(&mut stdout, "prompt");
+    }
+
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_messages");
+    let messages = frames.last().unwrap()["data"]["messages"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        messages.len(),
+        6,
+        "3 user + 3 assistant turns: {messages:#?}"
+    );
+    let ids: Vec<String> = messages
+        .iter()
+        .map(|m| m["id"].as_str().unwrap().to_string())
+        .collect();
+    // ids[0] = user "a", ids[1] = assistant "a-reply", ids[2] = user "b", ids[3] = assistant
+    // "b-reply", ids[4] = user "c", ids[5] = assistant "c-reply".
+
+    // Switch back to a's own leaf and append "d" — b/c's turns fall off the active path entirely.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "switch_branch", "target_id": ids[1], "summarize": false })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    assert_eq!(
+        read_until_response(&mut stdout, "switch_branch")
+            .last()
+            .unwrap()["success"],
+        true
+    );
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "d" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    // `get_fork_messages` targeting b's own user turn (off-branch) with `before:true` previews just
+    // [a, a-reply] — b's user message excluded (its own parent is a-reply, so excluding just b's
+    // message, not "the whole b pair", is exactly what `before` means: fork right before this entry).
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "get_fork_messages", "target_id": ids[2], "before": true })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let preview = read_until_response(&mut stdout, "get_fork_messages");
+    let preview_messages = preview.last().unwrap()["data"]["messages"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        preview_messages.len(),
+        2,
+        "before:true at b's own user turn excludes it, leaving just a's turn: {preview_messages:#?}"
+    );
+
+    // A real `fork` at c's assistant reply (off-branch), `before:false` (the default) — includes it,
+    // reaching the full original a->b->c line, none of which is the *current* active path (a->d).
+    writeln!(stdin, "{}", json!({ "type": "fork", "target_id": ids[5] })).unwrap();
+    stdin.flush().unwrap();
+    let fork_response = read_until_response(&mut stdout, "fork");
+    assert_eq!(fork_response.last().unwrap()["success"], true);
+
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_messages");
+    let dump = frames.last().unwrap()["data"]["messages"].to_string();
+    assert!(dump.contains("a-reply") && dump.contains("b-reply") && dump.contains("c-reply"));
+    assert!(
+        !dump.contains("d-reply"),
+        "the fork reached the off-branch a->b->c line, not the active a->d one: {dump}"
     );
 
     drop(stdin);
@@ -2148,6 +2765,79 @@ fn serve_switch_branch_summarizes_abandoned_activity_and_navigates() {
     let dump = frames.last().unwrap()["data"]["messages"].to_string();
     assert!(dump.contains("continued from the original branch"));
     assert!(!dump.contains("second answer"));
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_switch_branch_restores_the_model_active_on_that_branch() {
+    // `set_model` between two turns records a branch-local change (H6); navigating back to the point
+    // right before that change must restore the model that was actually active there, not silently
+    // continue with whatever model the process's global setting has since moved on to.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+
+    let (base, _bodies) = spawn_model_server(vec![
+        turn_text("first answer"),  // prompt "first" on the original model
+        turn_text("second answer"), // prompt "second" on the switched-to model
+        turn_text("third answer"),  // prompt "third" after switching back
+    ]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "first" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    // The tip right now (after "first answer") is where the upcoming model change is anchored.
+    let ids = message_ids(&session_file);
+    assert_eq!(ids.len(), 2, "expected 2 persisted messages: {ids:?}");
+    let anchor = ids[1].clone();
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_model", "model": "claude-test-2" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "set_model");
+    assert_eq!(frames.last().unwrap()["success"], true, "got: {frames:#?}");
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "second" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    // Navigate back to right after "first answer" — before the model change ever happened.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "switch_branch", "target_id": anchor, "summarize": false })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "switch_branch");
+    let resp = frames.last().unwrap();
+    assert_eq!(resp["success"], true, "got: {resp:#?}");
+    assert_eq!(
+        resp["data"]["model"], "claude-test",
+        "switching back before the set_model must restore the original model: {resp:#?}"
+    );
+
+    // `get_state` (not just the switch_branch response) must reflect the restored model too.
+    writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_state");
+    assert_eq!(frames.last().unwrap()["data"]["model"], "claude-test");
 
     drop(stdin);
     child.wait().unwrap();
@@ -2611,6 +3301,65 @@ fn serve_get_state_and_get_session_stats_answer_live_during_a_prompt() {
 }
 
 #[test]
+fn serve_get_state_reports_runtime_settings_and_queue_depth() {
+    // `get_state` must carry the runtime-mutable settings (thinking level, auto-compaction, auto-retry,
+    // queue mode) and the current queue depth — pi's `get_state` carries the same shape
+    // (`thinkingLevel`/`autoCompactionEnabled`/`steeringMode`/`followUpMode`/`pendingMessageCount`), and
+    // a client shouldn't need a separate round trip (or its own copy of the defaults) to render them.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    // Defaults, nothing queued yet.
+    writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_state");
+    let data = &frames.last().unwrap()["data"];
+    assert_eq!(data["thinking_level"], "off", "{data:#?}");
+    assert_eq!(data["auto_compaction"], true, "{data:#?}");
+    assert_eq!(data["auto_retry"], true, "{data:#?}");
+    assert_eq!(data["queue_mode"], "one_at_a_time", "{data:#?}");
+    assert_eq!(data["pending_messages"], 0, "{data:#?}");
+
+    // Queue two follow-ups (idle `follow_up`, no prompt in flight) and flip auto_compaction/queue_mode;
+    // `get_state` must reflect all of it without any prompt having run.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "follow_up", "message": "first" })
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "follow_up", "message": "second" })
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_auto_compaction", "enabled": false })
+    )
+    .unwrap();
+    writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_state");
+    let data = &frames.last().unwrap()["data"];
+    assert_eq!(data["auto_compaction"], false, "{data:#?}");
+    assert_eq!(
+        data["pending_messages"], 2,
+        "two queued follow-ups: {data:#?}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
 fn serve_reports_cwd_stale_false_for_a_freshly_created_session() {
     // A session `serve` creates itself always records the actual current directory, which obviously
     // still exists — `cwd_stale` must read false everywhere it's surfaced.
@@ -2784,5 +3533,94 @@ fn serve_survives_a_hard_crash_mid_run_with_the_first_round_trip_already_durable
     assert!(
         !dump.contains("toolu_2"),
         "the second (interrupted) round-trip must not appear as a completed pair: {dump}"
+    );
+}
+
+#[test]
+fn serve_stdout_stays_valid_json_even_when_a_load_warning_fires() {
+    // A prior bug (output-guard gap): the tracing subscriber defaulted to stdout, the same stream
+    // `serve`'s NDJSON protocol writes to. A `tracing::warn!` on a live path (here: `session_store.rs`
+    // skipping an unparseable line while loading) would interleave raw log text into the protocol
+    // stream, breaking any line-based JSON parser reading it. Plant a session file with exactly that
+    // kind of corrupt line, run with `RUST_LOG=warn` so the warning is guaranteed to fire, and assert
+    // every single stdout line still parses as JSON — while independently confirming (via captured
+    // stderr) that the warning really did fire, so the assertion isn't vacuously true.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl");
+    let header = json!({
+        "type": "session",
+        "id": "log-purity-session",
+        "created_at": 1,
+        "cwd": dir.path().to_string_lossy(),
+        "model": "claude-test",
+    });
+    std::fs::write(
+        &session_file,
+        format!("{header}\nthis line is not valid JSON at all\n"),
+    )
+    .unwrap();
+
+    let (base, _bodies) = spawn_model_server(vec![]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file.to_string_lossy())
+        .env("RUST_LOG", "warn")
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stderr = BufReader::new(child.stderr.take().unwrap());
+
+    // Deliberately NOT `read_until_response` — it silently skips a line that fails to parse as JSON,
+    // which would make this test vacuously pass even with the bug reintroduced. Every line must parse.
+    let mut line = String::new();
+    let mut lines_seen = 0;
+    loop {
+        line.clear();
+        if stdout.read_line(&mut line).unwrap() == 0 {
+            panic!("stdout closed before a ready frame arrived");
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let v: Value = serde_json::from_str(trimmed)
+            .unwrap_or_else(|e| panic!("stdout line was not valid JSON ({e}): {trimmed:?}"));
+        lines_seen += 1;
+        if v.get("type").and_then(Value::as_str) == Some("ready") {
+            break;
+        }
+    }
+    assert!(lines_seen >= 1);
+
+    writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
+    stdin.flush().unwrap();
+    loop {
+        line.clear();
+        if stdout.read_line(&mut line).unwrap() == 0 {
+            panic!("stdout closed before the get_state response arrived");
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let v: Value = serde_json::from_str(trimmed)
+            .unwrap_or_else(|e| panic!("stdout line was not valid JSON ({e}): {trimmed:?}"));
+        let done = v.get("type").and_then(Value::as_str) == Some("response")
+            && v.get("command").and_then(Value::as_str) == Some("get_state");
+        if done {
+            break;
+        }
+    }
+
+    drop(stdin);
+    child.wait().unwrap();
+
+    let mut stderr_text = String::new();
+    stderr.read_to_string(&mut stderr_text).unwrap();
+    assert!(
+        stderr_text.contains("skipping unparseable session entry line"),
+        "the load warning must actually have fired (on stderr, not stdout) for this test to mean \
+         anything: stderr was {stderr_text:?}"
     );
 }

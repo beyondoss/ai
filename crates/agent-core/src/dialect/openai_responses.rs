@@ -331,6 +331,7 @@ pub fn build_body(req: &ModelRequest) -> Value {
     // than silently reasoning at the provider's own (non-zero) default effort.
     if caps.reasoning_effort {
         if let Some(effort) = req.reasoning_effort {
+            let effort = crate::models::clamp_reasoning_effort(&caps, effort);
             map.insert(
                 "reasoning".into(),
                 json!({ "effort": effort.as_str(), "summary": "auto" }),
@@ -704,6 +705,26 @@ mod tests {
         let req = ModelRequest::new("gpt-4o", vec![Message::user("hi")], 64)
             .with_reasoning_effort(ReasoningEffort::High);
         assert!(build_body(&req).get("reasoning").is_none());
+    }
+
+    #[test]
+    fn reasoning_effort_is_clamped_per_model() {
+        use crate::transport::ReasoningEffort;
+        // o3-mini has no "xhigh" wire value at all — must clamp down to "high" rather than send a
+        // value the Responses API rejects for this model.
+        let req = ModelRequest::new("o3-mini", vec![Message::user("hi")], 64)
+            .with_reasoning_effort(ReasoningEffort::XHigh);
+        assert_eq!(build_body(&req)["reasoning"]["effort"], "high");
+
+        // gpt-5.5-pro rejects both "minimal" and "low" — must clamp up to "medium".
+        let req = ModelRequest::new("gpt-5.5-pro", vec![Message::user("hi")], 64)
+            .with_reasoning_effort(ReasoningEffort::Minimal);
+        assert_eq!(build_body(&req)["reasoning"]["effort"], "medium");
+
+        // gpt-5.2 does support xhigh — passes through unclamped.
+        let req = ModelRequest::new("gpt-5.2", vec![Message::user("hi")], 64)
+            .with_reasoning_effort(ReasoningEffort::XHigh);
+        assert_eq!(build_body(&req)["reasoning"]["effort"], "xhigh");
     }
 
     #[test]

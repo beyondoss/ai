@@ -26,6 +26,8 @@ use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContex
 use ignore::{WalkBuilder, WalkState};
 use serde_json::{Value, json};
 
+use super::output::format_path;
+
 /// Default cap on reported matches.
 const DEFAULT_LIMIT: usize = 100;
 /// Long match lines are clipped to keep output readable.
@@ -328,16 +330,10 @@ impl Tool for Grep {
         };
 
         let no_match = format!("no matches for {pattern:?}");
-        let job = GrepJob::new(
-            pattern,
-            literal,
-            ignore_case,
-            glob,
-            PathBuf::from(root),
-            limit,
-        )
-        .map_err(ToolError::InvalidInput)?
-        .with_context(before, after);
+        let root = PathBuf::from(root);
+        let job = GrepJob::new(pattern, literal, ignore_case, glob, root.clone(), limit)
+            .map_err(ToolError::InvalidInput)?
+            .with_context(before, after);
         // The walk blocks (its own thread pool, synchronous reads); keep it off the async runtime.
         let (matches, truncated) = tokio::task::spawn_blocking(move || search(&job, 0))
             .await
@@ -353,10 +349,11 @@ impl Tool for Grep {
             // separator); context lines use `path-line-` so a reader (and the model) can tell a hit
             // from its surrounding context at a glance. `writeln!` into a `String` can't fail, so the
             // `Result` is discarded.
+            let display_path = format_path(path, &root);
             let _ = if *is_match {
-                writeln!(out, "{}:{}: {}", path.display(), line, text)
+                writeln!(out, "{display_path}:{line}: {text}")
             } else {
-                writeln!(out, "{}-{}- {}", path.display(), line, text)
+                writeln!(out, "{display_path}-{line}- {text}")
             };
         }
         // The byte cap is checked *before* the match-count marker is appended, and takes priority when
@@ -403,6 +400,53 @@ mod tests {
             !out.contains("axbc"),
             "literal mode must not regex-match: {out}"
         );
+    }
+
+    #[tokio::test]
+    async fn output_paths_are_relative_to_the_search_root_not_absolute() {
+        // A prior bug reported the full path straight from the walk entry (often absolute, since the
+        // search root itself usually is) — costing the model extra tokens per line for a prefix it
+        // already knows, and diverging from pi's documented "relative to search directory" contract.
+        // Exact-match (not `.contains`) so a leftover root prefix can't slip through undetected.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "needle\n").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub").join("b.txt"), "needle\n").unwrap();
+
+        let out = Grep
+            .run(json!({ "pattern": "needle", "path": dir.path().to_str().unwrap() }))
+            .await
+            .unwrap()
+            .text;
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(
+            lines.contains(&"a.txt:1: needle"),
+            "expected a root-relative bare filename, got: {out}"
+        );
+        assert!(
+            lines.contains(&"sub/b.txt:1: needle"),
+            "expected a root-relative nested path, got: {out}"
+        );
+        assert!(
+            !out.contains(dir.path().to_str().unwrap()),
+            "the search root's own absolute prefix must not appear in the output: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn searching_a_single_file_reports_just_its_basename() {
+        // Mirrors pi: when `path` names a single file (not a directory), there's nothing meaningful to
+        // show beyond its own name — the "relative to root" and "the file itself" cases coincide.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "needle\n").unwrap();
+
+        let out = Grep
+            .run(json!({ "pattern": "needle", "path": file.to_str().unwrap() }))
+            .await
+            .unwrap()
+            .text;
+        assert_eq!(out.trim_end(), "a.txt:1: needle", "got: {out}");
     }
 
     #[tokio::test]
