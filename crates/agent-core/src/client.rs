@@ -139,7 +139,7 @@ impl ModelTransport for GatewayClient {
             let mut bytes = resp.bytes_stream();
             while let Some(chunk) = bytes.next().await {
                 let chunk = chunk.map_err(|e| Error::Transport(e.to_string()))?;
-                framer.extend(&chunk);
+                framer.extend(&chunk)?;
                 while let Some(line) = framer.next_line() {
                     let line = std::str::from_utf8(&line)
                         .map_err(|e| Error::Transport(format!("invalid UTF-8 in SSE stream: {e}")))?;
@@ -186,15 +186,29 @@ pub struct LineFramer {
     buf: BytesMut,
 }
 
+/// Ceiling on a single buffered (unterminated) line. A legitimate SSE `data:` line — even one
+/// carrying a large embedded payload — stays orders of magnitude under this; it exists solely to
+/// bound how much a malformed or adversarial stream (a line whose `\n` never arrives, or a
+/// pathologically long one from a misbehaving provider/gateway) can grow the buffer before the
+/// stream errors out instead of the process running out of memory.
+const MAX_BUFFERED_LINE_BYTES: usize = 32 * 1024 * 1024;
+
 impl LineFramer {
     /// A framer with an empty buffer.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Append a freshly-received chunk to the buffer.
-    pub fn extend(&mut self, chunk: &[u8]) {
+    /// Append a freshly-received chunk to the buffer. Errors if the unterminated line being
+    /// assembled would exceed [`MAX_BUFFERED_LINE_BYTES`] — see that constant's doc comment.
+    pub fn extend(&mut self, chunk: &[u8]) -> std::result::Result<(), Error> {
         self.buf.extend_from_slice(chunk);
+        if self.buf.len() > MAX_BUFFERED_LINE_BYTES {
+            return Err(Error::Transport(format!(
+                "SSE line exceeded {MAX_BUFFERED_LINE_BYTES} bytes without a newline"
+            )));
+        }
+        Ok(())
     }
 
     /// Pop the next complete line (including its trailing `\n`), or `None` if the buffer holds no
@@ -219,6 +233,11 @@ impl LineFramer {
 
 /// POST the request body, retrying transient failures with exponential backoff until a successful
 /// response or the retry budget is exhausted. Honors a `Retry-After` header when the server sends one.
+// 8 arguments, all independent inputs a single call site (`GatewayClient::stream`) already has in
+// scope from `self`/the request — bundling them into a struct would just be a second place those same
+// fields live, not a reduction in what the function needs to know. Private, single-caller helper, not
+// a public API shape, so the usual "too many params signals a missing abstraction" concern doesn't
+// apply here.
 #[allow(clippy::too_many_arguments)]
 async fn send_with_retry(
     http: &reqwest::Client,
@@ -346,6 +365,26 @@ fn backoff(attempt: u32, retry_after: Option<Duration>, base_backoff: Duration) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn line_framer_splits_whole_lines_and_buffers_the_tail() {
+        let mut framer = LineFramer::new();
+        framer.extend(b"data: {\"a\":1}\ndata: {\"b").unwrap();
+        assert_eq!(framer.next_line().unwrap(), &b"data: {\"a\":1}\n"[..]);
+        assert!(framer.next_line().is_none()); // unterminated remainder stays buffered
+        framer.extend(b"\":2}\n").unwrap();
+        assert_eq!(framer.next_line().unwrap(), &b"data: {\"b\":2}\n"[..]);
+    }
+
+    #[test]
+    fn line_framer_errors_instead_of_growing_unbounded_on_an_unterminated_line() {
+        // A malformed/adversarial stream (or a provider bug) that never sends a `\n` must not be
+        // allowed to grow the buffer without bound — this is what caps it.
+        let mut framer = LineFramer::new();
+        let chunk = vec![b'x'; MAX_BUFFERED_LINE_BYTES];
+        framer.extend(&chunk).unwrap(); // exactly at the cap: still fine
+        assert!(framer.extend(b"y").is_err()); // one more byte tips it over
+    }
 
     #[test]
     fn retryable_status_classification() {

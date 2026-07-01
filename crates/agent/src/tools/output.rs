@@ -196,7 +196,9 @@ impl OutputAccumulator {
         if self.spilled {
             // Post-spill: stream straight to the file so memory stays bounded.
             if let Some(w) = self.temp_writer.as_mut() {
-                let _ = w.write_all(data); // best-effort; a write error just loses full-output fidelity
+                if w.write_all(data).is_err() {
+                    self.mark_spill_broken();
+                }
             }
         } else if !self.spill_failed {
             // Pre-spill: keep the complete bytes in memory so a later spill can flush them whole.
@@ -220,7 +222,9 @@ impl OutputAccumulator {
         }
         self.finished = true;
         if let Some(w) = self.temp_writer.as_mut() {
-            let _ = w.flush();
+            if w.flush().is_err() {
+                self.mark_spill_broken();
+            }
         }
     }
 
@@ -251,7 +255,9 @@ impl OutputAccumulator {
             self.ensure_temp_file();
             // Flush so a reader (e.g. the model, or a test) sees the bytes we just wrote.
             if let Some(w) = self.temp_writer.as_mut() {
-                let _ = w.flush();
+                if w.flush().is_err() {
+                    self.mark_spill_broken();
+                }
             }
         }
 
@@ -352,7 +358,20 @@ impl OutputAccumulator {
         }
         let path =
             std::env::temp_dir().join(format!("{}-{}.log", self.temp_prefix, random_hex16()));
-        match File::create(&path) {
+        let mut opts = std::fs::OpenOptions::new();
+        // `create_new`, not `create`: `random_hex16` isn't cryptographically random, and this file
+        // lives in the shared, world-writable system temp dir, so refuse to follow anything already
+        // there (planted or coincidental) rather than silently truncating through it. `0600` — a
+        // command's full output (env vars, file contents it printed, secrets) shouldn't be readable
+        // by another local user on a shared host, set atomically at creation rather than via a
+        // `set_permissions` call afterward.
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        match opts.open(&path) {
             Ok(f) => {
                 let mut w = BufWriter::new(f);
                 if w.write_all(&self.raw_buffer).is_err() {
@@ -370,6 +389,16 @@ impl OutputAccumulator {
                 self.raw_buffer = Vec::new();
             }
         }
+    }
+
+    /// Mark the spill file as no longer trustworthy after a write/flush failure partway through
+    /// streaming to it (e.g. the disk filled up mid-command): stop advertising it via
+    /// `full_output_path` — the bytes on disk are now silently truncated relative to what the
+    /// command actually produced — and stop attempting further writes to it.
+    fn mark_spill_broken(&mut self) {
+        self.spill_failed = true;
+        self.temp_path = None;
+        self.temp_writer = None;
     }
 }
 
@@ -661,6 +690,50 @@ mod tests {
         assert_eq!(read_temp(&path), full);
         // Display content is bounded, not the whole 300 KiB.
         assert!(snap.content.len() <= DEFAULT_MAX_BYTES);
+
+        // A command's full output can carry secrets (env vars, file contents it printed); this
+        // lives in the shared, world-writable system temp dir, so it must not be group/world
+        // readable regardless of the process umask.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "spill file must be created private");
+        }
+    }
+
+    #[test]
+    fn spill_write_failure_stops_advertising_the_corrupted_file() {
+        // Simulating the actual OS failure (disk full mid-write) isn't practical without an
+        // injectable filesystem seam, so this drives the same recovery path `append`/`finish`
+        // call on a real write/flush error. The contract under test: once the writer is known
+        // broken, `snapshot` must stop pointing callers at a file that's now silently truncated
+        // relative to what the command actually produced, and further writes must not panic or
+        // resurrect it.
+        let mut acc = OutputAccumulator::with_prefix("pi-bash");
+        let mut full = Vec::new();
+        for n in 0..300u32 {
+            let mut line = format!("chunk-{n:04}-").into_bytes();
+            line.resize(1023, b'x');
+            line.push(b'\n');
+            full.extend_from_slice(&line);
+            acc.append(&line);
+        }
+        assert!(acc.spilled, "test setup: expected auto-spill to have happened");
+        assert!(acc.temp_path.is_some());
+
+        acc.mark_spill_broken();
+
+        // Data after the break must not panic, and must not silently re-enable the path.
+        acc.append(b"more data after the writer broke\n");
+        acc.finish();
+        let snap = acc.snapshot(true);
+
+        assert!(
+            snap.full_output_path.is_none(),
+            "a broken spill file must not be advertised as the complete output"
+        );
+        assert!(acc.spill_failed);
     }
 
     #[test]

@@ -121,6 +121,7 @@ impl Tool for Read {
         let mut lineno = 0usize;
         let mut shown = 0usize;
         let mut truncated = false;
+        let mut has_invalid_utf8 = false;
         let mut line: Vec<u8> = Vec::new();
         loop {
             let (n, line_clipped) = read_line_capped(&mut reader, &mut line, MAX_LINE_BYTES)
@@ -141,7 +142,22 @@ impl Tool for Read {
             // `read_line_capped` already stripped the trailing `\n`; strip a `\r` too. A capped line
             // may end mid-codepoint, so decode lossily rather than erroring on the split byte.
             let kept = line.strip_suffix(b"\r").unwrap_or(&line);
-            let text = String::from_utf8_lossy(kept);
+            let text = match std::str::from_utf8(kept) {
+                Ok(s) => std::borrow::Cow::Borrowed(s),
+                Err(e) => {
+                    // A clipped line can legitimately end mid-codepoint — our own cap splitting a
+                    // multi-byte sequence, not a sign the file itself is non-UTF-8. Only treat it as
+                    // the latter when the invalid bytes start well before the end (more than one
+                    // UTF-8 sequence's worth), or the line wasn't clipped at all so there's no
+                    // cap-related excuse. `edit` requires strictly valid UTF-8 and will refuse a file
+                    // flagged here, so the model needs to know *why* if it later can't edit it.
+                    let split_by_our_clip = line_clipped && kept.len() - e.valid_up_to() <= 3;
+                    if !split_by_our_clip {
+                        has_invalid_utf8 = true;
+                    }
+                    String::from_utf8_lossy(kept)
+                }
+            };
             // Write straight into `out` instead of allocating a `format!` temp String per line — a
             // windowed read of a large file did one heap allocation for every line shown. `writeln!`
             // into a `String` can't fail, so the `Result` is discarded.
@@ -168,6 +184,13 @@ impl Tool for Read {
             out.push_str(&format!(
                 "… (showing lines {offset}-{last}; use offset={lineno} to continue)\n"
             ));
+        }
+        if has_invalid_utf8 {
+            out.push_str(
+                "… (this file contains bytes that are not valid UTF-8; the text above used lossy \
+                 replacement (\u{FFFD}) for them, so it may not match the file's real bytes, and \
+                 `edit` will refuse to touch this file until that's fixed)\n",
+            );
         }
         Ok(out.into())
     }
@@ -297,6 +320,46 @@ mod tests {
         assert!(out.contains("[line truncated]"));
         // The next line is read correctly as line 2 (overflow was drained, not mis-parsed).
         assert!(out.contains("     2\tnext"));
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_is_flagged_so_the_model_knows_edit_will_refuse_it() {
+        // `edit` requires strictly valid UTF-8 and errors on a file like this one; `read` must not
+        // silently lossy-decode it with no signal, or the model has no way to connect a later
+        // `edit` failure back to this file's actual problem.
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"good line\n\xff\xfe not valid utf-8\nlast\n").unwrap();
+        let out = Read
+            .run(json!({ "path": f.path().to_str().unwrap() }))
+            .await
+            .unwrap()
+            .text;
+        assert!(
+            out.contains("not valid UTF-8"),
+            "missing the invalid-UTF-8 note: {out}"
+        );
+        // The other, genuinely valid lines are still shown.
+        assert!(out.contains("good line"));
+        assert!(out.contains("last"));
+    }
+
+    #[tokio::test]
+    async fn a_clip_point_splitting_a_codepoint_is_not_flagged_as_invalid_utf8() {
+        // A pathologically long but otherwise perfectly valid UTF-8 line can have its cap land
+        // mid-codepoint — that's an artifact of our own truncation, not evidence the file itself is
+        // non-UTF-8, and must not trigger the same warning as genuinely invalid bytes.
+        let huge = "é".repeat(MAX_LINE_BYTES); // 2-byte UTF-8 char, so the byte cap can split one
+        let f = tmp_file(&format!("{huge}\n"));
+        let out = Read
+            .run(json!({ "path": f.path().to_str().unwrap() }))
+            .await
+            .unwrap()
+            .text;
+        assert!(out.contains("[line truncated]"));
+        assert!(
+            !out.contains("not valid UTF-8"),
+            "a clip-induced split codepoint must not be flagged as the file being invalid: {out}"
+        );
     }
 
     #[tokio::test]

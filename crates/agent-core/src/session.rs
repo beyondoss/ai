@@ -121,9 +121,14 @@ impl Session {
         self.reasoning_tokens += u64::from(usage.reasoning_tokens);
         // The whole prompt the model just saw = uncached input + everything served from / written to
         // cache. This is the current context size (the cumulative sums above can't express it) and is
-        // what the compaction trigger compares against the model's context window.
-        self.last_input_tokens =
-            usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens;
+        // what the compaction trigger compares against the model's context window. `saturating_add`,
+        // not `+`: these three fields come straight from parsed model-API usage data with no
+        // upper-bound validation (a non-standard proxy could report anomalously large values), and
+        // `overflow-checks = true` in the release profile turns a raw `u32` overflow into a panic.
+        self.last_input_tokens = usage
+            .input_tokens
+            .saturating_add(usage.cache_read_tokens)
+            .saturating_add(usage.cache_write_tokens);
     }
 }
 
@@ -188,5 +193,20 @@ mod tests {
         assert_eq!(back.reasoning_tokens, 4);
         // Live context size = last turn's input + cache read + cache write (3 + 200 + 0).
         assert_eq!(back.last_input_tokens, 203);
+    }
+
+    #[test]
+    fn record_usage_saturates_instead_of_panicking_on_u32_overflow() {
+        // A non-standard proxy/gateway reporting anomalously large usage fields must not crash a
+        // long-running `serve` session — `overflow-checks = true` in the release profile turns a raw
+        // `u32 + u32 + u32` overflow into a hard panic.
+        let mut s = Session::new();
+        s.record_usage(TokenUsage {
+            input_tokens: u32::MAX - 10,
+            cache_read_tokens: 100,
+            cache_write_tokens: 100,
+            ..Default::default()
+        });
+        assert_eq!(s.last_input_tokens, u32::MAX);
     }
 }

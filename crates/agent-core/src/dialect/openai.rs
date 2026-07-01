@@ -252,7 +252,18 @@ fn map_finish_reason(s: Option<&str>) -> StopReason {
         Some("stop") => StopReason::EndTurn,
         Some("tool_calls") | Some("function_call") => StopReason::ToolUse,
         Some("length") => StopReason::MaxTokens,
-        _ => StopReason::Other,
+        Some(other) => {
+            // A genuinely unrecognized value (a new finish_reason we don't know about yet) silently
+            // collapsing into `Other` — which the loop treats identically to a normal `EndTurn` —
+            // would hide a real change in provider behavior. `warn!` so it's at least visible,
+            // matching the Anthropic and OpenAI Responses dialects' equivalent handling.
+            tracing::warn!(
+                finish_reason = other,
+                "unrecognized OpenAI finish_reason; treating as Other"
+            );
+            StopReason::Other
+        }
+        None => StopReason::Other,
     }
 }
 

@@ -48,16 +48,70 @@ fn text_of(blocks: &[ContentBlock]) -> String {
 /// Combine a function call's `call_id` (pairs a `function_call_output` back to its call) and item
 /// `id` (pairs the call with a preceding `reasoning` item for OpenAI's own validation) into our
 /// internal `ToolUse.id`, so both survive round-tripping through the dialect-agnostic `ContentBlock`.
+/// Pack `call_id` and `item_id` into one id. `call_id` is API-generated (OpenAI's own opaque token
+/// format) and in practice never contains `|`, but nothing guarantees a non-standard
+/// OpenAI-compatible provider honors that — a naive join would let a `|` inside `call_id` corrupt
+/// *both* halves on the next `split_tool_id` (it finds the first `|`, so one embedded earlier than
+/// intended shifts the split point). Escaping each half first (`\` → `\\`, `|` → `\|`) makes the join
+/// round-trip correctly regardless of what either id contains; the common case, where neither needs
+/// escaping, costs nothing beyond the two no-op `contains` checks.
 fn combine_tool_id(call_id: &str, item_id: &str) -> String {
-    format!("{call_id}|{item_id}")
+    format!("{}|{}", escape_tool_id_part(call_id), escape_tool_id_part(item_id))
 }
 
-/// Split a combined id back into `(call_id, item_id)`. No `|` (a plain id from another dialect, or a
-/// call whose item id we chose not to capture) means there's no item id to replay.
-fn split_tool_id(id: &str) -> (&str, Option<&str>) {
-    match id.split_once('|') {
-        Some((call_id, item_id)) => (call_id, (!item_id.is_empty()).then_some(item_id)),
-        None => (id, None),
+fn escape_tool_id_part(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.contains(['\\', '|']) {
+        std::borrow::Cow::Owned(s.replace('\\', "\\\\").replace('|', "\\|"))
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
+}
+
+fn unescape_tool_id_part(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.contains('\\') {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                out.push(next);
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Find the first *unescaped* `|` in `s` — one not part of a `\|` (or preceded by a `\\` that already
+/// consumed the backslash before it) — and split there.
+fn split_on_unescaped_separator(s: &str) -> Option<(&str, &str)> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            // `combine_tool_id`'s escaping only ever produces `\\` or `\|`, both two ASCII bytes, so
+            // skipping two bytes here always lands back on a real boundary.
+            b'\\' if i + 1 < bytes.len() => i += 2,
+            b'|' => return Some((&s[..i], &s[i + 1..])),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Split a combined id back into `(call_id, item_id)`, unescaping each half. No unescaped `|` (a plain
+/// id from another dialect, or a call whose item id we chose not to capture) means there's no item id
+/// to replay.
+fn split_tool_id(id: &str) -> (std::borrow::Cow<'_, str>, Option<std::borrow::Cow<'_, str>>) {
+    match split_on_unescaped_separator(id) {
+        Some((call_id, item_id)) => (
+            unescape_tool_id_part(call_id),
+            (!item_id.is_empty()).then(|| unescape_tool_id_part(item_id)),
+        ),
+        None => (std::borrow::Cow::Borrowed(id), None),
     }
 }
 
@@ -910,5 +964,46 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
             .count();
         assert_eq!(tool_starts, 2);
         assert_eq!(stops, 2);
+    }
+
+    #[test]
+    fn combine_tool_id_round_trips_through_split() {
+        let combined = combine_tool_id("call_1", "fc_1");
+        let (call_id, item_id) = split_tool_id(&combined);
+        assert_eq!(call_id, "call_1");
+        assert_eq!(item_id.as_deref(), Some("fc_1"));
+    }
+
+    #[test]
+    fn combine_tool_id_round_trips_when_call_id_contains_the_separator() {
+        // A `|` (or `\`) inside `call_id` must not corrupt either half on the next `split_tool_id` —
+        // a naive join splits on the first `|`, wherever it happens to land.
+        let combined = combine_tool_id("call|evil", "fc_1");
+        let (call_id, item_id) = split_tool_id(&combined);
+        assert_eq!(call_id, "call|evil");
+        assert_eq!(item_id.as_deref(), Some("fc_1"));
+    }
+
+    #[test]
+    fn combine_tool_id_round_trips_when_item_id_contains_the_separator() {
+        let combined = combine_tool_id("call_1", "fc|1");
+        let (call_id, item_id) = split_tool_id(&combined);
+        assert_eq!(call_id, "call_1");
+        assert_eq!(item_id.as_deref(), Some("fc|1"));
+    }
+
+    #[test]
+    fn combine_tool_id_round_trips_when_either_half_contains_a_backslash() {
+        let combined = combine_tool_id(r"call\1", r"fc\|2");
+        let (call_id, item_id) = split_tool_id(&combined);
+        assert_eq!(call_id, r"call\1");
+        assert_eq!(item_id.as_deref(), Some(r"fc\|2"));
+    }
+
+    #[test]
+    fn split_tool_id_treats_a_plain_id_with_no_separator_as_call_id_only() {
+        let (call_id, item_id) = split_tool_id("call_1");
+        assert_eq!(call_id, "call_1");
+        assert_eq!(item_id, None);
     }
 }

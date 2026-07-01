@@ -17,12 +17,20 @@ workspace = true
 
 [dependencies]
 async-trait.workspace = true
+# Zero-copy byte buffer for SSE line framing: `BytesMut::split_to` hands a decoded line back as an
+# owned `Bytes` handle sharing the backing allocation — no per-line `Vec` alloc, no drain-from-front
+# memmove of the buffer remainder (which `Vec<u8>` framing pays on every line of a coalesced chunk).
+bytes.workspace = true
 futures.workspace = true
 futures-timer.workspace = true
-tokio-util.workspace = true
+# SIMD single-byte search for the SSE newline split — the framer's inner scan runs once per streamed
+# line (the crate's highest-frequency operation). `memchr` vectorizes it; already in the build graph
+# (reqwest/tokio pull it), so this adds nothing to compile time.
+memchr = "2"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 
 # The default model transport (`client::GatewayClient`) speaks HTTP to the gateway. `async-stream`
@@ -39,4 +47,29 @@ httpdate = "1"
 [dev-dependencies]
 # Async test runtime for the `Tool`/loop tests. The library itself is runtime-agnostic — it pulls in
 # no executor, only the `futures` stream traits — so the runtime lives in dev-deps.
+# Bench harness for the streaming decode hot path. `divan` (the workspace's `bench:unit` pin, matching
+# gateway/agent) measures **allocations** natively via its `AllocProfiler` global allocator alongside
+# timing — so the per-SSE-event allocation cost the decode findings target is visible, not inferred.
+divan = "0.1"
+# Control allocator for the decode concurrency probe: swapping glibc malloc for a sharded, low-
+# contention allocator is the decisive test for whether the decode bend is allocator-lock contention
+# (flattens the curve) or CPU-side SMT/turbo/bandwidth (doesn't). Gated behind `bench-mimalloc` so the
+# default build/bench stays on the production system allocator; only the control run opts in.
+mimalloc = "0.1"
 tokio.workspace = true
+
+[features]
+# Install mimalloc as the global allocator in `decode_concurrent` — the allocator-contention control
+# run: `cargo bench -p beyond-ai-agent-core --bench decode_concurrent --features bench-mimalloc`.
+bench-mimalloc = []
+
+[[bench]]
+name = "decode"
+harness = false
+
+# Concurrency-scaling probe for the decode path (allocator-contention evidence gate). A separate
+# target because it must run on the *plain* system allocator — divan's `AllocProfiler` (in the sibling
+# `decode` bench) adds global atomic counters that would manufacture the contention it measures.
+[[bench]]
+name = "decode_concurrent"
+harness = false

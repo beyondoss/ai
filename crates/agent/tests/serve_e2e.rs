@@ -8,7 +8,7 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
 
 use common::{spawn_model_server, turn_text, turn_tool_use};
@@ -440,6 +440,85 @@ fn serve_abort_cancels_an_in_flight_prompt() {
 
     drop(stdin);
     child.wait().unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn serve_exits_gracefully_on_sigterm_mid_run() {
+    use std::time::{Duration, Instant};
+
+    // A SIGTERM (what `systemctl restart`/`docker stop`/a pod eviction sends) mid-run must be
+    // treated like `abort`/stdin-closing: cancel the in-flight turn, persist what's there, and exit
+    // on its own — not Rust's default disposition of immediate termination with no destructors run,
+    // which would orphan the sleeping child process and lose the turn's unpersisted messages.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir
+        .path()
+        .join("session.json")
+        .to_string_lossy()
+        .into_owned();
+
+    let turn1 = turn_tool_use(
+        "toolu_b",
+        "bash",
+        &json!({ "command": "sleep 30" }).to_string(),
+    );
+    let (base, _bodies) = spawn_model_server(vec![turn1]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let pid = child.id();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "run a long sleep" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+
+    // Give the run time to reach the tool before signaling, so this exercises the mid-run
+    // cancellation path (the harder one) rather than racing the idle-between-commands one.
+    std::thread::sleep(Duration::from_millis(500));
+
+    let status = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success(), "failed to send SIGTERM to serve");
+
+    // Must exit on its own well under the 30s sleep the in-flight tool call was running — not need
+    // a hard `child.kill()` to reap it.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let exit = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "serve did not exit within 10s of SIGTERM"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        exit.success(),
+        "serve should exit cleanly on SIGTERM, got {exit:?}"
+    );
+
+    // The stdout writer flushes on shutdown; whatever is left in the pipe just needs to not panic
+    // when drained, not match any particular frame.
+    let mut trailing = String::new();
+    let _ = stdout.read_to_string(&mut trailing);
+
+    // What was persisted before the cancel (at least the user's turn) must be a valid, non-empty,
+    // readable session file — not lost by the abrupt-looking exit.
+    let contents = std::fs::read_to_string(&session_file).unwrap();
+    assert!(
+        !contents.trim().is_empty(),
+        "nothing was persisted before SIGTERM shutdown"
+    );
 }
 
 /// Extract every persisted message's `id` field, in file order, by parsing the session file's raw

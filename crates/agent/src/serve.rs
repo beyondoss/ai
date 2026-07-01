@@ -105,6 +105,76 @@ pub struct ServeConfig {
     pub bash_timeout_ms: Option<u64>,
 }
 
+/// Waits for an OS shutdown request (SIGTERM, or SIGINT/Ctrl-C) so `serve` can drain in-flight work
+/// and persist before exiting — the same graceful-shutdown path stdin closing already takes (cancel
+/// the run, persist, break), just with the process's terminate signal as a second trigger. Without
+/// this, a `systemctl restart`/`docker stop`/pod eviction mid-turn hits Rust's default disposition —
+/// immediate termination, no destructors run — losing that turn's unpersisted messages and orphaning
+/// any backgrounded child process `exec`'s `kill_on_drop` cleanup depends on `Drop` running to reap.
+struct ShutdownSignal {
+    #[cfg(unix)]
+    sigterm: tokio::signal::unix::Signal,
+}
+
+impl ShutdownSignal {
+    fn new() -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            Ok(Self {
+                sigterm: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {})
+        }
+    }
+
+    /// Resolves once a shutdown signal arrives. Safe to call fresh on every loop iteration — both
+    /// `Signal::recv` and `tokio::signal::ctrl_c` are re-armable, not one-shot.
+    async fn wait(&mut self) {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = self.sigterm.recv() => {}
+                _ = tokio::signal::ctrl_c() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
+}
+
+/// Runs [`Persistence::persist`]'s blocking file I/O (`sync_all`, directory `fsync`) on tokio's
+/// blocking thread pool instead of `serve`'s single async control-loop task. `persist` runs after
+/// every turn (and every manual `compact`), so on a slow or network-backed session directory, a
+/// multi-ms-to-100ms `sync_all` would otherwise stall that task directly — delaying its stdin
+/// `select!` loop, and so `abort`/`steer` responsiveness, for the duration. `persistence` and `session`
+/// are moved in and handed back so the caller can keep using them (`Session` is cheap to clone: its
+/// `messages` field is an `Arc`, so this is a pointer clone, not a deep copy of the transcript).
+async fn persist_blocking(
+    mut persistence: Persistence,
+    session: Session,
+    compacted: bool,
+) -> Persistence {
+    // `persist` never panics itself (it handles its own I/O errors internally), and this task is
+    // never cancelled (always awaited directly, never `.abort()`ed) — so a `JoinError` here can only
+    // mean the closure panicked. Re-raise that panic rather than `.expect()`ing (denied by the
+    // workspace's panic-surface lints) on what would otherwise look like an ordinary recoverable
+    // error.
+    match tokio::task::spawn_blocking(move || {
+        persistence.persist(&session, compacted);
+        persistence
+    })
+    .await
+    {
+        Ok(persistence) => persistence,
+        Err(e) => std::panic::resume_unwind(e.into_panic()),
+    }
+}
+
 /// Where the server persists sessions: a multi-session [`SessionRepo`] (`--session-dir`), a single
 /// JSONL file (`--session-file`), or nowhere (in-memory). It always carries the current session's
 /// [`SessionMeta`] so the session id is stable across reattaches.
@@ -242,7 +312,13 @@ impl Persistence {
     fn list(&self) -> Vec<SessionMeta> {
         self.repo
             .as_ref()
-            .and_then(|r| r.list().ok())
+            .and_then(|r| match r.list() {
+                Ok(sessions) => Some(sessions),
+                Err(e) => {
+                    eprintln!("serve: failed to list sessions: {e}");
+                    None
+                }
+            })
             .unwrap_or_default()
     }
 
@@ -439,7 +515,18 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    while let Some(line) = lines.next_line().await? {
+    let mut shutdown = ShutdownSignal::new()?;
+    loop {
+        let line = tokio::select! {
+            biased;
+            // Idle between commands: nothing is in flight, so a shutdown request needs no drain —
+            // just stop reading and fall out to the writer join below.
+            () = shutdown.wait() => break,
+            maybe_line = lines.next_line() => match maybe_line? {
+                Some(l) => l,
+                None => break,
+            },
+        };
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -529,6 +616,13 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                         tokio::select! {
                             biased;
                             r = &mut run => break r,
+                            // A shutdown request mid-run gets the same treatment as stdin closing:
+                            // cancel and let the run unwind so the code below can persist before we
+                            // fall out of the outer loop (`!stdin_open` breaks it, further down).
+                            () = shutdown.wait() => {
+                                stdin_open = false;
+                                cancel.cancel();
+                            }
                             maybe_line = lines.next_line(), if stdin_open => match maybe_line {
                                 Ok(Some(l)) => {
                                     let l = l.trim();
@@ -582,7 +676,9 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
 
-                persistence.persist(&session, compacted.load(Ordering::Relaxed));
+                persistence =
+                    persist_blocking(persistence, session.clone(), compacted.load(Ordering::Relaxed))
+                        .await;
                 let frame = match result {
                     Ok(()) => response(
                         id.clone(),
@@ -745,7 +841,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     .await;
                 match result {
                     Ok(did) => {
-                        persistence.persist(&session, did);
+                        persistence = persist_blocking(persistence, session.clone(), did).await;
                         emit!(response(
                             id,
                             "compact",

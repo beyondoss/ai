@@ -285,10 +285,14 @@ impl SessionStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)?;
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&path)?;
         write_line(&mut f, &Entry::Session(meta.clone()))?;
         // Durability: get the header bytes (and the new file's directory entry) onto stable storage
         // before returning, so a crash right after `create` can't lose the session entirely.
@@ -319,10 +323,23 @@ impl SessionStore {
         let mut tip: Option<String> = None;
         let mut next_synth: u64 = 0;
 
-        for line in BufReader::new(file).lines() {
-            // A torn write makes `lines()` yield an `Err` (or a partial line that won't parse); either
-            // way we stop at the first unreadable line — only the last entry can be lost.
-            let Ok(line) = line else { break };
+        let mut reader = BufReader::new(file);
+        let mut raw = Vec::new();
+        loop {
+            // A torn write, invalid UTF-8, or a line over `MAX_LINE_BYTES` (a corrupted length
+            // delimiter, concatenated lines) all get the same lenient treatment: stop reading, keep
+            // whatever was valid so far — only the last entry can be lost.
+            let oversized = match read_capped_line(&mut reader, &mut raw) {
+                Ok(None) => break,
+                Ok(Some(oversized)) => oversized,
+                Err(_) => break,
+            };
+            if oversized {
+                break;
+            }
+            let Ok(line) = std::str::from_utf8(&raw) else {
+                break;
+            };
             let line = line.trim();
             if line.is_empty() {
                 continue;
@@ -502,7 +519,7 @@ impl SessionStore {
         }
 
         let tmp = self.path.with_extension("jsonl.tmp");
-        let mut f = File::create(&tmp)?;
+        let mut f = create_private(&tmp)?;
         write_line(&mut f, &Entry::Session(self.meta.clone()))?;
         for (id, node) in preserved.iter().chain(new_nodes.iter()) {
             write_line(
@@ -677,7 +694,7 @@ impl SessionStore {
         };
 
         let tmp = self.path.with_extension("jsonl.tmp");
-        let mut f = File::create(&tmp)?;
+        let mut f = create_private(&tmp)?;
         write_line(&mut f, &Entry::Session(self.meta.clone()))?;
         // Off-active-path nodes first (order doesn't matter — they're not the tip)...
         let active_set: HashSet<&str> = self.active.iter().map(String::as_str).collect();
@@ -940,6 +957,65 @@ fn mtime_secs(path: &Path) -> u64 {
 /// fsync a path's parent directory so a just-created or just-renamed entry in it is itself durable
 /// (a file `sync_all` persists contents, not the dentry that names them). A best-effort no-op if the
 /// path has no parent.
+/// Ceiling on one session-file line (one JSON entry) while loading. A legitimate entry — even one
+/// carrying a large embedded payload (a big base64 image in a message) — stays orders of magnitude
+/// under this; it exists to bound how much a corrupted or hand-edited file (a stray length delimiter,
+/// concatenated lines) can make [`SessionStore::open`] allocate before the line is treated as
+/// unreadable, the same recovery path already used for a torn write.
+const MAX_LINE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Read one `\n`-terminated line from `reader` into `buf` (cleared first, bytes only — the caller
+/// validates UTF-8), via `fill_buf`/`consume` so a pathologically long or unterminated line is
+/// processed in bounded chunks rather than by growing an unbounded `String` one byte at a time, the
+/// way [`BufReader::lines`] would. `buf` never grows past [`MAX_LINE_BYTES`]; bytes beyond the cap are
+/// still consumed from `reader` (so it lands correctly on the next line) but discarded, and the
+/// returned flag reports whether that happened. `Ok(None)` at EOF with no more lines.
+fn read_capped_line(reader: &mut impl BufRead, buf: &mut Vec<u8>) -> std::io::Result<Option<bool>> {
+    buf.clear();
+    let mut total = 0usize;
+    let mut saw_any_byte = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            break;
+        }
+        saw_any_byte = true;
+        let (chunk, hit_newline) = match available.iter().position(|&b| b == b'\n') {
+            Some(pos) => (&available[..pos], true),
+            None => (available, false),
+        };
+        total += chunk.len();
+        let room = MAX_LINE_BYTES.saturating_sub(buf.len());
+        let take = chunk.len().min(room);
+        buf.extend_from_slice(&chunk[..take]);
+        let consumed = if hit_newline { chunk.len() + 1 } else { chunk.len() };
+        reader.consume(consumed);
+        if hit_newline {
+            break;
+        }
+    }
+    if !saw_any_byte {
+        return Ok(None);
+    }
+    Ok(Some(total > MAX_LINE_BYTES))
+}
+
+/// Create (or truncate) `path` for exclusive access: `0600` on Unix, set atomically at creation
+/// rather than via a `set_permissions` call afterward (which would leave a window where the file is
+/// world/group-readable). Session files carry the full transcript — including whatever `read` has
+/// pulled off disk — so they should never be readable by anyone but the owner, independent of the
+/// process umask.
+fn create_private(path: &Path) -> std::io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
 fn fsync_dir(path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         // Opening the directory read-only and `sync_all`ing it flushes its updated entries. Linux/macOS
@@ -1020,6 +1096,37 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn session_files_are_created_private_and_stay_private_through_rewrite() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo
+            .create(SessionMeta::new("/work", "claude-test"))
+            .unwrap();
+
+        let mode_of =
+            |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        // Transcripts carry whatever `read` pulled off disk — never group/world-readable, on a
+        // shared host in particular, regardless of the process umask.
+        assert_eq!(mode_of(&store.path), 0o600, "create() must set 0600 atomically");
+
+        let mut session = Session::new();
+        session.user("a");
+        session.user("b");
+        store.append_new(&session.messages).unwrap();
+        assert_eq!(mode_of(&store.path), 0o600, "append must not loosen permissions");
+
+        store.rewrite(&[Message::user("summary")]).unwrap();
+        assert_eq!(
+            mode_of(&store.path),
+            0o600,
+            "rewrite's temp-file-then-rename must not loosen permissions"
+        );
+    }
+
+    #[test]
     fn append_new_batches_many_new_messages_in_one_call() {
         // Regression guard for the buffered-write fix: a multi-message batch (not the usual
         // one-or-two-at-a-time turn) must still land every line, in order, with the cursor advanced
@@ -1051,6 +1158,60 @@ mod tests {
         store.append_new(&session.messages).unwrap();
         let (_store, restored) = repo.open_id(&id).unwrap();
         assert_eq!(restored.messages.len(), 51);
+    }
+
+    #[test]
+    fn read_capped_line_bounds_allocation_and_flags_oversized_lines() {
+        use std::io::Cursor;
+
+        // A line beyond the cap must not grow `buf` past it, must still land the reader on the next
+        // line (not lose sync), and must be flagged so `SessionStore::open` can treat it like a torn
+        // write — a corrupted length delimiter or concatenated lines shouldn't be able to make `open`
+        // allocate without bound.
+        let mut input = vec![b'x'; MAX_LINE_BYTES + 10];
+        input.push(b'\n');
+        input.extend_from_slice(b"next\n");
+        let mut reader = BufReader::new(Cursor::new(input));
+
+        let mut buf = Vec::new();
+        let oversized = read_capped_line(&mut reader, &mut buf).unwrap();
+        assert_eq!(oversized, Some(true));
+        assert_eq!(buf.len(), MAX_LINE_BYTES, "buf must not grow past the cap");
+
+        let oversized = read_capped_line(&mut reader, &mut buf).unwrap();
+        assert_eq!(oversized, Some(false));
+        assert_eq!(buf, b"next");
+
+        assert_eq!(read_capped_line(&mut reader, &mut buf).unwrap(), None);
+    }
+
+    #[test]
+    fn oversized_line_is_recovered_like_a_torn_write() {
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo
+            .create(SessionMeta::new("/work", "claude-test"))
+            .unwrap();
+        let id = store.meta().id.clone();
+        let mut session = Session::new();
+        session.user("first");
+        store.append_new(&session.messages).unwrap();
+
+        // A pathologically long line (well past MAX_LINE_BYTES) — the on-disk analogue of a
+        // corrupted length delimiter or concatenated lines — must not be allocated in full; `open`
+        // treats it as unreadable, the same as a torn write.
+        let path = repo.find_path(&id).unwrap();
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        write!(f, "\"").unwrap();
+        for _ in 0..(MAX_LINE_BYTES / 1024 + 10) {
+            write!(f, "{}", "x".repeat(1024)).unwrap();
+        }
+        writeln!(f, "\"").unwrap();
+        drop(f);
+
+        let (_store, restored) = repo.open_id(&id).unwrap();
+        // The intact first message survives; the oversized record is dropped.
+        assert_eq!(restored.messages.len(), 1);
     }
 
     #[test]
@@ -1522,6 +1683,15 @@ mod tests {
         );
         assert!(raw.contains("recap of the abandoned branch"));
         assert!(raw.contains(&abandoned_tip));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&reopened.path).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "record_branch_summary's temp-file-then-rename must not loosen permissions"
+            );
+        }
     }
 
     #[test]

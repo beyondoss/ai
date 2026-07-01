@@ -236,8 +236,11 @@ fn expand_brace(inner: &str, args: &[String], all: &str) -> String {
             return String::new();
         };
         let slice: &[String] = match len_str.and_then(parse_usize) {
+            // `start`/`len` are parsed straight from a `${@:N:L}` placeholder in a project's own
+            // `.claude/prompts/*.md` file — untrusted repo content. `saturating_add` so a
+            // pathological `N` near `usize::MAX` can't overflow before `.min()` clamps it.
             Some(len) => args
-                .get(start..(start + len).min(args.len()))
+                .get(start..start.saturating_add(len).min(args.len()))
                 .unwrap_or(&[]),
             None => args.get(start..).unwrap_or(&[]),
         };
@@ -365,6 +368,15 @@ mod tests {
         let t = template("rest=[${@:2}] two=[${@:2:2}]");
         let expanded = expand_if_slash("/x a b c d e", &[t]);
         assert_eq!(expanded, "rest=[b c d e] two=[b c]");
+    }
+
+    #[test]
+    fn array_slice_with_huge_length_does_not_panic() {
+        // A `.claude/prompts/*.md` file is untrusted repo content — a pathological `L` near
+        // `usize::MAX` must not overflow `start + len` before `.min(args.len())` clamps it.
+        let t = template("slice=[${@:1:18446744073709551615}]");
+        let expanded = expand_if_slash("/x a b c", &[t]);
+        assert_eq!(expanded, "slice=[a b c]");
     }
 
     #[test]

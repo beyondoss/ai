@@ -552,3 +552,226 @@ fn smoke_openai_responses_reasoning_replays_signature() {
         );
     }
 }
+
+/// OpenAI-compatible **Chat Completions** dialect (`dialect::openai`), live. This is the wire shape
+/// *every third-party OpenAI-compatible provider* speaks (Groq, DeepSeek, OpenRouter, Together,
+/// Cerebras, xAI, Fireworks, Mistral) — but the two shared-suite providers never touch it: a native
+/// OpenAI id like `gpt-4o-mini` routes through `/v1/responses` (Responses dialect), and Claude routes
+/// through `/v1/messages`. `ChatCompletions` is only the fallback for an *unrecognized* id (see
+/// `Dialect::for_model` / `models::ApiKind`), so without a dedicated test the entire dialect — its
+/// `build_body` and SSE decoder — has zero live coverage, and a broken decoder here would silently
+/// break every non-Anthropic, non-native-OpenAI provider in production.
+///
+/// `gpt-3.5-turbo` is the lever that needs no new key: it matches no prefix branch in
+/// `models::capabilities`, so it falls to `ApiKind::ChatCompletions` by construction, yet it's still a
+/// live, callable model on OpenAI's real `/v1/chat/completions` — the existing `OPENAI_API_KEY`
+/// exercises the third-party wire shape against a real endpoint.
+#[test]
+#[ignore = "live provider smoke; run via `mise run test:smoke:agent` with OPENAI_API_KEY set"]
+fn smoke_chat_completions_dialect_tool_round_trip() {
+    use agent_core::dialect::Dialect;
+
+    let Some(_key) = env_key("OPENAI_API_KEY") else {
+        eprintln!("smoke[chat-completions]: OPENAI_API_KEY unset — skipping");
+        return;
+    };
+    // Guard the premise: if a future capability-table change routes this id elsewhere, this test
+    // would silently stop covering the ChatCompletions wire — fail loudly instead.
+    assert_eq!(
+        Dialect::for_model("gpt-3.5-turbo"),
+        Dialect::OpenAi,
+        "gpt-3.5-turbo must route through the Chat Completions dialect for this test to cover it"
+    );
+
+    // A one-off provider profile that forces the ChatCompletions dialect while reusing the OpenAI
+    // pool key (a native OpenAI id would take the Responses path instead).
+    let provider = Provider {
+        name: "openai-chat-completions",
+        env: "OPENAI_API_KEY",
+        pool: "openai",
+        model: "gpt-3.5-turbo",
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let token = "KUMQUAT-3157";
+    std::fs::write(dir.path().join("marker.txt"), format!("{token}\n")).unwrap();
+
+    let output = run_oneshot(
+        &provider,
+        dir.path(),
+        "Use the read tool to read the file marker.txt in the current directory, then reply with ONLY the exact token it contains.",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("--- [chat-completions] stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
+    assert!(
+        output.status.success(),
+        "chat-completions dialect tool round-trip failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains(token),
+        "the ChatCompletions decoder should have driven a real tool call and echoed `{token}`.\nstdout: {stdout}"
+    );
+}
+
+/// Auto-compaction actually fires against a **real** model. Compaction is the single largest section
+/// of `agent-core/ARCHITECTURE.md`, yet every one of its unit tests uses `MockTransport` — so the real
+/// "cross the threshold → one model call summarizes the prefix → splice a summary in → the next real
+/// request is accepted" round-trip has no live proof. The `serve` compaction flags exist precisely to
+/// make this cheap to force: pinning a tiny `--context-window` drives the *proactive* trigger (the
+/// model's own 200k window still applies on the wire, so nothing 400s — only our local threshold
+/// fires). We drive a few real tool-call turns and assert a `Compacted` event was emitted.
+///
+/// Anthropic-only by construction (uses `claude-haiku-4-5`), but compaction lives in `agent_core`
+/// above the dialect, so proving it on one provider proves the mechanism.
+#[test]
+#[ignore = "live provider smoke; run via `mise run test:smoke:agent` with ANTHROPIC_API_KEY set"]
+fn smoke_auto_compaction_fires_live() {
+    let Some(key) = env_key("ANTHROPIC_API_KEY") else {
+        eprintln!("smoke[compaction]: ANTHROPIC_API_KEY unset — skipping");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("marker.txt"), "PINEAPPLE-7493\n").unwrap();
+    let (gw_port, mut gateway) = boot_gateway(dir.path(), "anthropic", &key);
+
+    // A tiny window with almost no reserve/keep-recent: the system prompt + tool schemas alone push
+    // `last_input_tokens` past `context_window - reserve` after the first real turn, so the *next*
+    // turn compacts its prefix. The model's real window is untouched, so no request 400s.
+    let mut child = serve_child(
+        gw_port,
+        dir.path(),
+        "claude-haiku-4-5",
+        &[
+            "--context-window",
+            "2000",
+            "--compaction-reserve-tokens",
+            "200",
+            "--compaction-keep-recent-tokens",
+            "200",
+        ],
+    );
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    // Drive several turns; scan every frame across all of them for a `compacted` event. Turn 1 writes
+    // the prefix; a later turn crosses the threshold at its start and compacts.
+    let mut saw_compaction = false;
+    let mut all_frames: Vec<Value> = Vec::new();
+    for prompt in [
+        "Use the read tool to read marker.txt in the current directory, then reply with ONLY the token it contains.",
+        "Use the read tool to read marker.txt again, then reply with ONLY the token.",
+        "Read marker.txt one more time with the read tool and reply with ONLY the token.",
+    ] {
+        writeln!(stdin, "{}", json!({ "type": "prompt", "message": prompt })).unwrap();
+        stdin.flush().unwrap();
+        let frames = read_until_response(&mut stdout, "prompt");
+        if frames
+            .iter()
+            .any(|f| f["type"] == "event" && f["event"]["kind"] == "compacted")
+        {
+            saw_compaction = true;
+        }
+        all_frames.extend(frames);
+        if saw_compaction {
+            break;
+        }
+    }
+    drop(stdin);
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    let _ = child.wait();
+
+    let compacted_events: Vec<&Value> = all_frames
+        .iter()
+        .filter(|f| f["type"] == "event" && f["event"]["kind"] == "compacted")
+        .collect();
+    eprintln!("--- compaction events ---\n{compacted_events:?}");
+    assert!(
+        saw_compaction,
+        "auto-compaction should have fired against the real model with a pinned tiny context window \
+         — no `Compacted` event was seen across the driven turns"
+    );
+    // It fired via the auto-*threshold* trigger (not an overflow-retry or a manual `compact`), it
+    // recorded a real pre-compaction context size, and it never *grew* the history. (Note: the count
+    // needn't strictly shrink — compaction replaces the summarized prefix with one summary message, so
+    // when `find_cut` picks a minimal 1-message boundary on a short conversation the count is
+    // unchanged; the load-bearing proof is that the threshold trigger engaged against a live model.)
+    let ev = &compacted_events[0]["event"];
+    assert_eq!(
+        ev["reason"], "threshold",
+        "the live trigger must be the proactive threshold, not overflow/manual: {ev}"
+    );
+    let tokens_before = ev["tokens_before"].as_u64().unwrap_or(0);
+    assert!(
+        tokens_before > 0,
+        "compaction should record the real pre-compaction context size: {ev}"
+    );
+    let before = ev["messages_before"].as_u64().unwrap_or(0);
+    let after = ev["messages_after"].as_u64().unwrap_or(u64::MAX);
+    assert!(
+        after <= before,
+        "compaction must never grow the history (before={before}, after={after}): {ev}"
+    );
+}
+
+/// `Error::MaxSteps` is reached against a **real** model, and `run` surfaces it as a non-zero exit —
+/// the documented failure mode when the model never stops requesting tools. Pinning `--max-steps 1`
+/// against a prompt that inherently needs a tool call *plus* a final answer (≥2 steps) forces the
+/// ceiling: turn 1 runs the tool (steps=1), the loop check `steps >= max_steps` then bails with
+/// `Error::MaxSteps` before a second request. Proves the ceiling actually stops a live run rather than
+/// looping forever, and that the error propagates to the process exit code.
+#[test]
+#[ignore = "live provider smoke; run via `mise run test:smoke:agent` with a provider key set"]
+fn smoke_max_steps_halts_a_live_run() {
+    let providers = available();
+    if providers.is_empty() {
+        eprintln!("smoke[max-steps]: no provider key set — skipping");
+        return;
+    }
+    for p in providers {
+        let key = env_key(p.env).expect("provider key present");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("marker.txt"), "PINEAPPLE-7493\n").unwrap();
+        let (gw_port, mut gateway) = boot_gateway(dir.path(), p.pool, &key);
+
+        let output = Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+            .args([
+                "run",
+                "Use the read tool to read marker.txt in the current directory, then reply with ONLY the token it contains.",
+                "--gateway-url",
+                &format!("http://127.0.0.1:{gw_port}"),
+                "--key",
+                DEV_TOKEN,
+                "--model",
+                p.model,
+                "--max-steps",
+                "1",
+            ])
+            .current_dir(dir.path())
+            .output()
+            .expect("spawn agent");
+        let _ = gateway.kill();
+        let _ = gateway.wait();
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!(
+            "--- [{}] max-steps stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+            p.name
+        );
+        assert!(
+            !output.status.success(),
+            "[{}] a run pinned to --max-steps 1 on a tool-requiring prompt must exit non-zero.\nstdout: {stdout}\nstderr: {stderr}",
+            p.name
+        );
+        // `main` returns the error, so the runtime prints its `Debug` form (`MaxSteps(1)`), not the
+        // `Display` string — accept either shape so a future switch to `Display` doesn't break this.
+        let low = stderr.to_lowercase();
+        assert!(
+            low.contains("maxsteps") || low.contains("max steps"),
+            "[{}] the failure should be the step ceiling (Error::MaxSteps).\nstderr: {stderr}",
+            p.name
+        );
+    }
+}

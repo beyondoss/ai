@@ -204,12 +204,18 @@ appends.
 
 ### SSE byte framing
 
-`GatewayClient::stream` buffers raw `Vec<u8>`, not a per-chunk lossy-decoded `String`. A TCP/HTTP chunk
-boundary can land inside a multi-byte UTF-8 character; `from_utf8_lossy` per chunk would replace each
-half with `U+FFFD`, silently corrupting non-ASCII tool arguments or prose. Since `\n` (0x0A) never
-appears inside a UTF-8 multi-byte sequence, every newline-terminated line is guaranteed whole UTF-8 —
-only the unterminated tail is buffered across chunks (`client.rs:83-113`). Verified against a real
-socket that splits a write inside a 4-byte emoji (`tests/client_socket.rs`).
+`GatewayClient::stream` frames the chunked body through `LineFramer`, which buffers raw *bytes* (a
+`BytesMut`), not a per-chunk lossy-decoded `String`. A TCP/HTTP chunk boundary can land inside a
+multi-byte UTF-8 character; `from_utf8_lossy` per chunk would replace each half with `U+FFFD`, silently
+corrupting non-ASCII tool arguments or prose. Since `\n` (0x0A) never appears inside a UTF-8 multi-byte
+sequence, every newline-terminated line is guaranteed whole UTF-8 — only the unterminated tail is
+buffered across chunks. The newline is found with SIMD `memchr` and the line handed back via
+`BytesMut::split_to` — an O(1) pointer split sharing the backing allocation, so a line costs neither a
+per-line heap allocation nor a memmove of the buffer remainder (a `Vec<u8>` framer paid both on every
+line — O(lines × remaining bytes) when a burst coalesces many `data:` lines into one read). Verified
+against a real socket that splits a write inside a 4-byte emoji (`tests/client_socket.rs`), and benched
+in `benches/decode.rs` (framing is ~4× faster on coalesced chunks: ~2 allocations/turn vs ~2,500).
+`LineFramer` is `pub` so the framing hot path is benchable in isolation.
 
 ## State Machine
 

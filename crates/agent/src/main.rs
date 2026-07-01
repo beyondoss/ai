@@ -237,6 +237,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 bash_timeout_ms,
             })
             .await?;
+            // `serve` reads stdin via `tokio::io::stdin()`, which parks a dedicated blocking OS
+            // thread doing a blocking read for the life of the process. If stdin is never closed
+            // (a client that doesn't hang up, or — the case this matters for — a SIGTERM/SIGINT
+            // whose handler cancels the run and returns without stdin ever reaching EOF), that
+            // thread is still parked here even though all async work is done. Falling through to
+            // `#[tokio::main]`'s implicit runtime shutdown would then hang indefinitely: dropping
+            // a `Runtime` waits for every outstanding blocking task, and a parked stdin read never
+            // completes on its own. Exit explicitly instead — `serve` has already drained,
+            // persisted, and flushed everything before returning, so there's nothing left to lose.
+            std::process::exit(0);
         }
         Command::Tools => {
             let reg = tools::default_registry();

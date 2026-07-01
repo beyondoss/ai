@@ -105,6 +105,15 @@ impl RealRunner {
             (status, out, err)
         };
         match tokio::time::timeout(timeout, collect).await {
+            // Lossy on purpose, not by oversight: `bash` (this crate's primary consumer) never reads
+            // these two fields for real output — its `run_streaming` sink appends every chunk to its
+            // `OutputAccumulator` as raw bytes as they arrive (see `bash.rs`'s `sink` closure), and
+            // only falls back to `stdout`/`stderr` here when nothing streamed (a non-streaming test
+            // double). The live path this struct actually feeds for `bash` never goes through
+            // `from_utf8_lossy`. The Beyond platform tools (`fork`/`sync`/`logs`, `beyond.rs`) *do*
+            // consume these fields directly as their whole output — but that's the `beyond` CLI's own
+            // stdout/stderr, expected to be human-readable text, not arbitrary binary data the way a
+            // `bash`-run command's output can be.
             Ok((status, (stdout, out_trunc), (stderr, err_trunc))) => Ok(ExecResult {
                 code: status?.code(),
                 stdout: String::from_utf8_lossy(&stdout).into_owned(),
@@ -246,11 +255,22 @@ impl Capture {
 /// this free of `unsafe`/`libc`, which the workspace forbids.
 #[cfg(unix)]
 async fn kill_process_group(pgid: u32) {
-    let _ = tokio::process::Command::new("kill")
+    match tokio::process::Command::new("kill")
         .arg("-KILL")
         .arg(format!("-{pgid}"))
         .status()
-        .await;
+        .await
+    {
+        // `kill`'s own exit code (e.g. ESRCH because the group already exited on its own between
+        // the timeout firing and this running) isn't worth logging — only a failure to even run it.
+        Ok(_) => {}
+        Err(e) => {
+            // If `kill` itself couldn't run (missing binary, restrictive sandboxing), a backgrounded
+            // grandchild from the timed-out command may be left running with nothing else to reap
+            // it — surface that instead of silently losing the signal.
+            tracing::warn!(pgid, error = %e, "failed to run `kill` to reap a timed-out process group");
+        }
+    }
 }
 
 #[cfg(all(test, unix))]

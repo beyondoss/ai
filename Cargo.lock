@@ -392,9 +392,13 @@ version = "0.1.0"
 dependencies = [
  "async-stream",
  "async-trait",
+ "bytes",
+ "divan",
  "futures",
  "futures-timer",
  "httpdate",
+ "memchr",
+ "mimalloc",
  "reqwest",
  "serde",
  "serde_json",

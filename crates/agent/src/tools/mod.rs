@@ -24,15 +24,44 @@ pub mod write;
 /// sibling (same directory) so the rename stays on one filesystem. A bare `std::fs::write` truncates
 /// in place and would leave a partial file if the process died between truncation and the last byte.
 ///
+/// The temp file's name carries an unpredictable suffix ([`temp_suffix`]) and is opened with
+/// `create_new` rather than plain `create`: a deterministic `.foo.tmp` name would let anything able to
+/// plant a symlink in the same directory (another tool call, a prior turn) redirect this write to an
+/// arbitrary path — plant `.foo.tmp -> ~/.ssh/authorized_keys`, then wait for a `write`/`edit` on
+/// `foo`. `create_new` refuses to open through an existing path (including a symlink) instead of
+/// following it, closing that TOCTOU window.
+///
+/// If `path` already exists, the temp file is created with its permission bits rather than the process
+/// umask default — `rename(2)` swaps the whole directory entry, mode included, so a freshly-created
+/// temp file would otherwise silently downgrade e.g. a `chmod 600` file to world-readable on every
+/// edit.
+///
 /// Shared by `write` and `edit`: both replace whole files and must not leave a corrupt intermediate
 /// state that a later read (or `serve` reattach) would observe.
 pub(crate) fn write_atomic(path: &str, content: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
     let p = std::path::Path::new(path);
-    let tmp = match p.file_name() {
-        Some(name) => p.with_file_name(format!(".{}.tmp", name.to_string_lossy())),
+    let name = match p.file_name() {
+        Some(name) => name,
         None => return Err(std::io::Error::other(format!("invalid path: {path}"))),
     };
-    std::fs::write(&tmp, content)?;
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        if let Ok(meta) = std::fs::metadata(p) {
+            opts.mode(meta.permissions().mode());
+        }
+    }
+
+    let tmp = p.with_file_name(format!(".{}.tmp.{}", name.to_string_lossy(), temp_suffix()));
+    let mut f = opts.open(&tmp)?;
+    f.write_all(content)?;
+    drop(f);
+
     match std::fs::rename(&tmp, p) {
         Ok(()) => Ok(()),
         Err(e) => {
@@ -40,6 +69,23 @@ pub(crate) fn write_atomic(path: &str, content: &[u8]) -> std::io::Result<()> {
             Err(e)
         }
     }
+}
+
+/// An unpredictable per-call suffix for [`write_atomic`]'s temp file name, so it can't be preplanted
+/// under a symlink before the call happens. Same salt-plus-counter construction as
+/// `session_store::new_id`: `RandomState` draws OS entropy once per process, and a monotonic counter
+/// keeps same-process calls distinct — no need for a `rand`/`uuid` dependency just for this.
+fn temp_suffix() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::BuildHasher;
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SALT: OnceLock<u64> = OnceLock::new();
+    let salt = *SALT.get_or_init(|| RandomState::new().hash_one(0xA70A1Cu64));
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{salt:x}{seq:x}")
 }
 
 /// Canonicalize a path for use as a same-file grouping key (`Tool::write_target`): two same-turn calls
@@ -121,15 +167,60 @@ mod tests {
         assert!(write_atomic(target.to_str().unwrap(), b"new content").is_err());
 
         // The sibling temp file must not survive a failed rename — `write_atomic` removes it
-        // explicitly on the failure path rather than leaving litter behind.
-        let temps: Vec<_> = std::fs::read_dir(dir.path())
+        // explicitly on the failure path rather than leaving litter behind. `target` (the directory)
+        // should be the only entry left.
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
             .collect();
-        assert!(temps.is_empty(), "failed rename left a temp file behind");
+        assert_eq!(
+            entries.len(),
+            1,
+            "failed rename left extra files behind: {:?}",
+            entries
+                .iter()
+                .map(|e| e.file_name())
+                .collect::<Vec<_>>()
+        );
         // The original target is untouched by the failed write.
         assert!(target.is_dir());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_atomic_does_not_follow_a_symlink_planted_at_the_old_deterministic_temp_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("secret.txt");
+        std::fs::write(&target, b"original").unwrap();
+
+        // Simulate a symlink preplanted at the old, guessable `.{name}.tmp` path, pointing
+        // somewhere the write must never reach.
+        let decoy = dir.path().join("decoy-target");
+        let planted = dir.path().join(".secret.txt.tmp");
+        std::os::unix::fs::symlink(&decoy, &planted).unwrap();
+
+        write_atomic(target.to_str().unwrap(), b"new content").unwrap();
+
+        assert!(!decoy.exists(), "write_atomic followed the planted symlink");
+        assert_eq!(std::fs::read_link(&planted).unwrap(), decoy);
+        assert_eq!(std::fs::read(&target).unwrap(), b"new content");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_atomic_preserves_existing_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("secret.env");
+        std::fs::write(&target, b"SECRET=1").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_atomic(target.to_str().unwrap(), b"SECRET=2").unwrap();
+
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "write_atomic silently changed the file's permissions");
+        assert_eq!(std::fs::read(&target).unwrap(), b"SECRET=2");
     }
 
     #[test]
