@@ -21,7 +21,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use agent_core::Tool;
-use beyond_ai_agent::tools::{edit, find, grep, read};
+use beyond_ai_agent::tools::{edit, find, grep, ls, read};
 use divan::Bencher;
 use globset::Glob;
 use tempfile::TempDir;
@@ -164,6 +164,37 @@ fn edit_normalize(bencher: Bencher) {
     bencher.bench_local(|| {
         let (norm, map) = edit::normalize_with_map(&src);
         black_box((norm.len(), map.len()));
+    });
+}
+
+/// A directory of 500 subdirectories, for the `ls` bench — directory entries are exactly where the old
+/// `format!("{name}/")` allocated a second String per entry (and dropped the first).
+fn dir_of_subdirs() -> &'static PathBuf {
+    static D: OnceLock<(TempDir, PathBuf)> = OnceLock::new();
+    &D.get_or_init(|| {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..500 {
+            std::fs::create_dir(dir.path().join(format!("subdir_{i:04}"))).unwrap();
+        }
+        let root = dir.path().to_path_buf();
+        (dir, root)
+    })
+    .1
+}
+
+/// `ls` of a directory of subdirectories: builds + sorts the entry list. On-thread, so alloc counting
+/// is exact. Watch the alloc count across the `format!` → in-place suffix change.
+#[divan::bench]
+fn ls_dir(bencher: Bencher) {
+    let path = dir_of_subdirs().to_str().unwrap().to_string();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    bencher.bench_local(|| {
+        let out = rt
+            .block_on(ls::Ls.run(serde_json::json!({ "path": path, "limit": 1000 })))
+            .unwrap();
+        black_box(out.text.len());
     });
 }
 

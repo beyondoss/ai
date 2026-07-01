@@ -46,12 +46,20 @@ impl Tool for Ls {
             std::fs::read_dir(path).map_err(|e| ToolError::Execution(format!("ls {path}: {e}")))?;
         for entry in dir {
             let entry = entry.map_err(|e| ToolError::Execution(e.to_string()))?;
-            let name = entry.file_name().to_string_lossy().into_owned();
+            let fname = entry.file_name();
+            let name = fname.to_string_lossy();
             if !all && name.starts_with('.') {
                 continue;
             }
             let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            entries.push(if is_dir { format!("{name}/") } else { name });
+            // Build the display name once, with room for the trailing `/`, so a directory entry doesn't
+            // allocate a second String (the old `format!("{name}/")` dropped the first).
+            let mut display = String::with_capacity(name.len() + usize::from(is_dir));
+            display.push_str(&name);
+            if is_dir {
+                display.push('/');
+            }
+            entries.push(display);
         }
         // Directories first, then alphabetical — stable, predictable output for the model.
         entries.sort_by(|a, b| {
