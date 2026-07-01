@@ -3,7 +3,10 @@
 //! Each session is one newline-delimited JSON file: a header line carrying [`SessionMeta`] (stable id,
 //! cwd, model, timestamps, optional title and `parent` lineage), then one line per conversation
 //! message. A turn **appends** its new messages — O(new), not O(transcript) — and a torn final line
-//! (a crash mid-append) is dropped on load, so at most the last entry is lost.
+//! (a crash mid-append) is dropped on load, so at most the last entry is lost. More generally, any
+//! single line that fails to deserialize — not only the last one — is skipped rather than truncating
+//! the scan: reading resumes with whatever comes after it, since a fully-read line's boundaries are
+//! already known regardless of whether its *contents* parse.
 //!
 //! **Tree-shaped history.** Every message entry carries an `id` and a `parent_id`, so a session's
 //! history is a tree, not just a line — the "active path" (what `Session.messages` holds) is the
@@ -95,7 +98,7 @@ pub struct SessionMeta {
     pub dropped_messages: u64,
     /// Branch-summarization provenance (Track L2), the same counter shape as `compactions`/
     /// `dropped_messages` above but for abandoned-branch summaries instead of compaction rounds: how
-    /// many times [`SessionStore::record_branch_summary`] has run on this session. Defaults to 0.
+    /// many times [`SessionStore::switch_active_with_summary`] has run on this session. Defaults to 0.
     #[serde(default)]
     pub branch_summaries: u32,
     /// Total messages folded into those branch summaries — the branch-summary analog of
@@ -125,9 +128,21 @@ pub struct SessionMeta {
 impl SessionMeta {
     /// Fresh metadata with a generated id and the current timestamp.
     pub fn new(cwd: impl Into<String>, model: impl Into<String>) -> Self {
+        Self::with_id(new_id(), cwd, model)
+    }
+
+    /// Fresh metadata with a caller-supplied id, for a client that wants a deterministic session id
+    /// rather than the generated one. No collision check here: [`SessionStore::create`]'s
+    /// `create_new(true)` already fails loudly (`AlreadyExists`) if the id's derived path already
+    /// exists, rather than silently clobbering another session.
+    pub fn with_id(
+        id: impl Into<String>,
+        cwd: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
         Self {
             version: VERSION,
-            id: new_id(),
+            id: id.into(),
             created_at: now_secs(),
             cwd: cwd.into(),
             model: model.into(),
@@ -173,16 +188,40 @@ enum Entry {
         target_id: String,
     },
     /// An LLM-generated recap of an abandoned branch (Track L2), persisted when navigating away from
-    /// it — see [`SessionStore::record_branch_summary`]. `from_id` is the abandoned branch's old tip
-    /// (what was summarized); `id`/`parent_id` chain like every other entry, but a `BranchSummary` is
-    /// inert for tip resolution (`SessionStore::open` doesn't treat it as a navigation event — the
-    /// tree's active tip is unaffected by recording a summary of some *other* branch).
+    /// it — see [`SessionStore::switch_active_with_summary`]. `from_id` is the abandoned branch's old
+    /// tip (what was summarized); `parent_id` is the branch point being *returned to* — `id`/`parent_id`
+    /// chain like every other entry, and `SessionStore::open` treats this one as a real navigation
+    /// event too: it becomes the new active tip, materialized into a message so the recap actually
+    /// reaches the model, not just a provenance record sitting inert on disk.
     BranchSummary {
         id: String,
         parent_id: Option<String>,
         summary: String,
         from_id: String,
         details: BranchSummaryDetails,
+    },
+    /// Provenance for a compaction round — see [`SessionStore::rewrite_compacted`]. Unlike
+    /// [`Entry::BranchSummary`], this is purely a provenance record: the folded messages named in
+    /// `folded_ids` are preserved verbatim elsewhere in the file (never deleted), so `summary` here
+    /// would duplicate content that's already live as an ordinary `Message` entry right after this
+    /// one — this entry exists so a reader can tell *that* a compaction happened here, and exactly
+    /// what it folded, without needing to diff two versions of the file. `id`/`parent_id` chain like
+    /// every other entry (`parent_id` is the last folded message's id) but this is inert for tip
+    /// resolution, same as a `BranchSummary` used to be before it started redirecting the tip — this
+    /// one never should, since the very next entry (the new active-path message) already does that.
+    Compaction {
+        id: String,
+        parent_id: Option<String>,
+        /// Estimated input tokens at the moment this compaction fired (before the reset) — the same
+        /// value carried on `agent_core::AgentEvent::Compacted`.
+        tokens_before: u32,
+        /// Ids of every message this round folded away (the old active path's dropped prefix),
+        /// oldest-first. Still readable elsewhere in this file by these ids — not deleted.
+        folded_ids: Vec<String>,
+        /// The generated summary text (without its `SUMMARY_MARKER` wrapper) — duplicated from the
+        /// neighboring `Message` entry purely so this record is self-describing without needing to
+        /// cross-reference it.
+        summary: String,
     },
 }
 
@@ -199,6 +238,14 @@ pub struct BranchSummaryDetails {
     /// `SessionMeta::summarized_branch_messages` accumulates.
     #[serde(default)]
     pub summarized_messages: u64,
+}
+
+/// Provenance passed to [`SessionStore::rewrite_compacted`], recorded on the new [`Entry::Compaction`]
+/// line alongside what that method derives on its own (`folded_ids`, `summary`).
+pub struct CompactionMeta {
+    /// Estimated input tokens at the moment this compaction fired (before the reset) — the same value
+    /// carried on `agent_core::AgentEvent::Compacted`.
+    pub tokens_before: u32,
 }
 
 /// One branch in the session's tree, as reported by [`SessionStore::list_branches`] — a leaf (a node
@@ -224,6 +271,31 @@ pub struct BranchInfo {
 struct Node {
     parent_id: Option<String>,
     message: Message,
+}
+
+/// One node in the session's tree, as reported by [`SessionStore::tree`] — every message (not just the
+/// active path, and not just a branch's leaf like [`BranchInfo`]), with its own parent link, role, and
+/// a short preview of its own text content.
+#[derive(Debug, Clone, Serialize)]
+pub struct TreeNode {
+    pub id: String,
+    /// `None` at the tree's root.
+    pub parent_id: Option<String>,
+    pub role: Role,
+    /// A preview of this message's own text content, or `None` for a pure tool-use/tool-result/
+    /// thinking/image turn with no plain-text block.
+    pub preview: Option<String>,
+}
+
+/// Turn a persisted branch summary's text into the message that materializes at the tip of the branch
+/// being returned to — how the recap actually reaches the model on the next turn, mirroring
+/// `agent_core::compaction`'s `SUMMARY_MARKER`-prefixed user message for the same purpose.
+fn branch_summary_message(summary: &str) -> Message {
+    Message::user(format!(
+        "{}\n\n{}",
+        agent_core::BRANCH_SUMMARY_MARKER,
+        summary
+    ))
 }
 
 /// Walk `nodes`' parent chain from `tip` back to the root, returning ids root-first. `tip = None` (an
@@ -277,6 +349,13 @@ pub struct SessionStore {
     /// wholesale (a fresh linear chain) while preserving every id NOT in it (see the module doc's
     /// compaction-vs-branching section).
     active: Vec<String>,
+    /// [`BranchSummaryDetails`] for every [`Entry::BranchSummary`] seen, by that entry's own id — a
+    /// `Node`'s materialized message keeps only the prose recap, not this structured file-tracking data,
+    /// so a later branch summary that itself abandons a range containing an earlier one needs this index
+    /// to fold that earlier summary's `read_files`/`modified_files` forward (see
+    /// [`Self::branch_summary_details_within`]) rather than losing them once the prose-only message is
+    /// all that's left to scan.
+    branch_summary_details: HashMap<String, BranchSummaryDetails>,
 }
 
 impl SessionStore {
@@ -305,6 +384,7 @@ impl SessionStore {
             persisted: 0,
             nodes: HashMap::new(),
             active: Vec::new(),
+            branch_summary_details: HashMap::new(),
         })
     }
 
@@ -322,23 +402,29 @@ impl SessionStore {
         // to that latest message, not stay pinned at the leaf's target).
         let mut tip: Option<String> = None;
         let mut next_synth: u64 = 0;
+        let mut branch_summary_details: HashMap<String, BranchSummaryDetails> = HashMap::new();
 
         let mut reader = BufReader::new(file);
         let mut raw = Vec::new();
         loop {
-            // A torn write, invalid UTF-8, or a line over `MAX_LINE_BYTES` (a corrupted length
-            // delimiter, concatenated lines) all get the same lenient treatment: stop reading, keep
-            // whatever was valid so far — only the last entry can be lost.
+            // A genuine I/O read failure stops the load, keeping whatever was valid so far (only the
+            // in-flight entry can be lost). An oversized or invalid-UTF-8 *line*, though, is a fully
+            // read, boundary-known line, exactly like the deserialize-failure case below — skip just
+            // that one and keep scanning, rather than discarding every good entry after it (which used
+            // to happen here: a single bit-rotted or hand-edited line anywhere in the file silently
+            // truncated the whole session).
             let oversized = match read_capped_line(&mut reader, &mut raw) {
                 Ok(None) => break,
                 Ok(Some(oversized)) => oversized,
                 Err(_) => break,
             };
             if oversized {
-                break;
+                tracing::warn!(path = %path.display(), "skipping oversized session entry line");
+                continue;
             }
             let Ok(line) = std::str::from_utf8(&raw) else {
-                break;
+                tracing::warn!(path = %path.display(), "skipping non-UTF-8 session entry line");
+                continue;
             };
             let line = line.trim();
             if line.is_empty() {
@@ -373,11 +459,39 @@ impl SessionStore {
                     tip = Some(id);
                 }
                 Ok(Entry::Leaf { target_id, .. }) => tip = Some(target_id),
-                // A branch summary doesn't navigate anything — the tip is unaffected by recording a
-                // recap of some *other*, already-abandoned branch.
-                Ok(Entry::BranchSummary { .. }) => {}
-                // Unparseable (torn) line — stop; nothing valid follows a half-written record.
-                Err(_) => break,
+                // A branch summary *does* become the new tip — it's a child of the branch point being
+                // returned to (see `switch_active_with_summary`), materialized into a real message so
+                // the recap actually reaches the model on the next turn, not just sitting on disk.
+                Ok(Entry::BranchSummary {
+                    id,
+                    parent_id,
+                    summary,
+                    details,
+                    ..
+                }) => {
+                    nodes.insert(
+                        id.clone(),
+                        Node {
+                            parent_id,
+                            message: branch_summary_message(&summary),
+                        },
+                    );
+                    branch_summary_details.insert(id.clone(), details);
+                    tip = Some(id);
+                }
+                // Purely a provenance record (see `Entry::Compaction`'s doc comment) — the very next
+                // entry in the file is the real, live message this compaction produced, so this one
+                // must never itself move the tip.
+                Ok(Entry::Compaction { .. }) => {}
+                // A line that read fully (valid UTF-8, under the size cap) but failed to deserialize as
+                // an `Entry` — a bad line *other* than a torn final write (disk bit rot, a manual edit,
+                // a future `Entry` variant an older binary doesn't know about yet). Unlike the
+                // read-level failures above (where we can't be sure where the next line even begins),
+                // we already have this line's exact boundaries, so skip just this one and keep reading:
+                // a single bad line no longer discards every good entry that follows it.
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "skipping unparseable session entry line");
+                }
             }
         }
         let meta = meta.ok_or_else(|| {
@@ -401,6 +515,7 @@ impl SessionStore {
                 persisted,
                 nodes,
                 active,
+                branch_summary_details,
             },
             session,
         ))
@@ -546,6 +661,123 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Like [`rewrite`](Self::rewrite), but for the compaction case specifically: the folded-away
+    /// prefix is **preserved** on disk (by its original ids, still readable, listed in the new
+    /// [`Entry::Compaction`] record's `folded_ids`) instead of being deleted — a compaction round
+    /// becomes fully non-destructive and auditable, not just an aggregate-counter summary of what was
+    /// lost. It becomes an inert, self-contained sub-chain off to the side (structurally the same as
+    /// an abandoned branch), *not* reconnected to the new active path — `path_from_root` walks a
+    /// whole parent chain to build the live session, so linking the two would resurrect every folded
+    /// message back into the "active" transcript, undoing the compaction. `meta.tokens_before` is
+    /// recorded alongside the new entry (the same value carried on `agent_core::AgentEvent::Compacted`).
+    ///
+    /// **O(1) append, not O(total preserved size)**: unlike a plain [`rewrite`](Self::rewrite) (which
+    /// genuinely replaces the active path and so must be a full atomic swap), a compaction never touches
+    /// anything already on disk — the folded prefix and every other branch are already durable exactly
+    /// where they are, untouched. So this only ever *appends* the new entries (an updated header, the
+    /// provenance record, the new active-path messages), the same append-only write `append_new` already
+    /// does. A prior version of this method re-wrote the *entire* file (every preserved node) on every
+    /// single call — since preserved content only ever grows, each subsequent compaction rewrote more
+    /// bytes than the last, a compounding cost over a long session's lifetime that this avoids entirely.
+    /// Crash-safety: if the process dies mid-append, the reader's existing torn/partial-line recovery
+    /// (see [`Self::open`]) applies exactly as it already does to an interrupted [`append_new`] — and
+    /// since `tip` only moves once the new active-path messages are actually read back, a compaction cut
+    /// short mid-write simply doesn't take effect (the old tip, and everything it points to, is
+    /// completely unaffected by an `Entry::Compaction` record with no messages after it yet).
+    ///
+    /// `messages` is the new active-path list — by construction (this is only ever called from the
+    /// compaction path, right after `agent_core::compaction::apply_summary`) always exactly one
+    /// summary message followed by the kept suffix verbatim. That invariant is what lets this method
+    /// recover *which* original messages were folded purely from lengths, with no extra parameter:
+    /// `old_persisted - (messages.len() - 1)` is the net shrinkage (one summary message took every
+    /// folded message's place), so `+ 1` recovers the true folded count.
+    pub fn rewrite_compacted(
+        &mut self,
+        messages: &[Message],
+        meta: CompactionMeta,
+    ) -> std::io::Result<()> {
+        let dropped = self.persisted.saturating_sub(messages.len());
+        if dropped == 0 {
+            // Nothing was actually folded (a degenerate one-message-in-one-message-out round) — no
+            // `Entry::Compaction` provenance is meaningful, so fall back to a plain rewrite.
+            return self.rewrite(messages);
+        }
+        self.meta.compactions = self.meta.compactions.saturating_add(1);
+        self.meta.dropped_messages = self.meta.dropped_messages.saturating_add(dropped as u64);
+
+        let folded_count = dropped.saturating_add(1).min(self.active.len());
+        let folded_ids: Vec<String> = self.active[..folded_count].to_vec();
+
+        let mut new_nodes: Vec<(String, Node)> = Vec::with_capacity(messages.len());
+        // The new active path starts a fresh, detached chain (`parent: None`), exactly like a plain
+        // `rewrite` — *not* chained onto the last folded message. `path_from_root` walks a tip's whole
+        // parent chain to build the live session, so linking back into the folded prefix would just
+        // resurrect every folded message into the "active" transcript, defeating the point of
+        // compacting them away. The folded prefix stays exactly where it already was on disk — its own
+        // self-contained sub-chain, reachable by id and named in `folded_ids` below, structurally off
+        // to the side, the same way an abandoned branch already is.
+        let mut parent: Option<String> = None;
+        for m in messages {
+            let id = new_id();
+            new_nodes.push((
+                id.clone(),
+                Node {
+                    parent_id: parent.clone(),
+                    message: m.clone(),
+                },
+            ));
+            parent = Some(id);
+        }
+        let new_active: Vec<String> = new_nodes.iter().map(|(id, _)| id.clone()).collect();
+
+        // The summary text without its `SUMMARY_MARKER` wrapper, for the provenance record — reuses
+        // `agent_core`'s own parser rather than re-deriving the same prefix-stripping logic here.
+        let summary = messages
+            .first()
+            .and_then(|m| {
+                agent_core::compaction::previous_summary(std::slice::from_ref(m))
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        let compaction_entry = Entry::Compaction {
+            id: new_id(),
+            parent_id: folded_ids.last().cloned(),
+            tokens_before: meta.tokens_before,
+            folded_ids,
+            summary,
+        };
+
+        // An updated header snapshot (the new `compactions`/`dropped_messages` counters) first, then the
+        // provenance record, then the new active path itself — `open`'s replay takes the *last*
+        // `Entry::Session` line as the header (so appending a fresh one updates it in place) and treats
+        // `Entry::Compaction` as inert for tip purposes, so "the last message in the file" still
+        // resolves to the true tip with no `Leaf` marker needed.
+        let mut buf = Vec::new();
+        write_line(&mut buf, &Entry::Session(self.meta.clone()))?;
+        write_line(&mut buf, &compaction_entry)?;
+        for (id, node) in &new_nodes {
+            write_line(
+                &mut buf,
+                &Entry::Message {
+                    id: Some(id.clone()),
+                    parent_id: node.parent_id.clone(),
+                    message: node.message.clone(),
+                },
+            )?;
+        }
+        let mut f = OpenOptions::new().append(true).open(&self.path)?;
+        f.write_all(&buf)?;
+        // The parent dir is unchanged on an append (same inode, same dentry) — no directory fsync
+        // needed, exactly like `append_new`.
+        f.flush()?;
+        f.sync_all()?;
+
+        self.nodes.extend(new_nodes);
+        self.active = new_active;
+        self.persisted = messages.len();
+        Ok(())
+    }
+
     /// The messages that would become unreachable from the active tip if it switched to `target_id`
     /// right now — the suffix of the *current* active path after its deepest ancestor shared with
     /// `target_id`. Covers every case uniformly: `target_id` off the active path entirely (a sibling
@@ -559,8 +791,10 @@ impl SessionStore {
     /// What a caller (Track L3's `switch_branch` RPC handler) feeds to
     /// `agent_core::branch_summary_request` *before* actually calling [`Self::switch_active`] — the
     /// messages would otherwise already be gone from `self.active` by the time anything could
-    /// summarize them.
-    pub fn abandoned_by_switch(&self, target_id: &str) -> Vec<Message> {
+    /// summarize them. Paired with each message's own id so a caller can also fold forward any nested
+    /// branch summary's file-tracking via [`Self::branch_summary_details_within`] — a plain `Message`
+    /// alone doesn't carry that structured data (see [`Entry::BranchSummary`]'s doc comment).
+    pub fn abandoned_by_switch(&self, target_id: &str) -> Vec<(String, Message)> {
         let target_path = path_from_root(&self.nodes, Some(target_id));
         // A valid id's own path always includes at least itself; empty means `target_id` is unknown.
         if target_path.is_empty() {
@@ -576,8 +810,35 @@ impl SessionStore {
         let from = common_idx.map_or(0, |i| i + 1);
         self.active[from..]
             .iter()
-            .map(|id| self.nodes[id].message.clone())
+            .map(|id| (id.clone(), self.nodes[id].message.clone()))
             .collect()
+    }
+
+    /// Fold forward the `read_files`/`modified_files` of any [`Entry::BranchSummary`] whose id appears
+    /// in `ids` (e.g. an [`Self::abandoned_by_switch`] range) — pi's own branch-summarization pass over
+    /// nested detours: navigating *into* an abandoned branch via an earlier branch summary, then
+    /// abandoning that branch too, would otherwise lose the earlier summary's file awareness the moment
+    /// its prose-only materialized message is all that's left to scan (`extract_file_ops` only
+    /// recognizes `read`/`write`/`edit` tool calls, not a summary's own metadata). Deduplicated and
+    /// order-preserving, same as [`crate::compaction`]'s own file-op merging.
+    pub fn branch_summary_details_within(&self, ids: &[String]) -> BranchSummaryDetails {
+        let mut merged = BranchSummaryDetails::default();
+        for id in ids {
+            let Some(details) = self.branch_summary_details.get(id) else {
+                continue;
+            };
+            for f in &details.read_files {
+                if !merged.read_files.contains(f) {
+                    merged.read_files.push(f.clone());
+                }
+            }
+            for f in &details.modified_files {
+                if !merged.modified_files.contains(f) {
+                    merged.modified_files.push(f.clone());
+                }
+            }
+        }
+        merged
     }
 
     /// Every branch in the tree: one entry per leaf (a node with no children) *plus* the active tip
@@ -626,6 +887,25 @@ impl SessionStore {
         branches
     }
 
+    /// Every node in the session's tree — every message on every branch, not just the active path
+    /// [`BranchInfo`]/[`Self::list_branches`] surfaces only the leaves of. The `nodes` map already spans
+    /// the whole file, so this is a single pass over it with no new indexing. Order is by id, for
+    /// stable/deterministic client rendering.
+    pub fn tree(&self) -> Vec<TreeNode> {
+        let mut nodes: Vec<TreeNode> = self
+            .nodes
+            .iter()
+            .map(|(id, node)| TreeNode {
+                id: id.clone(),
+                parent_id: node.parent_id.clone(),
+                role: node.message.role,
+                preview: message_text_preview(&node.message),
+            })
+            .collect();
+        nodes.sort_by(|a, b| a.id.cmp(&b.id));
+        nodes
+    }
+
     /// Switch the active branch to the message `target_id` — anywhere in the tree, on or off the
     /// current active path — persisting a `Leaf` marker so a later `open()` resolves the new tip.
     /// Returns the branch's materialized messages (root through `target_id`, root-first); the caller
@@ -661,77 +941,89 @@ impl SessionStore {
         Ok(messages)
     }
 
-    /// Persist a branch summary — an LLM-generated recap of the branch abandoned by navigating to
-    /// `from_id`'s replacement (Track L3's branch-navigation RPC handler generates `summary` via
-    /// `agent_core::branch_summary_request` and calls this to record it; this method only persists the
-    /// result, it doesn't call the model itself — same network-free/storage split as compaction).
+    /// Switch to `target_id` *and* record a branch summary — an LLM-generated recap of the branch
+    /// abandoned by navigating to `target_id` (Track L3's branch-navigation RPC handler generates
+    /// `summary` via `agent_core::branch_summary_request` and calls this to record and apply it; this
+    /// method only persists/applies the result, it doesn't call the model itself — same
+    /// network-free/storage split as compaction).
     ///
-    /// Rewrites the whole file: every existing node (the active path *and* every other branch) is
-    /// preserved verbatim — a branch-summary event never touches conversation content — with the new
-    /// entry appended last. Unlike `append_new`/`switch_active`'s plain append, this needs a full
-    /// rewrite because it's the only way to durably update the header's `branch_summaries`/
-    /// `summarized_branch_messages` counters in the same atomic operation as the new entry, so the two
-    /// can never drift out of sync even across a crash between them — the same reasoning `set_title`
-    /// already applies to a rare, non-hot-path header change.
-    pub fn record_branch_summary(
+    /// Unlike a plain [`switch_active`](Self::switch_active), the summary becomes part of the *new*
+    /// active path: it's attached as a child of `target_id` and installed as the new tip, so it
+    /// actually reaches the model on the next turn (the recap the summary was meant to preserve),
+    /// rather than sitting on disk unreferenced by anything live. A later, unrelated
+    /// `switch_active(target_id)` — no new abandonment — bypasses it (writes a plain `Leaf` straight
+    /// to `target_id`); a second detour-and-return produces a sibling summary entry, not a duplicate.
+    ///
+    /// **O(1) append, not O(total tree size)**: the new entry's `parent_id` points at `target_id`,
+    /// already durable on disk wherever it was originally written — tree structure is id-based, not
+    /// file-position-based (see the module doc comment), so nothing that already exists needs to be
+    /// touched, let alone rewritten. This only ever *appends* an updated header snapshot (so the new
+    /// `branch_summaries`/`summarized_branch_messages` counters land in the same batch as the entry that
+    /// caused them, never drifting out of sync even across a crash between them) and the
+    /// [`Entry::BranchSummary`] record itself — the same append-only write [`Self::append_new`] already
+    /// does. A prior version of this method rewrote the *entire* file (every node, every branch) on
+    /// every call; since preserved content only ever grows, that cost compounded across a session's
+    /// life the same way [`Self::rewrite_compacted`]'s equivalent rewrite used to (see its doc comment).
+    pub fn switch_active_with_summary(
         &mut self,
+        target_id: &str,
         summary: impl Into<String>,
         from_id: impl Into<String>,
         details: BranchSummaryDetails,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<Vec<Message>> {
+        if !self.nodes.contains_key(target_id) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no message with id {target_id} in this session"),
+            ));
+        }
         self.meta.branch_summaries = self.meta.branch_summaries.saturating_add(1);
         self.meta.summarized_branch_messages = self
             .meta
             .summarized_branch_messages
             .saturating_add(details.summarized_messages);
 
+        let summary = summary.into();
+        let entry_id = new_id();
+        let details_for_index = details.clone();
         let entry = Entry::BranchSummary {
-            id: new_id(),
-            parent_id: self.active.last().cloned(),
-            summary: summary.into(),
+            id: entry_id.clone(),
+            parent_id: Some(target_id.to_string()),
+            summary: summary.clone(),
             from_id: from_id.into(),
             details,
         };
 
-        let tmp = self.path.with_extension("jsonl.tmp");
-        let mut f = create_private(&tmp)?;
-        write_line(&mut f, &Entry::Session(self.meta.clone()))?;
-        // Off-active-path nodes first (order doesn't matter — they're not the tip)...
-        let active_set: HashSet<&str> = self.active.iter().map(String::as_str).collect();
-        for (id, node) in self
-            .nodes
-            .iter()
-            .filter(|(id, _)| !active_set.contains(id.as_str()))
-        {
-            write_line(
-                &mut f,
-                &Entry::Message {
-                    id: Some(id.clone()),
-                    parent_id: node.parent_id.clone(),
-                    message: node.message.clone(),
-                },
-            )?;
-        }
-        // ...then the active path itself, in root-to-tip order, so "the last `Message` entry in the
-        // file" still resolves to the true tip with no `Leaf` marker needed — the summary entry after
-        // it is inert for tip purposes (see `open`'s match).
-        for id in &self.active {
-            let node = &self.nodes[id];
-            write_line(
-                &mut f,
-                &Entry::Message {
-                    id: Some(id.clone()),
-                    parent_id: node.parent_id.clone(),
-                    message: node.message.clone(),
-                },
-            )?;
-        }
-        write_line(&mut f, &entry)?;
+        // The updated header first (so a fresh `open()`'s last-`Entry::Session`-wins replay picks it
+        // up), then the summary entry — which becomes the new tip both on that fresh `open()` (the last
+        // tip-setting entry in the file wins) and in this process's own in-memory state, updated below.
+        let mut buf = Vec::new();
+        write_line(&mut buf, &Entry::Session(self.meta.clone()))?;
+        write_line(&mut buf, &entry)?;
+        let mut f = OpenOptions::new().append(true).open(&self.path)?;
+        f.write_all(&buf)?;
+        // The parent dir is unchanged on an append (same inode, same dentry) — no directory fsync
+        // needed, exactly like `append_new`.
         f.flush()?;
         f.sync_all()?;
-        fs::rename(&tmp, &self.path)?;
-        fsync_dir(&self.path)?;
-        Ok(())
+
+        self.nodes.insert(
+            entry_id.clone(),
+            Node {
+                parent_id: Some(target_id.to_string()),
+                message: branch_summary_message(&summary),
+            },
+        );
+        self.branch_summary_details
+            .insert(entry_id.clone(), details_for_index);
+        self.active = path_from_root(&self.nodes, Some(&entry_id));
+        let messages: Vec<Message> = self
+            .active
+            .iter()
+            .map(|id| self.nodes[id].message.clone())
+            .collect();
+        self.persisted = messages.len();
+        Ok(messages)
     }
 
     /// Set (and persist) the session title. The title lives in the header so the repo listing can read
@@ -757,6 +1049,43 @@ impl SessionRepo {
         let dir = dir.into();
         fs::create_dir_all(&dir)?;
         Ok(Self { dir })
+    }
+
+    /// The directory this repo is rooted at.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// List every session across every project's own repo directory — each immediate subdirectory of
+    /// `sessions_root` is treated as one project's [`SessionRepo`] (the convention `serve`'s default
+    /// session directory follows: `<sessions_root>/<encoded-cwd>/`). Unlike [`Self::list`], which is
+    /// scoped to one project, this is pi's cross-project `listAll`: each session's own `cwd` field
+    /// (recorded at creation) already identifies which project it belongs to, so callers don't need the
+    /// subdirectory name itself. A missing root is an empty list, not an error (nothing has ever been
+    /// persisted there yet); a subdirectory that isn't a valid repo, or can't be read, contributes
+    /// nothing rather than failing the whole scan — the same per-entry skip semantics [`Self::list`]
+    /// already applies one level down, one level up.
+    pub fn list_all(sessions_root: &Path) -> std::io::Result<Vec<SessionMeta>> {
+        let entries = match fs::read_dir(sessions_root) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let mut metas = Vec::new();
+        for entry in entries {
+            let Ok(entry) = entry else { continue };
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if let Ok(repo) = SessionRepo::open(&path) {
+                if let Ok(mut project_metas) = repo.list() {
+                    metas.append(&mut project_metas);
+                }
+            }
+        }
+        metas.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(metas)
     }
 
     fn path_for(&self, meta: &SessionMeta) -> PathBuf {
@@ -797,10 +1126,25 @@ impl SessionRepo {
 
     /// Delete a session by id. Idempotent per the repo invariant "check before destroy; don't error if
     /// it's gone": deleting an absent (or already-deleted) session is a successful no-op.
+    ///
+    /// Prefers a soft delete: moves the file into a `.trash` subdirectory rather than removing it
+    /// outright, so a session deleted by mistake is still recoverable. `.trash` is itself a directory
+    /// (no `.jsonl` extension), so [`Self::list`]'s flat, extension-filtered scan already excludes it
+    /// with no further filtering needed. Falls back to a hard delete if the trash directory can't be
+    /// created or the move fails for any reason (a read-only filesystem, a cross-device rename) —
+    /// losing the undo, not the delete itself.
     pub fn delete(&self, id: &str) -> std::io::Result<()> {
         let Some(path) = self.find_path(id) else {
             return Ok(());
         };
+        if let Some(file_name) = path.file_name() {
+            let trash_dir = self.dir.join(".trash");
+            if fs::create_dir_all(&trash_dir).is_ok()
+                && fs::rename(&path, trash_dir.join(file_name)).is_ok()
+            {
+                return Ok(());
+            }
+        }
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),
             // Raced with another deleter: the file vanished between `find_path` and `remove`. Still a
@@ -867,13 +1211,14 @@ fn read_listing(path: &Path) -> Option<SessionMeta> {
     let updated_at = mtime_secs(path);
     let file = File::open(path).ok()?;
     let mut reader = BufReader::new(file);
-    let mut buf = String::new();
+    let mut header = String::new();
 
     // The header is the first line.
-    reader.read_line(&mut buf).ok()?;
-    let mut meta = match serde_json::from_str::<Entry>(buf.trim()).ok()? {
+    reader.read_line(&mut header).ok()?;
+    let mut meta = match serde_json::from_str::<Entry>(header.trim()).ok()? {
         Entry::Session(m) => migrate(m, path).ok()?,
         Entry::Message { .. } | Entry::Leaf { .. } | Entry::BranchSummary { .. } => return None,
+        Entry::Compaction { .. } => return None,
     };
 
     // A streaming line count, not a tree walk: it counts every `Message` line in the file, which for a
@@ -882,14 +1227,26 @@ fn read_listing(path: &Path) -> Option<SessionMeta> {
     // session today, since nothing yet writes an off-branch entry.
     let mut message_count = 0usize;
     let mut preview = None;
+    let mut raw = Vec::new();
     loop {
-        buf.clear();
-        match reader.read_line(&mut buf) {
-            Ok(0) => break, // EOF
-            Ok(_) => {}
+        // Same lenient, skip-just-this-line recovery as `SessionStore::open` (see its comment):
+        // `read_capped_line` lets an oversized or invalid-UTF-8 line be skipped without losing the
+        // count/preview derived from every good line after it, and only a genuine I/O failure stops
+        // the scan early.
+        let oversized = match read_capped_line(&mut reader, &mut raw) {
+            Ok(None) => break,
+            Ok(Some(oversized)) => oversized,
             Err(_) => break,
+        };
+        if oversized {
+            tracing::warn!(path = %path.display(), "skipping oversized session entry line while listing");
+            continue;
         }
-        let line = buf.trim();
+        let Ok(line) = std::str::from_utf8(&raw) else {
+            tracing::warn!(path = %path.display(), "skipping non-UTF-8 session entry line while listing");
+            continue;
+        };
+        let line = line.trim();
         if line.is_empty() {
             continue;
         }
@@ -902,11 +1259,19 @@ fn read_listing(path: &Path) -> Option<SessionMeta> {
                     }
                 }
             }
-            // A stray header mid-file (or a branch-navigation/summary marker) is ignored; a torn
-            // (unparseable) final line ends the scan, same as the load path — only the last entry can
-            // be lost.
-            Ok(Entry::Session(_)) | Ok(Entry::Leaf { .. }) | Ok(Entry::BranchSummary { .. }) => {}
-            Err(_) => break,
+            // A stray header mid-file (or a branch-navigation/summary/compaction-provenance marker) is
+            // ignored.
+            Ok(Entry::Session(_))
+            | Ok(Entry::Leaf { .. })
+            | Ok(Entry::BranchSummary { .. })
+            | Ok(Entry::Compaction { .. }) => {}
+            // A fully-read line that failed to deserialize — skip just this one and keep scanning,
+            // same relaxed recovery as `SessionStore::open` (see its comment): we know this line's
+            // exact boundaries, so one bad line (anywhere in the file, not only a torn tail) no longer
+            // truncates the count/preview derived from every good line after it.
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "skipping unparseable session entry line");
+            }
         }
     }
 
@@ -941,6 +1306,17 @@ fn preview_of(text: &str) -> String {
         out.push('…');
     }
     out
+}
+
+/// A preview of any message's own text content (unlike [`first_user_text`], not restricted to the
+/// `User` role) — [`SessionStore::tree`]'s per-node preview, one message at a time rather than a
+/// branch's first user turn. `None` for a message with no plain-text block (a pure tool-use/tool-result/
+/// thinking/image turn).
+fn message_text_preview(msg: &Message) -> Option<String> {
+    msg.content.iter().find_map(|b| match b {
+        ContentBlock::Text { text } if !text.trim().is_empty() => Some(preview_of(text)),
+        _ => None,
+    })
 }
 
 /// The file's last-modified time as Unix seconds, read from `fs` metadata (no file content). Falls back
@@ -988,7 +1364,11 @@ fn read_capped_line(reader: &mut impl BufRead, buf: &mut Vec<u8>) -> std::io::Re
         let room = MAX_LINE_BYTES.saturating_sub(buf.len());
         let take = chunk.len().min(room);
         buf.extend_from_slice(&chunk[..take]);
-        let consumed = if hit_newline { chunk.len() + 1 } else { chunk.len() };
+        let consumed = if hit_newline {
+            chunk.len() + 1
+        } else {
+            chunk.len()
+        };
         reader.consume(consumed);
         if hit_newline {
             break;
@@ -1069,6 +1449,7 @@ fn new_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn tmpdir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
@@ -1110,13 +1491,21 @@ mod tests {
             |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         // Transcripts carry whatever `read` pulled off disk — never group/world-readable, on a
         // shared host in particular, regardless of the process umask.
-        assert_eq!(mode_of(&store.path), 0o600, "create() must set 0600 atomically");
+        assert_eq!(
+            mode_of(&store.path),
+            0o600,
+            "create() must set 0600 atomically"
+        );
 
         let mut session = Session::new();
         session.user("a");
         session.user("b");
         store.append_new(&session.messages).unwrap();
-        assert_eq!(mode_of(&store.path), 0o600, "append must not loosen permissions");
+        assert_eq!(
+            mode_of(&store.path),
+            0o600,
+            "append must not loosen permissions"
+        );
 
         store.rewrite(&[Message::user("summary")]).unwrap();
         assert_eq!(
@@ -1238,6 +1627,107 @@ mod tests {
     }
 
     #[test]
+    fn oversized_line_mid_file_does_not_discard_subsequent_good_entries() {
+        // The bug: an oversized line was treated like a torn *final* write (stop reading, keep what's
+        // valid so far) even when it wasn't the last line — silently discarding every good entry after
+        // it. It must instead be skipped like `corrupt_line_mid_file_does_not_discard_subsequent_good_entries`'s
+        // unparseable-JSON case.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo
+            .create(SessionMeta::new("/work", "claude-test"))
+            .unwrap();
+        let id = store.meta().id.clone();
+        let mut session = Session::new();
+        session.user("first");
+        store.append_new(&session.messages).unwrap();
+
+        let path = repo.find_path(&id).unwrap();
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        write!(f, "\"").unwrap();
+        for _ in 0..(MAX_LINE_BYTES / 1024 + 10) {
+            write!(f, "{}", "x".repeat(1024)).unwrap();
+        }
+        writeln!(f, "\"").unwrap();
+        drop(f);
+
+        session.user("third");
+        store.append_new(&session.messages).unwrap();
+
+        let (_store, restored) = repo.open_id(&id).unwrap();
+        assert_eq!(
+            restored.messages.len(),
+            2,
+            "both good entries must survive an oversized line between them, not just the ones before it"
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_line_mid_file_does_not_discard_subsequent_good_entries() {
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo
+            .create(SessionMeta::new("/work", "claude-test"))
+            .unwrap();
+        let id = store.meta().id.clone();
+        let mut session = Session::new();
+        session.user("first");
+        store.append_new(&session.messages).unwrap();
+
+        // A line with invalid UTF-8 bytes (simulating bit rot) landing mid-file, not at the end.
+        let path = repo.find_path(&id).unwrap();
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(b"\xff\xfe not valid utf-8\n").unwrap();
+        drop(f);
+
+        session.user("third");
+        store.append_new(&session.messages).unwrap();
+
+        let (_store, restored) = repo.open_id(&id).unwrap();
+        assert_eq!(
+            restored.messages.len(),
+            2,
+            "both good entries must survive an invalid-UTF-8 line between them, not just the ones before it"
+        );
+    }
+
+    #[test]
+    fn corrupt_line_mid_file_does_not_discard_subsequent_good_entries() {
+        // A bad line anywhere in the file — not only a torn final write — must be skipped, not treated
+        // as "nothing valid follows a half-written record": the good entries appended *after* it must
+        // still be recovered on open.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo
+            .create(SessionMeta::new("/work", "claude-test"))
+            .unwrap();
+        let id = store.meta().id.clone();
+        let mut session = Session::new();
+        session.user("first");
+        store.append_new(&session.messages).unwrap();
+
+        // A complete (newline-terminated), well-formed JSON line that isn't a valid `Entry` — not a
+        // torn write, just corrupted/foreign content landing mid-file (disk bit rot, a manual edit).
+        let path = repo.find_path(&id).unwrap();
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, r#"{{"not":"a valid entry"}}"#).unwrap();
+        drop(f);
+
+        // Appended using the same in-memory `store` (its `active`/`persisted` state is untouched by
+        // the raw write above), so this chains correctly off "first" regardless of the bad line
+        // sitting between them on disk.
+        session.user("third");
+        store.append_new(&session.messages).unwrap();
+
+        let (_store, restored) = repo.open_id(&id).unwrap();
+        assert_eq!(
+            restored.messages.len(),
+            2,
+            "both good entries must survive a bad line between them, not just the ones before it"
+        );
+    }
+
+    #[test]
     fn rewrite_replaces_whole_transcript() {
         let dir = tmpdir();
         let repo = SessionRepo::open(dir.path()).unwrap();
@@ -1262,6 +1752,230 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_compacted_preserves_folded_messages_and_records_provenance() {
+        // Compact 6 messages down to [summary, kept5, kept6] — the first 4 are folded away. Unlike
+        // `rewrite`, this must (a) keep every folded message physically readable on disk by its
+        // original id, (b) write exactly one `Entry::Compaction` provenance record naming them, and
+        // (c) still start the new active path as its own fresh, detached chain — *not* linked back
+        // into the folded prefix, which would resurrect it into the live transcript.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        for text in ["one", "two", "three", "four", "five", "six"] {
+            session.user(text);
+        }
+        store.append_new(&session.messages).unwrap();
+        let old_ids = store.active_ids().to_vec();
+        assert_eq!(old_ids.len(), 6);
+
+        let compacted_messages = vec![
+            Message::user(format!(
+                "{}\n\nrecap of the folded work",
+                agent_core::compaction::SUMMARY_MARKER
+            )),
+            session.messages[4].clone(),
+            session.messages[5].clone(),
+        ];
+        store
+            .rewrite_compacted(
+                &compacted_messages,
+                CompactionMeta {
+                    tokens_before: 12345,
+                },
+            )
+            .unwrap();
+        assert_eq!(store.active_ids().len(), 3);
+        assert_eq!(store.meta().compactions, 1);
+        assert_eq!(store.meta().dropped_messages, 3); // net shrinkage: 4 folded -> 1 summary
+
+        let (reopened, restored) = repo.open_id(&store.meta().id.clone()).unwrap();
+        assert_eq!(restored.messages.len(), 3);
+        assert_eq!(reopened.active_ids().len(), 3);
+
+        // Parse every line and find the two entries of interest, rather than substring-sniffing raw
+        // JSON (id ordering across the file isn't guaranteed).
+        let raw = fs::read_to_string(&reopened.path).unwrap();
+        let lines: Vec<Value> = raw
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+
+        // Every folded message is still physically present, by its original id and content.
+        for (id, text) in old_ids[..4].iter().zip(["one", "two", "three", "four"]) {
+            let found = lines.iter().find(|v| v["id"] == json!(id));
+            assert!(
+                found.is_some(),
+                "folded message {id} ({text}) missing from disk: {raw}"
+            );
+        }
+
+        // Exactly one compaction provenance record, naming the folded ids and carrying tokens_before.
+        let compaction_entries: Vec<&Value> = lines
+            .iter()
+            .filter(|v| v["type"] == json!("compaction"))
+            .collect();
+        assert_eq!(
+            compaction_entries.len(),
+            1,
+            "expected exactly one compaction entry: {raw}"
+        );
+        let entry = compaction_entries[0];
+        assert_eq!(entry["tokens_before"], json!(12345));
+        assert_eq!(entry["summary"], json!("recap of the folded work"));
+        assert_eq!(
+            entry["folded_ids"].as_array().unwrap().len(),
+            4,
+            "should name all 4 folded messages: {entry:#?}"
+        );
+        for id in &old_ids[..4] {
+            assert!(
+                entry["folded_ids"].as_array().unwrap().contains(&json!(id)),
+                "folded_ids missing {id}: {entry:#?}"
+            );
+        }
+
+        // The new active path's first node (the summary) starts a fresh, detached chain — *not*
+        // linked back into the folded prefix. `path_from_root` walks a tip's whole parent chain to
+        // build the live session, so a real link there would resurrect every folded message back into
+        // the "active" transcript, undoing the compaction (already caught once: `restored.messages`
+        // above would be 7, not 3, if this regressed).
+        let summary_entry = lines
+            .iter()
+            .find(|v| {
+                v["type"] == json!("message") && v.to_string().contains("recap of the folded work")
+            })
+            .expect("summary message entry not found");
+        assert_eq!(
+            summary_entry["parent_id"],
+            Value::Null,
+            "the summary message must start a fresh chain, not link back into the folded prefix: {summary_entry:#?}"
+        );
+
+        // The folded prefix survives as its own self-contained sub-chain (still linked to each other
+        // exactly as before compaction), unreachable from the new tip but not orphaned from *root* —
+        // the first folded message's parent_id is whatever it always was (`None`, the session root).
+        let first_folded_entry = lines
+            .iter()
+            .find(|v| v["id"] == json!(old_ids[0]))
+            .expect("first folded message entry not found");
+        assert_eq!(first_folded_entry["parent_id"], Value::Null);
+        let second_folded_entry = lines
+            .iter()
+            .find(|v| v["id"] == json!(old_ids[1]))
+            .expect("second folded message entry not found");
+        assert_eq!(second_folded_entry["parent_id"], json!(old_ids[0]));
+    }
+
+    #[test]
+    fn rewrite_compacted_appends_without_rewriting_existing_bytes() {
+        // The whole point of H-7: every byte already on disk before the call must still be there,
+        // byte-for-byte, as a strict *prefix* of the file afterward — proof this is a pure append, not
+        // a rewrite (which would reserialize and potentially reorder everything).
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        for text in ["one", "two", "three", "four", "five"] {
+            session.user(text);
+        }
+        store.append_new(&session.messages).unwrap();
+        let path = repo.find_path(&store.meta().id.clone()).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        let compacted = vec![
+            Message::user(format!(
+                "{}\n\nrecap",
+                agent_core::compaction::SUMMARY_MARKER
+            )),
+            session.messages[4].clone(),
+        ];
+        store
+            .rewrite_compacted(&compacted, CompactionMeta { tokens_before: 1 })
+            .unwrap();
+
+        let after = fs::read(&path).unwrap();
+        assert!(
+            after.starts_with(&before),
+            "every pre-existing byte must survive untouched as a prefix of the file"
+        );
+        assert!(
+            after.len() > before.len(),
+            "new content must have been appended"
+        );
+    }
+
+    #[test]
+    fn switch_active_with_summary_appends_without_rewriting_existing_bytes() {
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("only message");
+        store.append_new(&session.messages).unwrap();
+        let root_id = store.active_ids()[0].clone();
+        let path = repo.find_path(&store.meta().id.clone()).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        store
+            .switch_active_with_summary(
+                &root_id,
+                "a recap",
+                "abandoned-tip",
+                BranchSummaryDetails::default(),
+            )
+            .unwrap();
+
+        let after = fs::read(&path).unwrap();
+        assert!(
+            after.starts_with(&before),
+            "every pre-existing byte must survive untouched as a prefix of the file"
+        );
+        assert!(
+            after.len() > before.len(),
+            "new content must have been appended"
+        );
+    }
+
+    #[test]
+    fn torn_compaction_append_leaves_the_pre_compaction_state_fully_valid() {
+        // A crash between the `Entry::Compaction` record and the new active-path messages (or mid-way
+        // through one of those messages) must not corrupt anything: the *old* tip and everything it
+        // points to were never touched by an append-only compaction, so they must still resolve exactly
+        // as they did before the interrupted compaction ever started.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        for text in ["one", "two", "three", "four"] {
+            session.user(text);
+        }
+        store.append_new(&session.messages).unwrap();
+        let old_ids = store.active_ids().to_vec();
+        let id = store.meta().id.clone();
+        let path = repo.find_path(&id).unwrap();
+
+        // Simulate a crash mid-append: a torn, unterminated compaction-record line with nothing after
+        // it — as if the process died right after starting to write the batch.
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        write!(f, "{{\"type\":\"compaction\",\"id\":\"x").unwrap();
+        drop(f);
+
+        let (reopened, restored) = repo.open_id(&id).unwrap();
+        assert_eq!(
+            restored.messages.len(),
+            4,
+            "the pre-compaction transcript must be fully intact"
+        );
+        assert_eq!(
+            reopened.active_ids(),
+            old_ids.as_slice(),
+            "the tip must still be the pre-compaction tip — an interrupted compaction simply never took effect"
+        );
+    }
+
+    #[test]
     fn list_is_newest_first_and_fork_links_parent() {
         let dir = tmpdir();
         let repo = SessionRepo::open(dir.path()).unwrap();
@@ -1281,6 +1995,63 @@ mod tests {
         assert_eq!(metas.len(), 2);
         // Newest first: the fork was created after `a`.
         assert!(metas[0].created_at >= metas[1].created_at);
+    }
+
+    #[test]
+    fn list_all_merges_every_project_subdirectory() {
+        // The layout `serve`'s default session directory follows: one subdirectory per project under
+        // a shared root, each an independent `SessionRepo`.
+        let root = tmpdir();
+        let repo_a = SessionRepo::open(root.path().join("-home-jared-project-a")).unwrap();
+        repo_a
+            .create(SessionMeta::new("/home/jared/project-a", "m"))
+            .unwrap();
+        let repo_b = SessionRepo::open(root.path().join("-home-jared-project-b")).unwrap();
+        repo_b
+            .create(SessionMeta::new("/home/jared/project-b", "m"))
+            .unwrap();
+
+        let all = SessionRepo::list_all(root.path()).unwrap();
+        assert_eq!(all.len(), 2);
+        let cwds: std::collections::HashSet<&str> = all.iter().map(|m| m.cwd.as_str()).collect();
+        assert!(cwds.contains("/home/jared/project-a"));
+        assert!(cwds.contains("/home/jared/project-b"));
+    }
+
+    #[test]
+    fn list_all_is_newest_first_across_projects() {
+        let root = tmpdir();
+        let repo_a = SessionRepo::open(root.path().join("proj-a")).unwrap();
+        let older = repo_a.create(SessionMeta::new("/a", "m")).unwrap();
+        let repo_b = SessionRepo::open(root.path().join("proj-b")).unwrap();
+        let mut newer_meta = SessionMeta::new("/b", "m");
+        newer_meta.created_at = older.meta().created_at + 1;
+        repo_b.create(newer_meta).unwrap();
+
+        let all = SessionRepo::list_all(root.path()).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].cwd, "/b", "the newer session must sort first");
+        assert_eq!(all[1].cwd, "/a");
+    }
+
+    #[test]
+    fn list_all_ignores_non_repo_entries_and_a_missing_root() {
+        let root = tmpdir();
+        // A stray file at the root (not a project subdirectory) must not break the scan.
+        std::fs::write(root.path().join("not-a-project.txt"), "x").unwrap();
+        // An empty subdirectory (a project with no sessions yet) contributes nothing, not an error.
+        std::fs::create_dir(root.path().join("empty-project")).unwrap();
+        let repo = SessionRepo::open(root.path().join("real-project")).unwrap();
+        repo.create(SessionMeta::new("/real", "m")).unwrap();
+
+        let all = SessionRepo::list_all(root.path()).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].cwd, "/real");
+
+        // A root that doesn't exist at all (nothing has ever been persisted) is an empty list, not an
+        // I/O error.
+        let missing = root.path().join("does-not-exist");
+        assert!(SessionRepo::list_all(&missing).unwrap().is_empty());
     }
 
     #[test]
@@ -1326,6 +2097,37 @@ mod tests {
     }
 
     #[test]
+    fn delete_moves_to_trash_and_list_no_longer_shows_it() {
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let id = store.meta().id.clone();
+        let original_path = store.path.clone();
+
+        repo.delete(&id).unwrap();
+
+        assert!(
+            repo.list().unwrap().is_empty(),
+            "a trashed session must not appear in list()"
+        );
+        assert!(
+            !original_path.exists(),
+            "the file must no longer be at its original path"
+        );
+        let trash_dir = dir.path().join(".trash");
+        let trashed: Vec<_> = fs::read_dir(&trash_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(
+            trashed.len(),
+            1,
+            "the deleted session's file should have moved into .trash: {trashed:?}"
+        );
+        assert_eq!(trashed[0].file_name(), original_path.file_name().unwrap());
+    }
+
+    #[test]
     fn ids_are_unique_and_shaped() {
         // All ids in a batch are distinct (the per-process salt + monotonic seq guarantee it within a
         // process; the salt guards across processes), and the shape is `<hex>-<hex>-<hex>`.
@@ -1335,6 +2137,20 @@ mod tests {
         let id = new_id();
         assert_eq!(id.matches('-').count(), 2);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
+    }
+
+    #[test]
+    fn session_meta_with_id_uses_the_given_id_not_new_id() {
+        let meta = SessionMeta::with_id("my-custom-id", "/w", "m");
+        assert_eq!(meta.id, "my-custom-id");
+
+        // It round-trips through the repo like any other session.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let store = repo.create(meta).unwrap();
+        assert_eq!(store.meta().id, "my-custom-id");
+        let (reopened, _session) = repo.open_id("my-custom-id").unwrap();
+        assert_eq!(reopened.meta().id, "my-custom-id");
     }
 
     #[test]
@@ -1639,7 +2455,7 @@ mod tests {
     }
 
     #[test]
-    fn record_branch_summary_persists_counters_and_survives_reopen() {
+    fn switch_active_with_summary_persists_counters_and_survives_reopen() {
         let dir = tmpdir();
         let repo = SessionRepo::open(dir.path()).unwrap();
         let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
@@ -1649,12 +2465,12 @@ mod tests {
         store.append_new(&session.messages).unwrap();
         let ids = store.active_ids().to_vec();
 
-        // Navigate away from `beta` (the abandoned tip) back to `alpha`, then record a summary of
-        // what was abandoned.
+        // Navigate away from `beta` (the abandoned tip) back to `alpha`, recording a summary of what
+        // was abandoned in the same step.
         let abandoned_tip = ids[1].clone();
-        store.switch_active(&ids[0]).unwrap();
-        store
-            .record_branch_summary(
+        let messages = store
+            .switch_active_with_summary(
+                &ids[0],
                 "recap of the abandoned branch",
                 &abandoned_tip,
                 BranchSummaryDetails {
@@ -1667,15 +2483,17 @@ mod tests {
 
         assert_eq!(store.meta().branch_summaries, 1);
         assert_eq!(store.meta().summarized_branch_messages, 1);
-        // The active path itself is untouched by recording a summary.
-        assert_eq!(store.active_ids().len(), 1);
+        // The new active path is alpha *plus* the summary message — not just alpha, and not the
+        // untouched two-message branch either.
+        assert_eq!(messages.len(), 2);
+        assert_eq!(store.active_ids().len(), 2);
 
-        // Everything survives reopen: the header counters, and `beta`'s content (still physically on
-        // disk even though it's off the active path).
+        // Everything survives reopen: the header counters, `beta`'s content (still physically on disk
+        // even though it's off the active path), and the summary as the new tip.
         let (reopened, restored) = repo.open_id(&store.meta().id.clone()).unwrap();
         assert_eq!(reopened.meta().branch_summaries, 1);
         assert_eq!(reopened.meta().summarized_branch_messages, 1);
-        assert_eq!(restored.messages.len(), 1);
+        assert_eq!(restored.messages.len(), 2);
         let raw = fs::read_to_string(&reopened.path).unwrap();
         assert!(
             raw.contains("\"beta\""),
@@ -1689,34 +2507,134 @@ mod tests {
             assert_eq!(
                 fs::metadata(&reopened.path).unwrap().permissions().mode() & 0o777,
                 0o600,
-                "record_branch_summary's temp-file-then-rename must not loosen permissions"
+                "switch_active_with_summary's temp-file-then-rename must not loosen permissions"
             );
         }
     }
 
     #[test]
-    fn record_branch_summary_does_not_redirect_the_active_tip() {
-        // A `BranchSummary` entry, even though it's physically the last line in the file, must not be
-        // mistaken for a `Leaf` navigation marker — the active tip stays wherever it was.
+    fn switch_active_with_summary_surfaces_summary_as_first_message_of_new_branch() {
+        // Unlike a plain `switch_active`, this must actually redirect the tip: the summary becomes a
+        // real message, part of the live transcript the model sees on the next turn — not an inert
+        // provenance record sitting off to the side.
         let dir = tmpdir();
         let repo = SessionRepo::open(dir.path()).unwrap();
         let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
         let mut session = Session::new();
         session.user("only message");
         store.append_new(&session.messages).unwrap();
-        let tip_before = store.active_ids().to_vec();
+        let root_id = store.active_ids()[0].clone();
 
-        store
-            .record_branch_summary(
+        let messages = store
+            .switch_active_with_summary(
+                &root_id,
                 "some recap",
-                "nonexistent-abandoned-id",
+                "abandoned-branch-tip",
                 BranchSummaryDetails::default(),
             )
             .unwrap();
+        assert_eq!(messages.len(), 2);
+        let summary_text = match &messages[1].content[0] {
+            ContentBlock::Text { text } => text,
+            other => panic!("expected a text block, got {other:?}"),
+        };
+        assert!(summary_text.contains("some recap"));
 
         let (reopened, restored) = repo.open_id(&store.meta().id.clone()).unwrap();
-        assert_eq!(restored.messages.len(), 1);
-        assert_eq!(reopened.active_ids(), tip_before.as_slice());
+        assert_eq!(restored.messages.len(), 2);
+        assert_ne!(
+            reopened.active_ids(),
+            &[root_id],
+            "the tip must have moved to include the summary message, not stayed at the root"
+        );
+    }
+
+    #[test]
+    fn branch_summary_details_within_folds_forward_a_nested_summary() {
+        // A detour off a detour: root -> (branch summary S1, carrying file-tracking) -> one more
+        // message -> abandon back to root. The abandoned range's *messages* only expose S1's prose
+        // recap (extract_file_ops would find nothing new in it, since it's plain text, not a tool
+        // call) — `branch_summary_details_within` must still recover S1's original read/modified files
+        // from the index, not just whatever the plain message scan finds.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("root");
+        store.append_new(&session.messages).unwrap();
+        let root_id = store.active_ids()[0].clone();
+
+        // Record S1 at the root, carrying file-tracking from whatever it summarized.
+        store
+            .switch_active_with_summary(
+                &root_id,
+                "recap of the first detour",
+                "some-abandoned-tip",
+                BranchSummaryDetails {
+                    read_files: vec!["src/a.rs".to_string()],
+                    modified_files: vec!["src/b.rs".to_string()],
+                    summarized_messages: 4,
+                },
+            )
+            .unwrap();
+        let s1_id = store.active_ids().last().unwrap().clone();
+
+        // Continue past S1 with one more ordinary message, then abandon everything back to root.
+        let mut continued = Session::new();
+        continued.messages = Arc::new(
+            store
+                .switch_active(&s1_id)
+                .unwrap_or_else(|_| panic!("s1 must be a valid target")),
+        );
+        continued.user("one more message after the detour");
+        store.append_new(&continued.messages).unwrap();
+
+        let abandoned = store.abandoned_by_switch(&root_id);
+        assert_eq!(abandoned.len(), 2, "S1 plus the one message after it");
+        let ids: Vec<String> = abandoned.iter().map(|(id, _)| id.clone()).collect();
+        assert!(ids.contains(&s1_id));
+
+        let folded = store.branch_summary_details_within(&ids);
+        assert_eq!(folded.read_files, vec!["src/a.rs".to_string()]);
+        assert_eq!(folded.modified_files, vec!["src/b.rs".to_string()]);
+
+        // Survives a reopen — the index is rebuilt from the persisted `Entry::BranchSummary`, not just
+        // held in this process's live memory.
+        let (reopened, _) = repo.open_id(&store.meta().id.clone()).unwrap();
+        let refolded = reopened.branch_summary_details_within(&ids);
+        assert_eq!(refolded.read_files, vec!["src/a.rs".to_string()]);
+        assert_eq!(refolded.modified_files, vec!["src/b.rs".to_string()]);
+    }
+
+    #[test]
+    fn switching_back_twice_does_not_duplicate_summary() {
+        // A second, independent detour-and-return through the same point produces a second, sibling
+        // summary entry (different abandoned content) — never overwriting or deduping against the
+        // first one, and a *plain* switch_active to the same target afterward bypasses any summary
+        // entirely (it goes straight back to the raw message, not through either recap).
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("root");
+        store.append_new(&session.messages).unwrap();
+        let root_id = store.active_ids()[0].clone();
+
+        store
+            .switch_active_with_summary(&root_id, "first recap", "branch-a", Default::default())
+            .unwrap();
+        store
+            .switch_active_with_summary(&root_id, "second recap", "branch-b", Default::default())
+            .unwrap();
+        assert_eq!(store.meta().branch_summaries, 2);
+
+        let raw = fs::read_to_string(&store.path).unwrap();
+        assert!(raw.contains("first recap"));
+        assert!(raw.contains("second recap"));
+
+        // A later plain switch_active to the same root bypasses both summaries.
+        let messages = store.switch_active(&root_id).unwrap();
+        assert_eq!(messages.len(), 1);
     }
 
     #[test]
@@ -1741,8 +2659,8 @@ mod tests {
         // Case 2: target is an ancestor still on the active path (b) — c and d are abandoned.
         let abandoned = store.abandoned_by_switch(&ids[1]);
         assert_eq!(abandoned.len(), 2);
-        assert!(matches!(&abandoned[0].content[0], ContentBlock::Text{text} if text == "c"));
-        assert!(matches!(&abandoned[1].content[0], ContentBlock::Text{text} if text == "d"));
+        assert!(matches!(&abandoned[0].1.content[0], ContentBlock::Text{text} if text == "c"));
+        assert!(matches!(&abandoned[1].1.content[0], ContentBlock::Text{text} if text == "d"));
 
         // Case 3: unknown target — nothing abandoned (the switch itself will fail).
         assert!(store.abandoned_by_switch("does-not-exist").is_empty());
@@ -1759,7 +2677,7 @@ mod tests {
         // (which lives on the *other* branch, not the one currently active).
         let abandoned = store.abandoned_by_switch(&ids[3]);
         assert_eq!(abandoned.len(), 1);
-        assert!(matches!(&abandoned[0].content[0], ContentBlock::Text{text} if text == "e"));
+        assert!(matches!(&abandoned[0].1.content[0], ContentBlock::Text{text} if text == "e"));
     }
 
     #[test]
@@ -1871,13 +2789,13 @@ mod tests {
 
     #[test]
     fn crash_before_rename_leaves_the_original_file_untouched() {
-        // Both `rewrite` and `record_branch_summary` share the same temp+rename mechanism: write a
-        // complete new file to `.jsonl.tmp`, then atomically rename it over the original. A crash
-        // *before* that rename — simulated here by leaving a half-written `.tmp` file behind, never
-        // renamed — must leave the original completely untouched: that's the entire point of
-        // temp+rename, and it's what makes `record_branch_summary`'s full-file rewrite (needed to
-        // update the header's counters atomically with the new entry) safe to use for a rare,
-        // non-hot-path operation instead of building bespoke in-place-patch machinery.
+        // `rewrite` (and `rewrite_compacted`'s degenerate fallback to it) writes a complete new file to
+        // `.jsonl.tmp`, then atomically renames it over the original — genuinely replacing the active
+        // path, so it needs a full atomic swap. (`rewrite_compacted`'s and
+        // `switch_active_with_summary`'s *normal* paths are append-only instead — see their own doc
+        // comments — since neither one ever needs to replace anything already on disk.) A crash
+        // *before* rename's atomic swap — simulated here by leaving a half-written `.tmp` file behind,
+        // never renamed — must leave the original completely untouched: the entire point of temp+rename.
         let dir = tmpdir();
         let repo = SessionRepo::open(dir.path()).unwrap();
         let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();

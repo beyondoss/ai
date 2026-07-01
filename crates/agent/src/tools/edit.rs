@@ -74,8 +74,13 @@ impl Tool for Edit {
         // would otherwise never match — a silent, unrecoverable failure.
         let had_bom = raw.starts_with('\u{feff}');
         let body = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
-        let had_crlf = body.contains("\r\n");
-        let working = body.replace("\r\n", "\n");
+        // A file can mix `\r\n` and bare `\n` endings across lines (different tools/editors touched
+        // different lines). CRLF is only reintroduced wholesale when the file is *consistently* CRLF;
+        // otherwise untouched spans are spliced back in from the original bytes verbatim (via
+        // `body_map`) so an edit to one line can never flip another, untouched line's ending.
+        let has_bare_lf = body.replace("\r\n", "").contains('\n');
+        let is_pure_crlf = !has_bare_lf && body.contains("\r\n");
+        let (working, body_map) = strip_crlf_with_map(body);
 
         // Resolve every edit to byte ranges against the *original* text (not the running result), so
         // multi-edit semantics are order-independent and an earlier edit's output can't accidentally
@@ -101,23 +106,33 @@ impl Tool for Edit {
             }
         }
 
-        // Splice the replacements in a single pass.
-        let mut out = String::with_capacity(working.len());
-        let mut cursor = 0;
+        // Splice the replacements in a single pass. Untouched spans are copied from `body` (the
+        // original bytes, via `body_map`), not `working`, so a mixed-line-ending file's untouched
+        // lines keep their exact original ending rather than being reconstructed from LF space.
+        let mut out = String::with_capacity(body.len());
+        let mut cursor = 0usize;
         for (start, end, new) in &ranges {
-            out.push_str(&working[cursor..*start]);
-            out.push_str(new);
+            out.push_str(&body[body_map[cursor] as usize..body_map[*start] as usize]);
+            if is_pure_crlf {
+                out.push_str(&new.replace('\n', "\r\n"));
+            } else {
+                out.push_str(new);
+            }
             cursor = *end;
         }
-        out.push_str(&working[cursor..]);
+        out.push_str(&body[body_map[cursor] as usize..]);
 
-        if out == working {
+        if out == body {
             return Err(ToolError::InvalidInput(format!(
                 "edit made no changes to {path}"
             )));
         }
 
-        let restored = restore(out, had_crlf, had_bom);
+        let restored = if had_bom {
+            format!("\u{feff}{out}")
+        } else {
+            out
+        };
         super::write_atomic(path, restored.as_bytes())
             .map_err(|e| ToolError::Execution(format!("write {path}: {e}")))?;
         let applied = ranges.len();
@@ -271,18 +286,40 @@ pub fn normalize_with_map(orig: &str) -> (String, Vec<u32>) {
     (out, map)
 }
 
-/// Restore the file's original line endings (LF → CRLF) and a leading BOM after editing in LF space.
-fn restore(out: String, had_crlf: bool, had_bom: bool) -> String {
-    let body = if had_crlf {
-        out.replace('\n', "\r\n")
-    } else {
-        out
-    };
-    if had_bom {
-        format!("\u{feff}{body}")
-    } else {
-        body
+/// Collapse `\r\n` to `\n`, returning the result plus a byte-offset map back to `body`: `map[i]` is
+/// the original byte offset that output byte `i` *starts at*, with a trailing sentinel
+/// `map[out.len()] == body.len()`. A collapsed `\r\n` pair maps its resulting `\n` to the `\r`'s
+/// offset (the start of the pair, not the `\n`'s own offset) — the pair is one atomic unit, so a
+/// match boundary landing right after it must still recover the `\r` when the caller slices the
+/// original bytes back out via this map (see `run`'s untouched-span splice); mapping to the `\n`'s own
+/// offset would silently drop the preceding `\r` whenever a match boundary falls exactly there. Safe
+/// on UTF-8: `\r`/`\n` are single ASCII bytes, so collapsing a pair never touches a multi-byte
+/// character's other bytes.
+fn strip_crlf_with_map(body: &str) -> (String, Vec<u32>) {
+    let bytes = body.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut map = Vec::with_capacity(bytes.len() + 1);
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+            out.push(b'\n');
+            map.push(i as u32);
+            i += 2;
+            continue;
+        }
+        out.push(bytes[i]);
+        map.push(i as u32);
+        i += 1;
     }
+    map.push(bytes.len() as u32);
+    (
+        // Removing lone `\r` bytes that precede a `\n` never touches a multi-byte character's
+        // continuation bytes (those are always >= 0x80, never equal to the single-byte ASCII `\r`),
+        // so `out` is still valid UTF-8 whenever `body` was.
+        #[allow(clippy::expect_used)]
+        String::from_utf8(out).expect("removing ASCII \\r bytes preserves UTF-8 validity"),
+        map,
+    )
 }
 
 /// Accept either the `edits` array form (pi-style) or the single old_string/new_string form. Also
@@ -405,6 +442,20 @@ mod tests {
         .unwrap();
         let result = std::fs::read_to_string(p).unwrap();
         assert_eq!(result, "line one\r\nLINE TWO\r\nline three\r\n");
+    }
+
+    #[tokio::test]
+    async fn preserves_untouched_lines_original_ending_in_mixed_crlf_file() {
+        // Mixed line endings: `b`'s line is bare-LF, `a`'s and `c`'s lines are CRLF. Editing `b` must
+        // not rewrite `c`'s line ending to CRLF — the bug was a whole-file `had_crlf` flag blanket
+        // converting every `\n` back to `\r\n`, silently corrupting untouched bare-LF lines in a
+        // mixed file.
+        let f = write_tmp("a\r\nb\nc\r\n");
+        let p = f.path().to_str().unwrap();
+        Edit.run(json!({ "path": p, "old_string": "b", "new_string": "B" }))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(p).unwrap(), "a\r\nB\nc\r\n");
     }
 
     #[tokio::test]

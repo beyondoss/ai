@@ -91,7 +91,12 @@ impl RealRunner {
             cmd.current_dir(dir);
         }
         let mut child = cmd.spawn()?;
-        let pid = child.id();
+        // Arms a group-kill for the lifetime of this call: `kill_on_drop` above only reaps the
+        // *direct* child, so a future dropped mid-`await` (cancellation, not just a timeout) would
+        // otherwise leak a backgrounded grandchild as an orphan. `disarm`ed below once the child has
+        // actually exited on its own; still armed on both the timeout branch and an external drop, so
+        // either one reaches the whole process group.
+        let mut guard = GroupKillGuard { pid: child.id() };
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         // Drain both pipes *concurrently* with the wait: a child that fills one pipe's OS buffer
@@ -114,21 +119,20 @@ impl RealRunner {
             // consume these fields directly as their whole output — but that's the `beyond` CLI's own
             // stdout/stderr, expected to be human-readable text, not arbitrary binary data the way a
             // `bash`-run command's output can be.
-            Ok((status, (stdout, out_trunc), (stderr, err_trunc))) => Ok(ExecResult {
-                code: status?.code(),
-                stdout: String::from_utf8_lossy(&stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&stderr).into_owned(),
-                timed_out: false,
-                truncated: out_trunc || err_trunc,
-            }),
+            Ok((status, (stdout, out_trunc), (stderr, err_trunc))) => {
+                guard.disarm();
+                Ok(ExecResult {
+                    code: status?.code(),
+                    stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                    timed_out: false,
+                    truncated: out_trunc || err_trunc,
+                })
+            }
             Err(_) => {
-                // Timed out: kill the entire process group (leader pid == group id), reaching any
-                // backgrounded grandchildren, then report the timeout.
-                #[cfg(unix)]
-                if let Some(pid) = pid {
-                    kill_process_group(pid).await;
-                }
-                let _ = pid; // used only on unix
+                // Timed out: dropping `guard` here (rather than waiting for the function to return)
+                // kills the entire process group promptly, reaching any backgrounded grandchildren.
+                drop(guard);
                 Ok(ExecResult {
                     code: None,
                     stdout: String::new(),
@@ -137,6 +141,35 @@ impl RealRunner {
                     ..Default::default()
                 })
             }
+        }
+    }
+}
+
+/// Owns a spawned process-group leader; kills the whole group on drop unless [`disarm`](Self::disarm)d
+/// (the normal, already-reaped exit path). This is what actually closes the cancellation gap
+/// `kill_on_drop` leaves open: that flag only reaps the *direct* child on drop, but a future dropped
+/// mid-`await` — cancellation racing the whole dispatch, not just this call's own timeout — unwinds
+/// through this stack frame the same way, so arming the kill here (rather than only in the timeout
+/// branch) covers both.
+struct GroupKillGuard {
+    pid: Option<u32>,
+}
+
+impl GroupKillGuard {
+    fn disarm(&mut self) {
+        self.pid = None;
+    }
+}
+
+impl Drop for GroupKillGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.pid.take() {
+            // `Drop` can't `.await`; fire-and-forget onto the ambient runtime — `kill -KILL` is
+            // near-instant, and nothing downstream depends on this completing before `drop` returns.
+            tokio::spawn(async move {
+                kill_process_group(pid).await;
+            });
         }
     }
 }
@@ -300,6 +333,38 @@ mod tests {
         assert!(
             !marker.exists(),
             "backgrounded grandchild survived the timeout — process group not killed"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_future_kills_backgrounded_grandchildren() {
+        // Same fixture as `timeout_kills_backgrounded_grandchildren`, but this time the *caller* drops
+        // the `run` future outright (as cancellation does) rather than the command's own timeout
+        // firing — `kill_on_drop` alone only reaps the direct child, so without `GroupKillGuard` the
+        // backgrounded grandchild would survive this path even though the timeout path already
+        // handles it.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("leaked");
+        let script = format!("( sleep 1; echo leaked > {} ) & sleep 30", marker.display());
+
+        let args = vec!["-c".to_string(), script];
+        tokio::select! {
+            _ = RealRunner.run(
+                "sh",
+                &args,
+                None,
+                Duration::from_secs(30), // long enough that the timeout branch never fires
+            ) => panic!("the run future should have been dropped first"),
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                // The `run` future is dropped here as `select!`'s other arm is discarded.
+            }
+        }
+
+        // Wait past when the grandchild would have written the marker; it must not exist.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(
+            !marker.exists(),
+            "backgrounded grandchild survived dropping the future — process group not killed"
         );
     }
 

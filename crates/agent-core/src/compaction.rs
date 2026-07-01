@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::message::{ContentBlock, Message, Role};
+use crate::message::{ContentBlock, Message, Role, StopReason};
 use crate::session::Session;
 use crate::transport::ModelRequest;
 
@@ -159,6 +159,12 @@ suffix.";
 /// [`previous_summary`].
 pub const SUMMARY_MARKER: &str = "[Earlier conversation compacted to save context]";
 
+/// The turn-prefix summarization call's budget, as a fraction of the history call's
+/// [`CompactionConfig::summary_max_tokens`] — a split-turn's prefix is a *partial* turn (see
+/// [`is_split_turn`]), inherently shorter than the closed-off history it's summarized alongside, so it
+/// needs proportionally less room.
+pub const SPLIT_TURN_PREFIX_SCALE: f64 = 0.5;
+
 /// Tool-result content is truncated to this many characters when rendered into the summary prompt —
 /// tool output is usually the bulk of the transcript and the least useful to re-summarize in full.
 const TOOL_RESULT_MAX_CHARS: usize = 2_000;
@@ -169,8 +175,9 @@ pub fn estimate_tokens(text: &str) -> u32 {
     (text.chars().count() / 4) as u32
 }
 
-/// Estimate one message's token cost from its blocks.
-fn estimate_message_tokens(m: &Message) -> u32 {
+/// Estimate one message's token cost from its blocks. `pub(crate)`: also used by
+/// [`crate::branch_summary`] to window a branch's transcript by token budget.
+pub(crate) fn estimate_message_tokens(m: &Message) -> u32 {
     m.content
         .iter()
         .map(|b| match b {
@@ -188,11 +195,58 @@ fn estimate_message_tokens(m: &Message) -> u32 {
         .sum()
 }
 
+/// Estimated tokens in every message appended since [`Session::last_input_tokens`] was last set — the
+/// assistant turn that usage snapshot itself came from, plus anything since (tool results, further
+/// turns). `should_compact` adds this to `last_input_tokens` so the trigger reflects the prompt's
+/// *actual* current size rather than a size that's already stale by the time it's checked (the check
+/// runs at the top of the next loop iteration, after that turn's own messages were pushed).
+pub fn trailing_tokens(session: &Session) -> u32 {
+    let start = session.last_usage_message_count.min(session.messages.len());
+    session.messages[start..]
+        .iter()
+        .map(estimate_message_tokens)
+        .fold(0u32, |acc, n| acc.saturating_add(n))
+}
+
 /// Whether the live prompt has crossed the compaction threshold. Uses the *last turn's* input size
-/// ([`Session::last_input_tokens`]) — the real, current context size — not the cumulative totals.
+/// ([`Session::last_input_tokens`]) plus [`trailing_tokens`] (messages appended since that snapshot) —
+/// the real, current context size — not the cumulative totals.
 pub fn should_compact(session: &Session, cfg: &CompactionConfig) -> bool {
     session.last_input_tokens > 0
-        && session.last_input_tokens >= cfg.context_window.saturating_sub(cfg.reserve_tokens)
+        && session
+            .last_input_tokens
+            .saturating_add(trailing_tokens(session))
+            >= cfg.context_window.saturating_sub(cfg.reserve_tokens)
+}
+
+/// A hard overflow signal, independent of [`should_compact`]'s (possibly-disabled) soft threshold: the
+/// live prompt has already reached — or a turn's own shape strongly implies it's about to reach — the
+/// model's *raw* `context_window`, not just the reserve-adjusted budget `should_compact` guards.
+/// Disabling [`CompactionConfig::enabled`] is a preference about when to compact *proactively*, with
+/// headroom to spare; it isn't license to keep sending requests that are already guaranteed to overflow
+/// on the very next turn, so callers check this regardless of that flag.
+///
+/// Two ways this fires — both driven by the provider's own reported usage, not by parsing an error:
+/// - The live prompt (last turn's usage + anything appended since) already meets or exceeds the raw
+///   window on its own — a silent overflow no error was ever raised for (the request that pushed it
+///   there still succeeded).
+/// - `stop_reason` is [`StopReason::MaxTokens`] *and* the live prompt plus the full output budget the
+///   next turn would request together would meet or exceed the window — a turn getting cut off by the
+///   output-token ceiling is normally unremarkable (a model that simply wanted to keep writing), but
+///   when there's this little room left for output, the window itself — not `max_tokens` — is plausibly
+///   the actual constraint, and it can only get tighter as the conversation continues to grow.
+pub fn is_hard_overflow(
+    session: &Session,
+    cfg: &CompactionConfig,
+    stop_reason: StopReason,
+    next_max_tokens: u32,
+) -> bool {
+    let live_prompt = session
+        .last_input_tokens
+        .saturating_add(trailing_tokens(session));
+    live_prompt >= cfg.context_window
+        || (stop_reason == StopReason::MaxTokens
+            && live_prompt.saturating_add(next_max_tokens) >= cfg.context_window)
 }
 
 /// Choose the first message index to keep verbatim. Walks back from the end accumulating estimated
@@ -251,6 +305,88 @@ pub fn find_cut(messages: &[Message], keep_recent_tokens: u32) -> Option<usize> 
         return None;
     }
     Some(first_kept)
+}
+
+/// [`find_cut`]'s boundary, plus — when the prefix being summarized ends mid-turn (see
+/// [`is_split_turn`]) — where that in-progress turn actually *started*, so the caller can summarize
+/// the closed-off history and the split turn's own prefix separately instead of collapsing both under
+/// the split-turn template (which is written for a partial turn, not a whole conversation's worth of
+/// completed ones).
+pub struct CutPoint {
+    pub first_kept: usize,
+    /// `Some(index)` when `messages[..first_kept]` ends mid-turn: the index of the most recent
+    /// message that actually starts a turn (real user content, not a bare tool-result reply).
+    /// `messages[..turn_start]` is the closed-off history; `messages[turn_start..first_kept]` is the
+    /// in-progress turn's own prefix. `None` on a clean boundary — same single-call path as today.
+    pub turn_start: Option<usize>,
+}
+
+/// Backstop on how far back [`find_split_cut`]'s turn-start scan will look before giving up and
+/// treating the whole scanned window as the in-progress turn's own prefix. Deliberately large and
+/// independent of `keep_recent_tokens` (which callers may set small, e.g. in tests, to force a
+/// specific cut point for the unrelated suffix-selection budget in [`find_cut`]) — a real turn almost
+/// never approaches this, so it only bounds worst-case cost on a pathologically long single turn
+/// (hundreds of tool round-trips with no intervening genuine user turn) without changing the result
+/// of any realistic one.
+const MAX_SPLIT_TURN_SCAN_TOKENS: u32 = 200_000;
+
+/// [`find_cut`], plus the split-turn boundary described on [`CutPoint`].
+pub fn find_split_cut(messages: &[Message], keep_recent_tokens: u32) -> Option<CutPoint> {
+    let first_kept = find_cut(messages, keep_recent_tokens)?;
+    let turn_start = is_split_turn(&messages[..first_kept]).then(|| {
+        // Bounded by `MAX_SPLIT_TURN_SCAN_TOKENS`: stop once that much of the in-progress turn has
+        // been scanned, even without a genuine turn-start yet, rather than walking the entire
+        // (potentially session-spanning) prefix. `is_split_turn`'s gate is common — true after any
+        // multi-tool-call turn — so an unbounded scan here would run on most real compactions.
+        // Landing on the cap instead of the turn's true start is a safe approximation, not an
+        // incorrect one: everything from the cap forward is still treated as the in-progress turn's
+        // own prefix (summarized with the split-turn template), and anything before it as ordinary
+        // closed-off history — just a coarser split than scanning further back would have found.
+        let mut scanned_tokens = 0u32;
+        let mut cut = 0;
+        for i in (0..first_kept).rev() {
+            cut = i;
+            if is_turn_start(&messages[i]) {
+                break;
+            }
+            scanned_tokens = scanned_tokens.saturating_add(estimate_message_tokens(&messages[i]));
+            if scanned_tokens >= MAX_SPLIT_TURN_SCAN_TOKENS {
+                break;
+            }
+        }
+        // The scan bottomed out at index 0 without finding any genuine turn-start in between — the
+        // whole window back to the start of the session is one still-open turn. If that first message
+        // is a prior compaction's summary (always `messages[0]`; see `apply_summary`), it's closed-off
+        // history, not part of the open turn — bump past it so the summary itself becomes (all of) the
+        // history side of the split, and `compact`'s incremental-update path folds it forward instead
+        // of misreading `turn_start == 0` as "no prior history exists" and burying the summary inside
+        // the split-turn template meant for a partial turn's own activity.
+        if cut == 0 && previous_summary(&messages[..1]).is_some() {
+            cut = 1;
+        }
+        cut
+    });
+    Some(CutPoint {
+        first_kept,
+        turn_start,
+    })
+}
+
+/// Whether `m` is a genuine turn-start: a user message carrying real content (text, an image — anything
+/// that isn't purely a reply to a prior tool dispatch). Distinguishes "the user asked something new"
+/// from the `ToolResult`-only user messages the loop appends between rounds of one still-open turn —
+/// and from a prior compaction's own summary message (see [`SUMMARY_MARKER`]): it's `Role::User` with
+/// real text too, but it's closed-off history recording *past* activity, not the user asking something
+/// new right now.
+fn is_turn_start(m: &Message) -> bool {
+    m.role == Role::User
+        && m.content
+            .iter()
+            .any(|b| !matches!(b, ContentBlock::ToolResult { .. }))
+        && !matches!(
+            m.content.first(),
+            Some(ContentBlock::Text { text }) if text.starts_with(SUMMARY_MARKER)
+        )
 }
 
 /// Render the prefix `messages` into a plain-text transcript for the summarization prompt. Tool
@@ -368,6 +504,12 @@ pub fn is_split_turn(prefix: &[Message]) -> bool {
     }
 }
 
+/// Combine a [`find_split_cut`] round's two independently-generated summaries — the closed-off
+/// history and the in-progress turn's own prefix — into the one summary spliced into the session.
+pub fn merge_split_summary(history: &str, turn_prefix: &str) -> String {
+    format!("{history}\n\n---\n\n**Turn Context (split turn):**\n\n{turn_prefix}")
+}
+
 /// Build the (network-free) summarization request: the rendered prefix plus the structured
 /// instruction and file-op tags, as a single user turn. One self-contained message sidesteps any
 /// role-alternation constraints, and capping tool results keeps the prompt well under the window.
@@ -437,6 +579,10 @@ pub fn apply_summary(session: &mut Session, first_kept: usize, summary: &str) {
     new_messages.extend_from_slice(kept);
     session.messages = Arc::new(new_messages);
     session.last_input_tokens = 0;
+    // Rebase against the freshly-shrunk message list — a stale index from before the splice would
+    // otherwise either panic (out of bounds) or, worse, silently under/over-count `trailing_tokens`
+    // against messages that no longer exist at those positions.
+    session.last_usage_message_count = session.messages.len();
 }
 
 #[cfg(test)]
@@ -481,6 +627,97 @@ mod tests {
     }
 
     #[test]
+    fn should_compact_counts_trailing_messages_appended_since_last_usage_snapshot() {
+        // The last recorded usage snapshot sits just under the threshold (gap of 50 tokens) — but
+        // messages appended *since* that snapshot (a turn's tool results, further turns) aren't
+        // reflected in `last_input_tokens` yet. Without accounting for them, the trigger would stay
+        // stuck below threshold until the *next* model call reports a fresh (and by then already-over-
+        // budget) size — a full extra round late. `trailing_tokens` closes that gap immediately.
+        let cfg = CompactionConfig {
+            context_window: 1000,
+            reserve_tokens: 200, // threshold: 800
+            ..Default::default()
+        };
+        let mut s = Session::new();
+        s.last_input_tokens = 750; // 50 tokens under threshold
+        s.last_usage_message_count = s.messages.len(); // snapshot taken with no messages yet
+        assert!(!should_compact(&s, &cfg));
+
+        // ~75 estimated tokens' worth of message appended since the snapshot — comfortably over the
+        // 50-token gap.
+        s.push(Message::user("x".repeat(300)));
+        assert!(
+            should_compact(&s, &cfg),
+            "trailing tokens since the last usage snapshot must push the trigger over threshold"
+        );
+    }
+
+    #[test]
+    fn is_hard_overflow_fires_when_the_live_prompt_already_meets_the_raw_window() {
+        // No error was ever raised — the turn that pushed usage this high still succeeded — so this is
+        // exactly the "silent" overflow case: the raw window (not the softer reserve-adjusted
+        // threshold `should_compact` checks) has already been met.
+        let cfg = CompactionConfig {
+            context_window: 1000,
+            reserve_tokens: 200,
+            ..Default::default()
+        };
+        let mut s = Session::new();
+        s.last_input_tokens = 1000;
+        assert!(is_hard_overflow(&s, &cfg, StopReason::EndTurn, 0));
+    }
+
+    #[test]
+    fn is_hard_overflow_is_false_well_under_the_window_even_on_a_max_tokens_stop() {
+        // A `MaxTokens` stop reason alone must not force compaction — that's just a model that wanted
+        // to keep writing, extremely common and unrelated to context pressure, when there's plenty of
+        // window left for the next turn's full output budget too.
+        let cfg = CompactionConfig {
+            context_window: 100_000,
+            reserve_tokens: 10_000,
+            ..Default::default()
+        };
+        let mut s = Session::new();
+        s.last_input_tokens = 10_000;
+        assert!(!is_hard_overflow(&s, &cfg, StopReason::MaxTokens, 4_096));
+    }
+
+    #[test]
+    fn is_hard_overflow_fires_on_a_max_tokens_stop_when_the_output_budget_would_meet_the_window() {
+        // The live prompt alone is under the raw window, but a `MaxTokens` stop plus the *next* turn's
+        // requested output budget would meet it — a sign the window itself, not `max_tokens`, is the
+        // actual constraint on how much room the model had to keep writing.
+        let cfg = CompactionConfig {
+            context_window: 10_000,
+            reserve_tokens: 1_000,
+            ..Default::default()
+        };
+        let mut s = Session::new();
+        s.last_input_tokens = 9_500;
+        assert!(!is_hard_overflow(&s, &cfg, StopReason::EndTurn, 1_000));
+        assert!(
+            is_hard_overflow(&s, &cfg, StopReason::MaxTokens, 1_000),
+            "9_500 + 1_000 meets the 10_000 window under a MaxTokens stop"
+        );
+    }
+
+    #[test]
+    fn is_hard_overflow_counts_trailing_messages_since_the_last_usage_snapshot() {
+        // Same "messages appended since the snapshot aren't in `last_input_tokens` yet" gap
+        // `should_compact` accounts for via `trailing_tokens` — this check must too.
+        let cfg = CompactionConfig {
+            context_window: 1_000,
+            ..Default::default()
+        };
+        let mut s = Session::new();
+        s.last_input_tokens = 700;
+        s.last_usage_message_count = s.messages.len();
+        assert!(!is_hard_overflow(&s, &cfg, StopReason::EndTurn, 0));
+        s.push(Message::user("x".repeat(2_000))); // ~500 estimated tokens
+        assert!(is_hard_overflow(&s, &cfg, StopReason::EndTurn, 0));
+    }
+
+    #[test]
     fn find_cut_snaps_to_assistant_and_leaves_both_sides() {
         let messages = convo();
         // Keep a tiny budget so the cut lands late, then snaps to an assistant boundary.
@@ -508,6 +745,152 @@ mod tests {
         // message (here, message 3) ahead of the accumulation point.
         let kept_tokens: u32 = messages[cut..].iter().map(estimate_message_tokens).sum();
         assert!(kept_tokens <= 2, "kept {kept_tokens} tokens, budget was 2");
+    }
+
+    #[test]
+    fn find_split_cut_is_none_on_clean_boundary() {
+        // Two fully closed text-only turns; the cut lands right after the second one ends cleanly on
+        // an assistant reply — no split-turn boundary anywhere in sight.
+        let messages = vec![
+            Message::user(
+                "first request, long enough that its token estimate is comfortably nonzero",
+            ),
+            Message::assistant(vec![ContentBlock::Text {
+                text: "first done, a fairly long response so the estimate is nontrivial too".into(),
+            }]),
+            Message::user(
+                "second request, also long enough for a nonzero token estimate here as well",
+            ),
+            Message::assistant(vec![ContentBlock::Text {
+                text: "second done, another long enough response for the estimate to register"
+                    .into(),
+            }]),
+        ];
+        let cut = find_split_cut(&messages, 1).expect("a cut");
+        assert_eq!(cut.first_kept, 3);
+        assert_eq!(
+            cut.turn_start, None,
+            "a clean boundary must not report a split-turn start"
+        );
+    }
+
+    #[test]
+    fn find_split_cut_reports_turn_start_on_mid_turn_boundary() {
+        // Turn 1 (closed): user -> assistant(text). Turn 2 (still open): user -> assistant(tool_use)
+        // -> user(tool_result) -> assistant(tool_use) -> user(tool_result) — mid-dispatch, no
+        // concluding assistant reply yet.
+        let messages = vec![
+            Message::user("first request"), // 0
+            Message::assistant(vec![ContentBlock::Text {
+                // 1
+                text: "first done".into(),
+            }]),
+            Message::user("second request"), // 2 — the split turn's real start
+            Message::assistant(vec![ContentBlock::ToolUse {
+                // 3
+                id: "1".into(),
+                name: "read".into(),
+                input: json!({ "path": "a.rs" }),
+            }]),
+            Message::tool_result("1", "contents of a.rs", false), // 4
+            Message::assistant(vec![ContentBlock::ToolUse {
+                // 5
+                id: "2".into(),
+                name: "edit".into(),
+                input: json!({ "path": "a.rs" }),
+            }]),
+            Message::tool_result("2", "edited", false), // 6
+        ];
+        // A tiny budget forces the cut to land as late as possible; the trailing tool_result-only
+        // message at index 6 makes it snap (forward has nowhere to go, so it snaps backward) to the
+        // assistant message at index 5 — a split-turn boundary.
+        let cut = find_split_cut(&messages, 1).expect("a cut");
+        assert_eq!(cut.first_kept, 5);
+        assert_eq!(
+            cut.turn_start,
+            Some(2),
+            "must find the split turn's own start (the 'second request' message), not the first one"
+        );
+    }
+
+    #[test]
+    fn find_split_cut_scan_is_bounded_and_does_not_walk_the_whole_prefix() {
+        // A closed turn, then a pathologically long single turn (many tool round-trips, each with a
+        // huge tool_result) with no intervening genuine user turn until the very start. Without a
+        // bound, the turn-start scan would walk the entire chain back to index 2 (the "second
+        // request" message, the turn's true start); `MAX_SPLIT_TURN_SCAN_TOKENS` must stop it well
+        // before that instead.
+        let big = "x".repeat(400_000); // ~100,000 estimated tokens (chars/4) per message
+        let mut messages = vec![
+            Message::user("first request"), // 0 — a fully closed turn
+            Message::assistant(vec![ContentBlock::Text {
+                text: "first done".into(),
+            }]), // 1
+            Message::user("second request"), // 2 — the split turn's real (but far-back) start
+        ];
+        for i in 0..10 {
+            messages.push(Message::assistant(vec![ContentBlock::ToolUse {
+                id: i.to_string(),
+                name: "read".into(),
+                input: json!({ "path": "a.rs" }),
+            }]));
+            messages.push(Message::tool_result(i.to_string(), big.clone(), false));
+        }
+        let cut = find_split_cut(&messages, 1).expect("a cut");
+        let turn_start = cut
+            .turn_start
+            .expect("a trailing bare tool_result is a split-turn boundary");
+        assert_ne!(
+            turn_start, 2,
+            "the bound must stop the scan before reaching the true (far-back) turn start"
+        );
+        assert_ne!(
+            turn_start, 0,
+            "must not fall all the way back to index 0 either"
+        );
+    }
+
+    #[test]
+    fn find_split_cut_treats_a_prior_summary_as_history_not_as_the_turn_start() {
+        // After one compaction, `messages[0]` is always the summary marker message (`apply_summary`
+        // always splices it in at the front). If the entire conversation since then is one continuous,
+        // still-open turn — no genuine new user message anywhere — the backward scan would otherwise
+        // walk all the way back to the summary and misidentify it as the split turn's own start: it's
+        // `Role::User` with real text, the same shape `is_turn_start` looks for. That would report
+        // `turn_start == 0`, which `Agent::compact` reads as "nothing precedes the split turn" — losing
+        // the fact that a real prior summary exists. It must instead land at 1, folding the summary
+        // into the closed-off history side of the split.
+        let messages = vec![
+            Message::user(format!("{SUMMARY_MARKER}\n\nprior summary body")), // 0
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "1".into(),
+                name: "read".into(),
+                input: json!({ "path": "a.rs" }),
+            }]), // 1
+            Message::tool_result("1", "contents of a.rs", false),             // 2
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "2".into(),
+                name: "edit".into(),
+                input: json!({ "path": "a.rs" }),
+            }]), // 3
+            Message::tool_result("2", "edited", false),                       // 4
+        ];
+        let cut = find_split_cut(&messages, 1).expect("a cut");
+        assert_eq!(cut.first_kept, 3);
+        assert_eq!(
+            cut.turn_start,
+            Some(1),
+            "the summary at index 0 must be excluded from the split turn's own prefix"
+        );
+    }
+
+    #[test]
+    fn is_turn_start_rejects_a_summary_marker_message() {
+        let summary = Message::user(format!("{SUMMARY_MARKER}\n\nprior summary body"));
+        assert!(
+            !is_turn_start(&summary),
+            "a prior compaction's summary is closed-off history, not a fresh user turn"
+        );
     }
 
     #[test]

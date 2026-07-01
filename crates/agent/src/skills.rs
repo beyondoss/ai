@@ -29,7 +29,16 @@ const MAX_DEPTH: usize = 8;
 /// Discover skills under the user (`~/.claude/skills`) and project (`<cwd>/.claude/skills`) roots.
 /// Project skills shadow user skills of the same name. Returns them sorted by name (stable output).
 pub fn discover(cwd: &Path) -> Vec<Skill> {
+    discover_with_diagnostics(cwd).0
+}
+
+/// Like [`discover`], but also reports name collisions — the same skill `name` declared by more than
+/// one `SKILL.md`/loose-`.md` file, silently shadowed by `discover` (the later root, or the later file
+/// within one root, wins) — as human-readable strings naming both paths, for `get_commands` to surface
+/// as a diagnostic rather than a client having no way to notice a skill was shadowed.
+pub fn discover_with_diagnostics(cwd: &Path) -> (Vec<Skill>, Vec<String>) {
     let mut found: Vec<Skill> = Vec::new();
+    let mut collisions: Vec<String> = Vec::new();
     let mut roots: Vec<PathBuf> = Vec::new();
     if let Some(home) = home_dir() {
         roots.push(home.join(".claude/skills"));
@@ -40,6 +49,12 @@ pub fn discover(cwd: &Path) -> Vec<Skill> {
         for skill in discover_in(&root) {
             // Later roots (project) win over earlier (user) on name collisions.
             if let Some(existing) = found.iter_mut().find(|s| s.name == skill.name) {
+                collisions.push(format!(
+                    "skill \"{}\" defined at both {} and {} — the latter wins",
+                    skill.name,
+                    existing.path.display(),
+                    skill.path.display()
+                ));
                 *existing = skill;
             } else {
                 found.push(skill);
@@ -47,7 +62,7 @@ pub fn discover(cwd: &Path) -> Vec<Skill> {
         }
     }
     found.sort_by(|a, b| a.name.cmp(&b.name));
-    found
+    (found, collisions)
 }
 
 /// Discover skills anywhere under `root`: walk the tree and load a `SKILL.md` at any depth (pi recurses
@@ -132,7 +147,7 @@ fn loose_root_skills(root: &Path) -> Vec<Skill> {
 /// the directory name for `name` if the frontmatter omits it.
 fn parse_skill(manifest: &Path) -> Option<Skill> {
     let text = fs::read_to_string(manifest).ok()?;
-    let fm = parse_frontmatter(&text);
+    let (fm, _body) = parse_frontmatter(&text);
     let description = fm
         .get("description")
         .filter(|d| !d.trim().is_empty())?
@@ -188,18 +203,29 @@ fn validate_skill_name(name: &str) -> Vec<String> {
     issues
 }
 
-/// Parse a leading `---`-fenced YAML frontmatter block into its top-level scalar keys. Dependency-free
+/// Parse a leading `---`-fenced YAML frontmatter block into its top-level scalar keys, alongside the
+/// remaining body text (everything after the closing `---` fence, verbatim — used to expand a
+/// `/skill:name` invocation without leaking the raw YAML into the model-facing text). Dependency-free
 /// (no `serde_yaml`): enough of YAML for the Agent Skills spec — quoted values, and block scalars
 /// (`key: |` / `key: >`) whose value spans the following more-indented lines. A `>` (folded) block is
 /// joined with spaces, a `|` (literal) block with newlines; both let a long `description:` wrap across
-/// lines. Anything fancier (anchors, nested maps) is out of scope and ignored.
-fn parse_frontmatter(text: &str) -> HashMap<String, String> {
+/// lines. Anything fancier (anchors, nested maps) is out of scope and ignored. No frontmatter fence at
+/// all (or an unterminated one) returns an empty map and the whole input as the body, unchanged.
+fn parse_frontmatter(text: &str) -> (HashMap<String, String>, &str) {
     let mut map = HashMap::new();
-    let mut lines = text.lines().peekable();
-    if lines.next().map(str::trim) != Some("---") {
-        return map;
+    // Iterate raw, newline-inclusive lines and track how many bytes have been consumed, so the body can
+    // be sliced out byte-exact once the closing fence is found — `Lines` alone discards that offset.
+    let mut lines = text.split_inclusive('\n').peekable();
+    let Some(first) = lines.next() else {
+        return (map, text);
+    };
+    if first.trim_end_matches(['\n', '\r']) != "---" {
+        return (map, text);
     }
+    let mut consumed = first.len();
     while let Some(line) = lines.next() {
+        consumed += line.len();
+        let line = line.trim_end_matches(['\n', '\r']);
         if line.trim() == "---" {
             break;
         }
@@ -218,13 +244,15 @@ fn parse_frontmatter(text: &str) -> HashMap<String, String> {
             Some(folded @ ('|' | '>')) => {
                 let mut parts: Vec<String> = Vec::new();
                 while let Some(next) = lines.peek() {
-                    if next.trim() == "---" {
+                    let next_trimmed = next.trim_end_matches(['\n', '\r']);
+                    if next_trimmed.trim() == "---" {
                         break;
                     }
-                    if !next.trim().is_empty() && !next.starts_with([' ', '\t']) {
+                    if !next_trimmed.trim().is_empty() && !next_trimmed.starts_with([' ', '\t']) {
                         break; // dedent to another top-level key ends the block
                     }
-                    parts.push(next.trim().to_string());
+                    parts.push(next_trimmed.trim().to_string());
+                    consumed += next.len();
                     lines.next();
                 }
                 let joined = if folded == '>' {
@@ -238,7 +266,7 @@ fn parse_frontmatter(text: &str) -> HashMap<String, String> {
         };
         map.insert(key, value);
     }
-    map
+    (map, text.get(consumed..).unwrap_or(""))
 }
 
 /// Strip matching surrounding single or double quotes.
@@ -261,12 +289,14 @@ pub fn find_by_name<'a>(skills: &'a [Skill], name: &str) -> Option<&'a Skill> {
 }
 
 /// If `message` is a `/skill:name ...` explicit invocation of a known skill, expand it into that
-/// skill's full file contents (any trailing text after the name follows on its own paragraph);
-/// otherwise return the message unchanged. This is the one path that honors a skill flagged
-/// `disable-model-invocation` — that flag only keeps the model from *choosing* the skill on its own
-/// (see [`format_available`]), not from a user naming it directly. Distinct prefix from
-/// [`crate::prompts::expand_if_slash`]'s bare `/name`, so the two never collide; a caller should try
-/// this first and fall through to prompt-template expansion when it returns the message unchanged.
+/// skill's body wrapped in a `<skill name="..." location="...">` tag (any trailing text after the name
+/// follows on its own paragraph); otherwise return the message unchanged. The frontmatter fence is
+/// stripped before wrapping — raw YAML (`name:`/`description:`/etc.) is metadata for discovery, not
+/// something the model needs to see once the skill is actually invoked. This is the one path that
+/// honors a skill flagged `disable-model-invocation` — that flag only keeps the model from *choosing*
+/// the skill on its own (see [`format_available`]), not from a user naming it directly. Distinct prefix
+/// from [`crate::prompts::expand_if_slash`]'s bare `/name`, so the two never collide; a caller should
+/// try this first and fall through to prompt-template expansion when it returns the message unchanged.
 pub fn expand_if_skill_invocation(message: &str, skills: &[Skill]) -> String {
     let Some(rest) = message.strip_prefix("/skill:") else {
         return message.to_string();
@@ -278,13 +308,26 @@ pub fn expand_if_skill_invocation(message: &str, skills: &[Skill]) -> String {
     let Some(skill) = find_by_name(skills, name) else {
         return message.to_string();
     };
-    let Ok(body) = fs::read_to_string(&skill.path) else {
+    let Ok(text) = fs::read_to_string(&skill.path) else {
         return message.to_string();
     };
+    let (_, body) = parse_frontmatter(&text);
+    let dir = skill
+        .path
+        .parent()
+        .map(Path::display)
+        .map(|d| d.to_string())
+        .unwrap_or_default();
+    let wrapped = format!(
+        "<skill name=\"{}\" location=\"{}\">\nReferences are relative to {dir}.\n\n{}\n</skill>",
+        skill.name,
+        skill.path.display(),
+        body.trim()
+    );
     if trailing.is_empty() {
-        body
+        wrapped
     } else {
-        format!("{body}\n\n{trailing}")
+        format!("{wrapped}\n\n{trailing}")
     }
 }
 
@@ -326,6 +369,48 @@ mod tests {
         let sd = root.join(name);
         fs::create_dir_all(&sd).unwrap();
         fs::write(sd.join("SKILL.md"), frontmatter).unwrap();
+    }
+
+    #[test]
+    fn discover_with_diagnostics_reports_a_shadowed_skill_name() {
+        // Two different `SKILL.md` files (different directories, so `discover_in` alone wouldn't
+        // dedupe them by path) both declaring the same skill `name:` — one collision, naming both
+        // paths, and the later one wins in the returned list (no duplicate entry).
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_root = tmp.path().join(".claude/skills");
+        write_skill(
+            &skills_root,
+            "one",
+            "---\nname: dup\ndescription: first\n---\n",
+        );
+        write_skill(
+            &skills_root,
+            "two",
+            "---\nname: dup\ndescription: second\n---\n",
+        );
+        let (found, collisions) = discover_with_diagnostics(tmp.path());
+        assert_eq!(
+            found.iter().filter(|s| s.name == "dup").count(),
+            1,
+            "the later file must win, not duplicate the entry: {found:?}"
+        );
+        assert!(
+            collisions.iter().any(|c| c.contains("dup")),
+            "collision must be reported: {collisions:?}"
+        );
+    }
+
+    #[test]
+    fn discover_with_diagnostics_is_empty_when_no_names_collide() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_root = tmp.path().join(".claude/skills");
+        write_skill(
+            &skills_root,
+            "solo",
+            "---\nname: solo\ndescription: alone\n---\n",
+        );
+        let (_, collisions) = discover_with_diagnostics(tmp.path());
+        assert!(collisions.is_empty(), "got: {collisions:?}");
     }
 
     #[test]
@@ -420,6 +505,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_frontmatter_returns_the_body_past_the_closing_fence() {
+        let (fm, body) =
+            parse_frontmatter("---\nname: x\ndescription: y\n---\nBody line 1.\nLine 2.");
+        assert_eq!(fm.get("name").map(String::as_str), Some("x"));
+        assert_eq!(body, "Body line 1.\nLine 2.");
+    }
+
+    #[test]
+    fn parse_frontmatter_with_no_fence_returns_the_whole_input_as_body() {
+        let (fm, body) = parse_frontmatter("just plain text, no frontmatter at all");
+        assert!(fm.is_empty());
+        assert_eq!(body, "just plain text, no frontmatter at all");
+    }
+
+    #[test]
     fn gitignored_directories_are_not_walked() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join(".gitignore"), "vendor/\n").unwrap();
@@ -487,6 +587,27 @@ mod tests {
         let expanded = expand_if_skill_invocation("/skill:lint", &skills);
         assert!(expanded.contains("Run `cargo clippy`."));
         assert!(!expanded.starts_with("/skill:"));
+    }
+
+    #[test]
+    fn expand_if_skill_invocation_strips_frontmatter_and_wraps_in_a_skill_tag() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(
+            tmp.path(),
+            "lint",
+            "---\nname: lint\ndescription: Run the linter\n---\n\nRun `cargo clippy`.",
+        );
+        let skills = discover_in(tmp.path());
+        let expanded = expand_if_skill_invocation("/skill:lint", &skills);
+        assert!(
+            expanded.starts_with("<skill name=\"lint\" location=\""),
+            "got: {expanded}"
+        );
+        assert!(expanded.trim_end().ends_with("</skill>"));
+        assert!(expanded.contains("Run `cargo clippy`."));
+        // The raw frontmatter fence and its keys must not leak into the model-facing expansion.
+        assert!(!expanded.contains("---"));
+        assert!(!expanded.contains("description: Run the linter"));
     }
 
     #[test]

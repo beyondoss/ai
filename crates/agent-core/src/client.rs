@@ -13,7 +13,7 @@ use futures::StreamExt;
 use serde_json::Value;
 
 use crate::dialect::{Dialect, push_sse_line};
-use crate::error::{Error, Result};
+use crate::error::{Error, MID_STREAM_NETWORK_ERROR, Result};
 use crate::transport::{EventStream, ModelRequest, ModelTransport};
 
 /// Anthropic's Messages API requires this header; the gateway relays it to the upstream verbatim.
@@ -24,6 +24,11 @@ const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 /// Prompt-caching beta opt-in. GA for current models, but sent explicitly so caching engages
 /// regardless of the `anthropic-version` default.
 const PROMPT_CACHING_BETA: &str = "prompt-caching-2024-07-31";
+/// Fallback streaming beta for a model whose tool definitions *don't* carry the per-tool
+/// `eager_input_streaming: true` marker (see `dialect::anthropic::mark_eager_tool_streaming`) — the two
+/// are mutually exclusive; no current model needs this branch, since every current id supports the
+/// per-tool marker instead, but it exists for correctness if that ever changes.
+const FINE_GRAINED_TOOL_STREAMING_BETA: &str = "fine-grained-tool-streaming-2025-05-14";
 
 /// How many times to re-issue a request that failed transiently (connection refused, timeout, or a
 /// retryable status) before giving up. A multi-step agent run re-issues a request every turn, so a
@@ -112,6 +117,8 @@ impl ModelTransport for GatewayClient {
         let needs_interleaved_beta = req.thinking.is_some()
             && crate::models::capabilities(&req.model).thinking
                 != crate::models::ThinkingShape::Adaptive;
+        let needs_fine_grained_tool_streaming_beta = !req.tools.is_empty()
+            && !crate::models::capabilities(&req.model).supports_eager_tool_streaming;
         let stream = async_stream::try_stream! {
             // Retry the request up to the first byte: a transient failure (refused connection, 429,
             // 503) is re-issued with backoff. We do *not* retry once events have started flowing — a
@@ -124,6 +131,7 @@ impl ModelTransport for GatewayClient {
                 &body,
                 is_anthropic,
                 needs_interleaved_beta,
+                needs_fine_grained_tool_streaming_beta,
                 max_retries,
                 base_backoff,
             )
@@ -138,7 +146,14 @@ impl ModelTransport for GatewayClient {
             let mut framer = LineFramer::new();
             let mut bytes = resp.bytes_stream();
             while let Some(chunk) = bytes.next().await {
-                let chunk = chunk.map_err(|e| Error::Transport(e.to_string()))?;
+                // A tagged prefix, not `e.to_string()` alone: this is the one call site that turns a
+                // live `reqwest::Error` into a mid-stream failure (a connection reset, a read timeout,
+                // an unexpected EOF — the body was already flowing, so pre-first-byte retry above
+                // never sees it), and `Agent::is_retryable_mid_stream` needs to tell "the network
+                // dropped us, safe to restart the turn" apart from "the provider rejected the request"
+                // without re-deriving reqwest's classification from its Display text.
+                let chunk =
+                    chunk.map_err(|e| Error::Transport(format!("{MID_STREAM_NETWORK_ERROR}: {e}")))?;
                 framer.extend(&chunk)?;
                 while let Some(line) = framer.next_line() {
                     let line = std::str::from_utf8(&line)
@@ -231,6 +246,25 @@ impl LineFramer {
     }
 }
 
+/// Comma-joined `anthropic-beta` opt-ins for a request. Prompt caching is GA but sent explicitly;
+/// interleaved thinking is added only for `Budget`-shape thinking requests; the fine-grained
+/// tool-streaming beta and each tool definition's own `eager_input_streaming` marker (see
+/// `dialect::anthropic::mark_eager_tool_streaming`) are mutually exclusive, so the beta only fires for a
+/// model that lacks the per-tool marker.
+fn anthropic_betas(
+    needs_interleaved: bool,
+    needs_fine_grained_tool_streaming: bool,
+) -> Vec<&'static str> {
+    let mut betas = vec![PROMPT_CACHING_BETA];
+    if needs_interleaved {
+        betas.push(INTERLEAVED_THINKING_BETA);
+    }
+    if needs_fine_grained_tool_streaming {
+        betas.push(FINE_GRAINED_TOOL_STREAMING_BETA);
+    }
+    betas
+}
+
 /// POST the request body, retrying transient failures with exponential backoff until a successful
 /// response or the retry budget is exhausted. Honors a `Retry-After` header when the server sends one.
 // 8 arguments, all independent inputs a single call site (`GatewayClient::stream`) already has in
@@ -246,6 +280,7 @@ async fn send_with_retry(
     body: &Value,
     is_anthropic: bool,
     needs_interleaved_beta: bool,
+    needs_fine_grained_tool_streaming_beta: bool,
     max_retries: u32,
     base_backoff: Duration,
 ) -> Result<reqwest::Response> {
@@ -254,12 +289,10 @@ async fn send_with_retry(
         let mut builder = http.post(url).bearer_auth(api_key).json(body);
         if is_anthropic {
             builder = builder.header("anthropic-version", ANTHROPIC_VERSION);
-            // Comma-separated beta opt-ins. Prompt caching is GA but harmless to opt into explicitly;
-            // interleaved thinking is added only for `Budget`-shape thinking requests.
-            let mut betas = vec![PROMPT_CACHING_BETA];
-            if needs_interleaved_beta {
-                betas.push(INTERLEAVED_THINKING_BETA);
-            }
+            let betas = anthropic_betas(
+                needs_interleaved_beta,
+                needs_fine_grained_tool_streaming_beta,
+            );
             builder = builder.header("anthropic-beta", betas.join(","));
         }
         match builder.send().await {
@@ -267,7 +300,23 @@ async fn send_with_retry(
             Ok(resp) => {
                 let status = resp.status();
                 if is_retryable_status(status.as_u16()) && attempt < max_retries {
-                    let wait = backoff(attempt, retry_after(&resp), base_backoff);
+                    let hint = retry_after(&resp);
+                    // A 429 needs a quick body peek before committing to a retry: some providers use it
+                    // for genuine rate limiting (worth retrying — the request will likely succeed once
+                    // the window resets) and others for quota/billing exhaustion (retrying only delays
+                    // an unavoidable failure while burning the retry budget on it). The status code
+                    // alone can't tell the two apart. Every other retryable status (408/409/5xx/529) is
+                    // a pure infra hiccup, never a billing signal, so it skips this check.
+                    if status.as_u16() == 429 {
+                        let detail = resp.text().await.unwrap_or_default();
+                        if is_quota_exhausted(&detail) {
+                            return Err(Error::Transport(format!(
+                                "gateway returned {status}: {}",
+                                truncate_error_body(detail.trim())
+                            )));
+                        }
+                    }
+                    let wait = backoff(attempt, hint, base_backoff);
                     attempt += 1;
                     futures_timer::Delay::new(wait).await;
                     continue;
@@ -300,6 +349,26 @@ async fn send_with_retry(
 /// transient 5xx gateway/upstream failures. A 4xx other than 429 is the caller's fault — don't retry.
 fn is_retryable_status(status: u16) -> bool {
     matches!(status, 408 | 409 | 429 | 500 | 502 | 503 | 504 | 529)
+}
+
+/// Phrases seen in a 429 body when the rejection is quota/billing exhaustion rather than transient
+/// rate limiting — retrying one of these will never succeed until the account itself changes, so it
+/// isn't worth spending the retry budget on. Deliberately narrower than `agent::is_context_overflow`'s
+/// throttle-exclusion list: this only needs to cover the "don't bother retrying a 429" case, not
+/// classify every provider's wording.
+const QUOTA_EXHAUSTED_PATTERNS: &[&str] = &[
+    "insufficient_quota",
+    "quota exceeded",
+    "billing",
+    "out of budget",
+    "exceeded your current quota",
+];
+
+/// Whether a 429 response body indicates quota/billing exhaustion (fail fast) rather than ordinary
+/// rate limiting (worth retrying).
+fn is_quota_exhausted(body: &str) -> bool {
+    let m = body.to_ascii_lowercase();
+    QUOTA_EXHAUSTED_PATTERNS.iter().any(|p| m.contains(p))
 }
 
 /// Whether a `reqwest` send error is the transient connection class (refused/reset/timed out).
@@ -387,12 +456,62 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_betas_are_mutually_exclusive_with_eager_tool_streaming() {
+        // Baseline: prompt caching only.
+        assert_eq!(anthropic_betas(false, false), vec![PROMPT_CACHING_BETA]);
+        // Interleaved thinking layers on top.
+        assert_eq!(
+            anthropic_betas(true, false),
+            vec![PROMPT_CACHING_BETA, INTERLEAVED_THINKING_BETA]
+        );
+        // The fine-grained tool-streaming beta only fires when the model lacks the per-tool
+        // `eager_input_streaming` marker — never true for any current model, but exercised directly.
+        assert_eq!(
+            anthropic_betas(false, true),
+            vec![PROMPT_CACHING_BETA, FINE_GRAINED_TOOL_STREAMING_BETA]
+        );
+        assert_eq!(
+            anthropic_betas(true, true),
+            vec![
+                PROMPT_CACHING_BETA,
+                INTERLEAVED_THINKING_BETA,
+                FINE_GRAINED_TOOL_STREAMING_BETA
+            ]
+        );
+    }
+
+    #[test]
     fn retryable_status_classification() {
         for s in [429, 500, 502, 503, 504, 529, 408, 409] {
             assert!(is_retryable_status(s), "{s} should be retryable");
         }
         for s in [200, 400, 401, 403, 404, 422] {
             assert!(!is_retryable_status(s), "{s} should not be retryable");
+        }
+    }
+
+    #[test]
+    fn quota_exhaustion_classification() {
+        for body in [
+            r#"{"error":{"type":"insufficient_quota","message":"You exceeded your current quota"}}"#,
+            r#"{"error":"quota exceeded for this billing period"}"#,
+            r#"{"error":"please add a payment method — billing required"}"#,
+            r#"{"error":"you are out of budget for this key"}"#,
+        ] {
+            assert!(
+                is_quota_exhausted(body),
+                "should classify as quota exhaustion: {body}"
+            );
+        }
+        for body in [
+            r#"{"error":{"type":"rate_limit_error","message":"Too many requests, please slow down"}}"#,
+            "",
+            "gateway timeout",
+        ] {
+            assert!(
+                !is_quota_exhausted(body),
+                "should NOT classify as quota exhaustion: {body}"
+            );
         }
     }
 
@@ -454,6 +573,151 @@ mod tests {
         assert!(
             delay > Duration::ZERO && delay <= MAX_BACKOFF,
             "future http-date should yield a bounded positive delay, got {delay:?}"
+        );
+    }
+
+    /// A real TCP peer that answers with valid SSE headers plus one partial event, then vanishes
+    /// without a clean shutdown — what an abrupt connection reset or a crashed upstream looks like on
+    /// the wire, as opposed to anything this crate constructs itself.
+    #[tokio::test]
+    async fn a_connection_dropped_mid_body_is_tagged_as_a_mid_stream_network_error() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            // Drain the request so the response write doesn't race a half-closed read side.
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            // `Content-Length` promises far more body than actually arrives before the connection
+            // vanishes — unlike a close-delimited (`Connection: close`, no length) body, where EOF
+            // *is* the defined end-of-body and reqwest would read this as a normal, if short, success.
+            // A length mismatch is what makes the abrupt close an actual framing violation reqwest
+            // surfaces as a body-read error, matching what a mid-response connection reset looks like
+            // against a real chunked/length-bearing gateway response.
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100000\r\n\r\n\
+                      data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n",
+                )
+                .unwrap();
+            stream.flush().unwrap();
+            // No `message_stop`, no clean FIN — the connection just disappears mid-response.
+            drop(stream);
+        });
+
+        let client = GatewayClient::new(format!("http://{addr}"), "test-key").unwrap();
+        let req = ModelRequest::new("claude-test", Vec::new(), 100);
+        let mut events = client.stream(req).await.unwrap(); // the request itself succeeds
+        let mut tagged = false;
+        while let Some(ev) = events.next().await {
+            if let Err(Error::Transport(msg)) = ev {
+                tagged = msg.contains(MID_STREAM_NETWORK_ERROR);
+                break;
+            }
+        }
+        server.join().unwrap();
+        assert!(
+            tagged,
+            "a mid-body connection drop must surface as a MID_STREAM_NETWORK_ERROR-tagged transport error"
+        );
+    }
+
+    /// A real TCP peer that always answers 429 with a quota-exhaustion body — proves the client fails
+    /// fast (one request, no retry) instead of burning its retry budget on a rejection retrying can
+    /// never fix.
+    #[tokio::test]
+    async fn a_429_with_quota_exhaustion_body_is_not_retried() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let request_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count = request_count.clone();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut stream, _)) = listener.accept() {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let body = r#"{"error":{"type":"insufficient_quota","message":"You exceeded your current quota"}}"#;
+                let resp = format!(
+                    "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+
+        let client = GatewayClient::new(format!("http://{addr}"), "test-key")
+            .unwrap()
+            .with_retry(3, Duration::from_millis(10));
+        let req = ModelRequest::new("claude-test", Vec::new(), 100);
+        let mut events = client.stream(req).await.unwrap();
+        let first = events.next().await;
+        server.join().unwrap();
+
+        assert!(
+            matches!(first, Some(Err(Error::Transport(_)))),
+            "expected a transport error, got {first:?}"
+        );
+        assert_eq!(
+            request_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a quota-exhausted 429 must not be retried"
+        );
+    }
+
+    /// A real TCP peer that answers 429 with an ordinary rate-limit body (no quota/billing phrase) on
+    /// the first request, then succeeds on the retry — proves ordinary rate limiting still gets the
+    /// normal retry treatment `is_quota_exhausted` doesn't touch.
+    #[tokio::test]
+    async fn a_429_with_a_plain_rate_limit_body_is_retried() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let request_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count = request_count.clone();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for attempt in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                if attempt == 0 {
+                    let body =
+                        r#"{"error":{"type":"rate_limit_error","message":"Too many requests"}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                } else {
+                    let sse = "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\ndata: {\"type\":\"message_stop\"}\n\n";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        sse.len(),
+                        sse
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+            }
+        });
+
+        let client = GatewayClient::new(format!("http://{addr}"), "test-key")
+            .unwrap()
+            .with_retry(3, Duration::from_millis(10));
+        let req = ModelRequest::new("claude-test", Vec::new(), 100);
+        let mut events = client.stream(req).await.unwrap();
+        let _ = events.next().await; // drive the stream far enough to trigger the retry + second request
+        server.join().unwrap();
+
+        assert_eq!(
+            request_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "an ordinary rate-limit 429 must still be retried"
         );
     }
 }

@@ -41,3 +41,12 @@ pub enum Error {
 
 /// Crate result alias.
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Marker prefix a transport tags onto an [`Error::Transport`] built from a failure reading the
+/// response body *after* it started flowing (a connection reset, a read timeout, an unexpected EOF) —
+/// the class worth restarting the turn for, since the failure is the network's, not the request's.
+/// Lives here (not in `client.rs`) so the network-blind agent loop can recognize it without depending
+/// on a concrete transport: any [`ModelTransport`](crate::transport::ModelTransport) impl can tag its
+/// own mid-stream failures with this same prefix rather than the loop trying to re-derive the
+/// classification from a provider- or library-specific error's `Display` text.
+pub const MID_STREAM_NETWORK_ERROR: &str = "mid-stream network error";

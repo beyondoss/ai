@@ -88,6 +88,14 @@ impl ImageSource {
 pub struct Message {
     pub role: Role,
     pub content: Vec<ContentBlock>,
+    /// The model id that produced this message, when known. Only stamped on assistant turns (see
+    /// `Agent::run_events_steered`) — used to scrub state that doesn't survive a model switch (signed
+    /// thinking blocks, combined OpenAI-Responses tool-call ids) from messages produced by a
+    /// *different* model than the one about to see them. `None` for user/tool-result turns and for any
+    /// message persisted before this field existed — both are treated as foreign (always scrubbed) by
+    /// [`Session::scrub_cross_model_state`](crate::session::Session::scrub_cross_model_state).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
 }
 
 impl Message {
@@ -96,6 +104,7 @@ impl Message {
         Self {
             role: Role::User,
             content: vec![ContentBlock::Text { text: text.into() }],
+            model_id: None,
         }
     }
 
@@ -104,6 +113,7 @@ impl Message {
         Self {
             role: Role::Assistant,
             content,
+            model_id: None,
         }
     }
 
@@ -121,6 +131,7 @@ impl Message {
         Self {
             role: Role::User,
             content,
+            model_id: None,
         }
     }
 
@@ -138,6 +149,7 @@ impl Message {
                 is_error,
                 images: Vec::new(),
             }],
+            model_id: None,
         }
     }
 
@@ -149,7 +161,15 @@ impl Message {
         Self {
             role: Role::User,
             content: blocks,
+            model_id: None,
         }
+    }
+
+    /// Stamp `model_id` in place — used right after `Message::assistant` to record the model that just
+    /// produced this turn (see `Agent::run_events_steered`).
+    pub fn with_model_id(mut self, model_id: impl Into<String>) -> Self {
+        self.model_id = Some(model_id.into());
+        self
     }
 
     /// The `ToolUse` blocks in this message, if any (what the loop dispatches each step).

@@ -71,6 +71,18 @@ pub struct ModelCaps {
     pub thinking: ThinkingShape,
     /// Whether the model takes an OpenAI `reasoning_effort` parameter.
     pub reasoning_effort: bool,
+    /// Whether the model accepts an *explicit* "reasoning off" signal — Anthropic
+    /// `{"type":"disabled"}`, or OpenAI `{"effort":"none"}` — when the caller isn't requesting
+    /// thinking/reasoning this turn. A model that supports thinking/`reasoning_effort` at all doesn't
+    /// necessarily support turning it off explicitly (e.g. `claude-fable-5`); one that supports
+    /// neither has nothing to disable, so this is `false` there too.
+    pub reasoning_disableable: bool,
+    /// Whether the model's tool definitions should be marked with `eager_input_streaming: true` on the
+    /// Anthropic wire (ignored outside the Anthropic dialect). `true` for every current Anthropic id;
+    /// exists as a named capability (rather than a blanket constant) so a future model needing the
+    /// mutually-exclusive `fine-grained-tool-streaming-2025-05-14` beta header instead has somewhere to
+    /// say so.
+    pub supports_eager_tool_streaming: bool,
     /// Which OpenAI-wire API surface the model speaks (ignored for Anthropic ids). See [`ApiKind`].
     pub api: ApiKind,
 }
@@ -87,6 +99,8 @@ impl ModelCaps {
             supports_vision: false,
             thinking: ThinkingShape::None,
             reasoning_effort: false,
+            reasoning_disableable: false,
+            supports_eager_tool_streaming: false,
             api: ApiKind::ChatCompletions,
         }
     }
@@ -125,6 +139,10 @@ pub fn capabilities(model: &str) -> ModelCaps {
             } else {
                 128_000
             };
+            // Every gen6+ id can be told to disable thinking explicitly, except claude-fable-5 (pi:
+            // `thinkingLevelMap: {"off": null}` — there's no "off" wire shape for it at all).
+            let reasoning_disableable =
+                !(m.starts_with("claude-fable-5") || m.starts_with("fable-5"));
             return ModelCaps {
                 context_window: 1_000_000,
                 max_output,
@@ -133,6 +151,8 @@ pub fn capabilities(model: &str) -> ModelCaps {
                 supports_vision: true,
                 thinking: ThinkingShape::Adaptive,
                 reasoning_effort: false,
+                reasoning_disableable,
+                supports_eager_tool_streaming: true,
                 api: ApiKind::ChatCompletions,
             };
         }
@@ -153,10 +173,19 @@ pub fn capabilities(model: &str) -> ModelCaps {
                 context_window: 200_000,
                 max_output,
                 max_tokens_field: MaxTokensField::MaxTokens,
-                supports_long_cache: false,
+                // Prompt caching (the 1-hour TTL included) is supported on every current Claude 3.x
+                // id — pi's catalogue defaults `supportsLongCacheRetention` to `true` and no gen-3
+                // entry overrides it. `false` here would silently downgrade a `cache_long` request on
+                // these ids to the standard 5-minute TTL instead of the 1-hour one asked for.
+                supports_long_cache: true,
                 supports_vision: true,
                 thinking: ThinkingShape::None,
                 reasoning_effort: false,
+                // No thinking support at all here — nothing to explicitly disable, so the `thinking`
+                // field stays omitted entirely rather than sending a `{"type":"disabled"}` a model
+                // that never supported thinking might reject.
+                reasoning_disableable: false,
+                supports_eager_tool_streaming: true,
                 api: ApiKind::ChatCompletions,
             };
         }
@@ -176,6 +205,8 @@ pub fn capabilities(model: &str) -> ModelCaps {
             supports_vision: true,
             thinking: ThinkingShape::Budget,
             reasoning_effort: false,
+            reasoning_disableable: true,
+            supports_eager_tool_streaming: true,
             api: ApiKind::ChatCompletions,
         };
     }
@@ -198,9 +229,14 @@ pub fn capabilities(model: &str) -> ModelCaps {
             max_output: 100_000,
             max_tokens_field: MaxTokensField::MaxCompletionTokens,
             supports_long_cache: true,
-            supports_vision: !m.starts_with("o1-mini"),
+            // o3-mini is text-only (pi's catalogue: `input: ["text"]`) — the one o-series id that
+            // isn't vision-capable, unlike o1-mini's exclusion above for a different reason.
+            supports_vision: !m.starts_with("o1-mini") && !m.starts_with("o3-mini"),
             thinking: ThinkingShape::None,
             reasoning_effort: true,
+            // o-series ids are disable-capable by default in pi's catalogue (no override).
+            reasoning_disableable: true,
+            supports_eager_tool_streaming: false,
             api: ApiKind::Responses,
         };
     }
@@ -209,8 +245,13 @@ pub fn capabilities(model: &str) -> ModelCaps {
     if m.starts_with("gpt-5") {
         // The narrower "-chat-latest" variants share the family name but cap at the older
         // chat-completions ceiling (128k/16384), not the reasoning-model one, and aren't uniformly
-        // `reasoning_effort`-driven — treat them like a non-reasoning chat model.
+        // `reasoning_effort`-driven — treat them like a non-reasoning chat model. Two of the four
+        // current ids (5.1/5.2) are still `reasoning_effort`-driven per pi's catalogue, though;
+        // gpt-5-chat-latest/gpt-5.3-chat-latest are not. None of the four support an explicit "off"
+        // signal (pi: `"off": null` for this whole bucket).
         if m.contains("chat-latest") {
+            let reasoning_effort =
+                m.starts_with("gpt-5.1-chat-latest") || m.starts_with("gpt-5.2-chat-latest");
             return ModelCaps {
                 context_window: 128_000,
                 max_output: 16_384,
@@ -218,19 +259,53 @@ pub fn capabilities(model: &str) -> ModelCaps {
                 supports_long_cache: true,
                 supports_vision: true,
                 thinking: ThinkingShape::None,
-                reasoning_effort: false,
+                reasoning_effort,
+                reasoning_disableable: false,
+                supports_eager_tool_streaming: false,
                 api: ApiKind::Responses,
             };
         }
-        // "-pro" variants ship a much larger 1.05M context. The bare "gpt-5.4"/"gpt-5.5" release (no
-        // mini/nano/pro suffix) runs a smaller 272k window; every other family member is 400k.
-        let context_window = if m.contains("pro") {
+        // "gpt-5.3-codex-spark" is a narrower model than the rest of the family — 128k context, 32k
+        // output — not the generic 400k/128k every other gpt-5 id gets below. Not in pi's
+        // disable-capable allowlist (that's `gpt-5.3-codex`, a different id).
+        if m == "gpt-5.3-codex-spark" {
+            return ModelCaps {
+                context_window: 128_000,
+                max_output: 32_000,
+                max_tokens_field: MaxTokensField::MaxCompletionTokens,
+                supports_long_cache: true,
+                supports_vision: true,
+                thinking: ThinkingShape::None,
+                reasoning_effort: true,
+                reasoning_disableable: false,
+                supports_eager_tool_streaming: false,
+                api: ApiKind::Responses,
+            };
+        }
+        // "-pro" ships a much larger 1.05M context — but only the 5.4/5.5 generation of it;
+        // gpt-5-pro/gpt-5.2-pro are 400k like the rest of the family. The bare "gpt-5.4"/"gpt-5.5"
+        // release (no mini/nano/pro suffix) runs a smaller 272k window; every other family member is
+        // 400k.
+        let context_window = if m == "gpt-5.4-pro" || m == "gpt-5.5-pro" {
             1_050_000
         } else if m == "gpt-5.4" || m == "gpt-5.5" {
             272_000
         } else {
             400_000
         };
+        // Disable-capability is a per-exact-id allowlist in pi's catalogue, not a blanket rule — an
+        // id under this generic branch that isn't listed here (e.g. bare "gpt-5", "gpt-5-mini",
+        // "gpt-5.3" without "-codex", any "-pro"/"-nano" variant not listed) has no "off" signal.
+        const GPT5_DISABLE_CAPABLE: &[&str] = &[
+            "gpt-5.1",
+            "gpt-5.2",
+            "gpt-5.3-codex",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.4-nano",
+            "gpt-5.5",
+        ];
+        let reasoning_disableable = GPT5_DISABLE_CAPABLE.iter().any(|id| m == *id);
         return ModelCaps {
             context_window,
             max_output: 128_000,
@@ -239,11 +314,14 @@ pub fn capabilities(model: &str) -> ModelCaps {
             supports_vision: true,
             thinking: ThinkingShape::None,
             reasoning_effort: true,
+            reasoning_disableable,
+            supports_eager_tool_streaming: false,
             api: ApiKind::Responses,
         };
     }
 
     // ---- OpenAI GPT-4 family (bare gpt-4 / 4-turbo / 4o / 4.1) ----
+    // None of these take `reasoning_effort` at all, so there's nothing to explicitly disable.
     if m.starts_with("gpt-4") {
         // 4.1 shipped a ~1M-token context window, a full step up from the rest of the family.
         if m.starts_with("gpt-4.1") {
@@ -255,6 +333,23 @@ pub fn capabilities(model: &str) -> ModelCaps {
                 supports_vision: true,
                 thinking: ThinkingShape::None,
                 reasoning_effort: false,
+                reasoning_disableable: false,
+                supports_eager_tool_streaming: false,
+                api: ApiKind::Responses,
+            };
+        }
+        // This one pinned snapshot caps output tighter (4096) than every other 4o-family id (16384).
+        if m == "gpt-4o-2024-05-13" {
+            return ModelCaps {
+                context_window: 128_000,
+                max_output: 4_096,
+                max_tokens_field: MaxTokensField::MaxTokens,
+                supports_long_cache: true,
+                supports_vision: true,
+                thinking: ThinkingShape::None,
+                reasoning_effort: false,
+                reasoning_disableable: false,
+                supports_eager_tool_streaming: false,
                 api: ApiKind::Responses,
             };
         }
@@ -275,6 +370,8 @@ pub fn capabilities(model: &str) -> ModelCaps {
             supports_vision: true,
             thinking: ThinkingShape::None,
             reasoning_effort: false,
+            reasoning_disableable: false,
+            supports_eager_tool_streaming: false,
             api: ApiKind::Responses,
         };
     }
@@ -356,7 +453,9 @@ mod tests {
                 ThinkingShape::None,
                 "{id} predates extended thinking"
             );
-            assert!(!c.supports_long_cache);
+            // No thinking support doesn't mean no long-cache support — prompt caching (including the
+            // 1-hour TTL) is a separate, orthogonal capability that every current Claude 3.x id has.
+            assert!(c.supports_long_cache, "{id} does support the 1h cache TTL");
         }
         // 3.7-sonnet is the exception: it *does* support extended thinking (Budget shape).
         assert_eq!(
@@ -397,6 +496,120 @@ mod tests {
             ThinkingShape::None
         );
         assert!(!capabilities("gpt-5-chat-latest").reasoning_effort);
+    }
+
+    #[test]
+    fn o3_mini_is_text_only() {
+        // The one o-series id that isn't vision-capable (pi: `input: ["text"]`), unlike o1-mini
+        // (excluded above for a different reason) and every other o-series id.
+        assert!(!capabilities("o3-mini").supports_vision);
+        assert!(capabilities("o1").supports_vision);
+        assert!(capabilities("o4-mini").supports_vision);
+    }
+
+    #[test]
+    fn gpt5_pro_context_window_only_1_05m_for_5_4_and_5_5() {
+        // Only the 5.4/5.5 generation of "-pro" gets the larger window; earlier -pro ids share the
+        // rest of the family's 400k.
+        assert_eq!(capabilities("gpt-5-pro").context_window, 400_000);
+        assert_eq!(capabilities("gpt-5.2-pro").context_window, 400_000);
+        assert_eq!(capabilities("gpt-5.4-pro").context_window, 1_050_000);
+        assert_eq!(capabilities("gpt-5.5-pro").context_window, 1_050_000);
+    }
+
+    #[test]
+    fn gpt_5_3_codex_spark_is_narrower_than_the_rest_of_the_family() {
+        let c = capabilities("gpt-5.3-codex-spark");
+        assert_eq!(c.context_window, 128_000);
+        assert_eq!(c.max_output, 32_000);
+    }
+
+    #[test]
+    fn chat_latest_reasoning_effort_is_id_specific() {
+        // 5.1/5.2-chat-latest are still reasoning_effort-driven per pi's catalogue; the plain and
+        // 5.3 chat-latest ids are not.
+        assert!(capabilities("gpt-5.1-chat-latest").reasoning_effort);
+        assert!(capabilities("gpt-5.2-chat-latest").reasoning_effort);
+        assert!(!capabilities("gpt-5-chat-latest").reasoning_effort);
+        assert!(!capabilities("gpt-5.3-chat-latest").reasoning_effort);
+    }
+
+    #[test]
+    fn gpt4o_2024_05_13_pinned_snapshot_caps_output_at_4096() {
+        // This one dated snapshot caps output tighter (4096) than every other 4o-family id (16384).
+        assert_eq!(capabilities("gpt-4o-2024-05-13").max_output, 4_096);
+        assert_eq!(capabilities("gpt-4o").max_output, 16_384);
+    }
+
+    #[test]
+    fn reasoning_disableable_is_id_specific_not_family_wide() {
+        // Anthropic: every gen6+ id can be told to disable thinking explicitly, except claude-fable-5.
+        assert!(capabilities("claude-opus-4-8").reasoning_disableable);
+        assert!(capabilities("claude-sonnet-5").reasoning_disableable);
+        assert!(!capabilities("claude-fable-5").reasoning_disableable);
+        assert!(!capabilities("fable-5").reasoning_disableable);
+        // Budget-shaped (pre-gen6, post-gen3) Claude ids are disable-capable too.
+        assert!(capabilities("claude-opus-4-5").reasoning_disableable);
+        // Gen-3 legacy ids have no thinking support at all — nothing to disable.
+        assert!(!capabilities("claude-3-5-sonnet-20241022").reasoning_disableable);
+
+        // OpenAI o-series: disable-capable by default.
+        assert!(capabilities("o3-mini").reasoning_disableable);
+        assert!(capabilities("o1").reasoning_disableable);
+
+        // OpenAI gpt-5: only the exact-match allowlist is disable-capable.
+        assert!(capabilities("gpt-5.1").reasoning_disableable);
+        assert!(capabilities("gpt-5.2").reasoning_disableable);
+        assert!(capabilities("gpt-5.3-codex").reasoning_disableable);
+        assert!(capabilities("gpt-5.4").reasoning_disableable);
+        assert!(capabilities("gpt-5.4-mini").reasoning_disableable);
+        assert!(capabilities("gpt-5.4-nano").reasoning_disableable);
+        assert!(capabilities("gpt-5.5").reasoning_disableable);
+        assert!(
+            !capabilities("gpt-5").reasoning_disableable,
+            "bare gpt-5 isn't in the allowlist"
+        );
+        assert!(
+            !capabilities("gpt-5.1-chat-latest").reasoning_disableable,
+            "chat-latest ids have no off signal even though they take reasoning_effort"
+        );
+        assert!(!capabilities("gpt-5.3-codex-spark").reasoning_disableable);
+
+        // OpenAI gpt-4 family never takes reasoning_effort — nothing to disable.
+        assert!(!capabilities("gpt-4o").reasoning_disableable);
+        assert!(!capabilities("gpt-4.1").reasoning_disableable);
+    }
+
+    #[test]
+    fn supports_eager_tool_streaming_is_anthropic_only() {
+        // Every current Anthropic id (across all three generational branches) supports the per-tool
+        // eager-input-streaming shape.
+        for id in [
+            "claude-opus-4-8",
+            "claude-sonnet-5",
+            "claude-fable-5",
+            "claude-3-5-sonnet-20241022",
+            "claude-opus-4-5",
+        ] {
+            assert!(
+                capabilities(id).supports_eager_tool_streaming,
+                "{id} should support eager tool streaming"
+            );
+        }
+        // No current OpenAI id does — it's an Anthropic-wire-only concept.
+        for id in [
+            "o1",
+            "gpt-5",
+            "gpt-5-chat-latest",
+            "gpt-5.3-codex-spark",
+            "gpt-4o",
+            "gpt-4.1",
+        ] {
+            assert!(
+                !capabilities(id).supports_eager_tool_streaming,
+                "{id} should not support eager tool streaming"
+            );
+        }
     }
 
     #[test]

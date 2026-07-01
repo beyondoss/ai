@@ -74,6 +74,14 @@ pub struct OutputSnapshot {
     pub last_line_bytes: u64,
 }
 
+/// Format a bracketed truncation marker — pi's `[<description>]` convention, already used by
+/// [`format_output`]'s own `[Showing …]`/`[Full output: …]` markers. `read`/`grep`/`ls`/`find` each
+/// wrap their own truncation description in this shared bracket format instead of a hand-rolled
+/// `… (…)` string, so a truncation note reads consistently regardless of which tool emitted it.
+pub fn marker(description: impl std::fmt::Display) -> String {
+    format!("[{description}]")
+}
+
 /// Format a byte count the way pi's `formatSize` does: `<1024` → `"{n}B"`; `<1 MiB` →
 /// `"{:.1}KB"`; otherwise `"{:.1}MB"`. Divisor is 1024 at each step.
 pub fn format_size(bytes: u64) -> String {
@@ -84,6 +92,33 @@ pub fn format_size(bytes: u64) -> String {
     } else {
         format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
     }
+}
+
+/// Ceiling on total rendered output bytes for listing-style tools (`grep`, `find`, `ls`). Their
+/// per-item cap (`limit`) bounds *count*, but long paths/lines can still blow past a sane context
+/// budget well before `limit` items are reached; this is the backstop on the assembled text itself.
+pub const MAX_LISTING_BYTES: usize = 50 * 1024;
+
+/// Truncate an already-assembled listing `out` to [`MAX_LISTING_BYTES`] and append a marker, when it
+/// exceeds the cap. Returns whether truncation happened, so callers can skip a redundant count-based
+/// marker: the byte cap is checked *before* any count marker is appended, and takes priority when both
+/// would otherwise fire, since appending the count marker first and then truncating to the byte cap
+/// could slice straight through — and silently drop — the marker just added.
+pub fn cap_listing_bytes(out: &mut String, guidance: &str) -> bool {
+    if out.len() <= MAX_LISTING_BYTES {
+        return false;
+    }
+    let mut end = MAX_LISTING_BYTES;
+    while !out.is_char_boundary(end) {
+        end -= 1;
+    }
+    out.truncate(end);
+    out.push_str("\n\n");
+    out.push_str(&marker(format_args!(
+        "output truncated at {}; {guidance}",
+        format_size(MAX_LISTING_BYTES as u64)
+    )));
+    true
 }
 
 /// A unique-enough 16-hex-char (8-byte) token for temp-file names. It only needs to avoid collisions
@@ -719,7 +754,10 @@ mod tests {
             full.extend_from_slice(&line);
             acc.append(&line);
         }
-        assert!(acc.spilled, "test setup: expected auto-spill to have happened");
+        assert!(
+            acc.spilled,
+            "test setup: expected auto-spill to have happened"
+        );
         assert!(acc.temp_path.is_some());
 
         acc.mark_spill_broken();
@@ -787,6 +825,15 @@ mod tests {
             )),
             "got tail: {}",
             &out[out.len().saturating_sub(120)..]
+        );
+    }
+
+    #[test]
+    fn marker_wraps_the_description_in_brackets() {
+        assert_eq!(marker("plain text"), "[plain text]");
+        assert_eq!(
+            marker(format_args!("{} more entries", 7)),
+            "[7 more entries]"
         );
     }
 

@@ -59,6 +59,19 @@ pub fn turn_text(text: &str) -> String {
     ])
 }
 
+/// An Anthropic SSE turn that ends with `stop_reason: "refusal"` — a distinct terminal condition from
+/// a normal end-of-turn (see `agent_core::agent::Agent::run_events_steered`).
+pub fn turn_refusal(text: &str) -> String {
+    sse(&[
+        json!({ "type": "message_start", "message": { "usage": { "input_tokens": 12, "output_tokens": 1 } } }),
+        json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }),
+        json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": text } }),
+        json!({ "type": "content_block_stop", "index": 0 }),
+        json!({ "type": "message_delta", "delta": { "stop_reason": "refusal" }, "usage": { "output_tokens": 6 } }),
+        json!({ "type": "message_stop" }),
+    ])
+}
+
 fn sse(events: &[Value]) -> String {
     events.iter().map(|e| format!("data: {e}\n\n")).collect()
 }

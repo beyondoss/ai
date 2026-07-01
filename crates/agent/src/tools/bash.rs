@@ -1,4 +1,5 @@
-//! `bash` — run a shell command via `sh -c` and stream/return its combined output.
+//! `bash` — run a shell command via a resolved `bash` (falling back to `sh`) and stream/return its
+//! combined output.
 //!
 //! Output handling mirrors pi: raw stdout+stderr feed one [`OutputAccumulator`] (tail-truncated for
 //! display, full stream spilled to a temp file → `Full output: <path>`), and while the command runs
@@ -7,6 +8,7 @@
 //! the output — same as pi's throw.
 
 use std::borrow::Cow;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
@@ -30,6 +32,30 @@ const DEFAULT_TIMEOUT_MS: u64 = 1_800_000;
 /// Minimum gap between streamed progress snapshots — pi's `BASH_UPDATE_THROTTLE_MS`. Keeps a chatty
 /// command from flooding the event stream; the final snapshot is always emitted regardless.
 const UPDATE_THROTTLE: Duration = Duration::from_millis(100);
+
+/// Resolve the shell commands run through: `/bin/bash` if present, else `bash` on `$PATH`, else `sh` —
+/// pi's `shell.ts` resolution order (minus the Windows/WSL branches, which don't apply on this
+/// platform). Bash's associative arrays, `[[`, `pipefail`, and process substitution are common enough
+/// in model-generated commands that silently falling back to a POSIX `sh` (which may be `dash`, and
+/// rejects all of the above) is a real correctness gap, not just a style preference. Cached: the
+/// filesystem/PATH answer can't change mid-process.
+fn resolve_shell() -> &'static str {
+    static SHELL: OnceLock<String> = OnceLock::new();
+    SHELL.get_or_init(|| {
+        if Path::new("/bin/bash").exists() {
+            return "/bin/bash".to_string();
+        }
+        if let Some(path) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&path) {
+                let candidate = dir.join("bash");
+                if candidate.exists() {
+                    return candidate.to_string_lossy().into_owned();
+                }
+            }
+        }
+        "sh".to_string()
+    })
+}
 
 pub struct Bash {
     runner: Arc<dyn CommandRunner>,
@@ -112,7 +138,9 @@ impl Bash {
                 }
             };
             let sink: ChunkSink<'_> = &sink;
-            self.runner.run_streaming("sh", &args, cwd, dur, sink).await
+            self.runner
+                .run_streaming(resolve_shell(), &args, cwd, dur, sink)
+                .await
         }
         .map_err(|e| ToolError::Execution(format!("spawn failed: {e}")))?;
 
@@ -170,7 +198,7 @@ impl Tool for Bash {
         "bash"
     }
     fn description(&self) -> &str {
-        "Run a shell command via `sh -c` and return its combined stdout/stderr. Supports an optional \
+        "Run a shell command via bash and return its combined stdout/stderr. Supports an optional \
          `cwd` and `timeout_ms`."
     }
     fn input_schema(&self) -> Value {
@@ -183,6 +211,13 @@ impl Tool for Bash {
             },
             "required": ["command"]
         })
+    }
+
+    // An opaque shell command can mutate anything reachable from its `cwd` — there's no single path
+    // to report via `write_target`, so without this a same-turn `edit`/`write` it happens to race
+    // (e.g. `edit foo.py` batched with `bash: black foo.py`) would run fully concurrently against it.
+    fn conservative_exclusive(&self) -> bool {
+        true
     }
 
     async fn run(&self, input: Value) -> Result<ToolOutput, ToolError> {
@@ -372,7 +407,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invokes_sh_dash_c() {
+    async fn invokes_the_resolved_shell_dash_c() {
         let runner = recording(ExecResult {
             code: Some(0),
             stdout: "hi\n".into(),
@@ -386,8 +421,17 @@ mod tests {
         // pi does not trim: the command's output is shown as-is (trailing newline kept).
         assert_eq!(out, "hi\n");
         let (prog, args, _timeout) = runner.last.lock().unwrap().clone().unwrap();
-        assert_eq!(prog, "sh");
+        assert_eq!(prog, resolve_shell());
         assert_eq!(args, vec!["-c".to_string(), "echo hi".to_string()]);
+    }
+
+    #[test]
+    fn resolve_shell_never_panics_and_returns_a_plausible_path() {
+        let shell = resolve_shell();
+        assert!(!shell.is_empty());
+        assert!(shell == "sh" || shell.contains("bash"));
+        // Cached: calling twice returns the same answer.
+        assert_eq!(resolve_shell(), shell);
     }
 
     #[tokio::test]

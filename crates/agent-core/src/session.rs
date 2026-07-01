@@ -50,6 +50,12 @@ pub struct Session {
     /// context window.
     #[serde(default)]
     pub last_input_tokens: u32,
+    /// `messages.len()` at the moment `last_input_tokens` was last set. Messages appended after this
+    /// point (the very turn that usage snapshot came from, plus anything since) aren't reflected in
+    /// `last_input_tokens` yet — `compaction::trailing_tokens` estimates them separately so the
+    /// compaction trigger isn't comparing the window against a stale, undercounted size.
+    #[serde(default)]
+    pub last_usage_message_count: usize,
     /// What compaction has recorded about this session so far — folded forward across every round
     /// (see [`CompactionProvenance`]), since `apply_summary` physically replaces the summarized
     /// messages and anything not captured here is lost with them. Default (all-empty, `compactions:
@@ -94,19 +100,33 @@ impl Session {
         self
     }
 
-    /// Drop every `Thinking`/`RedactedThinking` block from history. A signed thinking block is only
-    /// valid for replay to the model that produced it — Anthropic can reject a later turn that replays
-    /// one to a *different* model — so a mid-session model switch (`set_model`) must scrub them rather
-    /// than risk the next turn erroring. Coarser than tracking per-message model provenance (there is
-    /// none today), but correct: the reasoning trace is lost, never silently misapplied.
-    pub fn strip_thinking_blocks(&mut self) {
+    /// Scrub state that doesn't survive a model switch, ahead of resuming the conversation on
+    /// `new_model`. Two things are per-producing-model, not portable:
+    ///
+    /// - Signed `Thinking`/`RedactedThinking` blocks — Anthropic can reject a later turn that replays
+    ///   one to a different model than produced it.
+    /// - Combined OpenAI-Responses tool-call ids (`"call_id|item_id"`) — the `item_id` half only pairs
+    ///   with a `reasoning` item on the *same* model/dialect; replayed to a foreign model it's at best
+    ///   dead weight, at worst rejected.
+    ///
+    /// Applied per-message, gated on `Message::model_id`: a message stamped with `new_model` itself is
+    /// untouched (still valid to replay), everything else — including any message with `model_id: None`
+    /// (persisted before this field existed, or from a source that never stamped it) — is treated as
+    /// foreign and scrubbed. `split_once('|')`-based truncation is a no-op for Anthropic-native tool-use
+    /// ids (never contain `|`), so this is safe to run unconditionally regardless of dialect.
+    pub fn scrub_cross_model_state(&mut self, new_model: &str) {
         let messages = Arc::make_mut(&mut self.messages);
         for message in messages.iter_mut() {
-            message.content.retain(|block| {
-                !matches!(
-                    block,
-                    ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. }
-                )
+            if message.model_id.as_deref() == Some(new_model) {
+                continue;
+            }
+            message.content.retain_mut(|block| match block {
+                ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => false,
+                ContentBlock::ToolUse { id, .. } => {
+                    *id = crate::dialect::openai_responses::call_id_only(id);
+                    true
+                }
+                _ => true,
             });
         }
     }
@@ -129,6 +149,7 @@ impl Session {
             .input_tokens
             .saturating_add(usage.cache_read_tokens)
             .saturating_add(usage.cache_write_tokens);
+        self.last_usage_message_count = self.messages.len();
     }
 }
 
@@ -137,22 +158,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn strip_thinking_blocks_drops_thinking_and_redacted_keeps_the_rest() {
+    fn scrub_cross_model_state_drops_thinking_blocks_from_a_foreign_model() {
         let mut s = Session::new();
         s.push(Message::user("think then answer"));
-        s.push(Message::assistant(vec![
-            ContentBlock::Thinking {
-                text: "let me reason".into(),
-                signature: "sig-abc".into(),
-            },
-            ContentBlock::RedactedThinking {
-                data: "opaque".into(),
-            },
-            ContentBlock::Text {
-                text: "answer".into(),
-            },
-        ]));
-        s.strip_thinking_blocks();
+        s.push(
+            Message::assistant(vec![
+                ContentBlock::Thinking {
+                    text: "let me reason".into(),
+                    signature: "sig-abc".into(),
+                },
+                ContentBlock::RedactedThinking {
+                    data: "opaque".into(),
+                },
+                ContentBlock::Text {
+                    text: "answer".into(),
+                },
+            ])
+            .with_model_id("claude-opus-4-8"),
+        );
+        s.scrub_cross_model_state("gpt-5");
         assert_eq!(s.messages[0].content.len(), 1); // user text untouched
         assert_eq!(s.messages[1].content.len(), 1); // only the Text block survives
         assert_eq!(
@@ -161,6 +185,51 @@ mod tests {
                 text: "answer".into()
             }
         );
+    }
+
+    #[test]
+    fn scrub_cross_model_state_leaves_a_message_stamped_with_the_new_model_untouched() {
+        let mut s = Session::new();
+        s.push(
+            Message::assistant(vec![ContentBlock::Thinking {
+                text: "reasoning".into(),
+                signature: "sig".into(),
+            }])
+            .with_model_id("gpt-5"),
+        );
+        s.scrub_cross_model_state("gpt-5");
+        assert_eq!(s.messages[0].content.len(), 1); // thinking block survives — same model
+    }
+
+    #[test]
+    fn scrub_cross_model_state_treats_a_message_with_no_model_id_as_foreign() {
+        // Persisted before this field existed (or from a source that never stamped it) — always
+        // scrubbed, matching the conservative default `strip_thinking_blocks` used to apply to all.
+        let mut s = Session::new();
+        s.push(Message::assistant(vec![ContentBlock::Thinking {
+            text: "reasoning".into(),
+            signature: "sig".into(),
+        }]));
+        s.scrub_cross_model_state("gpt-5");
+        assert!(s.messages[0].content.is_empty());
+    }
+
+    #[test]
+    fn scrub_cross_model_state_truncates_combined_tool_call_ids_from_a_foreign_model() {
+        let mut s = Session::new();
+        s.push(
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "call_1|fc_1".into(),
+                name: "read".into(),
+                input: serde_json::json!({}),
+            }])
+            .with_model_id("gpt-5"),
+        );
+        s.scrub_cross_model_state("claude-opus-4-8");
+        let ContentBlock::ToolUse { id, .. } = &s.messages[0].content[0] else {
+            panic!("expected a ToolUse block");
+        };
+        assert_eq!(id, "call_1");
     }
 
     #[test]

@@ -61,18 +61,35 @@ fn text_of(blocks: &[ContentBlock]) -> String {
         .collect()
 }
 
+/// Placeholder text substituted for an image sent to a model that doesn't accept one — matching pi's
+/// `transform-messages.ts` (`downgradeUnsupportedImages`); the Anthropic dialect uses the identical
+/// string for the same purpose.
+const USER_IMAGE_PLACEHOLDER: &str = "(image omitted: model does not support images)";
+/// Same idea, for a tool result's image output specifically.
+const TOOL_IMAGE_PLACEHOLDER: &str = "(tool image omitted: model does not support images)";
+
 /// Build an OpenAI user-message `content` from a turn's text and image blocks (tool results are
 /// emitted separately). Returns a plain string when there are no images — OpenAI's common case — and
-/// a multimodal parts array (`[{type:"text"}, {type:"image_url"}…]`) when images are present. `None`
-/// if the turn carries neither text nor image (e.g. a tool-result-only turn). Without this, image
-/// blocks were dropped on the floor: `text_of` keeps only text, so vision input silently vanished.
-fn user_content(blocks: &[ContentBlock]) -> Option<Value> {
+/// a multimodal parts array (`[{type:"text"}, {type:"image_url"}…]`) when images are present and
+/// `supports_vision` is `true`. `None` if the turn carries neither text nor image (e.g. a
+/// tool-result-only turn). Without this, image blocks were dropped on the floor: `text_of` keeps only
+/// text, so vision input silently vanished. When the model can't accept images, the image is instead
+/// replaced with a placeholder note (rather than sent and rejected, or silently dropped).
+fn user_content(blocks: &[ContentBlock], supports_vision: bool) -> Option<Value> {
     let has_image = blocks
         .iter()
         .any(|b| matches!(b, ContentBlock::Image { .. }));
     if !has_image {
         let text = text_of(blocks);
         return (!text.is_empty()).then_some(Value::String(text));
+    }
+    if !supports_vision {
+        let mut text = text_of(blocks);
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(USER_IMAGE_PLACEHOLDER);
+        return Some(Value::String(text));
     }
     let mut parts: Vec<Value> = Vec::new();
     for b in blocks {
@@ -94,6 +111,7 @@ fn user_content(blocks: &[ContentBlock]) -> Option<Value> {
 
 /// Build the streaming request body, translating the internal messages into OpenAI's flat shape.
 pub fn build_body(req: &ModelRequest) -> Value {
+    let caps = crate::models::capabilities(&req.model);
     let mut messages: Vec<Value> = Vec::new();
     if let Some(system) = &req.system {
         messages.push(json!({ "role": "system", "content": system }));
@@ -107,7 +125,7 @@ pub fn build_body(req: &ModelRequest) -> Value {
             Role::User => {
                 // Text + image blocks form the user message (a multimodal parts array when any image
                 // is present); tool results fan out into individual `role:"tool"` messages below.
-                if let Some(content) = user_content(&m.content) {
+                if let Some(content) = user_content(&m.content, caps.supports_vision) {
                     messages.push(json!({ "role": "user", "content": content }));
                 }
                 for b in &m.content {
@@ -120,21 +138,31 @@ pub fn build_body(req: &ModelRequest) -> Value {
                     {
                         messages.push(json!({ "role": "tool", "tool_call_id": tool_use_id, "content": content }));
                         // OpenAI's `tool` role can't carry images, so fan any visual output out to a
-                        // following `user` message that references the originating call.
+                        // following `user` message that references the originating call — or, when the
+                        // model can't accept images at all, a plain text placeholder instead.
                         if !images.is_empty() {
-                            let mut parts: Vec<Value> = vec![json!({
-                                "type": "text",
-                                "text": format!("Image output from tool call {tool_use_id}:"),
-                            })];
-                            for source in images {
-                                parts.push(json!({
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": format!("data:{};base64,{}", source.media_type, source.data),
-                                    },
+                            if !caps.supports_vision {
+                                messages.push(json!({
+                                    "role": "user",
+                                    "content": format!(
+                                        "Image output from tool call {tool_use_id}: {TOOL_IMAGE_PLACEHOLDER}"
+                                    ),
                                 }));
+                            } else {
+                                let mut parts: Vec<Value> = vec![json!({
+                                    "type": "text",
+                                    "text": format!("Image output from tool call {tool_use_id}:"),
+                                })];
+                                for source in images {
+                                    parts.push(json!({
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": format!("data:{};base64,{}", source.media_type, source.data),
+                                        },
+                                    }));
+                                }
+                                messages.push(json!({ "role": "user", "content": parts }));
                             }
-                            messages.push(json!({ "role": "user", "content": parts }));
                         }
                     }
                 }
@@ -180,7 +208,6 @@ pub fn build_body(req: &ModelRequest) -> Value {
         }
     }
 
-    let caps = crate::models::capabilities(&req.model);
     let mut map = Map::new();
     map.insert("model".into(), json!(req.model));
     // OpenAI reasoning models (o-series, gpt-5) reject `max_tokens` and require
@@ -252,6 +279,14 @@ fn map_finish_reason(s: Option<&str>) -> StopReason {
         Some("stop") => StopReason::EndTurn,
         Some("tool_calls") | Some("function_call") => StopReason::ToolUse,
         Some("length") => StopReason::MaxTokens,
+        // A safety-filtered or connection-dropped completion is not a clean stop — collapsing it into
+        // `Other` (which the loop treats identically to `EndTurn`) would report a filtered/truncated
+        // response as if the turn succeeded normally. `Refusal` is already this crate's distinct
+        // terminal state for "the model didn't actually finish answering, don't read this as success"
+        // (see the Anthropic dialect's own `stop_reason: "refusal"`/`"sensitive"` handling); `network_error`
+        // shares the same "the caller must not treat this as a real answer" shape even though it isn't a
+        // refusal in the strict sense — there is no better-fitting variant for either today.
+        Some("content_filter") | Some("network_error") => StopReason::Refusal,
         Some(other) => {
             // A genuinely unrecognized value (a new finish_reason we don't know about yet) silently
             // collapsing into `Other` — which the loop treats identically to a normal `EndTurn` —
@@ -294,6 +329,12 @@ pub struct Decoder {
     /// as the `Thinking` block's `signature` so a later replay (`build_body`) sends it back under the
     /// exact field name this provider expects (some accept only one of the three).
     reasoning_field: Option<&'static str>,
+    /// The `tool_calls[].index` of the tool call currently open (`self.open == Open::Tool`), if the
+    /// provider sent one. A parallel-tool-call turn interleaves each call's deltas by this index; an
+    /// `arguments` fragment is only appended when its index matches, so a fragment for a call that
+    /// isn't (or is no longer) open can't silently corrupt whichever call's buffer happens to be open
+    /// right now (see `push`'s tool-call arm).
+    tool_index: Option<i64>,
 }
 
 impl Default for Decoder {
@@ -305,6 +346,7 @@ impl Default for Decoder {
             stop_reason: StopReason::EndTurn,
             usage: TokenUsage::default(),
             reasoning_field: None,
+            tool_index: None,
         }
     }
 }
@@ -415,9 +457,11 @@ impl StreamDecoder for Decoder {
         {
             for tc in calls {
                 let func = tc.get("function");
+                let index = tc.get("index").and_then(Value::as_i64);
                 if let Some(id) = tc.get("id").and_then(Value::as_str) {
                     self.close_open(&mut out);
                     self.open = Open::Tool;
+                    self.tool_index = index;
                     let name = func
                         .and_then(|f| f.get("name"))
                         .and_then(Value::as_str)
@@ -432,10 +476,27 @@ impl StreamDecoder for Decoder {
                     .and_then(|f| f.get("arguments"))
                     .and_then(Value::as_str)
                 {
+                    // A continuation fragment (no `id`) only belongs to the call currently open —
+                    // matched by index when the provider sends one. Without this check, a fragment
+                    // that arrives for a *different* tool call (a provider interleaving parallel calls'
+                    // deltas rather than completing one before starting the next) would silently
+                    // append into whatever call happens to be open right now, corrupting its JSON
+                    // arguments. A missing index (some minimal implementations omit it, harmless for a
+                    // single tool call) falls back to trusting whatever's open, same as before.
+                    let belongs_to_open =
+                        self.open == Open::Tool && (index.is_none() || index == self.tool_index);
                     if !args.is_empty() {
-                        out.push(StreamEvent::InputJsonDelta {
-                            partial_json: args.to_string(),
-                        });
+                        if belongs_to_open {
+                            out.push(StreamEvent::InputJsonDelta {
+                                partial_json: args.to_string(),
+                            });
+                        } else {
+                            tracing::warn!(
+                                expected = ?self.tool_index,
+                                got = ?index,
+                                "dropping out-of-order OpenAI tool-call argument fragment (index mismatch)"
+                            );
+                        }
                     }
                 }
             }
@@ -607,6 +668,57 @@ mod tests {
     }
 
     #[test]
+    fn images_are_downgraded_to_a_placeholder_for_a_non_vision_model() {
+        use crate::message::ImageSource;
+        // o3-mini is the one o-series id that isn't vision-capable.
+        let req = ModelRequest::new(
+            "o3-mini",
+            vec![
+                Message::user_with_images(
+                    "what is this?",
+                    vec![ImageSource::base64("image/png", "AAAA")],
+                ),
+                Message::tool_results(vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_1".into(),
+                    content: "screenshot attached".into(),
+                    is_error: false,
+                    images: vec![ImageSource::base64("image/png", "BBBB")],
+                }]),
+            ],
+            64,
+        );
+        let body = build_body(&req);
+
+        // A plain string, not a multimodal parts array — the image became a placeholder note.
+        assert_eq!(
+            body["messages"][0]["content"],
+            "what is this?\n(image omitted: model does not support images)"
+        );
+
+        // The tool-result image never fans out to a following user message at all — no `image_url`
+        // part anywhere, just the placeholder folded into the tool message's own text content.
+        assert_eq!(body["messages"][1]["role"], "tool");
+        assert_eq!(body["messages"][1]["content"], "screenshot attached");
+        assert_eq!(body["messages"][2]["role"], "user");
+        assert_eq!(
+            body["messages"][2]["content"],
+            "Image output from tool call call_1: (tool image omitted: model does not support images)"
+        );
+
+        // A vision-capable model is unaffected.
+        let req = ModelRequest::new(
+            "gpt-4o",
+            vec![Message::user_with_images(
+                "what is this?",
+                vec![ImageSource::base64("image/png", "AAAA")],
+            )],
+            64,
+        );
+        let body = build_body(&req);
+        assert_eq!(body["messages"][0]["content"][1]["type"], "image_url");
+    }
+
+    #[test]
     fn reasoning_models_use_max_completion_tokens() {
         // o-series / gpt-5 reject `max_tokens` on chat-completions; the body must carry
         // `max_completion_tokens` instead. A non-reasoning model keeps `max_tokens`.
@@ -721,6 +833,98 @@ data: [DONE]
                 }),
                 StreamEvent::MessageStop {
                     stop_reason: StopReason::ToolUse
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn content_filter_finish_reason_maps_to_refusal_not_a_clean_stop() {
+        // A safety-filtered completion must not be indistinguishable from a normal `EndTurn` — the
+        // loop treats `Refusal` as a distinct terminal condition (ends the run, doesn't drain queued
+        // steer/follow-up messages), where `Other` would silently be read as success.
+        const FILTERED: &str = r#"
+data: {"choices":[{"index":0,"delta":{"content":"partial an"},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"content_filter"}]}
+
+data: [DONE]
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, FILTERED).unwrap();
+        assert_eq!(
+            events.last(),
+            Some(&StreamEvent::MessageStop {
+                stop_reason: StopReason::Refusal
+            })
+        );
+    }
+
+    #[test]
+    fn network_error_finish_reason_maps_to_refusal_not_a_clean_stop() {
+        const NETWORK_ERROR: &str = r#"
+data: {"choices":[{"index":0,"delta":{"content":"partial an"},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"network_error"}]}
+
+data: [DONE]
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, NETWORK_ERROR).unwrap();
+        assert_eq!(
+            events.last(),
+            Some(&StreamEvent::MessageStop {
+                stop_reason: StopReason::Refusal
+            })
+        );
+    }
+
+    #[test]
+    fn interleaved_parallel_tool_calls_do_not_corrupt_each_others_arguments() {
+        // Two parallel tool calls (index 0 then index 1) where a late/reordered index-0 argument
+        // fragment arrives *after* index 1 has already opened — a provider interleaving deltas across
+        // parallel calls rather than completing one before starting the next. The stray index-0
+        // fragment must be dropped, not silently appended into index 1's (currently open) buffer.
+        const INTERLEAVED: &str = r#"
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_A","type":"function","function":{"name":"alpha","arguments":""}}]},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"x\":1"}}]},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_B","type":"function","function":{"name":"beta","arguments":""}}]},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"}"}}]},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"y\":2}"}}]},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, INTERLEAVED).unwrap();
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::MessageStart,
+                StreamEvent::ToolUseStart {
+                    id: "call_A".into(),
+                    name: "alpha".into(),
+                },
+                StreamEvent::InputJsonDelta {
+                    partial_json: "{\"x\":1".into(),
+                },
+                StreamEvent::ContentBlockStop,
+                StreamEvent::ToolUseStart {
+                    id: "call_B".into(),
+                    name: "beta".into(),
+                },
+                // The stray index-0 "}" fragment is dropped here — not appended to call_B's buffer.
+                StreamEvent::InputJsonDelta {
+                    partial_json: "{\"y\":2}".into(),
+                },
+                StreamEvent::ContentBlockStop,
+                StreamEvent::MessageStop {
+                    stop_reason: StopReason::ToolUse,
                 },
             ]
         );

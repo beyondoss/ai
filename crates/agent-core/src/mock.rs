@@ -97,6 +97,21 @@ pub mod turn {
         ]
     }
 
+    /// A turn that emits a refusal explanation and ends with `StopReason::Refusal` — a distinct
+    /// terminal condition from a normal end-of-turn (see `Agent::run_events_steered`).
+    pub fn refusal(s: &str) -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::MessageStart,
+            StreamEvent::TextDelta {
+                text: s.to_string(),
+            },
+            StreamEvent::ContentBlockStop,
+            StreamEvent::MessageStop {
+                stop_reason: StopReason::Refusal,
+            },
+        ]
+    }
+
     /// A turn that calls one tool with the given (whole) JSON argument string.
     pub fn tool_call(id: &str, name: &str, args_json: &str) -> Vec<StreamEvent> {
         vec![

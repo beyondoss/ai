@@ -23,6 +23,7 @@ use crate::transport::{ModelRequest, ToolChoice};
 /// third onto the last message to capture the conversation so far. The TTL is 5 min, or 1 hour when
 /// `cache_long` is set (see [`cache_control`]).
 pub fn build_body(req: &ModelRequest) -> Value {
+    let caps = crate::models::capabilities(&req.model);
     let mut map = Map::new();
     map.insert("model".into(), Value::String(req.model.clone()));
     map.insert("max_tokens".into(), Value::from(req.max_tokens));
@@ -31,7 +32,7 @@ pub fn build_body(req: &ModelRequest) -> Value {
     // The 1-hour TTL is only valid on models that support long cache retention; Anthropic 400s
     // otherwise. Gate the request's `cache_long` opt-in on the model's capability so an unsupported
     // model silently falls back to the standard 5-minute TTL instead of erroring the turn.
-    let long = req.cache_long && crate::models::capabilities(&req.model).supports_long_cache;
+    let long = req.cache_long && caps.supports_long_cache;
     // `no_cache` skips every breakpoint below: a genuinely one-off request (no follow-up turn to read
     // the cache back) would otherwise eat the ~1.25x cache-write premium for an entry nothing reads.
     let cc = (!req.no_cache).then(|| cache_control(long));
@@ -39,6 +40,13 @@ pub fn build_body(req: &ModelRequest) -> Value {
     // Rolling breakpoint: cache the conversation prefix (tools + system + every prior message) up to
     // the final block, so next turn the whole accumulated transcript is a cache read, not a re-bill.
     let mut messages = serde_json::to_value(req.messages.as_ref()).unwrap_or(Value::Null);
+    // `Message::model_id` is an internal-only provenance field (which model produced this turn, used
+    // by `Session::scrub_cross_model_state`) — it must never reach the wire. Anthropic's schema is
+    // strict about unknown fields on a message object and 400s the whole request if it leaks through
+    // (unlike the OpenAI dialects, which build each wire message from named fields rather than
+    // serializing `Message` wholesale, so they never had this exposure).
+    strip_model_id(&mut messages);
+    downgrade_unsupported_images(&mut messages, caps.supports_vision);
     encode_tool_result_images(&mut messages);
     if let Some(cc) = &cc {
         mark_last_block(&mut messages, cc);
@@ -67,7 +75,7 @@ pub fn build_body(req: &ModelRequest) -> Value {
         // easy to get wrong. Both shapes explicitly set `display: "summarized"`: Anthropic's own API
         // default for `adaptive` is "omitted" (no visible reasoning text at all), so leaving it unset
         // on an adaptive model silently produces empty thinking output.
-        match crate::models::capabilities(&req.model).thinking {
+        match caps.thinking {
             crate::models::ThinkingShape::Adaptive => {
                 map.insert(
                     "thinking".into(),
@@ -88,12 +96,20 @@ pub fn build_body(req: &ModelRequest) -> Value {
                 );
             }
         }
+    } else if caps.reasoning_disableable {
+        // No thinking requested this turn, but the model can be told so explicitly rather than
+        // relying on Anthropic's own undocumented default for whatever it does when the field is
+        // omitted entirely.
+        map.insert("thinking".into(), json!({ "type": "disabled" }));
     }
     if !req.tools.is_empty() {
         // Anchor breakpoint: the tool definitions (ten JSON schemas) are identical every turn and sit
         // at the front of the cache order, so this entry stays warm even when the rolling message
         // breakpoint is rewritten each turn. Requires stable tool ordering — see `definitions()`.
         let mut tools = serde_json::to_value(req.tools.as_ref()).unwrap_or(Value::Null);
+        if caps.supports_eager_tool_streaming {
+            mark_eager_tool_streaming(&mut tools);
+        }
         if let Some(cc) = &cc {
             mark_last_tool(&mut tools, cc);
         }
@@ -127,6 +143,19 @@ fn cache_control(long: bool) -> Value {
     }
 }
 
+/// Remove the internal-only `model_id` key from every message object — `Message` derives `Serialize`
+/// directly (for session persistence), so a straight `serde_json::to_value` of the whole history
+/// carries it along unless stripped here first. Anthropic rejects a message object with any field
+/// outside its schema, so leaking this 400s the entire request.
+fn strip_model_id(messages: &mut Value) {
+    let Some(msgs) = messages.as_array_mut() else {
+        return;
+    };
+    for m in msgs.iter_mut().filter_map(Value::as_object_mut) {
+        m.remove("model_id");
+    }
+}
+
 /// Stamp a cache breakpoint onto the last content block of the last message. No-op if the history is
 /// empty or the final message carries no content blocks.
 fn mark_last_block(messages: &mut Value, cc: &Value) {
@@ -139,6 +168,76 @@ fn mark_last_block(messages: &mut Value, cc: &Value) {
         .and_then(Value::as_object_mut)
     {
         block.insert("cache_control".into(), cc.clone());
+    }
+}
+
+/// A model that can't accept images placeholder-text for one, matching pi's `transform-messages.ts`
+/// (`downgradeUnsupportedImages`).
+const USER_IMAGE_PLACEHOLDER: &str = "(image omitted: model does not support images)";
+/// Same idea, for a tool result's images specifically — a distinct string so a transcript reader can
+/// tell which shape produced it.
+const TOOL_IMAGE_PLACEHOLDER: &str = "(tool image omitted: model does not support images)";
+
+/// Replace image content with a text placeholder when `supports_vision` is `false` — sending an image
+/// to a model that doesn't accept one would otherwise 400 the whole turn instead of degrading
+/// gracefully. Runs *before* [`encode_tool_result_images`], while a `tool_result`'s images still live
+/// in their own `images` field (simpler to clear there than to un-splice them from `content` after).
+/// A no-op when `supports_vision` is `true` — the overwhelmingly common case costs nothing beyond the
+/// flag check.
+fn downgrade_unsupported_images(messages: &mut Value, supports_vision: bool) {
+    if supports_vision {
+        return;
+    }
+    let Some(msgs) = messages.as_array_mut() else {
+        return;
+    };
+    for m in msgs {
+        let Some(content) = m.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for block in content.iter_mut() {
+            let Some(obj) = block.as_object_mut() else {
+                continue;
+            };
+            if obj.get("type").and_then(Value::as_str) != Some("tool_result") {
+                continue;
+            }
+            let had_images =
+                matches!(obj.get("images"), Some(Value::Array(imgs)) if !imgs.is_empty());
+            if !had_images {
+                continue;
+            }
+            obj.remove("images");
+            let mut text = obj
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(TOOL_IMAGE_PLACEHOLDER);
+            obj.insert("content".into(), Value::String(text));
+        }
+        // Collapse any run of consecutive user-turn `{"type":"image"}` blocks into one placeholder
+        // text block, matching pi (rather than one placeholder per image).
+        let old = std::mem::take(content);
+        let mut pending_placeholder = false;
+        for block in old {
+            let is_image = block.get("type").and_then(Value::as_str) == Some("image");
+            if is_image {
+                pending_placeholder = true;
+                continue;
+            }
+            if pending_placeholder {
+                content.push(json!({ "type": "text", "text": USER_IMAGE_PLACEHOLDER }));
+                pending_placeholder = false;
+            }
+            content.push(block);
+        }
+        if pending_placeholder {
+            content.push(json!({ "type": "text", "text": USER_IMAGE_PLACEHOLDER }));
+        }
     }
 }
 
@@ -180,6 +279,17 @@ fn encode_tool_result_images(messages: &mut Value) {
                 parts.push(json!({ "type": "image", "source": source }));
             }
             obj.insert("content".into(), Value::Array(parts));
+        }
+    }
+}
+
+/// Mark every tool definition eager-input-streaming-capable — mutually exclusive with the
+/// `fine-grained-tool-streaming-2025-05-14` beta header (see `client.rs`), which only applies to models
+/// where this capability is absent.
+fn mark_eager_tool_streaming(tools: &mut Value) {
+    if let Some(list) = tools.as_array_mut() {
+        for tool in list.iter_mut().filter_map(Value::as_object_mut) {
+            tool.insert("eager_input_streaming".into(), json!(true));
         }
     }
 }
@@ -434,6 +544,51 @@ mod tests {
     }
 
     #[test]
+    fn build_body_never_leaks_model_id_onto_the_wire() {
+        // `Message::model_id` is internal-only provenance for `Session::scrub_cross_model_state` — a
+        // live 400 (`messages.N.model_id: Extra inputs are not permitted`) proved this was leaking
+        // straight through `serde_json::to_value(req.messages)` before `strip_model_id` was added.
+        let req = ModelRequest::new(
+            "claude-opus-4-8",
+            vec![
+                Message::user("hi"),
+                Message::assistant(vec![ContentBlock::Text {
+                    text: "hello".into(),
+                }])
+                .with_model_id("claude-opus-4-8"),
+            ],
+            256,
+        );
+        let body = build_body(&req);
+        for m in body["messages"].as_array().unwrap() {
+            assert!(
+                m.get("model_id").is_none(),
+                "model_id must never reach the wire: {m}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_body_marks_every_tool_eager_input_streaming() {
+        let req =
+            ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 256).with_tools(vec![
+                ToolDef {
+                    name: "read".into(),
+                    description: "read a file".into(),
+                    input_schema: json!({ "type": "object" }),
+                },
+                ToolDef {
+                    name: "write".into(),
+                    description: "write a file".into(),
+                    input_schema: json!({ "type": "object" }),
+                },
+            ]);
+        let body = build_body(&req);
+        assert_eq!(body["tools"][0]["eager_input_streaming"], true);
+        assert_eq!(body["tools"][1]["eager_input_streaming"], true);
+    }
+
+    #[test]
     fn build_body_stamps_cache_breakpoints() {
         let req = ModelRequest::new(
             "claude-opus-4-8",
@@ -498,6 +653,27 @@ mod tests {
         assert!(body["system"][0].get("cache_control").is_none());
         // The system block itself is still present, just uncached.
         assert_eq!(body["system"][0]["text"], "be brief");
+    }
+
+    #[test]
+    fn thinking_is_explicitly_disabled_when_not_requested_on_a_disable_capable_model() {
+        // No `thinking` requested on a model that supports turning it off explicitly (gen6+, minus
+        // claude-fable-5) → an explicit `{"type":"disabled"}`, not silent reliance on whatever
+        // Anthropic's own undocumented default does when the field is omitted.
+        let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 256);
+        let body = build_body(&req);
+        assert_eq!(body["thinking"]["type"], "disabled");
+
+        // claude-fable-5 has no "off" wire shape at all (pi: `thinkingLevelMap: {"off": null}") — the
+        // `thinking` field must stay omitted entirely, not sent as `{"type":"disabled"}`.
+        let req = ModelRequest::new("claude-fable-5", vec![Message::user("hi")], 256);
+        let body = build_body(&req);
+        assert!(body.get("thinking").is_none());
+
+        // Legacy gen-3 models have no thinking support at all — same "field omitted" expectation.
+        let req = ModelRequest::new("claude-3-5-sonnet-20241022", vec![Message::user("hi")], 256);
+        let body = build_body(&req);
+        assert!(body.get("thinking").is_none());
     }
 
     #[test]
@@ -769,6 +945,66 @@ data: {"type":"message_stop"}
         assert_eq!(content[1]["source"]["data"], "AAAA");
         // The transient `images` field must not leak onto the wire.
         assert!(body["messages"][0]["content"][0].get("images").is_none());
+    }
+
+    #[test]
+    fn images_are_downgraded_to_a_placeholder_for_a_non_vision_model() {
+        use crate::message::ImageSource;
+        // No current Anthropic id has `supports_vision: false`, so exercise the fallback
+        // (`ModelCaps::unknown()`) via a genuinely unrecognized model id — the one real path that
+        // reaches a non-vision Anthropic-wire model today, and the one a not-yet-catalogued future
+        // model would take.
+        let req = ModelRequest::new(
+            "some-future-anthropic-model",
+            vec![
+                Message::user_with_images(
+                    "what is this?",
+                    vec![ImageSource::base64("image/png", "AAAA")],
+                ),
+                Message::tool_results(vec![ContentBlock::ToolResult {
+                    tool_use_id: "tu_1".into(),
+                    content: "here is the screenshot".into(),
+                    is_error: false,
+                    images: vec![ImageSource::base64("image/png", "BBBB")],
+                }]),
+            ],
+            256,
+        );
+        let body = build_body(&req);
+
+        // User-turn image → one placeholder text block, no image block.
+        let user_content = &body["messages"][0]["content"];
+        assert_eq!(
+            user_content[0],
+            json!({ "type": "text", "text": "what is this?" })
+        );
+        assert_eq!(
+            user_content[1],
+            json!({ "type": "text", "text": "(image omitted: model does not support images)" })
+        );
+        assert_eq!(user_content.as_array().unwrap().len(), 2);
+
+        // Tool-result image → placeholder appended to the text content (still a plain string — no
+        // images survive to make `encode_tool_result_images` promote it to a content array), and the
+        // transient `images` field is gone.
+        assert_eq!(
+            body["messages"][1]["content"][0]["content"],
+            "here is the screenshot\n(tool image omitted: model does not support images)"
+        );
+        assert!(body["messages"][1]["content"][0].get("images").is_none());
+
+        // A vision-capable model is unaffected (existing image tests already cover the positive case,
+        // but assert it here too for a direct before/after contrast in one place).
+        let req = ModelRequest::new(
+            "claude-opus-4-8",
+            vec![Message::user_with_images(
+                "what is this?",
+                vec![ImageSource::base64("image/png", "AAAA")],
+            )],
+            256,
+        );
+        let body = build_body(&req);
+        assert_eq!(body["messages"][0]["content"][1]["type"], "image");
     }
 
     #[test]

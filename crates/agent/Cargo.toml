@@ -18,6 +18,10 @@ workspace = true
 async-trait.workspace = true
 beyond-ai-agent-core = { path = "../agent-core" }
 clap.workspace = true
+# Draining a `ToolProgress` sink for `serve`'s host-level `bash` RPC command — the same channel type
+# `agent_core::ToolProgress` is built on, so we poll it directly rather than adapting between channel
+# flavors.
+futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -46,6 +50,11 @@ unicode-normalization = "0.1"
 
 # `read` base64-encodes image files so the multimodal model can see them (e.g. a screenshot).
 base64 = "0.22"
+# `read`'s image pipeline: magic-byte format sniffing (`guess_format`) and Lanczos3 downscaling for an
+# oversized image, so it fits the base64 budget instead of being refused outright. `default-features =
+# false` drops the `rayon`/AVIF/EXR/etc. formats we never decode; only the four raster formats `read`
+# actually accepts are enabled.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 
 [dev-dependencies]
 # Scratch files/dirs for the file-tool tests.

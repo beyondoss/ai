@@ -4,6 +4,7 @@
 //! (project). When a prompt message begins with `/name ...`, the matching template's body is expanded
 //! with bash-style argument substitution and sent to the model in place of the slash line.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -23,7 +24,17 @@ pub struct PromptTemplate {
 
 /// Discover prompt templates under the user and project roots; project shadows user by name.
 pub fn discover(cwd: &Path) -> Vec<PromptTemplate> {
+    discover_with_diagnostics(cwd).0
+}
+
+/// Like [`discover`], but also reports name collisions — the same `/name` defined by more than one
+/// template file, silently shadowed by `discover` (the later root, or the later file within one root,
+/// wins) — as human-readable strings naming both paths, for `get_commands` to surface as a diagnostic
+/// rather than a client having no way to notice a template was shadowed.
+pub fn discover_with_diagnostics(cwd: &Path) -> (Vec<PromptTemplate>, Vec<String>) {
     let mut found: Vec<PromptTemplate> = Vec::new();
+    let mut origins: HashMap<String, PathBuf> = HashMap::new();
+    let mut collisions: Vec<String> = Vec::new();
     let mut roots: Vec<PathBuf> = Vec::new();
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
         roots.push(home.join(".claude/prompts"));
@@ -52,6 +63,14 @@ pub fn discover(cwd: &Path) -> Vec<PromptTemplate> {
                 description,
                 body,
             };
+            if let Some(existing_path) = origins.get(&name) {
+                collisions.push(format!(
+                    "prompt template \"{name}\" defined at both {} and {} — the latter wins",
+                    existing_path.display(),
+                    path.display()
+                ));
+            }
+            origins.insert(name.clone(), path.clone());
             if let Some(existing) = found.iter_mut().find(|t| t.name == name) {
                 *existing = template;
             } else {
@@ -60,7 +79,7 @@ pub fn discover(cwd: &Path) -> Vec<PromptTemplate> {
         }
     }
     found.sort_by(|a, b| a.name.cmp(&b.name));
-    found
+    (found, collisions)
 }
 
 /// Split optional `---` frontmatter (reading `argument-hint:` and `description:`) from the body, and
@@ -328,6 +347,23 @@ mod tests {
         assert_eq!(
             expanded,
             "Fix the bug in foo.rs and explain: foo.rs urgently"
+        );
+    }
+
+    #[test]
+    fn discover_with_diagnostics_is_empty_when_no_names_collide() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pdir = tmp.path().join(".claude/prompts");
+        fs::create_dir_all(&pdir).unwrap();
+        fs::write(pdir.join("solo.md"), "Body.").unwrap();
+        // `discover_with_diagnostics` also scans the developer's real `~/.claude/prompts`, which could
+        // in principle carry a same-named file — vanishingly unlikely for this fixture's name, and
+        // consistent with how this module's other `discover` (not `discover_in`) tests already accept
+        // scanning the real user root.
+        let (_, collisions) = discover_with_diagnostics(tmp.path());
+        assert!(
+            !collisions.iter().any(|c| c.contains("solo")),
+            "got: {collisions:?}"
         );
     }
 

@@ -7,6 +7,7 @@
 //! sorted by path, so output is deterministic and `limit` truncation keeps the lexicographically-
 //! smallest paths. A hard cap bounds memory; the blocking walk runs on `spawn_blocking`.
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use agent_core::tool::Tool;
@@ -50,7 +51,14 @@ impl FindJob {
 pub fn search(job: &FindJob) -> (Vec<PathBuf>, bool) {
     let mut paths: Vec<PathBuf> = Vec::new();
     // `hidden(false)` includes dotfiles (like ripgrep --hidden); .gitignore is respected by default.
-    for entry in WalkBuilder::new(&job.root).hidden(false).build() {
+    // `require_git(false)` keeps that respect even outside an actual git repository (e.g. a plain
+    // checkout with no `.git`, or a tree copied without its VCS metadata) — the ignore crate's default
+    // otherwise silently stops honoring `.gitignore` the moment there's no repo to find.
+    for entry in WalkBuilder::new(&job.root)
+        .hidden(false)
+        .require_git(false)
+        .build()
+    {
         if paths.len() >= HARD_CAP {
             break;
         }
@@ -135,14 +143,25 @@ impl Tool for Find {
         if paths.is_empty() {
             return Ok(no_match.into());
         }
+        // Write straight into `out` instead of allocating a `format!` temp String per path — same fix
+        // as `read`/`ls`/`grep`'s formatting loops. `writeln!` into a `String` can't fail, so the
+        // `Result` is discarded.
         let mut out = String::new();
         for path in &paths {
-            out.push_str(&format!("{}\n", path.display()));
+            let _ = writeln!(out, "{}", path.display());
         }
-        if truncated {
-            out.push_str(&format!(
-                "… (result limit {limit} reached; raise `limit` for more)\n"
-            ));
+        // The byte cap is checked *before* the result-count marker, and takes priority when both would
+        // otherwise fire — see `cap_listing_bytes`'s doc comment.
+        let byte_capped =
+            super::output::cap_listing_bytes(&mut out, "narrow the pattern or path to see more");
+        if !byte_capped && truncated {
+            let _ = writeln!(
+                out,
+                "{}",
+                super::output::marker(format_args!(
+                    "result limit {limit} reached; raise `limit` for more"
+                ))
+            );
         }
         Ok(out.into())
     }
@@ -228,8 +247,90 @@ mod tests {
             .await
             .unwrap()
             .text;
-        assert!(out.contains("result limit 3 reached"));
+        assert!(out.contains("[result limit 3 reached; raise `limit` for more]"));
         assert!(out.contains("f00.rs") && out.contains("f01.rs") && out.contains("f02.rs"));
         assert!(!out.contains("f03.rs"));
+    }
+
+    #[tokio::test]
+    async fn gitignore_is_honored_even_outside_a_git_repository() {
+        // `tempfile::tempdir()` lives under the system temp dir, not inside any git repository, so
+        // this exercises `require_git(false)`: without it, the `ignore` crate's default behavior is
+        // to stop respecting `.gitignore` files entirely once there's no `.git` ancestor to find.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "ignored.rs\n").unwrap();
+        std::fs::write(dir.path().join("ignored.rs"), "").unwrap();
+        std::fs::write(dir.path().join("kept.rs"), "").unwrap();
+        let out = Find
+            .run(json!({ "pattern": "*.rs", "path": dir.path().to_str().unwrap() }))
+            .await
+            .unwrap()
+            .text;
+        assert!(out.contains("kept.rs"), "got: {out}");
+        assert!(
+            !out.contains("ignored.rs"),
+            ".gitignore should be honored even without a .git directory: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn output_byte_cap_truncates_even_under_the_result_limit() {
+        // 300 long-named matches: well under the 1000-result default `limit` (so the result-count
+        // marker never fires), but the aggregate listing of paths still blows past the 50KB output
+        // cap on its own.
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..300 {
+            let name = format!("{i:04}-{}.rs", "x".repeat(200));
+            std::fs::write(dir.path().join(name), "").unwrap();
+        }
+        let out = Find
+            .run(json!({ "pattern": "*.rs", "path": dir.path().to_str().unwrap() }))
+            .await
+            .unwrap()
+            .text;
+        assert!(
+            out.len() <= super::super::output::MAX_LISTING_BYTES + 256,
+            "output should be capped near MAX_LISTING_BYTES, got {} bytes",
+            out.len()
+        );
+        assert!(
+            out.contains("[output truncated at 50.0KB"),
+            "byte-cap marker missing: {}",
+            &out[out.len().saturating_sub(200)..]
+        );
+        assert!(
+            !out.contains("result limit"),
+            "result-count marker must not co-fire when count never exceeded the limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn output_byte_cap_takes_priority_over_the_result_count_marker() {
+        // 1200 long-named matches against the default 1000-result `limit`: both the result-count
+        // marker (1200 > 1000) and the byte cap would fire on the same rendered text. The byte cap
+        // must win outright rather than leaving a marker sliced in half.
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..1200 {
+            let name = format!("{i:04}-{}.rs", "x".repeat(200));
+            std::fs::write(dir.path().join(name), "").unwrap();
+        }
+        let out = Find
+            .run(json!({ "pattern": "*.rs", "path": dir.path().to_str().unwrap() }))
+            .await
+            .unwrap()
+            .text;
+        assert!(
+            out.contains("[output truncated at 50.0KB"),
+            "byte-cap marker missing: {out}"
+        );
+        assert!(
+            !out.contains("result limit"),
+            "the byte-cap marker must win cleanly, not leave a mangled count marker behind"
+        );
+        assert!(
+            out.len() <= super::super::output::MAX_LISTING_BYTES + 256,
+            "output should be capped near MAX_LISTING_BYTES, got {} bytes",
+            out.len()
+        );
     }
 }

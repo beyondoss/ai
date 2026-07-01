@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use crate::compaction::{SUMMARY_SYSTEM, extract_file_ops, render_prefix};
+use crate::compaction::{SUMMARY_SYSTEM, estimate_message_tokens, extract_file_ops, render_prefix};
 use crate::message::Message;
 use crate::transport::ModelRequest;
 
@@ -31,16 +31,53 @@ identifiers (file paths, function names, commands) verbatim and omitting pleasan
 /// branch rather than being organic conversation content.
 pub const BRANCH_SUMMARY_MARKER: &str = "[Explored a different branch before returning here]";
 
+/// Keep only as much of the *tail* of `messages` as fits within `budget_tokens`, walking newest-to-
+/// oldest and stopping once the accumulated estimate would exceed it — pi's `prepareBranchEntries`
+/// windowing, so an oversized abandoned branch can't blow out the summarization call's own context
+/// window. Unlike compaction's `find_cut` (whose kept suffix re-enters the live conversation and so
+/// must land on a clean role-alternation boundary), a branch summary's rendered transcript is a
+/// one-off prompt discarded right after the call — no alternation constraint, so a plain budget walk
+/// suffices. Always keeps at least the single most recent message, even alone over budget, so a
+/// pathologically large final message doesn't window down to nothing.
+fn windowed_by_budget(messages: &[Message], budget_tokens: u32) -> &[Message] {
+    let mut acc = 0u32;
+    let mut start = messages.len();
+    for (i, m) in messages.iter().enumerate().rev() {
+        let cost = estimate_message_tokens(m);
+        if start != messages.len() && acc.saturating_add(cost) > budget_tokens {
+            break;
+        }
+        acc = acc.saturating_add(cost);
+        start = i;
+    }
+    &messages[start..]
+}
+
 /// Build the (network-free) branch-summarization request for `messages` — an abandoned branch's
 /// materialized messages, root to its old tip (e.g. the slice `SessionStore::switch_active` returns,
-/// captured *before* navigating away from it). Reuses [`render_prefix`] to render the transcript and
-/// [`extract_file_ops`] to tag the files the branch touched — exactly like a compaction summary, since
-/// both operations condense a transcript the same way for a different trigger.
-pub fn branch_summary_request(model: &str, messages: &[Message], max_tokens: u32) -> ModelRequest {
+/// captured *before* navigating away from it). [`extract_file_ops`] tags the files the *whole* branch
+/// touched (cheap metadata, kept regardless of size); the rendered transcript itself is windowed to
+/// `input_token_budget` (typically the model's `context_window - reserve_tokens`, mirroring pi) via
+/// [`windowed_by_budget`], with a note when that actually dropped older activity — otherwise a long
+/// branch could overflow the summarization model's own context window, the one failure mode this
+/// windowing exists to prevent.
+pub fn branch_summary_request(
+    model: &str,
+    messages: &[Message],
+    max_tokens: u32,
+    input_token_budget: u32,
+) -> ModelRequest {
     let (read, modified) = extract_file_ops(messages);
+    let windowed = windowed_by_budget(messages, input_token_budget);
 
     let mut prompt = String::new();
-    prompt.push_str(&render_prefix(messages));
+    if windowed.len() < messages.len() {
+        prompt.push_str(&format!(
+            "[{} earlier message(s) from this branch omitted to fit the summarization budget]\n\n",
+            messages.len() - windowed.len()
+        ));
+    }
+    prompt.push_str(&render_prefix(windowed));
     prompt.push_str("\n\n");
     if !read.is_empty() {
         prompt.push_str(&format!(
@@ -89,7 +126,7 @@ mod tests {
 
     #[test]
     fn branch_summary_request_renders_transcript_and_tags_files() {
-        let req = branch_summary_request("claude-test", &branch(), 512);
+        let req = branch_summary_request("claude-test", &branch(), 512, 100_000);
         let ContentBlock::Text { text } = &req.messages[0].content[0] else {
             panic!("expected text");
         };
@@ -105,6 +142,67 @@ mod tests {
     }
 
     #[test]
+    fn windowed_by_budget_keeps_only_the_newest_tail_within_budget() {
+        // Each message here costs a few tokens (estimate_tokens is chars/4); a tiny budget should keep
+        // only the last one or two, never the whole branch.
+        let messages = branch();
+        let windowed = windowed_by_budget(&messages, 1);
+        assert!(
+            windowed.len() < messages.len(),
+            "must actually drop older messages"
+        );
+        assert_eq!(
+            windowed.last().unwrap().content,
+            messages.last().unwrap().content,
+            "the most recent message must always survive"
+        );
+    }
+
+    #[test]
+    fn windowed_by_budget_never_drops_to_empty_on_one_oversized_message() {
+        let messages = vec![Message::user("x".repeat(10_000))];
+        let windowed = windowed_by_budget(&messages, 1);
+        assert_eq!(
+            windowed.len(),
+            1,
+            "a single message, however large, must survive"
+        );
+    }
+
+    #[test]
+    fn windowed_by_budget_keeps_everything_when_the_whole_branch_fits() {
+        let messages = branch();
+        let windowed = windowed_by_budget(&messages, 1_000_000);
+        assert_eq!(windowed.len(), messages.len());
+    }
+
+    #[test]
+    fn branch_summary_request_notes_when_windowing_dropped_older_activity() {
+        let req = branch_summary_request("claude-test", &branch(), 512, 1);
+        let ContentBlock::Text { text } = &req.messages[0].content[0] else {
+            panic!("expected text");
+        };
+        assert!(
+            text.contains("omitted to fit the summarization budget"),
+            "must disclose that older branch activity was windowed out: {text}"
+        );
+    }
+
+    #[test]
+    fn branch_summary_request_extracts_file_ops_from_the_full_branch_even_when_windowed() {
+        // File awareness is cheap metadata and should span the whole branch — a tiny budget that
+        // windows out the early `read`/`edit` calls from the rendered transcript must still surface
+        // them in `<read-files>`/`<modified-files>`.
+        let req = branch_summary_request("claude-test", &branch(), 512, 1);
+        let ContentBlock::Text { text } = &req.messages[0].content[0] else {
+            panic!("expected text");
+        };
+        assert!(text.contains("<read-files>"));
+        assert!(text.contains("src/x.rs"));
+        assert!(text.contains("<modified-files>"));
+    }
+
+    #[test]
     fn branch_summary_request_omits_file_tags_when_no_tool_calls() {
         let messages = vec![
             Message::user("just chatting"),
@@ -112,7 +210,7 @@ mod tests {
                 text: "sure".into(),
             }]),
         ];
-        let req = branch_summary_request("claude-test", &messages, 512);
+        let req = branch_summary_request("claude-test", &messages, 512, 100_000);
         let ContentBlock::Text { text } = &req.messages[0].content[0] else {
             panic!("expected text");
         };

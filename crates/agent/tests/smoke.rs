@@ -1169,7 +1169,7 @@ fn smoke_branch_summary_generated_live() {
 /// Cross-provider `set_model` scrubs a signed thinking history so the next request doesn't 400 —
 /// live, through one gateway fronting **both** providers. `agent-core/ARCHITECTURE.md` calls this out
 /// as a correctness landmine: a signed thinking/reasoning block is only replayable to the model that
-/// produced it, so `set_model` calls `strip_thinking_blocks()` before switching. `MockTransport` never
+/// produced it, so `set_model` calls `scrub_cross_model_state()` before switching. `MockTransport` never
 /// produces a *real* signed block, so only a live test proves the scrub actually prevents a 400 when a
 /// conversation started on Anthropic (with `--thinking`, which emits a signed block) continues on an
 /// OpenAI (Responses-dialect) model. Needs both keys; skips otherwise.

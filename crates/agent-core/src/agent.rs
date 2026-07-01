@@ -18,8 +18,8 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::compaction::{self, CompactionConfig, CompactionReason};
-use crate::error::{Error, Result};
-use crate::hooks::{AgentHooks, NoHooks};
+use crate::error::{Error, MID_STREAM_NETWORK_ERROR, Result};
+use crate::hooks::{AgentHooks, CheckpointHook, NoCheckpoint, NoHooks};
 use crate::message::{
     ContentBlock, ImageSource, Message, StopReason, StreamEvent, TokenUsage, ToolDef,
 };
@@ -88,13 +88,28 @@ pub enum AgentEvent {
 /// Default per-turn output token ceiling.
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 /// Default ceiling on loop iterations before bailing — a runaway-tool-call backstop.
-const DEFAULT_MAX_STEPS: u32 = 24;
+///
+/// Deliberately kept hard and fatal, not just raised or removed: this agent can run unattended
+/// (`serve`, a homelab automation), with no human approving each tool call, and this repo's own
+/// operating principle is that automated actions stay bounded and safe to interrupt (see the root
+/// CLAUDE.md's "operations must be idempotent and atomic"). A bounded blast radius on a runaway loop
+/// is a feature this ceiling provides, not a limitation to engineer away. `Error::MaxSteps` is fully
+/// resumable, though — the check runs before any per-turn state is touched, so a client that hits it
+/// can simply issue another `prompt` to continue past it with a fresh budget. 50 (up from an earlier
+/// 24) gives a legitimate multi-file task more headroom before that ceiling interrupts it; operators
+/// can still override it per deployment via [`Agent::with_max_steps`]. `pub` so a CLI's own flag
+/// default (`agent run --max-steps`/`agent serve --max-steps`) can reference this one number instead
+/// of carrying a second, driftable copy of it.
+pub const DEFAULT_MAX_STEPS: u32 = 50;
 /// Cap on tool-call groups dispatched concurrently within one turn. A model usually batches a
 /// handful, but nothing bounds how many it requests; without a cap a turn asking for dozens of
 /// `bash`/`grep` calls would spawn that many subprocesses / parallel walks at once (and `grep` itself
 /// fans out over CPU cores, compounding it). The cap throttles in-flight groups; results scatter by
 /// index, so the call-order transcript is unaffected — only peak concurrency is bounded.
 const MAX_CONCURRENT_TOOL_GROUPS: usize = 8;
+/// One tool call's dispatch outcome: `(text, images, is_error, terminate)`. Hooks rewrite the text and
+/// error flag; images and the terminate hint pass through untouched.
+type ToolCallResult = (String, Vec<ImageSource>, bool, bool);
 /// How many times to restart a turn whose stream dies *after* the request already succeeded — a
 /// truncated stream (dropped connection, gateway cut) or an in-band `overloaded_error` event. Distinct
 /// from `client.rs`'s retry, which only covers a failure *before* the first byte; once events start
@@ -133,6 +148,14 @@ pub struct Agent {
     cache_key: Option<String>,
     /// Use the 1-hour prompt-cache TTL (Anthropic) instead of the default 5 minutes.
     cache_long: bool,
+    /// Cross-turn, cross-run file-mutation exclusivity. Defaults to a registry private to this
+    /// `Agent`; share one `Arc` across multiple `Agent`s (e.g. one per session in a `serve` process)
+    /// to extend the guarantee across concurrently-running sessions too.
+    write_locks: Arc<crate::write_lock::WriteLockRegistry>,
+    /// Called at each durable mid-run checkpoint (see [`CheckpointHook`]). Defaults to a no-op, so a
+    /// caller that only ever persists once a full run completes (or doesn't persist at all) pays
+    /// nothing extra.
+    checkpoint: Arc<dyn CheckpointHook>,
 }
 
 impl Agent {
@@ -142,6 +165,15 @@ impl Agent {
     pub fn new(transport: Arc<dyn ModelTransport>, model: impl Into<String>) -> Self {
         let model = model.into();
         let caps = crate::models::capabilities(&model);
+        // Scale the summarization call's own output budget from the model's real ceiling, rather than
+        // trusting `CompactionConfig::default()`'s flat 4096 regardless of what the model can actually
+        // hold: `0.8 * reserve_tokens` mirrors how much headroom compaction is trying to buy back,
+        // capped at the model's `max_output` so this can never exceed what the model would reject, and
+        // floored so a very small `reserve_tokens` override still leaves the summary usably long.
+        let reserve_tokens = CompactionConfig::default().reserve_tokens;
+        let summary_max_tokens = (((reserve_tokens as f64) * 0.8) as u32)
+            .min(caps.max_output)
+            .max(1024);
         Self {
             transport,
             tools: ToolRegistry::new(),
@@ -154,11 +186,14 @@ impl Agent {
             reasoning_effort: None,
             compaction: CompactionConfig {
                 context_window: caps.context_window,
+                summary_max_tokens,
                 ..CompactionConfig::default()
             },
             hooks: Arc::new(NoHooks),
             cache_key: None,
             cache_long: false,
+            write_locks: Arc::new(crate::write_lock::WriteLockRegistry::new()),
+            checkpoint: Arc::new(NoCheckpoint),
         }
     }
 
@@ -174,6 +209,13 @@ impl Agent {
     pub fn with_system(mut self, system: impl Into<String>) -> Self {
         self.system = Some(system.into());
         self
+    }
+
+    /// Replace the system prompt in place, without rebuilding tools/compaction/cache config — the cheap
+    /// per-turn refresh a caller uses to keep the time-varying part of the prompt (the current date) up
+    /// to date without paying for a full `Agent` rebuild every turn.
+    pub fn set_system(&mut self, system: impl Into<String>) {
+        self.system = Some(system.into());
     }
 
     /// Set the per-turn output token ceiling.
@@ -217,6 +259,26 @@ impl Agent {
     /// Install interception hooks (tool gating / result rewriting). Defaults to no-ops.
     pub fn with_hooks(mut self, hooks: Arc<dyn AgentHooks>) -> Self {
         self.hooks = hooks;
+        self
+    }
+
+    /// Install a [`CheckpointHook`], called at each durable mid-run point so a caller can persist a
+    /// multi-step run incrementally instead of only once it finishes entirely. Defaults to a no-op.
+    pub fn with_checkpoint_hook(mut self, checkpoint: Arc<dyn CheckpointHook>) -> Self {
+        self.checkpoint = checkpoint;
+        self
+    }
+
+    /// Share a file-mutation-exclusivity registry across multiple `Agent`s (or across rebuilds of the
+    /// same one, e.g. `serve`'s `set_model`/`set_thinking`), so two calls that write the same path
+    /// serialize even when they belong to different turns or different concurrently-running sessions.
+    /// Defaults to a registry private to this `Agent` — fine for one agent running one session at a
+    /// time, which is why most callers never need this builder.
+    pub fn with_write_locks(
+        mut self,
+        write_locks: Arc<crate::write_lock::WriteLockRegistry>,
+    ) -> Self {
+        self.write_locks = write_locks;
         self
     }
 
@@ -282,6 +344,16 @@ impl Agent {
     /// the run, any messages a client pushed to `steering` are injected as new user turns and the loop
     /// continues — letting a client redirect or extend a working agent without starting over.
     ///
+    /// `steering` also carries a graceful stop request ([`Steering::request_stop`]) — pi's
+    /// `shouldStopAfterTurn` equivalent. It's checked at every turn boundary, after that turn's tool
+    /// calls (if any) have already run and their results are committed to `session`, but before another
+    /// model call would start. Unlike `cancel`, it never abandons a tool mid-execution or leaves an
+    /// orphaned `tool_use` behind — the current turn always finishes cleanly first. Whatever happens to
+    /// a pending request by the time this call returns (consumed by a turn-boundary check, or never
+    /// reached because the run ended some other way — an error, cancellation, or a refusal, which — like
+    /// the queue drains — skips it), it's always cleared before returning, so a stop meant for this run
+    /// can never bleed into a later, unrelated call sharing the same `Steering` handle.
+    ///
     /// [`run_events_cancellable`]: Self::run_events_cancellable
     pub async fn run_events_steered<F>(
         &self,
@@ -293,15 +365,34 @@ impl Agent {
     where
         F: FnMut(AgentEvent),
     {
+        // Clears any pending stop request when this call returns, by whatever path — normal
+        // completion, an early `?`/`return Err`, cancellation, or a refusal — so a request this call
+        // never got around to consuming can't leak into a later call that reuses `steering`.
+        struct ClearStopOnDrop(Steering);
+        impl Drop for ClearStopOnDrop {
+            fn drop(&mut self) {
+                self.0.take_stop_requested();
+            }
+        }
+        let _clear_stop_on_drop = ClearStopOnDrop(steering.clone());
         sink(AgentEvent::AgentStart);
         // Set once we've already compacted to recover from a context-overflow this turn, so a second
         // overflow gives up instead of looping. Reset after each turn that lands cleanly.
         let mut overflow_recovered = false;
+        // Steps taken *by this call*, distinct from `session.steps` (a lifetime total across every
+        // call, used only for observability — the `step` field on emitted events). Checking the
+        // ceiling against this instead means `Error::MaxSteps` is a per-call backstop a client can
+        // resume past by simply calling `run`/`run_events_steered` again with a fresh budget, rather
+        // than a permanent dead end once the session's lifetime total crosses it once.
+        let mut steps_this_call: u32 = 0;
+        // The previous turn's stop reason, read by `is_hard_overflow`'s `MaxTokens` check — `EndTurn`
+        // (a value that check never matches) until the first turn actually completes.
+        let mut last_stop_reason = StopReason::EndTurn;
         loop {
             if cancel.is_cancelled() {
                 return Err(Error::Cancelled);
             }
-            if session.steps >= self.max_steps {
+            if steps_this_call >= self.max_steps {
                 let err = Error::MaxSteps(self.max_steps);
                 sink(AgentEvent::Error {
                     message: err.to_string(),
@@ -313,6 +404,22 @@ impl Agent {
             // before building the next request so the run never walks into the context wall.
             if self.compaction.enabled && compaction::should_compact(session, &self.compaction) {
                 self.compact(session, CompactionReason::Threshold, &cancel, &mut sink)
+                    .await?;
+            } else if !self.compaction.enabled
+                && compaction::is_hard_overflow(
+                    session,
+                    &self.compaction,
+                    last_stop_reason,
+                    self.max_tokens,
+                )
+            {
+                // Auto-compaction is off, but the live prompt has already reached (or a `MaxTokens`
+                // stop implies it's about to reach) the raw context window, not just the soft
+                // threshold above — disabling proactive compaction isn't license to keep sending
+                // requests that are already guaranteed to overflow. See `is_hard_overflow`'s doc
+                // comment for why this bypasses the `enabled` gate but the threshold check above
+                // doesn't.
+                self.compact(session, CompactionReason::Overflow, &cancel, &mut sink)
                     .await?;
             }
 
@@ -373,11 +480,13 @@ impl Agent {
                 }
             };
             overflow_recovered = false;
+            last_stop_reason = turn.stop_reason;
             let malformed: HashMap<String, String> =
                 std::mem::take(&mut turn.malformed).into_iter().collect();
-            session.push(Message::assistant(turn.blocks));
+            session.push(Message::assistant(turn.blocks).with_model_id(&self.model));
             session.record_usage(turn.usage);
             session.steps += 1;
+            steps_this_call += 1;
             sink(AgentEvent::TurnEnd {
                 stop_reason: turn.stop_reason,
                 step: session.steps,
@@ -395,6 +504,27 @@ impl Agent {
                 .unwrap_or_default();
 
             if calls.is_empty() || turn.stop_reason != StopReason::ToolUse {
+                // A refusal is a distinct terminal condition, not an ordinary stop: draining queued
+                // steer/follow-up messages here would inject a new user turn right after the model
+                // just declined to engage with the current one, which the model would likely refuse
+                // again. End the run immediately instead, leaving the queue untouched — nothing is
+                // lost, since it's the same persistent `Steering` handle a later `prompt` call reads
+                // from (see `serve.rs`).
+                if turn.stop_reason == StopReason::Refusal {
+                    sink(AgentEvent::AgentEnd {
+                        steps: session.steps,
+                    });
+                    return Ok(());
+                }
+                // A pending graceful-stop request wins over draining follow-up/steer messages, exactly
+                // as it wins over continuing tool-call turns below — the queue is left untouched (same
+                // rationale as the refusal case above) so nothing queued for "next time" is lost.
+                if steering.take_stop_requested() {
+                    sink(AgentEvent::AgentEnd {
+                        steps: session.steps,
+                    });
+                    return Ok(());
+                }
                 // The model ended its turn. Before stopping, drain any follow-up messages a client
                 // queued (plus any steer messages stranded by a tool-less turn) and continue with them
                 // as new user turns. The last message is the assistant's, so pushing user turns here
@@ -411,6 +541,9 @@ impl Agent {
                     session.user(msg);
                 }
                 sink(AgentEvent::Steered { messages: count });
+                // A plain user message ends the visible history here — a valid, resumable checkpoint
+                // (see `CheckpointHook`) before the next model call.
+                self.checkpoint.checkpoint(session).await;
                 continue;
             }
 
@@ -420,10 +553,11 @@ impl Agent {
             // The calls run concurrently: tools are I/O-bound (file reads, shell commands, the
             // `beyond` CLI), and a model routinely batches independent ones in a single turn, so
             // overlapping them collapses the tool phase from the sum of their latencies to its slowest
-            // member. The transcript stays deterministic regardless of finish order — every
-            // `ToolStart` is emitted up front in call order, and the `ToolEnd`s and `tool_result`
-            // blocks are emitted/collected in call order after the join, never interleaved by
-            // whichever tool happened to finish first.
+            // member. `ToolStart` is emitted up front in call order; `ToolEnd` is emitted live, the
+            // instant each call's own result is known — a client watching the event stream sees
+            // completions in actual finish order, not batched after the slowest call joins. The
+            // *transcript* (the `tool_result` blocks pushed to the session below) still stays
+            // deterministic regardless of finish order, rebuilt in call order after the join.
             //
             // Calls aren't always independent, though: two calls that write the same path (the model
             // batching two `edit`s against one file) would otherwise race on disk. `Tool::write_target`
@@ -442,15 +576,28 @@ impl Agent {
                     input: input.clone(),
                 });
             }
-            let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
-            for (i, (_, name, input)) in calls.iter().enumerate() {
-                let key = self
-                    .tools
+            // A call whose mutation scope can't be named (see `Tool::conservative_exclusive`, e.g. an
+            // opaque `bash` command) still groups by its own `write_target` (`None`, so its own
+            // `solo:` group) — grouping is unchanged — but its presence anywhere in the batch caps the
+            // *group-level* concurrency below to 1, so it can't race a same-turn `edit`/`write` it has
+            // no path to be grouped against.
+            let exclusive_turn = calls.iter().any(|(_, name, _)| {
+                self.tools
                     .get(name)
-                    .and_then(|t| t.write_target(input))
+                    .is_some_and(|t| t.conservative_exclusive())
+            });
+            let mut groups: HashMap<String, (Option<String>, Vec<usize>)> = HashMap::new();
+            for (i, (_, name, input)) in calls.iter().enumerate() {
+                let target = self.tools.get(name).and_then(|t| t.write_target(input));
+                let key = target
+                    .clone()
                     .map(|path| format!("path:{path}"))
                     .unwrap_or_else(|| format!("solo:{i}"));
-                groups.entry(key).or_default().push(i);
+                groups
+                    .entry(key)
+                    .or_insert_with(|| (target, Vec::new()))
+                    .1
+                    .push(i);
             }
             let this = self;
             let malformed = &malformed;
@@ -461,17 +608,26 @@ impl Agent {
                 futures::channel::mpsc::unbounded::<crate::tool::ToolUpdate>();
             let prog_tx = &prog_tx;
             let cancel_ref = &cancel;
-            let group_runs = groups.into_values().map(|indices| {
+            let group_runs = groups.into_values().map(|(target, indices)| {
                 let calls = &calls;
                 let prog_tx = prog_tx.clone();
                 let cancel = cancel_ref.clone();
+                let write_locks = this.write_locks.clone();
                 async move {
+                    // Held for the group's whole serial run: extends the intra-turn grouping above
+                    // across turn and session boundaries, so a concurrently-running turn (or a
+                    // different session sharing this `Agent`'s registry) touching the same path really
+                    // waits, not just calls within this one turn.
+                    let _write_guard = match &target {
+                        Some(path) => Some(write_locks.lock(path).await),
+                        None => None,
+                    };
                     let mut out = Vec::with_capacity(indices.len());
                     for i in indices {
                         let (id, name, input) = &calls[i];
                         // Per call: (text, images, is_error, terminate). Hooks rewrite the *text* and
                         // error flag; images and the terminate hint pass through untouched.
-                        let result: (String, Vec<ImageSource>, bool, bool) =
+                        let result: ToolCallResult =
                             if let Some(raw) = malformed.get(id) {
                                 // The model streamed a tool call whose argument fragments never formed
                                 // valid JSON. Feed that back as an error result the model can correct
@@ -485,7 +641,7 @@ impl Agent {
                                     false,
                                 )
                             } else if let Some(reason) =
-                                this.hooks.before_tool_call(name, input).await
+                                this.hooks.before_tool_call(name, input, &cancel).await
                             {
                                 // A hook blocked the call (e.g. a permission policy). Feed the reason
                                 // back as an error result instead of running the tool.
@@ -511,30 +667,57 @@ impl Agent {
                                     };
                                 // Let a hook rewrite the result text (redact, cap, reclassify) before
                                 // it's fed back to the model.
-                                let (text, is_error) =
-                                    this.hooks.after_tool_call(name, input, text, is_error).await;
+                                let (text, is_error) = this
+                                    .hooks
+                                    .after_tool_call(name, input, text, is_error, &cancel)
+                                    .await;
                                 (text, images, is_error, terminate)
                             };
+                        // Sent the instant this call's own result is known — not batched until every
+                        // group in the turn finishes — so a client watching the event stream sees each
+                        // tool's completion as it actually happens, not all-at-once after the slowest
+                        // concurrently-dispatched call joins.
+                        prog_tx
+                            .unbounded_send(crate::tool::ToolUpdate::End {
+                                id: id.clone(),
+                                name: name.clone(),
+                                result: result.0.clone(),
+                                is_error: result.2,
+                            })
+                            .ok();
                         out.push((i, result));
                     }
                     out
                 }
             });
-            let mut results: Vec<(String, Vec<ImageSource>, bool, bool)> = (0..calls.len())
-                .map(|_| (String::new(), Vec::new(), false, false))
-                .collect();
+            // `None` until that call's group finishes; a slot left `None` means cancellation aborted
+            // dispatch before it ran, and `repair_cancelled_dispatch` needs to tell that apart from a
+            // real (possibly empty) result to synthesize a matching error `tool_result` for it.
+            let mut results: Vec<Option<ToolCallResult>> = vec![None; calls.len()];
             // Bound how many groups run at once. `buffer_unordered` is safe here because each group
             // yields its results tagged with their original call index `i`; cross-group completion
-            // order never reaches the transcript, which is rebuilt in call order below.
+            // order never reaches the transcript, which is rebuilt in call order below. `exclusive_turn`
+            // caps this at 1 instead — with only ever one group in flight, a `bash` call (or anything
+            // else `conservative_exclusive`) can't race a same-turn `edit`/`write` group it has no path
+            // to be grouped against; which group runs first still doesn't matter for the transcript,
+            // same as the concurrent case.
             //
             // Race the whole dispatch against cancellation: a tripped token drops `drain`, which drops
             // every in-flight tool future — aborting a hung `bash` (its `kill_on_drop` child dies) and
             // any other long-running tool — and returns promptly instead of waiting them all out. The
-            // block scopes `drain`'s `&mut results` borrow so the transcript below can consume them.
+            // block scopes `drain`'s `&mut results` borrow so the transcript below can consume them;
+            // `cancelled_mid_dispatch` is only *acted on* after the block ends and that borrow is
+            // fully released (repairing the transcript needs to move `results` out).
+            let mut cancelled_mid_dispatch = false;
             {
+                let concurrency = if exclusive_turn {
+                    1
+                } else {
+                    MAX_CONCURRENT_TOOL_GROUPS
+                };
                 let drain = async {
                     let mut group_stream = futures::stream::iter(group_runs)
-                        .buffer_unordered(MAX_CONCURRENT_TOOL_GROUPS)
+                        .buffer_unordered(concurrency)
                         .fuse();
                     // Forward tool-progress chunks to `sink` as they arrive, racing them against group
                     // completion (progress biased first so chunks flush promptly). The loop ends when
@@ -544,18 +727,13 @@ impl Agent {
                         futures::select_biased! {
                             prog = prog_rx.next() => {
                                 if let Some(u) = prog {
-                                    sink(AgentEvent::ToolProgress {
-                                        id: u.id,
-                                        name: u.name,
-                                        snapshot: u.snapshot,
-                                        details: u.details,
-                                    });
+                                    emit_tool_update(&mut sink, u);
                                 }
                             }
                             group = group_stream.next() => match group {
                                 Some(group) => {
                                     for (i, result) in group {
-                                        results[i] = result;
+                                        results[i] = Some(result);
                                     }
                                 }
                                 None => break,
@@ -564,34 +742,34 @@ impl Agent {
                     }
                     // Flush any updates buffered between the final poll and group completion.
                     while let Ok(u) = prog_rx.try_recv() {
-                        sink(AgentEvent::ToolProgress {
-                            id: u.id,
-                            name: u.name,
-                            snapshot: u.snapshot,
-                            details: u.details,
-                        });
+                        emit_tool_update(&mut sink, u);
                     }
                 };
                 let cancelled = cancel.cancelled();
                 futures::pin_mut!(drain, cancelled);
                 if let Either::Right(((), _)) = select(drain, cancelled).await {
-                    return Err(Error::Cancelled);
+                    cancelled_mid_dispatch = true;
                 }
             }
+            if cancelled_mid_dispatch {
+                // Cancelled mid-dispatch: the assistant message (with its `ToolUse` blocks) is already
+                // committed above, but the tool-results message below never will be. Left as-is, the
+                // session would end on an orphaned `tool_use` with no matching `tool_result` — a shape
+                // both Anthropic and OpenAI reject on resume. Repair it before propagating the
+                // cancellation.
+                repair_cancelled_dispatch(session, &calls, results);
+                return Err(Error::Cancelled);
+            }
+            // `ToolEnd` for each call was already emitted live, from within `group_runs`, the instant
+            // that call's own result was known — not here, after every group in the turn has joined.
+            // This loop only rebuilds the transcript's tool-result blocks, in call order.
             let mut result_blocks = Vec::with_capacity(calls.len());
             // A tool may ask to end the run; honor it only when *every* call in the batch agrees, so a
             // single tool can't cut off others the model dispatched alongside it.
             let mut terminate = !results.is_empty();
-            for ((id, name, _), (content, images, is_error, wants_terminate)) in
-                calls.iter().zip(results)
-            {
+            for ((id, _, _), result) in calls.iter().zip(results) {
+                let (content, images, is_error, wants_terminate) = resolve_tool_result(result);
                 terminate &= wants_terminate;
-                sink(AgentEvent::ToolEnd {
-                    id: id.clone(),
-                    name: name.clone(),
-                    result: content.clone(),
-                    is_error,
-                });
                 result_blocks.push(ContentBlock::ToolResult {
                     tool_use_id: id.clone(),
                     content,
@@ -611,14 +789,30 @@ impl Agent {
                 result_blocks.push(ContentBlock::Text { text: msg });
             }
             session.push(Message::tool_results(result_blocks));
+            // A tool round-trip just landed: assistant `tool_use` and its matching `tool_result`s are
+            // both committed now, so this is a valid, resumable checkpoint (see `CheckpointHook`) — the
+            // one mid-run point a crash between here and the run's eventual end would otherwise lose.
+            self.checkpoint.checkpoint(session).await;
+            if terminate {
+                // A tool requested completion (e.g. an `attempt_completion`/`exit` tool) and the whole
+                // batch agreed. The results are already recorded; end the run as if the model had
+                // stopped — this wins outright over a pending stop request, which would produce the
+                // same outcome anyway.
+                sink(AgentEvent::AgentEnd {
+                    steps: session.steps,
+                });
+                return Ok(());
+            }
             if steered_count > 0 {
                 sink(AgentEvent::Steered {
                     messages: steered_count,
                 });
-            } else if terminate {
-                // A tool requested completion (e.g. an `attempt_completion`/`exit` tool) and the whole
-                // batch agreed — and no steering redirected the run. The results are already recorded;
-                // end the run as if the model had stopped.
+            }
+            // A graceful-stop request is honored here too, after this turn's tool results (and any
+            // folded-in steer text) are already committed — the same turn-boundary contract as the
+            // tool-less branch above. Checked *after* the `Steered` event so a client sees its steer
+            // message land in the transcript even if the run stops right after.
+            if steering.take_stop_requested() {
                 sink(AgentEvent::AgentEnd {
                     steps: session.steps,
                 });
@@ -645,35 +839,54 @@ impl Agent {
                 Ok(turn) => return Ok(turn),
                 Err(e) if attempt < MAX_MID_STREAM_RETRIES && is_retryable_mid_stream(&e) => {
                     attempt += 1;
-                    futures_timer::Delay::new(mid_stream_backoff(attempt)).await;
+                    // Race the backoff sleep against cancellation too — left unraced, a tripped token
+                    // during this wait would sit idle for up to `MID_STREAM_MAX_BACKOFF` before the
+                    // next `run_turn_once` call even started racing it.
+                    let delay = futures_timer::Delay::new(mid_stream_backoff(attempt));
+                    let cancelled = cancel.cancelled();
+                    futures::pin_mut!(delay, cancelled);
+                    if let Either::Right(((), _)) = select(delay, cancelled).await {
+                        return Err(Error::Cancelled);
+                    }
                 }
                 Err(e) => return Err(e),
             }
         }
     }
 
-    /// One streaming attempt over a fresh connection. Racing each `stream.next()` against `cancel`
-    /// means a tripped token interrupts even a model that has gone quiet (a blocked read would
-    /// otherwise hang for the full idle timeout); dropping `stream` on cancel aborts the underlying
-    /// HTTP request.
+    /// One streaming attempt over a fresh connection. Racing the initial `transport.stream(req)` call
+    /// (the HTTP connect + any pre-first-byte retry inside it) and each subsequent `stream.next()`
+    /// against `cancel` means a tripped token interrupts even a model that has gone quiet (a blocked
+    /// read would otherwise hang for the full idle timeout) or a slow-to-connect gateway; dropping
+    /// `stream` (or the connect future, before it resolves) on cancel aborts the underlying HTTP
+    /// request rather than waiting it out.
     async fn run_turn_once(
         &self,
         req: ModelRequest,
         emit: &mut dyn FnMut(StreamEvent),
         cancel: &CancellationToken,
     ) -> Result<Turn> {
-        let mut stream = self.transport.stream(req).await?;
-        let mut acc = Accumulator::default();
         let cancelled = cancel.cancelled();
         futures::pin_mut!(cancelled);
+        let mut stream = {
+            let stream_fut = self.transport.stream(req);
+            futures::pin_mut!(stream_fut);
+            match select(stream_fut, cancelled.as_mut()).await {
+                Either::Left((res, _)) => res?,
+                Either::Right(((), _)) => return Err(Error::Cancelled),
+            }
+        };
+        let mut acc = Accumulator::default();
         loop {
             let next = stream.next();
             futures::pin_mut!(next);
             match select(next, cancelled.as_mut()).await {
                 Either::Left((Some(ev), _)) => {
                     let ev = ev?;
-                    emit(ev.clone());
-                    acc.apply(ev);
+                    // `apply` only borrows, so `ev` is still ours to move into `emit` afterward — no
+                    // clone needed on this per-delta hot path (see `Accumulator::apply`'s doc comment).
+                    acc.apply(&ev);
+                    emit(ev);
                 }
                 Either::Left((None, _)) => break,
                 Either::Right(((), _)) => return Err(Error::Cancelled),
@@ -695,30 +908,75 @@ impl Agent {
         cancel: &CancellationToken,
         sink: &mut dyn FnMut(AgentEvent),
     ) -> Result<bool> {
-        let Some(first_kept) =
-            compaction::find_cut(&session.messages, self.compaction.keep_recent_tokens)
+        let Some(cut) =
+            compaction::find_split_cut(&session.messages, self.compaction.keep_recent_tokens)
         else {
             return Ok(false);
         };
+        let first_kept = cut.first_kept;
         let before = session.messages.len();
         let tokens_before = session.last_input_tokens;
         let prefix: Vec<Message> = session.messages[..first_kept].to_vec();
         let file_ops = compaction::merge_file_ops(&session.compaction, &prefix, reason);
-        let req = compaction::summary_request(
-            &self.model,
-            &prefix,
-            self.compaction.summary_max_tokens,
-            &file_ops,
-        );
-        let turn = self.run_turn(req, &mut |_| {}, cancel).await?;
-        let summary: String = turn
-            .blocks
-            .iter()
-            .filter_map(|b| match b {
-                ContentBlock::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
+
+        let summary = match cut.turn_start {
+            None => {
+                // Clean boundary: unchanged, single-call path.
+                let req = compaction::summary_request(
+                    &self.model,
+                    &prefix,
+                    self.compaction.summary_max_tokens,
+                    &file_ops,
+                );
+                turn_text(&self.run_turn(req, &mut |_| {}, cancel).await?)
+            }
+            Some(turn_start) => {
+                // Split turn: summarize the closed-off history and the in-progress turn's own prefix
+                // separately, concurrently, then stitch them together — rather than collapsing both
+                // under the split-turn template, which is written for a partial turn, not a whole
+                // conversation's worth of already-completed ones.
+                let turn_prefix_max_tokens = ((self.compaction.summary_max_tokens as f64)
+                    * compaction::SPLIT_TURN_PREFIX_SCALE)
+                    as u32;
+                let history = async {
+                    if turn_start == 0 {
+                        // Nothing precedes the split turn — no history to summarize, no call to make.
+                        return Ok("No prior history.".to_string());
+                    }
+                    // The closed-off side is nothing but a still-current prior summary (a compaction's
+                    // summary message is always `session.messages[0]`; `find_split_cut` only ever bumps
+                    // `turn_start` to exactly 1 when the scan found no history beyond it) — no new
+                    // activity happened before this split turn began, so reuse it verbatim instead of
+                    // spending a model call to ask for what would be an unchanged restatement.
+                    if turn_start == 1 {
+                        if let Some(prev) =
+                            compaction::previous_summary(&session.messages[..turn_start])
+                        {
+                            return Ok(prev.to_string());
+                        }
+                    }
+                    let req = compaction::summary_request(
+                        &self.model,
+                        &session.messages[..turn_start],
+                        self.compaction.summary_max_tokens,
+                        &file_ops,
+                    );
+                    Ok::<_, Error>(turn_text(&self.run_turn(req, &mut |_| {}, cancel).await?))
+                };
+                let turn_prefix = async {
+                    let req = compaction::summary_request(
+                        &self.model,
+                        &session.messages[turn_start..first_kept],
+                        turn_prefix_max_tokens,
+                        &file_ops,
+                    );
+                    Ok::<_, Error>(turn_text(&self.run_turn(req, &mut |_| {}, cancel).await?))
+                };
+                let (history, turn_prefix) =
+                    futures::future::try_join(history, turn_prefix).await?;
+                compaction::merge_split_summary(&history, &turn_prefix)
+            }
+        };
         if summary.trim().is_empty() {
             return Ok(false);
         }
@@ -745,10 +1003,18 @@ impl Agent {
         messages: &[Message],
         cancel: &CancellationToken,
     ) -> Result<String> {
+        // Same input budget compaction sizes its own summarization calls against — the model's context
+        // window minus its reserved headroom — so an abandoned branch's rendered transcript can't
+        // overflow the summarization call's own window any more than a compaction summary's can.
+        let input_token_budget = self
+            .compaction
+            .context_window
+            .saturating_sub(self.compaction.reserve_tokens);
         let req = crate::branch_summary::branch_summary_request(
             &self.model,
             messages,
             self.compaction.summary_max_tokens,
+            input_token_budget,
         );
         let turn = self.run_turn(req, &mut |_| {}, cancel).await?;
         Ok(turn
@@ -762,6 +1028,140 @@ impl Agent {
     }
 }
 
+/// The concatenated text blocks of a summarization turn — a summary is always plain prose, so anything
+/// else the model emitted (there shouldn't be any; the summarization system prompt asks for none) is
+/// simply not text and is dropped here rather than erroring.
+fn turn_text(turn: &Turn) -> String {
+    turn.blocks
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Turn one [`ToolUpdate`](crate::tool::ToolUpdate) from the per-turn progress channel into the
+/// matching [`AgentEvent`] and emit it — shared by the live-arriving path and the final flush of
+/// whatever was still buffered when the group stream finished.
+fn emit_tool_update(sink: &mut dyn FnMut(AgentEvent), update: crate::tool::ToolUpdate) {
+    match update {
+        crate::tool::ToolUpdate::Progress {
+            id,
+            name,
+            snapshot,
+            details,
+        } => {
+            sink(AgentEvent::ToolProgress {
+                id,
+                name,
+                snapshot,
+                details,
+            });
+        }
+        crate::tool::ToolUpdate::End {
+            id,
+            name,
+            result,
+            is_error,
+        } => {
+            sink(AgentEvent::ToolEnd {
+                id,
+                name,
+                result,
+                is_error,
+            });
+        }
+    }
+}
+
+/// Resolve a per-call dispatch result, synthesizing an error placeholder for a call whose group never
+/// got to run — only reachable via [`repair_cancelled_dispatch`], when cancellation aborts the batch
+/// before every group's future resolved.
+fn resolve_tool_result(result: Option<ToolCallResult>) -> ToolCallResult {
+    result.unwrap_or_else(|| {
+        (
+            "cancelled: tool call aborted before it finished".to_string(),
+            Vec::new(),
+            true,
+            false,
+        )
+    })
+}
+
+/// Synthesize an error `tool_result` for every call whose group never finished (dispatch was
+/// cancelled mid-batch), preserving any that did finish, and commit the message — so a run cancelled
+/// mid-dispatch always leaves the session in a valid, resumable alternating shape instead of an
+/// orphaned `tool_use` with no matching `tool_result`.
+fn repair_cancelled_dispatch(
+    session: &mut Session,
+    calls: &[(String, String, Value)],
+    results: Vec<Option<ToolCallResult>>,
+) {
+    let blocks = calls
+        .iter()
+        .zip(results)
+        .map(|((id, ..), result)| {
+            let (content, images, is_error, _) = resolve_tool_result(result);
+            ContentBlock::ToolResult {
+                tool_use_id: id.clone(),
+                content,
+                is_error,
+                images,
+            }
+        })
+        .collect();
+    session.push(Message::tool_results(blocks));
+}
+
+/// Substrings seen in a *throttling* rejection that would otherwise false-positive against
+/// [`OVERFLOW_PATTERNS`]' broader entries (Bedrock's "Too many tokens, please wait before trying
+/// again" contains "too many tokens" but means "slow down", not "shrink the prompt") — checked first,
+/// so any of these vetoes an overflow match regardless of what else the message contains.
+const THROTTLE_EXCLUSIONS: &[&str] = &[
+    "throttlingexception",
+    "throttling error",
+    "please wait before trying again",
+    "service unavailable",
+    "rate limit",
+    "too many requests",
+];
+
+/// Phrases seen across providers when a request is rejected for exceeding the model's context window.
+/// Provider-specific (not exhaustive of every provider this agent could route through, but every one
+/// pi's own catalogue covers) — the trailing compound `context`+`{long,exceed,maximum,window}` check
+/// in [`is_context_overflow`] remains as a generic catch-all beneath this table.
+const OVERFLOW_PATTERNS: &[&str] = &[
+    // Anthropic
+    "prompt is too long",
+    "request_too_large",
+    // OpenAI / OpenAI-compatible proxies
+    "exceeds the context window",
+    "exceeds the model's maximum context length",
+    "exceeds model's maximum context length",
+    // Google Gemini
+    "exceeds the maximum number of tokens allowed",
+    // xAI
+    "maximum prompt length is",
+    // Groq
+    "reduce the length of the messages",
+    // OpenRouter
+    "maximum context length is",
+    "exceeds the maximum allowed input length of",
+    // Together AI
+    "is longer than the model's context length",
+    // Mistral
+    "too large for model with",
+    // Cerebras
+    "400 (no body)",
+    "413 (no body)",
+    // Generic / already covered before this table existed
+    "too many tokens",
+    "context length exceeded",
+    "context_length_exceeded",
+    "token limit exceeded",
+];
+
 /// Whether a transport error is the provider rejecting the request for exceeding its context window —
 /// the signal to compact and retry. Matched on the error text (the wire shape varies by provider).
 fn is_context_overflow(e: &Error) -> bool {
@@ -769,8 +1169,10 @@ fn is_context_overflow(e: &Error) -> bool {
         return false;
     };
     let m = msg.to_ascii_lowercase();
-    m.contains("prompt is too long")
-        || m.contains("too many tokens")
+    if THROTTLE_EXCLUSIONS.iter().any(|p| m.contains(p)) {
+        return false;
+    }
+    OVERFLOW_PATTERNS.iter().any(|p| m.contains(p))
         || (m.contains("context")
             && (m.contains("long")
                 || m.contains("exceed")
@@ -779,13 +1181,20 @@ fn is_context_overflow(e: &Error) -> bool {
 }
 
 /// Whether a transport error is the "stream died after the request already succeeded" class worth
-/// restarting the turn for: a decoder's own truncated-stream rejection (both dialects' `finish()` say
-/// "…stream ended before…" — see `dialect::anthropic::Decoder::finish`,
-/// `dialect::openai::Decoder::finish`) or an in-band `overloaded_error` event (`dialect::sse_error`
-/// prefixes it `"provider stream error: "`, matched by substring since the exact wrapping is an
-/// implementation detail this shouldn't couple to). A context-overflow rejection is deliberately
-/// excluded — that's a *different* signal already handled by compact-and-retry, not this path — and
-/// retrying it here would just fail identically-shaped again without compacting first.
+/// restarting the turn for:
+/// - a decoder's own truncated-stream rejection (both dialects' `finish()` say "…stream ended
+///   before…" — see `dialect::anthropic::Decoder::finish`, `dialect::openai::Decoder::finish`),
+/// - an in-band `overloaded_error` event (`dialect::sse_error` prefixes it `"provider stream error:
+///   "`, matched by substring since the exact wrapping is an implementation detail this shouldn't
+///   couple to), or
+/// - a genuine network failure hitting the response body after it started flowing — a connection
+///   reset, a read timeout, an unexpected EOF (tagged [`MID_STREAM_NETWORK_ERROR`] by the transport;
+///   see that constant's doc comment for why a literal marker beats re-deriving the classification
+///   from a library-specific error's `Display` text).
+///
+/// A context-overflow rejection is deliberately excluded — that's a *different* signal already
+/// handled by compact-and-retry, not this path — and retrying it here would just fail
+/// identically-shaped again without compacting first.
 fn is_retryable_mid_stream(e: &Error) -> bool {
     let Error::Transport(msg) = e else {
         return false;
@@ -794,7 +1203,9 @@ fn is_retryable_mid_stream(e: &Error) -> bool {
         return false;
     }
     let m = msg.to_ascii_lowercase();
-    m.contains("stream ended before") || m.contains("overloaded")
+    m.contains("stream ended before")
+        || m.contains("overloaded")
+        || msg.contains(MID_STREAM_NETWORK_ERROR)
 }
 
 /// Exponential backoff for a mid-stream retry: `MID_STREAM_BASE_BACKOFF · 2^(attempt-1)`, capped at
@@ -803,6 +1214,58 @@ fn mid_stream_backoff(attempt: u32) -> Duration {
     MID_STREAM_BASE_BACKOFF
         .saturating_mul(1u32 << attempt.saturating_sub(1).min(16))
         .min(MID_STREAM_MAX_BACKOFF)
+}
+
+/// Best-effort repair for streamed tool-call JSON that fails to parse on the first attempt, fixing two
+/// real-world streaming quirks seen from both dialects rather than giving up immediately: a raw control
+/// character inside a string literal that should have been escaped (a large `write`/`edit` argument
+/// carrying an embedded literal newline/tab instead of `\n`/`\t`), and a backslash that isn't a valid
+/// JSON escape (a Windows path like `C:\Users\x` streamed without escaping its own backslashes). Ported
+/// from pi's `repairJson` (`packages/ai/src/utils/json-parse.ts`) — a single pass that only touches
+/// bytes *inside* a string literal, so well-formed structural JSON (braces, commas, already-valid
+/// escapes) passes through unchanged. Not a full JSON5-style parser: it can't repair a buffer that's
+/// merely incomplete (cut off mid-stream with an unclosed brace) — that class still falls through to
+/// [`Accumulator::flush_block`]'s existing malformed-call recovery.
+fn repair_json(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_string = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if !in_string {
+            if c == '"' {
+                in_string = true;
+            }
+            out.push(c);
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = false;
+                out.push(c);
+            }
+            '\\' => match chars.next_if(|n| "\"\\/bfnrtu".contains(*n)) {
+                // A recognized JSON escape — copy both characters through untouched. (For `\u`, the
+                // four hex digits that follow are ordinary characters to this loop and fall through to
+                // the `_` arm below unchanged.)
+                Some(escape) => {
+                    out.push(c);
+                    out.push(escape);
+                }
+                // A stray backslash (not a valid escape lead-in, or the buffer ends right after it) —
+                // double it so the parser sees a literal backslash instead of a dangling/invalid escape.
+                None => out.push_str("\\\\"),
+            },
+            // A raw control byte where the stream should have emitted its escape.
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// The assembled result of one model turn.
@@ -832,39 +1295,47 @@ struct Accumulator {
 }
 
 impl Accumulator {
-    fn apply(&mut self, ev: StreamEvent) {
+    // Borrows rather than takes `StreamEvent` by value: a streamed turn folds hundreds to thousands
+    // of deltas through here, and the caller (`run_turn_once`) also needs the event afterward (to
+    // `emit` it) — taking it by value would force a clone on every single delta just so both sides
+    // get their own copy. Only the two block-boundary variants (`RedactedThinking`, `ToolUseStart`)
+    // need an owned copy of their payload for `self.blocks`/`self.tool`; the four high-frequency delta
+    // variants (`TextDelta`/`ThinkingDelta`/`SignatureDelta`/`InputJsonDelta`) just borrow to
+    // `push_str`, and `Usage`/`MessageStop` are `Copy`.
+    fn apply(&mut self, ev: &StreamEvent) {
         match ev {
             StreamEvent::MessageStart => {}
-            StreamEvent::TextDelta { text } => self.text.push_str(&text),
+            StreamEvent::TextDelta { text } => self.text.push_str(text),
             StreamEvent::ThinkingDelta { text } => {
                 self.thinking
                     .get_or_insert_with(Default::default)
                     .0
-                    .push_str(&text);
+                    .push_str(text);
             }
             StreamEvent::SignatureDelta { signature } => {
                 self.thinking
                     .get_or_insert_with(Default::default)
                     .1
-                    .push_str(&signature);
+                    .push_str(signature);
             }
             StreamEvent::RedactedThinking { data } => {
                 // Self-contained block with no deltas — close any open text and emit it directly.
                 self.flush_text();
-                self.blocks.push(ContentBlock::RedactedThinking { data });
+                self.blocks
+                    .push(ContentBlock::RedactedThinking { data: data.clone() });
             }
             StreamEvent::ToolUseStart { id, name } => {
                 self.flush_text();
-                self.tool = Some((id, name, String::new()));
+                self.tool = Some((id.clone(), name.clone(), String::new()));
             }
             StreamEvent::InputJsonDelta { partial_json } => {
                 if let Some((_, _, buf)) = &mut self.tool {
-                    buf.push_str(&partial_json);
+                    buf.push_str(partial_json);
                 }
             }
             StreamEvent::ContentBlockStop => self.flush_block(),
-            StreamEvent::Usage(usage) => self.usage = usage,
-            StreamEvent::MessageStop { stop_reason } => self.stop_reason = stop_reason,
+            StreamEvent::Usage(usage) => self.usage = *usage,
+            StreamEvent::MessageStop { stop_reason } => self.stop_reason = *stop_reason,
         }
     }
 
@@ -883,12 +1354,14 @@ impl Accumulator {
             let input = if args.trim().is_empty() {
                 json!({})
             } else {
-                match serde_json::from_str(&args) {
+                match serde_json::from_str(&args)
+                    .or_else(|_| serde_json::from_str(&repair_json(&args)))
+                {
                     Ok(v) => v,
-                    // Malformed arguments from the stream are a protocol glitch, not a tool failure.
-                    // Keep the tool_use block (with an empty, wire-valid input object so the next
-                    // request doesn't 400) and record the call as malformed; the loop feeds back an
-                    // error result the model can correct, instead of aborting the whole run.
+                    // Still doesn't parse even after the repair pass — a genuine protocol glitch, not
+                    // a tool failure. Keep the tool_use block (with an empty, wire-valid input object
+                    // so the next request doesn't 400) and record the call as malformed; the loop
+                    // feeds back an error result the model can correct, instead of aborting the run.
                     Err(_) => {
                         self.malformed.push((id.clone(), args));
                         json!({})
@@ -977,6 +1450,26 @@ mod tests {
                 text: "hello world".into()
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn set_system_replaces_the_prompt_used_by_the_next_turn() {
+        let (mut agent, mock) = agent_with(
+            vec![turn::text("first"), turn::text("second")],
+            ToolRegistry::new(),
+        );
+        agent = agent.with_system("system A");
+        let mut session = Session::new();
+        session.user("hi");
+        agent.run(&mut session, |_| {}).await.unwrap();
+        agent.set_system("system B");
+        session.user("again");
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].system.as_deref(), Some("system A"));
+        assert_eq!(requests[1].system.as_deref(), Some("system B"));
     }
 
     #[tokio::test]
@@ -1093,6 +1586,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancellation_interrupts_mid_stream_retry_backoff() {
+        use std::time::Duration;
+
+        // Attempt 1 dies mid-stream with a retryable error, which schedules a ~250ms backoff sleep
+        // before the retry. A cancel tripped well inside that window must interrupt the sleep itself —
+        // left unraced, the run would sit idle for the full backoff before the next attempt even got a
+        // chance to observe cancellation.
+        let mock = Arc::new(MockTransport::scripted(vec![vec![
+            Ok(StreamEvent::MessageStart),
+            Err(Error::Transport(
+                "Anthropic stream ended before message_stop".into(),
+            )),
+        ]]));
+        let agent = Agent::new(mock, "claude-opus-4-8").with_max_steps(8);
+        let mut session = Session::new();
+        session.user("hi");
+
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            trigger.cancel();
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(150), // comfortably under the ~250ms base backoff
+            agent.run_events_cancellable(&mut session, |_| {}, cancel),
+        )
+        .await
+        .expect("cancellation must interrupt the backoff sleep, not wait it out");
+        assert!(matches!(result, Err(Error::Cancelled)));
+    }
+
+    #[tokio::test]
     async fn non_retryable_mid_stream_error_fails_the_run_immediately() {
         // A generic transport error (not the "stream ended before…"/"overloaded" shapes) must not
         // retry — only one scripted turn exists, so a retry attempt would exhaust the mock and this
@@ -1113,6 +1640,77 @@ mod tests {
     }
 
     #[test]
+    fn is_context_overflow_detects_google() {
+        assert!(is_context_overflow(&Error::Transport(
+            "400 Bad Request: exceeds the maximum number of tokens allowed: 32768".into()
+        )));
+    }
+
+    #[test]
+    fn is_context_overflow_detects_xai() {
+        assert!(is_context_overflow(&Error::Transport(
+            "maximum prompt length is 131072 tokens".into()
+        )));
+    }
+
+    #[test]
+    fn is_context_overflow_detects_groq() {
+        assert!(is_context_overflow(&Error::Transport(
+            "Please reduce the length of the messages.".into()
+        )));
+    }
+
+    #[test]
+    fn is_context_overflow_detects_openrouter() {
+        assert!(is_context_overflow(&Error::Transport(
+            "maximum context length is 8192 tokens".into()
+        )));
+        assert!(is_context_overflow(&Error::Transport(
+            "This model's exceeds the maximum allowed input length of 16000".into()
+        )));
+    }
+
+    #[test]
+    fn is_context_overflow_detects_together() {
+        assert!(is_context_overflow(&Error::Transport(
+            "Input validation error: `inputs` tokens + `max_new_tokens` must be <= 4096. Given: \
+             is longer than the model's context length"
+                .into()
+        )));
+    }
+
+    #[test]
+    fn is_context_overflow_detects_mistral() {
+        assert!(is_context_overflow(&Error::Transport(
+            "too large for model with 32768 maximum context length".into()
+        )));
+    }
+
+    #[test]
+    fn is_context_overflow_detects_cerebras() {
+        assert!(is_context_overflow(&Error::Transport(
+            "400 (no body)".into()
+        )));
+        assert!(is_context_overflow(&Error::Transport(
+            "413 (no body)".into()
+        )));
+    }
+
+    #[test]
+    fn is_context_overflow_excludes_bedrock_throttling_despite_too_many_tokens_substring() {
+        // Bedrock's throttling message contains "too many tokens" — the same substring the generic
+        // overflow pattern matches — but means "you're sending requests too fast," not "shrink the
+        // prompt." Compacting in response would be pure churn against a request that would have
+        // succeeded unmodified on retry.
+        assert!(!is_context_overflow(&Error::Transport(
+            "ThrottlingException: Too many tokens, please wait before trying again.".into()
+        )));
+        assert!(!is_context_overflow(&Error::Transport(
+            "429: rate limit exceeded, too many requests".into()
+        )));
+    }
+
+    #[test]
     fn is_retryable_mid_stream_matches_both_dialects_truncation_and_overload() {
         assert!(is_retryable_mid_stream(&Error::Transport(
             "Anthropic stream ended before message_stop".into()
@@ -1123,6 +1721,16 @@ mod tests {
         assert!(is_retryable_mid_stream(&Error::Transport(
             "provider stream error: overloaded_error: Overloaded".into()
         )));
+        // A real network failure mid-body-read (connection reset, read timeout, unexpected EOF) —
+        // tagged by the transport with the shared marker rather than matched by guessing at
+        // `reqwest::Error`'s `Display` wording, which varies by OS/error kind and isn't a contract.
+        assert!(is_retryable_mid_stream(&Error::Transport(format!(
+            "{MID_STREAM_NETWORK_ERROR}: error reading a body from connection: connection reset \
+             by peer (os error 104)"
+        ))));
+        assert!(is_retryable_mid_stream(&Error::Transport(format!(
+            "{MID_STREAM_NETWORK_ERROR}: operation timed out"
+        ))));
         // Context overflow is a *different* signal (compact-and-retry owns it) — must not double up.
         assert!(!is_retryable_mid_stream(&Error::Transport(
             "prompt is too long: 250000 tokens > 200000 maximum".into()
@@ -1245,6 +1853,96 @@ mod tests {
                 "progress:chunk-2".to_string()
             ],
             "both chunks must arrive, in order, before ToolEnd: {log:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_end_streams_in_actual_finish_order_not_call_order() {
+        use std::time::Duration;
+
+        // "slow" is *called* first but finishes last; "fast" is called second but finishes
+        // immediately. `ToolEnd` must stream live as each call's own result becomes known — so
+        // "fast"'s `ToolEnd` arrives before "slow"'s — rather than batching every call's `ToolEnd`
+        // until the whole turn's dispatch joins (which would emit them in call order regardless of
+        // when each one actually finished: slow, then fast).
+        struct SlowTool;
+        #[async_trait]
+        impl Tool for SlowTool {
+            fn name(&self) -> &str {
+                "slow"
+            }
+            fn description(&self) -> &str {
+                "finishes last"
+            }
+            fn input_schema(&self) -> Value {
+                json!({ "type": "object" })
+            }
+            async fn run(
+                &self,
+                _: Value,
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                Ok("slow-done".into())
+            }
+        }
+        struct FastTool;
+        #[async_trait]
+        impl Tool for FastTool {
+            fn name(&self) -> &str {
+                "fast"
+            }
+            fn description(&self) -> &str {
+                "finishes immediately"
+            }
+            fn input_schema(&self) -> Value {
+                json!({ "type": "object" })
+            }
+            async fn run(
+                &self,
+                _: Value,
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+                Ok("fast-done".into())
+            }
+        }
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(SlowTool));
+        tools.register(Arc::new(FastTool));
+
+        let two_calls = vec![
+            StreamEvent::MessageStart,
+            StreamEvent::ToolUseStart {
+                id: "s".into(),
+                name: "slow".into(),
+            },
+            StreamEvent::ContentBlockStop,
+            StreamEvent::ToolUseStart {
+                id: "f".into(),
+                name: "fast".into(),
+            },
+            StreamEvent::ContentBlockStop,
+            StreamEvent::MessageStop {
+                stop_reason: StopReason::ToolUse,
+            },
+        ];
+        let (agent, _mock) = agent_with(vec![two_calls, turn::text("done")], tools);
+        let mut session = Session::new();
+        session.user("go");
+
+        let mut end_order: Vec<String> = Vec::new();
+        agent
+            .run_events(&mut session, |ev| {
+                if let AgentEvent::ToolEnd { id, .. } = ev {
+                    end_order.push(id);
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            end_order,
+            vec!["f".to_string(), "s".to_string()],
+            "ToolEnd must stream in actual finish order (fast, then slow), not call order: {end_order:?}"
         );
     }
 
@@ -1459,6 +2157,188 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conservative_exclusive_call_serializes_the_whole_turn() {
+        // A `bash`-like tool (no `write_target` — its scope can't be named) batched alongside an
+        // `edit`-like tool on a *different* path would normally land in two distinct groups and run
+        // fully concurrently. `conservative_exclusive` must still force the whole turn to one call at
+        // a time, so the opaque call can't race the path-targeted one on disk.
+        struct RecordingTool {
+            id: &'static str,
+            target: Option<&'static str>,
+            exclusive: bool,
+            log: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+        #[async_trait]
+        impl Tool for RecordingTool {
+            fn name(&self) -> &str {
+                self.id
+            }
+            fn description(&self) -> &str {
+                "records start/end order"
+            }
+            fn input_schema(&self) -> Value {
+                json!({ "type": "object" })
+            }
+            fn write_target(&self, _input: &Value) -> Option<String> {
+                self.target.map(str::to_string)
+            }
+            fn conservative_exclusive(&self) -> bool {
+                self.exclusive
+            }
+            async fn run(
+                &self,
+                _input: Value,
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+                self.log.lock().unwrap().push(format!("start:{}", self.id));
+                tokio::task::yield_now().await;
+                self.log.lock().unwrap().push(format!("end:{}", self.id));
+                Ok(self.id.into())
+            }
+        }
+
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(RecordingTool {
+            id: "edit",
+            target: Some("foo.rs"),
+            exclusive: false,
+            log: log.clone(),
+        }));
+        tools.register(Arc::new(RecordingTool {
+            id: "bash",
+            target: None,
+            exclusive: true,
+            log: log.clone(),
+        }));
+
+        let two_calls = vec![
+            StreamEvent::MessageStart,
+            StreamEvent::ToolUseStart {
+                id: "a".into(),
+                name: "edit".into(),
+            },
+            StreamEvent::InputJsonDelta {
+                partial_json: r#"{"path":"foo.rs"}"#.into(),
+            },
+            StreamEvent::ContentBlockStop,
+            StreamEvent::ToolUseStart {
+                id: "b".into(),
+                name: "bash".into(),
+            },
+            StreamEvent::InputJsonDelta {
+                partial_json: r#"{"command":"black foo.rs"}"#.into(),
+            },
+            StreamEvent::ContentBlockStop,
+            StreamEvent::MessageStop {
+                stop_reason: StopReason::ToolUse,
+            },
+        ];
+        let (agent, _mock) = agent_with(vec![two_calls, turn::text("done")], tools);
+
+        let mut session = Session::new();
+        session.user("go");
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        // Which group runs first is unspecified (same as any other two distinct groups — cross-group
+        // order never reaches the transcript), but neither call's "start" may land between the
+        // other's "start" and "end": no interleaving, even though the two calls report different (and
+        // no) targets and would normally be two independent, concurrently-run groups.
+        let log = log.lock().unwrap().clone();
+        assert!(
+            log == vec!["start:edit", "end:edit", "start:bash", "end:bash"]
+                || log == vec!["start:bash", "end:bash", "start:edit", "end:edit"],
+            "calls must not interleave: {log:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_write_target_serializes_across_two_agent_runs_sharing_a_registry() {
+        // The per-turn grouping above only reaches calls within one turn. Two *separate* `Agent`s
+        // (e.g. one per session in a `serve` process) targeting the same path must still serialize
+        // when they share a `WriteLockRegistry` — proving the exclusivity extends across turn/session
+        // boundaries, not just within a single dispatch.
+        struct RecordingTool {
+            id: &'static str,
+            log: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+        #[async_trait]
+        impl Tool for RecordingTool {
+            fn name(&self) -> &str {
+                self.id
+            }
+            fn description(&self) -> &str {
+                "records start/end order"
+            }
+            fn input_schema(&self) -> Value {
+                json!({ "type": "object" })
+            }
+            fn write_target(&self, _input: &Value) -> Option<String> {
+                Some("shared.rs".to_string())
+            }
+            async fn run(
+                &self,
+                _input: Value,
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+                self.log.lock().unwrap().push(format!("start:{}", self.id));
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                self.log.lock().unwrap().push(format!("end:{}", self.id));
+                Ok(self.id.into())
+            }
+        }
+
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let registry = Arc::new(crate::write_lock::WriteLockRegistry::new());
+
+        let mut tools_a = ToolRegistry::new();
+        tools_a.register(Arc::new(RecordingTool {
+            id: "a",
+            log: log.clone(),
+        }));
+        let mock_a = Arc::new(MockTransport::new(vec![
+            turn::tool_call("t", "a", "{}"),
+            turn::text("done"),
+        ]));
+        let agent_a = Agent::new(mock_a, "claude-opus-4-8")
+            .with_tools(tools_a)
+            .with_write_locks(registry.clone());
+
+        let mut tools_b = ToolRegistry::new();
+        tools_b.register(Arc::new(RecordingTool {
+            id: "b",
+            log: log.clone(),
+        }));
+        let mock_b = Arc::new(MockTransport::new(vec![
+            turn::tool_call("t", "b", "{}"),
+            turn::text("done"),
+        ]));
+        let agent_b = Agent::new(mock_b, "claude-opus-4-8")
+            .with_tools(tools_b)
+            .with_write_locks(registry.clone());
+
+        let mut session_a = Session::new();
+        session_a.user("go");
+        let mut session_b = Session::new();
+        session_b.user("go");
+
+        let (res_a, res_b) = tokio::join!(
+            agent_a.run(&mut session_a, |_| {}),
+            agent_b.run(&mut session_b, |_| {}),
+        );
+        res_a.unwrap();
+        res_b.unwrap();
+
+        // Neither run's "start" may land between the other's "start" and "end" — i.e. no interleaving
+        // across the two separate `Agent`/session pairs.
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 4);
+        assert!(
+            (*log == vec!["start:a", "end:a", "start:b", "end:b"])
+                || (*log == vec!["start:b", "end:b", "start:a", "end:a"]),
+            "expected the two runs' start/end pairs to never interleave, got: {log:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn tool_group_concurrency_is_capped() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
@@ -1634,6 +2514,99 @@ mod tests {
         }
     }
 
+    #[test]
+    fn repair_json_escapes_a_raw_control_character_inside_a_string() {
+        // A large `write`/`edit` argument streamed with a literal newline byte instead of `\n` — the
+        // motivating real-world case: the exact first-parse-fails-but-shouldn't shape this exists for.
+        let raw = "{\"content\":\"line one\nline two\"}";
+        assert!(
+            serde_json::from_str::<Value>(raw).is_err(),
+            "must actually be invalid first"
+        );
+        let repaired = repair_json(raw);
+        let v: Value = serde_json::from_str(&repaired).expect("repaired JSON must parse");
+        assert_eq!(v["content"], "line one\nline two");
+    }
+
+    #[test]
+    fn repair_json_doubles_a_stray_backslash() {
+        // A Windows path streamed without escaping its own backslashes. `\W` and `\S` aren't
+        // recognized JSON escape leads (unlike, say, `\n`, which — ambiguously, but per the JSON
+        // grammar itself, not a bug in the repair — a real backslash-then-`n` can't be told apart
+        // from an intended newline escape), so both round-trip as literal backslashes.
+        let raw = r#"{"path":"C:\Windows\System32"}"#;
+        assert!(
+            serde_json::from_str::<Value>(raw).is_err(),
+            "must actually be invalid first"
+        );
+        let repaired = repair_json(raw);
+        let v: Value = serde_json::from_str(&repaired).expect("repaired JSON must parse");
+        assert_eq!(v["path"], r"C:\Windows\System32");
+    }
+
+    #[test]
+    fn repair_json_leaves_already_valid_json_semantically_unchanged() {
+        let raw = r#"{"a":1,"b":"already \"valid\" \n json","c":[1,2,3]}"#;
+        let original: Value = serde_json::from_str(raw).unwrap();
+        let repaired: Value = serde_json::from_str(&repair_json(raw)).unwrap();
+        assert_eq!(original, repaired);
+    }
+
+    #[test]
+    fn repair_json_does_not_touch_structural_characters_outside_strings() {
+        // Whitespace/structure between key-value pairs must survive untouched — only bytes *inside* a
+        // string literal are ever rewritten.
+        let raw = "{\n  \"a\": 1,\n  \"b\": 2\n}";
+        assert_eq!(repair_json(raw), raw);
+    }
+
+    #[tokio::test]
+    async fn a_raw_control_character_in_streamed_tool_args_is_repaired_not_malformed() {
+        // Same shape as `malformed_tool_args_become_recoverable_error_result`, but for the class of
+        // failure `repair_json` exists to fix: a raw newline byte inside the streamed JSON string
+        // (as if a provider's SSE encoder forgot to escape it) rather than genuinely truncated JSON.
+        // This must now parse successfully on the repair pass instead of becoming a malformed call.
+        let turn = vec![
+            StreamEvent::MessageStart,
+            StreamEvent::ToolUseStart {
+                id: "tu_1".into(),
+                name: "echo".into(),
+            },
+            StreamEvent::InputJsonDelta {
+                partial_json: "{\"text\":\"line one".into(),
+            },
+            StreamEvent::InputJsonDelta {
+                partial_json: "\nline two\"}".into(), // raw newline, not an escaped `\n`
+            },
+            StreamEvent::ContentBlockStop,
+            StreamEvent::MessageStop {
+                stop_reason: StopReason::ToolUse,
+            },
+        ];
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        let (agent, _mock) = agent_with(vec![turn, turn::text("done")], tools);
+        let mut session = Session::new();
+        session.user("go");
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        match &session.messages[1].content[0] {
+            ContentBlock::ToolUse { input, .. } => {
+                assert_eq!(input["text"], "line one\nline two");
+            }
+            other => panic!("expected a tool_use block with repaired input, got {other:?}"),
+        }
+        match &session.messages[2].content[0] {
+            ContentBlock::ToolResult { is_error, .. } => {
+                assert!(
+                    !is_error,
+                    "a repaired call must not be reported as malformed"
+                );
+            }
+            other => panic!("expected a successful tool_result, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn max_steps_is_enforced() {
         // The model keeps asking for a tool forever.
@@ -1648,6 +2621,16 @@ mod tests {
         session.user("loop");
         let err = agent.run(&mut session, |_| {}).await.unwrap_err();
         assert!(matches!(err, Error::MaxSteps(3)));
+
+        // Resumable: the check runs before any per-turn state is touched, so a fresh `run` against the
+        // *same* session (no rollback needed) can simply continue past the ceiling with a fresh budget
+        // rather than the session being left in some unusable state. This fixture's model keeps
+        // requesting tools forever, so the second run hits its own fresh 3-step ceiling too — the
+        // point is that it *runs* 3 more steps rather than erroring immediately or corrupting state.
+        let steps_before = session.steps;
+        let err = agent.run(&mut session, |_| {}).await.unwrap_err();
+        assert!(matches!(err, Error::MaxSteps(3)));
+        assert_eq!(session.steps, steps_before + 3);
     }
 
     #[tokio::test]
@@ -1742,6 +2725,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hard_overflow_forces_compaction_even_when_auto_compaction_is_disabled() {
+        // Auto-compaction is off, so the normal threshold check (`should_compact`, gated on `enabled`)
+        // never fires. But the tool-call turn's own reported usage already meets the raw context
+        // window — a silent overflow no error was raised for. `is_hard_overflow` must still force a
+        // compaction before the next request goes out, regardless of the disabled toggle.
+        // `find_cut` declines short conversations (needs at least 4 messages), so two tool turns are
+        // scripted — only the second one's usage actually breaches the raw window.
+        fn tool_turn(id: &str, input_tokens: u32) -> Vec<StreamEvent> {
+            vec![
+                StreamEvent::MessageStart,
+                StreamEvent::ToolUseStart {
+                    id: id.into(),
+                    name: "echo".into(),
+                },
+                StreamEvent::InputJsonDelta {
+                    partial_json: r#"{"text":"a"}"#.into(),
+                },
+                StreamEvent::ContentBlockStop,
+                StreamEvent::Usage(TokenUsage {
+                    input_tokens,
+                    output_tokens: 5,
+                    ..Default::default()
+                }),
+                StreamEvent::MessageStop {
+                    stop_reason: StopReason::ToolUse,
+                },
+            ]
+        }
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        let mock = Arc::new(MockTransport::new(vec![
+            tool_turn("t1", 20),
+            tool_turn("t2", 150),
+            turn::text("## Goal\nsummary of earlier work"),
+            turn::text("all done"),
+        ]));
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8")
+            .with_tools(tools)
+            .with_compaction(CompactionConfig {
+                context_window: 100,
+                reserve_tokens: 10,
+                keep_recent_tokens: 1,
+                summary_max_tokens: 256,
+                enabled: false,
+            });
+        let mut session = Session::new();
+        session.user("seed task");
+
+        let mut reason_seen = None;
+        agent
+            .run_events(&mut session, |ev| {
+                if let AgentEvent::Compacted { reason, .. } = ev {
+                    reason_seen = Some(reason);
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            reason_seen,
+            Some(CompactionReason::Overflow),
+            "a hard overflow must compact with reason Overflow even though auto-compaction is disabled"
+        );
+        // 4 model calls: the two tool turns, the forced summarization call, the final turn.
+        assert_eq!(mock.calls(), 4);
+    }
+
+    #[tokio::test]
     async fn auto_compaction_records_provenance_on_the_session() {
         // A registered tool named "read" (not "echo") so `extract_file_ops` — keyed on tool name —
         // actually picks up a file reference from the compacted turns.
@@ -1828,6 +2880,197 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compact_issues_two_calls_and_merges_with_turn_context_header() {
+        // A split-turn compaction round (cut lands mid-tool-dispatch) must issue exactly two
+        // summarization calls — one for the closed-off history, one for the in-progress turn's own
+        // prefix — and splice their merged result in with the "Turn Context" separator, rather than
+        // collapsing everything under the minimal split-turn template.
+        let session_messages = vec![
+            Message::user("first request"),
+            Message::assistant(vec![ContentBlock::Text {
+                text: "first done".into(),
+            }]),
+            Message::user("second request"),
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "1".into(),
+                name: "read".into(),
+                input: json!({ "path": "a.rs" }),
+            }]),
+            Message::tool_result("1", "contents of a.rs", false),
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "2".into(),
+                name: "edit".into(),
+                input: json!({ "path": "a.rs" }),
+            }]),
+            Message::tool_result("2", "edited", false),
+        ];
+        let mut session = Session::new();
+        session.messages = Arc::new(session_messages);
+
+        let mock = Arc::new(MockTransport::new(vec![
+            turn::text("history summary text"),
+            turn::text("turn prefix summary text"),
+        ]));
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8").with_compaction(CompactionConfig {
+            keep_recent_tokens: 1,
+            ..CompactionConfig::default()
+        });
+        let cancel = CancellationToken::new();
+        let compacted = agent
+            .compact(&mut session, CompactionReason::Manual, &cancel, &mut |_| {})
+            .await
+            .unwrap();
+
+        assert!(
+            compacted,
+            "a split-turn compaction round should still apply"
+        );
+        assert_eq!(mock.calls(), 2, "a split turn must issue two summary calls");
+        assert!(
+            matches!(&session.messages[0].content[0], ContentBlock::Text { text }
+                if text.contains("history summary text")
+                    && text.contains("**Turn Context (split turn):**")
+                    && text.contains("turn prefix summary text")),
+            "expected the merged summary, got: {:?}",
+            session.messages[0].content
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_uses_half_budget_for_split_turn_prefix_call() {
+        // Of the two calls a split-turn compaction issues, the turn-prefix one gets half the
+        // history call's `summary_max_tokens` budget — a partial turn needs proportionally less room.
+        let session_messages = vec![
+            Message::user("first request"),
+            Message::assistant(vec![ContentBlock::Text {
+                text: "first done".into(),
+            }]),
+            Message::user("second request"),
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "1".into(),
+                name: "read".into(),
+                input: json!({ "path": "a.rs" }),
+            }]),
+            Message::tool_result("1", "contents of a.rs", false),
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "2".into(),
+                name: "edit".into(),
+                input: json!({ "path": "a.rs" }),
+            }]),
+            Message::tool_result("2", "edited", false),
+        ];
+        let mut session = Session::new();
+        session.messages = Arc::new(session_messages);
+
+        let mock = Arc::new(MockTransport::new(vec![
+            turn::text("history summary"),
+            turn::text("turn prefix summary"),
+        ]));
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8").with_compaction(CompactionConfig {
+            keep_recent_tokens: 1,
+            summary_max_tokens: 1000,
+            ..CompactionConfig::default()
+        });
+        let cancel = CancellationToken::new();
+        agent
+            .compact(&mut session, CompactionReason::Manual, &cancel, &mut |_| {})
+            .await
+            .unwrap();
+
+        let reqs = mock.requests();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(
+            reqs[0].max_tokens, 1000,
+            "the history call keeps the full summary_max_tokens budget"
+        );
+        assert_eq!(
+            reqs[1].max_tokens, 500,
+            "the turn-prefix call gets half the budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_reuses_a_prior_summary_verbatim_when_the_split_turn_starts_right_after_it() {
+        // A prior compaction's summary always sits at `session.messages[0]`. When the entire
+        // conversation since then is one continuous, still-open turn (no genuine new user message),
+        // `find_split_cut` reports `turn_start == 1` — the summary alone is the closed-off history side
+        // of the split. `compact` must reuse that summary text verbatim instead of spending a model
+        // call asking for what would be an unchanged restatement of it: only ONE call (the turn-prefix
+        // one) should fire, not two.
+        let session_messages = vec![
+            Message::user(format!(
+                "{}\n\nprior summary body",
+                compaction::SUMMARY_MARKER
+            )),
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "1".into(),
+                name: "read".into(),
+                input: json!({ "path": "a.rs" }),
+            }]),
+            Message::tool_result("1", "contents of a.rs", false),
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "2".into(),
+                name: "edit".into(),
+                input: json!({ "path": "a.rs" }),
+            }]),
+            Message::tool_result("2", "edited", false),
+        ];
+        let mut session = Session::new();
+        session.messages = Arc::new(session_messages);
+
+        // Only one response queued: if the (buggy) history call fired too, `MockTransport` would run
+        // out of scripted turns and panic/error, failing the test loudly rather than silently passing.
+        let mock = Arc::new(MockTransport::new(vec![turn::text(
+            "turn prefix summary text",
+        )]));
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8").with_compaction(CompactionConfig {
+            keep_recent_tokens: 1,
+            ..CompactionConfig::default()
+        });
+        let cancel = CancellationToken::new();
+        let compacted = agent
+            .compact(&mut session, CompactionReason::Manual, &cancel, &mut |_| {})
+            .await
+            .unwrap();
+
+        assert!(compacted);
+        assert_eq!(
+            mock.calls(),
+            1,
+            "reusing the prior summary verbatim must skip its model call entirely"
+        );
+        assert!(
+            matches!(&session.messages[0].content[0], ContentBlock::Text { text }
+                if text.contains("prior summary body")
+                    && text.contains("**Turn Context (split turn):**")
+                    && text.contains("turn prefix summary text")),
+            "expected the prior summary folded forward verbatim, got: {:?}",
+            session.messages[0].content
+        );
+    }
+
+    #[test]
+    fn agent_new_scales_summary_max_tokens_from_model_capabilities() {
+        // A model with a `max_output` ceiling below the naive 0.8*reserve_tokens computation must have
+        // its summarization budget clamped to that ceiling, not the flat 4096 default nor an
+        // unreachably large number the model would reject.
+        let mock = Arc::new(MockTransport::new(vec![]));
+        // claude-3-haiku-20240307: gen-3 legacy, max_output 4_096 (see `models.rs`) — comfortably
+        // below the default reserve_tokens(24_000)*0.8 = 19_200, so the clamp must bite.
+        let agent = Agent::new(mock, "claude-3-haiku-20240307");
+        assert_eq!(
+            agent.compaction.summary_max_tokens, 4_096,
+            "summary_max_tokens must be clamped to the model's own max_output"
+        );
+
+        // A model with a large max_output should get the full 0.8*reserve_tokens computation, not the
+        // old flat 4096 default.
+        let mock2 = Arc::new(MockTransport::new(vec![]));
+        let agent2 = Agent::new(mock2, "claude-opus-4-8");
+        assert_eq!(agent2.compaction.summary_max_tokens, 19_200);
+    }
+
+    #[tokio::test]
     async fn thinking_block_is_assembled_with_signature() {
         // A turn that streams a signed thinking block, then text. The assistant message must carry the
         // thinking block first (with its signature) so the next request can replay it.
@@ -1872,7 +3115,12 @@ mod tests {
         struct DenyAll;
         #[async_trait]
         impl AgentHooks for DenyAll {
-            async fn before_tool_call(&self, _name: &str, _input: &Value) -> Option<String> {
+            async fn before_tool_call(
+                &self,
+                _name: &str,
+                _input: &Value,
+                _cancel: &CancellationToken,
+            ) -> Option<String> {
                 Some("denied by test policy".into())
             }
         }
@@ -1943,6 +3191,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refusal_ends_the_run_without_draining_steering() {
+        // A refusal is a distinct terminal condition: unlike an ordinary tool-less stop, it must NOT
+        // drain queued steer/follow-up messages and inject them as a new turn (the model would likely
+        // just refuse that too) — the run ends immediately, and the queue is left untouched for a
+        // later `prompt` call to pick up (see `serve.rs`'s persistent `Steering` handle).
+        let (agent, mock) = agent_with(
+            vec![turn::refusal("I can't help with that.")],
+            ToolRegistry::new(),
+        );
+        let mut session = Session::new();
+        session.user("do something disallowed");
+
+        let steering = Steering::new();
+        steering.push("a queued follow-up");
+
+        let mut steered = false;
+        agent
+            .run_events_steered(
+                &mut session,
+                |ev| {
+                    if matches!(ev, AgentEvent::Steered { .. }) {
+                        steered = true;
+                    }
+                },
+                CancellationToken::new(),
+                steering.clone(),
+            )
+            .await
+            .unwrap();
+
+        assert!(!steered, "a refusal must never drain/inject steering");
+        assert_eq!(
+            mock.calls(),
+            1,
+            "the run must end after the refusal, not continue"
+        );
+        // user + assistant(refusal) only — no injected follow-up turn.
+        assert_eq!(session.messages.len(), 2);
+        // The queued message survives, untouched, for a later `prompt` call to pick up.
+        assert!(!steering.is_empty());
+    }
+
+    #[tokio::test]
     async fn steering_is_injected_mid_run_between_tool_turns() {
         // A steering message queued while the agent is mid-tool-call must be folded into the *same*
         // tool-results user turn (not deferred to a stop boundary), so a client can redirect a busy
@@ -1986,6 +3277,272 @@ mod tests {
             &blocks[1],
             ContentBlock::Text { text } if text == "actually, also handle the edge case"
         ));
+    }
+
+    #[tokio::test]
+    async fn request_stop_ends_the_run_after_the_current_turns_tool_calls_finish() {
+        // The model would normally continue to a second turn after its tool call, but a graceful stop
+        // is requested before the run starts. The current turn's tool call still runs to completion
+        // and its result is committed — the run just never starts a second model call.
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        let (agent, mock) = agent_with(
+            vec![
+                turn::tool_call("tu_1", "echo", r#"{"text":"pong"}"#),
+                turn::text("would have replied here"),
+            ],
+            tools,
+        );
+        let mut session = Session::new();
+        session.user("start");
+
+        let steering = Steering::new();
+        steering.request_stop();
+
+        agent
+            .run_events_steered(&mut session, |_| {}, CancellationToken::new(), steering)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            mock.calls(),
+            1,
+            "the run must stop after the first turn's tool call, not continue to a second model call"
+        );
+        // user, assistant(tool_use), user(tool_result) — the tool call ran and its result is committed.
+        assert_eq!(session.messages.len(), 3);
+        assert!(matches!(
+            session.messages[2].content[0],
+            ContentBlock::ToolResult { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn request_stop_takes_priority_over_a_queued_follow_up() {
+        // A follow-up is queued (would normally drive a second turn), but a graceful stop was also
+        // requested. The stop wins: the run ends after the first reply, and the follow-up is left
+        // queued untouched — mirroring the refusal case's "nothing is lost" contract.
+        let (agent, mock) = agent_with(vec![turn::text("first reply")], ToolRegistry::new());
+        let mut session = Session::new();
+        session.user("hello");
+
+        let steering = Steering::new();
+        steering.push("a queued follow-up");
+        steering.request_stop();
+
+        let mut steered = false;
+        agent
+            .run_events_steered(
+                &mut session,
+                |ev| {
+                    if matches!(ev, AgentEvent::Steered { .. }) {
+                        steered = true;
+                    }
+                },
+                CancellationToken::new(),
+                steering.clone(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !steered,
+            "a stop request must win over draining a queued follow-up"
+        );
+        assert_eq!(mock.calls(), 1, "the run must end after the first turn");
+        assert_eq!(session.messages.len(), 2);
+        assert!(
+            !steering.is_empty(),
+            "the follow-up must remain queued, not be dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_stop_still_lets_a_folded_in_steer_message_emit_its_event_first() {
+        // A mid-run steer message folds into the current tool-results turn regardless of a pending
+        // stop request (it's already part of the committed transcript by the time the stop is
+        // checked) — only whether the run continues to another model call is affected.
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        let (agent, mock) = agent_with(
+            vec![
+                turn::tool_call("tu_1", "echo", r#"{"text":"pong"}"#),
+                turn::text("would have replied here"),
+            ],
+            tools,
+        );
+        let mut session = Session::new();
+        session.user("start");
+
+        let steering = Steering::new();
+        steering.push_steer("also handle this");
+        steering.request_stop();
+
+        let mut steered = false;
+        agent
+            .run_events_steered(
+                &mut session,
+                |ev| {
+                    if matches!(ev, AgentEvent::Steered { .. }) {
+                        steered = true;
+                    }
+                },
+                CancellationToken::new(),
+                steering,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            steered,
+            "the folded-in steer message must still emit its Steered event"
+        );
+        assert_eq!(
+            mock.calls(),
+            1,
+            "the stop request must still end the run after this turn"
+        );
+        let blocks = &session.messages[2].content;
+        assert!(matches!(blocks[0], ContentBlock::ToolResult { .. }));
+        assert!(matches!(
+            &blocks[1],
+            ContentBlock::Text { text } if text == "also handle this"
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_stop_request_left_pending_by_a_refusal_does_not_bleed_into_the_next_run() {
+        // A refusal ends the run without ever checking the stop request (it's a distinct terminal
+        // condition, checked first — see `refusal_ends_the_run_without_draining_steering`). If a client
+        // had also requested a graceful stop on that same run, the request must still not survive to
+        // affect a later, unrelated run that reuses the same `Steering` handle.
+        let (agent, mock) = agent_with(
+            vec![turn::refusal("I can't help with that.")],
+            ToolRegistry::new(),
+        );
+        let mut session = Session::new();
+        session.user("do something disallowed");
+
+        let steering = Steering::new();
+        steering.request_stop();
+
+        agent
+            .run_events_steered(
+                &mut session,
+                |_| {},
+                CancellationToken::new(),
+                steering.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mock.calls(), 1, "run A ends on the refusal");
+
+        // Run B: an unrelated run on a fresh session, sharing the same `steering` handle. Uses a
+        // tool-call turn so a leftover `true` flag (if the guard above didn't clear it) would cut it
+        // short after just one call instead of the two it should take.
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        let (agent_b, mock_b) = agent_with(
+            vec![
+                turn::tool_call("tu_2", "echo", r#"{"text":"pong"}"#),
+                turn::text("done"),
+            ],
+            tools,
+        );
+        let mut session_b = Session::new();
+        session_b.user("start again");
+        agent_b
+            .run_events_steered(&mut session_b, |_| {}, CancellationToken::new(), steering)
+            .await
+            .unwrap();
+        assert_eq!(
+            mock_b.calls(),
+            2,
+            "a stop request left over from a different, already-ended run must not affect this one"
+        );
+    }
+
+    /// Records `session.messages.len()` at every checkpoint — a stand-in for a host that would persist
+    /// incrementally (see `serve.rs`'s own `CheckpointHook` impl) without doing real I/O in a test.
+    struct RecordingCheckpoint {
+        lens: std::sync::Mutex<Vec<usize>>,
+    }
+
+    #[async_trait]
+    impl CheckpointHook for RecordingCheckpoint {
+        async fn checkpoint(&self, session: &Session) {
+            self.lens
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(session.messages.len());
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_fires_after_each_tool_round_trip_not_just_at_the_end() {
+        // Two tool round-trips followed by a final text turn: the checkpoint must fire twice — once
+        // per tool_results commit — each time with every message durable up to that point (never
+        // mid-way through an assistant message's tool_use with no matching tool_result yet), and it
+        // must NOT double-fire or fire again for the final text-only turn's own `AgentEnd` (that path
+        // is already covered by a caller's own post-run persist).
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        let mock = Arc::new(MockTransport::new(vec![
+            turn::tool_call("tu_1", "echo", r#"{"text":"one"}"#),
+            turn::tool_call("tu_2", "echo", r#"{"text":"two"}"#),
+            turn::text("done"),
+        ]));
+        let checkpoint = Arc::new(RecordingCheckpoint {
+            lens: std::sync::Mutex::new(Vec::new()),
+        });
+        let agent = Agent::new(mock, "claude-opus-4-8")
+            .with_tools(tools)
+            .with_max_steps(8)
+            .with_checkpoint_hook(checkpoint.clone());
+        let mut session = Session::new();
+        session.user("go");
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        let lens = checkpoint.lens.lock().unwrap().clone();
+        // user, assistant(tool_use), tool_results = 3 after the first round-trip; +2 more after the
+        // second = 5. The final text turn ends the run via `AgentEnd`, not a checkpoint.
+        assert_eq!(
+            lens,
+            vec![3, 5],
+            "checkpoint must fire exactly once per tool round-trip, with the session already durable"
+        );
+        assert_eq!(
+            session.messages.len(),
+            6,
+            "sanity: final count after the text turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_fires_when_a_steered_message_is_injected_at_a_stop_boundary() {
+        // A follow-up queued before the model would otherwise stop must also land on a checkpoint —
+        // the injected user message is itself a valid, resumable point.
+        let (agent, _mock) = agent_with(
+            vec![turn::text("first answer"), turn::text("second answer")],
+            ToolRegistry::new(),
+        );
+        let checkpoint = Arc::new(RecordingCheckpoint {
+            lens: std::sync::Mutex::new(Vec::new()),
+        });
+        let agent = agent.with_checkpoint_hook(checkpoint.clone());
+        let mut session = Session::new();
+        session.user("go");
+        let steering = Steering::new();
+        steering.push("a follow-up question");
+
+        agent
+            .run_events_steered(&mut session, |_| {}, CancellationToken::new(), steering)
+            .await
+            .unwrap();
+
+        let lens = checkpoint.lens.lock().unwrap().clone();
+        // user, assistant("first answer"), user(follow-up) = 3, right when the follow-up is injected.
+        assert_eq!(lens, vec![3]);
     }
 
     #[tokio::test]
@@ -2038,6 +3595,136 @@ mod tests {
         .await
         .expect("cancellation must abort the hung tool, not hang the run");
         assert!(matches!(result, Err(Error::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn cancellation_mid_dispatch_repairs_the_orphaned_tool_use() {
+        use std::time::Duration;
+
+        // One tool returns immediately, the other hangs forever. Cancelling once the fast one has
+        // surely finished (but the hung one hasn't) must still leave the session in a valid,
+        // resumable shape: the assistant's tool_use message was already committed before dispatch, so
+        // without a repair step the run would end on an orphaned tool_use with no matching
+        // tool_result — a shape both Anthropic and OpenAI reject on resume.
+        struct FastTool;
+        #[async_trait]
+        impl Tool for FastTool {
+            fn name(&self) -> &str {
+                "fast"
+            }
+            fn description(&self) -> &str {
+                "returns immediately"
+            }
+            fn input_schema(&self) -> Value {
+                json!({ "type": "object" })
+            }
+            async fn run(
+                &self,
+                _: Value,
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+                Ok("fast-done".into())
+            }
+        }
+        struct HangTool;
+        #[async_trait]
+        impl Tool for HangTool {
+            fn name(&self) -> &str {
+                "hang"
+            }
+            fn description(&self) -> &str {
+                "never returns"
+            }
+            fn input_schema(&self) -> Value {
+                json!({ "type": "object" })
+            }
+            async fn run(
+                &self,
+                _: Value,
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+                futures::future::pending::<()>().await;
+                unreachable!()
+            }
+        }
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(FastTool));
+        tools.register(Arc::new(HangTool));
+
+        let two_calls = vec![
+            StreamEvent::MessageStart,
+            StreamEvent::ToolUseStart {
+                id: "f".into(),
+                name: "fast".into(),
+            },
+            StreamEvent::ContentBlockStop,
+            StreamEvent::ToolUseStart {
+                id: "h".into(),
+                name: "hang".into(),
+            },
+            StreamEvent::ContentBlockStop,
+            StreamEvent::MessageStop {
+                stop_reason: StopReason::ToolUse,
+            },
+        ];
+        let (agent, _mock) = agent_with(vec![two_calls], tools);
+        let mut session = Session::new();
+        session.user("go");
+
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            // Long enough that `fast` has certainly resolved; `hang` never will regardless.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            trigger.cancel();
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            agent.run_events_cancellable(&mut session, |_| {}, cancel),
+        )
+        .await
+        .expect("cancellation must abort the run, not hang it");
+        assert!(matches!(result, Err(Error::Cancelled)));
+
+        // The session must end on a valid tool_results message, not an orphaned tool_use: the real
+        // "fast" result survives, and "hang" gets a synthesized error result standing in for the call
+        // that never finished.
+        let last = session.messages.last().expect("session has messages");
+        assert_eq!(last.role, Role::User);
+        assert_eq!(last.content.len(), 2);
+        match (&last.content[0], &last.content[1]) {
+            (
+                ContentBlock::ToolResult {
+                    tool_use_id: fid,
+                    content: fcontent,
+                    is_error: ferr,
+                    ..
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: hid,
+                    content: hcontent,
+                    is_error: herr,
+                    ..
+                },
+            ) => {
+                assert_eq!(fid, "f");
+                assert_eq!(fcontent, "fast-done");
+                assert!(
+                    !ferr,
+                    "the call that actually finished must not be flagged an error"
+                );
+                assert_eq!(hid, "h");
+                assert!(
+                    hcontent.contains("cancelled"),
+                    "the call that never finished should carry a synthesized cancellation result: {hcontent}"
+                );
+                assert!(
+                    herr,
+                    "a synthesized cancellation result must be flagged an error"
+                );
+            }
+            other => panic!("expected two ordered tool_result blocks, got {other:?}"),
+        }
     }
 
     #[tokio::test]

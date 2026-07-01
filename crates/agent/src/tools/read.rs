@@ -8,11 +8,19 @@ use agent_core::tool::Tool;
 use agent_core::{ToolError, ToolOutput};
 use async_trait::async_trait;
 use base64::Engine as _;
+use image::ImageEncoder as _;
 use serde_json::{Value, json};
 
-/// Cap on image file size we'll inline as a data-URI (bytes). Beyond this the base64 payload would
-/// dominate the model's context; tell the model to narrow rather than ballooning the request.
-const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+/// Base64-encoded budget for an inlined image, matching pi's `resizeImageInProcess` default — the
+/// budget is on the *base64* payload (what actually rides in the request), not the raw file bytes,
+/// leaving headroom under Anthropic's real ~5MB request-image limit.
+const MAX_IMAGE_BASE64_BYTES: f64 = 4.5 * 1024.0 * 1024.0;
+/// Max width/height an oversized image is downscaled to before re-encoding — pi's default.
+const MAX_IMAGE_DIMENSION: u32 = 2000;
+/// JPEG quality used when an oversized image must be re-encoded to fit the base64 budget — pi's
+/// default. Only applies on the resize path; an image that already fits is sent as its original bytes,
+/// original format, unmodified.
+const JPEG_QUALITY: u8 = 80;
 
 /// Default cap on returned lines when no `limit` is given (keeps large files from flooding context).
 const DEFAULT_LIMIT: usize = 2000;
@@ -94,9 +102,11 @@ impl Tool for Read {
             .ok_or_else(|| ToolError::InvalidInput("missing `path`".into()))?;
 
         // An image file is returned as an attachment the multimodal model can see, not decoded as
-        // UTF-8 text (which would hand back garbage). Detected by extension.
-        if let Some(media_type) = image_media_type(path) {
-            return read_image(path, media_type);
+        // UTF-8 text (which would hand back garbage). The extension gate decides *whether* to take this
+        // path (so an ordinary text-file read never pays for an extra image-format probe); `read_image`
+        // then sniffs the real magic bytes to recover from a mislabeled extension.
+        if let Some(ext_format) = extension_image_format(path) {
+            return read_image(path, ext_format);
         }
 
         let offset = input
@@ -181,9 +191,10 @@ impl Tool for Read {
         }
         if truncated {
             let last = offset + shown - 1;
-            out.push_str(&format!(
-                "… (showing lines {offset}-{last}; use offset={lineno} to continue)\n"
-            ));
+            out.push_str(&super::output::marker(format_args!(
+                "showing lines {offset}-{last}; use offset={lineno} to continue"
+            )));
+            out.push('\n');
         }
         if has_invalid_utf8 {
             out.push_str(
@@ -196,41 +207,311 @@ impl Tool for Read {
     }
 }
 
-/// The image MIME type for a path's extension, or `None` if it isn't a recognized image. Used to
-/// route `read` to the attachment path instead of UTF-8 text decoding.
-fn image_media_type(path: &str) -> Option<&'static str> {
+/// The image format implied by a path's extension, or `None` if it isn't a recognized one. Used only
+/// to decide *whether* `read` should route to the attachment path at all — the actual format sent on
+/// the wire comes from sniffing the file's real magic bytes (see [`read_image`]), so a mislabeled
+/// extension (a `.jpg` that's actually a PNG) still reports its true format.
+fn extension_image_format(path: &str) -> Option<image::ImageFormat> {
     let ext = std::path::Path::new(path)
         .extension()
         .and_then(|e| e.to_str())?
         .to_ascii_lowercase();
     Some(match ext.as_str() {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
+        "png" => image::ImageFormat::Png,
+        "jpg" | "jpeg" => image::ImageFormat::Jpeg,
+        "gif" => image::ImageFormat::Gif,
+        "webp" => image::ImageFormat::WebP,
+        "bmp" => image::ImageFormat::Bmp,
         _ => return None,
     })
 }
 
-/// Read an image file and return it as a base64 [`ImageSource`] attachment (plus a short text note),
-/// so the multimodal model can actually see it. Oversized files are refused rather than ballooning the
-/// request with a multi-megabyte base64 payload.
-fn read_image(path: &str, media_type: &str) -> Result<ToolOutput, ToolError> {
-    let meta =
-        std::fs::metadata(path).map_err(|e| ToolError::Execution(format!("read {path}: {e}")))?;
-    if meta.len() > MAX_IMAGE_BYTES {
-        return Err(ToolError::InvalidInput(format!(
-            "image {path} is {} bytes; larger than the {MAX_IMAGE_BYTES}-byte inline limit",
-            meta.len()
-        )));
+/// The IANA media type for an [`image::ImageFormat`] this tool supports (the five extensions
+/// [`extension_image_format`] recognizes).
+fn media_type_of(format: image::ImageFormat) -> &'static str {
+    match format {
+        image::ImageFormat::Png => "image/png",
+        image::ImageFormat::Jpeg => "image/jpeg",
+        image::ImageFormat::Gif => "image/gif",
+        image::ImageFormat::WebP => "image/webp",
+        image::ImageFormat::Bmp => "image/bmp",
+        _ => "application/octet-stream",
     }
+}
+
+/// The base64-encoded length of `n` raw bytes, without actually encoding — 4 output chars per 3 input
+/// bytes, rounded up.
+fn base64_len(n: usize) -> usize {
+    n.div_ceil(3) * 4
+}
+
+/// Losslessly re-encode `bytes` (already known to be `format`) as PNG, or `None` if decoding fails —
+/// used to normalize a format (BMP) most vision APIs don't accept into one they do.
+fn convert_to_png(bytes: &[u8], format: image::ImageFormat) -> Option<Vec<u8>> {
+    let img = image::load_from_memory_with_format(bytes, format).ok()?;
+    let mut out = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .ok()?;
+    Some(out)
+}
+
+/// Read an image file and return it as a base64 [`ImageSource`] attachment (plus a short text note), so
+/// the multimodal model can actually see it. `ext_format` is only the fallback used when magic-byte
+/// sniffing can't identify the real format (a truncated or corrupt header); the sniffed format is
+/// preferred whenever it succeeds. An image that already fits [`MAX_IMAGE_BASE64_BYTES`] is sent as its
+/// original bytes, unmodified; an oversized one is downscaled/re-encoded by [`resize_image`], and only
+/// refused outright if even that can't fit the budget.
+fn read_image(path: &str, ext_format: image::ImageFormat) -> Result<ToolOutput, ToolError> {
     let bytes =
         std::fs::read(path).map_err(|e| ToolError::Execution(format!("read {path}: {e}")))?;
-    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    Ok(ToolOutput::image(
-        format!("Read image {path} ({media_type}, {} bytes).", meta.len()),
-        ImageSource::base64(media_type, data),
-    ))
+    let format = image::guess_format(&bytes).unwrap_or(ext_format);
+
+    // Most vision APIs (Anthropic: png/jpeg/gif/webp only) reject BMP outright. Convert it losslessly
+    // to PNG up front — matching pi's `normalizeSupportedImageMimeType`, which always converts BMP
+    // before it can reach the model — rather than sending a media type the provider will 400 on. A
+    // failed conversion falls through with the original bytes/format; the caller still gets a
+    // best-effort attachment rather than a hard error over a format quirk.
+    let (bytes, format) = if format == image::ImageFormat::Bmp {
+        match convert_to_png(&bytes, format) {
+            Some(png) => (png, image::ImageFormat::Png),
+            None => (bytes, format),
+        }
+    } else {
+        (bytes, format)
+    };
+    let media_type = media_type_of(format);
+
+    if base64_len(bytes.len()) <= MAX_IMAGE_BASE64_BYTES as usize {
+        let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        return Ok(ToolOutput::image(
+            format!("Read image {path} ({media_type}, {} bytes).", bytes.len()),
+            ImageSource::base64(media_type, data),
+        ));
+    }
+
+    match resize_image(
+        &bytes,
+        format,
+        MAX_IMAGE_DIMENSION,
+        MAX_IMAGE_DIMENSION,
+        MAX_IMAGE_BASE64_BYTES as usize,
+        JPEG_QUALITY,
+    ) {
+        Some(resized) => {
+            let (orig_w, orig_h) = resized.orig_dimensions;
+            let (new_w, new_h) = resized.dimensions;
+            let resized_media_type = resized.media_type;
+            Ok(ToolOutput::image(
+                format!(
+                    "Read image {path} ({media_type}, {} bytes); resized from {orig_w}x{orig_h} to \
+                     {new_w}x{new_h} ({resized_media_type}) to fit within the inline size budget.",
+                    bytes.len()
+                ),
+                ImageSource::base64(resized_media_type, resized.base64_data),
+            ))
+        }
+        None => Err(ToolError::InvalidInput(format!(
+            "image {path} is {} bytes and could not be downscaled to fit the inline size budget",
+            bytes.len()
+        ))),
+    }
+}
+
+/// The result of a successful [`resize_image`] call.
+struct ResizedImage {
+    base64_data: String,
+    media_type: &'static str,
+    dimensions: (u32, u32),
+    orig_dimensions: (u32, u32),
+}
+
+/// Downscale/re-encode an oversized image to fit under `max_base64_bytes`. Applies JPEG EXIF
+/// orientation correction before resizing (a camera photo's pixels are often stored un-rotated, with
+/// the intended rotation recorded separately in Exif — skipping this would silently show the model a
+/// sideways image), then resizes with Lanczos3 (matching pi's `resizeImageInProcess`) to fit within
+/// `max_width`x`max_height`. At each size tried, a lossless PNG re-encode is attempted *first* — pi's
+/// own `tryEncodings` order — since a downscaled screenshot/diagram/text-heavy image often already fits
+/// losslessly, and a lossy JPEG re-encode would otherwise smear small text at block-compression edges
+/// for no reason; only when the PNG doesn't fit the budget does it fall back to JPEG (the only format
+/// here with a quality knob left to trade against size). If PNG-at-this-size still doesn't fit, both
+/// the dimensions and JPEG quality are stepped down and it retries a bounded number of times; returns
+/// `None` only if even the smallest re-encode can't fit.
+fn resize_image(
+    bytes: &[u8],
+    format: image::ImageFormat,
+    max_width: u32,
+    max_height: u32,
+    max_base64_bytes: usize,
+    jpeg_quality: u8,
+) -> Option<ResizedImage> {
+    let mut img = image::load_from_memory_with_format(bytes, format).ok()?;
+    if format == image::ImageFormat::Jpeg {
+        if let Some(orientation) = jpeg_exif_orientation(bytes) {
+            img = apply_exif_orientation(img, orientation);
+        }
+    }
+    let orig_dims = (img.width(), img.height());
+
+    let mut width = max_width.min(orig_dims.0).max(1);
+    let mut height = max_height.min(orig_dims.1).max(1);
+    let mut quality = jpeg_quality;
+    // A handful of shrink-and-retry rounds is enough in practice to find a fit (each round cuts pixel
+    // count by ~36% and quality by 10); a pathological image that still can't fit at the size/quality
+    // floor genuinely can't be served inline, and `None` tells the caller to say so.
+    for _ in 0..6 {
+        let scaled = if width < orig_dims.0 || height < orig_dims.1 {
+            img.resize(width, height, image::imageops::FilterType::Lanczos3)
+        } else {
+            img.clone()
+        };
+        let rgb = scaled.to_rgb8();
+
+        let mut png_buf = Vec::new();
+        let png_ok = image::codecs::png::PngEncoder::new(&mut png_buf)
+            .write_image(
+                rgb.as_raw(),
+                scaled.width(),
+                scaled.height(),
+                image::ExtendedColorType::Rgb8,
+            )
+            .is_ok();
+        if png_ok {
+            let data = base64::engine::general_purpose::STANDARD.encode(&png_buf);
+            if data.len() <= max_base64_bytes {
+                return Some(ResizedImage {
+                    base64_data: data,
+                    media_type: "image/png",
+                    dimensions: (scaled.width(), scaled.height()),
+                    orig_dimensions: orig_dims,
+                });
+            }
+        }
+
+        let mut jpeg_buf = Vec::new();
+        let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_buf, quality);
+        if encoder
+            .write_image(
+                rgb.as_raw(),
+                scaled.width(),
+                scaled.height(),
+                image::ExtendedColorType::Rgb8,
+            )
+            .is_err()
+        {
+            return None;
+        }
+        let data = base64::engine::general_purpose::STANDARD.encode(&jpeg_buf);
+        if data.len() <= max_base64_bytes {
+            return Some(ResizedImage {
+                base64_data: data,
+                media_type: "image/jpeg",
+                dimensions: (scaled.width(), scaled.height()),
+                orig_dimensions: orig_dims,
+            });
+        }
+        width = ((width as f64) * 0.8) as u32;
+        height = ((height as f64) * 0.8) as u32;
+        width = width.max(64);
+        height = height.max(64);
+        quality = quality.saturating_sub(10).max(30);
+    }
+    None
+}
+
+/// Parse a JPEG's Exif orientation tag (IFD0, tag `0x0112`), if present. A small hand-rolled scan for
+/// just this one tag rather than a general-purpose EXIF-reading dependency — matching this codebase's
+/// preference for narrow hand-rolled parsers over a heavier crate when only one field is ever read
+/// (see `resources.rs`'s TZif parser).
+fn jpeg_exif_orientation(bytes: &[u8]) -> Option<u16> {
+    if bytes.len() < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
+        return None; // not a JPEG (missing the SOI marker)
+    }
+    let mut pos = 2usize;
+    while pos + 4 <= bytes.len() {
+        if bytes[pos] != 0xFF {
+            break; // malformed marker stream
+        }
+        let marker = bytes[pos + 1];
+        // Markers with no payload: standalone RST*/SOI/EOI bytes.
+        if marker == 0xD8 || marker == 0xD9 || (0xD0..=0xD7).contains(&marker) {
+            pos += 2;
+            continue;
+        }
+        if marker == 0xDA {
+            break; // start of scan: compressed data follows, no more markers to inspect
+        }
+        let seg_len = u16::from_be_bytes([bytes[pos + 2], bytes[pos + 3]]) as usize;
+        if marker == 0xE1 && pos + 10 <= bytes.len() && &bytes[pos + 4..pos + 10] == b"Exif\0\0" {
+            let end = (pos + 2 + seg_len).min(bytes.len());
+            return parse_tiff_orientation(&bytes[pos + 10..end]);
+        }
+        if seg_len < 2 {
+            break; // a spec-violating zero/negative-length segment; stop rather than loop forever
+        }
+        pos += 2 + seg_len;
+    }
+    None
+}
+
+/// Read the Exif orientation tag out of a TIFF-structured IFD0 (the payload of a JPEG's APP1 segment,
+/// past the `Exif\0\0` marker).
+fn parse_tiff_orientation(tiff: &[u8]) -> Option<u16> {
+    if tiff.len() < 8 {
+        return None;
+    }
+    let little_endian = match &tiff[0..2] {
+        b"II" => true,
+        b"MM" => false,
+        _ => return None,
+    };
+    let read_u16 = |b: &[u8]| {
+        if little_endian {
+            u16::from_le_bytes([b[0], b[1]])
+        } else {
+            u16::from_be_bytes([b[0], b[1]])
+        }
+    };
+    let read_u32 = |b: &[u8]| {
+        if little_endian {
+            u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+        } else {
+            u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+        }
+    };
+    let ifd0_offset = read_u32(&tiff[4..8]) as usize;
+    if ifd0_offset + 2 > tiff.len() {
+        return None;
+    }
+    let num_entries = read_u16(&tiff[ifd0_offset..ifd0_offset + 2]) as usize;
+    let entries_start = ifd0_offset + 2;
+    for i in 0..num_entries {
+        let entry_off = entries_start + i * 12;
+        if entry_off + 12 > tiff.len() {
+            break;
+        }
+        let tag = read_u16(&tiff[entry_off..entry_off + 2]);
+        if tag == 0x0112 {
+            // SHORT (type 3): the value lives in the first 2 bytes of the entry's 4-byte value field.
+            let value_off = entry_off + 8;
+            return Some(read_u16(&tiff[value_off..value_off + 2]));
+        }
+    }
+    None
+}
+
+/// Apply an Exif orientation tag (values 1-8; 1 is "no transform needed") to a decoded image, so the
+/// pixels come out right-side-up regardless of how the camera stored them.
+fn apply_exif_orientation(img: image::DynamicImage, orientation: u16) -> image::DynamicImage {
+    match orientation {
+        2 => img.fliph(),
+        3 => img.rotate180(),
+        4 => img.flipv(),
+        5 => img.rotate90().fliph(),
+        6 => img.rotate90(),
+        7 => img.rotate270().fliph(),
+        8 => img.rotate270(),
+        _ => img,
+    }
 }
 
 #[cfg(test)]
@@ -275,7 +556,10 @@ mod tests {
             .unwrap()
             .text;
         //Showed lines 1-2; the model is told to continue at line 3.
-        assert!(out.contains("use offset=3 to continue"), "got: {out}");
+        assert!(
+            out.contains("[showing lines 1-2; use offset=3 to continue]"),
+            "got: {out}"
+        );
     }
 
     #[tokio::test]
@@ -328,7 +612,8 @@ mod tests {
         // silently lossy-decode it with no signal, or the model has no way to connect a later
         // `edit` failure back to this file's actual problem.
         let mut f = tempfile::NamedTempFile::new().unwrap();
-        f.write_all(b"good line\n\xff\xfe not valid utf-8\nlast\n").unwrap();
+        f.write_all(b"good line\n\xff\xfe not valid utf-8\nlast\n")
+            .unwrap();
         let out = Read
             .run(json!({ "path": f.path().to_str().unwrap() }))
             .await
@@ -384,5 +669,258 @@ mod tests {
             out.text.contains("Read image"),
             "a text note accompanies it"
         );
+    }
+
+    #[tokio::test]
+    async fn oversized_image_is_downscaled_to_fit_the_base64_budget() {
+        // An uncompressed BMP well past MAX_IMAGE_DIMENSION on one side and comfortably over the
+        // base64 budget in raw size — proves the resize path actually engages and lands under budget.
+        // Pixels are pseudo-random noise (a cheap xorshift-style mix, not a real RNG dependency) rather
+        // than a smooth gradient: a gradient PNG-compresses so well that this BMP fixture would (after
+        // the BMP-to-PNG normalization every image now goes through) land back *under* budget without
+        // ever exercising the resize path at all, since PNG's DEFLATE handles smooth data extremely
+        // well but not noise.
+        let width = MAX_IMAGE_DIMENSION + 800;
+        let height = 600;
+        let img = image::RgbImage::from_fn(width, height, |x, y| {
+            let h = (x.wrapping_mul(2654435761) ^ y.wrapping_mul(40503)).wrapping_add(0x9e3779b9);
+            image::Rgb([
+                (h & 0xff) as u8,
+                ((h >> 8) & 0xff) as u8,
+                ((h >> 16) & 0xff) as u8,
+            ])
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.bmp");
+        image::DynamicImage::ImageRgb8(img)
+            .save_with_format(&path, image::ImageFormat::Bmp)
+            .unwrap();
+        assert!(
+            base64_len(std::fs::metadata(&path).unwrap().len() as usize)
+                > MAX_IMAGE_BASE64_BYTES as usize,
+            "fixture must actually exceed the budget pre-resize"
+        );
+
+        let out = Read
+            .run(json!({ "path": path.to_str().unwrap() }))
+            .await
+            .unwrap();
+        assert_eq!(out.images.len(), 1);
+        // PNG is tried first at every size step (see `resize_image`'s doc comment) and, once shrunk
+        // enough by the retry loop, even incompressible noise's raw pixel data fits comfortably under
+        // budget as lossless PNG — so that's what wins here, not JPEG. (`resize_image_falls_back_to_
+        // jpeg_when_png_does_not_fit` isolates and proves the JPEG-fallback path directly, without
+        // depending on the outer shrink loop's eventual convergence to a trivially-small image.)
+        assert_eq!(
+            out.images[0].media_type, "image/png",
+            "a small enough downscaled image fits losslessly, so PNG wins over JPEG"
+        );
+        assert!(
+            out.images[0].data.len() <= MAX_IMAGE_BASE64_BYTES as usize,
+            "resized payload must fit the budget: {} bytes",
+            out.images[0].data.len()
+        );
+        assert!(
+            out.text.contains("resized from"),
+            "the resize must be noted in the text: {}",
+            out.text
+        );
+    }
+
+    #[tokio::test]
+    async fn small_bmp_is_converted_to_png_not_sent_as_bmp() {
+        // Most vision APIs (Anthropic: png/jpeg/gif/webp only) reject BMP outright — a BMP comfortably
+        // under the inline size budget (so the resize path never engages) must still come back as PNG,
+        // not the original, unsupported `image/bmp`.
+        let img = image::RgbImage::from_pixel(4, 4, image::Rgb([10, 20, 30]));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small.bmp");
+        image::DynamicImage::ImageRgb8(img)
+            .save_with_format(&path, image::ImageFormat::Bmp)
+            .unwrap();
+        assert!(
+            base64_len(std::fs::metadata(&path).unwrap().len() as usize)
+                <= MAX_IMAGE_BASE64_BYTES as usize,
+            "fixture must fit the budget as-is, so the resize path never engages"
+        );
+
+        let out = Read
+            .run(json!({ "path": path.to_str().unwrap() }))
+            .await
+            .unwrap();
+        assert_eq!(out.images.len(), 1);
+        assert_eq!(
+            out.images[0].media_type, "image/png",
+            "BMP must be converted to PNG, never sent as-is"
+        );
+        // The converted bytes must actually decode as a real PNG carrying the same pixels.
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&out.images[0].data)
+            .unwrap();
+        assert_eq!(
+            image::guess_format(&decoded).unwrap(),
+            image::ImageFormat::Png
+        );
+        let round_tripped = image::load_from_memory(&decoded).unwrap().to_rgb8();
+        assert_eq!(round_tripped.get_pixel(0, 0), &image::Rgb([10, 20, 30]));
+    }
+
+    #[tokio::test]
+    async fn mislabeled_extension_is_still_correctly_sniffed() {
+        // A real PNG saved under a `.jpg` name: the extension gate still routes it to the image path
+        // (so it isn't UTF-8-decoded as garbage text), but the *reported* format comes from sniffing
+        // the real magic bytes, not trusting the wrong extension.
+        let img = image::RgbImage::from_pixel(4, 4, image::Rgb([200, 100, 50]));
+        let mut png_bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut png_bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("actually_a_png.jpg");
+        std::fs::write(&path, &png_bytes).unwrap();
+
+        let out = Read
+            .run(json!({ "path": path.to_str().unwrap() }))
+            .await
+            .unwrap();
+        assert_eq!(out.images.len(), 1);
+        assert_eq!(
+            out.images[0].media_type, "image/png",
+            "sniffed format must win over the misleading .jpg extension"
+        );
+    }
+
+    /// Splice a synthetic Exif APP1 segment (TIFF IFD0, one entry: orientation) right after a JPEG's
+    /// SOI marker — real cameras embed Exif the same way, and a conforming decoder skips an APPn
+    /// segment it doesn't otherwise care about, so this still decodes as a normal JPEG.
+    fn jpeg_with_exif_orientation(width: u32, height: u32, orientation: u16) -> Vec<u8> {
+        let img =
+            image::RgbImage::from_fn(width, height, |x, _| image::Rgb([(x % 256) as u8, 0, 0]));
+        let mut jpeg_bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut jpeg_bytes),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II"); // little-endian
+        tiff.extend_from_slice(&42u16.to_le_bytes());
+        tiff.extend_from_slice(&8u32.to_le_bytes()); // IFD0 starts right after this header
+        tiff.extend_from_slice(&1u16.to_le_bytes()); // one entry
+        tiff.extend_from_slice(&0x0112u16.to_le_bytes()); // tag: Orientation
+        tiff.extend_from_slice(&3u16.to_le_bytes()); // type: SHORT
+        tiff.extend_from_slice(&1u32.to_le_bytes()); // count: 1
+        tiff.extend_from_slice(&orientation.to_le_bytes());
+        tiff.extend_from_slice(&[0, 0]); // pad the 4-byte value field
+        tiff.extend_from_slice(&0u32.to_le_bytes()); // no next IFD
+
+        let mut app1 = Vec::new();
+        app1.extend_from_slice(b"Exif\0\0");
+        app1.extend_from_slice(&tiff);
+        let seg_len = (app1.len() + 2) as u16;
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&jpeg_bytes[0..2]); // SOI
+        out.extend_from_slice(&[0xFF, 0xE1]);
+        out.extend_from_slice(&seg_len.to_be_bytes());
+        out.extend_from_slice(&app1);
+        out.extend_from_slice(&jpeg_bytes[2..]); // the rest of the real JPEG stream
+        out
+    }
+
+    #[test]
+    fn jpeg_exif_orientation_reads_the_spliced_tag() {
+        let bytes = jpeg_with_exif_orientation(8, 4, 6);
+        assert_eq!(jpeg_exif_orientation(&bytes), Some(6));
+    }
+
+    #[test]
+    fn exif_orientation_6_swaps_width_and_height_through_resize_image() {
+        // Orientation 6 means "rotate 90° CW to display correctly" — an 8-wide x 4-tall raw pixel
+        // buffer must come out 4-wide x 8-tall once `resize_image` applies the correction.
+        let bytes = jpeg_with_exif_orientation(8, 4, 6);
+        let resized = resize_image(
+            &bytes,
+            image::ImageFormat::Jpeg,
+            1000,
+            1000,
+            10 * 1024 * 1024,
+            90,
+        )
+        .expect("a tiny image at a generous budget must always fit");
+        // A tiny image at a 10MB budget fits losslessly, so PNG (tried first — see `resize_image`'s
+        // doc comment) wins; this test's real point is the dimension swap below, not the format.
+        assert_eq!(resized.media_type, "image/png");
+        assert_eq!(
+            resized.dimensions,
+            (4, 8),
+            "dimensions must be swapped by the rotation"
+        );
+    }
+
+    #[test]
+    fn resize_image_prefers_lossless_png_when_it_fits() {
+        // A smooth gradient compresses extremely well under PNG — once downscaled, it should come back
+        // losslessly rather than needlessly re-encoded as lossy JPEG (pi's own `tryEncodings` order:
+        // PNG tried first at every size step, JPEG only as a fallback).
+        let img = image::RgbImage::from_fn(400, 400, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, 128])
+        });
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+
+        let resized = resize_image(&bytes, image::ImageFormat::Png, 200, 200, 200_000, 80)
+            .expect("a downscaled smooth gradient must fit comfortably");
+        assert_eq!(resized.media_type, "image/png");
+    }
+
+    #[test]
+    fn resize_image_falls_back_to_jpeg_when_png_does_not_fit() {
+        // Pseudo-random noise at a budget deliberately sized between "fits as JPEG-80" and "too big as
+        // lossless PNG" at the *same* dimensions (no shrinking needed) — isolates the per-size
+        // PNG-then-JPEG fallback from the outer shrink loop's eventual convergence (a small enough
+        // image always fits as PNG *eventually*, which a different test already covers).
+        let img = image::RgbImage::from_fn(300, 300, |x, y| {
+            let h = (x.wrapping_mul(2654435761) ^ y.wrapping_mul(40503)).wrapping_add(0x9e3779b9);
+            image::Rgb([
+                (h & 0xff) as u8,
+                ((h >> 8) & 0xff) as u8,
+                ((h >> 16) & 0xff) as u8,
+            ])
+        });
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+
+        // Sanity: confirm the fixture is actually shaped as intended before trusting the real assertion.
+        let mut png_at_size = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png_at_size)
+            .write_image(
+                &image::load_from_memory(&bytes).unwrap().to_rgb8(),
+                300,
+                300,
+                image::ExtendedColorType::Rgb8,
+            )
+            .unwrap();
+        let png_b64_len = base64_len(png_at_size.len());
+        let budget = png_b64_len - 1; // just under the lossless size at this exact resolution
+
+        let resized = resize_image(&bytes, image::ImageFormat::Png, 300, 300, budget, 80)
+            .expect("JPEG must still fit even where lossless PNG does not");
+        assert_eq!(resized.media_type, "image/jpeg");
     }
 }

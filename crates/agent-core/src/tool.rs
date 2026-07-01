@@ -16,17 +16,28 @@ use tokio_util::sync::CancellationToken;
 use crate::error::ToolError;
 use crate::message::{ImageSource, ToolDef};
 
-/// One streamed progress update from a running tool: a **snapshot** of its output so far (not a delta
-/// — clients render the latest, matching pi's `tool_execution_update`/`partialResult` model) plus
-/// optional tool-specific `details` (e.g. bash's truncation info + full-output-file path).
-pub struct ToolUpdate {
-    pub id: String,
-    pub name: String,
-    /// The full accumulated output so far (a snapshot, not an incremental chunk).
-    pub snapshot: String,
-    /// Tool-specific structured detail (bash: `{ truncation, full_output_path }`). `None` when there's
-    /// nothing extra to report (e.g. the initial empty update).
-    pub details: Option<Value>,
+/// One update from a running (or just-finished) tool call, streamed to the loop's per-turn progress
+/// channel so it can forward each one to `sink` the moment it arrives — rather than batching
+/// completions until every concurrently-dispatched call in the turn has finished.
+pub enum ToolUpdate {
+    /// A **snapshot** of the tool's output so far (not a delta — clients render the latest, matching
+    /// pi's `tool_execution_update`/`partialResult` model) plus optional tool-specific `details`.
+    Progress {
+        id: String,
+        name: String,
+        /// The full accumulated output so far (a snapshot, not an incremental chunk).
+        snapshot: String,
+        /// Tool-specific structured detail (bash: `{ truncation, full_output_path }`). `None` when
+        /// there's nothing extra to report (e.g. the initial empty update).
+        details: Option<Value>,
+    },
+    /// A tool call's final result, sent the instant its own future resolves.
+    End {
+        id: String,
+        name: String,
+        result: String,
+        is_error: bool,
+    },
 }
 
 /// A sink a tool uses to emit progress *while it is still running* — a long shell command's streaming
@@ -52,8 +63,12 @@ pub struct ToolProgress {
 }
 
 impl ToolProgress {
-    /// Build a progress handle for one tool call. The loop constructs these; tools receive `&ToolProgress`.
-    pub(crate) fn new(
+    /// Build a progress handle for one tool call. The loop constructs these for a model-invoked call;
+    /// tools receive `&ToolProgress`. `pub` (not `pub(crate)`) so a host can invoke a registered tool
+    /// directly outside the model loop — e.g. `serve`'s `bash` RPC command — while still reusing the
+    /// same streaming/cancellation plumbing a model-driven call gets, rather than that host needing its
+    /// own parallel progress-reporting mechanism.
+    pub fn new(
         tx: UnboundedSender<ToolUpdate>,
         id: String,
         name: String,
@@ -70,7 +85,7 @@ impl ToolProgress {
     /// Emit a progress snapshot (the full output so far) plus optional `details`. Best-effort: if the
     /// run has already finished (the receiver is gone), the update is dropped rather than erroring.
     pub fn emit(&self, snapshot: impl Into<String>, details: Option<Value>) {
-        let _ = self.tx.unbounded_send(ToolUpdate {
+        let _ = self.tx.unbounded_send(ToolUpdate::Progress {
             id: self.id.clone(),
             name: self.name.clone(),
             snapshot: snapshot.into(),
@@ -185,6 +200,20 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// Whether this call's mutation scope can't be named by [`write_target`](Tool::write_target) at
+    /// all — an opaque shell command is the paradigm case: it can write anywhere reachable from its
+    /// `cwd`, so there's no single path to group it against. Without this, such a call reports `None`
+    /// like any other read-only tool and gets a unique `solo:` group, running fully concurrently with
+    /// a same-turn `edit`/`write` it could easily race on disk (e.g. the model batching an `edit` on
+    /// `foo.py` with a `bash: black foo.py` in one turn). When any call in a turn returns `true` here,
+    /// the loop drops that whole turn's dispatch to one call at a time (see `Agent::run_events`)
+    /// instead of its usual per-group concurrency — conservative, but correctness beats parallelism
+    /// for a call whose blast radius can't be scoped. Defaults to `false`: most tools either don't
+    /// mutate, or name their exact target via `write_target`.
+    fn conservative_exclusive(&self) -> bool {
+        false
+    }
+
     /// The advertised definition sent to the model. Derived from the accessors; override only if a
     /// tool needs a non-default shape.
     fn definition(&self) -> ToolDef {
@@ -238,6 +267,15 @@ impl ToolRegistry {
     /// Whether no tools are registered.
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
+    }
+
+    /// Keep only tools whose name satisfies `predicate`, dropping the rest — the one primitive a
+    /// caller needs to apply an allow-list (`retain(|n| allowed.contains(n))`), a deny-list
+    /// (`retain(|n| !excluded.contains(n))`), or "no tools at all" (`retain(|_| false)`), without the
+    /// registry needing separate concepts for each.
+    pub fn retain(&mut self, mut predicate: impl FnMut(&str) -> bool) -> &mut Self {
+        self.tools.retain(|name, _| predicate(name));
+        self
     }
 }
 
@@ -320,22 +358,6 @@ mod tests {
 
     #[test]
     fn definitions_are_sorted_by_name() {
-        struct Named(&'static str);
-        #[async_trait]
-        impl Tool for Named {
-            fn name(&self) -> &str {
-                self.0
-            }
-            fn description(&self) -> &str {
-                "stand-in for sort-order testing"
-            }
-            fn input_schema(&self) -> Value {
-                json!({ "type": "object" })
-            }
-            async fn run(&self, _: Value) -> Result<ToolOutput, ToolError> {
-                Ok(self.0.into())
-            }
-        }
         let mut reg = ToolRegistry::new();
         // Registered out of name order — `definitions()` must still come back sorted: the Anthropic
         // dialect anchors a prompt-cache breakpoint on the *last* tool definition, and a cache hit
@@ -354,6 +376,56 @@ mod tests {
         assert_eq!(out.text, "hi");
         let err = EchoTool.run(json!({})).await;
         assert!(matches!(err, Err(ToolError::InvalidInput(_))));
+    }
+
+    #[test]
+    fn retain_applies_an_allow_list() {
+        let mut reg = ToolRegistry::new();
+        for name in ["read", "write", "bash"] {
+            reg.register(Arc::new(Named(name)));
+        }
+        let allow = ["read".to_string()];
+        reg.retain(|n| allow.iter().any(|a| a == n));
+        assert_eq!(reg.len(), 1);
+        assert!(reg.get("read").is_some());
+    }
+
+    #[test]
+    fn retain_applies_a_deny_list() {
+        let mut reg = ToolRegistry::new();
+        for name in ["read", "write", "bash"] {
+            reg.register(Arc::new(Named(name)));
+        }
+        let deny = ["bash".to_string()];
+        reg.retain(|n| !deny.iter().any(|d| d == n));
+        assert_eq!(reg.len(), 2);
+        assert!(reg.get("bash").is_none());
+    }
+
+    #[test]
+    fn retain_false_empties_the_registry() {
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        reg.retain(|_| false);
+        assert!(reg.is_empty());
+    }
+
+    /// A trivial named tool, reused across the sort-order and `retain` tests.
+    struct Named(&'static str);
+    #[async_trait]
+    impl Tool for Named {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "stand-in for name-keyed testing"
+        }
+        fn input_schema(&self) -> Value {
+            json!({ "type": "object" })
+        }
+        async fn run(&self, _: Value) -> Result<ToolOutput, ToolError> {
+            Ok(self.0.into())
+        }
     }
 
     #[test]

@@ -56,7 +56,11 @@ fn text_of(blocks: &[ContentBlock]) -> String {
 /// round-trip correctly regardless of what either id contains; the common case, where neither needs
 /// escaping, costs nothing beyond the two no-op `contains` checks.
 fn combine_tool_id(call_id: &str, item_id: &str) -> String {
-    format!("{}|{}", escape_tool_id_part(call_id), escape_tool_id_part(item_id))
+    format!(
+        "{}|{}",
+        escape_tool_id_part(call_id),
+        escape_tool_id_part(item_id)
+    )
 }
 
 fn escape_tool_id_part(s: &str) -> std::borrow::Cow<'_, str> {
@@ -115,6 +119,16 @@ fn split_tool_id(id: &str) -> (std::borrow::Cow<'_, str>, Option<std::borrow::Co
     }
 }
 
+/// Truncate a combined `"call_id|item_id"` tool-call id back down to just `call_id` — used when a
+/// message produced by an OpenAI-Responses model is about to be replayed to a *different* model (see
+/// [`crate::session::Session::scrub_cross_model_state`]): the `item_id` half only means anything back
+/// to the model/reasoning-item pairing that produced it, and a foreign model would either ignore it or
+/// reject the combined id outright. A no-op for a plain id with no unescaped `|` (already just a
+/// `call_id`, or a dialect that never combines ids in the first place).
+pub(crate) fn call_id_only(id: &str) -> String {
+    split_tool_id(id).0.into_owned()
+}
+
 /// The system/developer-prompt role: `"developer"` for reasoning models (matching pi, which prefers
 /// it whenever the model supports it), `"system"` otherwise.
 fn instruction_role(caps: &crate::models::ModelCaps) -> &'static str {
@@ -125,22 +139,33 @@ fn instruction_role(caps: &crate::models::ModelCaps) -> &'static str {
     }
 }
 
-fn push_user_content(input: &mut Vec<Value>, blocks: &[ContentBlock]) {
+/// Placeholder text substituted for an image sent to a model that doesn't accept one — shared string
+/// with the Chat Completions and Anthropic dialects.
+const USER_IMAGE_PLACEHOLDER: &str = "(image omitted: model does not support images)";
+/// Same idea, for a tool result's image output specifically.
+const TOOL_IMAGE_PLACEHOLDER: &str = "(tool image omitted: model does not support images)";
+
+fn push_user_content(input: &mut Vec<Value>, blocks: &[ContentBlock], supports_vision: bool) {
     let mut parts: Vec<Value> = Vec::new();
+    let mut had_image = false;
     for b in blocks {
         match b {
             ContentBlock::Text { text } if !text.is_empty() => {
                 parts.push(json!({ "type": "input_text", "text": text }));
             }
-            ContentBlock::Image { source } => {
+            ContentBlock::Image { source } if supports_vision => {
                 parts.push(json!({
                     "type": "input_image",
                     "detail": "auto",
                     "image_url": format!("data:{};base64,{}", source.media_type, source.data),
                 }));
             }
+            ContentBlock::Image { .. } => had_image = true,
             _ => {}
         }
+    }
+    if had_image {
+        parts.push(json!({ "type": "input_text", "text": USER_IMAGE_PLACEHOLDER }));
     }
     if !parts.is_empty() {
         input.push(json!({ "role": "user", "content": parts }));
@@ -149,8 +174,9 @@ fn push_user_content(input: &mut Vec<Value>, blocks: &[ContentBlock]) {
 
 /// Fan a turn's `ToolResult` blocks out into `function_call_output` items. Images ride directly in
 /// `output` as a content-parts list (the Responses API supports this natively — unlike Chat
-/// Completions' `tool` role, which can't carry images at all).
-fn push_tool_results(input: &mut Vec<Value>, blocks: &[ContentBlock]) {
+/// Completions' `tool` role, which can't carry images at all) — or, when the model can't accept
+/// images, a text placeholder instead.
+fn push_tool_results(input: &mut Vec<Value>, blocks: &[ContentBlock], supports_vision: bool) {
     for b in blocks {
         if let ContentBlock::ToolResult {
             tool_use_id,
@@ -162,6 +188,13 @@ fn push_tool_results(input: &mut Vec<Value>, blocks: &[ContentBlock]) {
             let (call_id, _item_id) = split_tool_id(tool_use_id);
             let output = if images.is_empty() {
                 json!(content)
+            } else if !supports_vision {
+                let mut text = content.clone();
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(TOOL_IMAGE_PLACEHOLDER);
+                json!(text)
             } else {
                 let mut parts: Vec<Value> = Vec::new();
                 if !content.is_empty() {
@@ -256,8 +289,8 @@ pub fn build_body(req: &ModelRequest) -> Value {
                 }));
             }
             Role::User => {
-                push_user_content(&mut input, &m.content);
-                push_tool_results(&mut input, &m.content);
+                push_user_content(&mut input, &m.content, caps.supports_vision);
+                push_tool_results(&mut input, &m.content, caps.supports_vision);
             }
             Role::Assistant => push_assistant_content(&mut input, &m.content),
         }
@@ -293,7 +326,9 @@ pub fn build_body(req: &ModelRequest) -> Value {
 
     // Reasoning models only: an explicit effort level requests visible summaries and asks for the
     // reasoning item's encrypted content, which is what makes the block replayable next turn (without
-    // it, the reasoning item can't be sent back and cross-turn reasoning continuity is lost).
+    // it, the reasoning item can't be sent back and cross-turn reasoning continuity is lost). When no
+    // effort is requested but the model can be told to turn reasoning off explicitly, do so — rather
+    // than silently reasoning at the provider's own (non-zero) default effort.
     if caps.reasoning_effort {
         if let Some(effort) = req.reasoning_effort {
             map.insert(
@@ -301,6 +336,8 @@ pub fn build_body(req: &ModelRequest) -> Value {
                 json!({ "effort": effort.as_str(), "summary": "auto" }),
             );
             map.insert("include".into(), json!(["reasoning.encrypted_content"]));
+        } else if caps.reasoning_disableable {
+            map.insert("reasoning".into(), json!({ "effort": "none" }));
         }
     }
 
@@ -530,15 +567,21 @@ impl StreamDecoder for Decoder {
             }
             "response.output_item.done" => {
                 let index = i64_at(data, "output_index");
-                let item = data.get("item");
-                if item.and_then(|i| i.get("type")).and_then(Value::as_str) == Some("reasoning") {
-                    // The whole item, JSON-stringified, is the block's replayable signature — see the
-                    // module doc comment.
-                    let sig = item.map(ToString::to_string).unwrap_or_default();
-                    out.push(StreamEvent::SignatureDelta { signature: sig });
-                }
-                out.push(StreamEvent::ContentBlockStop);
+                // Guarded the same way `close_if_switching` is: a `done` for an index that isn't the
+                // one currently open (a duplicate, a late/out-of-order event, or one that was already
+                // force-closed by an interleaving `close_if_switching` elsewhere) must not close
+                // whatever block actually *is* open right now — the `Accumulator` can only ever hold
+                // one open, so an unguarded close here would silently truncate it.
                 if self.open_index == Some(index) {
+                    let item = data.get("item");
+                    if item.and_then(|i| i.get("type")).and_then(Value::as_str) == Some("reasoning")
+                    {
+                        // The whole item, JSON-stringified, is the block's replayable signature — see
+                        // the module doc comment.
+                        let sig = item.map(ToString::to_string).unwrap_or_default();
+                        out.push(StreamEvent::SignatureDelta { signature: sig });
+                    }
+                    out.push(StreamEvent::ContentBlockStop);
                     self.open_index = None;
                 }
             }
@@ -646,8 +689,15 @@ mod tests {
         assert_eq!(body["reasoning"]["summary"], "auto");
         assert_eq!(body["include"][0], "reasoning.encrypted_content");
 
-        // No effort set → no `reasoning` field emitted at all (provider default).
+        // No effort set on a disable-capable reasoning model (o3-mini defaults to `true`) → an
+        // explicit "off" signal, not silent reliance on the provider's own default effort.
         let req = ModelRequest::new("o3-mini", vec![Message::user("hi")], 64);
+        assert_eq!(build_body(&req)["reasoning"]["effort"], "none");
+        assert!(build_body(&req).get("include").is_none());
+
+        // No effort set on a reasoning model that *isn't* disable-capable (bare "gpt-5" — not in the
+        // gpt-5 allowlist) → no `reasoning` field at all, since there's no "off" wire shape to send.
+        let req = ModelRequest::new("gpt-5", vec![Message::user("hi")], 64);
         assert!(build_body(&req).get("reasoning").is_none());
 
         // A non-reasoning model never emits `reasoning`, even with an effort set.
@@ -744,6 +794,58 @@ mod tests {
         assert_eq!(body["input"][0]["call_id"], "call_1");
         assert_eq!(body["input"][0]["output"][0]["text"], "screenshot attached");
         assert_eq!(body["input"][0]["output"][1]["type"], "input_image");
+    }
+
+    #[test]
+    fn images_are_downgraded_to_a_placeholder_for_a_non_vision_model() {
+        // o3-mini is the one o-series id that isn't vision-capable.
+        let req = ModelRequest::new(
+            "o3-mini",
+            vec![
+                Message::user_with_images(
+                    "what is this?",
+                    vec![ImageSource::base64("image/png", "AAAA")],
+                ),
+                Message::tool_results(vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_1".into(),
+                    content: "screenshot attached".into(),
+                    is_error: false,
+                    images: vec![ImageSource::base64("image/png", "BBBB")],
+                }]),
+            ],
+            64,
+        );
+        let body = build_body(&req);
+
+        // User turn: text part plus one placeholder text part, no `input_image` part at all.
+        let content = &body["input"][0]["content"];
+        assert_eq!(
+            content[0],
+            json!({ "type": "input_text", "text": "what is this?" })
+        );
+        assert_eq!(
+            content[1],
+            json!({ "type": "input_text", "text": "(image omitted: model does not support images)" })
+        );
+        assert_eq!(content.as_array().unwrap().len(), 2);
+
+        // Tool result: a plain string output with the placeholder appended, not a parts array.
+        assert_eq!(
+            body["input"][1]["output"],
+            "screenshot attached\n(tool image omitted: model does not support images)"
+        );
+
+        // A vision-capable model is unaffected.
+        let req = ModelRequest::new(
+            "gpt-4o",
+            vec![Message::user_with_images(
+                "what is this?",
+                vec![ImageSource::base64("image/png", "AAAA")],
+            )],
+            64,
+        );
+        let body = build_body(&req);
+        assert_eq!(body["input"][0]["content"][1]["type"], "input_image");
     }
 
     #[test]
@@ -964,6 +1066,66 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
             .count();
         assert_eq!(tool_starts, 2);
         assert_eq!(stops, 2);
+    }
+
+    #[test]
+    fn stale_output_item_done_does_not_close_a_different_open_block() {
+        // Item 0 opens, item 1 opens (force-closing item 0 via `close_if_switching`), then item 0's
+        // own `output_item.done` arrives *late* — after item 1 is already the one open. Before the
+        // fix, `output_item.done`'s `ContentBlockStop` fired unconditionally, so this stale event
+        // would prematurely close item 1's still-accumulating block even though its index (0) doesn't
+        // match what's actually open (1).
+        const SSE: &str = r#"
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"a"}}
+
+data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_2","call_id":"call_2","name":"b"}}
+
+data: {"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"y\":2}"}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"a","arguments":"{}"}}
+
+data: {"type":"response.function_call_arguments.delta","output_index":1,"delta":"more"}
+
+data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc_2","call_id":"call_2","name":"b","arguments":"{\"y\":2}more"}}
+
+data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, SSE).unwrap();
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::MessageStart,
+                StreamEvent::ToolUseStart {
+                    id: combine_tool_id("call_1", "fc_1"),
+                    name: "a".into(),
+                },
+                // Item 1 opening force-closes item 0 — the only close attributable to item 0.
+                StreamEvent::ContentBlockStop,
+                StreamEvent::ToolUseStart {
+                    id: combine_tool_id("call_2", "fc_2"),
+                    name: "b".into(),
+                },
+                StreamEvent::InputJsonDelta {
+                    partial_json: "{\"y\":2}".into(),
+                },
+                // Item 0's stale `output_item.done` (index 0) is dropped here — item 1 (index 1) is
+                // what's actually open, so no ContentBlockStop/SignatureDelta fires for it.
+                StreamEvent::InputJsonDelta {
+                    partial_json: "more".into(),
+                },
+                // Item 1's own `output_item.done` closes it — the only close attributable to item 1.
+                StreamEvent::ContentBlockStop,
+                StreamEvent::Usage(TokenUsage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    ..Default::default()
+                }),
+                StreamEvent::MessageStop {
+                    stop_reason: StopReason::ToolUse,
+                },
+            ]
+        );
     }
 
     #[test]

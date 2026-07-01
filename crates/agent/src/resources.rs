@@ -30,9 +30,22 @@ pub struct PromptOptions<'a> {
     pub project_trusted: bool,
 }
 
-/// Build the full system prompt for a session. Pulls in project instruction files (global +
-/// cwd-to-root walk), advertises discovered skills, and appends the current date and working directory.
+/// Build the full system prompt for a session: the static base (see [`build_static_system_prompt`])
+/// plus the current dynamic footer (see [`dynamic_footer`]). A caller that rebuilds the prompt every
+/// turn just to pick up the current date (e.g. `serve`'s per-turn refresh) should call the two pieces
+/// separately instead — see `serve::build_agent`'s callers.
 pub fn build_system_prompt(opts: &PromptOptions) -> String {
+    let mut s = build_static_system_prompt(opts);
+    s.push_str(&dynamic_footer(opts.cwd));
+    s
+}
+
+/// Everything in the system prompt except the per-turn dynamic footer (current date/cwd, see
+/// [`dynamic_footer`]): the base identity or its `SYSTEM.md` override, project instructions, and
+/// discovered skills. Walks the filesystem (project-instruction files, skill directories), so it's
+/// meant to be rebuilt only at startup and on a model/thinking-triggered `Agent` rebuild — not on every
+/// turn, unlike the cheap dynamic footer.
+pub fn build_static_system_prompt(opts: &PromptOptions) -> String {
     // An on-disk `SYSTEM.md` (project `<cwd>/.claude/`, else user `~/.claude/`) replaces the built-in
     // base entirely — that's how a project pins its own agent identity (pi's resource-loader does the
     // same). Absent one, the caller-supplied `base` stands.
@@ -69,12 +82,18 @@ pub fn build_system_prompt(opts: &PromptOptions) -> String {
         }
     }
 
-    s.push_str(&format!(
+    s
+}
+
+/// The cheap, time-varying tail of the system prompt: the current date and working directory. Does no
+/// filesystem discovery (unlike [`build_static_system_prompt`]), so it's cheap enough to recompute
+/// before every turn — the one part of the prompt that's actually time-varying.
+pub fn dynamic_footer(cwd: &Path) -> String {
+    format!(
         "\n\nCurrent date: {}\nCurrent working directory: {}",
         today(),
-        opts.cwd.display()
-    ));
-    s
+        cwd.display()
+    )
 }
 
 /// A `SYSTEM.md` override: project-local (`<cwd>/.claude/SYSTEM.md`, only when `project_trusted`) takes
@@ -492,6 +511,28 @@ mod tests {
         let wrapper_end = prompt.find("</project_context>").unwrap();
         let instructions_pos = prompt.find("<project_instructions").unwrap();
         assert!(instructions_pos > wrapper_start && instructions_pos < wrapper_end);
+    }
+
+    #[test]
+    fn static_prompt_plus_dynamic_footer_equals_the_full_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let opts = PromptOptions {
+            base: "You are an agent.",
+            append: None,
+            cwd: tmp.path(),
+            include_context_files: false,
+            include_skills: false,
+            project_trusted: false,
+        };
+        let full = build_system_prompt(&opts);
+        let static_part = build_static_system_prompt(&opts);
+        let footer = dynamic_footer(tmp.path());
+        assert_eq!(full, format!("{static_part}{footer}"));
+        // The static half must carry no date/cwd at all — that's the whole point of the split.
+        assert!(!static_part.contains("Current date:"));
+        assert!(!static_part.contains("Current working directory:"));
+        assert!(footer.contains("Current date:"));
+        assert!(footer.contains("Current working directory:"));
     }
 
     #[test]

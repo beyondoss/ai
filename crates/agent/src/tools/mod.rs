@@ -59,7 +59,11 @@ pub(crate) fn write_atomic(path: &str, content: &[u8]) -> std::io::Result<()> {
 
     let tmp = p.with_file_name(format!(".{}.tmp.{}", name.to_string_lossy(), temp_suffix()));
     let mut f = opts.open(&tmp)?;
-    f.write_all(content)?;
+    if let Err(e) = f.write_all(content) {
+        drop(f);
+        let _ = std::fs::remove_file(&tmp); // don't leave the temp behind on a mid-write failure
+        return Err(e);
+    }
     drop(f);
 
     match std::fs::rename(&tmp, p) {
@@ -152,6 +156,32 @@ pub fn default_registry_with(bash_timeout_ms: Option<u64>) -> ToolRegistry {
     reg
 }
 
+/// Restrict a registry to an allow-list, a deny-list, or nothing at all — the CLI/RPC surface for
+/// scoping an agent's capabilities (e.g. a read-only reviewer with no `bash`/`edit`/`write`), which
+/// otherwise has no way to run with less than the full default tool set. `no_tools` wins outright
+/// (checked first); otherwise `tools` (if given) narrows to exactly those names, and `exclude` (if
+/// given) drops names from whatever remains — so `tools` + `exclude` can combine to carve one tool out
+/// of an allow-list, though picking just one of the three is the common case. Unknown names in either
+/// list are silently ignored (there's nothing to remove/keep that isn't already there), matching
+/// `ToolRegistry::retain`'s set semantics rather than erroring on a typo.
+pub fn apply_filter(
+    reg: &mut ToolRegistry,
+    tools: Option<&[String]>,
+    exclude: Option<&[String]>,
+    no_tools: bool,
+) {
+    if no_tools {
+        reg.retain(|_| false);
+        return;
+    }
+    if let Some(allow) = tools {
+        reg.retain(|name| allow.iter().any(|a| a == name));
+    }
+    if let Some(deny) = exclude {
+        reg.retain(|name| !deny.iter().any(|d| d == name));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,10 +207,7 @@ mod tests {
             entries.len(),
             1,
             "failed rename left extra files behind: {:?}",
-            entries
-                .iter()
-                .map(|e| e.file_name())
-                .collect::<Vec<_>>()
+            entries.iter().map(|e| e.file_name()).collect::<Vec<_>>()
         );
         // The original target is untouched by the failed write.
         assert!(target.is_dir());
@@ -219,7 +246,10 @@ mod tests {
         write_atomic(target.to_str().unwrap(), b"SECRET=2").unwrap();
 
         let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "write_atomic silently changed the file's permissions");
+        assert_eq!(
+            mode, 0o600,
+            "write_atomic silently changed the file's permissions"
+        );
         assert_eq!(std::fs::read(&target).unwrap(), b"SECRET=2");
     }
 
@@ -274,6 +304,73 @@ mod tests {
             assert!(reg.get(name).is_some(), "missing beyond tool: {name}");
         }
         assert_eq!(reg.len(), 10);
+    }
+
+    #[test]
+    fn apply_filter_no_tools_wins_outright() {
+        let mut reg = default_registry();
+        apply_filter(
+            &mut reg,
+            Some(&["read".to_string()]),
+            Some(&["write".to_string()]),
+            true,
+        );
+        assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn apply_filter_allow_list_keeps_only_named_tools() {
+        let mut reg = default_registry();
+        apply_filter(
+            &mut reg,
+            Some(&["read".to_string(), "ls".to_string()]),
+            None,
+            false,
+        );
+        assert_eq!(reg.len(), 2);
+        assert!(reg.get("read").is_some());
+        assert!(reg.get("ls").is_some());
+        assert!(reg.get("bash").is_none());
+    }
+
+    #[test]
+    fn apply_filter_deny_list_drops_named_tools() {
+        let mut reg = default_registry();
+        apply_filter(
+            &mut reg,
+            None,
+            Some(&["bash".to_string(), "edit".to_string(), "write".to_string()]),
+            false,
+        );
+        assert!(reg.get("bash").is_none());
+        assert!(reg.get("edit").is_none());
+        assert!(reg.get("write").is_none());
+        assert!(reg.get("read").is_some());
+        assert_eq!(reg.len(), default_registry().len() - 3);
+    }
+
+    #[test]
+    fn apply_filter_allow_and_deny_combine() {
+        let mut reg = default_registry();
+        // Allow read/write/edit, then carve `write` back out — the intersection.
+        apply_filter(
+            &mut reg,
+            Some(&["read".to_string(), "write".to_string(), "edit".to_string()]),
+            Some(&["write".to_string()]),
+            false,
+        );
+        assert_eq!(reg.len(), 2);
+        assert!(reg.get("read").is_some());
+        assert!(reg.get("edit").is_some());
+        assert!(reg.get("write").is_none());
+    }
+
+    #[test]
+    fn apply_filter_unknown_names_are_silently_ignored() {
+        let mut reg = default_registry();
+        let before = reg.len();
+        apply_filter(&mut reg, None, Some(&["does-not-exist".to_string()]), false);
+        assert_eq!(reg.len(), before);
     }
 
     #[test]

@@ -32,6 +32,7 @@ pub mod session;
 pub mod steering;
 pub mod tool;
 pub mod transport;
+pub mod write_lock;
 
 pub use agent::{Agent, AgentEvent};
 pub use branch_summary::{
@@ -40,7 +41,7 @@ pub use branch_summary::{
 pub use client::GatewayClient;
 pub use compaction::{CompactionConfig, CompactionProvenance, CompactionReason};
 pub use error::{Error, Result, ToolError};
-pub use hooks::{AgentHooks, NoHooks};
+pub use hooks::{AgentHooks, CheckpointHook, NoCheckpoint, NoHooks};
 pub use message::{
     ContentBlock, ImageSource, Message, Role, StopReason, StreamEvent, TokenUsage, ToolDef,
 };
@@ -50,6 +51,7 @@ pub use session::Session;
 pub use steering::Steering;
 pub use tool::{Tool, ToolOutput, ToolProgress, ToolRegistry, ToolUpdate};
 pub use transport::{ModelRequest, ModelTransport, ReasoningEffort, ToolChoice};
+pub use write_lock::WriteLockRegistry;
 // Re-exported because it appears in `Agent::run_events_cancellable`'s signature — callers shouldn't
 // need a direct `tokio-util` dependency to drive a cancellable run.
 pub use tokio_util::sync::CancellationToken;

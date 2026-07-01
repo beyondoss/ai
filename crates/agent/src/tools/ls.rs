@@ -1,4 +1,9 @@
 //! `ls` — list a directory's entries (directories suffixed with `/`).
+//!
+//! Two deliberate divergences from the reference agent, kept rather than "fixed" to match: dotfiles are
+//! hidden by default (`all: true` opts back in — cuts real noise like `.git`/editor swapfiles without
+//! losing access), and directories are always sorted before files (a stable UX improvement independent
+//! of parity with anything else).
 
 use agent_core::tool::Tool;
 use agent_core::{ToolError, ToolOutput};
@@ -71,16 +76,27 @@ impl Tool for Ls {
         }
         // Cap the listing so a huge directory can't flood the model's context.
         let total = entries.len();
-        if total > limit {
+        let count_truncated = total > limit;
+        if count_truncated {
             entries.truncate(limit);
-            let mut out = entries.join("\n");
-            out.push_str(&format!(
-                "\n… ({} more entries; {total} total — narrow with a subpath or use `find`/`grep`)",
-                total - limit
-            ));
-            return Ok(out.into());
         }
-        Ok(entries.join("\n").into())
+        let mut out = entries.join("\n");
+        if count_truncated {
+            out.push('\n');
+        }
+        // The byte cap is checked *before* the count marker, and takes priority when both would
+        // otherwise fire — see `cap_listing_bytes`'s doc comment.
+        let byte_capped = super::output::cap_listing_bytes(
+            &mut out,
+            "narrow with a subpath or use `find`/`grep` to see more",
+        );
+        if !byte_capped && count_truncated {
+            out.push_str(&super::output::marker(format_args!(
+                "{} more entries; {total} total — narrow with a subpath or use `find`/`grep`",
+                total - limit
+            )));
+        }
+        Ok(out.into())
     }
 }
 
@@ -141,8 +157,69 @@ mod tests {
             out.contains("more entries"),
             "a small limit must truncate: {out}"
         );
-        assert!(out.contains("7 more entries; 10 total"));
+        assert!(out.contains("[7 more entries; 10 total"));
         // Three entry lines plus the truncation note.
         assert_eq!(out.lines().count(), 4);
+    }
+
+    #[tokio::test]
+    async fn output_byte_cap_truncates_even_under_the_entry_limit() {
+        // 300 entries with long names: well under the 500-entry default `limit` (so the entry-count
+        // marker never fires), but the aggregate listing still blows past the 50KB output cap on its
+        // own.
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..300 {
+            let name = format!("{i:04}-{}", "x".repeat(200));
+            std::fs::write(dir.path().join(name), "x").unwrap();
+        }
+        let out = Ls
+            .run(json!({ "path": dir.path().to_str().unwrap() }))
+            .await
+            .unwrap()
+            .text;
+        assert!(
+            out.len() <= super::super::output::MAX_LISTING_BYTES + 256,
+            "output should be capped near MAX_LISTING_BYTES, got {} bytes",
+            out.len()
+        );
+        assert!(
+            out.contains("[output truncated at 50.0KB"),
+            "byte-cap marker missing: {}",
+            &out[out.len().saturating_sub(200)..]
+        );
+        assert!(
+            !out.contains("more entries;"),
+            "entry-count marker must not co-fire when count never exceeded the limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn output_byte_cap_takes_priority_over_the_entry_count_marker() {
+        // 600 long-named entries against the default 500-entry `limit`: both the entry-count marker
+        // (600 > 500) and the byte cap would fire on the same rendered text. The byte cap must win
+        // outright rather than leaving a marker sliced in half.
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..600 {
+            let name = format!("{i:04}-{}", "x".repeat(200));
+            std::fs::write(dir.path().join(name), "x").unwrap();
+        }
+        let out = Ls
+            .run(json!({ "path": dir.path().to_str().unwrap() }))
+            .await
+            .unwrap()
+            .text;
+        assert!(
+            out.contains("[output truncated at 50.0KB"),
+            "byte-cap marker missing: {out}"
+        );
+        assert!(
+            !out.contains("more entries;"),
+            "the byte-cap marker must win cleanly, not leave a mangled count marker behind"
+        );
+        assert!(
+            out.len() <= super::super::output::MAX_LISTING_BYTES + 256,
+            "output should be capped near MAX_LISTING_BYTES, got {} bytes",
+            out.len()
+        );
     }
 }
