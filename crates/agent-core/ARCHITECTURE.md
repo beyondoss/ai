@@ -51,7 +51,11 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   `SPLIT_TURN_PREFIX_SCALE` × the summary token budget for the smaller one), merged under a "Turn
   Context (split turn)" header — closer to pi's two-template approach than summarizing the whole prefix
   with one minimal-context call. `summary_max_tokens` scales from the model's own `max_output` rather
-  than a flat constant. The trigger adds `compaction::trailing_tokens` (messages appended since the last
+  than a flat constant (`agent::scaled_summary_max_tokens`) — seeded by `Agent::new` and *rescaled* by
+  `with_compaction` whenever the incoming config still carries the struct's own flat default, so a
+  caller replacing the whole config wholesale (e.g. `serve.rs`'s `build_agent`, to override just
+  `reserve_tokens`) doesn't silently discard the model-aware value in favor of that default. The trigger
+  adds `compaction::trailing_tokens` (messages appended since the last
   usage snapshot, estimated rather than assumed already reflected in `last_input_tokens`) so it doesn't
   compare a stale, undercounted size against the window. Overflow detection
   (`agent.rs::is_context_overflow`) is table-driven (`OVERFLOW_PATTERNS`) with a `THROTTLE_EXCLUSIONS`
@@ -68,6 +72,13 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   events; signatures replay verbatim (Anthropic requires it with tools). `with_thinking(budget)`; the
   thinking _shape_ (Anthropic enabled-budget vs adaptive) is chosen per model from the capability
   table, and `with_reasoning_effort` drives OpenAI reasoning models / Anthropic adaptive thinking.
+  `models::ThinkingLevel` (`Off`/`Minimal`/`Low`/`Medium`/`High`/`XHigh`) is the portable vocabulary a
+  caller (`serve`'s `cycle_thinking_level`/`set_reasoning_effort`) uses instead of a raw budget;
+  `models::thinking_for_level(caps, level)` translates a level into the `(thinking_budget,
+  reasoning_effort)` pair `with_thinking`/`with_reasoning_effort` need for a *specific* model — setting
+  both together for `Adaptive` shape (the budget is a pure on/off gate there; `output_config.effort`
+  carries the real depth), only `reasoning_effort` for OpenAI reasoning models, only a scaled budget for
+  `Budget` shape.
 - **Model capabilities** — [`models::capabilities`](src/models.rs) maps a model id (by prefix) to a
   minimal `ModelCaps` table (context window, max output, `max_tokens` vs `max_completion_tokens` field,
   long-cache support, vision, thinking shape, reasoning-effort, explicit-disable capability, eager
@@ -114,7 +125,12 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   dialect's vocabulary; unset emits nothing (provider default), so the common request shape is intact.
 - **Transport resilience** — `GatewayClient` retries transient failures (429/5xx/connection, honoring
   `Retry-After`) up to the first byte; a mid-stream `event: error` or truncated stream surfaces as
-  `Error::Transport` (the SSE decoder's `finish` returns `Result`).
+  `Error::Transport` (the SSE decoder's `finish` returns `Result`), which `Agent::run_turn` retries with
+  backoff (`is_retryable_mid_stream`, capped at `MAX_MID_STREAM_RETRIES`) from a fresh connection and
+  a fresh `Accumulator`, rather than resuming a dead attempt's partial blocks. `Agent::with_auto_retry`
+  (default enabled) disables this specific layer — a normally-retried failure surfaces on the very
+  first attempt instead — for debugging a flaky connection without several silent attempts first;
+  `GatewayClient`'s own pre-first-byte retry above is unaffected either way.
 - **Cache observability** — `StreamEvent::Usage` carries `TokenUsage` (input/output + cache-read/write
   - reasoning); both decoders populate it, and `Session` folds the cumulative totals + `last_input_tokens`.
 - **Lifecycle events** — `AgentEvent` adds `AgentStart`/`TurnStart`/`Steered`/`AgentEnd`/`Compacted`/`Error`.
@@ -126,6 +142,19 @@ all live in `crates/agent`. It has **no dependency on the gateway crate** — `G
 contract is "POST dialect JSON to a base URL, get SSE back"; routing, provider auth, and metering are
 the gateway's job. This split is what lets the loop, the dialect adapters, and the tool dispatch logic
 run as pure unit tests with `MockTransport` — no network, no live model, no gateway binary.
+
+It is **not a plugin host**. pi has a real extension system (`core/extensions/`): dynamically loaded
+third-party code that subscribes to typed lifecycle events (including `session_compact`) and can call
+back into session actions (`navigateTree`, `fork`, `newSession`, …). This crate's equivalent seams —
+`AgentHooks` (tool-call gate/rewrite) and `CheckpointHook` (mid-run persistence points) — are Rust
+traits with exactly one implementation chosen by the embedder at compile time, not a runtime-loadable,
+subscribable, third-party extension surface. Evaluated and deliberately **not** extended to cover
+compaction or branch-navigation as hookable lifecycle events: nothing in this codebase dynamically
+loads untrusted code, there is no extension marketplace or third-party-author story to serve, and
+adding one would mean taking on loading/sandboxing/versioning machinery with no concrete consumer —
+directly against this project's minimum-effective-abstraction bias. If a genuine need for third-party
+extensibility ever appears, revisit this as a deliberate, scoped addition rather than bolting hooks on
+piecemeal.
 
 ## Data Flow
 

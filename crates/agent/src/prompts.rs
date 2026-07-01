@@ -64,11 +64,13 @@ pub fn discover_with_diagnostics(cwd: &Path) -> (Vec<PromptTemplate>, Vec<String
                 body,
             };
             if let Some(existing_path) = origins.get(&name) {
-                collisions.push(format!(
+                let message = format!(
                     "prompt template \"{name}\" defined at both {} and {} — the latter wins",
                     existing_path.display(),
                     path.display()
-                ));
+                );
+                tracing::warn!("{message}");
+                collisions.push(message);
             }
             origins.insert(name.clone(), path.clone());
             if let Some(existing) = found.iter_mut().find(|t| t.name == name) {

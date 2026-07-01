@@ -169,6 +169,12 @@ pub const SPLIT_TURN_PREFIX_SCALE: f64 = 0.5;
 /// tool output is usually the bulk of the transcript and the least useful to re-summarize in full.
 const TOOL_RESULT_MAX_CHARS: usize = 2_000;
 
+/// A visible thinking block's text is truncated to this many characters when rendered into the
+/// summary prompt — the reasoning trace can run long, and it's supplementary color for *why* a
+/// decision was made, not primary content worth spending as much of the prompt's own budget on as an
+/// actual user/assistant exchange.
+const THINKING_MAX_CHARS: usize = 1_000;
+
 /// Estimate a text's token count. The cheap, dependency-free char/4 heuristic — good enough for the
 /// trigger and the cut-point search, which only need to be in the right ballpark.
 pub fn estimate_tokens(text: &str) -> u32 {
@@ -390,7 +396,10 @@ fn is_turn_start(m: &Message) -> bool {
 }
 
 /// Render the prefix `messages` into a plain-text transcript for the summarization prompt. Tool
-/// results — usually the bulk — are truncated; thinking blocks are dropped (not worth re-summarizing).
+/// results — usually the bulk — are truncated, as is a visible thinking block's text (supplementary
+/// context on *why* a decision was made, not primary content); `RedactedThinking` is always dropped —
+/// its `data` is opaque ciphertext the provider chose not to expose, never human-readable regardless
+/// of length.
 pub fn render_prefix(messages: &[Message]) -> String {
     let mut out = String::new();
     for m in messages {
@@ -422,8 +431,13 @@ pub fn render_prefix(messages: &[Message]) -> String {
                     out.push_str(&format!("[{tag}] {body}\n"));
                 }
                 ContentBlock::Image { .. } => out.push_str("[image]\n"),
-                // Thinking is internal scratch — omit from the summary input.
-                ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {}
+                ContentBlock::Thinking { text, .. } => {
+                    let body = truncate_chars(text, THINKING_MAX_CHARS);
+                    out.push_str(&format!("[thinking] {body}\n"));
+                }
+                // Encrypted thinking the provider chose not to expose in clear text — opaque
+                // ciphertext, never worth spending prompt budget on regardless of length.
+                ContentBlock::RedactedThinking { .. } => {}
             }
         }
     }
@@ -982,6 +996,58 @@ mod tests {
         assert!(text.contains("a.rs"));
         assert!(text.contains("## Goal"));
         assert_eq!(req.system.as_deref(), Some(SUMMARY_SYSTEM));
+    }
+
+    #[test]
+    fn render_prefix_includes_a_visible_thinking_blocks_text() {
+        let messages = vec![
+            Message::user("why did the build fail?"),
+            Message::assistant(vec![
+                ContentBlock::Thinking {
+                    text: "the error mentions a missing semicolon on line 12".into(),
+                    signature: "sig".into(),
+                },
+                ContentBlock::Text {
+                    text: "there's a missing semicolon".into(),
+                },
+            ]),
+        ];
+        let rendered = render_prefix(&messages);
+        assert!(
+            rendered.contains("[thinking] the error mentions a missing semicolon on line 12"),
+            "got: {rendered}"
+        );
+        assert!(rendered.contains("there's a missing semicolon"));
+    }
+
+    #[test]
+    fn render_prefix_truncates_a_long_thinking_block() {
+        let long = "x".repeat(THINKING_MAX_CHARS + 500);
+        let messages = vec![Message::assistant(vec![ContentBlock::Thinking {
+            text: long.clone(),
+            signature: "sig".into(),
+        }])];
+        let rendered = render_prefix(&messages);
+        assert!(rendered.contains("characters truncated"));
+        assert!(
+            !rendered.contains(&long),
+            "the full untruncated text must not appear"
+        );
+    }
+
+    #[test]
+    fn render_prefix_omits_redacted_thinking_entirely() {
+        // Opaque ciphertext the provider chose not to expose — never human-readable, so it must never
+        // be spent on, unlike a visible `Thinking` block.
+        let messages = vec![Message::assistant(vec![ContentBlock::RedactedThinking {
+            data: "opaque-ciphertext-blob".into(),
+        }])];
+        let rendered = render_prefix(&messages);
+        assert!(!rendered.contains("opaque-ciphertext-blob"));
+        assert_eq!(
+            rendered, "",
+            "a redacted-thinking-only message renders as nothing"
+        );
     }
 
     #[test]

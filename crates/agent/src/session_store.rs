@@ -49,7 +49,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_core::{ContentBlock, Message, Role, Session};
@@ -67,6 +68,10 @@ const VERSION: u32 = 1;
 
 /// How many characters of the first user message a listing preview keeps.
 const PREVIEW_MAX: usize = 80;
+/// How many characters of accumulated user-message text a listing's `search_text` keeps — enough to
+/// substring-match a session by topic without opening every transcript, capped so a huge session
+/// doesn't bloat every listing response.
+const SEARCH_TEXT_MAX_CHARS: usize = 2_000;
 
 /// Stable identity + metadata for one session, persisted as the file's header line.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,7 +82,8 @@ pub struct SessionMeta {
     pub id: String,
     /// Unix seconds at creation. Orders the repo listing.
     pub created_at: u64,
-    /// Working directory the session was started in.
+    /// Working directory the session was started in. Callers are expected to have passed this through
+    /// [`canonical_cwd`] first, so it's a canonical (symlink-resolved, no trailing separator) path.
     pub cwd: String,
     /// Model the session runs against.
     pub model: String,
@@ -123,6 +129,12 @@ pub struct SessionMeta {
     /// or when the session has no user text yet (e.g. empty, or only tool-result turns so far).
     #[serde(skip)]
     pub preview: Option<String>,
+    /// User-message text accumulated across the whole session (not just the first message), space-
+    /// joined and truncated to [`SEARCH_TEXT_MAX_CHARS`] — a broader surface than `preview` for a
+    /// client to substring/fuzzy-match a session by topic without opening every transcript. Empty
+    /// outside of a listing, or when the session has no user text yet.
+    #[serde(skip)]
+    pub search_text: String,
 }
 
 impl SessionMeta {
@@ -155,7 +167,27 @@ impl SessionMeta {
             updated_at: 0,
             message_count: 0,
             preview: None,
+            search_text: String::new(),
         }
+    }
+
+    /// The listing view as JSON: every persisted field, plus the derived-only fields
+    /// (`updated_at`/`message_count`/`preview`/`search_text`) that `#[serde(skip)]` deliberately
+    /// keeps out of the on-disk header — so a stale scan can never leak into it — but that a
+    /// client browsing a listing needs to see. Use this instead of `serde_json::to_value` when
+    /// serializing a listing entry for an RPC response.
+    pub fn to_listing_json(&self) -> serde_json::Value {
+        let mut v = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
+        if let serde_json::Value::Object(map) = &mut v {
+            map.insert("updated_at".into(), serde_json::json!(self.updated_at));
+            map.insert(
+                "message_count".into(),
+                serde_json::json!(self.message_count),
+            );
+            map.insert("preview".into(), serde_json::json!(self.preview));
+            map.insert("search_text".into(), serde_json::json!(self.search_text));
+        }
+        v
     }
 }
 
@@ -635,6 +667,30 @@ impl SessionStore {
 
         let tmp = self.path.with_extension("jsonl.tmp");
         let mut f = create_private(&tmp)?;
+
+        // Cleans up `tmp` if any step below returns early via `?` — a genuine in-process error (disk
+        // full, a permission error mid-write), not a hard crash: the process is still alive here and can
+        // just remove it, unlike the crash case (already safe on its own — a stray `.tmp` is never read
+        // back as a session, see `read_listing`'s extension filter — and the next `rewrite` call reuses
+        // this same deterministic path anyway, so leaving it behind was never a correctness hazard, just
+        // litter). Disarmed once the rename actually succeeds, since `tmp` no longer exists under that
+        // name by then.
+        struct RemoveTmpOnError<'a> {
+            path: &'a Path,
+            armed: bool,
+        }
+        impl Drop for RemoveTmpOnError<'_> {
+            fn drop(&mut self) {
+                if self.armed {
+                    let _ = fs::remove_file(self.path);
+                }
+            }
+        }
+        let mut cleanup = RemoveTmpOnError {
+            path: &tmp,
+            armed: true,
+        };
+
         write_line(&mut f, &Entry::Session(self.meta.clone()))?;
         for (id, node) in preserved.iter().chain(new_nodes.iter()) {
             write_line(
@@ -652,6 +708,7 @@ impl SessionStore {
         f.flush()?;
         f.sync_all()?;
         fs::rename(&tmp, &self.path)?;
+        cleanup.armed = false;
         fsync_dir(&self.path)?;
 
         self.nodes = preserved.into_iter().collect();
@@ -1056,6 +1113,27 @@ impl SessionRepo {
         &self.dir
     }
 
+    /// Reopen the most recent session whose recorded `cwd` matches, or create a fresh one — not just
+    /// the globally newest session, so a shared repo directory spanning multiple projects doesn't
+    /// resume a stranger's unrelated session. Matching is an exact string comparison — callers are
+    /// expected to have already passed `cwd` through [`canonical_cwd`], so a symlinked or
+    /// trailing-slashed spelling of the same real directory still matches (`serve`'s own startup
+    /// reattach and `run --continue` both do). Shared by both, so they pick up "my last session in
+    /// this directory" the same way.
+    pub fn resume_or_create(
+        &self,
+        cwd: &str,
+        model: &str,
+    ) -> std::io::Result<(SessionStore, Session)> {
+        match self.list()?.into_iter().find(|m| m.cwd == cwd) {
+            Some(meta) => self.open_id(&meta.id),
+            None => {
+                let store = self.create(SessionMeta::new(cwd, model))?;
+                Ok((store, Session::new()))
+            }
+        }
+    }
+
     /// List every session across every project's own repo directory — each immediate subdirectory of
     /// `sessions_root` is treated as one project's [`SessionRepo`] (the convention `serve`'s default
     /// session directory follows: `<sessions_root>/<encoded-cwd>/`). Unlike [`Self::list`], which is
@@ -1066,24 +1144,41 @@ impl SessionRepo {
     /// nothing rather than failing the whole scan — the same per-entry skip semantics [`Self::list`]
     /// already applies one level down, one level up.
     pub fn list_all(sessions_root: &Path) -> std::io::Result<Vec<SessionMeta>> {
+        Self::list_all_with_progress(sessions_root, |_, _| {})
+    }
+
+    /// Same as [`Self::list_all`], but reports scan progress — see [`Self::list_with_progress`], whose
+    /// parallel-scan strategy this shares: every project directory's `.jsonl` files are gathered up
+    /// front into one flat list, then scanned together across one worker pool instead of one project
+    /// (and its own pool) at a time, so `on_progress`'s `total` — and the parallelism — spans the whole
+    /// root, not just whichever project happens to be scanning at a given moment.
+    pub fn list_all_with_progress(
+        sessions_root: &Path,
+        on_progress: impl Fn(usize, usize) + Send + Sync,
+    ) -> std::io::Result<Vec<SessionMeta>> {
         let entries = match fs::read_dir(sessions_root) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e),
         };
-        let mut metas = Vec::new();
+        let mut paths = Vec::new();
         for entry in entries {
             let Ok(entry) = entry else { continue };
-            let path = entry.path();
-            if !path.is_dir() {
+            let project_dir = entry.path();
+            if !project_dir.is_dir() {
                 continue;
             }
-            if let Ok(repo) = SessionRepo::open(&path) {
-                if let Ok(mut project_metas) = repo.list() {
-                    metas.append(&mut project_metas);
-                }
-            }
+            let Ok(project_entries) = fs::read_dir(&project_dir) else {
+                continue;
+            };
+            paths.extend(
+                project_entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl")),
+            );
         }
+        let mut metas = scan_listings(paths, &on_progress);
         metas.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         Ok(metas)
     }
@@ -1099,19 +1194,34 @@ impl SessionRepo {
     }
 
     /// All sessions' metadata, newest first (by `created_at`; clients can re-sort by `updated_at`). Each
-    /// entry carries the derived listing fields (`updated_at`, `message_count`, `preview`). Files that
-    /// fail to read, lack a header, or carry an unreadable version are skipped.
+    /// entry carries the derived listing fields (`updated_at`, `message_count`, `preview`,
+    /// `search_text`). Files that fail to read, lack a header, or carry an unreadable version are
+    /// skipped.
     pub fn list(&self) -> std::io::Result<Vec<SessionMeta>> {
-        let mut metas = Vec::new();
+        self.list_with_progress(|_, _| {})
+    }
+
+    /// Same as [`Self::list`], but invokes `on_progress(scanned, total)` once per file as the scan
+    /// completes it (`total` known up front from the directory listing; `scanned` counts up
+    /// monotonically to it, including files that turn out unreadable — those still count as scanned,
+    /// just contribute nothing to the result). Each file's `read_listing` is pure disk I/O plus parsing
+    /// with no cross-file dependency, so the scan fans out across a small worker pool instead of running
+    /// one file at a time — a repo directory with hundreds of sessions (or, via
+    /// [`Self::list_all_with_progress`], hundreds spread across many projects) scans in wall-clock time
+    /// bounded by how many can run concurrently, not by their sum. A client can surface `on_progress` as
+    /// a live "scanning…" indicator for a listing large enough to take a moment.
+    pub fn list_with_progress(
+        &self,
+        on_progress: impl Fn(usize, usize) + Send + Sync,
+    ) -> std::io::Result<Vec<SessionMeta>> {
+        let mut paths = Vec::new();
         for entry in fs::read_dir(&self.dir)? {
             let path = entry?.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            if let Some(meta) = read_listing(&path) {
-                metas.push(meta);
+            if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                paths.push(path);
             }
         }
+        let mut metas = scan_listings(paths, &on_progress);
         metas.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         Ok(metas)
     }
@@ -1182,6 +1292,39 @@ impl SessionRepo {
     }
 }
 
+/// Canonicalize `cwd` for session-matching purposes: resolves symlinks and `.`/`..` components (and, as
+/// a side effect, any trailing separator) so two different-but-equivalent spellings of the same real
+/// directory — a project reached through a symlink one time and its real path another, or a caller that
+/// happens to include a trailing `/` — match the same session instead of silently fragmenting into two.
+/// Falls back to `cwd` unchanged if it can't be resolved (removed out from under the process, a
+/// permission error): matching degrades to today's exact-string comparison, never a new failure mode.
+/// Every path this module ever records into or matches against a [`SessionMeta::cwd`] should be passed
+/// through this first — `serve`'s own startup cwd and `run --continue`'s both do.
+pub fn canonical_cwd(cwd: &Path) -> PathBuf {
+    cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf())
+}
+
+/// Encode `cwd` into a filesystem-safe directory-name component: every path separator becomes `-`, so
+/// `/home/jared/ai` becomes `-home-jared-ai` — the same convention this repo's other per-project state
+/// already uses (`trust_store.rs`'s `~/.claude/trusted-projects.json`, `prompts.rs`'s
+/// `~/.claude/prompts`), extended here to give each project its own session subdirectory.
+pub fn encode_cwd(cwd: &str) -> String {
+    cwd.chars()
+        .map(|c| if c == '/' || c == '\\' { '-' } else { c })
+        .collect()
+}
+
+/// The default session directory for `cwd` when nothing more specific was given: `~/.claude/sessions/
+/// <encoded-cwd>/`, one subdirectory per project so unrelated projects' sessions never mix in the same
+/// listing. Shared by `serve`'s own default (`--session-file`/`--session-dir` absent) and `run
+/// --continue`.
+pub fn default_session_dir(cwd: &str) -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    home.join(".claude/sessions").join(encode_cwd(cwd))
+}
+
 /// Validate — and, in a future format, migrate — a header to the current [`VERSION`]. Today there is
 /// exactly one readable shape; a header whose version is *newer* than this build understands means we'd
 /// be guessing at fields we don't know, so we refuse it loudly rather than mis-parse. The `match` is the
@@ -1202,11 +1345,65 @@ fn migrate(meta: SessionMeta, path: &Path) -> std::io::Result<SessionMeta> {
     }
 }
 
+/// Scan every path in `paths` for its listing metadata, calling `on_progress(scanned, total)` once per
+/// path — including ones that turn out unreadable, which still count as scanned and just contribute
+/// nothing. `read_listing` is pure disk I/O plus parsing with no dependency between files, so the work
+/// fans out across a small worker pool (`std::thread::available_parallelism`, capped at one thread per
+/// path) rather than running strictly one file at a time; below two candidate workers it just runs
+/// inline; no thread pool to justify the setup cost for a one- or two-file listing. Returned in
+/// arbitrary order — every caller sorts the result itself.
+fn scan_listings(
+    paths: Vec<PathBuf>,
+    on_progress: &(impl Fn(usize, usize) + Send + Sync),
+) -> Vec<SessionMeta> {
+    let total = paths.len();
+    let workers = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1)
+        .min(total);
+    if workers < 2 {
+        return paths
+            .iter()
+            .enumerate()
+            .filter_map(|(i, path)| {
+                let meta = read_listing(path);
+                on_progress(i + 1, total);
+                meta
+            })
+            .collect();
+    }
+
+    let scanned = AtomicUsize::new(0);
+    let metas = Mutex::new(Vec::with_capacity(total));
+    let scanned_ref = &scanned;
+    let metas_ref = &metas;
+    let chunk_size = total.div_ceil(workers);
+    std::thread::scope(|scope| {
+        for chunk in paths.chunks(chunk_size) {
+            scope.spawn(move || {
+                for path in chunk {
+                    if let Some(meta) = read_listing(path) {
+                        metas_ref
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(meta);
+                    }
+                    on_progress(scanned_ref.fetch_add(1, Ordering::Relaxed) + 1, total);
+                }
+            });
+        }
+    });
+    metas
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Read a session file's listing metadata: its (version-checked) header with the derived `updated_at` /
-/// `message_count` / `preview` fields filled in. One streaming pass — lines are read and parsed
-/// individually, never collected — so this stays light even for long transcripts (the header alone gives
-/// id/title/etc.; only the count and preview need the scan). Returns `None` for a file that isn't a
-/// readable session (no/invalid header, or an unreadable version), matching `list`'s skip semantics.
+/// `message_count` / `preview` / `search_text` fields filled in. One streaming pass — lines are read and
+/// parsed individually, never collected — so this stays light even for long transcripts (the header
+/// alone gives id/title/etc.; only the count and preview/search text need the scan). Returns `None` for
+/// a file that isn't a readable session (no/invalid header, or an unreadable version), matching `list`'s
+/// skip semantics.
 fn read_listing(path: &Path) -> Option<SessionMeta> {
     let updated_at = mtime_secs(path);
     let file = File::open(path).ok()?;
@@ -1227,6 +1424,8 @@ fn read_listing(path: &Path) -> Option<SessionMeta> {
     // session today, since nothing yet writes an off-branch entry.
     let mut message_count = 0usize;
     let mut preview = None;
+    let mut search_text = String::new();
+    let mut search_chars = 0usize;
     let mut raw = Vec::new();
     loop {
         // Same lenient, skip-just-this-line recovery as `SessionStore::open` (see its comment):
@@ -1253,9 +1452,19 @@ fn read_listing(path: &Path) -> Option<SessionMeta> {
         match serde_json::from_str::<Entry>(line) {
             Ok(Entry::Message { message, .. }) => {
                 message_count += 1;
-                if preview.is_none() {
-                    if let Some(text) = first_user_text(&message) {
+                if let Some(text) = first_user_text(&message) {
+                    if preview.is_none() {
                         preview = Some(preview_of(text));
+                    }
+                    if search_chars < SEARCH_TEXT_MAX_CHARS {
+                        if !search_text.is_empty() {
+                            search_text.push(' ');
+                            search_chars += 1;
+                        }
+                        let remaining = SEARCH_TEXT_MAX_CHARS - search_chars;
+                        let taken: String = text.chars().take(remaining).collect();
+                        search_chars += taken.chars().count();
+                        search_text.push_str(&taken);
                     }
                 }
             }
@@ -1278,6 +1487,7 @@ fn read_listing(path: &Path) -> Option<SessionMeta> {
     meta.updated_at = updated_at;
     meta.message_count = message_count;
     meta.preview = preview;
+    meta.search_text = search_text;
     Some(meta)
 }
 
@@ -1752,6 +1962,31 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_cleans_up_the_temp_file_when_the_final_rename_fails() {
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("hello");
+        store.append_new(&session.messages).unwrap();
+
+        // Replace the session file with an (empty) directory of the same name: `create_private(&tmp)`
+        // still succeeds (it's a different filename), but the final `fs::rename(&tmp, &self.path)`
+        // must fail — a file can never be renamed onto an existing directory. A genuine in-process
+        // error, not a crash, so `rewrite` gets the chance to clean up after itself.
+        let path = store.path.clone();
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+
+        let tmp = path.with_extension("jsonl.tmp");
+        let err = store.rewrite(&[]).unwrap_err();
+        assert!(
+            !tmp.exists(),
+            "the orphaned temp file must be removed after a failed rewrite: {err}"
+        );
+    }
+
+    #[test]
     fn rewrite_compacted_preserves_folded_messages_and_records_provenance() {
         // Compact 6 messages down to [summary, kept5, kept6] — the first 4 are folded away. Unlike
         // `rewrite`, this must (a) keep every folded message physically readable on disk by its
@@ -1998,6 +2233,174 @@ mod tests {
     }
 
     #[test]
+    fn list_with_progress_reports_every_file_exactly_once_up_to_the_total() {
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        for i in 0..12 {
+            repo.create(SessionMeta::new(format!("/w{i}"), "m"))
+                .unwrap();
+        }
+
+        let calls: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+        let metas = repo
+            .list_with_progress(|scanned, total| calls.lock().unwrap().push((scanned, total)))
+            .unwrap();
+        assert_eq!(metas.len(), 12, "parallel scan must not drop any file");
+
+        let calls = calls.into_inner().unwrap();
+        assert_eq!(calls.len(), 12, "exactly one progress call per file");
+        assert!(
+            calls.iter().all(|&(_, total)| total == 12),
+            "total must be stable across every call: {calls:?}"
+        );
+        let mut scanned: Vec<usize> = calls.iter().map(|&(s, _)| s).collect();
+        scanned.sort_unstable();
+        assert_eq!(
+            scanned,
+            (1..=12).collect::<Vec<_>>(),
+            "scanned counts must cover 1..=total exactly once each, even with concurrent workers: {scanned:?}"
+        );
+    }
+
+    #[test]
+    fn list_with_progress_returns_the_same_sessions_as_list() {
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        for i in 0..8 {
+            repo.create(SessionMeta::new(format!("/w{i}"), "m"))
+                .unwrap();
+        }
+
+        let mut plain: Vec<String> = repo.list().unwrap().into_iter().map(|m| m.id).collect();
+        let mut via_progress: Vec<String> = repo
+            .list_with_progress(|_, _| {})
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        plain.sort();
+        via_progress.sort();
+        assert_eq!(plain, via_progress);
+    }
+
+    #[test]
+    fn list_with_progress_on_an_empty_repo_calls_nothing_and_returns_empty() {
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let calls = Mutex::new(0usize);
+        let metas = repo
+            .list_with_progress(|_, _| *calls.lock().unwrap() += 1)
+            .unwrap();
+        assert!(metas.is_empty());
+        assert_eq!(*calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn list_all_with_progress_spans_every_project_in_one_pool() {
+        let root = tmpdir();
+        let repo_a = SessionRepo::open(root.path().join("proj-a")).unwrap();
+        for i in 0..5 {
+            repo_a
+                .create(SessionMeta::new(format!("/a{i}"), "m"))
+                .unwrap();
+        }
+        let repo_b = SessionRepo::open(root.path().join("proj-b")).unwrap();
+        for i in 0..5 {
+            repo_b
+                .create(SessionMeta::new(format!("/b{i}"), "m"))
+                .unwrap();
+        }
+
+        let calls: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+        let metas = SessionRepo::list_all_with_progress(root.path(), |scanned, total| {
+            calls.lock().unwrap().push((scanned, total))
+        })
+        .unwrap();
+        assert_eq!(metas.len(), 10, "must merge both projects' sessions");
+
+        let calls = calls.into_inner().unwrap();
+        assert_eq!(
+            calls.len(),
+            10,
+            "progress spans both projects, not per-project"
+        );
+        assert!(calls.iter().all(|&(_, total)| total == 10));
+    }
+
+    #[test]
+    fn resume_or_create_reopens_the_session_matching_cwd() {
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut other = repo.create(SessionMeta::new("/other", "m")).unwrap();
+        let mut sa = Session::new();
+        sa.user("from another project");
+        other.append_new(&sa.messages).unwrap();
+
+        let mut mine = repo.create(SessionMeta::new("/mine", "m")).unwrap();
+        let mut sb = Session::new();
+        sb.user("from my project");
+        mine.append_new(&sb.messages).unwrap();
+
+        let (store, session) = repo.resume_or_create("/mine", "m").unwrap();
+        assert_eq!(store.meta().id, mine.meta().id);
+        assert_eq!(session.messages.len(), 1);
+    }
+
+    #[test]
+    fn resume_or_create_makes_a_fresh_session_when_no_cwd_matches() {
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let (store, session) = repo.resume_or_create("/brand/new", "m").unwrap();
+        assert_eq!(store.meta().cwd, "/brand/new");
+        assert!(session.messages.is_empty());
+    }
+
+    #[test]
+    fn canonical_cwd_resolves_a_symlink_to_its_real_target() {
+        let dir = tmpdir();
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert_eq!(canonical_cwd(&link), canonical_cwd(&real));
+    }
+
+    #[test]
+    fn canonical_cwd_falls_back_to_the_given_path_when_it_does_not_exist() {
+        let missing = Path::new("/definitely/does/not/exist/xyz-canonical-cwd-test");
+        assert_eq!(canonical_cwd(missing), missing);
+    }
+
+    #[test]
+    fn resume_or_create_matches_a_session_recorded_under_a_symlinked_cwd_once_canonicalized() {
+        // The regression this guards: a project reached through a symlink one time and its real path
+        // another must resolve to the same session, not silently fork into two.
+        let dir = tmpdir();
+        let real = dir.path().join("project");
+        fs::create_dir(&real).unwrap();
+        let link = dir.path().join("project-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let repo_dir = tmpdir();
+        let repo = SessionRepo::open(repo_dir.path()).unwrap();
+        let real_cwd = canonical_cwd(&real).to_string_lossy().into_owned();
+        let mut store = repo.create(SessionMeta::new(&real_cwd, "m")).unwrap();
+        let mut s = Session::new();
+        s.user("hello from the real path");
+        store.append_new(&s.messages).unwrap();
+
+        let link_cwd = canonical_cwd(&link).to_string_lossy().into_owned();
+        let (reopened, session) = repo.resume_or_create(&link_cwd, "m").unwrap();
+        assert_eq!(
+            reopened.meta().id,
+            store.meta().id,
+            "a symlinked cwd must canonicalize to the same session as its real path"
+        );
+        assert_eq!(session.messages.len(), 1);
+    }
+
+    #[test]
     fn list_all_merges_every_project_subdirectory() {
         // The layout `serve`'s default session directory follows: one subdirectory per project under
         // a shared root, each an independent `SessionRepo`.
@@ -2172,6 +2575,70 @@ mod tests {
             Some("hello world, this is the first message")
         );
         assert!(l.updated_at > 0);
+        // Unlike `preview` (first message only), `search_text` accumulates every user message.
+        assert!(
+            l.search_text
+                .contains("hello world, this is the first message")
+        );
+        assert!(l.search_text.contains("second"));
+    }
+
+    #[test]
+    fn search_text_is_capped_and_skips_non_user_content() {
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("x".repeat(SEARCH_TEXT_MAX_CHARS + 500));
+        session.user("this must not appear: budget already spent");
+        store.append_new(&session.messages).unwrap();
+
+        let listings = repo.list().unwrap();
+        let search_text = &listings[0].search_text;
+        assert!(
+            search_text.chars().count() <= SEARCH_TEXT_MAX_CHARS,
+            "got {} chars",
+            search_text.chars().count()
+        );
+        assert!(!search_text.contains("this must not appear"));
+    }
+
+    #[test]
+    fn search_text_is_empty_when_the_session_has_no_user_text() {
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let id = store.meta().id.clone();
+        let listings = repo.list().unwrap();
+        let l = listings.iter().find(|l| l.id == id).unwrap();
+        assert_eq!(l.search_text, "");
+    }
+
+    #[test]
+    fn to_listing_json_surfaces_derived_fields_that_serde_skip_hides() {
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("hello world");
+        store.append_new(&session.messages).unwrap();
+
+        let listing = repo.list().unwrap().into_iter().next().unwrap();
+        // The plain derive hides these — that's the bug `to_listing_json` exists to work around.
+        let bare = serde_json::to_value(&listing).unwrap();
+        assert!(bare.get("updated_at").is_none());
+        assert!(bare.get("message_count").is_none());
+        assert!(bare.get("preview").is_none());
+        assert!(bare.get("search_text").is_none());
+
+        let full = listing.to_listing_json();
+        assert_eq!(full["message_count"], 1);
+        assert_eq!(full["preview"], "hello world");
+        assert_eq!(full["search_text"], "hello world");
+        assert!(full["updated_at"].as_u64().unwrap() > 0);
+        // Persisted fields still round-trip through the same call.
+        assert_eq!(full["id"], listing.id);
+        assert_eq!(full["cwd"], "/w");
     }
 
     #[test]

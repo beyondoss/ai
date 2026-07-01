@@ -142,6 +142,11 @@ pub struct Agent {
     reasoning_effort: Option<ReasoningEffort>,
     /// Context-compaction policy: when to summarize the prefix to stay under the context window.
     compaction: CompactionConfig,
+    /// Whether [`Self::run_turn`] retries a mid-stream transport failure (see
+    /// [`is_retryable_mid_stream`]) instead of surfacing it immediately. Defaults to `true`; an
+    /// operator debugging a flaky network hop can disable it via `with_auto_retry(false)` to see the
+    /// raw failure on the very first hiccup rather than after `MAX_MID_STREAM_RETRIES` silent attempts.
+    auto_retry: bool,
     /// Interception hooks around tool calls (gate/rewrite). Defaults to no-ops.
     hooks: Arc<dyn AgentHooks>,
     /// Stable prompt-cache affinity key for this run (OpenAI `prompt_cache_key`).
@@ -158,6 +163,18 @@ pub struct Agent {
     checkpoint: Arc<dyn CheckpointHook>,
 }
 
+/// The summarization call's own output budget, scaled from the model's real ceiling rather than a
+/// flat constant regardless of what the model can actually hold: `0.8 * reserve_tokens` mirrors how
+/// much headroom compaction is trying to buy back, capped at `max_output` so this can never exceed
+/// what the model would reject, and floored so a very small `reserve_tokens` still leaves the summary
+/// usably long. Shared by [`Agent::new`] (the initial seed) and [`Agent::with_compaction`] (rescaling
+/// when a caller replaces the whole config, e.g. to override `reserve_tokens` alone).
+fn scaled_summary_max_tokens(reserve_tokens: u32, max_output: u32) -> u32 {
+    (((reserve_tokens as f64) * 0.8) as u32)
+        .min(max_output)
+        .max(1024)
+}
+
 impl Agent {
     /// An agent over `transport` using `model`, with no tools and model-aware defaults: the per-turn
     /// output ceiling and the compaction context window are seeded from the model's
@@ -165,15 +182,8 @@ impl Agent {
     pub fn new(transport: Arc<dyn ModelTransport>, model: impl Into<String>) -> Self {
         let model = model.into();
         let caps = crate::models::capabilities(&model);
-        // Scale the summarization call's own output budget from the model's real ceiling, rather than
-        // trusting `CompactionConfig::default()`'s flat 4096 regardless of what the model can actually
-        // hold: `0.8 * reserve_tokens` mirrors how much headroom compaction is trying to buy back,
-        // capped at the model's `max_output` so this can never exceed what the model would reject, and
-        // floored so a very small `reserve_tokens` override still leaves the summary usably long.
         let reserve_tokens = CompactionConfig::default().reserve_tokens;
-        let summary_max_tokens = (((reserve_tokens as f64) * 0.8) as u32)
-            .min(caps.max_output)
-            .max(1024);
+        let summary_max_tokens = scaled_summary_max_tokens(reserve_tokens, caps.max_output);
         Self {
             transport,
             tools: ToolRegistry::new(),
@@ -189,6 +199,7 @@ impl Agent {
                 summary_max_tokens,
                 ..CompactionConfig::default()
             },
+            auto_retry: true,
             hooks: Arc::new(NoHooks),
             cache_key: None,
             cache_long: false,
@@ -245,7 +256,22 @@ impl Agent {
     }
 
     /// Set the compaction policy (context window, reserve, keep-recent, enabled).
-    pub fn with_compaction(mut self, compaction: CompactionConfig) -> Self {
+    pub fn with_compaction(mut self, mut compaction: CompactionConfig) -> Self {
+        // A caller replacing the whole config wholesale — the common pattern for overriding just
+        // `reserve_tokens`/`enabled`/`context_window` via struct-update syntax against
+        // `CompactionConfig::default()` — would otherwise silently discard `Agent::new()`'s
+        // model-aware `summary_max_tokens` scaling and fall back to the struct's flat default, however
+        // poor a fit that is for this model's real `max_output`. Detected by the incoming value still
+        // being exactly that flat default (i.e. not something the caller deliberately chose): rescale
+        // it the same way `Agent::new()` seeds it initially, against *this* config's `reserve_tokens`.
+        // A caller on a model whose `max_output` genuinely caps out at (or below) the flat default gets
+        // that same value back either way, so this is never a regression for them — only ever a fix for
+        // every model with more headroom to give.
+        if compaction.summary_max_tokens == CompactionConfig::default().summary_max_tokens {
+            let caps = crate::models::capabilities(&self.model);
+            compaction.summary_max_tokens =
+                scaled_summary_max_tokens(compaction.reserve_tokens, caps.max_output);
+        }
         self.compaction = compaction;
         self
     }
@@ -253,6 +279,12 @@ impl Agent {
     /// Convenience: set just the model's context window, leaving the other compaction defaults.
     pub fn with_context_window(mut self, context_window: u32) -> Self {
         self.compaction.context_window = context_window;
+        self
+    }
+
+    /// Enable or disable mid-stream retry (default: enabled) — see the `auto_retry` field's doc comment.
+    pub fn with_auto_retry(mut self, enabled: bool) -> Self {
+        self.auto_retry = enabled;
         self
     }
 
@@ -837,7 +869,11 @@ impl Agent {
         loop {
             match self.run_turn_once(req.clone(), emit, cancel).await {
                 Ok(turn) => return Ok(turn),
-                Err(e) if attempt < MAX_MID_STREAM_RETRIES && is_retryable_mid_stream(&e) => {
+                Err(e)
+                    if self.auto_retry
+                        && attempt < MAX_MID_STREAM_RETRIES
+                        && is_retryable_mid_stream(&e) =>
+                {
                     attempt += 1;
                     // Race the backoff sleep against cancellation too — left unraced, a tripped token
                     // during this wait would sit idle for up to `MID_STREAM_MAX_BACKOFF` before the
@@ -1637,6 +1673,31 @@ mod tests {
         let err = agent.run(&mut session, |_| {}).await.unwrap_err();
         assert!(matches!(err, Error::Transport(msg) if msg.contains("400")));
         assert_eq!(mock.calls(), 1, "a non-retryable error must not retry");
+    }
+
+    #[tokio::test]
+    async fn with_auto_retry_false_fails_immediately_on_an_otherwise_retryable_error() {
+        // The exact same retryable error shape `cancellation_interrupts_mid_stream_retry_backoff`
+        // above proves gets retried by default — with `auto_retry` off, it must fail on the very first
+        // attempt instead, with no backoff wait and no second transport call.
+        let mock = Arc::new(MockTransport::scripted(vec![vec![
+            Ok(StreamEvent::MessageStart),
+            Err(Error::Transport(
+                "Anthropic stream ended before message_stop".into(),
+            )),
+        ]]));
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8")
+            .with_max_steps(8)
+            .with_auto_retry(false);
+        let mut session = Session::new();
+        session.user("hi");
+        let err = agent.run(&mut session, |_| {}).await.unwrap_err();
+        assert!(matches!(err, Error::Transport(msg) if msg.contains("stream ended")));
+        assert_eq!(
+            mock.calls(),
+            1,
+            "auto_retry(false) must not retry an otherwise-retryable error"
+        );
     }
 
     #[test]
@@ -3068,6 +3129,44 @@ mod tests {
         let mock2 = Arc::new(MockTransport::new(vec![]));
         let agent2 = Agent::new(mock2, "claude-opus-4-8");
         assert_eq!(agent2.compaction.summary_max_tokens, 19_200);
+    }
+
+    #[test]
+    fn with_compaction_rescales_summary_max_tokens_instead_of_resetting_it_to_the_flat_default() {
+        // The common pattern for overriding just one field of the compaction config (`serve.rs`'s own
+        // `build_agent` does exactly this): struct-update syntax against `CompactionConfig::default()`.
+        // Before this fix, replacing the whole config this way silently discarded `Agent::new()`'s
+        // model-aware `summary_max_tokens` and fell back to the struct's flat 4096 default — a real
+        // regression on any high-`max_output` model, not just when `reserve_tokens` itself changed.
+        let mock = Arc::new(MockTransport::new(vec![]));
+        let agent = Agent::new(mock, "claude-opus-4-8").with_compaction(CompactionConfig {
+            context_window: 500_000,
+            enabled: false,
+            ..CompactionConfig::default()
+        });
+        assert_eq!(
+            agent.compaction.summary_max_tokens, 19_200,
+            "must rescale to 0.8 * reserve_tokens against the model's real max_output, not reset to \
+             the flat 4096 default"
+        );
+
+        // Overriding `reserve_tokens` too must rescale against the *new* value, not the one
+        // `Agent::new()` originally seeded from.
+        let mock2 = Arc::new(MockTransport::new(vec![]));
+        let agent2 = Agent::new(mock2, "claude-opus-4-8").with_compaction(CompactionConfig {
+            reserve_tokens: 10_000,
+            ..CompactionConfig::default()
+        });
+        assert_eq!(agent2.compaction.summary_max_tokens, 8_000);
+
+        // A caller that *did* deliberately set `summary_max_tokens` to something other than the flat
+        // default must still have that respected verbatim, not silently rescaled out from under them.
+        let mock3 = Arc::new(MockTransport::new(vec![]));
+        let agent3 = Agent::new(mock3, "claude-opus-4-8").with_compaction(CompactionConfig {
+            summary_max_tokens: 2_048,
+            ..CompactionConfig::default()
+        });
+        assert_eq!(agent3.compaction.summary_max_tokens, 2_048);
     }
 
     #[tokio::test]

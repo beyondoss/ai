@@ -20,13 +20,16 @@ pub struct PromptOptions<'a> {
     pub cwd: &'a Path,
     /// Whether to discover and inject `AGENTS.md`/`CLAUDE.md` project-instruction files.
     pub include_context_files: bool,
-    /// Whether to discover and advertise skills.
+    /// Whether to discover and advertise skills at all — an independent on/off switch, not a trust
+    /// gate (see `project_trusted` below for that). A real caller always passes `true`; tests pass
+    /// `false` to skip touching the developer's actual `~/.claude/skills`.
     pub include_skills: bool,
     /// Whether `cwd` is a trusted project (an explicit `--trust-project`/RPC override, or recorded in
-    /// `TrustStore`). Gates the *project-local* `SYSTEM.md` override only — an untrusted checkout can't
-    /// replace the agent's identity just by shipping the file (see `crate::trust_store`). The user-global
-    /// `~/.claude/SYSTEM.md` override is unaffected either way: it's the operator's own machine, not
-    /// something a repo checkout controls.
+    /// `TrustStore`). Gates the *project-local* `SYSTEM.md` override and the project-local skills root
+    /// (`<cwd>/.claude/skills`, see `skills::discover`) — an untrusted checkout can't replace the
+    /// agent's identity or inject its own skills just by shipping the files (see `crate::trust_store`).
+    /// The user-global `~/.claude/SYSTEM.md` override and `~/.claude/skills` are unaffected either way:
+    /// they're the operator's own machine, not something a repo checkout controls.
     pub project_trusted: bool,
 }
 
@@ -75,7 +78,7 @@ pub fn build_static_system_prompt(opts: &PromptOptions) -> String {
     }
 
     if opts.include_skills {
-        let skills: Vec<Skill> = skills::discover(opts.cwd);
+        let skills: Vec<Skill> = skills::discover(opts.cwd, opts.project_trusted);
         if !skills.is_empty() {
             s.push_str("\n\n");
             s.push_str(&skills::format_available(&skills));

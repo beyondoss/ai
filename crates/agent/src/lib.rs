@@ -8,10 +8,13 @@
 // `.unwrap()` *is* the assertion — allow it under `test`, matching the binary and agent-core roots.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+pub mod export;
 pub mod prompts;
 pub mod resources;
 pub mod serve;
 pub mod session_store;
 pub mod skills;
 pub mod tools;
+#[cfg(test)]
+pub(crate) mod tracing_test;
 pub mod trust_store;

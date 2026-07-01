@@ -16,6 +16,16 @@ pub const DEV_PUBKEY_B64: &str = "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=";
 /// The matching dev `bai_v1` token (tenant 1 / vpc 1, kid 1).
 pub const DEV_TOKEN: &str = "bai_v1.1.AQAAAAAAAAABAAAAAAAAAA.WrWcPbklu91PS-4WuR6GnBNF3h4nROpH0EQQlfJf06f7_lEnlQOCSBimhH2JMwXFJgw40BniTB7-yIdFnpldDw";
 
+/// A `HOME` that deliberately doesn't exist on disk. `serve`/`run` read `~/.claude/skills` and
+/// `~/.claude/trusted-projects.json` unconditionally (skill discovery is no longer gated on project
+/// trust — an untrusted project must not blank out the user's own global skills), and every codepath
+/// that reads under `HOME` already treats a missing file/directory as "nothing there" rather than an
+/// error, so this keeps a test hermetic (never sees, and can't pollute, the actual developer's real
+/// `~/.claude/`) without needing a `TempDir` guard kept alive for the spawned process's lifetime. A test
+/// that specifically wants real HOME-relative behavior (trust store writes, seeded skills) overrides
+/// this afterward via its own `.env("HOME", ...)`, which simply wins — `Command::env` is last-write.
+pub const ISOLATED_HOME: &str = "/nonexistent-beyond-ai-agent-test-home";
+
 /// Locate the gateway binary (built beside the agent binary); build it on demand if absent.
 pub fn gateway_bin() -> PathBuf {
     let agent = PathBuf::from(env!("CARGO_BIN_EXE_beyond-ai-agent"));

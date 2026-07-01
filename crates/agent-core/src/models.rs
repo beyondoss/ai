@@ -367,7 +367,11 @@ pub fn capabilities(model: &str) -> ModelCaps {
             max_output,
             max_tokens_field: MaxTokensField::MaxTokens,
             supports_long_cache: true,
-            supports_vision: true,
+            // Bare "gpt-4" (pi's catalogue: `input: ["text"]`) predates GPT-4's vision support
+            // entirely — that shipped separately as "gpt-4-vision-preview" and was later folded into
+            // "gpt-4-turbo" (`input: ["text","image"]`) and every 4o-family id. Every other id in this
+            // branch does accept image input.
+            supports_vision: m != "gpt-4",
             thinking: ThinkingShape::None,
             reasoning_effort: false,
             reasoning_disableable: false,
@@ -381,6 +385,138 @@ pub fn capabilities(model: &str) -> ModelCaps {
         "unrecognized model id; falling back to conservative capabilities"
     );
     ModelCaps::unknown()
+}
+
+/// A portable thinking-depth level, independent of which wire mechanism the active model actually uses
+/// — an Anthropic token budget (`ThinkingShape::Budget`), an Anthropic adaptive effort
+/// (`ThinkingShape::Adaptive`), or an OpenAI `reasoning_effort` parameter. A client (or
+/// `cycle_thinking_level`) can move through these six rungs and land at a comparable depth no matter
+/// which model is currently active — see [`thinking_for_level`] for the translation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingLevel {
+    Off,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    XHigh,
+}
+
+/// Ladder order `ThinkingLevel::next` cycles through, wrapping from `XHigh` back to `Off`.
+const THINKING_LEVEL_LADDER: [ThinkingLevel; 6] = [
+    ThinkingLevel::Off,
+    ThinkingLevel::Minimal,
+    ThinkingLevel::Low,
+    ThinkingLevel::Medium,
+    ThinkingLevel::High,
+    ThinkingLevel::XHigh,
+];
+
+impl ThinkingLevel {
+    /// The wire string this level round-trips as: `"off"`, plus `ReasoningEffort::as_str`'s vocabulary
+    /// for the other five.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThinkingLevel::Off => "off",
+            ThinkingLevel::Minimal => "minimal",
+            ThinkingLevel::Low => "low",
+            ThinkingLevel::Medium => "medium",
+            ThinkingLevel::High => "high",
+            ThinkingLevel::XHigh => "xhigh",
+        }
+    }
+
+    /// Parse [`Self::as_str`]'s vocabulary (case-sensitive, matching `ReasoningEffort`'s own wire
+    /// strings). `None` for anything else.
+    pub fn parse(s: &str) -> Option<Self> {
+        THINKING_LEVEL_LADDER
+            .iter()
+            .copied()
+            .find(|l| l.as_str() == s)
+    }
+
+    /// The next rung, wrapping from `XHigh` back to `Off`.
+    pub fn next(self) -> Self {
+        let idx = THINKING_LEVEL_LADDER
+            .iter()
+            .position(|&l| l == self)
+            .unwrap_or(0);
+        THINKING_LEVEL_LADDER[(idx + 1) % THINKING_LEVEL_LADDER.len()]
+    }
+
+    /// The `ReasoningEffort` this level carries, or `None` for `Off`.
+    pub fn reasoning_effort(self) -> Option<crate::transport::ReasoningEffort> {
+        use crate::transport::ReasoningEffort as RE;
+        match self {
+            ThinkingLevel::Off => None,
+            ThinkingLevel::Minimal => Some(RE::Minimal),
+            ThinkingLevel::Low => Some(RE::Low),
+            ThinkingLevel::Medium => Some(RE::Medium),
+            ThinkingLevel::High => Some(RE::High),
+            ThinkingLevel::XHigh => Some(RE::XHigh),
+        }
+    }
+}
+
+impl From<crate::transport::ReasoningEffort> for ThinkingLevel {
+    fn from(effort: crate::transport::ReasoningEffort) -> Self {
+        use crate::transport::ReasoningEffort as RE;
+        match effort {
+            RE::Minimal => ThinkingLevel::Minimal,
+            RE::Low => ThinkingLevel::Low,
+            RE::Medium => ThinkingLevel::Medium,
+            RE::High => ThinkingLevel::High,
+            RE::XHigh => ThinkingLevel::XHigh,
+        }
+    }
+}
+
+/// A fixed effort→token-budget ladder for [`ThinkingShape::Budget`]-shape models, clamped below
+/// `max_output` (a thinking budget must leave room for the turn's actual output). For
+/// [`ThinkingShape::Adaptive`]-shape models this value is a pure on/off gate on the wire — only its
+/// `Some`-ness is checked, the actual depth comes from `output_config.effort` (see
+/// `dialect::anthropic::build_body`) — so its exact magnitude doesn't matter there, but reusing the same
+/// ladder keeps one code path instead of two.
+fn budget_for_effort(effort: crate::transport::ReasoningEffort, max_output: u32) -> u32 {
+    use crate::transport::ReasoningEffort as RE;
+    let budget = match effort {
+        RE::Minimal => 1_024,
+        RE::Low => 2_048,
+        RE::Medium => 8_192,
+        RE::High => 24_000,
+        RE::XHigh => 32_000,
+    };
+    budget.min(max_output.saturating_sub(1).max(1))
+}
+
+/// Translate a portable `level` into the `(thinking_budget, reasoning_effort)` pair
+/// [`crate::Agent::with_thinking`]/[`crate::Agent::with_reasoning_effort`] need for a model with
+/// capabilities `caps` — whichever combination its `thinking`/`reasoning_effort` capabilities actually
+/// call for:
+/// - `ThinkingShape::None` and no OpenAI `reasoning_effort` support: neither field is ever set — the
+///   model has no thinking/reasoning mechanism at all.
+/// - `ThinkingShape::Budget` (Claude 3.7/4.x): a token budget scaled from `level`, clamped below
+///   `max_output`; `reasoning_effort` stays unset (that dialect arm never reads it).
+/// - `ThinkingShape::Adaptive` (gen-6+ Claude/Fable) and OpenAI's `reasoning_effort: true` models both
+///   want `reasoning_effort` set — for `Adaptive`, `thinking` is *also* set (any nonzero budget; it's
+///   purely the on/off gate for that shape, see `budget_for_effort`'s doc comment) since Anthropic's
+///   `output_config.effort` sibling field only takes effect when thinking itself is enabled.
+pub fn thinking_for_level(
+    caps: &ModelCaps,
+    level: ThinkingLevel,
+) -> (Option<u32>, Option<crate::transport::ReasoningEffort>) {
+    let Some(effort) = level.reasoning_effort() else {
+        return (None, None);
+    };
+    let thinking = matches!(
+        caps.thinking,
+        ThinkingShape::Budget | ThinkingShape::Adaptive
+    )
+    .then(|| budget_for_effort(effort, caps.max_output));
+    let reasoning_effort_applies =
+        caps.reasoning_effort || caps.thinking == ThinkingShape::Adaptive;
+    let reasoning_effort = reasoning_effort_applies.then_some(effort);
+    (thinking, reasoning_effort)
 }
 
 #[cfg(test)]
@@ -628,6 +764,23 @@ mod tests {
     }
 
     #[test]
+    fn bare_gpt4_predates_vision_support_unlike_every_other_gpt4_id() {
+        // Bare "gpt-4" (pi's catalogue: `input: ["text"]`) is the original, text-only model — vision
+        // shipped later as "gpt-4-vision-preview" and was folded into "gpt-4-turbo"/4o onward. Getting
+        // this wrong would let the loop attach an image to a request the model can't accept at all.
+        assert!(
+            !capabilities("gpt-4").supports_vision,
+            "bare gpt-4 must not be marked vision-capable"
+        );
+        for id in ["gpt-4-turbo", "gpt-4o", "gpt-4o-mini", "gpt-4.1"] {
+            assert!(
+                capabilities(id).supports_vision,
+                "{id} should still be vision-capable"
+            );
+        }
+    }
+
+    #[test]
     fn unknown_model_is_conservative() {
         let c = capabilities("some-future-model-x");
         assert_eq!(c.max_tokens_field, MaxTokensField::MaxTokens);
@@ -681,5 +834,126 @@ mod tests {
             capabilities("some-future-model-x").api,
             ApiKind::ChatCompletions
         );
+    }
+
+    #[test]
+    fn thinking_level_next_cycles_through_all_six_rungs_and_wraps() {
+        let mut level = ThinkingLevel::Off;
+        let mut seen = vec![level];
+        for _ in 0..5 {
+            level = level.next();
+            seen.push(level);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                ThinkingLevel::Off,
+                ThinkingLevel::Minimal,
+                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
+                ThinkingLevel::High,
+                ThinkingLevel::XHigh,
+            ]
+        );
+        assert_eq!(
+            level.next(),
+            ThinkingLevel::Off,
+            "the ladder must wrap from XHigh back to Off"
+        );
+    }
+
+    #[test]
+    fn thinking_level_as_str_and_parse_round_trip() {
+        for level in [
+            ThinkingLevel::Off,
+            ThinkingLevel::Minimal,
+            ThinkingLevel::Low,
+            ThinkingLevel::Medium,
+            ThinkingLevel::High,
+            ThinkingLevel::XHigh,
+        ] {
+            assert_eq!(ThinkingLevel::parse(level.as_str()), Some(level));
+        }
+        assert_eq!(ThinkingLevel::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn thinking_for_level_is_off_for_a_model_with_no_thinking_mechanism_at_all() {
+        // Legacy gen-3 Claude ids: `ThinkingShape::None`, `reasoning_effort: false`.
+        let caps = capabilities("claude-3-5-sonnet-20241022");
+        assert_eq!(caps.thinking, ThinkingShape::None);
+        for level in [
+            ThinkingLevel::Minimal,
+            ThinkingLevel::High,
+            ThinkingLevel::XHigh,
+        ] {
+            assert_eq!(
+                thinking_for_level(&caps, level),
+                (None, None),
+                "a model with no thinking mechanism must never get either field set"
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_for_level_off_always_clears_both_fields_regardless_of_shape() {
+        for id in ["claude-opus-4-5", "claude-opus-4-8", "o3", "gpt-4o"] {
+            assert_eq!(
+                thinking_for_level(&capabilities(id), ThinkingLevel::Off),
+                (None, None),
+                "{id}: Off must clear both fields"
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_for_level_sets_only_a_budget_for_budget_shape_models() {
+        // "claude-opus-4-5" is pre-gen6: `ThinkingShape::Budget`, no OpenAI-style `reasoning_effort`.
+        let caps = capabilities("claude-opus-4-5");
+        assert_eq!(caps.thinking, ThinkingShape::Budget);
+        let (thinking, effort) = thinking_for_level(&caps, ThinkingLevel::High);
+        assert_eq!(thinking, Some(24_000));
+        assert_eq!(
+            effort, None,
+            "a Budget-shape model's dialect never reads reasoning_effort"
+        );
+    }
+
+    #[test]
+    fn thinking_for_level_clamps_the_budget_below_max_output() {
+        // A small `max_output` (e.g. a legacy id) must clamp XHigh's 32_000 rungs down to something
+        // that still leaves room for the turn's own output.
+        let caps = ModelCaps {
+            max_output: 4_096,
+            ..capabilities("claude-opus-4-5")
+        };
+        let (thinking, _) = thinking_for_level(&caps, ThinkingLevel::XHigh);
+        assert_eq!(thinking, Some(4_095), "must clamp to max_output - 1");
+    }
+
+    #[test]
+    fn thinking_for_level_sets_both_fields_for_adaptive_shape_models() {
+        // Gen6+ Claude (e.g. the default "claude-opus-4-8"): `ThinkingShape::Adaptive`. Both `thinking`
+        // (the on/off gate) and `reasoning_effort` (the actual depth) must be set together.
+        let caps = capabilities("claude-opus-4-8");
+        assert_eq!(caps.thinking, ThinkingShape::Adaptive);
+        let (thinking, effort) = thinking_for_level(&caps, ThinkingLevel::Medium);
+        assert!(thinking.is_some(), "Adaptive needs a nonzero gate value");
+        assert_eq!(effort, Some(crate::transport::ReasoningEffort::Medium));
+    }
+
+    #[test]
+    fn thinking_for_level_sets_only_reasoning_effort_for_openai_style_models() {
+        // OpenAI reasoning models (o-series): `ThinkingShape::None` + `reasoning_effort: true` — no
+        // Anthropic-style budget field at all, only the named effort.
+        let caps = capabilities("o3");
+        assert_eq!(caps.thinking, ThinkingShape::None);
+        assert!(caps.reasoning_effort);
+        let (thinking, effort) = thinking_for_level(&caps, ThinkingLevel::Low);
+        assert_eq!(
+            thinking, None,
+            "OpenAI reasoning models take no budget field"
+        );
+        assert_eq!(effort, Some(crate::transport::ReasoningEffort::Low));
     }
 }

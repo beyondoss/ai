@@ -25,17 +25,24 @@
 //!   - `{type:"get_messages"}`           → `data: {messages: [...]}` (each tagged with its tree `id`
 //!     when persistence is configured, so a client can fork from any point via `switch_branch`)
 //!   - `{type:"new_session"}`            start a fresh session → `data: {session_id}`
-//!   - `{type:"list_sessions"}`          (repo mode) → `data: {sessions: [SessionMeta…]}`, this
-//!     project's sessions only (matched by the default per-cwd directory, or whatever `--session-dir`
-//!     points at)
-//!   - `{type:"list_all_sessions"}`      (repo mode) → `data: {sessions: [SessionMeta…]}` across every
-//!     project's own session directory, not just this one's — each entry's own `cwd` field says which
-//!     project it belongs to (pi's cross-project `listAll`)
+//!   - `{type:"list_sessions"}`          (repo mode) → `data: {sessions: [SessionMeta + updated_at/
+//!     message_count/preview/search_text…]}` (via `SessionMeta::to_listing_json` — those four fields are
+//!     `#[serde(skip)]` on the struct itself), this project's sessions only (matched by the default
+//!     per-cwd directory, or whatever `--session-dir` points at). The underlying scan
+//!     (`SessionRepo::list_with_progress`) runs across a small worker pool rather than one file at a
+//!     time, and streams `list_progress` frames while it's in flight.
+//!   - `{type:"list_all_sessions"}`      (repo mode) → same shape and same `list_progress` streaming as
+//!     `list_sessions`, across every project's own session directory, not just this one's — each entry's
+//!     own `cwd` field says which project it belongs to (pi's cross-project `listAll`)
 //!   - `{type:"switch_session", session_id}` (repo mode) load another session
 //!   - `{type:"fork", upto?}`            (repo mode) copy the prefix into a new session, switch to it
 //!   - `{type:"get_fork_messages", session_id?, upto?}` (repo mode) preview what `fork` would produce —
 //!     no new session, no switch
 //!   - `{type:"set_session_name", title}` set the session's title
+//!   - `{type:"export_html", output_path?}` render the active session's transcript as a single
+//!     self-contained HTML file → `data: {path}`. `output_path` defaults to a timestamped
+//!     `session-<unix-seconds>.html` in the current directory; parent directories are created as
+//!     needed.
 //!   - `{type:"compact"}`                summarize the prefix now → `data: {compacted: bool}`
 //!   - `{type:"get_last_assistant_text"}` → `data: {text}` (the latest assistant reply)
 //!   - `{type:"get_session_stats"}`      → token/step accounting
@@ -44,11 +51,21 @@
 //!     re-check trust, refreshing the static half of the system prompt (the cheap date/cwd footer is
 //!     already refreshed every turn regardless)
 //!   - `{type:"set_model", model}`       switch the model for subsequent prompts → `data: {model}`
-//!   - `{type:"set_thinking", budget}`   set/clear the thinking budget (integer, or `null` to disable)
+//!   - `{type:"set_thinking", budget}`   set/clear an explicit raw thinking-budget override (integer,
+//!     or `null` to disable it and defer back to the portable level below) → `data: {thinking}`
+//!   - `{type:"set_reasoning_effort", effort}` set the portable thinking-depth level directly — one of
+//!     off/minimal/low/medium/high/xhigh (or `null`, an alias for `"off"`) — correctly for whichever
+//!     mechanism the active model actually uses (an Anthropic token budget, an Anthropic adaptive
+//!     effort, or an OpenAI `reasoning_effort`); see `agent_core::ThinkingLevel` → `data: {level,
+//!     thinking, reasoning_effort}`
 //!   - `{type:"cycle_model"}`            advance through `get_available_models`'s list, wrapping
-//!   - `{type:"cycle_thinking_level"}`   advance through a fixed Off/Low/Medium/High budget ladder
+//!   - `{type:"cycle_thinking_level"}`   advance the same portable level one rung, wrapping from
+//!     `xhigh` back to `off` → `data: {level, thinking, reasoning_effort}`
 //!   - `{type:"set_auto_compaction", enabled}` toggle threshold-triggered compaction (manual `compact`
 //!     is unaffected either way)
+//!   - `{type:"set_auto_retry", enabled}` toggle mid-stream transport-failure retry (on by default) —
+//!     off surfaces a normally-retried transient failure immediately, for debugging a flaky connection
+//!     rather than waiting through several silent attempts
 //!   - `{type:"get_available_models"}`   → `data: {models: […]}` (a known, non-exhaustive id list)
 //!   - `{type:"list_branches"}`          → `data: {branches: [BranchInfo…]}` (the session's *leaves*)
 //!   - `{type:"get_tree"}`               → `data: {nodes: [TreeNode…]}` (every message on every
@@ -77,7 +94,9 @@
 //! session's next turn can't leak into another.
 //!
 //! Frames (stdout) are `{type:"ack", id?, command}`, `{type:"response", id?, command, success, data?,
-//! error?}`, or `{type:"event", event: <AgentEvent>}`.
+//! error?}`, `{type:"event", event: <AgentEvent>}`, or `{type:"list_progress", id?, command, scanned,
+//! total}` — zero or more unsolicited progress updates a `list_sessions`/`list_all_sessions` scan emits
+//! while in flight, correlated to the request via the same `id` its eventual `response` carries.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -283,9 +302,9 @@ impl Persistence {
     /// Open persistence and restore (or create) the active session. In repo mode, reopens the most
     /// recent session or creates a fresh one; in file mode, opens the file or creates it.
     fn open(cfg: &ServeConfig) -> std::io::Result<(Self, Session)> {
-        let cwd = std::env::current_dir()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let cwd = crate::session_store::canonical_cwd(&std::env::current_dir().unwrap_or_default())
+            .to_string_lossy()
+            .into_owned();
         if let Some(dir) = &cfg.session_dir {
             return Self::open_repo(dir, &cwd, &cfg.model);
         }
@@ -320,7 +339,11 @@ impl Persistence {
         // Neither flag was given and persistence wasn't explicitly opted out: default to a per-cwd
         // repo directory rather than silently running in-memory-only, so an operator who simply
         // forgot the flag doesn't lose all history on the next restart with no indication why.
-        Self::open_repo(default_session_dir(&cwd), &cwd, &cfg.model)
+        Self::open_repo(
+            crate::session_store::default_session_dir(&cwd),
+            &cwd,
+            &cfg.model,
+        )
     }
 
     /// Open (creating if needed) a multi-session repo at `dir` and reattach to the most recent session
@@ -334,13 +357,7 @@ impl Persistence {
         model: &str,
     ) -> std::io::Result<(Self, Session)> {
         let repo = SessionRepo::open(dir)?;
-        let (store, session) = match repo.list()?.into_iter().find(|m| m.cwd == cwd) {
-            Some(meta) => repo.open_id(&meta.id)?,
-            None => {
-                let store = repo.create(SessionMeta::new(cwd, model))?;
-                (store, Session::new())
-            }
-        };
+        let (store, session) = repo.resume_or_create(cwd, model)?;
         let meta = store.meta().clone();
         Ok((
             Self {
@@ -385,11 +402,13 @@ impl Persistence {
         }
     }
 
-    /// The working directory, for new session metadata.
+    /// The working directory, for new session metadata — canonicalized, so a session created via
+    /// `new_session` matches the same [`canonical_cwd`](crate::session_store::canonical_cwd) form
+    /// every other session-cwd is recorded in.
     fn cwd() -> String {
-        std::env::current_dir()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default()
+        crate::session_store::canonical_cwd(&std::env::current_dir().unwrap_or_default())
+            .to_string_lossy()
+            .into_owned()
     }
 
     /// Start a fresh session. In repo mode this creates a new file (new id); in single-file mode it
@@ -451,11 +470,16 @@ impl Persistence {
         Ok(session.messages[..upto].to_vec())
     }
 
-    /// All sessions' metadata, newest first (empty unless in repo mode).
-    fn list(&self) -> Vec<SessionMeta> {
+    /// All sessions' metadata, newest first (empty unless in repo mode). `on_progress(scanned, total)`
+    /// is invoked once per file as the scan completes it — see
+    /// [`SessionRepo::list_with_progress`](crate::session_store::SessionRepo::list_with_progress).
+    fn list_with_progress(
+        &self,
+        on_progress: impl Fn(usize, usize) + Send + Sync,
+    ) -> Vec<SessionMeta> {
         self.repo
             .as_ref()
-            .and_then(|r| match r.list() {
+            .and_then(|r| match r.list_with_progress(on_progress) {
                 Ok(sessions) => Some(sessions),
                 Err(e) => {
                     eprintln!("serve: failed to list sessions: {e}");
@@ -467,9 +491,15 @@ impl Persistence {
 
     /// Every session across every project's own repo directory (pi's cross-project `listAll`), not
     /// just this process's own — the parent of this repo's directory is treated as the shared sessions
-    /// root, with one subdirectory per project (the convention [`default_session_dir`] follows).
+    /// root, with one subdirectory per project (the convention
+    /// [`session_store::default_session_dir`](crate::session_store::default_session_dir) follows).
     /// `Err` when not in repo mode, or the repo directory has no parent to scan siblings of.
-    fn list_all(&self) -> std::io::Result<Vec<SessionMeta>> {
+    /// `on_progress(scanned, total)` is invoked once per file across every project combined — see
+    /// [`SessionRepo::list_all_with_progress`](crate::session_store::SessionRepo::list_all_with_progress).
+    fn list_all_with_progress(
+        &self,
+        on_progress: impl Fn(usize, usize) + Send + Sync,
+    ) -> std::io::Result<Vec<SessionMeta>> {
         let repo = self.repo.as_ref().ok_or_else(not_in_repo_mode)?;
         let root = repo.dir().parent().ok_or_else(|| {
             std::io::Error::new(
@@ -477,7 +507,7 @@ impl Persistence {
                 "session directory has no parent to list other projects from",
             )
         })?;
-        SessionRepo::list_all(root)
+        SessionRepo::list_all_with_progress(root, on_progress)
     }
 
     /// Set the current session's title.
@@ -612,24 +642,16 @@ fn not_in_repo_mode() -> std::io::Error {
     )
 }
 
-/// Encode `cwd` into a filesystem-safe directory-name component: every path separator becomes `-`, so
-/// `/home/jared/ai` becomes `-home-jared-ai` — the same convention this repo's other per-project state
-/// already uses (`trust_store.rs`'s `~/.claude/trusted-projects.json`, `prompts.rs`'s
-/// `~/.claude/prompts`), extended here to give each project its own session subdirectory.
-fn encode_cwd(cwd: &str) -> String {
-    cwd.chars()
-        .map(|c| if c == '/' || c == '\\' { '-' } else { c })
-        .collect()
-}
-
-/// The default session directory when neither `--session-file` nor `--session-dir` is given (and
-/// persistence wasn't explicitly opted out): `~/.claude/sessions/<encoded-cwd>/`, one subdirectory per
-/// project so unrelated projects' sessions never mix in the same listing.
-fn default_session_dir(cwd: &str) -> std::path::PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default();
-    home.join(".claude/sessions").join(encode_cwd(cwd))
+/// Whether a session's recorded `cwd` no longer reflects reality for this process: the directory has
+/// been moved or deleted since the session was created, or — since `switch_session`/`fork`/reattaching
+/// to an existing session never change the process's actual working directory — it simply isn't where
+/// this process is running (a shared `--session-dir` spanning multiple projects, or a session forked
+/// from one created elsewhere; `SessionRepo::fork` copies the *source* session's `cwd`, not the current
+/// one). Surfaced (as `cwd_stale` on the relevant responses) so a client can warn before the model's
+/// tools proceed against a mismatched or nonexistent directory instead of silently producing confusing
+/// results.
+fn cwd_is_stale(meta_cwd: &str, actual_cwd: &std::path::Path) -> bool {
+    !std::path::Path::new(meta_cwd).is_dir() || meta_cwd != actual_cwd.to_string_lossy()
 }
 
 /// Run the control loop until stdin closes.
@@ -641,7 +663,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
     // half (this discovery-based block — expensive, rebuilt only on `set_model`/`set_thinking`/`reload`)
     // and a cheap dynamic footer (current date/cwd, recomputed before every `prompt` via `full_system`)
     // so a long-running `serve` process doesn't re-walk the filesystem every turn just for the date.
-    let cwd = std::env::current_dir().unwrap_or_default();
+    let cwd = crate::session_store::canonical_cwd(&std::env::current_dir().unwrap_or_default());
     let mut project_trusted =
         cfg.trust_project || crate::trust_store::TrustStore::open_default().is_trusted(&cwd);
     let mut static_system =
@@ -650,26 +672,32 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
             append: cfg.append_system.as_deref(),
             cwd: &cwd,
             include_context_files: cfg.context_files,
-            include_skills: project_trusted,
+            include_skills: true,
             project_trusted,
         });
 
     // Slash-command prompt templates (`/name args`) and discoverable skills, for `get_commands` and
-    // for expanding a `/name` prompt before it reaches the model. Gated on trust: an untrusted repo's
-    // `.claude/skills`/`.claude/prompts` are attacker-controlled instructions, so they're neither
-    // advertised nor invocable until the directory is trusted — otherwise `/skill:name` or `/name`
-    // would inject arbitrary content into context regardless of trust. The `_with_diagnostics` variant
-    // also reports name collisions (the same `/name` or skill name shadowed across roots), surfaced via
-    // `get_commands`'s `collisions` field rather than silently resolved with no way for a client to
-    // notice.
-    let (mut prompt_templates, mut prompt_collisions, mut skills, mut skill_collisions) =
-        if project_trusted {
-            let (templates, tc) = crate::prompts::discover_with_diagnostics(&cwd);
-            let (skills, sc) = crate::skills::discover_with_diagnostics(&cwd);
-            (templates, tc, skills, sc)
-        } else {
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
-        };
+    // for expanding a `/name`/`/skill:name` prompt before it reaches the model.
+    //
+    // Prompt templates are gated on trust wholesale: an untrusted repo's `.claude/prompts` is
+    // attacker-controlled instructions, so it's neither advertised nor invocable until the directory is
+    // trusted — otherwise `/name` would inject arbitrary content into context regardless of trust.
+    //
+    // Skills are *not* gated wholesale — only the project-local root is (`skills::discover_with_diagnostics`'s
+    // own `project_trusted` param): the user-global root (`~/.claude/skills`) is the operator's own
+    // machine, not something the current project checkout controls, so an untrusted project must not
+    // blank out the user's own skills along with its own.
+    //
+    // The `_with_diagnostics` variant also reports name collisions (the same `/name` or skill name
+    // shadowed across roots), surfaced via `get_commands`'s `collisions` field rather than silently
+    // resolved with no way for a client to notice.
+    let (mut prompt_templates, mut prompt_collisions) = if project_trusted {
+        crate::prompts::discover_with_diagnostics(&cwd)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let (mut skills, mut skill_collisions) =
+        crate::skills::discover_with_diagnostics(&cwd, project_trusted);
 
     // Keep the transport in an `Arc` we can clone: `set_model`/`set_thinking` rebuild the `Agent` at
     // runtime (a new model id picks a new dialect), and each rebuild reuses this one HTTP client.
@@ -686,7 +714,22 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
     // `build_agent` folds the mutable trio into a fresh `Agent` whenever any of them changes.
     let mut current_model = cfg.model.clone();
     let mut current_thinking = cfg.thinking;
+    // The portable thinking-depth level (see `agent_core::ThinkingLevel`) — the runtime-mutable
+    // counterpart to `cfg.reasoning_effort`, seeded from it so a process started with
+    // `--reasoning-effort` keeps that depth until `cycle_thinking_level`/`set_reasoning_effort` change
+    // it. Unlike `current_thinking` (an explicit raw-budget override that wins when present), this
+    // always takes effect: `build_agent` derives both the thinking budget *and* the reasoning effort
+    // from it via `agent_core::thinking_for_level`, correctly for whichever mechanism `current_model`
+    // actually uses.
+    let mut current_level = cfg
+        .reasoning_effort
+        .map(agent_core::ThinkingLevel::from)
+        .unwrap_or(agent_core::ThinkingLevel::Off);
     let mut current_auto_compaction = true;
+    // Mid-stream transport-failure retry (`agent_core::Agent::with_auto_retry`) — on by default;
+    // `set_auto_retry` lets an operator debugging a flaky network hop disable it to see the raw failure
+    // on the very first hiccup instead of after several silent retries.
+    let mut current_auto_retry = true;
     // Shared across every `build_agent` rebuild for this process's lifetime, so file-mutation
     // exclusivity (same-path `edit`/`write` calls) survives a `set_model`/`set_thinking` rebuild.
     let write_locks = Arc::new(agent_core::WriteLockRegistry::new());
@@ -710,7 +753,9 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
         &cfg,
         &current_model,
         current_thinking,
+        current_level,
         current_auto_compaction,
+        current_auto_retry,
         persistence.session_id(),
         &write_locks,
         &checkpoint,
@@ -777,9 +822,12 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
     // Announce readiness so a client can sync before issuing commands. If this already fails the
     // writer never started; there is nothing to serve.
     if out_tx
-        .send(
-            json!({ "type": "ready", "session_id": persistence.session_id(), "model": current_model }),
-        )
+        .send(json!({
+            "type": "ready",
+            "session_id": persistence.session_id(),
+            "model": current_model,
+            "cwd_stale": cwd_is_stale(&persistence.meta.cwd, &cwd),
+        }))
         .is_err()
     {
         let _ = writer.await;
@@ -1018,6 +1066,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                                                 m.insert("model".into(), json!(current_model));
                                                 m.insert("message_count".into(), Value::Null);
                                                 m.insert("title".into(), json!(persistence.meta.title));
+                                                m.insert("cwd_stale".into(), json!(cwd_is_stale(&persistence.meta.cwd, &cwd)));
                                             }
                                             let _ = out_tx.send(response(cid, "get_state", true, Some(data), None));
                                         }
@@ -1041,13 +1090,27 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                                             let _ = out_tx.send(response(cid, "get_tree", true, Some(json!({ "nodes": persistence.tree() })), None));
                                         }
                                         "list_sessions" => {
-                                            let sessions = serde_json::to_value(persistence.list()).unwrap_or(Value::Null);
+                                            let progress_id = cid.clone();
+                                            let sessions: Vec<Value> = persistence
+                                                .list_with_progress(|scanned, total| {
+                                                    if should_report_scan_progress(scanned, total) {
+                                                        let _ = out_tx.send(list_progress_frame(progress_id.clone(), "list_sessions", scanned, total));
+                                                    }
+                                                })
+                                                .iter()
+                                                .map(SessionMeta::to_listing_json)
+                                                .collect();
                                             let _ = out_tx.send(response(cid, "list_sessions", true, Some(json!({ "sessions": sessions })), None));
                                         }
                                         "list_all_sessions" => {
-                                            match persistence.list_all() {
+                                            let progress_id = cid.clone();
+                                            match persistence.list_all_with_progress(|scanned, total| {
+                                                if should_report_scan_progress(scanned, total) {
+                                                    let _ = out_tx.send(list_progress_frame(progress_id.clone(), "list_all_sessions", scanned, total));
+                                                }
+                                            }) {
                                                 Ok(sessions) => {
-                                                    let sessions = serde_json::to_value(sessions).unwrap_or(Value::Null);
+                                                    let sessions: Vec<Value> = sessions.iter().map(SessionMeta::to_listing_json).collect();
                                                     let _ = out_tx.send(response(cid, "list_all_sessions", true, Some(json!({ "sessions": sessions })), None));
                                                 }
                                                 Err(e) => {
@@ -1138,6 +1201,10 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     m.insert("model".into(), json!(current_model));
                     m.insert("message_count".into(), json!(session.messages.len()));
                     m.insert("title".into(), json!(persistence.meta.title));
+                    m.insert(
+                        "cwd_stale".into(),
+                        json!(cwd_is_stale(&persistence.meta.cwd, &cwd)),
+                    );
                 }
                 emit!(response(id, "get_state", true, Some(data), None));
             }
@@ -1175,12 +1242,29 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     id,
                     "new_session",
                     true,
-                    Some(json!({ "session_id": persistence.session_id() })),
+                    Some(json!({
+                        "session_id": persistence.session_id(),
+                        "cwd_stale": cwd_is_stale(&persistence.meta.cwd, &cwd),
+                    })),
                     None,
                 ));
             }
             "list_sessions" => {
-                let sessions = serde_json::to_value(persistence.list()).unwrap_or(Value::Null);
+                let progress_id = id.clone();
+                let sessions: Vec<Value> = persistence
+                    .list_with_progress(|scanned, total| {
+                        if should_report_scan_progress(scanned, total) {
+                            let _ = out_tx.send(list_progress_frame(
+                                progress_id.clone(),
+                                "list_sessions",
+                                scanned,
+                                total,
+                            ));
+                        }
+                    })
+                    .iter()
+                    .map(SessionMeta::to_listing_json)
+                    .collect();
                 emit!(response(
                     id,
                     "list_sessions",
@@ -1189,25 +1273,38 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     None,
                 ));
             }
-            "list_all_sessions" => match persistence.list_all() {
-                Ok(sessions) => {
-                    let sessions = serde_json::to_value(sessions).unwrap_or(Value::Null);
-                    emit!(response(
+            "list_all_sessions" => {
+                let progress_id = id.clone();
+                match persistence.list_all_with_progress(|scanned, total| {
+                    if should_report_scan_progress(scanned, total) {
+                        let _ = out_tx.send(list_progress_frame(
+                            progress_id.clone(),
+                            "list_all_sessions",
+                            scanned,
+                            total,
+                        ));
+                    }
+                }) {
+                    Ok(sessions) => {
+                        let sessions: Vec<Value> =
+                            sessions.iter().map(SessionMeta::to_listing_json).collect();
+                        emit!(response(
+                            id,
+                            "list_all_sessions",
+                            true,
+                            Some(json!({ "sessions": sessions })),
+                            None,
+                        ));
+                    }
+                    Err(e) => emit!(response(
                         id,
                         "list_all_sessions",
-                        true,
-                        Some(json!({ "sessions": sessions })),
+                        false,
                         None,
-                    ));
+                        Some(&e.to_string())
+                    )),
                 }
-                Err(e) => emit!(response(
-                    id,
-                    "list_all_sessions",
-                    false,
-                    None,
-                    Some(&e.to_string())
-                )),
-            },
+            }
             "switch_session" => match cmd.get("session_id").and_then(Value::as_str) {
                 Some(target) => match persistence.switch(target) {
                     Ok(s) => {
@@ -1217,7 +1314,10 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                             id,
                             "switch_session",
                             true,
-                            Some(json!({ "session_id": persistence.session_id() })),
+                            Some(json!({
+                                "session_id": persistence.session_id(),
+                                "cwd_stale": cwd_is_stale(&persistence.meta.cwd, &cwd),
+                            })),
                             None,
                         ));
                     }
@@ -1252,7 +1352,10 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                             id,
                             "fork",
                             true,
-                            Some(json!({ "session_id": persistence.session_id() })),
+                            Some(json!({
+                                "session_id": persistence.session_id(),
+                                "cwd_stale": cwd_is_stale(&persistence.meta.cwd, &cwd),
+                            })),
                             None,
                         ));
                     }
@@ -1284,6 +1387,26 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     Err(e) => emit!(response(
                         id,
                         "get_fork_messages",
+                        false,
+                        None,
+                        Some(&e.to_string())
+                    )),
+                }
+            }
+            "export_html" => {
+                let output_path = cmd.get("output_path").and_then(Value::as_str);
+                match crate::export::export_html(&persistence.meta, &session.messages, output_path)
+                {
+                    Ok(path) => emit!(response(
+                        id,
+                        "export_html",
+                        true,
+                        Some(json!({ "path": path.to_string_lossy() })),
+                        None,
+                    )),
+                    Err(e) => emit!(response(
+                        id,
+                        "export_html",
                         false,
                         None,
                         Some(&e.to_string())
@@ -1402,22 +1525,17 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                         append: cfg.append_system.as_deref(),
                         cwd: &cwd,
                         include_context_files: cfg.context_files,
-                        include_skills: project_trusted,
+                        include_skills: true,
                         project_trusted,
                     },
                 );
-                (
-                    prompt_templates,
-                    prompt_collisions,
-                    skills,
-                    skill_collisions,
-                ) = if project_trusted {
-                    let (templates, tc) = crate::prompts::discover_with_diagnostics(&cwd);
-                    let (discovered_skills, sc) = crate::skills::discover_with_diagnostics(&cwd);
-                    (templates, tc, discovered_skills, sc)
+                (prompt_templates, prompt_collisions) = if project_trusted {
+                    crate::prompts::discover_with_diagnostics(&cwd)
                 } else {
-                    (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                    (Vec::new(), Vec::new())
                 };
+                (skills, skill_collisions) =
+                    crate::skills::discover_with_diagnostics(&cwd, project_trusted);
                 agent.set_system(full_system(&static_system, &cwd));
                 emit!(response(id, "reload", true, None, None));
             }
@@ -1436,7 +1554,9 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                         &cfg,
                         &current_model,
                         current_thinking,
+                        current_level,
                         current_auto_compaction,
+                        current_auto_retry,
                         persistence.session_id(),
                         &write_locks,
                         &checkpoint,
@@ -1470,7 +1590,9 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                             &cfg,
                             &current_model,
                             current_thinking,
+                            current_level,
                             current_auto_compaction,
+                            current_auto_retry,
                             persistence.session_id(),
                             &write_locks,
                             &checkpoint,
@@ -1491,7 +1613,9 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                             &cfg,
                             &current_model,
                             current_thinking,
+                            current_level,
                             current_auto_compaction,
+                            current_auto_retry,
                             persistence.session_id(),
                             &write_locks,
                             &checkpoint,
@@ -1510,6 +1634,60 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                         false,
                         None,
                         Some("`budget` must be a non-negative integer or null"),
+                    )),
+                }
+            }
+            "set_reasoning_effort" => {
+                // `effort` is one of the portable level names ("off"/"minimal"/"low"/"medium"/"high"/
+                // "xhigh"), or `null` as an alias for `"off"`. Unlike `set_thinking`, this sets
+                // `current_level` directly (no raw-override concept — a named effort already *is* a
+                // ladder rung) and clears any pending `set_thinking` override, for the same reason
+                // `cycle_thinking_level` does: the newly-requested level should take visible effect
+                // immediately, not be silently masked by a stale raw budget.
+                let parsed = match cmd.get("effort") {
+                    Some(Value::Null) => Some(agent_core::ThinkingLevel::Off),
+                    Some(Value::String(s)) => agent_core::ThinkingLevel::parse(s),
+                    _ => None,
+                };
+                match parsed {
+                    Some(level) => {
+                        current_level = level;
+                        current_thinking = None;
+                        agent = build_agent(
+                            client.clone(),
+                            &full_system(&static_system, &cwd),
+                            &cfg,
+                            &current_model,
+                            current_thinking,
+                            current_level,
+                            current_auto_compaction,
+                            current_auto_retry,
+                            persistence.session_id(),
+                            &write_locks,
+                            &checkpoint,
+                        );
+                        let (thinking, reasoning_effort) = agent_core::thinking_for_level(
+                            &agent_core::capabilities(&current_model),
+                            current_level,
+                        );
+                        emit!(response(
+                            id,
+                            "set_reasoning_effort",
+                            true,
+                            Some(json!({
+                                "level": current_level.as_str(),
+                                "thinking": thinking,
+                                "reasoning_effort": reasoning_effort.map(|e| e.as_str()),
+                            })),
+                            None,
+                        ));
+                    }
+                    None => emit!(response(
+                        id,
+                        "set_reasoning_effort",
+                        false,
+                        None,
+                        Some("`effort` must be one of off/minimal/low/medium/high/xhigh, or null"),
                     )),
                 }
             }
@@ -1532,7 +1710,9 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     &cfg,
                     &current_model,
                     current_thinking,
+                    current_level,
                     current_auto_compaction,
+                    current_auto_retry,
                     persistence.session_id(),
                     &write_locks,
                     &checkpoint,
@@ -1546,30 +1726,39 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 ));
             }
             "cycle_thinking_level" => {
-                // Advance through a fixed Off/Low/Medium/High token-budget ladder, wrapping — the
-                // current budget maps to its nearest rung first, so cycling from an arbitrary
-                // `set_thinking` value still advances sensibly rather than jumping to a rung far from
-                // where it started.
-                current_thinking = next_thinking_level(
-                    current_thinking,
-                    agent_core::capabilities(&current_model).max_output,
-                );
+                // Advance the portable Off/Minimal/Low/Medium/High/XHigh ladder, wrapping, and clear
+                // any explicit raw-budget override (`set_thinking`) — otherwise a stale override could
+                // silently mask the level having just changed. `thinking_for_level` reports what the
+                // new level actually resolves to for `current_model` specifically, so the response
+                // reflects reality rather than a number that may be meaningless for this model's shape.
+                current_level = current_level.next();
+                current_thinking = None;
                 agent = build_agent(
                     client.clone(),
                     &full_system(&static_system, &cwd),
                     &cfg,
                     &current_model,
                     current_thinking,
+                    current_level,
                     current_auto_compaction,
+                    current_auto_retry,
                     persistence.session_id(),
                     &write_locks,
                     &checkpoint,
+                );
+                let (thinking, reasoning_effort) = agent_core::thinking_for_level(
+                    &agent_core::capabilities(&current_model),
+                    current_level,
                 );
                 emit!(response(
                     id,
                     "cycle_thinking_level",
                     true,
-                    Some(json!({ "thinking": current_thinking })),
+                    Some(json!({
+                        "level": current_level.as_str(),
+                        "thinking": thinking,
+                        "reasoning_effort": reasoning_effort.map(|e| e.as_str()),
+                    })),
                     None,
                 ));
             }
@@ -1582,7 +1771,9 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                         &cfg,
                         &current_model,
                         current_thinking,
+                        current_level,
                         current_auto_compaction,
+                        current_auto_retry,
                         persistence.session_id(),
                         &write_locks,
                         &checkpoint,
@@ -1598,6 +1789,38 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 None => emit!(response(
                     id,
                     "set_auto_compaction",
+                    false,
+                    None,
+                    Some("missing boolean `enabled`")
+                )),
+            },
+            "set_auto_retry" => match cmd.get("enabled").and_then(Value::as_bool) {
+                Some(enabled) => {
+                    current_auto_retry = enabled;
+                    agent = build_agent(
+                        client.clone(),
+                        &full_system(&static_system, &cwd),
+                        &cfg,
+                        &current_model,
+                        current_thinking,
+                        current_level,
+                        current_auto_compaction,
+                        current_auto_retry,
+                        persistence.session_id(),
+                        &write_locks,
+                        &checkpoint,
+                    );
+                    emit!(response(
+                        id,
+                        "set_auto_retry",
+                        true,
+                        Some(json!({ "auto_retry": current_auto_retry })),
+                        None,
+                    ));
+                }
+                None => emit!(response(
+                    id,
+                    "set_auto_retry",
                     false,
                     None,
                     Some("missing boolean `enabled`")
@@ -1847,16 +2070,17 @@ fn full_system(static_system: &str, cwd: &std::path::Path) -> String {
     format!("{static_system}{}", crate::resources::dynamic_footer(cwd))
 }
 
-/// Build the [`Agent`] for the current model + thinking budget + auto-compaction flag. Called once at
-/// startup and again on every `set_model`/`set_thinking`/`cycle_model`/`cycle_thinking_level`/
-/// `set_auto_compaction`, so a client can re-tune the run without restarting `serve`. The transport,
-/// tools, system prompt, loop bounds, and cache settings are the same each time; only the model id,
-/// thinking budget, and auto-compaction flag vary. Compaction's `context_window` defaults to `model`'s
-/// own capabilities; an explicit `--context-window` overrides that and stays pinned across a model
-/// switch (the operator's compaction budget, not the dialect's) — left unset, each switch picks up the
-/// *new* model's real window instead of a stale operator number. `reserve_tokens`/`keep_recent_tokens`
-/// default to `CompactionConfig::default()`, overridable independently of `context_window`.
-// 8 arguments, all independent inputs every call site already has on hand from `cfg`/local
+/// Build the [`Agent`] for the current model + thinking budget + auto-compaction/auto-retry flags.
+/// Called once at startup and again on every `set_model`/`set_thinking`/`cycle_model`/
+/// `cycle_thinking_level`/`set_auto_compaction`/`set_auto_retry`, so a client can re-tune the run
+/// without restarting `serve`. The transport, tools, system prompt, loop bounds, and cache settings are
+/// the same each time; only the model id, thinking budget, and the two flags vary. Compaction's
+/// `context_window` defaults to `model`'s own capabilities; an explicit `--context-window` overrides
+/// that and stays pinned across a model switch (the operator's compaction budget, not the dialect's) —
+/// left unset, each switch picks up the *new* model's real window instead of a stale operator number.
+/// `reserve_tokens`/`keep_recent_tokens` default to `CompactionConfig::default()`, overridable
+/// independently of `context_window`.
+// 9 arguments, all independent inputs every call site already has on hand from `cfg`/local
 // runtime-switchable state — bundling them into a struct would just be a second place those same
 // fields live, not a reduction in what the function needs to know (see `client.rs::send_with_retry`
 // for the same tradeoff). Private, single-purpose helper, not a public API shape.
@@ -1867,7 +2091,9 @@ fn build_agent(
     cfg: &ServeConfig,
     model: &str,
     thinking: Option<u32>,
+    level: agent_core::ThinkingLevel,
     auto_compaction: bool,
+    auto_retry: bool,
     cache_key: &str,
     write_locks: &Arc<agent_core::WriteLockRegistry>,
     checkpoint: &Arc<dyn agent_core::CheckpointHook>,
@@ -1891,6 +2117,7 @@ fn build_agent(
         .with_system(system.to_string())
         .with_max_steps(cfg.max_steps)
         .with_compaction(compaction)
+        .with_auto_retry(auto_retry)
         // Pin this session to a warm prompt-cache node via its stable id.
         .with_cache_key(cache_key.to_string())
         .with_cache_long(cfg.cache_long)
@@ -1902,10 +2129,16 @@ fn build_agent(
         // mid-run point (see `ChannelCheckpoint`), so a long multi-step turn is persisted incrementally
         // instead of only once it fully completes.
         .with_checkpoint_hook(checkpoint.clone());
-    if let Some(budget) = thinking {
+    // `level` (the portable ladder) supplies the default thinking/reasoning-effort pair for whichever
+    // mechanism `model`'s capabilities actually call for; `thinking`, when present, is an explicit raw
+    // budget override that wins over the level's own derived budget (but never touches reasoning
+    // effort, which always comes from `level` — see `current_thinking`'s doc comment in `serve`).
+    let (level_thinking, reasoning_effort) =
+        agent_core::thinking_for_level(&agent_core::capabilities(model), level);
+    if let Some(budget) = thinking.or(level_thinking) {
         agent = agent.with_thinking(budget);
     }
-    if let Some(effort) = cfg.reasoning_effort {
+    if let Some(effort) = reasoning_effort {
         agent = agent.with_reasoning_effort(effort);
     }
     agent
@@ -1926,31 +2159,11 @@ fn build_tools(cfg: &ServeConfig) -> agent_core::ToolRegistry {
     registry
 }
 
-/// The fixed Off/Low/Medium/High thinking-budget ladder `cycle_thinking_level` steps through.
-const THINKING_LEVELS: [Option<u32>; 4] = [None, Some(2_048), Some(8_192), Some(24_000)];
-
-/// The next rung on [`THINKING_LEVELS`] after `current`, wrapping — clamped below `max_output` (a
-/// thinking budget must leave room for the turn's actual output). `current` first maps to its *nearest*
-/// rung (not necessarily the one it came from, if `set_thinking` set an arbitrary value), so cycling
-/// always advances sensibly rather than jumping to a rung far from where the budget actually was.
-fn next_thinking_level(current: Option<u32>, max_output: u32) -> Option<u32> {
-    let nearest = match current {
-        None => 0,
-        Some(budget) => THINKING_LEVELS
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, lvl)| lvl.map_or(u32::MAX, |b| b.abs_diff(budget)))
-            .map(|(i, _)| i)
-            .unwrap_or(0),
-    };
-    let next = THINKING_LEVELS[(nearest + 1) % THINKING_LEVELS.len()];
-    next.map(|budget| budget.min(max_output.saturating_sub(1).max(1)))
-}
-
 /// A small, non-exhaustive list of model ids the [`capabilities`](agent_core::capabilities) table
 /// recognizes, for a client's model picker. The gateway forwards any id verbatim, so this is a
-/// convenience hint — not an allowlist; `set_model` accepts ids outside this list.
-fn available_models() -> &'static [&'static str] {
+/// convenience hint — not an allowlist; `set_model` accepts ids outside this list. Shared by `serve`'s
+/// own `get_available_models`/`cycle_model` and `main`'s `list-models` CLI subcommand.
+pub fn available_models() -> &'static [&'static str] {
     &[
         "claude-opus-4-8",
         "claude-sonnet-4-5",
@@ -2093,6 +2306,29 @@ impl LiveStats {
             "last_input_tokens": self.last_input_tokens.load(Ordering::Relaxed),
         })
     }
+}
+
+/// Whether a `list_sessions`/`list_all_sessions` scan's progress at `scanned`/`total` is worth putting
+/// on the wire: the first file, the last, and roughly every 10% step in between — enough for a client's
+/// "scanning…" indicator to move without a frame per individual file when there are thousands of them.
+/// A pure function of `scanned`'s value, not of arrival order, so it stays deterministic even though
+/// `list_with_progress`'s underlying scan runs in parallel across several files at once.
+fn should_report_scan_progress(scanned: usize, total: usize) -> bool {
+    scanned <= 1 || scanned >= total || scanned % (total / 10).max(1) == 0
+}
+
+/// Build a `list_progress` frame — an unsolicited progress update for an in-flight `list_sessions`/
+/// `list_all_sessions` scan, correlated to the eventual `response` frame via the same request `id`.
+fn list_progress_frame(id: Option<String>, command: &str, scanned: usize, total: usize) -> Value {
+    let mut m = Map::new();
+    m.insert("type".into(), json!("list_progress"));
+    if let Some(id) = id {
+        m.insert("id".into(), json!(id));
+    }
+    m.insert("command".into(), json!(command));
+    m.insert("scanned".into(), json!(scanned));
+    m.insert("total".into(), json!(total));
+    Value::Object(m)
 }
 
 /// Build a `response` frame.

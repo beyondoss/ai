@@ -46,7 +46,7 @@ pub use message::{
     ContentBlock, ImageSource, Message, Role, StopReason, StreamEvent, TokenUsage, ToolDef,
 };
 pub use mock::MockTransport;
-pub use models::{ModelCaps, capabilities};
+pub use models::{ModelCaps, ThinkingLevel, capabilities, thinking_for_level};
 pub use session::Session;
 pub use steering::Steering;
 pub use tool::{Tool, ToolOutput, ToolProgress, ToolRegistry, ToolUpdate};

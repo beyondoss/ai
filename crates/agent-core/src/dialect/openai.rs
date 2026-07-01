@@ -219,10 +219,16 @@ pub fn build_body(req: &ModelRequest) -> Value {
     };
     map.insert(max_tokens_field.into(), json!(req.max_tokens));
     // Reasoning models are driven by `reasoning_effort` (minimal/low/medium/high/xhigh) rather than a
-    // thinking-token budget; emit it when the model takes one and the caller set a level.
+    // thinking-token budget; emit it when the model takes one and the caller set a level. When no
+    // level is set but the model can be told explicitly to turn reasoning off, send that instead of
+    // omitting the field — matching `dialect::openai_responses`'s `{"effort":"none"}` (this dialect's
+    // field is flat, so the equivalent here is `reasoning_effort: "none"`) rather than silently
+    // relying on whatever the provider's own undocumented default does when the field is absent.
     if caps.reasoning_effort {
         if let Some(effort) = req.reasoning_effort {
             map.insert("reasoning_effort".into(), json!(effort.as_str()));
+        } else if caps.reasoning_disableable {
+            map.insert("reasoning_effort".into(), json!("none"));
         }
     }
     map.insert("stream".into(), json!(true));
@@ -638,6 +644,29 @@ mod tests {
             &ModelRequest::new("gpt-4o", vec![Message::user("hi")], 64)
                 .with_reasoning_effort(ReasoningEffort::High),
         );
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn reasoning_effort_unset_emits_an_explicit_off_signal_when_disableable() {
+        // No level requested this turn, but the model can be told explicitly rather than relying on
+        // the provider's own undocumented default for an omitted field.
+        let body = build_body(&ModelRequest::new("o3-mini", vec![Message::user("hi")], 64));
+        assert_eq!(
+            body["reasoning_effort"], "none",
+            "a disable-capable reasoning model must get an explicit off signal, not a missing field"
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_unset_omits_the_field_when_not_disableable() {
+        // A reasoning model that can't be told to turn reasoning off at all (`reasoning_disableable:
+        // false`) must not get a fabricated "none" it doesn't actually support.
+        let body = build_body(&ModelRequest::new(
+            "gpt-5.3-codex-spark",
+            vec![Message::user("hi")],
+            64,
+        ));
         assert!(body.get("reasoning_effort").is_none());
     }
 

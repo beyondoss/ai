@@ -11,7 +11,8 @@ mod common;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
 
-use common::{spawn_model_server, turn_refusal, turn_text, turn_tool_use};
+use beyond_ai_agent::session_store::{SessionMeta, SessionRepo};
+use common::{ISOLATED_HOME, spawn_model_server, turn_refusal, turn_text, turn_tool_use};
 use serde_json::{Value, json};
 
 /// Read stdout frames until the `response` frame for `command` arrives; return all frames seen.
@@ -49,6 +50,7 @@ fn serve_cmd(bin: &str, base: &str, session_file: &str) -> Command {
         "--session-file",
         session_file,
     ])
+    .env("HOME", ISOLATED_HOME)
     .stdin(Stdio::piped())
     .stdout(Stdio::piped())
     .stderr(Stdio::null());
@@ -68,6 +70,7 @@ fn serve_dir_cmd(bin: &str, base: &str, session_dir: &str) -> Command {
         "--session-dir",
         session_dir,
     ])
+    .env("HOME", ISOLATED_HOME)
     .stdin(Stdio::piped())
     .stdout(Stdio::piped())
     .stderr(Stdio::null());
@@ -87,6 +90,7 @@ fn serve_default_persistence_cmd(bin: &str, base: &str) -> Command {
         "--model",
         "claude-test",
     ])
+    .env("HOME", ISOLATED_HOME)
     .stdin(Stdio::piped())
     .stdout(Stdio::piped())
     .stderr(Stdio::null());
@@ -332,6 +336,48 @@ fn serve_stop_after_turn_is_a_no_op_ack_when_idle() {
         2,
         "the prompt sent after an idle stop_after_turn must run to its natural completion"
     );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_export_html_writes_a_self_contained_transcript() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![turn_text("hello there")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "say hi" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    let output_path = dir.path().join("out.html").to_string_lossy().into_owned();
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "export_html", "output_path": output_path })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "export_html");
+    let response = frames.last().unwrap();
+    assert_eq!(response["success"], true, "got: {response:#?}");
+    assert_eq!(response["data"]["path"], output_path);
+
+    let html = std::fs::read_to_string(&output_path).unwrap();
+    assert!(html.starts_with("<!DOCTYPE html>"));
+    assert!(html.contains("say hi"));
+    assert!(html.contains("hello there"));
 
     drop(stdin);
     child.wait().unwrap();
@@ -737,15 +783,128 @@ fn serve_cycle_thinking_level_advances_through_the_ladder_and_wraps() {
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
-    // Starting with thinking off, each cycle advances one rung: Low, Medium, High, then back to off.
-    let expected = [json!(2048), json!(8192), json!(24000), Value::Null];
-    for want in expected {
+    // Starting Off, each cycle advances one rung on the portable Off/Minimal/Low/Medium/High/XHigh
+    // ladder, wrapping back to Off. `claude-test` (this test's model) resolves to `ThinkingShape::Budget`
+    // with a 32_000 max_output, so `reasoning_effort` stays null throughout (that dialect arm never
+    // reads it) and `thinking` is the level's derived, clamped budget.
+    let expected = [
+        ("minimal", json!(1024)),
+        ("low", json!(2048)),
+        ("medium", json!(8192)),
+        ("high", json!(24000)),
+        ("xhigh", json!(31999)),
+        ("off", Value::Null),
+    ];
+    for (level, thinking) in expected {
         writeln!(stdin, "{}", json!({ "type": "cycle_thinking_level" })).unwrap();
         stdin.flush().unwrap();
         let frames = read_until_response(&mut stdout, "cycle_thinking_level");
-        assert_eq!(frames.last().unwrap()["success"], true);
-        assert_eq!(frames.last().unwrap()["data"]["thinking"], want);
+        let data = &frames.last().unwrap()["data"];
+        assert_eq!(frames.last().unwrap()["success"], true, "got: {data:#?}");
+        assert_eq!(data["level"], level, "got: {data:#?}");
+        assert_eq!(data["thinking"], thinking, "got: {data:#?}");
+        assert!(data["reasoning_effort"].is_null(), "got: {data:#?}");
     }
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_set_reasoning_effort_sets_the_portable_level_directly() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_reasoning_effort", "effort": "high" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "set_reasoning_effort");
+    let data = &frames.last().unwrap()["data"];
+    assert_eq!(frames.last().unwrap()["success"], true, "got: {data:#?}");
+    assert_eq!(data["level"], "high");
+    assert_eq!(data["thinking"], 24000);
+
+    // A subsequent cycle starts from "high", advancing to "xhigh" — proving `set_reasoning_effort`
+    // really did move `current_level`, not just a one-off override.
+    writeln!(stdin, "{}", json!({ "type": "cycle_thinking_level" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "cycle_thinking_level");
+    assert_eq!(frames.last().unwrap()["data"]["level"], "xhigh");
+
+    // `null` clears it back to off.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_reasoning_effort", "effort": Value::Null })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "set_reasoning_effort");
+    let data = &frames.last().unwrap()["data"];
+    assert_eq!(data["level"], "off");
+    assert!(data["thinking"].is_null());
+
+    // An unrecognized effort name is rejected, not silently ignored.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_reasoning_effort", "effort": "extreme" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "set_reasoning_effort");
+    assert_eq!(frames.last().unwrap()["success"], false);
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_set_reasoning_effort_wins_over_a_stale_set_thinking_override() {
+    // `set_thinking` sets an explicit raw-budget override; `set_reasoning_effort` (like
+    // `cycle_thinking_level`) must clear it so the newly-requested level takes visible effect
+    // immediately rather than being masked by the leftover override.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_thinking", "budget": 4096 })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "set_thinking");
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_reasoning_effort", "effort": "low" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "set_reasoning_effort");
+    let data = &frames.last().unwrap()["data"];
+    assert_eq!(
+        data["thinking"], 2048,
+        "the level's own budget must win, not the stale 4096 override: {data:#?}"
+    );
 
     drop(stdin);
     child.wait().unwrap();
@@ -793,6 +952,96 @@ fn serve_set_auto_compaction_toggles_and_rejects_a_non_boolean() {
     stdin.flush().unwrap();
     let frames = read_until_response(&mut stdout, "set_auto_compaction");
     assert_eq!(frames.last().unwrap()["success"], false);
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_set_auto_retry_toggles_and_rejects_a_non_boolean() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_auto_retry", "enabled": false })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "set_auto_retry");
+    assert_eq!(frames.last().unwrap()["success"], true);
+    assert_eq!(frames.last().unwrap()["data"]["auto_retry"], false);
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_auto_retry", "enabled": true })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "set_auto_retry");
+    assert_eq!(frames.last().unwrap()["data"]["auto_retry"], true);
+
+    // Missing/non-boolean `enabled` is rejected, not silently coerced.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_auto_retry", "enabled": "yes" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "set_auto_retry");
+    assert_eq!(frames.last().unwrap()["success"], false);
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_set_auto_retry_false_fails_immediately_instead_of_retrying_a_dropped_stream() {
+    // A stream that opens (`message_start`) but closes with no `message_stop` is a dropped connection —
+    // normally retried (`agent_core`'s mid-stream retry). With auto_retry off, it must surface as an
+    // immediate `prompt` failure instead, with no second request ever reaching the model server.
+    let truncated = "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, bodies) = spawn_model_server(vec![truncated.to_string()]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_auto_retry", "enabled": false })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "set_auto_retry");
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "prompt");
+    let response = frames.last().unwrap();
+    assert_eq!(response["success"], false);
+    assert!(
+        response["error"].as_str().unwrap().contains("stream ended"),
+        "got: {response:#?}"
+    );
+    assert_eq!(
+        bodies.lock().unwrap().len(),
+        1,
+        "auto_retry(false) must not attempt a second request"
+    );
 
     drop(stdin);
     child.wait().unwrap();
@@ -983,6 +1232,75 @@ fn serve_gates_skills_and_prompts_on_project_trust() {
 }
 
 #[test]
+fn serve_untrusted_project_still_advertises_and_invokes_a_user_global_skill() {
+    // The bug this guards: `.claude/skills` under the *project* is attacker-controlled and rightly
+    // gated on trust, but `~/.claude/skills` is the operator's own machine — an untrusted project must
+    // not blank that out too.
+    let home = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let user_skill_dir = home.path().join(".claude/skills/mine");
+    std::fs::create_dir_all(&user_skill_dir).unwrap();
+    std::fs::write(
+        user_skill_dir.join("SKILL.md"),
+        "---\nname: mine\ndescription: a user-global skill\n---\nDo the user thing.",
+    )
+    .unwrap();
+    // Also seed an untrusted *project* skill, to confirm it stays gated even while the user skill
+    // isn't — the split, not just a blanket toggle.
+    let project_skill_dir = dir.path().join(".claude/skills/theirs");
+    std::fs::create_dir_all(&project_skill_dir).unwrap();
+    std::fs::write(
+        project_skill_dir.join("SKILL.md"),
+        "---\nname: theirs\ndescription: an untrusted project skill\n---\nBody.",
+    )
+    .unwrap();
+
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let (base, _bodies) = spawn_model_server(vec![turn_text("ok")]);
+    let mut cmd = serve_cmd(bin, &base, &session_file);
+    // No --trust-project: the project is untrusted.
+    cmd.current_dir(dir.path()).env("HOME", home.path());
+    let mut child = cmd.spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "get_commands" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_commands");
+    let commands = frames.last().unwrap()["data"]["commands"]
+        .as_array()
+        .unwrap();
+    let names: Vec<&str> = commands.iter().filter_map(|c| c["name"].as_str()).collect();
+    assert!(
+        names.contains(&"mine"),
+        "an untrusted project must still advertise the user-global skill: {names:?}"
+    );
+    assert!(
+        !names.contains(&"theirs"),
+        "the untrusted project's own skill must stay gated: {names:?}"
+    );
+
+    // And it's actually invocable, not merely listed.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "/skill:mine" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+    drop(stdin);
+    child.wait().unwrap();
+
+    let recorded = _bodies.lock().unwrap();
+    assert!(
+        recorded.iter().any(|b| b.contains("Do the user thing")),
+        "the user-global skill's body must reach the model when invoked: {recorded:#?}"
+    );
+}
+
+#[test]
 fn serve_get_commands_reports_a_cross_root_skill_collision() {
     // A skill named "dup" declared at both the user (`~/.claude/skills`) and project
     // (`<cwd>/.claude/skills`) roots: `get_commands` must list it once (project wins) but also report
@@ -1163,6 +1481,140 @@ fn serve_resumes_newest_session_matching_cwd_not_globally_newest() {
 }
 
 #[test]
+fn serve_reattaches_through_a_symlinked_cwd_to_the_session_recorded_under_its_real_path() {
+    // A project reached through a symlink one time and its real path another must resolve to the
+    // same session (`session_store::canonical_cwd`), not silently fork into two.
+    let session_dir_tmp = tempfile::tempdir().unwrap();
+    let session_dir = session_dir_tmp.path().to_string_lossy().into_owned();
+    let projects = tempfile::tempdir().unwrap();
+    let real = projects.path().join("real-project");
+    std::fs::create_dir(&real).unwrap();
+    let link = projects.path().join("project-link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+
+    // Start (and prompt) from the real path.
+    {
+        let (base, _bodies) = spawn_model_server(vec![turn_text("answer via real path")]);
+        let mut cmd = serve_dir_cmd(bin, &base, &session_dir);
+        cmd.current_dir(&real);
+        let mut child = cmd.spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        writeln!(
+            stdin,
+            "{}",
+            json!({ "type": "prompt", "message": "hi via real path" })
+        )
+        .unwrap();
+        stdin.flush().unwrap();
+        read_until_response(&mut stdout, "prompt");
+        drop(stdin);
+        child.wait().unwrap();
+    }
+
+    // Reattach from the symlinked path — must resume the same session, not mint a new one.
+    {
+        let (base, _bodies) = spawn_model_server(vec![]);
+        let mut cmd = serve_dir_cmd(bin, &base, &session_dir);
+        cmd.current_dir(&link);
+        let mut child = cmd.spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+        stdin.flush().unwrap();
+        let frames = read_until_response(&mut stdout, "get_messages");
+        let dump = frames.last().unwrap()["data"]["messages"].to_string();
+        assert!(
+            dump.contains("hi via real path") && dump.contains("answer via real path"),
+            "a symlinked cwd must reattach to the session recorded under its real path: {dump}"
+        );
+        drop(stdin);
+        child.wait().unwrap();
+    }
+}
+
+#[test]
+fn serve_list_sessions_streams_progress_frames_correlated_to_the_request_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_dir = dir.path().join("sessions").to_string_lossy().into_owned();
+
+    // Pre-seed sessions directly on disk (no need to drive a `prompt` per session) so the scan
+    // `list_sessions` performs has more than one file to report progress across.
+    let repo = SessionRepo::open(&session_dir).unwrap();
+    for i in 0..6 {
+        repo.create(SessionMeta::new(format!("/w{i}"), "m"))
+            .unwrap();
+    }
+
+    let (base, _bodies) = spawn_model_server(vec![]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_dir_cmd(bin, &base, &session_dir).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    // Drain the `ready` banner.
+    let mut ready = String::new();
+    stdout.read_line(&mut ready).unwrap();
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "list_sessions", "id": "req-1" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "list_sessions");
+
+    let progress: Vec<&Value> = frames
+        .iter()
+        .filter(|f| f["type"] == "list_progress")
+        .collect();
+    assert!(
+        !progress.is_empty(),
+        "expected at least one list_progress frame: {frames:#?}"
+    );
+    for p in &progress {
+        assert_eq!(p["command"], "list_sessions");
+        assert_eq!(
+            p["id"], "req-1",
+            "progress must correlate to the request id"
+        );
+        assert!(p["scanned"].as_u64().unwrap() >= 1);
+        assert!(p["total"].as_u64().unwrap() >= p["scanned"].as_u64().unwrap());
+    }
+    // The last progress frame observed must reach the full total. Since the scan is parallel, frames
+    // may not arrive in strictly increasing `scanned` order, but the maximum reported must still be
+    // the total, and the total must match the response's own session count — `serve`'s own startup
+    // reattach mints one more session for its actual cwd (which matches none of the 6 seeded here),
+    // so the total is 7, not 6.
+    let max_scanned = progress
+        .iter()
+        .map(|p| p["scanned"].as_u64().unwrap())
+        .max()
+        .unwrap();
+    let total = progress[0]["total"].as_u64().unwrap();
+    assert!(
+        total >= 6,
+        "must cover at least the 6 pre-seeded sessions: {progress:#?}"
+    );
+    assert_eq!(
+        max_scanned, total,
+        "the last progress frame must reach 100%"
+    );
+
+    let response = frames.last().unwrap();
+    assert_eq!(response["success"], true);
+    assert_eq!(
+        response["data"]["sessions"].as_array().unwrap().len() as u64,
+        total,
+        "progress total must match the number of sessions actually returned"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
 fn serve_repo_lists_switches_and_forks_sessions() {
     let dir = tempfile::tempdir().unwrap();
     let session_dir = dir.path().join("sessions").to_string_lossy().into_owned();
@@ -1210,6 +1662,26 @@ fn serve_repo_lists_switches_and_forks_sessions() {
     assert!(
         sessions.len() >= 2,
         "both sessions should be listed: {sessions:#?}"
+    );
+    // Derived listing fields (`preview`/`message_count`/`updated_at`/`search_text`) live behind
+    // `#[serde(skip)]` on `SessionMeta` so they never leak into the on-disk header — `list_sessions`
+    // must still surface them to the client via `SessionMeta::to_listing_json`.
+    let first_session = &sessions[0];
+    assert!(
+        first_session["message_count"].as_u64().unwrap() > 0,
+        "message_count must be populated: {first_session:#?}"
+    );
+    assert!(
+        first_session["updated_at"].as_u64().unwrap() > 0,
+        "updated_at must be populated: {first_session:#?}"
+    );
+    assert!(
+        first_session["preview"].is_string(),
+        "preview must be populated: {first_session:#?}"
+    );
+    assert!(
+        first_session["search_text"].is_string(),
+        "search_text must be populated: {first_session:#?}"
     );
 
     // Switch back to session 1 and confirm its transcript is restored.
@@ -2136,6 +2608,126 @@ fn serve_get_state_and_get_session_stats_answer_live_during_a_prompt() {
     assert_eq!(state_resp["success"], true, "{state_resp:#?}");
     assert!(state_resp["data"]["message_count"].is_null());
     assert!(state_resp["data"]["session_id"].is_string());
+}
+
+#[test]
+fn serve_reports_cwd_stale_false_for_a_freshly_created_session() {
+    // A session `serve` creates itself always records the actual current directory, which obviously
+    // still exists — `cwd_stale` must read false everywhere it's surfaced.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    let mut ready = String::new();
+    stdout.read_line(&mut ready).unwrap();
+    let ready: Value = serde_json::from_str(ready.trim()).unwrap();
+    assert_eq!(ready["cwd_stale"], false, "got: {ready:#?}");
+
+    writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_state");
+    let state = frames.last().unwrap();
+    assert_eq!(state["data"]["cwd_stale"], false, "got: {state:#?}");
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_reports_cwd_stale_true_when_the_recorded_directory_no_longer_exists() {
+    // File-mode persistence (`--session-file`) reattaches to whatever session is on disk without any
+    // cwd-matching filter (unlike repo mode's automatic reattach). Hand-write a header recording a
+    // directory that doesn't exist, simulating a project that was since moved or deleted, and confirm
+    // `serve` surfaces the mismatch rather than silently proceeding as if nothing changed.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl");
+    let header = json!({
+        "type": "session",
+        "id": "stale-cwd-session",
+        "created_at": 1,
+        "cwd": "/definitely/does/not/exist/beyond-ai-agent-test-fixture",
+        "model": "claude-test",
+    });
+    std::fs::write(&session_file, format!("{header}\n")).unwrap();
+
+    let (base, _bodies) = spawn_model_server(vec![]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file.to_string_lossy())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    let mut ready = String::new();
+    stdout.read_line(&mut ready).unwrap();
+    let ready: Value = serde_json::from_str(ready.trim()).unwrap();
+    assert_eq!(ready["session_id"], "stale-cwd-session");
+    assert_eq!(ready["cwd_stale"], true, "got: {ready:#?}");
+
+    writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_state");
+    let state = frames.last().unwrap();
+    assert_eq!(state["data"]["cwd_stale"], true, "got: {state:#?}");
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_switch_session_reports_cwd_stale_for_the_newly_active_session() {
+    // Repo mode's automatic reattach filters by cwd, so a mismatched session can only be reached by an
+    // explicit `switch_session` — plant one directly in the repo directory (matching its
+    // `<created_at>_<id>.jsonl` naming convention) and confirm switching to it surfaces the mismatch
+    // immediately in the `switch_session` response, not just on a later `get_state` poll.
+    let dir = tempfile::tempdir().unwrap();
+    let session_dir = dir.path().join("sessions");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let stale_header = json!({
+        "type": "session",
+        "id": "stale-target",
+        "created_at": 1,
+        "cwd": "/definitely/does/not/exist/beyond-ai-agent-test-fixture",
+        "model": "claude-test",
+    });
+    std::fs::write(
+        session_dir.join("1_stale-target.jsonl"),
+        format!("{stale_header}\n"),
+    )
+    .unwrap();
+
+    let (base, _bodies) = spawn_model_server(vec![]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_dir_cmd(bin, &base, &session_dir.to_string_lossy())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    // The freshly (auto-)created active session must not be stale.
+    let mut ready = String::new();
+    stdout.read_line(&mut ready).unwrap();
+    let ready: Value = serde_json::from_str(ready.trim()).unwrap();
+    assert_eq!(ready["cwd_stale"], false, "got: {ready:#?}");
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "switch_session", "session_id": "stale-target" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "switch_session");
+    let response = frames.last().unwrap();
+    assert_eq!(response["success"], true, "got: {response:#?}");
+    assert_eq!(response["data"]["cwd_stale"], true, "got: {response:#?}");
+
+    drop(stdin);
+    child.wait().unwrap();
 }
 
 #[test]

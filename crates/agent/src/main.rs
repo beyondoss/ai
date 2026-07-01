@@ -14,11 +14,14 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use std::io::Write as _;
-use std::path::PathBuf;
+use std::io::{IsTerminal, Read as _, Write as _};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agent_core::{Agent, GatewayClient, Session, StreamEvent};
+use beyond_ai_agent::session_store::{
+    SessionMeta, SessionRepo, SessionStore, canonical_cwd, default_session_dir,
+};
 use beyond_ai_agent::{serve, tools};
 use clap::{Parser, Subcommand};
 
@@ -69,8 +72,12 @@ struct Cli {
 enum Command {
     /// Run a one-shot agent task to completion, streaming output to stdout.
     Run {
-        /// The task prompt for the agent.
-        task: String,
+        /// The task prompt for the agent. Multiple messages run as separate, sequential turns (the
+        /// second is sent only after the first fully completes). An argument starting with `@` is a
+        /// file reference instead of a message: its contents are read and wrapped in a
+        /// `<file name="...">` block prepended to the *first* message (stdin, if piped, comes before
+        /// that). At least one of a message, `@file`, or piped stdin is required.
+        tasks: Vec<String>,
         /// Model id (default `claude-opus-4-8`, or `AI_AGENT_MODEL`).
         #[arg(long, env = "AI_AGENT_MODEL")]
         model: Option<String>,
@@ -99,6 +106,21 @@ enum Command {
         /// Register no tools at all — a pure-conversation run. Wins over `--tools`/`--exclude-tools`.
         #[arg(long, default_value_t = false)]
         no_tools: bool,
+        /// Persist this run to a specific session file, creating it if missing or continuing it if it
+        /// already exists — so a later `run --session <path>` picks up where this one left off. Wins
+        /// over `--continue` if both are given.
+        #[arg(long)]
+        session: Option<String>,
+        /// Continue the most recent session for the current directory (the same
+        /// `~/.claude/sessions/<encoded-cwd>/` repo `serve` defaults to), creating one if this is the
+        /// first run here. Ignored if `--session` is also given.
+        #[arg(long, short = 'c', default_value_t = false)]
+        r#continue: bool,
+        /// After the run completes, export the transcript as a self-contained HTML file at this path
+        /// (parent directories are created as needed) — the same rendering `serve`'s `export_html` RPC
+        /// command produces, for a one-shot run with no server involved.
+        #[arg(long)]
+        export: Option<String>,
     },
     /// Run the headless agent server: a newline-delimited JSON control protocol over stdio.
     Serve {
@@ -191,6 +213,10 @@ enum Command {
     },
     /// List the tools the agent advertises to the model.
     Tools,
+    /// List a small, non-exhaustive set of model ids the capabilities table recognizes (a convenience
+    /// hint for a model picker — the gateway forwards any id verbatim, so `--model`/`set_model` accept
+    /// ids outside this list too).
+    ListModels,
     /// Record `path` (default: the current directory) in the persisted project-trust allowlist
     /// (`~/.claude/trusted-projects.json`), so its `.claude/SYSTEM.md` is honored on future runs
     /// without needing `--trust-project` every time. Idempotent — trusting an already-trusted path is
@@ -215,7 +241,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match Cli::parse().command {
         Command::Run {
-            task,
+            tasks,
             model,
             gateway_url,
             key,
@@ -224,9 +250,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tools,
             exclude_tools,
             no_tools,
+            session,
+            r#continue,
+            export,
         } => {
             run_task(
-                task,
+                tasks,
                 model,
                 gateway_url,
                 key,
@@ -235,6 +264,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tools,
                 exclude_tools,
                 no_tools,
+                session,
+                r#continue,
+                export,
             )
             .await?;
         }
@@ -317,6 +349,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{} tools:\n", reg.len());
             println!("{}", serde_json::to_string_pretty(&reg.definitions())?);
         }
+        Command::ListModels => {
+            for model in serve::available_models() {
+                println!("{model}");
+            }
+        }
         Command::Trust { path } => {
             let dir = match path {
                 Some(p) => PathBuf::from(p),
@@ -339,9 +376,82 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Split `run`'s positional `tasks` into file references (an `@`-prefixed argument, path with the
+/// prefix stripped) and plain message strings, each preserving its own relative order.
+fn partition_tasks(tasks: Vec<String>) -> (Vec<String>, Vec<String>) {
+    let mut file_refs = Vec::new();
+    let mut messages = Vec::new();
+    for t in tasks {
+        match t.strip_prefix('@') {
+            Some(path) => file_refs.push(path.to_string()),
+            None => messages.push(t),
+        }
+    }
+    (file_refs, messages)
+}
+
+/// Read each of `file_refs` (resolved against `cwd`; an already-absolute ref is used as-is) and wrap
+/// its contents in a `<file name="...">` block, concatenated in argument order. Errors naming the
+/// first unreadable file, so a typo'd `@path` fails loudly instead of silently vanishing from the
+/// prompt.
+fn read_file_refs(file_refs: &[String], cwd: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let mut out = String::new();
+    for r in file_refs {
+        let path = cwd.join(r);
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+        out.push_str(&format!(
+            "<file name=\"{}\">\n{content}\n</file>\n",
+            path.display()
+        ));
+    }
+    Ok(out)
+}
+
+/// The full contents of stdin, if it's piped (not an interactive terminal) and non-empty. `None`
+/// otherwise — including on a read error, since a broken pipe just means there was nothing to add.
+fn read_stdin_if_piped() -> Option<String> {
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        return None;
+    }
+    let mut buf = String::new();
+    match stdin.lock().read_to_string(&mut buf) {
+        Ok(_) if !buf.is_empty() => Some(buf),
+        _ => None,
+    }
+}
+
+/// Stream one turn's assistant reply to stdout: text live, a `[tool: name]` marker when the model
+/// calls one, then a trailing blank line once the turn ends.
+async fn run_turn(agent: &Agent, session: &mut Session) -> agent_core::Result<()> {
+    agent
+        .run(session, |ev| match ev {
+            StreamEvent::TextDelta { text } => {
+                print!("{text}");
+                let _ = std::io::stdout().flush();
+            }
+            StreamEvent::ToolUseStart { name, .. } => {
+                // No trailing newline: `InputJsonDelta` fragments print immediately after, live, on
+                // this same line — a growing preview of the call's arguments as they stream in,
+                // rather than the model appearing to hang until the whole call (and its result) land.
+                print!("\n[tool: {name}] ");
+                let _ = std::io::stdout().flush();
+            }
+            StreamEvent::InputJsonDelta { partial_json } => {
+                print!("{partial_json}");
+                let _ = std::io::stdout().flush();
+            }
+            _ => {}
+        })
+        .await?;
+    println!();
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_task(
-    task: String,
+    tasks: Vec<String>,
     model: Option<String>,
     gateway_url: Option<String>,
     key: Option<String>,
@@ -350,13 +460,39 @@ async fn run_task(
     tools_allow: Option<Vec<String>>,
     tools_exclude: Option<Vec<String>>,
     no_tools: bool,
+    session_path: Option<String>,
+    continue_session: bool,
+    export: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = canonical_cwd(&std::env::current_dir().unwrap_or_default());
+
+    // Compose the first message from (in order) piped stdin, `@file` contents, then the first
+    // plain-text message argument — mirroring the reference agent's own composition order. At least
+    // one source must contribute something; a typo'd invocation with none of the three fails loudly
+    // here rather than sending the model an empty prompt.
+    let (file_refs, mut messages) = partition_tasks(tasks);
+    let stdin_content = read_stdin_if_piped();
+    let file_content = read_file_refs(&file_refs, &cwd)?;
+    let mut parts = Vec::new();
+    if let Some(s) = stdin_content {
+        parts.push(s);
+    }
+    if !file_content.is_empty() {
+        parts.push(file_content);
+    }
+    if !messages.is_empty() {
+        parts.push(messages.remove(0));
+    }
+    if parts.is_empty() {
+        return Err("no task given: pass a message, an @file, or pipe input via stdin".into());
+    }
+    let initial_message = parts.join("");
+
     let gateway = gateway_url.unwrap_or_else(|| DEFAULT_GATEWAY.to_string());
     let model = model.unwrap_or_else(|| DEFAULT_MODEL.to_string());
     let key =
         key.ok_or("no gateway key: pass --key or set AI_AGENT_KEY (a bai_v1… virtual key)")?;
 
-    let cwd = std::env::current_dir().unwrap_or_default();
     let project_trusted =
         trust_project || beyond_ai_agent::trust_store::TrustStore::open_default().is_trusted(&cwd);
     let mut registry = tools::default_registry();
@@ -373,35 +509,63 @@ async fn run_task(
             append: None,
             cwd: &cwd,
             include_context_files: true,
-            include_skills: project_trusted,
+            include_skills: true,
             project_trusted,
         },
     );
 
     let client = GatewayClient::new(gateway, key)?;
-    let agent = Agent::new(Arc::new(client), model)
+    let agent = Agent::new(Arc::new(client), model.clone())
         .with_tools(registry)
         .with_system(system)
         .with_max_steps(max_steps);
 
-    let mut session = Session::new();
-    session.user(task);
-
-    // Render assistant text live; surface tool activity on its own line.
-    agent
-        .run(&mut session, |ev| match ev {
-            StreamEvent::TextDelta { text } => {
-                print!("{text}");
-                let _ = std::io::stdout().flush();
+    // `--session`/`--continue` persist this run (and load prior history to continue it) exactly like
+    // `serve`'s own repo/file modes; neither given keeps `run` in-memory-only, as before.
+    let cwd_str = cwd.to_string_lossy().into_owned();
+    let (mut store, mut session) = match session_path {
+        Some(path) => {
+            let path = PathBuf::from(path);
+            if path.exists() {
+                let (store, session) = SessionStore::open(path)?;
+                (Some(store), session)
+            } else {
+                let store = SessionStore::create(path, SessionMeta::new(&cwd_str, &model))?;
+                (Some(store), Session::new())
             }
-            StreamEvent::ToolUseStart { name, .. } => {
-                println!("\n[tool: {name}]");
-            }
-            _ => {}
-        })
-        .await?;
+        }
+        None if continue_session => {
+            let repo = SessionRepo::open(default_session_dir(&cwd_str))?;
+            let (store, session) = repo.resume_or_create(&cwd_str, &model)?;
+            (Some(store), session)
+        }
+        None => (None, Session::new()),
+    };
+    let meta = store
+        .as_ref()
+        .map(|s| s.meta().clone())
+        .unwrap_or_else(|| SessionMeta::new(&cwd_str, &model));
 
-    println!();
+    session.user(initial_message);
+    run_turn(&agent, &mut session).await?;
+    if let Some(store) = &mut store {
+        store.append_new(&session.messages)?;
+    }
+    for message in messages {
+        session.user(message);
+        run_turn(&agent, &mut session).await?;
+        if let Some(store) = &mut store {
+            store.append_new(&session.messages)?;
+        }
+    }
+
+    if let Some(export) = export {
+        match beyond_ai_agent::export::export_html(&meta, &session.messages, Some(&export)) {
+            Ok(path) => eprintln!("[exported transcript to {}]", path.display()),
+            Err(e) => eprintln!("[failed to export transcript: {e}]"),
+        }
+    }
+
     eprintln!(
         "[done in {} step(s); {} in / {} out tokens]",
         session.steps, session.input_tokens, session.output_tokens
@@ -437,5 +601,51 @@ mod tests {
         let prompt = default_system_prompt(&registry);
         assert!(!prompt.contains("bash"));
         assert!(prompt.contains("read"));
+    }
+
+    #[test]
+    fn partition_tasks_separates_at_file_refs_from_plain_messages() {
+        let (files, messages) = partition_tasks(vec![
+            "@notes.txt".to_string(),
+            "first message".to_string(),
+            "@img.png".to_string(),
+            "second message".to_string(),
+        ]);
+        assert_eq!(files, vec!["notes.txt", "img.png"]);
+        assert_eq!(messages, vec!["first message", "second message"]);
+    }
+
+    #[test]
+    fn partition_tasks_with_no_at_refs_returns_all_as_messages() {
+        let (files, messages) = partition_tasks(vec!["just a message".to_string()]);
+        assert!(files.is_empty());
+        assert_eq!(messages, vec!["just a message"]);
+    }
+
+    #[test]
+    fn read_file_refs_wraps_contents_in_a_file_tag_with_the_resolved_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello world").unwrap();
+        let out = read_file_refs(&["a.txt".to_string()], dir.path()).unwrap();
+        assert!(out.contains("hello world"));
+        assert!(out.contains(&format!("name=\"{}\"", dir.path().join("a.txt").display())));
+    }
+
+    #[test]
+    fn read_file_refs_errors_naming_the_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = read_file_refs(&["does-not-exist.txt".to_string()], dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does-not-exist.txt"), "got: {err}");
+    }
+
+    #[test]
+    fn read_file_refs_concatenates_multiple_files_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "AAA").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "BBB").unwrap();
+        let out = read_file_refs(&["a.txt".to_string(), "b.txt".to_string()], dir.path()).unwrap();
+        assert!(out.find("AAA").unwrap() < out.find("BBB").unwrap());
     }
 }

@@ -8,6 +8,7 @@ use agent_core::tool::Tool;
 use agent_core::{ToolError, ToolOutput};
 use async_trait::async_trait;
 use base64::Engine as _;
+use image::ImageDecoder as _;
 use image::ImageEncoder as _;
 use serde_json::{Value, json};
 
@@ -325,7 +326,7 @@ struct ResizedImage {
     orig_dimensions: (u32, u32),
 }
 
-/// Downscale/re-encode an oversized image to fit under `max_base64_bytes`. Applies JPEG EXIF
+/// Downscale/re-encode an oversized image to fit under `max_base64_bytes`. Applies JPEG/WebP EXIF
 /// orientation correction before resizing (a camera photo's pixels are often stored un-rotated, with
 /// the intended rotation recorded separately in Exif — skipping this would silently show the model a
 /// sideways image), then resizes with Lanczos3 (matching pi's `resizeImageInProcess`) to fit within
@@ -344,12 +345,19 @@ fn resize_image(
     max_base64_bytes: usize,
     jpeg_quality: u8,
 ) -> Option<ResizedImage> {
-    let mut img = image::load_from_memory_with_format(bytes, format).ok()?;
-    if format == image::ImageFormat::Jpeg {
-        if let Some(orientation) = jpeg_exif_orientation(bytes) {
-            img = apply_exif_orientation(img, orientation);
-        }
-    }
+    // Read orientation off the decoder itself — `image`'s own generic Exif-orientation support
+    // (`ImageDecoder::orientation`), backed by a real parser for every format that can carry Exif
+    // (JPEG, WebP, …), rather than a hand-rolled one-format-at-a-time parser here. A camera/phone
+    // photo's pixels are often stored un-rotated, with the intended rotation recorded separately in
+    // Exif — skipping this would silently show the model a sideways image.
+    let mut decoder = image::ImageReader::with_format(std::io::Cursor::new(bytes), format)
+        .into_decoder()
+        .ok()?;
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut img = image::DynamicImage::from_decoder(decoder).ok()?;
+    img.apply_orientation(orientation);
     let orig_dims = (img.width(), img.height());
 
     let mut width = max_width.min(orig_dims.0).max(1);
@@ -416,102 +424,6 @@ fn resize_image(
         quality = quality.saturating_sub(10).max(30);
     }
     None
-}
-
-/// Parse a JPEG's Exif orientation tag (IFD0, tag `0x0112`), if present. A small hand-rolled scan for
-/// just this one tag rather than a general-purpose EXIF-reading dependency — matching this codebase's
-/// preference for narrow hand-rolled parsers over a heavier crate when only one field is ever read
-/// (see `resources.rs`'s TZif parser).
-fn jpeg_exif_orientation(bytes: &[u8]) -> Option<u16> {
-    if bytes.len() < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
-        return None; // not a JPEG (missing the SOI marker)
-    }
-    let mut pos = 2usize;
-    while pos + 4 <= bytes.len() {
-        if bytes[pos] != 0xFF {
-            break; // malformed marker stream
-        }
-        let marker = bytes[pos + 1];
-        // Markers with no payload: standalone RST*/SOI/EOI bytes.
-        if marker == 0xD8 || marker == 0xD9 || (0xD0..=0xD7).contains(&marker) {
-            pos += 2;
-            continue;
-        }
-        if marker == 0xDA {
-            break; // start of scan: compressed data follows, no more markers to inspect
-        }
-        let seg_len = u16::from_be_bytes([bytes[pos + 2], bytes[pos + 3]]) as usize;
-        if marker == 0xE1 && pos + 10 <= bytes.len() && &bytes[pos + 4..pos + 10] == b"Exif\0\0" {
-            let end = (pos + 2 + seg_len).min(bytes.len());
-            return parse_tiff_orientation(&bytes[pos + 10..end]);
-        }
-        if seg_len < 2 {
-            break; // a spec-violating zero/negative-length segment; stop rather than loop forever
-        }
-        pos += 2 + seg_len;
-    }
-    None
-}
-
-/// Read the Exif orientation tag out of a TIFF-structured IFD0 (the payload of a JPEG's APP1 segment,
-/// past the `Exif\0\0` marker).
-fn parse_tiff_orientation(tiff: &[u8]) -> Option<u16> {
-    if tiff.len() < 8 {
-        return None;
-    }
-    let little_endian = match &tiff[0..2] {
-        b"II" => true,
-        b"MM" => false,
-        _ => return None,
-    };
-    let read_u16 = |b: &[u8]| {
-        if little_endian {
-            u16::from_le_bytes([b[0], b[1]])
-        } else {
-            u16::from_be_bytes([b[0], b[1]])
-        }
-    };
-    let read_u32 = |b: &[u8]| {
-        if little_endian {
-            u32::from_le_bytes([b[0], b[1], b[2], b[3]])
-        } else {
-            u32::from_be_bytes([b[0], b[1], b[2], b[3]])
-        }
-    };
-    let ifd0_offset = read_u32(&tiff[4..8]) as usize;
-    if ifd0_offset + 2 > tiff.len() {
-        return None;
-    }
-    let num_entries = read_u16(&tiff[ifd0_offset..ifd0_offset + 2]) as usize;
-    let entries_start = ifd0_offset + 2;
-    for i in 0..num_entries {
-        let entry_off = entries_start + i * 12;
-        if entry_off + 12 > tiff.len() {
-            break;
-        }
-        let tag = read_u16(&tiff[entry_off..entry_off + 2]);
-        if tag == 0x0112 {
-            // SHORT (type 3): the value lives in the first 2 bytes of the entry's 4-byte value field.
-            let value_off = entry_off + 8;
-            return Some(read_u16(&tiff[value_off..value_off + 2]));
-        }
-    }
-    None
-}
-
-/// Apply an Exif orientation tag (values 1-8; 1 is "no transform needed") to a decoded image, so the
-/// pixels come out right-side-up regardless of how the camera stored them.
-fn apply_exif_orientation(img: image::DynamicImage, orientation: u16) -> image::DynamicImage {
-    match orientation {
-        2 => img.fliph(),
-        3 => img.rotate180(),
-        4 => img.flipv(),
-        5 => img.rotate90().fliph(),
-        6 => img.rotate90(),
-        7 => img.rotate270().fliph(),
-        8 => img.rotate270(),
-        _ => img,
-    }
 }
 
 #[cfg(test)]
@@ -793,6 +705,23 @@ mod tests {
         );
     }
 
+    /// A minimal TIFF-structured IFD0 (one entry: orientation) — the same blob JPEG carries after its
+    /// APP1 segment's `Exif\0\0` prefix and WebP carries verbatim as its `EXIF` chunk payload.
+    fn tiff_with_orientation(orientation: u16) -> Vec<u8> {
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II"); // little-endian
+        tiff.extend_from_slice(&42u16.to_le_bytes());
+        tiff.extend_from_slice(&8u32.to_le_bytes()); // IFD0 starts right after this header
+        tiff.extend_from_slice(&1u16.to_le_bytes()); // one entry
+        tiff.extend_from_slice(&0x0112u16.to_le_bytes()); // tag: Orientation
+        tiff.extend_from_slice(&3u16.to_le_bytes()); // type: SHORT
+        tiff.extend_from_slice(&1u32.to_le_bytes()); // count: 1
+        tiff.extend_from_slice(&orientation.to_le_bytes());
+        tiff.extend_from_slice(&[0, 0]); // pad the 4-byte value field
+        tiff.extend_from_slice(&0u32.to_le_bytes()); // no next IFD
+        tiff
+    }
+
     /// Splice a synthetic Exif APP1 segment (TIFF IFD0, one entry: orientation) right after a JPEG's
     /// SOI marker — real cameras embed Exif the same way, and a conforming decoder skips an APPn
     /// segment it doesn't otherwise care about, so this still decodes as a normal JPEG.
@@ -807,21 +736,9 @@ mod tests {
             )
             .unwrap();
 
-        let mut tiff = Vec::new();
-        tiff.extend_from_slice(b"II"); // little-endian
-        tiff.extend_from_slice(&42u16.to_le_bytes());
-        tiff.extend_from_slice(&8u32.to_le_bytes()); // IFD0 starts right after this header
-        tiff.extend_from_slice(&1u16.to_le_bytes()); // one entry
-        tiff.extend_from_slice(&0x0112u16.to_le_bytes()); // tag: Orientation
-        tiff.extend_from_slice(&3u16.to_le_bytes()); // type: SHORT
-        tiff.extend_from_slice(&1u32.to_le_bytes()); // count: 1
-        tiff.extend_from_slice(&orientation.to_le_bytes());
-        tiff.extend_from_slice(&[0, 0]); // pad the 4-byte value field
-        tiff.extend_from_slice(&0u32.to_le_bytes()); // no next IFD
-
         let mut app1 = Vec::new();
         app1.extend_from_slice(b"Exif\0\0");
-        app1.extend_from_slice(&tiff);
+        app1.extend_from_slice(&tiff_with_orientation(orientation));
         let seg_len = (app1.len() + 2) as u16;
 
         let mut out = Vec::new();
@@ -833,10 +750,94 @@ mod tests {
         out
     }
 
+    /// Wrap a real WebP bitstream in the "extended" (VP8X) container and append a synthetic `EXIF`
+    /// chunk (the same TIFF IFD0 blob JPEG carries). A conforming decoder only looks for metadata
+    /// chunks *after* seeing `VP8X` declare (via its flags byte) that they're present — the plain
+    /// container `image`'s own encoder writes has no room for them at all — so this, not simply
+    /// splicing a chunk into a plain file, is what a real Exif-carrying WebP looks like on disk.
+    fn webp_with_exif_orientation(width: u32, height: u32, orientation: u16) -> Vec<u8> {
+        let img =
+            image::RgbImage::from_fn(width, height, |x, _| image::Rgb([(x % 256) as u8, 0, 0]));
+        let mut webp_bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut webp_bytes),
+                image::ImageFormat::WebP,
+            )
+            .unwrap();
+        // Everything after the 12-byte "RIFF"+size+"WEBP" header is the plain VP8/VP8L bitstream
+        // chunk (FourCC + size + payload, already padded to an even boundary) — copied verbatim into
+        // the extended container built below.
+        let bitstream_chunk = &webp_bytes[12..];
+
+        let tiff = tiff_with_orientation(orientation);
+        let mut exif_chunk = Vec::new();
+        exif_chunk.extend_from_slice(b"EXIF");
+        exif_chunk.extend_from_slice(&(tiff.len() as u32).to_le_bytes());
+        exif_chunk.extend_from_slice(&tiff);
+        if tiff.len() % 2 == 1 {
+            exif_chunk.push(0); // RIFF chunks pad to an even byte boundary
+        }
+
+        let mut vp8x_payload = Vec::new();
+        vp8x_payload.push(0b0000_1000); // flags: bit 3 = Exif metadata present
+        vp8x_payload.extend_from_slice(&[0, 0, 0]); // reserved
+        vp8x_payload.extend_from_slice(&(width - 1).to_le_bytes()[0..3]); // canvas width - 1
+        vp8x_payload.extend_from_slice(&(height - 1).to_le_bytes()[0..3]); // canvas height - 1
+        let mut vp8x_chunk = Vec::new();
+        vp8x_chunk.extend_from_slice(b"VP8X");
+        vp8x_chunk.extend_from_slice(&(vp8x_payload.len() as u32).to_le_bytes());
+        vp8x_chunk.extend_from_slice(&vp8x_payload);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(b"RIFF");
+        let riff_size = (4 + vp8x_chunk.len() + bitstream_chunk.len() + exif_chunk.len()) as u32;
+        out.extend_from_slice(&riff_size.to_le_bytes());
+        out.extend_from_slice(b"WEBP");
+        out.extend_from_slice(&vp8x_chunk);
+        out.extend_from_slice(bitstream_chunk);
+        out.extend_from_slice(&exif_chunk);
+        out
+    }
+
     #[test]
-    fn jpeg_exif_orientation_reads_the_spliced_tag() {
-        let bytes = jpeg_with_exif_orientation(8, 4, 6);
-        assert_eq!(jpeg_exif_orientation(&bytes), Some(6));
+    fn a_plain_webp_with_no_exif_chunk_decodes_unchanged_through_resize_image() {
+        // No orientation metadata at all: `resize_image` must decode normally rather than treating a
+        // missing Exif chunk as an error (`ImageDecoder::orientation` defaults to `NoTransforms`).
+        let img = image::RgbImage::from_pixel(6, 3, image::Rgb([1, 2, 3]));
+        let mut plain = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut plain),
+                image::ImageFormat::WebP,
+            )
+            .unwrap();
+        let resized = resize_image(
+            &plain,
+            image::ImageFormat::WebP,
+            100,
+            100,
+            10 * 1024 * 1024,
+            80,
+        )
+        .unwrap();
+        assert_eq!(resized.dimensions, (6, 3));
+    }
+
+    #[test]
+    fn exif_orientation_6_swaps_width_and_height_for_a_webp_through_resize_image() {
+        // Same "orientation 6 = rotate 90°" swap the JPEG test proves below, for the WebP path.
+        let bytes = webp_with_exif_orientation(8, 4, 6);
+        let resized = resize_image(
+            &bytes,
+            image::ImageFormat::WebP,
+            100,
+            100,
+            10 * 1024 * 1024,
+            80,
+        )
+        .unwrap();
+        assert_eq!(resized.dimensions, (4, 8));
     }
 
     #[test]
