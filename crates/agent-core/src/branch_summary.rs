@@ -38,7 +38,7 @@ pub const BRANCH_SUMMARY_MARKER: &str = "[Explored a different branch before ret
 fn is_nested_summary(m: &Message) -> bool {
     matches!(
         m.content.first(),
-        Some(ContentBlock::Text { text })
+        Some(ContentBlock::Text { text, .. })
             if text.starts_with(SUMMARY_MARKER) || text.starts_with(BRANCH_SUMMARY_MARKER)
     )
 }
@@ -141,16 +141,14 @@ mod tests {
                 input: json!({ "path": "src/x.rs" }),
             }]),
             Message::tool_result("2", "edited", false),
-            Message::assistant(vec![ContentBlock::Text {
-                text: "approach X didn't pan out".into(),
-            }]),
+            Message::assistant(vec![ContentBlock::text("approach X didn't pan out")]),
         ]
     }
 
     #[test]
     fn branch_summary_request_renders_transcript_and_tags_files() {
         let req = branch_summary_request("claude-test", &branch(), 512, 100_000);
-        let ContentBlock::Text { text } = &req.messages[0].content[0] else {
+        let ContentBlock::Text { text, .. } = &req.messages[0].content[0] else {
             panic!("expected text");
         };
         assert!(text.contains("try approach X"));
@@ -251,7 +249,7 @@ mod tests {
     #[test]
     fn branch_summary_request_notes_when_windowing_dropped_older_activity() {
         let req = branch_summary_request("claude-test", &branch(), 512, 1);
-        let ContentBlock::Text { text } = &req.messages[0].content[0] else {
+        let ContentBlock::Text { text, .. } = &req.messages[0].content[0] else {
             panic!("expected text");
         };
         assert!(
@@ -266,7 +264,7 @@ mod tests {
         // windows out the early `read`/`edit` calls from the rendered transcript must still surface
         // them in `<read-files>`/`<modified-files>`.
         let req = branch_summary_request("claude-test", &branch(), 512, 1);
-        let ContentBlock::Text { text } = &req.messages[0].content[0] else {
+        let ContentBlock::Text { text, .. } = &req.messages[0].content[0] else {
             panic!("expected text");
         };
         assert!(text.contains("<read-files>"));
@@ -278,12 +276,10 @@ mod tests {
     fn branch_summary_request_omits_file_tags_when_no_tool_calls() {
         let messages = vec![
             Message::user("just chatting"),
-            Message::assistant(vec![ContentBlock::Text {
-                text: "sure".into(),
-            }]),
+            Message::assistant(vec![ContentBlock::text("sure")]),
         ];
         let req = branch_summary_request("claude-test", &messages, 512, 100_000);
-        let ContentBlock::Text { text } = &req.messages[0].content[0] else {
+        let ContentBlock::Text { text, .. } = &req.messages[0].content[0] else {
             panic!("expected text");
         };
         assert!(!text.contains("<read-files>"));

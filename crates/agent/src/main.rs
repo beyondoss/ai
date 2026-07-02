@@ -36,12 +36,61 @@ const DEFAULT_GATEWAY: &str = "http://ai.internal";
 /// silently omitted the Beyond platform tools (fork/sync/logs) entirely, and a version that always
 /// listed `default_registry()` regardless of filtering would claim tools a restricted agent doesn't
 /// actually have, inviting the model to call one that gets rejected.
-fn default_system_prompt(registry: &agent_core::ToolRegistry) -> String {
+/// `extra_guidelines` are operator-supplied bullets (`--prompt-guideline`, repeatable) appended after
+/// the built-in ones — pi's own `promptGuidelines` (deduplicated and trimmed, matching pi's
+/// `buildSystemPrompt`). Deliberately *not* a full port of pi's system prompt: pi also renders a
+/// redundant per-tool text snippet list ("Available tools:\n- bash: Execute bash commands...")
+/// alongside the native tool-call JSON schema already describing each tool to the model — the same
+/// information twice, in two different places the model reads. This function's own dynamic tool-name
+/// listing (`Use them to accomplish...with tools: {names}`) already avoids that duplication, so only
+/// the genuinely useful, non-redundant half of pi's feature is ported here: the guideline-bullet
+/// mechanism itself, including its one built-in conditional (`bash` registered but none of its usual
+/// companions).
+fn default_system_prompt(
+    registry: &agent_core::ToolRegistry,
+    extra_guidelines: &[String],
+) -> String {
     let names: Vec<String> = registry.definitions().into_iter().map(|d| d.name).collect();
+    let has = |n: &str| names.iter().any(|x| x == n);
+
+    let mut guidelines: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let add =
+        |g: String, guidelines: &mut Vec<String>, seen: &mut std::collections::HashSet<String>| {
+            if seen.insert(g.clone()) {
+                guidelines.push(g);
+            }
+        };
+    // Matches pi's own conditional exactly: when `bash` is the only exploration tool registered (none
+    // of `grep`/`find`/`ls`), the model needs to be told it's the fallback for those operations too.
+    if has("bash") && !has("grep") && !has("find") && !has("ls") {
+        add(
+            "Use bash for file operations like ls, rg, find".to_string(),
+            &mut guidelines,
+            &mut seen,
+        );
+    }
+    for g in extra_guidelines {
+        let g = g.trim();
+        if !g.is_empty() {
+            add(g.to_string(), &mut guidelines, &mut seen);
+        }
+    }
+    add(
+        "Show file paths clearly when working with files".to_string(),
+        &mut guidelines,
+        &mut seen,
+    );
+    let guidelines = guidelines
+        .into_iter()
+        .map(|g| format!("- {g}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
     format!(
         "You are the Beyond coding agent. You operate inside a real working directory with tools: {}. \
          Use them to accomplish the user's task directly — inspect before you change, make minimal \
-         edits, and verify your work. Be concise.",
+         edits, and verify your work. Be concise.\n\nGuidelines:\n{guidelines}",
         names.join(", ")
     )
 }
@@ -122,6 +171,31 @@ enum Command {
         /// `--no-prompt-templates`.
         #[arg(long, default_value_t = false)]
         no_prompt_templates: bool,
+        /// Do not discover/inject AGENTS.md / CLAUDE.md project-instruction files. Matches `serve`'s
+        /// identical flag — `run` previously hardcoded this on with no way to opt out.
+        #[arg(long, default_value_t = false)]
+        no_context_files: bool,
+        /// Discover skills from this directory too, in addition to the two standard roots (repeatable).
+        /// Matches pi's own `--skill <path>`. A path that doesn't exist is warned about, not silently
+        /// ignored. Wins over the standard roots on a name collision.
+        #[arg(long = "skill", value_name = "PATH")]
+        extra_skill_paths: Vec<String>,
+        /// Discover prompt templates from this directory too, in addition to the two standard roots
+        /// (repeatable). Matches pi's own `--prompt-template <path>`; see `--skill`'s doc comment for
+        /// the missing-path/shadow-order behavior, which applies identically here.
+        #[arg(long = "prompt-template", value_name = "PATH")]
+        extra_prompt_template_paths: Vec<String>,
+        /// Set this run's session name up front, before the first turn even starts — a whitespace-only
+        /// value is rejected rather than silently producing a blank/meaningless name. Matches pi's own
+        /// `--name`; the RPC `set_session_name` command (`serve` only) covers renaming an already-running
+        /// session, this covers naming one from the very start.
+        #[arg(long)]
+        name: Option<String>,
+        /// An extra guideline bullet appended to the default system prompt's `Guidelines:` section
+        /// (repeatable) — pi's own `promptGuidelines`. Deduplicated and trimmed against the built-in
+        /// guidelines.
+        #[arg(long = "prompt-guideline", value_name = "TEXT")]
+        prompt_guidelines: Vec<String>,
         /// Persist this run to a specific session file, creating it if missing or continuing it if it
         /// already exists — so a later `run --session <path>` picks up where this one left off. Wins
         /// over `--continue` if both are given.
@@ -261,6 +335,37 @@ enum Command {
         /// list instead.
         #[arg(long, env = "AI_AGENT_MODELS", value_delimiter = ',')]
         models: Option<Vec<String>>,
+        /// Disable skills discovery/loading — no `<available_skills>` listing in the system prompt, and
+        /// a `/skill:name` invocation (however it reaches the session — `prompt`, `steer`, `follow_up`)
+        /// is sent through unexpanded. Matches pi's own `--no-skills` and `run`'s identical flag; applies
+        /// on every `reload` too.
+        #[arg(long, default_value_t = false)]
+        no_skills: bool,
+        /// Disable prompt-template discovery/loading — a `/name` invocation is sent through unexpanded
+        /// instead of being resolved against `.claude/prompts/*.md`. Matches pi's own
+        /// `--no-prompt-templates` and `run`'s identical flag; applies on every `reload` too.
+        #[arg(long, default_value_t = false)]
+        no_prompt_templates: bool,
+        /// Discover skills from this directory too, in addition to the two standard roots (repeatable).
+        /// Matches pi's own `--skill <path>` and `run`'s identical flag; applies on every `reload` too.
+        #[arg(long = "skill", value_name = "PATH")]
+        extra_skill_paths: Vec<String>,
+        /// Discover prompt templates from this directory too, in addition to the two standard roots
+        /// (repeatable). Matches pi's own `--prompt-template <path>` and `run`'s identical flag; applies
+        /// on every `reload` too.
+        #[arg(long = "prompt-template", value_name = "PATH")]
+        extra_prompt_template_paths: Vec<String>,
+        /// Set the initial session's name up front, before the first turn even starts — a whitespace-only
+        /// value is rejected. Matches pi's own `--name`; the RPC `set_session_name` command covers
+        /// renaming afterward.
+        #[arg(long)]
+        name: Option<String>,
+        /// An extra guideline bullet appended to the default system prompt's `Guidelines:` section
+        /// (repeatable) — pi's own `promptGuidelines`; `run`'s identical flag. Has no effect when
+        /// `--system-prompt` supplies a full custom prompt (matches pi: a custom prompt replaces the
+        /// whole guidelines mechanism, not just extends it).
+        #[arg(long = "prompt-guideline", value_name = "TEXT")]
+        prompt_guidelines: Vec<String>,
     },
     /// List the tools the agent advertises to the model.
     Tools,
@@ -329,6 +434,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             no_tools,
             no_skills,
             no_prompt_templates,
+            no_context_files,
+            extra_skill_paths,
+            extra_prompt_template_paths,
+            name,
+            prompt_guidelines,
             session,
             session_id,
             r#continue,
@@ -348,6 +458,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 no_tools,
                 no_skills,
                 no_prompt_templates,
+                no_context_files,
+                extra_skill_paths,
+                extra_prompt_template_paths,
+                name,
+                prompt_guidelines,
                 session,
                 session_id,
                 r#continue,
@@ -383,12 +498,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             exclude_tools,
             no_tools,
             models,
+            no_skills,
+            no_prompt_templates,
+            extra_skill_paths,
+            extra_prompt_template_paths,
+            name,
+            prompt_guidelines,
         } => {
             let key = key
                 .ok_or("no gateway key: pass --key or set AI_AGENT_KEY (a bai_v1… virtual key)")?;
             if let Some(path) = &bash_shell_path {
                 if !std::path::Path::new(path).exists() {
                     return Err(format!("--bash-shell-path not found: {path}").into());
+                }
+            }
+            // Fail fast, before starting the server — see `run_task`'s identical check for why this
+            // rejects rather than silently clearing (pi's own `--name` behavior).
+            if let Some(n) = &name {
+                if n.trim().is_empty() {
+                    return Err("--name requires a non-empty value".into());
                 }
             }
             let system = system_prompt.unwrap_or_else(|| {
@@ -401,7 +529,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     exclude_tools.as_deref(),
                     no_tools,
                 );
-                default_system_prompt(&reg)
+                default_system_prompt(&reg, &prompt_guidelines)
             });
             serve::serve(serve::ServeConfig {
                 gateway: gateway_url.unwrap_or_else(|| DEFAULT_GATEWAY.to_string()),
@@ -430,6 +558,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 exclude_tools,
                 no_tools,
                 models: models.unwrap_or_default(),
+                no_skills,
+                no_prompt_templates,
+                extra_skill_paths,
+                extra_prompt_template_paths,
+                name,
             })
             .await?;
             // `serve` reads stdin via `tokio::io::stdin()`, which parks a dedicated blocking OS
@@ -608,7 +741,7 @@ async fn run_turn_once(
     }
     agent
         .run(session, |ev| match ev {
-            StreamEvent::TextDelta { text } => {
+            StreamEvent::TextDelta { text, .. } => {
                 print!("{text}");
                 let _ = std::io::stdout().flush();
             }
@@ -619,7 +752,7 @@ async fn run_turn_once(
                 print!("\n[tool: {name}] ");
                 let _ = std::io::stdout().flush();
             }
-            StreamEvent::InputJsonDelta { partial_json } => {
+            StreamEvent::InputJsonDelta { partial_json, .. } => {
                 print!("{partial_json}");
                 let _ = std::io::stdout().flush();
             }
@@ -701,12 +834,26 @@ async fn run_task(
     no_tools: bool,
     no_skills: bool,
     no_prompt_templates: bool,
+    no_context_files: bool,
+    extra_skill_paths: Vec<String>,
+    extra_prompt_template_paths: Vec<String>,
+    name: Option<String>,
+    prompt_guidelines: Vec<String>,
     session_path: Option<String>,
     session_id: Option<String>,
     continue_session: bool,
     export: Option<String>,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Fail fast, before touching any files — matches pi's own `--name` validation. Whitespace-only is
+    // rejected outright here (a startup argument the operator clearly meant to be meaningful), unlike
+    // the RPC `set_session_name` command's "empty clears the title" convention (renaming an
+    // already-running session to nothing is a deliberate, different action).
+    if let Some(n) = &name {
+        if n.trim().is_empty() {
+            return Err("--name requires a non-empty value".into());
+        }
+    }
     let mut timing = beyond_ai_agent::timing::StartupTiming::new();
     let cwd = canonical_cwd(&std::env::current_dir().unwrap_or_default());
 
@@ -751,12 +898,12 @@ async fn run_task(
     let skills = if no_skills {
         Vec::new()
     } else {
-        beyond_ai_agent::skills::discover(&cwd, project_trusted)
+        beyond_ai_agent::skills::discover(&cwd, project_trusted, &extra_skill_paths)
     };
     let prompt_templates = if no_prompt_templates {
         Vec::new()
     } else {
-        beyond_ai_agent::prompts::discover(&cwd, project_trusted)
+        beyond_ai_agent::prompts::discover(&cwd, project_trusted, &extra_prompt_template_paths)
     };
     timing.mark("discover skills/prompt templates");
     let mut registry = tools::default_registry();
@@ -766,14 +913,14 @@ async fn run_task(
         tools_exclude.as_deref(),
         no_tools,
     );
-    let base = default_system_prompt(&registry);
+    let base = default_system_prompt(&registry, &prompt_guidelines);
     let system = beyond_ai_agent::resources::build_system_prompt(
         &beyond_ai_agent::resources::PromptOptions {
             base: &base,
             append: None,
             cwd: &cwd,
-            include_context_files: true,
-            include_skills: !no_skills,
+            include_context_files: !no_context_files,
+            skills: &skills,
             project_trusted,
         },
     );
@@ -786,9 +933,16 @@ async fn run_task(
     // reopening an existing `--session <path>` or resuming via `--continue` already has a fixed id from
     // disk. Matches pi's own `--session-id`: a known, predictable id for a script/test harness to
     // correlate against, instead of parsing it back out of the run's own output.
-    let fresh_meta = || match &session_id {
-        Some(id) => SessionMeta::with_id(id.clone(), &cwd_str, &model),
-        None => SessionMeta::new(&cwd_str, &model),
+    // `--name`, like `--session-id`, only ever applies where a *new* `SessionMeta` is minted — reopening
+    // an existing session shouldn't get silently renamed just because the flag happened to be passed
+    // again on a later invocation.
+    let fresh_meta = || {
+        let mut meta = match &session_id {
+            Some(id) => SessionMeta::with_id(id.clone(), &cwd_str, &model),
+            None => SessionMeta::new(&cwd_str, &model),
+        };
+        meta.title = name.clone();
+        meta
     };
     let (store, mut session) = match session_path {
         Some(path) => {
@@ -1002,7 +1156,7 @@ mod tests {
         // The whole point of generating this dynamically: it can't silently omit a tool the way the
         // prior hardcoded string did (it never mentioned the Beyond platform tools at all).
         let registry = tools::default_registry();
-        let prompt = default_system_prompt(&registry);
+        let prompt = default_system_prompt(&registry, &[]);
         for def in tools::default_registry().definitions() {
             assert!(
                 prompt.contains(&def.name),
@@ -1018,9 +1172,56 @@ mod tests {
         // otherwise the model is invited to call one that's guaranteed to be rejected.
         let mut registry = tools::default_registry();
         tools::apply_filter(&mut registry, None, Some(&["bash".to_string()]), false);
-        let prompt = default_system_prompt(&registry);
+        let prompt = default_system_prompt(&registry, &[]);
         assert!(!prompt.contains("bash"));
         assert!(prompt.contains("read"));
+    }
+
+    #[test]
+    fn default_system_prompt_always_shows_the_file_paths_guideline() {
+        // pi: system-prompt.test.ts, "shows file paths guideline even with no tools" — a built-in
+        // guideline, always present regardless of the tool set (unlike the conditional bash one below).
+        let registry = tools::default_registry();
+        let prompt = default_system_prompt(&registry, &[]);
+        assert!(prompt.contains("Show file paths clearly when working with files"));
+    }
+
+    #[test]
+    fn default_system_prompt_tells_the_model_to_use_bash_for_exploration_without_grep_find_ls() {
+        // pi: the one built-in conditional guideline — only fires when `bash` is registered but none
+        // of its usual companions are, since the model then has no other way to explore the filesystem.
+        let mut only_bash = agent_core::tool::ToolRegistry::new();
+        only_bash.register(std::sync::Arc::new(tools::bash::Bash::real()));
+        let prompt = default_system_prompt(&only_bash, &[]);
+        assert!(prompt.contains("Use bash for file operations like ls, rg, find"));
+
+        // The guideline must not fire when grep/find/ls are also registered — bash isn't the only
+        // exploration tool anymore.
+        let full = tools::default_registry();
+        let prompt = default_system_prompt(&full, &[]);
+        assert!(!prompt.contains("Use bash for file operations like ls, rg, find"));
+    }
+
+    #[test]
+    fn default_system_prompt_appends_and_dedupes_extra_guidelines() {
+        // pi: system-prompt.test.ts, "appends promptGuidelines to default guidelines" /
+        // "deduplicates and trims promptGuidelines".
+        let registry = tools::default_registry();
+        let prompt = default_system_prompt(
+            &registry,
+            &[
+                "Use dynamic_tool for project summaries.".to_string(),
+                "  Use dynamic_tool for project summaries.  ".to_string(),
+                "   ".to_string(),
+            ],
+        );
+        assert_eq!(
+            prompt
+                .matches("- Use dynamic_tool for project summaries.")
+                .count(),
+            1,
+            "got: {prompt}"
+        );
     }
 
     #[test]

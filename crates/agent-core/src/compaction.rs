@@ -187,7 +187,7 @@ pub(crate) fn estimate_message_tokens(m: &Message) -> u32 {
     m.content
         .iter()
         .map(|b| match b {
-            ContentBlock::Text { text } => estimate_tokens(text),
+            ContentBlock::Text { text, .. } => estimate_tokens(text),
             ContentBlock::Thinking { text, .. } => estimate_tokens(text),
             ContentBlock::RedactedThinking { data } => estimate_tokens(data),
             ContentBlock::ToolUse { name, input, .. } => {
@@ -391,7 +391,7 @@ fn is_turn_start(m: &Message) -> bool {
             .any(|b| !matches!(b, ContentBlock::ToolResult { .. }))
         && !matches!(
             m.content.first(),
-            Some(ContentBlock::Text { text }) if text.starts_with(SUMMARY_MARKER)
+            Some(ContentBlock::Text { text, .. }) if text.starts_with(SUMMARY_MARKER)
         )
 }
 
@@ -405,7 +405,7 @@ pub fn render_prefix(messages: &[Message]) -> String {
     for m in messages {
         for b in &m.content {
             match b {
-                ContentBlock::Text { text } => {
+                ContentBlock::Text { text, .. } => {
                     let who = match m.role {
                         Role::User => "User",
                         Role::Assistant => "Assistant",
@@ -488,7 +488,7 @@ pub fn previous_summary(prefix: &[Message]) -> Option<&str> {
     if first.role != Role::User {
         return None;
     }
-    let ContentBlock::Text { text } = first.content.first()? else {
+    let ContentBlock::Text { text, .. } = first.content.first()? else {
         return None;
     };
     let body = text.strip_prefix(SUMMARY_MARKER)?;
@@ -502,17 +502,21 @@ pub fn previous_summary(prefix: &[Message]) -> Option<&str> {
 /// — in which case the request that motivated `prefix`'s trailing work is itself inside `prefix`,
 /// summarized away, while the *conclusion* of that same turn lives in the kept suffix.
 ///
-/// Detected by shape: a mid-turn tool round-trip always ends with a user message containing only
-/// `ToolResult` blocks (no free text) in this message model — the loop appends exactly that after
-/// dispatching a batch of tool calls, before the assistant's next (possibly still-mid-turn) response.
+/// Detected by shape: a mid-turn tool round-trip always ends with a user message carrying at least one
+/// `ToolResult` block — the loop appends exactly that after dispatching a batch of tool calls, before
+/// the assistant's next (possibly still-mid-turn) response. LOW pi-parity gap (fixed): this used to
+/// require *every* block to be a `ToolResult` (no free text at all), which missed a message that's
+/// still fundamentally a tool-dispatch continuation but also carries a mid-run steer's injected text
+/// block (`Agent::run_events_steered` folds a queued steer message onto this same turn, see
+/// `steering.rs`) — a message model with no genuine-fresh-turn path that could ever produce a
+/// `ToolResult` block at all, so its mere presence is unambiguous regardless of what else rides along.
 pub fn is_split_turn(prefix: &[Message]) -> bool {
     match prefix.last() {
         Some(m) => {
             m.role == Role::User
-                && !m.content.is_empty()
                 && m.content
                     .iter()
-                    .all(|b| matches!(b, ContentBlock::ToolResult { .. }))
+                    .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
         }
         None => false,
     }
@@ -629,9 +633,7 @@ mod tests {
                 input: json!({ "path": "src/foo.rs" }),
             }]),
             Message::tool_result("2", "edited", false),
-            Message::assistant(vec![ContentBlock::Text {
-                text: "done".into(),
-            }]),
+            Message::assistant(vec![ContentBlock::text("done")]),
         ]
     }
 
@@ -779,16 +781,15 @@ mod tests {
             Message::user(
                 "first request, long enough that its token estimate is comfortably nonzero",
             ),
-            Message::assistant(vec![ContentBlock::Text {
-                text: "first done, a fairly long response so the estimate is nontrivial too".into(),
-            }]),
+            Message::assistant(vec![ContentBlock::text(
+                "first done, a fairly long response so the estimate is nontrivial too",
+            )]),
             Message::user(
                 "second request, also long enough for a nonzero token estimate here as well",
             ),
-            Message::assistant(vec![ContentBlock::Text {
-                text: "second done, another long enough response for the estimate to register"
-                    .into(),
-            }]),
+            Message::assistant(vec![ContentBlock::text(
+                "second done, another long enough response for the estimate to register",
+            )]),
         ];
         let cut = find_split_cut(&messages, 1).expect("a cut");
         assert_eq!(cut.first_kept, 3);
@@ -805,10 +806,7 @@ mod tests {
         // concluding assistant reply yet.
         let messages = vec![
             Message::user("first request"), // 0
-            Message::assistant(vec![ContentBlock::Text {
-                // 1
-                text: "first done".into(),
-            }]),
+            Message::assistant(vec![ContentBlock::text("first done")]),
             Message::user("second request"), // 2 — the split turn's real start
             Message::assistant(vec![ContentBlock::ToolUse {
                 // 3
@@ -847,9 +845,7 @@ mod tests {
         let big = "x".repeat(400_000); // ~100,000 estimated tokens (chars/4) per message
         let mut messages = vec![
             Message::user("first request"), // 0 — a fully closed turn
-            Message::assistant(vec![ContentBlock::Text {
-                text: "first done".into(),
-            }]), // 1
+            Message::assistant(vec![ContentBlock::text("first done")]), // 1
             Message::user("second request"), // 2 — the split turn's real (but far-back) start
         ];
         for i in 0..10 {
@@ -935,9 +931,7 @@ mod tests {
                 false,
             ));
         }
-        messages.push(Message::assistant(vec![ContentBlock::Text {
-            text: "done".into(),
-        }]));
+        messages.push(Message::assistant(vec![ContentBlock::text("done")]));
 
         for budget in [1u32, 3, 5, 8, 12, 20, 50] {
             let Some(cut) = find_cut(&messages, budget) else {
@@ -987,9 +981,7 @@ mod tests {
             // A concluding assistant response — without this the prefix ends on a bare tool_result,
             // which `is_split_turn` (correctly) reads as an in-progress turn and would swap in
             // `SPLIT_TURN_INSTRUCTION` instead of the generic template this test is exercising.
-            Message::assistant(vec![ContentBlock::Text {
-                text: "done".into(),
-            }]),
+            Message::assistant(vec![ContentBlock::text("done")]),
         ];
         let file_ops = merge_file_ops(
             &CompactionProvenance::default(),
@@ -998,7 +990,7 @@ mod tests {
         );
         let req = summary_request("claude-test", &messages, 512, &file_ops, None);
         let text = match &req.messages[0].content[0] {
-            ContentBlock::Text { text } => text,
+            ContentBlock::Text { text, .. } => text,
             other => panic!("expected text, got {other:?}"),
         };
         assert!(text.contains("characters truncated"));
@@ -1017,9 +1009,7 @@ mod tests {
                     text: "the error mentions a missing semicolon on line 12".into(),
                     signature: "sig".into(),
                 },
-                ContentBlock::Text {
-                    text: "there's a missing semicolon".into(),
-                },
+                ContentBlock::text("there's a missing semicolon"),
             ]),
         ];
         let rendered = render_prefix(&messages);
@@ -1068,9 +1058,7 @@ mod tests {
             Message::user(format!(
                 "{SUMMARY_MARKER}\n\nPrevious summary body about task X"
             )),
-            Message::assistant(vec![ContentBlock::Text {
-                text: "new work since".into(),
-            }]),
+            Message::assistant(vec![ContentBlock::text("new work since")]),
             Message::tool_result("9", "new tool output", false),
         ];
         // The prior summary is detected and handed back verbatim.
@@ -1085,7 +1073,7 @@ mod tests {
             CompactionReason::Manual,
         );
         let req = summary_request("claude-test", &prefix, 512, &file_ops, None);
-        let ContentBlock::Text { text } = &req.messages[0].content[0] else {
+        let ContentBlock::Text { text, .. } = &req.messages[0].content[0] else {
             panic!("expected text");
         };
         // Uses the incremental update framing, not the from-scratch instruction.
@@ -1142,7 +1130,7 @@ mod tests {
         // The summarization prompt itself carries the *merged* tags, not just this round's activity —
         // the model doing the summarizing sees the full file history, not a truncated one.
         let req = summary_request("claude-test", &round2_prefix, 512, &round2_ops, None);
-        let ContentBlock::Text { text } = &req.messages[0].content[0] else {
+        let ContentBlock::Text { text, .. } = &req.messages[0].content[0] else {
             panic!("expected text");
         };
         assert!(
@@ -1193,6 +1181,24 @@ mod tests {
     }
 
     #[test]
+    fn is_split_turn_still_detects_a_tool_result_message_with_a_steered_text_block_mixed_in() {
+        // LOW pi-parity gap (fixed): a mid-run steer message rides on the same tool-results turn
+        // (`Agent::run_events_steered`), so this message is *not* purely `ToolResult` blocks — but
+        // it's still unambiguously a tool-dispatch continuation, since a genuine fresh user turn can
+        // never carry a `ToolResult` block at all. The old `all(...)` check missed this shape entirely.
+        let steered_with_tool_result = Message::tool_results(vec![
+            ContentBlock::ToolResult {
+                tool_use_id: "1".into(),
+                content: "ok".into(),
+                is_error: false,
+                images: Vec::new(),
+            },
+            ContentBlock::text("keep going, also check the other file"),
+        ]);
+        assert!(is_split_turn(&[steered_with_tool_result]));
+    }
+
+    #[test]
     fn summary_request_uses_the_split_turn_instruction_when_the_cut_is_mid_turn() {
         let messages = convo();
         let prefix = &messages[..messages.len() - 1]; // ends on a bare tool_result — split-turn shape
@@ -1202,7 +1208,7 @@ mod tests {
             CompactionReason::Threshold,
         );
         let req = summary_request("claude-test", prefix, 512, &file_ops, None);
-        let ContentBlock::Text { text } = &req.messages[0].content[0] else {
+        let ContentBlock::Text { text, .. } = &req.messages[0].content[0] else {
             panic!("expected text");
         };
         assert!(text.contains("## Original Request"));
@@ -1220,7 +1226,7 @@ mod tests {
             CompactionReason::Threshold,
         );
         let req = summary_request("claude-test", &messages, 512, &file_ops, None);
-        let ContentBlock::Text { text } = &req.messages[0].content[0] else {
+        let ContentBlock::Text { text, .. } = &req.messages[0].content[0] else {
             panic!("expected text");
         };
         assert!(text.contains("## Goal"));
@@ -1245,7 +1251,7 @@ mod tests {
             &file_ops,
             Some("keep every detail about the auth refactor"),
         );
-        let ContentBlock::Text { text } = &req.messages[0].content[0] else {
+        let ContentBlock::Text { text, .. } = &req.messages[0].content[0] else {
             panic!("expected text");
         };
         assert!(
@@ -1267,7 +1273,7 @@ mod tests {
             CompactionReason::Threshold,
         );
         let req = summary_request("claude-test", &messages, 512, &file_ops, None);
-        let ContentBlock::Text { text } = &req.messages[0].content[0] else {
+        let ContentBlock::Text { text, .. } = &req.messages[0].content[0] else {
             panic!("expected text");
         };
         assert!(!text.contains("Additional focus"));
@@ -1286,7 +1292,7 @@ mod tests {
         assert_eq!(s.messages[0].role, Role::User);
         assert!(matches!(
             &s.messages[0].content[0],
-            ContentBlock::Text { text } if text.contains("SUMMARY")
+            ContentBlock::Text { text, .. } if text.contains("SUMMARY")
         ));
         // Alternation: summary(user) then the kept assistant message.
         assert_eq!(s.messages[1].role, Role::Assistant);

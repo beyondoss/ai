@@ -69,6 +69,9 @@ pub struct Bash {
     default_timeout_ms: u64,
     /// Overrides `resolve_shell()`'s auto-detection when set — see [`with_shell_path`](Self::with_shell_path).
     shell_path: Option<String>,
+    /// Prepended to every command, on its own line, when set — see
+    /// [`with_command_prefix`](Self::with_command_prefix).
+    command_prefix: Option<String>,
     /// Rendered once (at construction, and again if `with_default_timeout_ms` changes the default) —
     /// see [`describe`] — rather than a `'static` literal, so a customized default actually shows up
     /// in what the model sees instead of the tool description silently going stale for a deployment
@@ -100,6 +103,7 @@ impl Bash {
             runner: Arc::new(RealRunner),
             default_timeout_ms: DEFAULT_TIMEOUT_MS,
             shell_path: None,
+            command_prefix: None,
             description: describe(DEFAULT_TIMEOUT_MS),
         }
     }
@@ -124,6 +128,16 @@ impl Bash {
         self
     }
 
+    /// Builder-style: prepend `prefix` (its own line, before the model's command) to every command run
+    /// through this tool — matches pi's `BashToolOptions.commandPrefix` (e.g. sourcing a project's env
+    /// setup, activating a venv, or setting a variable every command should see). Both the prefix's and
+    /// the command's output land in the same combined stdout/stderr stream, in order — this is just
+    /// script concatenation, not a separate execution.
+    pub fn with_command_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.command_prefix = Some(prefix.into());
+        self
+    }
+
     /// A `bash` tool over a custom runner (tests inject one to capture the invocation).
     #[cfg(test)]
     pub fn with_runner(runner: Arc<dyn CommandRunner>) -> Self {
@@ -131,6 +145,7 @@ impl Bash {
             runner,
             default_timeout_ms: DEFAULT_TIMEOUT_MS,
             shell_path: None,
+            command_prefix: None,
             description: describe(DEFAULT_TIMEOUT_MS),
         }
     }
@@ -156,6 +171,15 @@ impl Bash {
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing `command`".into()))?;
         let cwd = input.get("cwd").and_then(Value::as_str);
+        // Fail with a clear message instead of the raw spawn-error wrapping ("spawn failed: No such
+        // file or directory") a bad `cwd` would otherwise surface as — matches pi's own pre-check.
+        if let Some(dir) = cwd {
+            if !Path::new(dir).is_dir() {
+                return Err(ToolError::InvalidInput(format!(
+                    "Working directory does not exist: {dir}"
+                )));
+            }
+        }
         // A present `timeout_ms` must be a positive integer no larger than `MAX_TIMEOUT_MS` — 0 would
         // pass straight through as an instant, confusingly-worded timeout ("Command timed out after 0
         // seconds"), a negative value previously fell silently back to the default instead of being
@@ -178,7 +202,14 @@ impl Bash {
                 }
             },
         };
-        let args = vec!["-c".to_string(), command.to_string()];
+        // Prefix and command run as one script in one shell invocation — matches pi's
+        // `${commandPrefix}\n${command}` — so both land in the same combined output stream, in order,
+        // rather than looking like two separate calls.
+        let resolved_command = match &self.command_prefix {
+            Some(prefix) => format!("{prefix}\n{command}"),
+            None => command.to_string(),
+        };
+        let args = vec!["-c".to_string(), resolved_command];
         let dur = Duration::from_millis(timeout_ms);
 
         let acc = Arc::new(Mutex::new(OutputAccumulator::new()));
@@ -480,6 +511,43 @@ mod tests {
         })
     }
 
+    /// A streaming runner that replays a fixed sequence of raw byte chunks through `on_chunk`, then
+    /// returns a canned final result — for exercising the live-streaming path (`RecordingRunner` above
+    /// never streams at all).
+    struct ChunkedRunner {
+        chunks: Vec<Vec<u8>>,
+    }
+
+    #[async_trait]
+    impl CommandRunner for ChunkedRunner {
+        async fn run(
+            &self,
+            _program: &str,
+            _args: &[String],
+            _cwd: Option<&str>,
+            _timeout: Duration,
+        ) -> std::io::Result<ExecResult> {
+            unreachable!("test only exercises the streaming path")
+        }
+
+        async fn run_streaming(
+            &self,
+            _program: &str,
+            _args: &[String],
+            _cwd: Option<&str>,
+            _timeout: Duration,
+            on_chunk: ChunkSink<'_>,
+        ) -> std::io::Result<ExecResult> {
+            for chunk in &self.chunks {
+                on_chunk(chunk);
+            }
+            Ok(ExecResult {
+                code: Some(0),
+                ..Default::default()
+            })
+        }
+    }
+
     #[tokio::test]
     async fn invokes_the_resolved_shell_dash_c() {
         let runner = recording(ExecResult {
@@ -661,6 +729,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn command_prefix_runs_before_the_command_in_the_same_shell() {
+        // pi: tools.test.ts, "should prepend command prefix when configured" — the prefix must run in
+        // the *same* shell invocation as the command (a variable it sets is visible to the command).
+        let out = Bash::real()
+            .with_command_prefix("export TEST_VAR=hello")
+            .run(json!({ "command": "echo $TEST_VAR" }))
+            .await
+            .unwrap()
+            .text;
+        assert_eq!(out.trim(), "hello");
+    }
+
+    #[tokio::test]
+    async fn command_prefix_and_command_output_both_appear_in_order() {
+        // pi: tools.test.ts, "should include output from both prefix and command".
+        let out = Bash::real()
+            .with_command_prefix("echo prefix-output")
+            .run(json!({ "command": "echo command-output" }))
+            .await
+            .unwrap()
+            .text;
+        assert_eq!(out.trim(), "prefix-output\ncommand-output");
+    }
+
+    #[tokio::test]
+    async fn no_command_prefix_runs_the_command_unmodified() {
+        // pi: tools.test.ts, "should work without command prefix".
+        let out = Bash::real()
+            .run(json!({ "command": "echo no-prefix" }))
+            .await
+            .unwrap()
+            .text;
+        assert_eq!(out.trim(), "no-prefix");
+    }
+
+    #[tokio::test]
     async fn strips_ansi_escape_sequences() {
         let runner = recording(ExecResult {
             code: Some(0),
@@ -731,6 +835,107 @@ mod tests {
             panic!("expected Execution error")
         };
         assert!(msg.contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn nonexistent_cwd_is_a_clear_invalid_input_error_not_a_raw_spawn_failure() {
+        let runner = recording(ExecResult {
+            code: Some(0),
+            ..Default::default()
+        });
+        let err = Bash::with_runner(runner.clone())
+            .run(json!({ "command": "echo hi", "cwd": "/definitely/not/a/real/path/xyz" }))
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::InvalidInput(msg) => assert!(
+                msg.contains("Working directory does not exist"),
+                "got: {msg}"
+            ),
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+        // Must fail before ever reaching the runner.
+        assert!(runner.last.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn carriage_returns_in_output_are_preserved_not_stripped() {
+        // Deliberate divergence from pi (which strips every `\r`): `is_keepable` explicitly keeps
+        // `\r` alongside `\t`/`\n` so progress-bar-style output (`pip`, `npm`, `curl -#`) survives with
+        // its real structure intact rather than being silently collapsed. Pinning this so a future
+        // change to `is_keepable` can't accidentally start stripping `\r` without a test noticing.
+        let runner = recording(ExecResult {
+            code: Some(0),
+            stdout: "\x1b[31mred\x1b[0m\r\n".into(),
+            ..Default::default()
+        });
+        let out = Bash::with_runner(runner)
+            .run(json!({ "command": "x" }))
+            .await
+            .unwrap()
+            .text;
+        assert_eq!(out, "red\r\n");
+    }
+
+    #[tokio::test]
+    async fn a_multibyte_utf8_character_split_across_stream_chunks_decodes_correctly() {
+        // pi: tools.test.ts, "should decode UTF-8 characters split across output chunks". `é` is the
+        // 2-byte UTF-8 sequence 0xC3 0xA9 — split it across two separate `on_chunk` deliveries and
+        // confirm the final text still decodes correctly (raw bytes accumulate before any UTF-8 decode
+        // happens, so this should hold by construction; pinning it so a future rewrite can't regress it).
+        let runner = Arc::new(ChunkedRunner {
+            chunks: vec![b"h\xC3".to_vec(), b"\xA9llo".to_vec()],
+        });
+        let out = Bash::with_runner(runner)
+            .run(json!({ "command": "x" }))
+            .await
+            .unwrap()
+            .text;
+        assert_eq!(out, "héllo");
+    }
+
+    #[tokio::test]
+    async fn streaming_updates_are_throttled_for_chatty_output() {
+        // pi: tools.test.ts, "should coalesce streaming updates for chatty output". 5000 tiny chunks
+        // arriving back-to-back (no real time passing between them) must not produce 5000 progress
+        // events — `UPDATE_THROTTLE` should bound the emitted count to a small number, plus one final
+        // flush after the run completes.
+        let chunks: Vec<Vec<u8>> = (0..5000).map(|_| b"x".to_vec()).collect();
+        let runner = Arc::new(ChunkedRunner { chunks });
+
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        let progress = ToolProgress::new(
+            tx,
+            "id".into(),
+            "bash".into(),
+            agent_core::CancellationToken::new(),
+        );
+        Bash::with_runner(runner)
+            .run_streaming(json!({ "command": "x" }), &progress)
+            .await
+            .unwrap();
+        drop(progress);
+
+        let mut count = 0usize;
+        while rx.try_recv().is_ok() {
+            count += 1;
+        }
+        assert!(
+            count < 100,
+            "expected a throttled handful of updates for 5000 rapid chunks, got {count}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_nonexistent_shell_path_produces_a_clear_spawn_error() {
+        // pi: tools.test.ts, "should handle process spawn errors". `with_shell_path` pointed at a
+        // genuinely nonexistent binary must surface a clear error, not panic or hang.
+        let err = Bash::real()
+            .with_shell_path("/definitely/not/a/real/shell/binary")
+            .run(json!({ "command": "echo hi" }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Execution(_)), "got: {err:?}");
     }
 
     #[tokio::test]

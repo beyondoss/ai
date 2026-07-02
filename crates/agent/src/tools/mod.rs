@@ -380,6 +380,26 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn canonical_write_target_unifies_a_symlink_with_its_real_target() {
+        // A same-turn `edit(real_path)` and `write(symlink_to_real_path)` must serialize under one
+        // write-lock key — otherwise they'd run fully concurrently against the same underlying file
+        // (pi: file-mutation-queue.test.ts, "uses the same queue for symlink aliases").
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().canonicalize().unwrap().join("target.txt");
+        std::fs::write(&real, b"hello").unwrap();
+        let link = dir.path().join("alias.txt");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let via_real = canonical_write_target(real.to_str().unwrap());
+        let via_symlink = canonical_write_target(link.to_str().unwrap());
+        assert_eq!(
+            via_real, via_symlink,
+            "a symlink and its real target must canonicalize to the same write-lock key"
+        );
+    }
+
+    #[test]
     fn canonical_write_target_falls_back_to_lexical_normalization_when_the_file_is_new() {
         // `write` routinely targets a path that doesn't exist yet — `canonicalize` fails (NotFound),
         // so the grouping key must still unify spellings without touching the filesystem. Uses

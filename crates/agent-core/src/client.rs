@@ -97,7 +97,16 @@ impl GatewayClient {
 
 #[async_trait]
 impl ModelTransport for GatewayClient {
-    async fn stream(&self, req: ModelRequest) -> Result<EventStream> {
+    async fn stream(&self, mut req: ModelRequest) -> Result<EventStream> {
+        // Every dialect's wire shape requires a `tool_use` to be immediately followed by its
+        // `tool_result` — repair any orphaned one (a hand-edited/externally-loaded session, or a
+        // not-yet-discovered code path) before it can reach a request and 400. Cheap no-op when the
+        // message list is already well-formed (the overwhelmingly common case).
+        if let std::borrow::Cow::Owned(repaired) =
+            crate::dialect::repair_orphaned_tool_use(&req.messages)
+        {
+            req.messages = repaired.into();
+        }
         let dialect = Dialect::for_model(&req.model);
         let url = format!("{}{}", self.base_url, dialect.endpoint_path());
         let body = dialect.build_body(&req);
@@ -297,6 +306,12 @@ async fn send_with_retry(
     loop {
         let mut builder = http.post(url).bearer_auth(api_key).json(body);
         if let Some(session_id) = session_affinity_header {
+            // pi sends both: `session_id` (`compat.sendSessionIdHeader`, true by default for native
+            // OpenAI — the only provider this header condition ever fires for) and
+            // `x-client-request-id`, both carrying the same value. Missing `session_id` risked
+            // cache/session-affinity routing landing on a different backend node per turn even though
+            // `x-client-request-id` was already correct.
+            builder = builder.header("session_id", session_id);
             builder = builder.header("x-client-request-id", session_id);
         }
         if is_anthropic {

@@ -47,7 +47,12 @@ impl Tool for Ls {
             .map(|n| n as usize)
             .unwrap_or(DEFAULT_LIMIT);
 
-        let mut entries: Vec<String> = Vec::new();
+        // Sort by the bare name, not the display string (which gets a trailing `/` for directories) —
+        // comparing display strings inverts order for sibling names sharing a prefix (e.g. "src" vs
+        // "src-old": '-' sorts below '/' byte-wise, so "src-old/" would sort before "src/"). The
+        // display suffix is appended only after sorting, matching the reference agent's own two-step
+        // sort-then-suffix order.
+        let mut entries: Vec<(String, bool)> = Vec::new();
         let dir =
             std::fs::read_dir(path).map_err(|e| ToolError::Execution(format!("ls {path}: {e}")))?;
         for entry in dir {
@@ -58,20 +63,25 @@ impl Tool for Ls {
                 continue;
             }
             let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            // Build the display name once, with room for the trailing `/`, so a directory entry doesn't
-            // allocate a second String (the old `format!("{name}/")` dropped the first).
-            let mut display = String::with_capacity(name.len() + usize::from(is_dir));
-            display.push_str(&name);
-            if is_dir {
-                display.push('/');
-            }
-            entries.push(display);
+            entries.push((name.into_owned(), is_dir));
         }
-        // Directories first, then alphabetical — stable, predictable output for the model.
-        entries.sort_by(|a, b| {
-            let (ad, bd) = (a.ends_with('/'), b.ends_with('/'));
-            bd.cmp(&ad).then_with(|| a.cmp(b))
+        // Directories first, then alphabetical by bare name — stable, predictable output for the model.
+        entries.sort_by(|(a_name, a_dir), (b_name, b_dir)| {
+            b_dir.cmp(a_dir).then_with(|| a_name.cmp(b_name))
         });
+        let mut entries: Vec<String> = entries
+            .into_iter()
+            .map(|(name, is_dir)| {
+                // Built with room for the trailing `/` so a directory entry doesn't allocate a second
+                // String beyond this one.
+                let mut display = String::with_capacity(name.len() + usize::from(is_dir));
+                display.push_str(&name);
+                if is_dir {
+                    display.push('/');
+                }
+                display
+            })
+            .collect();
         if entries.is_empty() {
             return Ok("(empty directory)".into());
         }
@@ -125,6 +135,24 @@ mod tests {
             .unwrap()
             .text;
         assert!(all.contains(".hidden"));
+    }
+
+    #[tokio::test]
+    async fn sorts_by_bare_name_not_the_slash_suffixed_display_string() {
+        // MEDIUM pi-parity gap (fixed): sorting the display string (with `/` already appended) instead
+        // of the bare name inverts order for sibling names sharing a prefix — '-' (0x2D) sorts below
+        // '/' (0x2F) byte-wise, so "src-old/" would sort before "src/" even though a human (and the
+        // reference agent, which sorts bare names then appends the suffix) expects "src" first since
+        // it's a strict prefix of "src-old".
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src-old")).unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let out = Ls
+            .run(json!({ "path": dir.path().to_str().unwrap() }))
+            .await
+            .unwrap()
+            .text;
+        assert_eq!(out, "src/\nsrc-old/", "got: {out}");
     }
 
     #[tokio::test]

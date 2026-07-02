@@ -280,11 +280,19 @@ pub fn capabilities(model: &str) -> ModelCaps {
         return ModelCaps {
             context_window: 200_000,
             max_output: 100_000,
+            // Every o-series id speaks the Responses API (`api` below), which always sends
+            // `max_output_tokens` regardless of this field (see `dialect/openai_responses.rs::build_body`)
+            // — `max_tokens_field` is only ever read by the Chat Completions dialect. Still set correctly
+            // (o-series genuinely rejects `max_tokens`, requiring `max_completion_tokens` instead) rather
+            // than left at a value that would be actively wrong if a future routing change ever sent one
+            // of these ids through Chat Completions.
             max_tokens_field: MaxTokensField::MaxCompletionTokens,
             supports_long_cache: true,
-            // o3-mini is text-only (pi's catalogue: `input: ["text"]`) — the one o-series id that
-            // isn't vision-capable, unlike o1-mini's exclusion above for a different reason.
-            supports_vision: !m.starts_with("o1-mini") && !m.starts_with("o3-mini"),
+            // o3-mini is text-only (pi's catalogue: `input: ["text"]`) — the one o-series id that isn't
+            // vision-capable. o1-mini used to be excluded here too, but pi's live catalogue has fully
+            // retired it (no entry at all, as of this writing) — nothing upstream still serves it, so
+            // there's no longer a live model to special-case.
+            supports_vision: !m.starts_with("o3-mini"),
             thinking: ThinkingShape::None,
             reasoning_effort: true,
             // o-series ids are disable-capable by default in pi's catalogue (no override).
@@ -333,6 +341,8 @@ pub fn capabilities(model: &str) -> ModelCaps {
             return ModelCaps {
                 context_window: 128_000,
                 max_output: 32_000,
+                // Unread: Responses-routed (see the o-series branch above for why this is still set
+                // correctly rather than to a harmless-but-wrong value).
                 max_tokens_field: MaxTokensField::MaxCompletionTokens,
                 supports_long_cache: true,
                 supports_vision: true,
@@ -383,6 +393,8 @@ pub fn capabilities(model: &str) -> ModelCaps {
         return ModelCaps {
             context_window,
             max_output: 128_000,
+            // Unread: Responses-routed (see the o-series branch above for why this is still set
+            // correctly rather than to a harmless-but-wrong value).
             max_tokens_field: MaxTokensField::MaxCompletionTokens,
             supports_long_cache: true,
             supports_vision: true,
@@ -597,6 +609,78 @@ pub fn clamp_reasoning_effort(
     e
 }
 
+/// The [`ThinkingLevel`] rungs `caps`'s model actually accepts, in ladder order — `Off` excluded when
+/// the model has a thinking/reasoning mechanism it can't explicitly disable
+/// (`reasoning_disableable == false`), `XHigh` excluded when `!supports_xhigh_reasoning`, and any rung
+/// below `min_reasoning_effort` excluded. A model with no thinking/reasoning mechanism at all
+/// (`ThinkingShape::None` and `!reasoning_effort`) has exactly one available level, `Off` — nothing
+/// else could ever mean anything to it. Used by [`clamp_thinking_level`] (via containment) and
+/// [`next_available_thinking_level`] (to cycle only through what's real for this model, instead of the
+/// raw 6-rung ladder).
+pub fn available_thinking_levels(caps: &ModelCaps) -> Vec<ThinkingLevel> {
+    let has_mechanism = caps.reasoning_effort || caps.thinking != ThinkingShape::None;
+    if !has_mechanism {
+        return vec![ThinkingLevel::Off];
+    }
+    THINKING_LEVEL_LADDER
+        .iter()
+        .copied()
+        .filter(|&level| match level {
+            ThinkingLevel::Off => caps.reasoning_disableable,
+            ThinkingLevel::XHigh => caps.supports_xhigh_reasoning,
+            _ => level
+                .reasoning_effort()
+                .is_some_and(|effort| effort >= caps.min_reasoning_effort),
+        })
+        .collect()
+}
+
+/// Clamp a portable [`ThinkingLevel`] to the nearest rung `caps`'s model actually accepts — the
+/// ladder-wide counterpart to [`clamp_reasoning_effort`], additionally handling `Off`: a model that
+/// can't explicitly disable a reasoning mechanism it has (`reasoning_disableable == false`) has no
+/// legal `Off` state at all — pi's `thinkingLevelMap.off === null` — so requesting it bumps up to the
+/// model's own floor (`min_reasoning_effort`) instead of silently omitting the reasoning field and
+/// leaving the provider to apply its own hidden default. Mirrors pi's `clampThinkingLevel`/
+/// `getSupportedThinkingLevels`, called on every model switch (`sdk.ts:241`) and every level change
+/// (`agent-session.ts` `setThinkingLevel`/`cycleThinkingLevel`). Every non-`Off` rung reuses
+/// [`clamp_reasoning_effort`]'s existing floor/`xhigh`-ceiling behavior unchanged.
+///
+/// Callers: every point that sets a session's active thinking level for a given model — the initial
+/// level at startup, `set_model`/`cycle_model` (re-clamp the *existing* level against the *new*
+/// model), `set_reasoning_effort`, and branch-switch model/level restoration. `cycle_thinking_level`
+/// uses [`next_available_thinking_level`] instead (see its own doc comment for why a plain
+/// `next().then(clamp)` gets stuck for models missing `xhigh`).
+pub fn clamp_thinking_level(caps: &ModelCaps, level: ThinkingLevel) -> ThinkingLevel {
+    match level.reasoning_effort() {
+        None => {
+            // `level == ThinkingLevel::Off` — the only variant with no `ReasoningEffort`.
+            let has_mechanism = caps.reasoning_effort || caps.thinking != ThinkingShape::None;
+            if has_mechanism && !caps.reasoning_disableable {
+                ThinkingLevel::from(caps.min_reasoning_effort)
+            } else {
+                ThinkingLevel::Off
+            }
+        }
+        Some(effort) => ThinkingLevel::from(clamp_reasoning_effort(caps, effort)),
+    }
+}
+
+/// The rung `cycle_thinking_level` should land on next, for `caps`'s model, from `level`. Advances
+/// through [`available_thinking_levels`] — not the raw 6-rung ladder via [`ThinkingLevel::next`] — so
+/// cycling always reaches every level the model actually supports and wraps cleanly at its own ends,
+/// rather than getting stuck: a naive `level.next()` then [`clamp_thinking_level`] would bounce forever
+/// between `High` and a re-clamped `XHigh` for any model lacking `xhigh` support, since `XHigh` always
+/// clamps back down to the same `High` it started from and the ladder never advances past it. If
+/// `level` itself isn't currently available (e.g. state predates a model switch that narrowed the set),
+/// lands on its clamp first rather than jumping an extra rung ahead.
+pub fn next_available_thinking_level(caps: &ModelCaps, level: ThinkingLevel) -> ThinkingLevel {
+    let available = available_thinking_levels(caps);
+    match available.iter().position(|&l| l == level) {
+        Some(i) => available[(i + 1) % available.len()],
+        None => clamp_thinking_level(caps, level),
+    }
+}
+
 /// The Anthropic adaptive-thinking `output_config.effort` wire string for a (clamped) reasoning
 /// effort, mirroring pi's `mapThinkingLevelToEffort`: Anthropic's adaptive shape has no `minimal` tier
 /// at all (always sent as `"low"`), and `xhigh` is model-specific (`adaptive_xhigh_effort_wire`) —
@@ -762,9 +846,17 @@ mod tests {
     }
 
     #[test]
+    fn o1_mini_is_no_longer_special_cased() {
+        // LOW pi-parity gap (fixed): o1-mini used to be excluded from `supports_vision` alongside
+        // o3-mini, but pi's live catalogue has fully retired the id — nothing upstream still serves
+        // it, so it now falls through like any other (still-live) o-series id.
+        assert!(capabilities("o1-mini").supports_vision);
+    }
+
+    #[test]
     fn o3_mini_is_text_only() {
-        // The one o-series id that isn't vision-capable (pi: `input: ["text"]`), unlike o1-mini
-        // (excluded above for a different reason) and every other o-series id.
+        // The one o-series id that isn't vision-capable (pi: `input: ["text"]`); every other
+        // o-series id is vision-capable.
         assert!(!capabilities("o3-mini").supports_vision);
         assert!(capabilities("o1").supports_vision);
         assert!(capabilities("o4-mini").supports_vision);
@@ -1196,5 +1288,202 @@ mod tests {
                 "{id} has no xhigh wire value; must degrade to high"
             );
         }
+    }
+
+    #[test]
+    fn clamp_thinking_level_bumps_off_to_the_floor_for_non_disableable_reasoning_models() {
+        // The CRITICAL gap this fix closes: a model that has a reasoning mechanism but can't
+        // explicitly disable it must never be left at the stored level `Off` — that silently omits
+        // the reasoning field entirely and lets the provider apply its own hidden default effort.
+        for id in [
+            "gpt-5",
+            "gpt-5-codex",
+            "gpt-5-mini",
+            "gpt-5-nano",
+            "gpt-5-pro",
+            "gpt-5.1-codex",
+            "gpt-5.1-codex-max",
+            "gpt-5.1-codex-mini",
+            "gpt-5.1-chat-latest",
+            "gpt-5.2-chat-latest",
+            "gpt-5.2-codex",
+            "gpt-5.2-pro",
+            "gpt-5.3-codex-spark",
+            "gpt-5.4-pro",
+            "claude-fable-5",
+        ] {
+            let caps = capabilities(id);
+            assert!(
+                !caps.reasoning_disableable,
+                "{id} must be a non-disableable model for this test to be meaningful"
+            );
+            assert_ne!(
+                clamp_thinking_level(&caps, ThinkingLevel::Off),
+                ThinkingLevel::Off,
+                "{id}: Off must not survive the clamp for a non-disableable reasoning model"
+            );
+        }
+        // Ordinary floor: bumps to Minimal.
+        assert_eq!(
+            clamp_thinking_level(&capabilities("gpt-5-codex"), ThinkingLevel::Off),
+            ThinkingLevel::Minimal
+        );
+        // A model-specific floor above Minimal must be honored too, not just a hardcoded "Minimal".
+        assert_eq!(
+            clamp_thinking_level(&capabilities("gpt-5.5-pro"), ThinkingLevel::Off),
+            ThinkingLevel::Medium,
+            "gpt-5.5-pro's floor is Medium, not the generic Minimal"
+        );
+    }
+
+    #[test]
+    fn clamp_thinking_level_leaves_off_alone_when_legal() {
+        // Disable-capable reasoning models: Off is a real, legal state.
+        for id in ["claude-opus-4-8", "claude-sonnet-5", "o3", "o1", "gpt-5.1"] {
+            assert_eq!(
+                clamp_thinking_level(&capabilities(id), ThinkingLevel::Off),
+                ThinkingLevel::Off,
+                "{id}: Off is legal and must not be bumped"
+            );
+        }
+        // Models with no thinking/reasoning mechanism at all: Off is the only sensible state.
+        for id in ["gpt-4o", "gpt-4.1", "claude-3-5-sonnet-20241022"] {
+            assert_eq!(
+                clamp_thinking_level(&capabilities(id), ThinkingLevel::Off),
+                ThinkingLevel::Off,
+                "{id}: has no mechanism to disable; Off must pass through"
+            );
+        }
+    }
+
+    #[test]
+    fn clamp_thinking_level_still_clamps_non_off_rungs_like_clamp_reasoning_effort() {
+        use crate::transport::ReasoningEffort as RE;
+        // xhigh ceiling: delegates to the same behavior as `clamp_reasoning_effort`.
+        assert_eq!(
+            clamp_thinking_level(&capabilities("o3"), ThinkingLevel::XHigh),
+            ThinkingLevel::from(RE::High)
+        );
+        assert_eq!(
+            clamp_thinking_level(&capabilities("claude-opus-4-8"), ThinkingLevel::XHigh),
+            ThinkingLevel::XHigh
+        );
+        // floor: gpt-5.5-pro excludes Minimal/Low.
+        assert_eq!(
+            clamp_thinking_level(&capabilities("gpt-5.5-pro"), ThinkingLevel::Minimal),
+            ThinkingLevel::Medium
+        );
+    }
+
+    #[test]
+    fn available_thinking_levels_excludes_off_for_non_disableable_models() {
+        assert_eq!(
+            available_thinking_levels(&capabilities("gpt-5-codex")),
+            vec![
+                ThinkingLevel::Minimal,
+                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
+                ThinkingLevel::High,
+            ],
+            "gpt-5-codex has no xhigh and no off"
+        );
+    }
+
+    #[test]
+    fn available_thinking_levels_is_the_full_ladder_for_a_fully_capable_model() {
+        assert_eq!(
+            available_thinking_levels(&capabilities("claude-opus-4-8")),
+            vec![
+                ThinkingLevel::Off,
+                ThinkingLevel::Minimal,
+                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
+                ThinkingLevel::High,
+                ThinkingLevel::XHigh,
+            ]
+        );
+    }
+
+    #[test]
+    fn available_thinking_levels_is_just_off_for_a_model_with_no_mechanism() {
+        assert_eq!(
+            available_thinking_levels(&capabilities("gpt-4o")),
+            vec![ThinkingLevel::Off]
+        );
+    }
+
+    #[test]
+    fn next_available_thinking_level_wraps_within_the_models_own_ladder_without_getting_stuck() {
+        // The regression this specifically guards: a naive `level.next()` + `clamp_thinking_level`
+        // bounces forever between High and a re-clamped XHigh for a model lacking xhigh support,
+        // since XHigh always clamps back down to the very High it started from.
+        let caps = capabilities("gpt-5-codex");
+        let mut level = ThinkingLevel::Minimal;
+        let mut seen = vec![level];
+        for _ in 0..3 {
+            level = next_available_thinking_level(&caps, level);
+            seen.push(level);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                ThinkingLevel::Minimal,
+                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
+                ThinkingLevel::High,
+            ]
+        );
+        // Cycling past the top must wrap back to Minimal (the model's actual floor), not get stuck.
+        assert_eq!(
+            next_available_thinking_level(&caps, ThinkingLevel::High),
+            ThinkingLevel::Minimal
+        );
+    }
+
+    #[test]
+    fn next_available_thinking_level_cycles_the_full_ladder_for_a_fully_capable_model() {
+        let caps = capabilities("claude-opus-4-8");
+        let mut level = ThinkingLevel::Off;
+        let mut seen = vec![level];
+        for _ in 0..5 {
+            level = next_available_thinking_level(&caps, level);
+            seen.push(level);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                ThinkingLevel::Off,
+                ThinkingLevel::Minimal,
+                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
+                ThinkingLevel::High,
+                ThinkingLevel::XHigh,
+            ]
+        );
+        assert_eq!(
+            next_available_thinking_level(&caps, ThinkingLevel::XHigh),
+            ThinkingLevel::Off
+        );
+    }
+
+    #[test]
+    fn next_available_thinking_level_stays_at_off_for_a_model_with_no_mechanism() {
+        let caps = capabilities("gpt-4o");
+        assert_eq!(
+            next_available_thinking_level(&caps, ThinkingLevel::Off),
+            ThinkingLevel::Off
+        );
+    }
+
+    #[test]
+    fn next_available_thinking_level_reclamps_a_stale_unavailable_level_instead_of_skipping() {
+        // If the stored level isn't in the model's available set at all (e.g. carried over from a
+        // model switch that should have re-clamped it, but didn't), landing on its clamp first is
+        // safer than jumping straight to the next rung after it.
+        let caps = capabilities("gpt-5-codex"); // Off is not available here.
+        assert_eq!(
+            next_available_thinking_level(&caps, ThinkingLevel::Off),
+            clamp_thinking_level(&caps, ThinkingLevel::Off),
+        );
     }
 }

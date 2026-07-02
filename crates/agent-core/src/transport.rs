@@ -49,6 +49,59 @@ impl ReasoningEffort {
     }
 }
 
+/// How verbose a reasoning model's visible thinking summary should be — OpenAI Responses'
+/// `reasoning.summary` field. Only meaningful alongside an explicit [`ReasoningEffort`] (a model with
+/// no effort set gets no summary either, regardless of this). `None` on [`ModelRequest`] defaults to
+/// `Auto` on the wire, matching pi's own `reasoningSummary` default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningSummary {
+    /// The provider picks a level of detail automatically.
+    Auto,
+    /// A fuller, more detailed summary.
+    Detailed,
+    /// A shorter summary.
+    Concise,
+}
+
+impl ReasoningSummary {
+    /// The wire string OpenAI's Responses API uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReasoningSummary::Auto => "auto",
+            ReasoningSummary::Detailed => "detailed",
+            ReasoningSummary::Concise => "concise",
+        }
+    }
+}
+
+/// OpenAI Responses' `service_tier` — a queueing/latency class, not purely a pricing knob: `Flex` and
+/// `Priority` change how quickly a request is served (cheaper-and-slower vs. pricier-and-faster),
+/// independent of the model or effort chosen. `None` on [`ModelRequest`] omits the field, leaving
+/// OpenAI's own default tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceTier {
+    /// The provider picks a tier automatically.
+    Auto,
+    /// The account's configured default tier.
+    Default,
+    /// Cheaper, slower, best-effort queueing.
+    Flex,
+    /// Pricier, faster queueing.
+    Priority,
+}
+
+impl ServiceTier {
+    /// The wire string OpenAI's Responses API uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ServiceTier::Auto => "auto",
+            ServiceTier::Default => "default",
+            ServiceTier::Flex => "flex",
+            ServiceTier::Priority => "priority",
+        }
+    }
+}
+
 /// How the model may use the advertised tools this turn. A request's [`ModelRequest::tool_choice`] is
 /// an `Option<ToolChoice>`: `None` (the default) emits **nothing** on the wire, leaving the provider's
 /// own default (auto when tools are present). The variants force a choice, and each dialect maps them
@@ -116,6 +169,12 @@ pub struct ModelRequest {
     /// understand `metadata.user_id` (OpenAI-shaped ones) simply ignore it, same as pi's provider
     /// implementations only extracting the fields they recognize.
     pub user_id: Option<String>,
+    /// How verbose a visible reasoning summary should be (OpenAI Responses only; ignored by every
+    /// other dialect). `None` defaults to [`ReasoningSummary::Auto`] on the wire.
+    pub reasoning_summary: Option<ReasoningSummary>,
+    /// Queueing/latency class for the request (OpenAI Responses only; ignored by every other
+    /// dialect). `None` omits the field, leaving OpenAI's own default tier.
+    pub service_tier: Option<ServiceTier>,
 }
 
 impl ModelRequest {
@@ -138,6 +197,8 @@ impl ModelRequest {
             cache_long: false,
             no_cache: false,
             user_id: None,
+            reasoning_summary: None,
+            service_tier: None,
         }
     }
 
@@ -196,6 +257,18 @@ impl ModelRequest {
     /// field's own doc comment for the hashed/anonymized-id expectation.
     pub fn with_user_id(mut self, user_id: impl Into<String>) -> Self {
         self.user_id = Some(user_id.into());
+        self
+    }
+
+    /// Builder-style: set how verbose a visible reasoning summary should be (OpenAI Responses only).
+    pub fn with_reasoning_summary(mut self, summary: ReasoningSummary) -> Self {
+        self.reasoning_summary = Some(summary);
+        self
+    }
+
+    /// Builder-style: set the request's queueing/latency tier (OpenAI Responses only).
+    pub fn with_service_tier(mut self, tier: ServiceTier) -> Self {
+        self.service_tier = Some(tier);
         self
     }
 }

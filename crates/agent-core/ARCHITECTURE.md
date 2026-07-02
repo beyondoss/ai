@@ -39,6 +39,13 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   `Steering::pending_count` peeks the combined depth of both lanes without draining either — pi's
   `pendingMessageCount` — for a host surface (e.g. `serve`'s `get_state`) that wants to report queue
   depth to a client.
+  A queued message is a `SteeringMessage` (text plus optional image attachments), not a bare `String` —
+  the same shape a fresh `prompt` accepts, so `steer`/`follow_up` aren't a lesser channel that silently
+  drops attachments a `prompt` would have kept. `From<&str>`/`From<String>` build a text-only message,
+  so every plain-text `push`/`push_steer` call site keeps compiling unchanged. On drain, a follow-up
+  with images becomes a real `Message::user_with_images` turn instead of a plain-text one; a mid-run
+  steer's images are appended as `ContentBlock::Image` blocks after its text block, onto the same
+  tool-results turn its text rides on.
 - **Graceful stop** — `Steering::request_stop` (pi's `shouldStopAfterTurn` equivalent) sets a flag
   checked at every turn boundary, *after* that turn's tool calls (if any) have already run and their
   results are committed to the session, but before the next model call would start. It wins over both
@@ -83,13 +90,18 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   lands where the live prompt plus the next turn's full output budget would meet it (the window, not
   `max_tokens`, is plausibly the real constraint), the run compacts anyway — disabling proactive
   compaction is a preference about timing with headroom to spare, not license to keep sending requests
-  already guaranteed to overflow. Complementary and proactive, on the Anthropic dialect specifically:
-  `dialect/anthropic::clamp_max_tokens_to_context` estimates the live prompt from `req.messages`/
-  `req.system` directly and clamps the *request's own* `max_tokens` down to whatever headroom is left
-  under `context_window` (minus a margin absorbing estimation slop) — so a long-running session doesn't
-  keep sending its static output ceiling on every turn regardless of how much of the window the prompt
-  has already consumed, paying for a wasted round-trip each time before the reactive path above ever
-  gets a chance to compact. Never clamps below a configured thinking budget, and never raises
+  already guaranteed to overflow. Complementary and proactive, shared across **all three dialects**:
+  `dialect::clamp_max_tokens_to_context` estimates the live prompt from `req.messages`/`req.system`
+  directly and clamps the *request's own* `max_tokens` down to whatever headroom is left under
+  `context_window` (minus a margin absorbing estimation slop) — so a long-running session doesn't keep
+  sending its static output ceiling on every turn regardless of how much of the window the prompt has
+  already consumed, paying for a wasted round-trip each time before the reactive path above ever gets a
+  chance to compact. Anthropic writes `max_tokens`, OpenAI Chat Completions writes `max_tokens`/
+  `max_completion_tokens` (per `ModelCaps::max_tokens_field`), and OpenAI Responses writes
+  `max_output_tokens` — all three funnel through the one shared clamp rather than each reimplementing
+  it (a HIGH pi-parity gap, fixed: the clamp originally existed only on the Anthropic dialect, so the
+  two OpenAI wire formats had no proactive protection at all against this exact failure mode). Never
+  clamps below a configured thinking budget, and never raises
   `max_tokens` above what was asked.
 - **Thinking** — `ContentBlock::Thinking`/`RedactedThinking` + `ThinkingDelta`/`SignatureDelta` stream
   events; signatures replay verbatim (Anthropic requires it with tools). `with_thinking(budget)`; the
@@ -144,6 +156,20 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   per `ThinkingShape`) drives an explicit "off" signal (Anthropic `{"type":"disabled"}`, OpenAI
   `{"effort":"none"}`) on a turn that isn't requesting thinking, for a model capable of one — instead of
   omitting the field and trusting the provider's undocumented default.
+- **`ThinkingLevel::Off` is not a legal state for every model** — a model with a reasoning mechanism it
+  can't explicitly disable (`reasoning_disableable == false`; most of the OpenAI gpt-5 codex/pro line,
+  `claude-fable-5`) has no way to actually turn reasoning off: sending `Off` there doesn't disable
+  anything, it just omits the reasoning field entirely and lets the provider apply its own hidden
+  default effort — silent cost/latency divergence from what a client believes is happening.
+  `models::clamp_thinking_level(caps, level)` bumps `Off` up to the model's own floor
+  (`ModelCaps::min_reasoning_effort`) for exactly these models (every other rung delegates to
+  `clamp_reasoning_effort` unchanged); `models::next_available_thinking_level` is the cycling
+  counterpart, advancing only through `models::available_thinking_levels(caps)` rather than the raw
+  6-rung ladder — a plain `level.next()` then re-clamp would bounce forever between `High` and a
+  re-clamped `XHigh` for any model lacking `xhigh` support. `serve`'s startup level, `set_model`/
+  `cycle_model` (re-clamping the *existing* level against the *new* model), `set_reasoning_effort`, and
+  `switch_branch`'s restored level all clamp through these before the level is ever stored or built into
+  an `Agent` — mirrors pi's `clampThinkingLevel`, applied on every model switch and level change.
 - **Cross-model state scrubbing** — `Message::model_id` (stamped on every assistant turn from
   `Agent`'s own `model`) records which model produced it; `Session::scrub_cross_model_state(new_model)`
   downgrades a non-empty signed `Thinking` block to a plain `Text` block (preserving the visible
@@ -167,16 +193,25 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   truncation rejection and a tagged network failure (`MID_STREAM_NETWORK_ERROR`),
   `is_retryable_mid_stream` recognizes a table of named in-band provider error *types*
   (`MID_STREAM_RETRYABLE_ERROR_TYPES` — Anthropic's `rate_limit_error`/`api_error`/`timeout_error`,
-  OpenAI's `rate_limit_exceeded`/`server_error`/`internal_error`/`service_unavailable`) and explicit
-  provider retry-guidance phrases (`MID_STREAM_RETRY_GUIDANCE_PHRASES`), deliberately keyed on names
-  rather than raw HTTP status-code substrings ("500" et al.) — a mid-stream failure never carries a
-  fresh status code to key on, and a bare digit substring risks matching an unrelated number in the
-  message. `Agent::with_auto_retry` (default enabled) disables this specific layer — a normally-retried
+  OpenAI's `rate_limit_exceeded`/`server_error`/`internal_error`/`service_unavailable`), a free-text
+  prose fallback for a provider error with no recognized `error.type` at all
+  (`MID_STREAM_RETRYABLE_FREE_TEXT_PATTERNS` — pi's `RETRYABLE_PROVIDER_ERROR_PATTERN`, narrowed to
+  this crate's two dialects), and explicit provider retry-guidance phrases
+  (`MID_STREAM_RETRY_GUIDANCE_PHRASES`), deliberately keyed on names/prose rather than raw HTTP
+  status-code substrings ("500" et al.) — a mid-stream failure never carries a fresh status code to key
+  on, and a bare digit substring risks matching an unrelated number in the message (raw status digits
+  are instead a whole-run-only concern — see the `agent` crate's `retry.rs`). `Agent::with_auto_retry`
+  (default enabled) disables this specific layer — a normally-retried
   failure surfaces on the very first attempt instead — for debugging a flaky connection without several
   silent attempts first; `GatewayClient`'s own pre-first-byte retry above is unaffected either way.
 - **Cache observability** — `StreamEvent::Usage` carries `TokenUsage` (input/output + cache-read/write
   - reasoning); both decoders populate it, and `Session` folds the cumulative totals + `last_input_tokens`.
-- **Lifecycle events** — `AgentEvent` adds `AgentStart`/`TurnStart`/`Steered`/`AgentEnd`/`Compacted`/`Error`.
+- **Lifecycle events** — `AgentEvent` adds `AgentStart`/`TurnStart`/`Steered`/`AgentEnd`/`CompactionStart`/
+  `Compacted`/`Error`. `CompactionStart` (carrying the same `CompactionReason` `Compacted` does) fires
+  once `Agent::compact` confirms a worthwhile prefix exists, right before its first summarization model
+  call — a caller tracking "is a compaction currently in flight" (pi's `isCompacting`, surfaced by
+  `crates/agent`'s `serve.rs`) sets a flag here and clears it on `Compacted`, since `compact`'s own
+  summarization call passes a discarding inner sink and so nothing else can arrive in between.
 
 ## What this crate is not
 
@@ -266,8 +301,11 @@ TCP chunks (Bytes) ──► Vec<u8> byte buffer ──split on '\n'──► wh
 Anthropic emits an explicit `content_block_stop` per block; OpenAI doesn't, so its decoder synthesizes
 `ContentBlockStop` when a tool call's `id` arrives (closing the prior block) or `finish_reason` shows
 up, and defers `MessageStop` to `Decoder::finish()` so it lands after the trailing usage-only chunk.
-Both decoders produce the identical `StreamEvent` sequence shape — the loop's `Accumulator` is
-dialect-blind.
+All three dialect decoders produce the identical `StreamEvent` sequence shape — the loop's
+`Accumulator` is dialect-blind. Anthropic's own wire already carries a real per-block `index` on
+`content_block_start`/`_delta`/`_stop`, read straight through rather than discarded (defensive, since
+Anthropic's documented behavior never actually interleaves blocks in practice — but the decoder no
+longer has to *assume* strict sequential delivery to stay correct if that ever changed).
 
 ## Concepts & Terminology
 
@@ -283,21 +321,33 @@ dialect-blind.
 | `ModelCaps`                      | Per-model wire knobs from `capabilities(model)`: max-tokens field, long-cache, vision, thinking shape, reasoning-effort, context window   | Not a model catalog or pricing/routing table — the gateway routes and meters; this is the smallest table the wire decisions need |
 | `ToolChoice` / `ReasoningEffort` | How the model may use tools this turn / its effort level — optional `ModelRequest` fields mapped per dialect                              | Unset emits nothing on the wire (provider default), so the default request shape is unchanged                                    |
 | `Error`                          | A loop/transport failure → `run`/`run_events` returns `Err`, the in-flight turn is discarded                                              | `Cancelled` is a user abort, not a fault; malformed tool args are recoverable, not an error                                      |
-| `StreamEvent`                    | The normalized unit both dialect decoders emit; what `Accumulator` folds (text/thinking/tool/usage)                                       | Not the wire format — it's the post-translation internal shape                                                                   |
+| `StreamEvent`                    | The normalized unit all three dialect decoders emit; every block-scoped variant carries an `index`, what `Accumulator` folds (text/thinking/tool/usage) — more than one index can be concurrently open | Not the wire format — it's the post-translation internal shape                                                                   |
 | `ContentBlock`                   | One piece of a `Message` (`Text`/`Thinking`/`RedactedThinking`/`ToolUse`/`ToolResult`/`Image`)                                            | Not a streaming unit — it's the assembled, turn-final form                                                                       |
-| `AgentEvent`                     | The full observation surface (`AgentStart`/`TurnStart`/`Stream`/`ToolStart`/`ToolEnd`/`TurnEnd`/`Steered`/`Compacted`/`AgentEnd`/`Error`) | Not exposed by `Agent::run` — that filters to `Stream` only                                                                      |
+| `AgentEvent`                     | The full observation surface (`AgentStart`/`TurnStart`/`Stream`/`ToolStart`/`ToolEnd`/`TurnEnd`/`Steered`/`CompactionStart`/`Compacted`/`AgentEnd`/`Error`) | Not exposed by `Agent::run` — that filters to `Stream` only                                                                      |
 | `max_steps`                      | Loop-iteration ceiling; one step = one model turn (tool dispatch doesn't increment it again)                                              | Not a token or wall-clock budget                                                                                                 |
 
 ## Core Mechanism
 
 ### Accumulating a turn (`agent.rs::Accumulator`)
 
-`Accumulator` folds a `StreamEvent` sequence into `Vec<ContentBlock>` + stop reason + token counts:
-text deltas accrue into a `String` buffer; a `ToolUseStart` flushes any open text run and opens a
-`(id, name, json-buffer)` tuple; `InputJsonDelta` fragments append to that buffer; `ContentBlockStop`
-finalizes whichever is open (parsing the buffered JSON, or `{}` if it was empty). A thinking block
-accrues `(text, signature)` from `ThinkingDelta`/`SignatureDelta` and flushes to a `Thinking` block.
-Parsing a non-empty buffer tries three tiers in order before giving up: the raw buffer as-is; then
+`Accumulator` folds a `StreamEvent` sequence into `Vec<ContentBlock>` + stop reason + token counts.
+Every block-scoped event carries an `index`, and **more than one index can be open at once** — a
+dialect whose wire genuinely interleaves multiple blocks (OpenAI Responses, when the model streams two
+tool calls' arguments concurrently) reports them as such: `Accumulator.open: HashMap<usize, OpenBlock>`
+tracks each index's own accruing state (`OpenBlock::Text(text, id, phase)` — `id`/`phase` are OpenAI
+Responses' replay metadata, threaded through from a `TextFinal` resync, `None` from every other dialect
+— / `Thinking(text, signature)` / `Tool(id, name, json-buffer)`) completely independently — a
+`ToolUseStart` at one index no longer
+force-closes whatever's open at a different index. `ContentBlockStop{index}` finalizes just that one
+index (parsing its buffered JSON for a tool call, or `{}` if empty) into `Accumulator.done: HashMap<usize,
+Option<ContentBlock>>`; a finalized index sits there until every *earlier-declared* index (tracked in
+declaration order by `Accumulator.order`) has also finalized, at which point the run of
+consecutively-ready entries flushes into `blocks` in declaration order (`try_flush`) — so the assembled
+message never reorders blocks relative to when the model announced them, even though a later-declared
+block may finish streaming its content first. A dialect whose wire never interleaves (Anthropic in
+practice, OpenAI Chat Completions' text) just always uses index 0, so exactly one index is ever open and
+this degenerates to the single-current-block behavior every dialect used before this design. Parsing a
+non-empty tool-argument buffer tries three tiers in order before giving up: the raw buffer as-is; then
 `repair_json` (fixes mis-escaping — a raw control byte or stray backslash inside a string, not a
 structural problem); then `close_incomplete_json` (closes whatever string/`{`/`[` were still open when
 the buffer ended — a genuinely *incomplete* stream, e.g. a long `write`/`edit` value cut off by an
@@ -522,6 +572,18 @@ way Anthropic's is) — the only way to replay OpenAI's encrypted reasoning acro
 content-block variant; a signature that fails to parse as JSON (e.g. after `set_model` scrubbed a
 cross-provider thinking history) degrades to plain text instead of erroring.
 
+`ContentBlock::Text` similarly carries two OpenAI-Responses-only, otherwise-`None` fields: `id` (the
+wire message id) and `phase` (`"commentary"` vs `"final_answer"` — a channel label OpenAI's docs say
+must be preserved on replay for gpt-5.3-codex and later, or those models' quality measurably degrades).
+Both are captured off `output_item.done`'s `item.id`/`item.phase` alongside the block's authoritative
+text (`StreamEvent::TextFinal`'s own `id`/`phase` fields) and restamped verbatim by
+`push_assistant_content`, which also always sets `status: "completed"` (the only status a *replayed*
+block can have) and, when nothing was ever captured (a locally-authored block — a compaction/branch
+summary — or a session persisted before this field existed), a deterministic `msg_{msg_index}` /
+`msg_{msg_index}_{text_block_index}` fallback id via `fallback_message_id` — stable across rebuilds of
+the same request so it doesn't churn the prompt-cache prefix turn to turn. Every other dialect leaves
+both fields `None` and never reads them.
+
 ## Trust Boundaries
 
 **What the system verifies (rejects if invalid):**
@@ -565,19 +627,19 @@ cross-provider thinking history) degrades to plain text instead of erroring.
 | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `lib.rs`                      | Crate root: module list, public re-exports, and the crate-wide `#![cfg_attr(test, allow(...))]` panic-free gate                                                                                                                                                                                                                                                                            |
 | `agent.rs`                    | `Agent` config + `run`/`run_events`/`run_events_cancellable`/`run_events_steered` loop, `Accumulator`, concurrent tool dispatch (threading text/images/`terminate`), tool-driven termination, mid-run + stop-boundary steering, `with_reasoning_effort`, model-aware `new` defaults, hooks, auto-compaction + overflow retry                                                               |
-| `message.rs`                  | `Role`/`ContentBlock`(+ `Thinking`/`RedactedThinking`/`Image`; `ToolResult` carries optional `images`)/`Message`/`ToolDef`/`StopReason`(+ `Refusal`)/`StreamEvent`/`TokenUsage`(+ `reasoning_tokens`) — the internal model                                                                                                                                                                 |
+| `message.rs`                  | `Role`/`ContentBlock`(+ `Thinking`/`RedactedThinking`/`Image`; `ToolResult` carries optional `images`; `Text` carries optional `id`/`phase`, OpenAI Responses' replay metadata)/`Message`/`ToolDef`/`StopReason`(+ `Refusal`)/`StreamEvent`/`TokenUsage`(+ `reasoning_tokens`) — the internal model                                                                                                                                                                 |
 | `compaction.rs`               | Context compaction: trigger, cut-point search, summary-prompt build (`summary_request` takes an optional `custom_instructions`, appended as "Additional focus: …" — a manual compaction's client-supplied steering, matching pi's `generateSummary`; never applied to the split-turn prefix call, matching pi's `generateTurnPrefixSummary` not accepting one at all), file-op extraction, and incremental update (`previous_summary`/`SUMMARY_MARKER` fold-forward) — the network-free half of `Agent::compact`                                                                                                                                                                             |
 | `models.rs`                   | `capabilities(model) -> ModelCaps`: minimal per-model wire table (max-tokens field, long-cache, vision, thinking shape, reasoning-effort, context window), matched by id prefix; consumed by the dialects and `Agent::new`                                                                                                                                                                 |
 | `hooks.rs`                    | `AgentHooks` interception trait (`before_tool_call`/`after_tool_call`, both cancellation-aware) + `NoHooks` default                                                                                                                                                                                                                                                                        |
-| `steering.rs`                 | `Steering` — two shared queues: `push_steer` (mid-run, folded onto the tool-results turn) and `push`/follow-up (injected at would-stop boundaries), each with its own independent `QueueMode` (`set_steering_mode`/`set_follow_up_mode`); `pending_count` peeks the combined depth of both lanes without draining; plus `request_stop`/`take_stop_requested`, a graceful-stop flag checked at turn boundaries; `clear()` drops both lanes and the stop flag without returning them, for a caller about to swap in a different session's conversation     |
+| `steering.rs`                 | `Steering` — two shared queues of `SteeringMessage` (text + optional images): `push_steer` (mid-run, folded onto the tool-results turn) and `push`/follow-up (injected at would-stop boundaries), each with its own independent `QueueMode` (`set_steering_mode`/`set_follow_up_mode`); `pending_count` peeks the combined depth of both lanes without draining; plus `request_stop`/`take_stop_requested`, a graceful-stop flag checked at turn boundaries; `clear()` drops both lanes and the stop flag without returning them, for a caller about to swap in a different session's conversation     |
 | `write_lock.rs`               | `WriteLockRegistry` — a process-scoped, path-keyed async-mutex map (`Agent::with_write_locks`) extending same-path write exclusivity across `Agent` rebuilds (a `set_model`/`set_thinking` rebuild, or multiple sessions sharing one registry), layered on top of the per-turn write-target grouping below                                                                                |
 | `tool.rs`                     | `Tool` trait (`run -> ToolOutput`, optional streaming `run_streaming` + `ToolProgress` sink) + `ToolOutput { text, images, terminate }` + `ToolRegistry` (name-keyed `Arc<dyn Tool>` map, last-registration-wins, name-sorted `definitions`)                                                                                                                                               |
 | `transport.rs`                | `ModelRequest` (system/tools/thinking/`reasoning_effort`/`tool_choice`/cache_key/cache_long/`user_id` — Anthropic's `metadata.user_id` abuse-detection hint, unset by default), `ReasoningEffort` + `ToolChoice` enums, `ModelTransport` trait, `EventStream` alias                                                                                                                                                                                                          |
-| `client.rs`                   | `GatewayClient`: production `ModelTransport`; retry-with-backoff (`Retry-After` delta-seconds _or_ HTTP-date), chunked-SSE byte framing into whole UTF-8 lines; sends `x-client-request-id: <cache_key>` for the OpenAI Responses dialect only, when a `cache_key` is set — connection-level session-affinity routing, distinct from `prompt_cache_key`'s cache-node affinity in the body, matching pi's `openai-responses.ts`                                                                                                                                                                                                                            |
-| `dialect/mod.rs`              | `Dialect` enum (model-id → wire selection), `StreamDecoder` trait, SSE line-splitting (`push_sse_line`/`decode_sse`)                                                                                                                                                                                                                                                                       |
+| `client.rs`                   | `GatewayClient`: production `ModelTransport`; retry-with-backoff (`Retry-After` delta-seconds _or_ HTTP-date), chunked-SSE byte framing into whole UTF-8 lines; sends both `session_id: <cache_key>` and `x-client-request-id: <cache_key>` for the OpenAI Responses dialect only, when a `cache_key` is set — connection-level session-affinity routing, distinct from `prompt_cache_key`'s cache-node affinity in the body, matching pi's `openai-responses.ts` (which sends both headers, not just one)                                                                                                                                                                                                                            |
+| `dialect/mod.rs`              | `Dialect` enum (model-id → wire selection), `StreamDecoder` trait, SSE line-splitting (`push_sse_line`/`decode_sse`), `clamp_max_tokens_to_context` (shared by all three dialects)                                                                                                                                                                                                        |
 | `dialect/anthropic.rs`        | `/v1/messages` body builder (three prompt-cache breakpoints, capability-gated 1h TTL, per-model thinking shape, `tool_choice`, tool-result image rewrite) + decoder (text/thinking/tool/cache-usage, reasoning-token breakout, `pause_turn`/refusal-explanation, in-band error + truncation detection)                                                                                     |
 | `dialect/openai.rs`           | `/v1/chat/completions` body builder + decoder — real translation: flattened messages, string-encoded tool args, `image_url` data-URIs (user + fanned-out tool-result images), `max_completion_tokens` vs `max_tokens`, `reasoning_effort`, `tool_choice`, synthesized block-stop events                                                                                                    |
-| `dialect/openai_responses.rs` | `/v1/responses` body builder (flat `input` array of typed items, flat tool defs, `max_output_tokens`, `reasoning.effort` + `include:["reasoning.encrypted_content"]`, `store:false`) + decoder — genuine item-boundary events (`output_item.added`/`.done`), not implicit index-keyed deltas; a reasoning item's whole JSON becomes the `Thinking` block's `signature` for verbatim replay; genuinely interleaved items (concurrent tool calls) are buffered per-index and replayed as one fully-formed block once the focus item closes, rather than force-closed and truncated, since the shared `StreamEvent`/`Accumulator` contract only ever tracks one open block at a time; `function_call_arguments.done`/`output_item.done`'s own `arguments`/`content` resync (replace, not append) whatever the streamed deltas produced, so a single dropped/duplicated delta can't silently corrupt the final block |
+| `dialect/openai_responses.rs` | `/v1/responses` body builder (flat `input` array of typed items, flat tool defs, `max_output_tokens`, `reasoning.effort` + `reasoning.summary` (`ModelRequest::reasoning_summary`, defaults to `ReasoningSummary::Auto`) + `include:["reasoning.encrypted_content"]`, `service_tier` (`ModelRequest::service_tier`, omitted unless set — a queueing/latency class, not just pricing), `store:false`) + decoder — genuine item-boundary events (`output_item.added`/`.done`), not implicit index-keyed deltas; every event carries its own true `output_index` and is emitted immediately, live, in real arrival order — no buffering, no "focus" item — since `Accumulator` natively tracks as many concurrently-open indices as the wire actually has (genuinely interleaved items, e.g. concurrent tool calls, stream live rather than one being buffered and replayed as a burst once the other closes); `function_call_arguments.done`/`output_item.done`'s own `arguments`/`content` resync (replace, not append) whatever the streamed deltas produced, so a single dropped/duplicated delta can't silently corrupt the final block; a `message`-type item's `id`/`phase` are captured off that same `output_item.done` and restamped verbatim on replay (`push_assistant_content`/`fallback_message_id`) |
 | `branch_summary.rs`           | `branch_summary_request`: the (network-free) prompt builder for summarizing an abandoned tree branch on navigation — reuses `compaction`'s `render_prefix`/`SUMMARY_SYSTEM`/`extract_file_ops` unchanged, framed by its own instruction (no incremental-update path; a branch is summarized once); `windowed_by_budget` trims the rendered tail to fit the summarization call's own context, privileging a nested compaction/branch-summary entry (a dense recap, not raw conversation) past the ordinary cutoff as long as the accumulated tail is still under 90% of budget, matching pi's `prepareBranchEntries` |
 | `session.rs`                  | `Session`: Arc-shared copy-on-write message history + step/token counters + `last_usage_message_count`, serde round-trippable; `scrub_cross_model_state(new_model)` downgrades a non-empty signed `Thinking` block to `Text` (drops it only if empty), drops `RedactedThinking`, and truncates a combined tool-call id — all from any message not stamped with `new_model`                                                                                                                |
 | `error.rs`                    | `Error` (loop/transport, aborts the run) and `ToolError` (tool failure, becomes an error `tool_result`)                                                                                                                                                                                                                                                                                    |

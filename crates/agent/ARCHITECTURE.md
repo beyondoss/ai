@@ -46,15 +46,20 @@ The harness layers several capabilities over the bare tools + loop:
   `set_model`/`set_thinking`/an explicit `reload` — and refreshes just the cheap dynamic footer before
   every `prompt`, so a long-running process doesn't re-walk the filesystem every turn just for the date.
   CLI flags: `--system-prompt` (replace), `--append-system-prompt`, `--no-context-files`,
-  `--no-skills`/`--no-prompt-templates` (`run` only — skip discovery outright rather than discover-then-
-  discard, so `/skill:name`/`/name` invocations pass through unexpanded and no `<available_skills>`
-  listing is injected; matches pi's own flags). Skills are
+  `--no-skills`/`--no-prompt-templates` (both `run` and `serve` — skip discovery outright rather than
+  discover-then-discard, so `/skill:name`/`/name` invocations pass through unexpanded and no
+  `<available_skills>` listing is injected; matches pi's own flags; on `serve` these also apply on every
+  `reload`). Skills are
   discovered recursively (`SKILL.md` at any depth, following symlinked directories — matching pi's own
   `skills.ts`, so a shared skills library symlinked into `.claude/skills` isn't invisible; a symlink
   loop is caught by `walkdir`'s own detection, not an unbounded walk), honoring `.gitignore`/`.ignore`
   (`WalkBuilder`'s own defaults) and `.fdignore` (registered explicitly via
   `add_custom_ignore_filename` — the third file `skills.ts::IGNORE_FILE_NAMES` lists, which the
-  `ignore` crate doesn't honor by default); a `disable-model-invocation`
+  `ignore` crate doesn't honor by default), and hardcode-pruning any `node_modules` directory regardless
+  of ignore-file coverage (`filter_entry`, matching pi's own unconditional skip) — the symlink-follow
+  above means a shared skills library can lead *outside* this walk's own root into a foreign npm
+  package with its own nested `node_modules` and no ignore file of its own, so relying on ignore-file
+  coverage alone wouldn't reliably catch it; a `disable-model-invocation`
   skill is omitted from the listing but still
   reachable by an explicit `/skill:name`, which strips the raw YAML frontmatter and wraps the body in a
   `<skill name="..." location="...">` tag rather than leaking the frontmatter verbatim. Both
@@ -158,7 +163,12 @@ The harness layers several capabilities over the bare tools + loop:
   next tool turn) / `follow_up` (queued for the next stop boundary, and — unlike a bare
   `steer`/`follow_up` — also accepted while idle, queuing against a persistent handle for whichever
   `prompt` runs next; `stop_after_turn` sent while idle is instead a no-op ack, since there is no future
-  run it could safely bind to), `compact`(optional `custom_instructions` steers what the summary
+  run it could safely bind to). Every path that queues a raw user-authored message this way — `steer`,
+  `follow_up` (both the idle and mid-run handlers), and `prompt`'s `streaming_behavior:"steer"|"follow_up"`
+  variant — expands a `/skill:name`/`/name` invocation exactly like a fresh `prompt` does (`serve.rs`'s
+  shared `expand_message` helper) and accepts the same optional `images` array a fresh `prompt` does
+  (parsed via `parse_images` into an `agent_core::SteeringMessage`), so neither expansion nor image
+  attachments are a `prompt`-only behavior a client has to special-case. `compact`(optional `custom_instructions` steers what the summary
   emphasizes, passed straight through to `Agent::compact` — matching pi's own `compact(customInstructions)`),
   `list_sessions`/`list_all_sessions`(cross-project — every project's own session directory under the
   shared root, not just this one's; each streams unsolicited `list_progress` frames, correlated to the
@@ -265,7 +275,11 @@ The harness layers several capabilities over the bare tools + loop:
   a mislabeled extension. Decode/resize/re-encode runs on `spawn_blocking` (same pattern as `grep`/
   `find`'s own blocking walks), not inline on the async runtime — CPU-bound work on a large image can
   take a while, and pi's own equivalent (`resizeImageInProcess`) runs its decode/resize/encode in a
-  worker thread for the same reason: so it can't stall unrelated concurrent work.
+  worker thread for the same reason: so it can't stall unrelated concurrent work. A resized image's text
+  note states both dimension pairs *and* the coordinate-scale multiplier (`orig_w / new_w` — the resize
+  preserves aspect ratio, so either dimension's ratio agrees) needed to map a point identified in the
+  downscaled image back to the original's coordinate space, matching pi's `formatDimensionNote` rather
+  than leaving the model to re-derive (and potentially mis-derive) it.
 
 ---
 
@@ -317,7 +331,11 @@ instead of writing directly, because it needs to keep servicing concurrent stdin
 append inside the async callback is the simpler correct choice here. Without this, a long multi-step
 turn (several tool round-trips, each running a real command or editing a real file) that crashed or hard-
 failed partway through left *no session record at all* of the round-trips that had already happened —
-`persist_run_tail` only ever runs after `run_turn` returns successfully.
+`persist_run_tail` only ever runs after `run_turn` returns successfully. `serve`'s own `persist_error`
+(the RunningTurn→Ready transition row above) reflects only the *final* post-attempt persist's own
+outcome — a mid-run checkpoint's failure is logged, not tracked, since that final persist re-persists the
+whole session fresh regardless and so is a strict superset of every checkpoint along the way; a
+checkpoint hiccup superseded by a successful final write must not surface as a false failure.
 
 ### `serve` — headless NDJSON control protocol
 
@@ -342,7 +360,9 @@ loop over stdin lines ───────────────────�
   │                                                              message_count, input/output_tokens,
   │                                                              thinking_level, auto_compaction,
   │                                                              auto_retry, steering_mode,
-  │                                                              follow_up_mode, pending_messages}}
+  │                                                              follow_up_mode, pending_messages,
+  │                                                              session_file, is_streaming,
+  │                                                              is_compacting}}
   ├─ {"type":"get_messages", since?} / {"type":"get_tree"} ──► response{data:{messages:[...]}} /
   │     (since: only what's new)                                 response{data:{nodes:[TreeNode…]}}
   ├─ {"type":"new_session"} ─────────────────────────► response{data:{session_id, parent}}  (fresh
@@ -644,6 +664,46 @@ surfacing the stall as a closed session rather than masking it with dropped fram
 buffering. Every frame — events and responses — flows through this one task, so output is FIFO and
 never interleaves even though tool execution itself is concurrent.
 
+### Why the stdout guard is a compile-time lint, not a runtime patch
+
+A stray line on stdout (a debug `println!`, a misconfigured logger) corrupts the NDJSON stream a
+client reads line-by-line — `tracing`'s subscriber is already pinned to stderr (`main.rs`) for exactly
+this reason, but that only covers *our own* `tracing::warn!`/`info!` calls, not a direct `println!`/
+`print!`. pi's equivalent (`output-guard.ts`'s `takeOverStdout`) closes that gap at runtime: it
+monkey-patches `process.stdout.write` globally, transparently redirecting *any* code's stray write
+(including a dependency's own stray `console.log`) to stderr, leaving its own `writeRawStdout` as the
+only sanctioned path back to the real stdout. There's no honest equivalent here — that requires
+reopening/redirecting the raw fd, and this workspace's `[workspace.lints.rust] unsafe_code = "forbid"`
+rules out the FFI that would take, categorically, not for lack of trying. `serve.rs` instead carries
+`#![deny(clippy::print_stdout)]`: since nothing in that module has ever needed `println!`/`print!`
+directly (the single `tokio::io::stdout()` writer task is already the only sanctioned path), this
+costs nothing today and turns any future stray one — the realistic risk, since idiomatic Rust crates
+overwhelmingly log through `tracing`/`log` rather than raw stdout writes, unlike the Node ecosystem
+pi's version targets — into a hard compile error instead of a corrupted protocol stream discovered in
+production.
+
+### Why `is_compacting` is event-driven, and why `is_streaming` isn't
+
+`get_state`'s `is_streaming`/`is_compacting`/`session_file` mirror pi's `RpcSessionState` fields of the
+same name. `is_streaming` needs no tracking at all: it's simply `true` in the busy-loop's `get_state`
+arm and `false` in the idle one — architecturally, those are the *only* two places `get_state` can ever
+run from, so which arm answered already says everything. `is_compacting` is different: `Agent::compact`
+runs *inside* the busy loop's own event stream, so its state has to be tracked live. It's set on the new
+`AgentEvent::CompactionStart` (emitted once `compact` confirms a worthwhile prefix exists, right before
+its first summarization call) and cleared on literally the next event of any kind, not specifically
+`Compacted` — `compact` can end without ever emitting `Compacted` at all (an empty-summary no-op, or a
+propagated error), and its own summarization call passes a discarding inner sink, so nothing else can
+possibly arrive between `CompactionStart` and whatever naturally follows it (`Compacted` on success, the
+next turn's `TurnStart` otherwise). Clearing on "anything else" is therefore exact, not a conservative
+guess, and never leaves the flag stuck `true` past the compaction attempt that set it. Manual `compact`
+and branch summarization (`switch_branch`'s `summarize?`) don't participate in this flag at all — both
+only ever run from the idle main loop, which processes one stdin command to completion before reading
+the next, so no concurrent `get_state` could ever observe them in flight regardless; tracking a flag
+neither the client nor this process's own control flow could ever race would be a private detail with
+no external correctness. `session_file` is a plain accessor (`Persistence::session_file`) — repo and
+single-file modes both populate `Persistence.store`, so one method covers either without needing to
+distinguish them, and it's `None` only for true in-memory (`--no-session-persistence`) runs.
+
 ### Why tool results batch into one user message, not one per tool
 
 (Enforced in `agent_core`, but it constrains how this crate's tools must behave.) Anthropic rejects
@@ -793,12 +853,12 @@ container/VM — not by this crate restricting its own tools.
   growing preview of the call's arguments as they stream in, not just its name) to stdout for `run` in its default text mode, or (`run --json`) one `AgentEvent` object per line via `run_events`/`serde_json::to_string` — the same full observation surface (tool calls/results, turn boundaries) `serve`'s NDJSON protocol streams, preceded by a `{"kind":"session", id, model, cwd}` header line — for a scripting caller that wants structured output without spawning `serve`; `run` composes its first message from piped stdin + `@file` references (`partition_tasks`/`read_file_refs`) + the first positional message, runs any further positional messages as separate sequential turns, and — via `--session <path>`/`--continue` (reusing `SessionStore`/`SessionRepo::resume_or_create`) — can persist and resume a transcript across invocations exactly like `serve`'s own repo/file modes; `--session-id <id>` (matching pi's own flag) overrides the freshly-generated id with a caller-chosen one, wherever a *new* `SessionMeta` is actually minted (a fresh `--session <path>` or a plain ephemeral run) — a script/test harness gets a known id to correlate against instead of parsing one back out of the run's own output; `run --export <path>` renders the finished transcript via `export::export_html` after a live run completes, while the standalone `export <session.jsonl> [output.html]` subcommand renders an *already-persisted* session file straight off disk — no gateway, key, or model involved at all (`SessionStore::open` + `export::export_html`)                                                                          |
 | `src/lib.rs`           | Library root; re-exports `serve`/`tools`/`resources`/`skills`/`prompts`/`session_store`/`trust_store`/`export` for tests/benches                                                                                                                                                                                                                                                                                                         |
 | `src/serve.rs`         | NDJSON control protocol: single stdout-writer task, `Persistence` (file/dir/none, default-per-cwd directory), a large command set (session/branch nav, `reload`, model/thinking/tool/auto-compaction tuning, `bash`/`abort_bash`, `export_html`) — see the module's own doc comment for the exhaustive list; prompt runs concurrently with stdin routing `steer`/`follow_up` (also accepted while idle, via a persistent `Steering` handle) |
-| `src/export.rs`        | `export_html`/`render_html` — renders a session's transcript as one self-contained, dependency-free HTML file (inline CSS, no client-side JS, images inlined as data URIs); every abandoned branch (passed in as `SessionStore::abandoned_branches`'s output) renders inline as a collapsible `<details>` block right after the message it actually diverged from (`render_branches_diverging_at`, native HTML — no script) — only the divergent suffix, not the shared prefix already shown above, and numbered sequentially across the whole document; `edit`/`write`/`bash`/`read` tool calls get a dedicated renderer (`render_tool_call`) instead of raw pretty-printed JSON — `edit` reuses the diff-coloring machinery (`diff_pair_html`) to show its before/after as a real diff, falling back to generic JSON if `input` doesn't parse as a valid edit shape; everything else (`grep`/`find`/`ls`, the Beyond platform tools) stays generic JSON; message text is rendered as markdown (`render_markdown`, `pulldown-cmark`, server-side at export time — not pi's client-side `marked`/`highlight.js`) with raw HTML defused to visible text and link/image URLs scheme-allow-listed (`sanitize_url`); a fenced ` ```diff ` block or diff-shaped tool-result content (`looks_like_diff`) gets per-line +/- coloring (`diff_html`) instead of real syntax highlighting, which is deliberately not implemented (would need a heavy crate like `syntect`, bloating every build of this CLI for a nice-to-have); reuses `skills::xml_escape` for HTML-text escaping; shared by `serve`'s `export_html` RPC command, `run --export`, and the standalone `export` subcommand                                                                                                                                                    |
+| `src/export.rs`        | `export_html`/`render_html` — renders a session's transcript as one self-contained, dependency-free HTML file (inline CSS, no client-side JS, images inlined as data URIs); every abandoned branch (passed in as `SessionStore::abandoned_branches`'s output) renders inline as a collapsible `<details>` block right after the message it actually diverged from (`render_branches_diverging_at`, native HTML — no script) — only the divergent suffix, not the shared prefix already shown above, and numbered sequentially across the whole document; every built-in tool call (`edit`/`write`/`bash`/`read`/`grep`/`find`/`ls`, and the Beyond platform tools `fork`/`sync`/`logs`) gets a dedicated renderer (`render_tool_call`) instead of raw pretty-printed JSON — `edit` reuses the diff-coloring machinery (`diff_pair_html`) to show its before/after as a real diff, falling back to generic JSON if `input` doesn't parse as a valid edit shape; only a genuinely unrecognized tool name (a third-party extension) stays generic JSON; message text is rendered as markdown (`render_markdown`, `pulldown-cmark`, server-side at export time — not pi's client-side `marked`/`highlight.js`) with raw HTML defused to visible text and link/image URLs scheme-allow-listed (`sanitize_url`); a fenced ` ```diff ` block or diff-shaped tool-result content (`looks_like_diff`) gets per-line +/- coloring (`diff_html`) instead of real syntax highlighting, which is deliberately not implemented (would need a heavy crate like `syntect`, bloating every build of this CLI for a nice-to-have); reuses `skills::xml_escape` for HTML-text escaping; shared by `serve`'s `export_html` RPC command, `run --export`, and the standalone `export` subcommand                                                                                                                                                    |
 | `src/trust_store.rs`   | Tri-state (`Trust::{Trusted,Untrusted,Unknown}`), ancestor-inheriting trust allowlist (`~/.claude/trusted-projects.json`); `trust`/`distrust` record an explicit grant/denial, `clear` removes a directory's own entry (trusted *or* untrusted) without recording a new one, reverting it to inheriting its nearest ancestor's decision; legacy bare-array files still parse (trusted-only)                                                                                                                                                                                                                                                            |
 | `src/session_store.rs` | JSONL `SessionStore` (fsync'd append/atomic-rewrite/mid-file-corruption recovery, header metadata + durable `Entry::Compaction` provenance, version-migration guard, collision-safe ids; `create` initializes an existing but zero-byte file in place — `touch`'d ahead of time, or left over from a crash before the header write landed — rather than hard-failing, while still refusing (`AlreadyExists`) a genuinely non-empty one; `run`/`serve`'s own `--session <path>` open-vs-create decision checks file *content*, not just existence, so this path actually gets exercised) + multi-session `SessionRepo` (list-with-metadata, soft-delete-to-`.trash`, fork + read-only fork preview, `resume_or_create` — reopen the most recent session matching a `cwd` or make a fresh one, shared by `serve`'s startup reattach and `run --continue`); `default_session_dir`/`encode_cwd`/`canonical_cwd` — the `~/.claude/sessions/<encoded-cwd>/` convention and the symlink/trailing-separator-safe form every recorded `cwd` is passed through first, likewise shared; tree-shaped history (`id`/`parent_id` per message, `Leaf`/`BranchSummary`/`Compaction`/`ModelChange`/`ThinkingLevelChange`/`TitleChange` entries, `switch_active_with_summary`/`list_branches`/`tree`/`abandoned_by_switch`/`abandoned_branches`(every non-active leaf's full root-to-leaf message chain, plus how much of it is shared with the active path — for HTML export), legacy migration, off-branch-preserving compaction); `set_title` — an O(1) `TitleChange` append, not a rewrite, whole-session-scoped (most-recent-wins across the whole file) unlike the branch-scoped model/thinking-level changes, sanitizing `\r`/`\n` to a single collapsed space and treating a sanitizes-to-empty title as clearing it (`None`) rather than persisting a blank string, at both the write path and the two read-reconstruction paths (`open`'s tree build, `read_listing`'s cheap scan); `SessionMeta::to_listing_json` — the derived listing fields (`updated_at`/`message_count`/`preview`/`search_text`) are `#[serde(skip)]` on the struct itself, so this is the only path that actually surfaces them as JSON |
-| `src/resources.rs`     | System-prompt assembly split into `build_static_system_prompt` (on-disk `SYSTEM.md` override + additive `APPEND_SYSTEM.md`, one-file-per-dir `AGENTS.md`>`CLAUDE.md` discovery, skill injection — expensive, cached) and `dynamic_footer` (local date/cwd — cheap, refreshed every turn); `build_system_prompt` composes both for a one-shot caller                                                                                                                   |
+| `src/resources.rs`     | System-prompt assembly split into `build_static_system_prompt` (on-disk `SYSTEM.md` override + additive `APPEND_SYSTEM.md`, one-file-per-dir `AGENTS.md`>`CLAUDE.md` discovery, skill injection from an already-discovered `PromptOptions::skills` slice — the caller's job, not this function's, since every real caller already discovers skills separately for its own purposes and re-discovering here too would walk the same directories twice — expensive, cached) and `dynamic_footer` (local date/cwd — cheap, refreshed every turn); `build_system_prompt` composes both for a one-shot caller                                                                                                                   |
 | `src/skills.rs`        | Recursive skill discovery (`SKILL.md` frontmatter at any depth, `disable-model-invocation`, `/skill:` lookup — expands into a `<skill name=".." location="..">` tag with the frontmatter stripped, not the raw file) + `<available_skills>` rendering + `discover_with_diagnostics` (name-collision reporting); `project_trusted` gates only the project-local root, the user-global root is always scanned; `validate_skill_name`/`validate_skill_description` — non-fatal, `warn!`-logged shape/length checks (a bad `name`, or a `description` past 1024 chars) that never block discovery                |
-| `src/prompts.rs`       | `/name args` prompt-template discovery + bash-style expansion (quote-aware args, `$N`, `${@:N:L}` slices, `${N:-default}`, `description` frontmatter) + `discover_with_diagnostics` (name-collision reporting)                                                                                                                                                                                                                           |
+| `src/prompts.rs`       | `/name args` prompt-template discovery + bash-style expansion (quote-aware args, `$N`, `${@:N:L}` slices, `${N:-default}`, `description`/`argument-hint` frontmatter — parsed via `skills::parse_frontmatter`, shared rather than reimplemented, so a YAML block scalar is understood the same way a skill's frontmatter already is) + `discover_with_diagnostics` (name-collision reporting)                                                                                                                                                                                                                           |
 | `src/timing.rs`        | `StartupTiming` — `AI_AGENT_TIMING=1`-gated startup profiling (pi's own `PI_TIMING=1`/`timings.ts`); `mark(label)`/`print()` are no-ops (don't even read the clock) when unset, so it's safe to sprinkle through `run`/`serve`'s startup path unconditionally; prints to stderr only, never stdout                                                                                                                                      |
 | `src/tools/mod.rs`     | `default_registry_with(bash_timeout_ms)` — assembles the base 10-tool `ToolRegistry`; `apply_filter(&mut registry, tools, exclude_tools, no_tools)` — allow/deny-list/no-tools filtering applied once at process build time                                                                                                                                                                                                             |
 | `src/tools/read.rs`    | `read` — line-numbered read with `offset`/`limit`, byte budget, offset-past-EOF error, continuation hints; image files sniffed by magic bytes and downscaled/re-encoded (Lanczos3, PNG-then-JPEG, Exif orientation via `image`'s own generic decoder API — JPEG and WebP both) to fit a 4.5 MB base64 budget; an image already under that budget is still decode-validated (not just magic-byte-sniffed) before being sent as-is — matching pi's `resizeImageInProcess`, which always decodes even on its own already-fits fast path — so a truncated/bit-rotted/polyglot file that merely starts with a real image's magic bytes gets a clear tool error instead of being forwarded to the model unchecked                                                                                                                            |
@@ -829,7 +889,8 @@ container/VM — not by this crate restricting its own tools.
 | `--key` / `AI_AGENT_KEY`                                       | none (required)             | Bearer token sent to the gateway — a `bai_v1…` virtual key, or a BYO provider key forwarded as-is                                |
 | `--max-steps`                                                  | `agent_core::DEFAULT_MAX_STEPS` (50) | Ceiling on loop iterations (`run`) or per-`prompt` iterations (`serve`) before `Error::MaxSteps` (resumable with a fresh call)     |
 | `--tools` / `--exclude-tools` / `--no-tools` (+ `AI_AGENT_TOOLS`/`AI_AGENT_EXCLUDE_TOOLS` for `serve`) | none (full default registry) | Restrict/drop from the advertised tool set before the process's `Agent`/system prompt are built; `--no-tools` wins outright        |
-| `--no-skills` / `--no-prompt-templates` (`run` only)           | `false`                     | Skip skill/prompt-template discovery outright — no `<available_skills>` listing, and a `/skill:name`/`/name` invocation passes through unexpanded; matches pi's own flags |
+| `--no-skills` / `--no-prompt-templates` (`run` and `serve`)    | `false`                     | Skip skill/prompt-template discovery outright — no `<available_skills>` listing, and a `/skill:name`/`/name` invocation passes through unexpanded; matches pi's own flags. On `serve`, applies on every `reload` too |
+| `--no-context-files` (`run` and `serve`)                       | `false`                     | Skip AGENTS.md/CLAUDE.md project-instruction discovery/injection entirely; matches pi's own flag       |
 | `--trust-project`                                              | `false`                     | Trust the cwd for this run only (session-scoped), independent of `agent trust <path>`'s persistent allowlist                     |
 | `--force-untrusted`                                             | `false`                     | Force the cwd *untrusted* for this run only, overriding both `--trust-project` and a persisted `agent trust <path>` grant — pi's own `--no-approve`/`-na`; wins over `--trust-project` if both are given |
 | `--session-file` / `--session-dir` / `AI_AGENT_SESSION_FILE`   | per-cwd directory under `~/.claude/sessions/` | `serve`-only: where the `Session`/`SessionRepo` persists; `--no-session-persistence` opts out to pure in-memory                   |

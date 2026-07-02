@@ -85,6 +85,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aborting_a_lock_holder_mid_critical_section_releases_the_lock_only_at_that_point() {
+        // pi's file-mutation-queue had a real bug here (`file-mutation-queue.test.ts`, "keeps
+        // write/edit queue locked while an aborted write is still in flight"): releasing the lock the
+        // instant a caller *requests* cancellation, even though the underlying write was still
+        // physically in progress, let a second write interleave with the first's still-unflushed
+        // bytes. Our guard's release is tied to `Drop`, not a separate "I'm done" signal, so a second
+        // locker can only ever proceed once the first's guard has genuinely dropped — including when
+        // that drop is triggered by cancellation partway through an `.await` inside the critical
+        // section (simulating a future `spawn_blocking`-wrapped write). Pinning this so a refactor that
+        // moved the guard's lifetime *outside* the actual work (e.g. dropping it before awaiting a
+        // spawned blocking write's completion) would be caught here first.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let registry = Arc::new(WriteLockRegistry::new());
+        let holder_registry = registry.clone();
+        let holder_progressed_past_abort_point = Arc::new(AtomicBool::new(false));
+        let flag = holder_progressed_past_abort_point.clone();
+        let holder = tokio::spawn(async move {
+            let _guard = holder_registry.lock("target.rs").await;
+            // An internal await inside the locked section — the thing a `spawn_blocking`-wrapped write
+            // would introduce. Long enough that the abort below always lands while still pending.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            flag.store(true, Ordering::SeqCst); // only reached if NOT aborted in time
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await; // let the holder actually acquire first
+
+        let waiter_registry = registry.clone();
+        let waiter_acquired = Arc::new(AtomicBool::new(false));
+        let waiter_flag = waiter_acquired.clone();
+        let waiter = tokio::spawn(async move {
+            let _guard = waiter_registry.lock("target.rs").await;
+            waiter_flag.store(true, Ordering::SeqCst);
+        });
+
+        // The waiter must not have snuck in while the holder is still mid-critical-section.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !waiter_acquired.load(Ordering::SeqCst),
+            "the waiter acquired the lock while the holder's critical section was still in flight"
+        );
+
+        holder.abort();
+        let _ = holder.await; // a cancelled JoinHandle — expected
+        assert!(
+            !holder_progressed_past_abort_point.load(Ordering::SeqCst),
+            "sanity check: the abort must have actually landed mid-sleep, not after it completed"
+        );
+
+        // Now that the holder's guard has dropped (via cancellation), the waiter proceeds promptly.
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter must not deadlock once the holder's guard is dropped")
+            .unwrap();
+        assert!(waiter_acquired.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
     async fn different_keys_run_concurrently() {
         use std::time::Duration;
 

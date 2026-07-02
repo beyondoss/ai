@@ -13,11 +13,12 @@
 //! plain `<pre><code class="language-x">` (language-tagged, monospaced, just not token-colored) —
 //! except a `diff`-tagged block, or any tool-result content shaped like a unified diff, which does get
 //! real per-line +/- coloring (`diff_html`/`looks_like_diff`), since that needs no language-specific
-//! lexer at all. The most common file-mutating/shell tool calls (`edit`/`write`/`bash`/`read`) get a
-//! dedicated renderer (`render_tool_call`) instead of raw pretty-printed JSON — `edit` in particular
-//! reuses the diff-coloring machinery to show its before/after as a real (if not line-diffed) diff;
-//! everything else (`grep`/`find`/`ls`, the Beyond platform tools) falls back to generic JSON, which
-//! already reads fine for those.
+//! lexer at all. Every built-in tool call (`edit`/`write`/`bash`/`read`/`grep`/`find`/`ls`, and the
+//! Beyond platform tools `fork`/`sync`/`logs`) gets a dedicated renderer (`render_tool_call`) instead
+//! of raw pretty-printed JSON — `edit` in particular reuses the diff-coloring machinery to show its
+//! before/after as a real (if not line-diffed) diff. Only a genuinely unrecognized tool name (a
+//! third-party extension, or a future built-in not yet taught this module) falls back to generic JSON,
+//! which reads fine for the rare case that needs it.
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -123,6 +124,7 @@ h1 { font-size: 1.3rem; margin: 0 0 0.25rem; }\n\
 color: #999; margin-bottom: 0.4rem; }\n\
 .tool-call, .tool-result { border-left: 3px solid #666; padding-left: 0.75rem; margin: 0.5rem 0; }\n\
 .tool-result.error { border-left-color: #c94f4f; }\n\
+.skill-invocation { border-left: 3px solid #a67ee2; padding-left: 0.75rem; margin: 0.5rem 0; }\n\
 .tool-title { font-size: 0.8rem; color: #aaa; margin-bottom: 0.25rem; }\n\
 pre { white-space: pre-wrap; word-wrap: break-word; background: #151515; padding: 0.5rem; \
 border-radius: 4px; overflow-x: auto; margin: 0.25rem 0; }\n\
@@ -184,11 +186,20 @@ fn render_message(out: &mut String, message: &Message) {
 
 fn render_block(out: &mut String, block: &ContentBlock) {
     match block {
-        ContentBlock::Text { text } => {
-            out.push_str(&format!(
-                "<div class=\"text markdown\">{}</div>\n",
-                render_markdown(text)
-            ));
+        ContentBlock::Text { text, .. } => {
+            // A `/skill:name` invocation stores its expansion as a structural
+            // `<skill name="..." location="...">...</skill>` wrapper around the model-facing text (see
+            // `skills.rs::expand_if_skill_invocation`) — render it as its own distinct block instead of
+            // as one raw-escaped blob with the wrapper tags visible as literal text.
+            match parse_skill_block(text) {
+                Some(skill) => render_skill_invocation(out, &skill),
+                None => {
+                    out.push_str(&format!(
+                        "<div class=\"text markdown\">{}</div>\n",
+                        render_markdown(text)
+                    ));
+                }
+            }
         }
         ContentBlock::Thinking { text, .. } => {
             out.push_str(&format!(
@@ -243,6 +254,12 @@ fn render_tool_call(out: &mut String, name: &str, input: &serde_json::Value) {
         "write" => render_write_call(out, input),
         "bash" => render_bash_call(out, input),
         "read" => render_read_call(out, input),
+        "grep" => render_grep_call(out, input),
+        "find" => render_find_call(out, input),
+        "ls" => render_ls_call(out, input),
+        "fork" => render_fork_call(out, input),
+        "sync" => render_sync_call(out, input),
+        "logs" => render_logs_call(out, input),
         _ => render_generic_call(out, name, input),
     }
 }
@@ -350,6 +367,98 @@ fn render_read_call(out: &mut String, input: &serde_json::Value) {
     ));
 }
 
+/// Render a `grep` call: the pattern searched for, plus the path/glob narrowing it if given.
+fn render_grep_call(out: &mut String, input: &serde_json::Value) {
+    let pattern = input.get("pattern").and_then(serde_json::Value::as_str);
+    let path = input.get("path").and_then(serde_json::Value::as_str);
+    let glob = input.get("glob").and_then(serde_json::Value::as_str);
+    let mut title = match pattern {
+        Some(p) => format!("Searched for <code>{}</code>", html_escape(p)),
+        None => "Search".to_string(),
+    };
+    if let Some(p) = path {
+        title.push_str(&format!(" in <code>{}</code>", html_escape(p)));
+    }
+    if let Some(g) = glob {
+        title.push_str(&format!(" (glob <code>{}</code>)", html_escape(g)));
+    }
+    out.push_str(&format!(
+        "<div class=\"tool-call\"><div class=\"tool-title\">{title}</div></div>\n"
+    ));
+}
+
+/// Render a `find` call: the glob pattern matched, plus the search root if given.
+fn render_find_call(out: &mut String, input: &serde_json::Value) {
+    let pattern = input.get("pattern").and_then(serde_json::Value::as_str);
+    let path = input.get("path").and_then(serde_json::Value::as_str);
+    let mut title = match pattern {
+        Some(p) => format!("Found files matching <code>{}</code>", html_escape(p)),
+        None => "Find".to_string(),
+    };
+    if let Some(p) = path {
+        title.push_str(&format!(" in <code>{}</code>", html_escape(p)));
+    }
+    out.push_str(&format!(
+        "<div class=\"tool-call\"><div class=\"tool-title\">{title}</div></div>\n"
+    ));
+}
+
+/// Render an `ls` call: the directory listed, defaulting to `.` — matching the tool's own default.
+fn render_ls_call(out: &mut String, input: &serde_json::Value) {
+    let path = input
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(".");
+    out.push_str(&format!(
+        "<div class=\"tool-call\"><div class=\"tool-title\">Listed <code>{}</code></div></div>\n",
+        html_escape(path)
+    ));
+}
+
+/// Render a `fork` call (Beyond platform tool): the app forked, plus the branch name if given.
+fn render_fork_call(out: &mut String, input: &serde_json::Value) {
+    let app = input.get("app").and_then(serde_json::Value::as_str);
+    let name = input.get("name").and_then(serde_json::Value::as_str);
+    let mut title = match app {
+        Some(a) => format!("Forked <code>{}</code>", html_escape(a)),
+        None => "Fork".to_string(),
+    };
+    if let Some(n) = name {
+        title.push_str(&format!(" as <code>{}</code>", html_escape(n)));
+    }
+    out.push_str(&format!(
+        "<div class=\"tool-call\"><div class=\"tool-title\">{title}</div></div>\n"
+    ));
+}
+
+/// Render a `sync` call (Beyond platform tool): the directory synced, if a non-default one was given.
+fn render_sync_call(out: &mut String, input: &serde_json::Value) {
+    let path = input.get("path").and_then(serde_json::Value::as_str);
+    let title = match path {
+        Some(p) => format!("Synced <code>{}</code>", html_escape(p)),
+        None => "Synced the project root".to_string(),
+    };
+    out.push_str(&format!(
+        "<div class=\"tool-call\"><div class=\"tool-title\">{title}</div></div>\n"
+    ));
+}
+
+/// Render a `logs` call (Beyond platform tool): which app's logs, plus the Lucene query if given.
+fn render_logs_call(out: &mut String, input: &serde_json::Value) {
+    let app = input.get("app").and_then(serde_json::Value::as_str);
+    let query = input.get("query").and_then(serde_json::Value::as_str);
+    let mut title = "Read logs".to_string();
+    if let Some(a) = app {
+        title.push_str(&format!(" for <code>{}</code>", html_escape(a)));
+    }
+    if let Some(q) = query {
+        title.push_str(&format!(" (query: <code>{}</code>)", html_escape(q)));
+    }
+    out.push_str(&format!(
+        "<div class=\"tool-call\"><div class=\"tool-title\">{title}</div></div>\n"
+    ));
+}
+
 /// Render `text` as HTML via CommonMark plus a few GFM extensions (strikethrough/tables/task lists) —
 /// pi's own `marked`, run server-side at export time instead of client-side JS, so this crate's
 /// "no JS in the exported file" design holds. Two defenses against untrusted (model- or
@@ -418,7 +527,17 @@ fn render_markdown(text: &str) -> String {
 /// dropping anything else (`javascript:`, `data:`, `vbscript:`, ...) rather than emitting it as a live
 /// `href`/`src` — pi's own `sanitizeMarkdownUrl`.
 fn sanitize_url(url: pulldown_cmark::CowStr) -> pulldown_cmark::CowStr {
-    let trimmed = url.trim();
+    // Strip C0 controls + DEL before the scheme check — matches pi's own
+    // `.replace(/[\x00-\x1f\x7f]/g, '')`. Not an active bypass-prevention here (the scheme check is
+    // already an allow-list keyed on `starts_with`, not a denylist a control char could dodge), but a
+    // legitimate URL carrying a stray embedded control byte (a copy/paste artifact, or a markdown
+    // parser quirk upstream) should still normalize to something usable rather than being handled
+    // inconsistently with one still present.
+    let stripped: String = url
+        .chars()
+        .filter(|c| !matches!(c, '\u{0}'..='\u{1f}' | '\u{7f}'))
+        .collect();
+    let trimmed = stripped.trim();
     let lower = trimmed.to_ascii_lowercase();
     let safe = lower.starts_with("http://")
         || lower.starts_with("https://")
@@ -429,7 +548,7 @@ fn sanitize_url(url: pulldown_cmark::CowStr) -> pulldown_cmark::CowStr {
         || trimmed.starts_with("../")
         || !lower.contains(':'); // no scheme at all — a bare relative reference
     if safe {
-        url
+        pulldown_cmark::CowStr::from(trimmed.to_string())
     } else {
         pulldown_cmark::CowStr::Borrowed("")
     }
@@ -475,11 +594,72 @@ fn diff_html(content: &str) -> String {
     out
 }
 
+/// A parsed `<skill name="..." location="...">...</skill>` invocation wrapper, plus any trailing
+/// user-authored text after it — see [`parse_skill_block`].
+struct SkillBlock<'a> {
+    name: &'a str,
+    location: &'a str,
+    content: &'a str,
+    user_message: Option<&'a str>,
+}
+
+/// Detect and split apart `skills.rs::expand_if_skill_invocation`'s wrapper format — mirrors pi's own
+/// `parseSkillBlock` regex (`/^<skill name="([^"]+)" location="([^"]+)">\n([\s\S]*?)\n<\/skill>
+/// (?:\n\n([\s\S]+))?$/`) byte-for-byte: an opening tag, a newline, the skill body up to the *first*
+/// `\n</skill>` (non-greedy — a body that happens to contain that literal substring later doesn't
+/// extend the match), then either end-of-string or exactly `\n\n` followed by the user's own trailing
+/// message. Anything that doesn't fit this exact shape (including a name/location containing `"`,
+/// which the wrapper itself never produces) isn't a skill block at all — returns `None`, and the caller
+/// falls through to ordinary text rendering.
+fn parse_skill_block(text: &str) -> Option<SkillBlock<'_>> {
+    let rest = text.strip_prefix("<skill name=\"")?;
+    let (name, rest) = rest.split_once("\" location=\"")?;
+    let (location, rest) = rest.split_once("\">\n")?;
+    let close_idx = rest.find("\n</skill>")?;
+    let content = &rest[..close_idx];
+    let after = &rest[close_idx + "\n</skill>".len()..];
+    let user_message = if after.is_empty() {
+        None
+    } else {
+        Some(after.strip_prefix("\n\n")?.trim())
+    };
+    Some(SkillBlock {
+        name,
+        location,
+        content,
+        user_message,
+    })
+}
+
+/// Render a parsed skill invocation as its own block (markdown body, matching pi's
+/// `safeMarkedParse(skillBlock.content)`), followed by a separate sibling block for the user's own
+/// trailing text when present — the two are siblings, not nested, matching pi's TUI layout
+/// (`SkillInvocationMessageComponent`/`UserMessageComponent`).
+fn render_skill_invocation(out: &mut String, skill: &SkillBlock) {
+    out.push_str(&format!(
+        "<div class=\"skill-invocation\"><div class=\"tool-title\">Invoked skill <code>{}</code> \
+         (<code>{}</code>)</div>\n{}</div>\n",
+        html_escape(skill.name),
+        html_escape(skill.location),
+        render_markdown(skill.content),
+    ));
+    if let Some(msg) = skill.user_message.filter(|m| !m.is_empty()) {
+        out.push_str(&format!(
+            "<div class=\"text markdown\">{}</div>\n",
+            render_markdown(msg)
+        ));
+    }
+}
+
 fn render_image(out: &mut String, media_type: &str, data: &str) {
+    // `data` rides straight from `ContentBlock::Image`/`ImageSource` — a plain, unvalidated `String`
+    // deserialized from session JSONL on disk, so a tampered file or an untrusted tool's "image" output
+    // reaching here isn't guaranteed to actually be base64. Must be escaped like any other untrusted
+    // attribute value, or it can break out of the `src="..."` attribute into live HTML/script.
     out.push_str(&format!(
         "<img class=\"attachment\" src=\"data:{};base64,{}\" alt=\"attachment\">\n",
         html_escape(media_type),
-        data
+        html_escape(data)
     ));
 }
 
@@ -545,24 +725,89 @@ mod tests {
 
     #[test]
     fn renders_text_tool_use_and_tool_result_blocks() {
-        // `grep` (and every other tool without a dedicated renderer — see
-        // `renders_edit_write_bash_and_read_calls_with_dedicated_rendering` below for those) still
-        // falls back to generic pretty-printed JSON.
+        // A tool with no dedicated renderer (an invented name, not any real tool) still falls back to
+        // generic pretty-printed JSON — `grep` itself now has dedicated rendering, see
+        // `renders_grep_find_ls_and_beyond_calls_with_dedicated_rendering` below.
         let messages = vec![
             Message::user("please search a.rs"),
             Message::assistant(vec![ContentBlock::ToolUse {
                 id: "1".into(),
-                name: "grep".into(),
+                name: "some_future_tool".into(),
                 input: serde_json::json!({ "pattern": "fn main", "path": "a.rs" }),
             }]),
             Message::tool_result("1", "fn main() {}", false),
         ];
         let html = render_html(&meta(), &messages, &[]);
         assert!(html.contains("please search a.rs"));
-        assert!(html.contains("Called <code>grep</code>"));
+        assert!(html.contains("Called <code>some_future_tool</code>"));
         assert!(html.contains("&quot;pattern&quot;"));
         assert!(html.contains("fn main() {}"));
         assert!(html.contains("class=\"tool-result\""));
+    }
+
+    #[test]
+    fn renders_grep_find_ls_and_beyond_calls_with_dedicated_rendering() {
+        // MEDIUM pi-parity gap (fixed): grep/find/ls and the Beyond-platform tools (fork/sync/logs)
+        // used to fall back to generic pretty-printed JSON like any unrecognized tool; pi routes every
+        // tool, including third-party ones, through a rich renderer.
+        let messages = vec![
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "1".into(),
+                name: "grep".into(),
+                input: serde_json::json!({ "pattern": "fn main", "path": "src", "glob": "*.rs" }),
+            }]),
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "2".into(),
+                name: "find".into(),
+                input: serde_json::json!({ "pattern": "*.rs", "path": "src" }),
+            }]),
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "3".into(),
+                name: "ls".into(),
+                input: serde_json::json!({}),
+            }]),
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "4".into(),
+                name: "fork".into(),
+                input: serde_json::json!({ "app": "myapp", "name": "sandbox" }),
+            }]),
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "5".into(),
+                name: "sync".into(),
+                input: serde_json::json!({}),
+            }]),
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "6".into(),
+                name: "logs".into(),
+                input: serde_json::json!({ "app": "myapp", "query": "level:error" }),
+            }]),
+        ];
+        let html = render_html(&meta(), &messages, &[]);
+
+        assert!(
+            html.contains(
+                "Searched for <code>fn main</code> in <code>src</code> (glob <code>*.rs</code>)"
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains("Found files matching <code>*.rs</code> in <code>src</code>"),
+            "{html}"
+        );
+        assert!(html.contains("Listed <code>.</code>"), "{html}");
+        assert!(
+            html.contains("Forked <code>myapp</code> as <code>sandbox</code>"),
+            "{html}"
+        );
+        assert!(html.contains("Synced the project root"), "{html}");
+        assert!(
+            html.contains("Read logs for <code>myapp</code> (query: <code>level:error</code>)"),
+            "{html}"
+        );
+        assert!(
+            !html.contains("&quot;pattern&quot;") && !html.contains("&quot;app&quot;"),
+            "none of these should fall back to raw JSON: {html}"
+        );
     }
 
     #[test]
@@ -670,6 +915,32 @@ mod tests {
     }
 
     #[test]
+    fn href_attribute_breakout_is_neutralized() {
+        // Unit-tested at `sanitize_url` directly rather than through `render_html`: CommonMark's own
+        // bare-link-destination grammar doesn't accept a literal `"` followed by `onmouseover="...` as
+        // part of a destination (it reads as a malformed title), so `Parser` never emits a `Link` event
+        // for this text at all — it falls through as plain escaped text, never reaching `sanitize_url`.
+        // That's a safe outcome, just via a different mechanism than this test originally assumed; the
+        // real guarantee to pin is at the function `sanitize_url` actually owns: an allowed scheme's
+        // value passes through unmangled, and escaping the resulting attribute is
+        // `pulldown_cmark::html::push_html`'s job (well-established behavior of that crate, not ours to
+        // re-verify) — proven end-to-end by `drops_a_javascript_scheme_link_but_keeps_an_http_one`
+        // above for the non-adversarial case.
+        let value = "https://example.com\" onmouseover=\"alert(1)";
+        let cleaned = sanitize_url(pulldown_cmark::CowStr::Borrowed(value));
+        assert_eq!(cleaned.as_ref(), value);
+    }
+
+    #[test]
+    fn strips_c0_control_characters_from_a_url_before_the_scheme_check() {
+        // Unit-tested directly (see `href_attribute_breakout_is_neutralized` above for why): a raw C0
+        // control byte inside a bare markdown link destination isn't valid CommonMark either, so this
+        // can't be proven through `render_html` — `sanitize_url` is the actual owner of this behavior.
+        let cleaned = sanitize_url(pulldown_cmark::CowStr::Borrowed("https://exa\u{1}mple.com"));
+        assert_eq!(cleaned.as_ref(), "https://example.com");
+    }
+
+    #[test]
     fn defuses_raw_html_inside_markdown_text_to_plain_visible_text() {
         // Raw HTML in the markdown *source* (not the already-tested plain-text case above) must still
         // render as visible escaped text, not a live tag — a prompt-injected block quoted as "```" or
@@ -717,12 +988,89 @@ mod tests {
     }
 
     #[test]
+    fn renders_a_skill_invocation_as_a_distinct_block_from_the_trailing_user_message() {
+        // The exact wrapper shape `skills.rs::expand_if_skill_invocation` produces. Must render as a
+        // separate skill-invocation block (markdown body) plus a sibling text block for the trailing
+        // user message — not one raw-escaped blob with the `<skill>` tags visible as literal text.
+        let messages = vec![Message::user(
+            "<skill name=\"lint\" location=\"/x/.claude/skills/lint/SKILL.md\">\n\
+             References are relative to /x/.claude/skills/lint.\n\n\
+             Run `cargo clippy`.\n\
+             </skill>\n\n\
+             only src/main.rs",
+        )];
+        let html = render_html(&meta(), &messages, &[]);
+        assert!(
+            !html.contains("&lt;skill name="),
+            "the wrapper tag must not appear as visible raw-escaped text: {html}"
+        );
+        assert!(html.contains("class=\"skill-invocation\""));
+        assert!(html.contains("Invoked skill <code>lint</code>"));
+        assert!(html.contains("/x/.claude/skills/lint/SKILL.md"));
+        assert!(html.contains("Run <code>cargo clippy</code>")); // markdown-rendered, not raw-escaped
+        // The trailing user message renders as its own sibling block, after the skill block.
+        let skill_pos = html.find("skill-invocation").unwrap();
+        let trailing_pos = html.find("only src/main.rs").unwrap();
+        assert!(trailing_pos > skill_pos);
+    }
+
+    #[test]
+    fn a_skill_invocation_with_no_trailing_user_message_renders_no_extra_text_block() {
+        let messages = vec![Message::user(
+            "<skill name=\"lint\" location=\"/x/SKILL.md\">\nReferences are relative to /x.\n\n\
+             Body.\n</skill>",
+        )];
+        let html = render_html(&meta(), &messages, &[]);
+        assert!(html.contains("class=\"skill-invocation\""));
+        // Exactly one message-level div (the skill block doesn't spawn an empty trailing text div).
+        assert_eq!(html.matches("class=\"text markdown\"").count(), 0);
+    }
+
+    #[test]
+    fn text_that_merely_resembles_a_skill_tag_is_not_misparsed() {
+        // A user pasting something that starts with `<skill` but doesn't match the exact wrapper shape
+        // must fall through to ordinary (safely escaped) markdown rendering, not a broken skill block.
+        let messages = vec![Message::user("<skill>not a real wrapper</skill>")];
+        let html = render_html(&meta(), &messages, &[]);
+        assert!(!html.contains("class=\"skill-invocation\""));
+        assert!(html.contains("&lt;skill&gt;"));
+    }
+
+    #[test]
     fn renders_an_image_attachment_as_a_data_uri() {
         let messages = vec![Message::assistant(vec![ContentBlock::Image {
             source: ImageSource::base64("image/png", "Zm9v"),
         }])];
         let html = render_html(&meta(), &messages, &[]);
         assert!(html.contains("src=\"data:image/png;base64,Zm9v\""));
+    }
+
+    #[test]
+    fn escapes_adversarial_bytes_in_an_image_attachment_data_uri() {
+        // `ImageSource.data` rides straight from session JSONL on disk (or an untrusted tool result) —
+        // a plain, unvalidated `String`, not guaranteed to actually be base64. Must be escaped like any
+        // other untrusted attribute value or it can break out of `src="..."` into live HTML.
+        let messages = vec![Message::assistant(vec![ContentBlock::Image {
+            source: ImageSource::base64("image/png", "Zm9v\"><script>alert(1)</script>"),
+        }])];
+        let html = render_html(&meta(), &messages, &[]);
+        assert!(
+            !html.contains("<script>alert(1)</script>"),
+            "adversarial image data must not break out of the src attribute: {html}"
+        );
+        assert!(html.contains("&quot;&gt;&lt;script&gt;"));
+    }
+
+    #[test]
+    fn drops_a_javascript_scheme_markdown_image_but_keeps_a_data_uri_media_type_escaped() {
+        // The link-scheme allow-list is exercised above only for `<a href>`; markdown image syntax
+        // (`![alt](url)`) routes through the same `sanitize_url`, but nothing proved that directly.
+        let messages = vec![Message::user("![x](javascript:alert(1))")];
+        let html = render_html(&meta(), &messages, &[]);
+        assert!(
+            !html.contains("javascript:"),
+            "an unsafe URL scheme must never reach a live img src: {html}"
+        );
     }
 
     #[test]

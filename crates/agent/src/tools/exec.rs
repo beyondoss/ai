@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::sync::watch;
 
 /// Per-stream capture caps. We keep the first [`STREAM_HEAD`] and last [`STREAM_TAIL`] bytes of each
 /// of stdout/stderr and discard the middle *as it streams*, so a command that emits gigabytes (e.g.
@@ -17,6 +18,16 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 /// `bash` plenty to head/tail-truncate (with its own marker) on top.
 const STREAM_HEAD: usize = 128 * 1024;
 const STREAM_TAIL: usize = 128 * 1024;
+
+/// How long a pipe may sit silent, once the direct child has exited, before we stop waiting on it.
+/// Without this, a detached grandchild that inherits the stdout/stderr fd (e.g. `cmd &` backgrounding
+/// something before the shell itself exits) keeps the pipe open with no EOF, and the read loop blocks
+/// on it until the *outer command timeout* (default 30 minutes — see `bash.rs::DEFAULT_TIMEOUT_MS`)
+/// finally fires and reaps the process group. Re-armed on every chunk read after exit, so an actively
+/// writing descendant (e.g. a backgrounded `lint-staged` still flushing output) is never cut off early
+/// — only a genuinely quiet held-open handle releases us. Matches pi's `waitForChildProcess` fix for
+/// earendil-works/pi#5303 (`EXIT_STDIO_GRACE_MS = 100`).
+const POST_EXIT_IDLE_GRACE: Duration = Duration::from_millis(100);
 
 /// The result of running a command.
 #[derive(Debug, Clone, Default)]
@@ -101,11 +112,32 @@ impl RealRunner {
         let stderr = child.stderr.take();
         // Drain both pipes *concurrently* with the wait: a child that fills one pipe's OS buffer
         // while we read only the other would deadlock, and an unread pipe stalls the child's exit.
+        // `exited` fans the wait's completion out to both drains so each can switch from "block on
+        // reads" to "release after a short idle grace" the moment the direct child exits (see
+        // `POST_EXIT_IDLE_GRACE`), independent of whether the *other* stream's holder has let go yet.
+        let (exited_tx, exited_rx) = watch::channel(false);
+        let wait = async {
+            let status = child.wait().await;
+            let _ = exited_tx.send(true);
+            status
+        };
         let collect = async {
             let (status, out, err) = tokio::join!(
-                child.wait(),
-                drain_capped(stdout, STREAM_HEAD, STREAM_TAIL, on_chunk),
-                drain_capped(stderr, STREAM_HEAD, STREAM_TAIL, on_chunk),
+                wait,
+                drain_capped(
+                    stdout,
+                    STREAM_HEAD,
+                    STREAM_TAIL,
+                    on_chunk,
+                    exited_rx.clone()
+                ),
+                drain_capped(
+                    stderr,
+                    STREAM_HEAD,
+                    STREAM_TAIL,
+                    on_chunk,
+                    exited_rx.clone()
+                ),
             );
             (status, out, err)
         };
@@ -198,30 +230,54 @@ impl CommandRunner for RealRunner {
     }
 }
 
-/// Read a child pipe to EOF, keeping only the first `head_cap` and last `tail_cap` bytes; the middle
-/// is discarded as it arrives so memory stays bounded regardless of how much the command emits.
-/// Returns the kept bytes (head followed by tail) and whether any middle was dropped.
+/// Read a child pipe, keeping only the first `head_cap` and last `tail_cap` bytes; the middle is
+/// discarded as it arrives so memory stays bounded regardless of how much the command emits. Returns
+/// the kept bytes (head followed by tail) and whether any middle was dropped.
+///
+/// Two phases, gated on `exited`: while the direct child is still running, reads block normally (the
+/// only other thing worth racing is `exited` itself, so we notice the transition promptly instead of
+/// polling). Once the child has exited, a read that doesn't complete within [`POST_EXIT_IDLE_GRACE`]
+/// means only a *detached* descendant is holding this pipe open — release rather than block on it
+/// indefinitely; a real EOF or actively-arriving output is still captured either way.
 async fn drain_capped<R: AsyncRead + Unpin>(
     reader: Option<R>,
     head_cap: usize,
     tail_cap: usize,
     on_chunk: Option<ChunkSink<'_>>,
+    mut exited: watch::Receiver<bool>,
 ) -> (Vec<u8>, bool) {
     let mut cap = Capture::new(head_cap, tail_cap);
     if let Some(mut r) = reader {
         let mut buf = [0u8; 64 * 1024];
+        while !*exited.borrow() {
+            tokio::select! {
+                res = r.read(&mut buf) => {
+                    match res {
+                        Ok(0) => return cap.finish(),
+                        Ok(n) => {
+                            // Stream the chunk out for live progress *before* the cap drops any of it.
+                            if let Some(sink) = on_chunk {
+                                sink(&buf[..n]);
+                            }
+                            cap.push(&buf[..n]);
+                        }
+                        // A read error (e.g. the pipe closing under us) ends capture with what we have.
+                        Err(_) => return cap.finish(),
+                    }
+                }
+                _ = exited.changed() => {}
+            }
+        }
         loop {
-            match r.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    // Stream the chunk out for live progress *before* the cap drops any of it.
+            match tokio::time::timeout(POST_EXIT_IDLE_GRACE, r.read(&mut buf)).await {
+                Ok(Ok(0)) | Err(_) => break, // real EOF, or idle grace elapsed with nothing new
+                Ok(Ok(n)) => {
                     if let Some(sink) = on_chunk {
                         sink(&buf[..n]);
                     }
                     cap.push(&buf[..n]);
                 }
-                // A read error (e.g. the pipe closing under us) ends capture with what we have.
-                Err(_) => break,
+                Ok(Err(_)) => break,
             }
         }
     }
@@ -382,6 +438,54 @@ mod tests {
             !marker.exists(),
             "backgrounded grandchild survived dropping the future — process group not killed"
         );
+    }
+
+    #[tokio::test]
+    async fn resolves_promptly_when_a_detached_child_holds_the_pipe_open_but_stays_quiet() {
+        // pi issue #5303: a shell exits immediately but a backgrounded sleeper inherits the stdout
+        // pipe and holds it open without writing. We must release via the post-exit idle grace rather
+        // than block until the pipe's true EOF (which wouldn't arrive for 30s here) — and, before the
+        // fix, not until the overall command timeout either.
+        let start = std::time::Instant::now();
+        let res = RealRunner
+            .run(
+                "sh",
+                &["-c".into(), "printf 'DONE\\n'; ( sleep 30 ) &".into()],
+                None,
+                Duration::from_secs(25), // far longer than the idle grace should ever need
+            )
+            .await
+            .unwrap();
+        assert!(!res.timed_out);
+        assert_eq!(res.stdout, "DONE\n");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "took {:?}; must release via the idle grace, not wait on the held-open pipe",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn captures_output_emitted_after_exit_while_a_detached_child_holds_stdout_open() {
+        // Companion to the test above: the idle grace must not cut off output that's still actively
+        // arriving from a detached descendant — only a genuinely quiet handle releases early. Ticks
+        // land every 50ms, each one re-arming the 100ms grace, well past a single grace window.
+        let res = RealRunner
+            .run(
+                "sh",
+                &[
+                    "-c".into(),
+                    "printf 'HEAD\\n'; ( for i in 1 2 3 4 5 6; do sleep 0.05; printf \"TICK$i\\n\"; done ) &"
+                        .into(),
+                ],
+                None,
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        assert!(!res.timed_out);
+        assert!(res.stdout.contains("HEAD"), "got: {:?}", res.stdout);
+        assert!(res.stdout.contains("TICK6"), "got: {:?}", res.stdout);
     }
 
     #[tokio::test]

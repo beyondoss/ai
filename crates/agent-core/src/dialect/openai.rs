@@ -55,7 +55,7 @@ fn text_of(blocks: &[ContentBlock]) -> String {
     blocks
         .iter()
         .filter_map(|b| match b {
-            ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect()
@@ -94,7 +94,7 @@ fn user_content(blocks: &[ContentBlock], supports_vision: bool) -> Option<Value>
     let mut parts: Vec<Value> = Vec::new();
     for b in blocks {
         match b {
-            ContentBlock::Text { text } if !text.is_empty() => {
+            ContentBlock::Text { text, .. } if !text.is_empty() => {
                 parts.push(json!({ "type": "text", "text": text }));
             }
             ContentBlock::Image { source } => parts.push(json!({
@@ -217,7 +217,12 @@ pub fn build_body(req: &ModelRequest) -> Value {
         crate::models::MaxTokensField::MaxCompletionTokens => "max_completion_tokens",
         crate::models::MaxTokensField::MaxTokens => "max_tokens",
     };
-    map.insert(max_tokens_field.into(), json!(req.max_tokens));
+    // Clamped so the estimated prompt plus this ceiling doesn't already exceed the model's context
+    // window — see `super::clamp_max_tokens_to_context`'s doc comment for why this can't be skipped.
+    map.insert(
+        max_tokens_field.into(),
+        json!(super::clamp_max_tokens_to_context(req, &caps)),
+    );
     // Reasoning models are driven by `reasoning_effort` (minimal/low/medium/high/xhigh) rather than a
     // thinking-token budget; emit it when the model takes one and the caller set a level. When no
     // level is set but the model can be told explicitly to turn reasoning off, send that instead of
@@ -336,7 +341,12 @@ enum Open {
 const REASONING_FIELDS: [&str; 3] = ["reasoning_content", "reasoning", "reasoning_text"];
 
 /// Decodes OpenAI SSE. Synthesizes the block-stop boundaries OpenAI omits and holds `MessageStop`
-/// until `finish()` so it lands after the trailing usage chunk.
+/// until `finish()` so it lands after the trailing usage chunk. Chat Completions never has more than
+/// one block open at a time in this decoder's own model — `self.open`'s `None`/`Text`/`Thinking`/`Tool`
+/// states are mutually exclusive, closed via `close_open` before the next one starts — so every
+/// `StreamEvent` here always carries `index: 0`; a later, unrelated block reusing that same index
+/// number after the previous one closed is exactly as correct as Anthropic assigning it a fresh one,
+/// since `Accumulator` fully clears an index's state once it flushes.
 pub struct Decoder {
     started: bool,
     saw_finish: bool,
@@ -372,7 +382,7 @@ impl Default for Decoder {
 impl Decoder {
     fn close_open(&mut self, out: &mut Vec<StreamEvent>) {
         if self.open != Open::None {
-            out.push(StreamEvent::ContentBlockStop);
+            out.push(StreamEvent::ContentBlockStop { index: 0 });
             self.open = Open::None;
         }
     }
@@ -445,10 +455,12 @@ impl StreamDecoder for Decoder {
                 // The field name becomes the signature once, at the start of the block — `finish`
                 // doesn't need it again, and the accumulator just appends onto one signature string.
                 out.push(StreamEvent::SignatureDelta {
+                    index: 0,
                     signature: self.reasoning_field.unwrap_or_default().to_string(),
                 });
             }
             out.push(StreamEvent::ThinkingDelta {
+                index: 0,
                 text: text.to_string(),
             });
         }
@@ -463,6 +475,7 @@ impl StreamDecoder for Decoder {
                     self.open = Open::Text;
                 }
                 out.push(StreamEvent::TextDelta {
+                    index: 0,
                     text: text.to_string(),
                 });
             }
@@ -486,6 +499,7 @@ impl StreamDecoder for Decoder {
                         .unwrap_or("")
                         .to_string();
                     out.push(StreamEvent::ToolUseStart {
+                        index: 0,
                         id: id.to_string(),
                         name,
                     });
@@ -506,6 +520,7 @@ impl StreamDecoder for Decoder {
                     if !args.is_empty() {
                         if belongs_to_open {
                             out.push(StreamEvent::InputJsonDelta {
+                                index: 0,
                                 partial_json: args.to_string(),
                             });
                         } else {
@@ -560,9 +575,7 @@ mod tests {
             vec![
                 Message::user("weather?"),
                 Message::assistant(vec![
-                    ContentBlock::Text {
-                        text: "checking".into(),
-                    },
+                    ContentBlock::text("checking"),
                     ContentBlock::ToolUse {
                         id: "call_1".into(),
                         name: "get_weather".into(),
@@ -788,6 +801,30 @@ mod tests {
     }
 
     #[test]
+    fn max_tokens_is_clamped_when_the_live_prompt_nears_the_context_window() {
+        // HIGH pi-parity gap (fixed): `clamp_max_tokens_to_context` was implemented for the Anthropic
+        // dialect only; this Chat-Completions dialect wrote `req.max_tokens` straight onto the wire
+        // unclamped. gpt-4o: 128_000 context window. A ~100_000-token prompt (400_000 chars, the
+        // chars/4 estimator) leaves 128_000 - 100_000 - 4_096 (the shared margin) = 23_904 tokens of
+        // headroom — less than the request's own (artificially large, to force the clamp) max_tokens.
+        let big_text = "x".repeat(400_000);
+        let req = ModelRequest::new("gpt-4o", vec![Message::user(big_text)], 50_000);
+        let body = build_body(&req);
+        assert_eq!(
+            body["max_tokens"], 23_904,
+            "max_tokens must be clamped down to the actual remaining context headroom, not sent as \
+             the static 50_000 ceiling regardless of how much of the window the prompt already fills"
+        );
+    }
+
+    #[test]
+    fn max_tokens_is_unchanged_for_a_prompt_nowhere_near_the_context_window() {
+        let req = ModelRequest::new("gpt-4o", vec![Message::user("hi")], 8_192);
+        let body = build_body(&req);
+        assert_eq!(body["max_tokens"], 8_192);
+    }
+
+    #[test]
     fn tool_choice_emitted_only_when_set() {
         use crate::transport::ToolChoice;
         let tools = vec![ToolDef {
@@ -862,22 +899,26 @@ data: [DONE]
             vec![
                 StreamEvent::MessageStart,
                 StreamEvent::TextDelta {
+                    index: 0,
                     text: "Let me check.".into()
                 },
                 // Text block closes when the tool call begins — same shape the Anthropic decoder
                 // produces, so the loop assembles both dialects identically.
-                StreamEvent::ContentBlockStop,
+                StreamEvent::ContentBlockStop { index: 0 },
                 StreamEvent::ToolUseStart {
+                    index: 0,
                     id: "call_42".into(),
                     name: "get_weather".into()
                 },
                 StreamEvent::InputJsonDelta {
+                    index: 0,
                     partial_json: "{\"city\":".into()
                 },
                 StreamEvent::InputJsonDelta {
+                    index: 0,
                     partial_json: "\"SF\"}".into()
                 },
-                StreamEvent::ContentBlockStop,
+                StreamEvent::ContentBlockStop { index: 0 },
                 StreamEvent::Usage(TokenUsage {
                     input_tokens: 24,
                     output_tokens: 31,
@@ -959,22 +1000,30 @@ data: [DONE]
             vec![
                 StreamEvent::MessageStart,
                 StreamEvent::ToolUseStart {
+                    index: 0,
                     id: "call_A".into(),
                     name: "alpha".into(),
                 },
                 StreamEvent::InputJsonDelta {
+                    index: 0,
                     partial_json: "{\"x\":1".into(),
                 },
-                StreamEvent::ContentBlockStop,
+                StreamEvent::ContentBlockStop { index: 0 },
+                // call_B reuses `StreamEvent` index 0 too — this decoder force-closes on any switch
+                // (see its own doc comment), so call_A and call_B are never concurrently open in its
+                // model even though their *wire* deltas interleave; a fresh index is unnecessary since
+                // `Accumulator` already fully flushed and cleared index 0 for call_A above.
                 StreamEvent::ToolUseStart {
+                    index: 0,
                     id: "call_B".into(),
                     name: "beta".into(),
                 },
                 // The stray index-0 "}" fragment is dropped here — not appended to call_B's buffer.
                 StreamEvent::InputJsonDelta {
+                    index: 0,
                     partial_json: "{\"y\":2}".into(),
                 },
-                StreamEvent::ContentBlockStop,
+                StreamEvent::ContentBlockStop { index: 0 },
                 StreamEvent::MessageStop {
                     stop_reason: StopReason::ToolUse,
                 },
@@ -1041,19 +1090,23 @@ data: [DONE]
             vec![
                 StreamEvent::MessageStart,
                 StreamEvent::SignatureDelta {
+                    index: 0,
                     signature: "reasoning_content".into()
                 },
                 StreamEvent::ThinkingDelta {
+                    index: 0,
                     text: "Let me ".into()
                 },
                 StreamEvent::ThinkingDelta {
+                    index: 0,
                     text: "think.".into()
                 },
-                StreamEvent::ContentBlockStop, // thinking closes when text starts
+                StreamEvent::ContentBlockStop { index: 0 }, // thinking closes when text starts
                 StreamEvent::TextDelta {
+                    index: 0,
                     text: "Answer.".into()
                 },
-                StreamEvent::ContentBlockStop,
+                StreamEvent::ContentBlockStop { index: 0 },
                 StreamEvent::MessageStop {
                     stop_reason: StopReason::EndTurn
                 },
@@ -1080,7 +1133,7 @@ data: [DONE]
         let thinking_text: String = events
             .iter()
             .filter_map(|e| match e {
-                StreamEvent::ThinkingDelta { text } => Some(text.as_str()),
+                StreamEvent::ThinkingDelta { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect();
@@ -1098,7 +1151,7 @@ data: [DONE]
                         text: "step one".into(),
                         signature: "reasoning".into(),
                     },
-                    ContentBlock::Text { text: "42".into() },
+                    ContentBlock::text("42"),
                 ]),
             ],
             64,

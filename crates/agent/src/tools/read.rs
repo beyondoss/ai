@@ -46,6 +46,37 @@ const MAX_OUTPUT_BYTES: usize = super::output::DEFAULT_MAX_BYTES;
 
 pub struct Read;
 
+/// If `path` doesn't exist as given, try a small set of Unicode-normalization fallbacks pi's `read`
+/// tool also tries (`resolveReadPath`), in order: NFD-decomposed form, straight-to-curly-quote
+/// substitution (`'` → U+2019), and the combination of both. A model or user typing an NFC/straight-
+/// quote path when the real file — often synced from, or itself referencing, a macOS-authored name —
+/// uses NFD/curly-quote form would otherwise fail with a confusing "not found" despite the file
+/// genuinely existing. Returns `path` unchanged when it already exists, or when none of the fallbacks
+/// resolve to a real file (the caller's own error path still fires, just against the original path so
+/// the error message names what the caller actually typed). Deliberately skips pi's macOS-specific
+/// AM/PM narrow-no-break-space screenshot variant — that's Finder-clipboard-naming-specific and this
+/// agent targets Linux, where it can never fire.
+fn resolve_read_path(path: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+
+    if std::path::Path::new(path).exists() {
+        return path.to_string();
+    }
+    let nfd: String = path.nfd().collect();
+    if nfd != path && std::path::Path::new(&nfd).exists() {
+        return nfd;
+    }
+    let curly = path.replace('\'', "\u{2019}");
+    if curly != path && std::path::Path::new(&curly).exists() {
+        return curly;
+    }
+    let nfd_curly = nfd.replace('\'', "\u{2019}");
+    if nfd_curly != path && std::path::Path::new(&nfd_curly).exists() {
+        return nfd_curly;
+    }
+    path.to_string()
+}
+
 /// Read one line into `buf` (without the trailing newline), keeping at most `cap` bytes; bytes beyond
 /// `cap` are consumed from the stream but discarded, so a single huge line can't balloon memory.
 /// Returns `(bytes_consumed, truncated)`; `bytes_consumed == 0` means EOF.
@@ -111,7 +142,7 @@ impl Tool for Read {
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing `path`".into()))?;
-        let path = super::normalize_path(path);
+        let path = resolve_read_path(&super::normalize_path(path));
 
         // An image file is returned as an attachment the multimodal model can see, not decoded as
         // UTF-8 text (which would hand back garbage). Routing is decided primarily by sniffing the
@@ -351,16 +382,27 @@ fn read_image(path: &str, ext_format: image::ImageFormat) -> Result<ToolOutput, 
         // first (even on its own already-fits fast path) rather than shipping raw bytes through
         // unchecked. The original bytes are still sent unmodified on success — this only rules out
         // sending something that isn't really a decodable image.
-        if let Err(e) = image::load_from_memory_with_format(&bytes, format) {
-            return Err(ToolError::InvalidInput(format!(
-                "image {path} does not decode as a valid {media_type} file: {e}"
-            )));
+        let decoded = match image::load_from_memory_with_format(&bytes, format) {
+            Ok(img) => img,
+            Err(e) => {
+                return Err(ToolError::InvalidInput(format!(
+                    "image {path} does not decode as a valid {media_type} file: {e}"
+                )));
+            }
+        };
+        // The fast path only applies when *both* the byte size and the pixel dimensions are within
+        // budget — matching pi, which checks `originalWidth <= maxWidth && originalHeight <= maxHeight
+        // && inputBase64Size < maxBytes` together. A large-dimension image that happens to compress to
+        // a small file (e.g. a huge flat-color PNG) must still be downscaled: sending it unresized would
+        // exceed `MAX_IMAGE_DIMENSION` even though it fits the byte budget. An image within the byte
+        // budget but over-dimensioned falls through to `resize_image` below instead of returning here.
+        if decoded.width() <= MAX_IMAGE_DIMENSION && decoded.height() <= MAX_IMAGE_DIMENSION {
+            let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            return Ok(ToolOutput::image(
+                format!("Read image {path} ({media_type}, {} bytes).", bytes.len()),
+                ImageSource::base64(media_type, data),
+            ));
         }
-        let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        return Ok(ToolOutput::image(
-            format!("Read image {path} ({media_type}, {} bytes).", bytes.len()),
-            ImageSource::base64(media_type, data),
-        ));
     }
 
     match resize_image(
@@ -375,10 +417,18 @@ fn read_image(path: &str, ext_format: image::ImageFormat) -> Result<ToolOutput, 
             let (orig_w, orig_h) = resized.orig_dimensions;
             let (new_w, new_h) = resized.dimensions;
             let resized_media_type = resized.media_type;
+            // Aspect-ratio-preserving resize (`image::resize`, not `resize_exact`) scales both
+            // dimensions by the same factor, so either ratio works; width matches pi's own
+            // `formatDimensionNote` (`originalWidth / width`) exactly. Precomputing and stating the
+            // multiplier — not just the two dimension pairs — saves the model from re-deriving it
+            // (and from a division-order mistake) whenever it needs to map a point it identified in
+            // the downscaled image back to the original's coordinate space (e.g. a click target).
+            let scale = f64::from(orig_w) / f64::from(new_w);
             Ok(ToolOutput::image(
                 format!(
                     "Read image {path} ({media_type}, {} bytes); resized from {orig_w}x{orig_h} to \
-                     {new_w}x{new_h} ({resized_media_type}) to fit within the inline size budget.",
+                     {new_w}x{new_h} ({resized_media_type}) to fit within the inline size budget. \
+                     Multiply coordinates by {scale:.2} to map to the original image.",
                     bytes.len()
                 ),
                 ImageSource::base64(resized_media_type, resized.base64_data),
@@ -577,6 +627,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn no_limit_argument_defaults_to_a_2000_line_cap() {
+        // Every other truncation test passes an explicit `limit`; this proves the actual default
+        // (`DEFAULT_LIMIT`) kicks in when the argument is omitted entirely.
+        let body = (1..=2500)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let f = tmp_file(&format!("{body}\n"));
+        let out = Read
+            .run(json!({ "path": f.path().to_str().unwrap() }))
+            .await
+            .unwrap()
+            .text;
+        assert!(out.contains("  2000\t2000"), "line 2000 must be shown");
+        assert!(!out.contains("\t2001\n"), "line 2001 must not be shown");
+        assert!(
+            out.contains("use offset=2001 to continue"),
+            "got: {}",
+            &out[out.len().saturating_sub(200)..]
+        );
+    }
+
+    #[tokio::test]
     async fn honors_offset_and_limit() {
         let f = tmp_file("a\nb\nc\nd\ne\n");
         let out = Read
@@ -593,6 +666,53 @@ mod tests {
     async fn missing_file_is_execution_error() {
         let err = Read
             .run(json!({ "path": "/no/such/file/xyz" }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Execution(_)));
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_the_nfd_form_of_a_path_that_does_not_exist_as_nfc() {
+        // pi: path-utils.test.ts, `resolveReadPath` NFD fallback. The file on disk is named with a
+        // combining accent (NFD: "e" + U+0301), the way macOS stores filenames — the caller passes the
+        // precomposed NFC form ("é", a single codepoint), which doesn't byte-match the real filename.
+        let dir = tempfile::tempdir().unwrap();
+        let nfd_name = "cafe\u{301}.txt"; // NFD: e + combining acute accent
+        std::fs::write(dir.path().join(nfd_name), "content").unwrap();
+
+        let nfc_path = dir.path().join("caf\u{e9}.txt"); // NFC: precomposed é
+        let out = Read
+            .run(json!({ "path": nfc_path.to_str().unwrap() }))
+            .await
+            .unwrap()
+            .text;
+        assert!(out.contains("content"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_a_curly_quote_variant_of_a_path_that_does_not_exist_with_a_straight_quote()
+     {
+        // pi: path-utils.test.ts, `resolveReadPath` curly-quote fallback — macOS uses U+2019 in some
+        // generated filenames; a user/model typing a straight apostrophe should still find the file.
+        let dir = tempfile::tempdir().unwrap();
+        let curly_name = "don\u{2019}t.txt"; // U+2019 right single quotation mark
+        std::fs::write(dir.path().join(curly_name), "content").unwrap();
+
+        let straight_path = dir.path().join("don't.txt"); // U+0027 straight apostrophe
+        let out = Read
+            .run(json!({ "path": straight_path.to_str().unwrap() }))
+            .await
+            .unwrap()
+            .text;
+        assert!(out.contains("content"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn a_genuinely_missing_file_still_errors_after_exhausting_fallbacks() {
+        // None of the Unicode-normalization fallbacks should turn a truly nonexistent file into a
+        // false positive.
+        let err = Read
+            .run(json!({ "path": "/no/such/file/xyz-caf\u{e9}-don't.txt" }))
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Execution(_)));
@@ -751,6 +871,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_large_dimension_but_small_byte_size_image_is_still_downscaled() {
+        // A flat color compresses so well under PNG that the file is tiny even at a huge resolution —
+        // the byte-size fast path alone would wrongly ship it unresized, exceeding MAX_IMAGE_DIMENSION.
+        // The fast path must also check dimensions, not just base64 byte size (pi: `resizeImageInProcess`
+        // checks `originalWidth <= maxWidth && originalHeight <= maxHeight && inputBase64Size < maxBytes`
+        // together).
+        let width = MAX_IMAGE_DIMENSION + 500;
+        let height = MAX_IMAGE_DIMENSION + 500;
+        let img = image::RgbImage::from_pixel(width, height, image::Rgb([10, 20, 30]));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge_flat.png");
+        image::DynamicImage::ImageRgb8(img)
+            .save_with_format(&path, image::ImageFormat::Png)
+            .unwrap();
+        assert!(
+            base64_len(std::fs::metadata(&path).unwrap().len() as usize)
+                <= MAX_IMAGE_BASE64_BYTES as usize,
+            "fixture must fit the byte budget as-is, so only the dimension check can catch it"
+        );
+
+        let out = Read
+            .run(json!({ "path": path.to_str().unwrap() }))
+            .await
+            .unwrap();
+        assert_eq!(out.images.len(), 1);
+        let decoded = image::load_from_memory(
+            &base64::engine::general_purpose::STANDARD
+                .decode(&out.images[0].data)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            decoded.width() <= MAX_IMAGE_DIMENSION && decoded.height() <= MAX_IMAGE_DIMENSION,
+            "must be downscaled despite fitting the byte budget: {}x{}",
+            decoded.width(),
+            decoded.height()
+        );
+        assert!(out.text.contains("resized from"), "got: {}", out.text);
+    }
+
+    #[tokio::test]
+    async fn resize_note_states_the_exact_coordinate_scale_multiplier() {
+        // A clean 2x-oversized square: MAX_IMAGE_DIMENSION * 2 on each side downscales to exactly
+        // MAX_IMAGE_DIMENSION, so `orig_w / new_w` is exactly 2.00 — a value precise enough to catch a
+        // wrong-direction division (e.g. `new_w / orig_w`, which would print "0.50" instead).
+        let side = MAX_IMAGE_DIMENSION * 2;
+        let img = image::RgbImage::from_pixel(side, side, image::Rgb([10, 20, 30]));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge_flat_square.png");
+        image::DynamicImage::ImageRgb8(img)
+            .save_with_format(&path, image::ImageFormat::Png)
+            .unwrap();
+
+        let out = Read
+            .run(json!({ "path": path.to_str().unwrap() }))
+            .await
+            .unwrap();
+        assert!(
+            out.text
+                .contains("Multiply coordinates by 2.00 to map to the original image"),
+            "got: {}",
+            out.text
+        );
+    }
+
+    #[tokio::test]
     async fn oversized_image_is_downscaled_to_fit_the_base64_budget() {
         // An uncompressed BMP well past MAX_IMAGE_DIMENSION on one side and comfortably over the
         // base64 budget in raw size — proves the resize path actually engages and lands under budget.
@@ -802,6 +988,15 @@ mod tests {
         assert!(
             out.text.contains("resized from"),
             "the resize must be noted in the text: {}",
+            out.text
+        );
+        // LOW pi-parity gap (fixed): pi's `formatDimensionNote` precomputes and states the coordinate
+        // multiplier the model needs to map a point in the downscaled image back to the original — not
+        // just the two dimension pairs, which would leave the model to (maybe incorrectly) re-derive it.
+        assert!(
+            out.text.contains("Multiply coordinates by")
+                && out.text.contains("to map to the original image"),
+            "the resize note must state the coordinate-scale multiplier: {}",
             out.text
         );
     }
@@ -1125,6 +1320,22 @@ mod tests {
         let resized = resize_image(&bytes, image::ImageFormat::Png, 200, 200, 200_000, 80)
             .expect("a downscaled smooth gradient must fit comfortably");
         assert_eq!(resized.media_type, "image/png");
+    }
+
+    #[test]
+    fn resize_image_returns_none_when_the_budget_is_unreachable() {
+        // Even at the smallest size/quality floor the retry loop bottoms out at, a 1-byte budget can
+        // never be hit — `resize_image` must report that as `None` rather than looping forever or
+        // returning something that silently exceeds the caller's budget.
+        let img = image::RgbImage::from_pixel(64, 64, image::Rgb([10, 20, 30]));
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        assert!(resize_image(&bytes, image::ImageFormat::Png, 100, 100, 1, 80).is_none());
     }
 
     #[test]

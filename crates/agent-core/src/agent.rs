@@ -69,6 +69,11 @@ pub enum AgentEvent {
     Steered { messages: usize },
     /// The run finished normally (the model ended its turn and no steering was queued).
     AgentEnd { steps: u32 },
+    /// A compaction round has begun — [`Agent::compact`] confirmed a worthwhile prefix exists and is
+    /// about to make its first summarization model call. Emitted before [`Compacted`](Self::Compacted),
+    /// which reports the same round's outcome once it finishes; a caller tracking "is a compaction
+    /// currently in flight" (pi's `isCompacting`) sets a flag on this event and clears it on `Compacted`.
+    CompactionStart { reason: CompactionReason },
     /// The conversation prefix was summarized to stay under the context window.
     Compacted {
         messages_before: usize,
@@ -588,7 +593,13 @@ impl Agent {
                 }
                 let count = injected.len();
                 for msg in injected {
-                    session.user(msg);
+                    if msg.images.is_empty() {
+                        session.user(msg.text);
+                    } else {
+                        session.push(crate::message::Message::user_with_images(
+                            msg.text, msg.images,
+                        ));
+                    }
                 }
                 sink(AgentEvent::Steered { messages: count });
                 // A plain user message ends the visible history here — a valid, resumable checkpoint
@@ -836,7 +847,10 @@ impl Agent {
             let steered = steering.drain_steer();
             let steered_count = steered.len();
             for msg in steered {
-                result_blocks.push(ContentBlock::Text { text: msg });
+                result_blocks.push(ContentBlock::text(msg.text));
+                for source in msg.images {
+                    result_blocks.push(ContentBlock::Image { source });
+                }
             }
             session.push(Message::tool_results(result_blocks));
             // A tool round-trip just landed: assistant `tool_use` and its matching `tool_result`s are
@@ -973,6 +987,7 @@ impl Agent {
         else {
             return Ok(false);
         };
+        sink(AgentEvent::CompactionStart { reason });
         let first_kept = cut.first_kept;
         let before = session.messages.len();
         let tokens_before = session.last_input_tokens;
@@ -1093,7 +1108,7 @@ impl Agent {
             .blocks
             .iter()
             .filter_map(|b| match b {
-                ContentBlock::Text { text } => Some(text.as_str()),
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect())
@@ -1107,7 +1122,7 @@ fn turn_text(turn: &Turn) -> String {
     turn.blocks
         .iter()
         .filter_map(|b| match b {
-            ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect()
@@ -1296,6 +1311,31 @@ const MID_STREAM_RETRYABLE_ERROR_TYPES: &[&str] = &[
     "service_unavailable",
 ];
 
+/// Free-text prose fallback for a transient in-band error whose `error.type` field is missing,
+/// differently-shaped, or absent entirely (a plain-text/HTML error body, or a provider that doesn't
+/// use OpenAI/Anthropic's `type` vocabulary) — pi's `RETRYABLE_PROVIDER_ERROR_PATTERN`
+/// (`packages/ai/src/utils/retry.ts`), narrowed to this crate's two dialects. Deliberately excludes
+/// everything [`MID_STREAM_RETRYABLE_ERROR_TYPES`]'s doc comment already excludes raw status digits
+/// for (the same "500 in a mid-stream message is more likely a token count than a status code" risk
+/// applies equally to prose — digits stay whole-run-only, see `agent::retry::WHOLE_RUN_RETRYABLE_STATUS_DIGITS`
+/// in the `agent` crate), pi's WebSocket/HTTP2/Bedrock-specific text (this crate never uses those
+/// transports), pi's quota/billing exclusion list (unnecessary here — this function is an *allowlist*
+/// of known-retryable shapes, not pi's broad-regex-then-exclude, so an unrecognized quota/billing
+/// message simply never matches in the first place), and bare single ambiguous words like "terminated"
+/// (too easily a false positive from something unrelated a provider's own error wrapper mentions).
+const MID_STREAM_RETRYABLE_FREE_TEXT_PATTERNS: &[&str] = &[
+    "rate limit",
+    "too many requests",
+    "server error",
+    "internal error",
+    "service unavailable",
+    "provider returned error",
+    "network error",
+    "connection error",
+    "timed out",
+    "ended without",
+];
+
 /// Phrases a provider uses to explicitly say "this specific failure is safe to retry" — pi's own
 /// retry-guidance patterns (`"you can retry your request"` etc., seen from OpenAI Responses/Bedrock).
 const MID_STREAM_RETRY_GUIDANCE_PHRASES: &[&str] = &[
@@ -1311,7 +1351,8 @@ const MID_STREAM_RETRY_GUIDANCE_PHRASES: &[&str] = &[
 /// - an in-band error event whose type is [`MID_STREAM_RETRYABLE_ERROR_TYPES`] (`overloaded_error`
 ///   checked separately below since it predates the table; `dialect::sse_error` prefixes every in-band
 ///   error `"provider stream error: "`, matched by substring since the exact wrapping is an
-///   implementation detail this shouldn't couple to) or carries one of
+///   implementation detail this shouldn't couple to), or whose *message* prose (not a recognized
+///   `error.type`) matches [`MID_STREAM_RETRYABLE_FREE_TEXT_PATTERNS`] or carries one of
 ///   [`MID_STREAM_RETRY_GUIDANCE_PHRASES`],
 /// - or a genuine network failure hitting the response body after it started flowing — a connection
 ///   reset, a read timeout, an unexpected EOF (tagged [`MID_STREAM_NETWORK_ERROR`] by the transport;
@@ -1340,6 +1381,9 @@ pub fn is_retryable_mid_stream(e: &Error) -> bool {
         || m.contains("overloaded")
         || msg.contains(MID_STREAM_NETWORK_ERROR)
         || MID_STREAM_RETRYABLE_ERROR_TYPES
+            .iter()
+            .any(|p| m.contains(p))
+        || MID_STREAM_RETRYABLE_FREE_TEXT_PATTERNS
             .iter()
             .any(|p| m.contains(p))
         || MID_STREAM_RETRY_GUIDANCE_PHRASES
@@ -1484,15 +1528,41 @@ struct Turn {
     malformed: Vec<(String, String)>,
 }
 
-/// Folds a `StreamEvent` sequence into content blocks. Text accrues into the current text run; a
-/// tool call accrues its streamed JSON argument fragments; `ContentBlockStop` finalizes whichever is
-/// open. Works identically for both dialects because they emit the same event shape.
+/// One still-open content block's accumulated state, keyed by its `index` in [`Accumulator::open`].
+enum OpenBlock {
+    /// (text, id, phase) of an open text block — `id`/`phase` are OpenAI Responses' replay
+    /// metadata, populated only by that dialect's `TextFinal` (see `ContentBlock::Text`).
+    Text(String, Option<String>, Option<String>),
+    /// (text, signature) of an open thinking block.
+    Thinking(String, String),
+    /// (id, name, json-arg buffer) of an open tool call.
+    Tool(String, String, String),
+}
+
+/// Folds a `StreamEvent` sequence into content blocks. Every block-scoped event carries an `index`,
+/// and more than one can be open at once — a dialect whose wire genuinely interleaves multiple blocks
+/// (currently only OpenAI Responses, when the model streams two tool calls' arguments concurrently)
+/// reports them as such, each accruing its own text/thinking/tool-argument state independently rather
+/// than one being buffered and replayed as a single burst once the other closes. `ContentBlockStop`
+/// finalizes one index; a finalized index is held in `done` until every *earlier-declared* index has
+/// also finalized, then the run of consecutively-ready entries flushes into `blocks` in declaration
+/// order (`try_flush`) — so the assembled message never reorders blocks relative to when the model
+/// announced them, even though a later-declared block may finish streaming its content first. A
+/// dialect whose wire never interleaves (Anthropic in practice, OpenAI Chat Completions' text) just
+/// always uses index 0, so exactly one index is ever open and this degenerates to the old
+/// single-current-block behavior.
 #[derive(Default)]
 struct Accumulator {
+    /// Declaration order of every index seen so far, oldest first.
+    order: Vec<usize>,
+    /// Still-open blocks, by index.
+    open: HashMap<usize, OpenBlock>,
+    /// Finalized blocks awaiting their turn to flush (an index whose `ContentBlockStop` arrived before
+    /// an earlier-declared index's own), by index. `None` means the index resolved to no content at
+    /// all (e.g. a text block that never accrued anything) — still needs a slot so `try_flush` knows
+    /// it's resolved and doesn't stall waiting on it forever, it just contributes nothing to `blocks`.
+    done: HashMap<usize, Option<ContentBlock>>,
     blocks: Vec<ContentBlock>,
-    text: String,
-    thinking: Option<(String, String)>, // (text, signature) of an open thinking block
-    tool: Option<(String, String, String)>, // (id, name, json-arg buffer)
     stop_reason: StopReason,
     usage: TokenUsage,
     /// Tool calls whose streamed JSON arguments failed to parse, as `(id, raw buffer)`. Surfaced on
@@ -1501,102 +1571,173 @@ struct Accumulator {
 }
 
 impl Accumulator {
+    /// Record `index` in declaration order, the first time anything mentions it. O(1) — checks the
+    /// maps, not a linear scan of `order`, since this runs on every single delta (hundreds to thousands
+    /// per turn).
+    fn declare(&mut self, index: usize) {
+        if !self.open.contains_key(&index) && !self.done.contains_key(&index) {
+            self.order.push(index);
+        }
+    }
+
     // Borrows rather than takes `StreamEvent` by value: a streamed turn folds hundreds to thousands
     // of deltas through here, and the caller (`run_turn_once`) also needs the event afterward (to
     // `emit` it) — taking it by value would force a clone on every single delta just so both sides
-    // get their own copy. Only the two block-boundary variants (`RedactedThinking`, `ToolUseStart`)
-    // need an owned copy of their payload for `self.blocks`/`self.tool`; the four high-frequency delta
-    // variants (`TextDelta`/`ThinkingDelta`/`SignatureDelta`/`InputJsonDelta`) just borrow to
-    // `push_str`, and `Usage`/`MessageStop` are `Copy`.
+    // get their own copy. Only the block-boundary variants need an owned copy of their payload for
+    // `self.open`/`self.blocks`; the high-frequency delta variants just borrow to `push_str`, and
+    // `Usage`/`MessageStop` are `Copy`.
     fn apply(&mut self, ev: &StreamEvent) {
         match ev {
             StreamEvent::MessageStart => {}
-            StreamEvent::TextDelta { text } => self.text.push_str(text),
-            StreamEvent::ThinkingDelta { text } => {
-                self.thinking
-                    .get_or_insert_with(Default::default)
-                    .0
-                    .push_str(text);
+            StreamEvent::TextDelta { index, text } => {
+                self.declare(*index);
+                if let OpenBlock::Text(s, ..) = self
+                    .open
+                    .entry(*index)
+                    .or_insert_with(|| OpenBlock::Text(String::new(), None, None))
+                {
+                    s.push_str(text);
+                }
             }
-            StreamEvent::SignatureDelta { signature } => {
-                self.thinking
-                    .get_or_insert_with(Default::default)
-                    .1
-                    .push_str(signature);
+            StreamEvent::ThinkingDelta { index, text } => {
+                self.declare(*index);
+                if let OpenBlock::Thinking(t, _) = self
+                    .open
+                    .entry(*index)
+                    .or_insert_with(|| OpenBlock::Thinking(String::new(), String::new()))
+                {
+                    t.push_str(text);
+                }
             }
-            StreamEvent::RedactedThinking { data } => {
-                // Self-contained block with no deltas — close any open text and emit it directly.
-                self.flush_text();
-                self.blocks
-                    .push(ContentBlock::RedactedThinking { data: data.clone() });
+            StreamEvent::SignatureDelta { index, signature } => {
+                self.declare(*index);
+                if let OpenBlock::Thinking(_, sig) = self
+                    .open
+                    .entry(*index)
+                    .or_insert_with(|| OpenBlock::Thinking(String::new(), String::new()))
+                {
+                    sig.push_str(signature);
+                }
             }
-            StreamEvent::ToolUseStart { id, name } => {
-                self.flush_text();
-                self.tool = Some((id.clone(), name.clone(), String::new()));
+            StreamEvent::RedactedThinking { index, data } => {
+                // Self-contained — no delta phase, so there's no `open` entry, just an immediate
+                // resolution in its declared position.
+                self.declare(*index);
+                self.done.insert(
+                    *index,
+                    Some(ContentBlock::RedactedThinking { data: data.clone() }),
+                );
+                self.try_flush();
             }
-            StreamEvent::InputJsonDelta { partial_json } => {
-                if let Some((_, _, buf)) = &mut self.tool {
+            StreamEvent::ToolUseStart { index, id, name } => {
+                self.declare(*index);
+                self.open.insert(
+                    *index,
+                    OpenBlock::Tool(id.clone(), name.clone(), String::new()),
+                );
+            }
+            StreamEvent::InputJsonDelta {
+                index,
+                partial_json,
+            } => {
+                if let Some(OpenBlock::Tool(_, _, buf)) = self.open.get_mut(index) {
                     buf.push_str(partial_json);
                 }
             }
-            StreamEvent::InputJsonFinal { full_json } => {
-                if let Some((_, _, buf)) = &mut self.tool {
+            StreamEvent::InputJsonFinal { index, full_json } => {
+                if let Some(OpenBlock::Tool(_, _, buf)) = self.open.get_mut(index) {
                     buf.clone_from(full_json);
                 }
             }
-            StreamEvent::TextFinal { text } => self.text.clone_from(text),
-            StreamEvent::ContentBlockStop => self.flush_block(),
+            StreamEvent::TextFinal {
+                index,
+                text,
+                id,
+                phase,
+            } => {
+                if let Some(OpenBlock::Text(s, block_id, block_phase)) = self.open.get_mut(index) {
+                    s.clone_from(text);
+                    block_id.clone_from(id);
+                    block_phase.clone_from(phase);
+                }
+            }
+            StreamEvent::ContentBlockStop { index } => self.flush_block(*index),
             StreamEvent::Usage(usage) => self.usage = *usage,
             StreamEvent::MessageStop { stop_reason } => self.stop_reason = *stop_reason,
         }
     }
 
-    fn flush_text(&mut self) {
-        if !self.text.is_empty() {
-            self.blocks.push(ContentBlock::Text {
-                text: std::mem::take(&mut self.text),
-            });
-        }
+    /// Finalize `index`: convert its accumulated state into a `ContentBlock` (or nothing, for an empty
+    /// text run) and record it in `done`, then flush whatever consecutive run of declared indices, from
+    /// the front, is now fully resolved.
+    fn flush_block(&mut self, index: usize) {
+        let Some(open_block) = self.open.remove(&index) else {
+            // A `ContentBlockStop` with nothing open at this index (never declared, or already
+            // flushed) — harmless no-op, same as the old code's behavior for a spurious extra stop.
+            return;
+        };
+        let block = match open_block {
+            OpenBlock::Tool(id, name, args) => {
+                let input = if args.trim().is_empty() {
+                    json!({})
+                } else {
+                    let parsed = serde_json::from_str(&args)
+                        .or_else(|_| serde_json::from_str(&repair_json(&args)))
+                        .or_else(|e| match close_incomplete_json(&args) {
+                            Some(closed) => serde_json::from_str(&closed),
+                            None => Err(e),
+                        });
+                    match parsed {
+                        Ok(v) => v,
+                        // Still doesn't parse even after both repair passes — a genuine protocol
+                        // glitch, not a tool failure. Keep the tool_use block (with an empty,
+                        // wire-valid input object so the next request doesn't 400) and record the
+                        // call as malformed; the loop feeds back an error result the model can
+                        // correct, instead of aborting the run.
+                        Err(_) => {
+                            self.malformed.push((id.clone(), args));
+                            json!({})
+                        }
+                    }
+                };
+                Some(ContentBlock::ToolUse { id, name, input })
+            }
+            OpenBlock::Thinking(text, signature) => {
+                Some(ContentBlock::Thinking { text, signature })
+            }
+            OpenBlock::Text(text, id, phase) => {
+                (!text.is_empty()).then_some(ContentBlock::Text { text, id, phase })
+            }
+        };
+        self.done.insert(index, block);
+        self.try_flush();
     }
 
-    fn flush_block(&mut self) {
-        // At most one block is open at a time (each is delimited by `content_block_stop`): a tool call,
-        // a thinking block, or accruing text — flush whichever it is.
-        if let Some((id, name, args)) = self.tool.take() {
-            let input = if args.trim().is_empty() {
-                json!({})
-            } else {
-                let parsed = serde_json::from_str(&args)
-                    .or_else(|_| serde_json::from_str(&repair_json(&args)))
-                    .or_else(|e| match close_incomplete_json(&args) {
-                        Some(closed) => serde_json::from_str(&closed),
-                        None => Err(e),
-                    });
-                match parsed {
-                    Ok(v) => v,
-                    // Still doesn't parse even after both repair passes — a genuine protocol glitch,
-                    // not a tool failure. Keep the tool_use block (with an empty, wire-valid input
-                    // object so the next request doesn't 400) and record the call as malformed; the
-                    // loop feeds back an error result the model can correct, instead of aborting the
-                    // run.
-                    Err(_) => {
-                        self.malformed.push((id.clone(), args));
-                        json!({})
+    /// Flush every consecutive index, from the front of `order`, that has finalized — stopping at the
+    /// first index that hasn't (preserving declaration order: a later-declared index that finished
+    /// streaming first waits here until its predecessors catch up).
+    fn try_flush(&mut self) {
+        while let Some(&front) = self.order.first() {
+            match self.done.remove(&front) {
+                Some(block) => {
+                    self.order.remove(0);
+                    if let Some(block) = block {
+                        self.blocks.push(block);
                     }
                 }
-            };
-            self.blocks.push(ContentBlock::ToolUse { id, name, input });
-        } else if let Some((text, signature)) = self.thinking.take() {
-            self.blocks.push(ContentBlock::Thinking { text, signature });
-        } else {
-            self.flush_text();
+                None => break,
+            }
         }
     }
 
     fn finish(mut self) -> Turn {
-        // A stream that ended without a trailing ContentBlockStop (or with leftover text) still
-        // contributes its text.
-        self.flush_block();
+        // A stream that ended without a trailing `ContentBlockStop` for every open index still
+        // contributes each one's accumulated content. Any call order works here — `try_flush` (run
+        // from inside each `flush_block`) resolves final ordering regardless of which index this loop
+        // happens to finalize first.
+        for index in self.open.keys().copied().collect::<Vec<_>>() {
+            self.flush_block(index);
+        }
         Turn {
             blocks: self.blocks,
             stop_reason: self.stop_reason,
@@ -1611,6 +1752,7 @@ mod tests {
     use super::*;
     use crate::message::Role;
     use crate::mock::{MockTransport, turn};
+    use crate::steering::SteeringMessage;
     use crate::tool::Tool;
     use async_trait::async_trait;
     use serde_json::json;
@@ -1663,9 +1805,7 @@ mod tests {
         assert_eq!(session.messages.len(), 2);
         assert_eq!(
             session.messages[1].content,
-            vec![ContentBlock::Text {
-                text: "hello world".into()
-            }]
+            vec![ContentBlock::text("hello world")]
         );
     }
 
@@ -1740,10 +1880,12 @@ mod tests {
             vec![
                 Ok(StreamEvent::MessageStart),
                 Ok(StreamEvent::ToolUseStart {
+                    index: 0,
                     id: "tu_1".into(),
                     name: "echo".into(),
                 }),
                 Ok(StreamEvent::InputJsonDelta {
+                    index: 0,
                     partial_json: "{\"tex".into(),
                 }),
                 Err(Error::Transport(
@@ -1753,13 +1895,15 @@ mod tests {
             vec![
                 Ok(StreamEvent::MessageStart),
                 Ok(StreamEvent::ToolUseStart {
+                    index: 0,
                     id: "tu_1".into(),
                     name: "echo".into(),
                 }),
                 Ok(StreamEvent::InputJsonDelta {
+                    index: 0,
                     partial_json: "{\"text\":\"pong\"}".into(),
                 }),
-                Ok(StreamEvent::ContentBlockStop),
+                Ok(StreamEvent::ContentBlockStop { index: 0 }),
                 Ok(StreamEvent::MessageStop {
                     stop_reason: StopReason::ToolUse,
                 }),
@@ -2062,6 +2206,35 @@ mod tests {
     }
 
     #[test]
+    fn is_retryable_mid_stream_recognizes_free_text_prose_without_a_recognized_error_type() {
+        // LOW pi-parity gap (fixed): pi's `RETRYABLE_PROVIDER_ERROR_PATTERN` also matches plain prose,
+        // for a provider/wrapper whose error body has no `error.type` field at all (or a differently-
+        // shaped one) — a plain-text/HTML error page, or an OpenRouter-style wrapper message. None of
+        // these messages contain any of `MID_STREAM_RETRYABLE_ERROR_TYPES`' type strings, so only the
+        // new free-text fallback can catch them.
+        for msg in [
+            "provider stream error: Rate limit exceeded, slow down",
+            "upstream said: 429 Too Many Requests",
+            "provider returned error: <html>Internal Server Error</html>",
+            "gateway wrapper: Service Unavailable, try again shortly",
+            "Provider returned error: bad gateway from upstream",
+            "connection error talking to the model provider",
+            "the request timed out waiting for a response",
+            "Anthropic stream ended without a final message",
+        ] {
+            assert!(
+                is_retryable_mid_stream(&Error::Transport(msg.into())),
+                "expected retryable via free-text fallback: {msg}"
+            );
+        }
+        // Prose that happens to share a word with a retryable pattern, but not the whole phrase, must
+        // not match — otherwise this degenerates into "any error mentioning a server is retryable".
+        assert!(!is_retryable_mid_stream(&Error::Transport(
+            "invalid_request_error: 'server' is not a valid parameter name".into()
+        )));
+    }
+
+    #[test]
     fn is_retryable_mid_stream_recognizes_explicit_retry_guidance_phrases() {
         for msg in [
             "provider stream error: server_error: you can retry your request.",
@@ -2207,6 +2380,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn genuinely_interleaved_tool_call_deltas_reach_the_callback_live_in_wire_order() {
+        // MEDIUM pi-parity gap (fixed): a wire event carrying index 1's argument delta, arriving while
+        // index 0 is still open, used to have nowhere to go in the shared `StreamEvent`/`Accumulator`
+        // contract — the OpenAI Responses decoder buffered it and replayed it in one burst once index 0
+        // finally closed. `Accumulator` now tracks both indices concurrently, so the *loop* forwards
+        // every event to the callback the instant it arrives (see `run_turn_once`'s `emit(ev)` call,
+        // right after `acc.apply(&ev)` — no batching layer sits between decode and callback). This test
+        // proves that live-arrival-order guarantee end to end: index 1's delta lands in the callback
+        // between index 0's start and its own eventual close, not deferred until index 0 finishes, and
+        // the final assembled message still holds both tool_use blocks, complete and in declaration
+        // order, regardless of which one's deltas happened to finish streaming first.
+        let scripted_turn = vec![
+            StreamEvent::MessageStart,
+            StreamEvent::ToolUseStart {
+                index: 0,
+                id: "call_a".into(),
+                name: "echo".into(),
+            },
+            // Index 1 opens *before* index 0 closes — genuinely interleaved, not sequential.
+            StreamEvent::ToolUseStart {
+                index: 1,
+                id: "call_b".into(),
+                name: "echo".into(),
+            },
+            // Index 1's delta arrives live, while index 0 is still open.
+            StreamEvent::InputJsonDelta {
+                index: 1,
+                partial_json: r#"{"text":"b"}"#.into(),
+            },
+            // Index 0 keeps streaming *after* index 1 already has content — proves index 0 was never
+            // force-closed by index 1 opening.
+            StreamEvent::InputJsonDelta {
+                index: 0,
+                partial_json: r#"{"text":"a"}"#.into(),
+            },
+            StreamEvent::ContentBlockStop { index: 0 },
+            StreamEvent::ContentBlockStop { index: 1 },
+            StreamEvent::MessageStop {
+                stop_reason: StopReason::ToolUse,
+            },
+        ];
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        let (agent, _mock) = agent_with(vec![scripted_turn, turn::text("done")], tools);
+        let mut session = Session::new();
+        session.user("go");
+
+        let mut seen = Vec::new();
+        agent
+            .run_events(&mut session, |ev| {
+                if let AgentEvent::Stream(StreamEvent::InputJsonDelta { index, .. }) = &ev {
+                    seen.push(*index);
+                }
+            })
+            .await
+            .unwrap();
+
+        // The callback saw index 1's delta *before* index 0's second delta — the exact scripted wire
+        // order — proving nothing buffered/reordered them, live, at the loop level.
+        assert_eq!(
+            seen,
+            vec![1, 0],
+            "deltas must reach the callback in true arrival order: {seen:?}"
+        );
+
+        // The final message still holds both tool calls, complete and in declaration order (index 0
+        // before index 1), regardless of which one's deltas finished streaming first.
+        match &session.messages[1].content[..] {
+            [
+                ContentBlock::ToolUse {
+                    id: id_a,
+                    input: input_a,
+                    ..
+                },
+                ContentBlock::ToolUse {
+                    id: id_b,
+                    input: input_b,
+                    ..
+                },
+            ] => {
+                assert_eq!(id_a, "call_a");
+                assert_eq!(input_a["text"], "a");
+                assert_eq!(id_b, "call_b");
+                assert_eq!(input_b["text"], "b");
+            }
+            other => panic!("expected two ordered tool_use blocks, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn text_finals_id_and_phase_thread_through_the_accumulator_into_the_final_block() {
+        // LOW pi-parity gap (fixed): a `TextFinal`'s `id`/`phase` (OpenAI Responses' replay metadata
+        // for a finished message item — see `ContentBlock::Text`'s doc comment) must survive the fold
+        // from `StreamEvent` into the persisted `ContentBlock`, not just be accepted by the event type.
+        let scripted_turn = vec![
+            StreamEvent::MessageStart,
+            StreamEvent::TextDelta {
+                index: 0,
+                text: "Hel".into(),
+            },
+            StreamEvent::TextFinal {
+                index: 0,
+                text: "Hello, world!".into(),
+                id: Some("msg_real_1".into()),
+                phase: Some("commentary".into()),
+            },
+            StreamEvent::ContentBlockStop { index: 0 },
+            StreamEvent::MessageStop {
+                stop_reason: StopReason::EndTurn,
+            },
+        ];
+        let (agent, _mock) = agent_with(vec![scripted_turn], ToolRegistry::new());
+        let mut session = Session::new();
+        session.user("go");
+        agent.run_events(&mut session, |_| {}).await.unwrap();
+
+        assert_eq!(
+            session.messages[1].content[0],
+            ContentBlock::Text {
+                text: "Hello, world!".into(),
+                id: Some("msg_real_1".into()),
+                phase: Some("commentary".into()),
+            },
+            "the TextFinal's id/phase must land on the assembled block, not be dropped: {:?}",
+            session.messages[1].content[0]
+        );
+    }
+
+    #[tokio::test]
     async fn tool_end_streams_in_actual_finish_order_not_call_order() {
         use std::time::Duration;
 
@@ -2262,15 +2564,17 @@ mod tests {
         let two_calls = vec![
             StreamEvent::MessageStart,
             StreamEvent::ToolUseStart {
+                index: 0,
                 id: "s".into(),
                 name: "slow".into(),
             },
-            StreamEvent::ContentBlockStop,
+            StreamEvent::ContentBlockStop { index: 0 },
             StreamEvent::ToolUseStart {
+                index: 0,
                 id: "f".into(),
                 name: "fast".into(),
             },
-            StreamEvent::ContentBlockStop,
+            StreamEvent::ContentBlockStop { index: 0 },
             StreamEvent::MessageStop {
                 stop_reason: StopReason::ToolUse,
             },
@@ -2367,15 +2671,17 @@ mod tests {
         let two_calls = vec![
             StreamEvent::MessageStart,
             StreamEvent::ToolUseStart {
+                index: 0,
                 id: "a".into(),
                 name: "t1".into(),
             },
-            StreamEvent::ContentBlockStop,
+            StreamEvent::ContentBlockStop { index: 0 },
             StreamEvent::ToolUseStart {
+                index: 0,
                 id: "b".into(),
                 name: "t2".into(),
             },
-            StreamEvent::ContentBlockStop,
+            StreamEvent::ContentBlockStop { index: 0 },
             StreamEvent::MessageStop {
                 stop_reason: StopReason::ToolUse,
             },
@@ -2473,21 +2779,25 @@ mod tests {
         let two_calls = vec![
             StreamEvent::MessageStart,
             StreamEvent::ToolUseStart {
+                index: 0,
                 id: "a".into(),
                 name: "edit".into(),
             },
             StreamEvent::InputJsonDelta {
+                index: 0,
                 partial_json: r#"{"path":"foo.rs"}"#.into(),
             },
-            StreamEvent::ContentBlockStop,
+            StreamEvent::ContentBlockStop { index: 0 },
             StreamEvent::ToolUseStart {
+                index: 0,
                 id: "b".into(),
                 name: "write".into(),
             },
             StreamEvent::InputJsonDelta {
+                index: 0,
                 partial_json: r#"{"path":"foo.rs"}"#.into(),
             },
-            StreamEvent::ContentBlockStop,
+            StreamEvent::ContentBlockStop { index: 0 },
             StreamEvent::MessageStop {
                 stop_reason: StopReason::ToolUse,
             },
@@ -2564,21 +2874,25 @@ mod tests {
         let two_calls = vec![
             StreamEvent::MessageStart,
             StreamEvent::ToolUseStart {
+                index: 0,
                 id: "a".into(),
                 name: "edit".into(),
             },
             StreamEvent::InputJsonDelta {
+                index: 0,
                 partial_json: r#"{"path":"foo.rs"}"#.into(),
             },
-            StreamEvent::ContentBlockStop,
+            StreamEvent::ContentBlockStop { index: 0 },
             StreamEvent::ToolUseStart {
+                index: 0,
                 id: "b".into(),
                 name: "bash".into(),
             },
             StreamEvent::InputJsonDelta {
+                index: 0,
                 partial_json: r#"{"command":"black foo.rs"}"#.into(),
             },
-            StreamEvent::ContentBlockStop,
+            StreamEvent::ContentBlockStop { index: 0 },
             StreamEvent::MessageStop {
                 stop_reason: StopReason::ToolUse,
             },
@@ -2738,10 +3052,11 @@ mod tests {
         let mut many_calls = vec![StreamEvent::MessageStart];
         for i in 0..N {
             many_calls.push(StreamEvent::ToolUseStart {
+                index: 0,
                 id: format!("c{i}"),
                 name: "count".into(),
             });
-            many_calls.push(StreamEvent::ContentBlockStop);
+            many_calls.push(StreamEvent::ContentBlockStop { index: 0 });
         }
         many_calls.push(StreamEvent::MessageStop {
             stop_reason: StopReason::ToolUse,
@@ -2829,13 +3144,15 @@ mod tests {
         let bad_turn = vec![
             StreamEvent::MessageStart,
             StreamEvent::ToolUseStart {
+                index: 0,
                 id: "tu_1".into(),
                 name: "echo".into(),
             },
             StreamEvent::InputJsonDelta {
+                index: 0,
                 partial_json: r#"{"text":"#.into(), // truncated — not parseable
             },
-            StreamEvent::ContentBlockStop,
+            StreamEvent::ContentBlockStop { index: 0 },
             StreamEvent::MessageStop {
                 stop_reason: StopReason::ToolUse,
             },
@@ -2873,16 +3190,18 @@ mod tests {
         let truncated_turn = vec![
             StreamEvent::MessageStart,
             StreamEvent::ToolUseStart {
+                index: 0,
                 id: "tu_1".into(),
                 name: "echo".into(),
             },
             StreamEvent::InputJsonDelta {
+                index: 0,
                 // `text` matches `EchoTool`'s own required field, so a successful recovery both
                 // produces a valid `tool_use` input *and* lets the tool actually run and echo it back
                 // — not merely parse, but genuinely usable end to end.
                 partial_json: r#"{"text":"hello wor"#.into(),
             },
-            StreamEvent::ContentBlockStop,
+            StreamEvent::ContentBlockStop { index: 0 },
             StreamEvent::MessageStop {
                 stop_reason: StopReason::ToolUse,
             },
@@ -3018,16 +3337,19 @@ mod tests {
         let turn = vec![
             StreamEvent::MessageStart,
             StreamEvent::ToolUseStart {
+                index: 0,
                 id: "tu_1".into(),
                 name: "echo".into(),
             },
             StreamEvent::InputJsonDelta {
+                index: 0,
                 partial_json: "{\"text\":\"line one".into(),
             },
             StreamEvent::InputJsonDelta {
+                index: 0,
                 partial_json: "\nline two\"}".into(), // raw newline, not an escaped `\n`
             },
-            StreamEvent::ContentBlockStop,
+            StreamEvent::ContentBlockStop { index: 0 },
             StreamEvent::MessageStop {
                 stop_reason: StopReason::ToolUse,
             },
@@ -3094,7 +3416,7 @@ mod tests {
             .unwrap();
         assert!(
             seen.iter()
-                .any(|e| matches!(e, StreamEvent::TextDelta { text } if text == "stream me"))
+                .any(|e| matches!(e, StreamEvent::TextDelta { text, .. } if text == "stream me"))
         );
     }
 
@@ -3109,13 +3431,15 @@ mod tests {
             vec![
                 StreamEvent::MessageStart,
                 StreamEvent::ToolUseStart {
+                    index: 0,
                     id: id.into(),
                     name: "echo".into(),
                 },
                 StreamEvent::InputJsonDelta {
+                    index: 0,
                     partial_json: r#"{"text":"a"}"#.into(),
                 },
-                StreamEvent::ContentBlockStop,
+                StreamEvent::ContentBlockStop { index: 0 },
                 StreamEvent::Usage(TokenUsage {
                     input_tokens: 95,
                     output_tokens: 5,
@@ -3169,8 +3493,89 @@ mod tests {
         // The transcript was rewritten: the first message is the summary user turn.
         assert!(matches!(
             &session.messages[0].content[0],
-            ContentBlock::Text { text } if text.contains("compacted")
+            ContentBlock::Text { text, .. } if text.contains("compacted")
         ));
+    }
+
+    #[tokio::test]
+    async fn compaction_start_fires_with_the_right_reason_before_compacted() {
+        // LOW pi-parity gap (fixed): `serve.rs` surfaces pi's `isCompacting` via `get_state`, tracked
+        // by setting a flag on `CompactionStart` and clearing it on `Compacted` — this proves the new
+        // event actually fires, with the correct `reason`, strictly before `Compacted` (not after, and
+        // not instead of it), for both event types this run's own dispatcher can produce.
+        fn big_tool_turn(id: &str) -> Vec<StreamEvent> {
+            vec![
+                StreamEvent::MessageStart,
+                StreamEvent::ToolUseStart {
+                    index: 0,
+                    id: id.into(),
+                    name: "echo".into(),
+                },
+                StreamEvent::InputJsonDelta {
+                    index: 0,
+                    partial_json: r#"{"text":"a"}"#.into(),
+                },
+                StreamEvent::ContentBlockStop { index: 0 },
+                StreamEvent::Usage(TokenUsage {
+                    input_tokens: 95,
+                    output_tokens: 5,
+                    ..Default::default()
+                }),
+                StreamEvent::MessageStop {
+                    stop_reason: StopReason::ToolUse,
+                },
+            ]
+        }
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        let mock = Arc::new(MockTransport::new(vec![
+            big_tool_turn("t1"),
+            big_tool_turn("t2"),
+            turn::text("## Goal\nsummary of earlier work"),
+            turn::text("all done"),
+        ]));
+        let agent = Agent::new(mock, "claude-opus-4-8")
+            .with_tools(tools)
+            .with_max_steps(12)
+            .with_compaction(CompactionConfig {
+                context_window: 100,
+                reserve_tokens: 10,
+                keep_recent_tokens: 1,
+                summary_max_tokens: 256,
+                enabled: true,
+            });
+        let mut session = Session::new();
+        session.user("seed task with enough text to fill several estimated tokens here please");
+
+        let mut kinds = Vec::new();
+        agent
+            .run_events(&mut session, |ev| {
+                if matches!(
+                    ev,
+                    AgentEvent::CompactionStart { .. } | AgentEvent::Compacted { .. }
+                ) {
+                    kinds.push(ev);
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(kinds.len(), 2, "got: {kinds:#?}");
+        assert!(
+            matches!(
+                &kinds[0],
+                AgentEvent::CompactionStart {
+                    reason: CompactionReason::Threshold
+                }
+            ),
+            "got: {:#?}",
+            kinds[0]
+        );
+        assert!(
+            matches!(&kinds[1], AgentEvent::Compacted { .. }),
+            "CompactionStart must precede Compacted, not follow it: {:#?}",
+            kinds[1]
+        );
     }
 
     #[tokio::test]
@@ -3185,13 +3590,15 @@ mod tests {
             vec![
                 StreamEvent::MessageStart,
                 StreamEvent::ToolUseStart {
+                    index: 0,
                     id: id.into(),
                     name: "echo".into(),
                 },
                 StreamEvent::InputJsonDelta {
+                    index: 0,
                     partial_json: r#"{"text":"a"}"#.into(),
                 },
-                StreamEvent::ContentBlockStop,
+                StreamEvent::ContentBlockStop { index: 0 },
                 StreamEvent::Usage(TokenUsage {
                     input_tokens,
                     output_tokens: 5,
@@ -3270,13 +3677,15 @@ mod tests {
             vec![
                 StreamEvent::MessageStart,
                 StreamEvent::ToolUseStart {
+                    index: 0,
                     id: id.into(),
                     name: "read".into(),
                 },
                 StreamEvent::InputJsonDelta {
+                    index: 0,
                     partial_json: r#"{"path":"tracked.rs"}"#.into(),
                 },
-                StreamEvent::ContentBlockStop,
+                StreamEvent::ContentBlockStop { index: 0 },
                 StreamEvent::Usage(TokenUsage {
                     input_tokens: 95,
                     output_tokens: 5,
@@ -3336,9 +3745,7 @@ mod tests {
         // collapsing everything under the minimal split-turn template.
         let session_messages = vec![
             Message::user("first request"),
-            Message::assistant(vec![ContentBlock::Text {
-                text: "first done".into(),
-            }]),
+            Message::assistant(vec![ContentBlock::text("first done")]),
             Message::user("second request"),
             Message::assistant(vec![ContentBlock::ToolUse {
                 id: "1".into(),
@@ -3382,7 +3789,7 @@ mod tests {
         );
         assert_eq!(mock.calls(), 2, "a split turn must issue two summary calls");
         assert!(
-            matches!(&session.messages[0].content[0], ContentBlock::Text { text }
+            matches!(&session.messages[0].content[0], ContentBlock::Text { text, .. }
                 if text.contains("history summary text")
                     && text.contains("**Turn Context (split turn):**")
                     && text.contains("turn prefix summary text")),
@@ -3427,9 +3834,7 @@ mod tests {
 
         let session_messages = vec![
             Message::user("first request"),
-            Message::assistant(vec![ContentBlock::Text {
-                text: "first done".into(),
-            }]),
+            Message::assistant(vec![ContentBlock::text("first done")]),
             Message::user("second request"),
             Message::assistant(vec![ContentBlock::ToolUse {
                 id: "1".into(),
@@ -3485,9 +3890,7 @@ mod tests {
         // history call's `summary_max_tokens` budget — a partial turn needs proportionally less room.
         let session_messages = vec![
             Message::user("first request"),
-            Message::assistant(vec![ContentBlock::Text {
-                text: "first done".into(),
-            }]),
+            Message::assistant(vec![ContentBlock::text("first done")]),
             Message::user("second request"),
             Message::assistant(vec![ContentBlock::ToolUse {
                 id: "1".into(),
@@ -3595,7 +3998,7 @@ mod tests {
             "reusing the prior summary verbatim must skip its model call entirely"
         );
         assert!(
-            matches!(&session.messages[0].content[0], ContentBlock::Text { text }
+            matches!(&session.messages[0].content[0], ContentBlock::Text { text, .. }
                 if text.contains("prior summary body")
                     && text.contains("**Turn Context (split turn):**")
                     && text.contains("turn prefix summary text")),
@@ -3670,16 +4073,19 @@ mod tests {
         let thinking_turn = vec![
             StreamEvent::MessageStart,
             StreamEvent::ThinkingDelta {
+                index: 0,
                 text: "reasoning…".into(),
             },
             StreamEvent::SignatureDelta {
+                index: 0,
                 signature: "sig-xyz".into(),
             },
-            StreamEvent::ContentBlockStop,
+            StreamEvent::ContentBlockStop { index: 0 },
             StreamEvent::TextDelta {
+                index: 1,
                 text: "the answer".into(),
             },
-            StreamEvent::ContentBlockStop,
+            StreamEvent::ContentBlockStop { index: 1 },
             StreamEvent::MessageStop {
                 stop_reason: StopReason::EndTurn,
             },
@@ -3698,7 +4104,7 @@ mod tests {
         }
         assert!(matches!(
             &session.messages[1].content[1],
-            ContentBlock::Text { text } if text == "the answer"
+            ContentBlock::Text { text, .. } if text == "the answer"
         ));
     }
 
@@ -3779,7 +4185,89 @@ mod tests {
         assert_eq!(session.messages.len(), 4);
         assert!(matches!(
             &session.messages[2].content[0],
-            ContentBlock::Text { text } if text == "now do the follow-up"
+            ContentBlock::Text { text, .. } if text == "now do the follow-up"
+        ));
+    }
+
+    #[tokio::test]
+    async fn steering_injects_a_follow_up_with_images_at_a_stop_boundary() {
+        // MEDIUM pi-parity gap (fixed): `Steering`'s queue used to be `VecDeque<String>` with no field
+        // for images at all, so a `follow_up`/`steer` carrying image attachments silently dropped them
+        // — unlike a fresh `prompt`, which has always supported `images`. A queued `SteeringMessage`
+        // with images must land as a real multimodal user turn (text block, then image blocks), the
+        // same shape `Message::user_with_images` produces.
+        let (agent, mock) = agent_with(
+            vec![turn::text("first reply"), turn::text("second reply")],
+            ToolRegistry::new(),
+        );
+        let mut session = Session::new();
+        session.user("hello");
+
+        let steering = Steering::new();
+        let image = ImageSource::base64("image/png", "aGVsbG8=");
+        steering.push(SteeringMessage::new("look at this", vec![image.clone()]));
+
+        agent
+            .run_events_steered(&mut session, |_| {}, CancellationToken::new(), steering)
+            .await
+            .unwrap();
+
+        assert_eq!(mock.calls(), 2, "the follow-up drove a second model turn");
+        // user, assistant(first), user(follow-up: text+image), assistant(second)
+        let blocks = &session.messages[2].content;
+        assert_eq!(
+            blocks.len(),
+            2,
+            "expected a text block and an image block: {blocks:?}"
+        );
+        assert!(matches!(
+            &blocks[0],
+            ContentBlock::Text { text, .. } if text == "look at this"
+        ));
+        assert!(matches!(
+            &blocks[1],
+            ContentBlock::Image { source } if *source == image
+        ));
+    }
+
+    #[tokio::test]
+    async fn steering_is_injected_mid_run_with_images_between_tool_turns() {
+        // Same gap as above, for the mid-run `steer` lane specifically: an image folded onto the
+        // tool-results turn must appear as a real `ContentBlock::Image`, not be silently dropped.
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        let (agent, mock) = agent_with(
+            vec![
+                turn::tool_call("tu_1", "echo", r#"{"text":"pong"}"#),
+                turn::text("acknowledged"),
+            ],
+            tools,
+        );
+        let mut session = Session::new();
+        session.user("start");
+
+        let steering = Steering::new();
+        let image = ImageSource::base64("image/jpeg", "Zm9v");
+        steering.push_steer(SteeringMessage::new(
+            "also look at this",
+            vec![image.clone()],
+        ));
+
+        agent
+            .run_events_steered(&mut session, |_| {}, CancellationToken::new(), steering)
+            .await
+            .unwrap();
+
+        assert_eq!(mock.calls(), 2);
+        let blocks = &session.messages[2].content;
+        assert!(matches!(blocks[0], ContentBlock::ToolResult { .. }));
+        assert!(matches!(
+            &blocks[1],
+            ContentBlock::Text { text, .. } if text == "also look at this"
+        ));
+        assert!(matches!(
+            &blocks[2],
+            ContentBlock::Image { source } if *source == image
         ));
     }
 
@@ -3868,7 +4356,7 @@ mod tests {
         assert!(matches!(blocks[0], ContentBlock::ToolResult { .. }));
         assert!(matches!(
             &blocks[1],
-            ContentBlock::Text { text } if text == "actually, also handle the edge case"
+            ContentBlock::Text { text, .. } if text == "actually, also handle the edge case"
         ));
     }
 
@@ -3999,7 +4487,7 @@ mod tests {
         assert!(matches!(blocks[0], ContentBlock::ToolResult { .. }));
         assert!(matches!(
             &blocks[1],
-            ContentBlock::Text { text } if text == "also handle this"
+            ContentBlock::Text { text, .. } if text == "also handle this"
         ));
     }
 
@@ -4246,15 +4734,17 @@ mod tests {
         let two_calls = vec![
             StreamEvent::MessageStart,
             StreamEvent::ToolUseStart {
+                index: 0,
                 id: "f".into(),
                 name: "fast".into(),
             },
-            StreamEvent::ContentBlockStop,
+            StreamEvent::ContentBlockStop { index: 0 },
             StreamEvent::ToolUseStart {
+                index: 0,
                 id: "h".into(),
                 name: "hang".into(),
             },
-            StreamEvent::ContentBlockStop,
+            StreamEvent::ContentBlockStop { index: 0 },
             StreamEvent::MessageStop {
                 stop_reason: StopReason::ToolUse,
             },

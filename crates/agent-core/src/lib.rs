@@ -46,11 +46,16 @@ pub use message::{
     ContentBlock, ImageSource, Message, Role, StopReason, StreamEvent, TokenUsage, ToolDef,
 };
 pub use mock::MockTransport;
-pub use models::{ModelCaps, ThinkingLevel, capabilities, thinking_for_level};
+pub use models::{
+    ModelCaps, ThinkingLevel, capabilities, clamp_thinking_level, next_available_thinking_level,
+    thinking_for_level,
+};
 pub use session::Session;
-pub use steering::{QueueMode, Steering};
+pub use steering::{QueueMode, Steering, SteeringMessage};
 pub use tool::{Tool, ToolOutput, ToolProgress, ToolRegistry, ToolUpdate};
-pub use transport::{ModelRequest, ModelTransport, ReasoningEffort, ToolChoice};
+pub use transport::{
+    ModelRequest, ModelTransport, ReasoningEffort, ReasoningSummary, ServiceTier, ToolChoice,
+};
 pub use write_lock::WriteLockRegistry;
 // Re-exported because it appears in `Agent::run_events_cancellable`'s signature — callers shouldn't
 // need a direct `tokio-util` dependency to drive a cancellable run.

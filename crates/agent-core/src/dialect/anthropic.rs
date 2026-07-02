@@ -28,7 +28,7 @@ pub fn build_body(req: &ModelRequest) -> Value {
     map.insert("model".into(), Value::String(req.model.clone()));
     map.insert(
         "max_tokens".into(),
-        Value::from(clamp_max_tokens_to_context(req, &caps)),
+        Value::from(super::clamp_max_tokens_to_context(req, &caps)),
     );
     map.insert("stream".into(), Value::Bool(true));
 
@@ -132,51 +132,6 @@ pub fn build_body(req: &ModelRequest) -> Value {
         map.insert("metadata".into(), json!({ "user_id": user_id }));
     }
     Value::Object(map)
-}
-
-/// A floor under [`clamp_max_tokens_to_context`]'s result: never clamp down to something so small the
-/// turn can't produce a useful response. pi uses no explicit floor of its own (its clamp can only ever
-/// reduce `maxTokens`, and a near-zero `available` there is already a sign compaction is badly overdue
-/// — this floor is a defensive addition, not a divergence from its behavior in practice).
-const MIN_CLAMPED_MAX_TOKENS: u32 = 1_024;
-/// Held back below `context_window` on top of the estimated prompt size — matches pi's
-/// `clampMaxTokensToContext` margin (`packages/ai/src/api/simple-options.ts`). Token *estimates* (ours:
-/// chars/4, see [`crate::compaction::estimate_tokens`]) are approximate; this absorbs that slop so the
-/// clamp doesn't itself become the thing that pushes a request over the edge.
-const CONTEXT_CLAMP_MARGIN: u32 = 4_096;
-
-/// Clamp `req.max_tokens` down so `estimated prompt tokens + max_tokens` doesn't already exceed the
-/// model's context window — mirroring pi's `clampMaxTokensToContext`. Without this, a long-running
-/// session sends its *static* `max_tokens` ceiling on every turn regardless of how much of the window
-/// the live conversation has already consumed: once the prompt passes `context_window - max_tokens`,
-/// every further turn is a guaranteed-to-400 request, recovered only reactively (see
-/// `agent::is_context_overflow`) after paying for a wasted round-trip. Never *raises* `max_tokens` (a
-/// short prompt still gets the model's real ceiling), and never clamps below what a configured
-/// [`crate::transport::ThinkingConfig`] budget requires (Anthropic requires `max_tokens >
-/// budget_tokens`) — a request that's already this close to the window is a case for compaction to
-/// have caught, not for this clamp to make worse by triggering a *different* 400.
-fn clamp_max_tokens_to_context(req: &ModelRequest, caps: &crate::models::ModelCaps) -> u32 {
-    let estimated_prompt: u32 = req
-        .messages
-        .iter()
-        .map(crate::compaction::estimate_message_tokens)
-        .fold(0u32, |acc, n| acc.saturating_add(n))
-        .saturating_add(
-            req.system
-                .as_deref()
-                .map(crate::compaction::estimate_tokens)
-                .unwrap_or(0),
-        );
-    let available = caps
-        .context_window
-        .saturating_sub(estimated_prompt)
-        .saturating_sub(CONTEXT_CLAMP_MARGIN);
-    let floor = req
-        .thinking
-        .map(|t| t.budget_tokens.saturating_add(1))
-        .unwrap_or(0)
-        .max(MIN_CLAMPED_MAX_TOKENS);
-    req.max_tokens.min(available.max(floor))
 }
 
 /// Map a [`ToolChoice`] to Anthropic's `tool_choice` object. Anthropic spells "must call some tool"
@@ -446,6 +401,11 @@ fn map_stop_reason(s: Option<&str>) -> StopReason {
     }
 }
 
+/// A synthetic block index for the refusal-explanation text `message_delta` synthesizes (see its own
+/// handler below) — guaranteed never to collide with a real Anthropic content-block index (always
+/// small, starting at 0).
+const REFUSAL_EXPLANATION_INDEX: usize = usize::MAX;
+
 /// Decodes Anthropic SSE. Tracks token usage (input + cache reads/writes from `message_start`,
 /// output from `message_delta`) and the stop reason, emitting a single `Usage` + `MessageStop` at
 /// `message_stop`. `saw_start`/`saw_stop` let `finish` reject a stream truncated before its terminal
@@ -479,16 +439,18 @@ impl StreamDecoder for Decoder {
                 vec![StreamEvent::MessageStart]
             }
             "content_block_start" => {
+                let index = usize_at(Some(data), "index");
                 let block = data.get("content_block");
                 match block.and_then(|b| b.get("type")).and_then(Value::as_str) {
                     Some("tool_use") => {
                         let id = str_at(block, "id").to_string();
                         let name = str_at(block, "name").to_string();
-                        vec![StreamEvent::ToolUseStart { id, name }]
+                        vec![StreamEvent::ToolUseStart { index, id, name }]
                     }
                     // A redacted-thinking block is fully delivered here (no deltas follow): its opaque
                     // `data` must be replayed verbatim so the model keeps reasoning continuity.
                     Some("redacted_thinking") => vec![StreamEvent::RedactedThinking {
+                        index,
                         data: str_at(block, "data").to_string(),
                     }],
                     // Text and (clear) thinking blocks open empty and accrue via deltas — no event.
@@ -496,32 +458,39 @@ impl StreamDecoder for Decoder {
                 }
             }
             "content_block_delta" => {
+                let index = usize_at(Some(data), "index");
                 let delta = data.get("delta");
                 match delta.and_then(|d| d.get("type")).and_then(Value::as_str) {
                     Some("text_delta") => {
                         vec![StreamEvent::TextDelta {
+                            index,
                             text: str_at(delta, "text").to_string(),
                         }]
                     }
                     Some("thinking_delta") => {
                         vec![StreamEvent::ThinkingDelta {
+                            index,
                             text: str_at(delta, "thinking").to_string(),
                         }]
                     }
                     Some("signature_delta") => {
                         vec![StreamEvent::SignatureDelta {
+                            index,
                             signature: str_at(delta, "signature").to_string(),
                         }]
                     }
                     Some("input_json_delta") => {
                         vec![StreamEvent::InputJsonDelta {
+                            index,
                             partial_json: str_at(delta, "partial_json").to_string(),
                         }]
                     }
                     _ => Vec::new(),
                 }
             }
-            "content_block_stop" => vec![StreamEvent::ContentBlockStop],
+            "content_block_stop" => vec![StreamEvent::ContentBlockStop {
+                index: usize_at(Some(data), "index"),
+            }],
             "message_delta" => {
                 let delta = data.get("delta");
                 self.stop_reason = map_stop_reason(
@@ -574,7 +543,14 @@ impl StreamDecoder for Decoder {
                         .and_then(Value::as_str)
                         .unwrap_or("");
                     if !explanation.is_empty() {
+                        // A fresh, never-real index: every actual content block has already closed
+                        // by the time `message_delta` arrives, so this can't collide with one — and
+                        // it never gets an explicit `ContentBlockStop` (there isn't a wire event for
+                        // it), relying on `Accumulator::finish()`'s own "flush whatever's still open"
+                        // pass at the end of the turn, exactly as it did before this event carried an
+                        // index at all.
                         return vec![StreamEvent::TextDelta {
+                            index: REFUSAL_EXPLANATION_INDEX,
                             text: explanation.to_string(),
                         }];
                     }
@@ -605,6 +581,10 @@ impl StreamDecoder for Decoder {
         }
         Ok(Vec::new())
     }
+
+    fn is_terminal(&self) -> bool {
+        self.saw_stop
+    }
 }
 
 fn str_at<'a>(v: Option<&'a Value>, key: &str) -> &'a str {
@@ -617,6 +597,16 @@ fn u32_at(v: Option<&Value>, key: &str) -> u32 {
     v.and_then(|v| v.get(key))
         .and_then(Value::as_u64)
         .unwrap_or(0) as u32
+}
+
+/// Anthropic's own `content_block_start`/`_delta`/`_stop` all carry a real `index` — read it straight
+/// through rather than discarding it, so genuinely interleaved blocks (should Anthropic ever deliver
+/// them; not observed in practice today, but the wire already carries the field) accumulate correctly
+/// instead of relying on an assumption of strict sequential delivery.
+fn usize_at(v: Option<&Value>, key: &str) -> usize {
+    v.and_then(|v| v.get(key))
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize
 }
 
 #[cfg(test)]
@@ -657,10 +647,8 @@ mod tests {
             "claude-opus-4-8",
             vec![
                 Message::user("hi"),
-                Message::assistant(vec![ContentBlock::Text {
-                    text: "hello".into(),
-                }])
-                .with_model_id("claude-opus-4-8"),
+                Message::assistant(vec![ContentBlock::text("hello")])
+                    .with_model_id("claude-opus-4-8"),
             ],
             256,
         );
@@ -865,20 +853,24 @@ data: {"type":"message_stop"}
             vec![
                 StreamEvent::MessageStart,
                 StreamEvent::TextDelta {
+                    index: 0,
                     text: "Let me check.".into()
                 },
-                StreamEvent::ContentBlockStop,
+                StreamEvent::ContentBlockStop { index: 0 },
                 StreamEvent::ToolUseStart {
+                    index: 1,
                     id: "toolu_42".into(),
                     name: "get_weather".into()
                 },
                 StreamEvent::InputJsonDelta {
+                    index: 1,
                     partial_json: "{\"city\":".into()
                 },
                 StreamEvent::InputJsonDelta {
+                    index: 1,
                     partial_json: "\"SF\"}".into()
                 },
-                StreamEvent::ContentBlockStop,
+                StreamEvent::ContentBlockStop { index: 1 },
                 StreamEvent::Usage(TokenUsage {
                     input_tokens: 24,
                     output_tokens: 31,
@@ -1189,9 +1181,7 @@ data: {"type":"message_stop"}
                         text: "let me reason".into(),
                         signature: "sig-abc".into(),
                     },
-                    ContentBlock::Text {
-                        text: "answer".into(),
-                    },
+                    ContentBlock::text("answer"),
                 ]),
                 Message::user("again"),
             ],
@@ -1218,9 +1208,7 @@ data: {"type":"message_stop"}
                         text: "half-formed reasoning".into(),
                         signature: String::new(),
                     },
-                    ContentBlock::Text {
-                        text: "answer".into(),
-                    },
+                    ContentBlock::text("answer"),
                 ]),
                 Message::user("again"),
             ],
@@ -1250,9 +1238,7 @@ data: {"type":"message_stop"}
                         text: String::new(),
                         signature: String::new(),
                     },
-                    ContentBlock::Text {
-                        text: "answer".into(),
-                    },
+                    ContentBlock::text("answer"),
                 ]),
                 Message::user("again"),
             ],
@@ -1301,9 +1287,11 @@ data: {"type":"message_stop"}
         let mut dec = Decoder::default();
         let events = decode_sse(&mut dec, THINKING).unwrap();
         assert!(events.contains(&StreamEvent::ThinkingDelta {
+            index: 0,
             text: "step one".into()
         }));
         assert!(events.contains(&StreamEvent::SignatureDelta {
+            index: 0,
             signature: "SIG".into()
         }));
     }
@@ -1344,6 +1332,7 @@ data: {"type":"message_stop"}
         let mut dec = Decoder::default();
         let events = decode_sse(&mut dec, REFUSED).unwrap();
         assert!(events.contains(&StreamEvent::TextDelta {
+            index: REFUSAL_EXPLANATION_INDEX,
             text: "I can't help with that.".into()
         }));
         assert!(events.contains(&StreamEvent::MessageStop {
@@ -1511,6 +1500,65 @@ data: {"type":"error","error":{"type":"overloaded_error","message":"server overl
             }
             other => panic!("expected transport error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_non_json_trailer_after_message_stop_is_ignored_not_a_transport_error() {
+        // pi: anthropic-sse-parsing.test.ts (`event: done` / `event: proxy.stats` with `data: not
+        // json` after `message_stop`, asserting a clean `stopReason: "stop"`, no error). A gateway or
+        // proxy appending a keepalive/stats line after the real message has already completed must
+        // not fail an otherwise-successful turn — the already-emitted `MessageStop`/`Usage` events are
+        // unaffected either way.
+        const TRAILING_NOISE: &str = r#"
+event: message_start
+data: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":5,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+event: done
+data: not-json-at-all
+
+event: proxy.stats
+data: {"malformed": true, "trailing brace missing"
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, TRAILING_NOISE).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::MessageStop { stop_reason, .. } if *stop_reason == StopReason::EndTurn)),
+            "the real message's own MessageStop must still be emitted: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_non_json_data_line_before_message_stop_is_still_a_hard_error() {
+        // The flip side of the test above: garbage arriving *before* the decoder has seen its
+        // terminal event is a genuine corrupted/tampered stream, not trailing proxy noise — must still
+        // fail loudly rather than silently swallowing mid-turn data loss.
+        const GARBAGE_MID_STREAM: &str = r#"
+event: message_start
+data: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":5,"output_tokens":1}}}
+
+event: mystery
+data: not-json-at-all
+"#;
+        let mut dec = Decoder::default();
+        let err = decode_sse(&mut dec, GARBAGE_MID_STREAM).unwrap_err();
+        assert!(matches!(err, Error::Transport(_)));
     }
 
     #[test]

@@ -73,7 +73,10 @@ mod tests {
 
     #[test]
     fn whole_run_retries_a_plain_http_status_digit_mid_stream_never_would() {
-        let e = Error::Transport("gateway returned 503: <html>Service Unavailable</html>".into());
+        // Deliberately no retryable *prose* here (contrast the free-text fallback tests in
+        // `agent_core::agent`'s test module) — this message's only retryable-looking signal is the raw
+        // "503" digit, which is the one thing the mid-stream layer excludes on purpose.
+        let e = Error::Transport("gateway returned 503: unexpected response from upstream".into());
         assert!(
             !agent_core::agent::is_retryable_mid_stream(&e),
             "mid-stream layer deliberately excludes raw status digits"
@@ -107,5 +110,16 @@ mod tests {
     fn whole_run_does_not_retry_a_non_retryable_error() {
         let e = Error::Transport("invalid_request_error: missing required field".into());
         assert!(!is_retryable_whole_run(&e));
+    }
+
+    #[test]
+    fn whole_run_inherits_the_mid_stream_free_text_fallback() {
+        // LOW pi-parity gap (fixed): `is_retryable_mid_stream`'s new free-text prose fallback (for a
+        // provider error with no recognized `error.type`) must reach this outer layer too, the same
+        // way every other mid-stream-retryable shape already does — this isn't a separate pattern list
+        // to keep in sync, just confirming the inheritance actually holds for the new addition.
+        let e = Error::Transport("provider returned error: Service Unavailable, try later".into());
+        assert!(agent_core::agent::is_retryable_mid_stream(&e));
+        assert!(is_retryable_whole_run(&e));
     }
 }

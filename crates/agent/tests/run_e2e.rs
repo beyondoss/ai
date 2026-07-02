@@ -942,6 +942,87 @@ fn run_binary_no_skills_leaves_a_skill_invocation_unexpanded() {
 }
 
 #[test]
+fn run_binary_no_context_files_skips_project_instructions() {
+    // MEDIUM pi-parity gap (fixed): `run` hardcoded `include_context_files: true` with no way to opt
+    // out, unlike `serve`'s `--no-context-files`. A `CLAUDE.md` in cwd must be injected by default, but
+    // must be skipped entirely when `--no-context-files` is passed.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("CLAUDE.md"), "PROJECT-MARKER-777").unwrap();
+    let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "hello",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--no-context-files",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        !bodies[0].contains("PROJECT-MARKER-777"),
+        "--no-context-files must prevent CLAUDE.md from being injected at all: {}",
+        bodies[0]
+    );
+}
+
+#[test]
+fn run_binary_injects_project_instructions_by_default() {
+    // The other half of the previous test: without the flag, CLAUDE.md must still be injected —
+    // proving `--no-context-files` genuinely toggles behavior rather than the marker just never having
+    // been reachable.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("CLAUDE.md"), "PROJECT-MARKER-778").unwrap();
+    let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "hello",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[0].contains("PROJECT-MARKER-778"),
+        "CLAUDE.md must be injected by default: {}",
+        bodies[0]
+    );
+}
+
+#[test]
 fn run_binary_no_prompt_templates_leaves_a_template_invocation_unexpanded() {
     // Same fixture as `run_binary_expands_a_prompt_template_in_the_first_message`, but with
     // `--no-prompt-templates` — the template must not be discovered at all, so `/fix foo.rs` reaches
@@ -1178,4 +1259,176 @@ fn export_subcommand_renders_an_existing_session_file_with_no_gateway_or_key() {
     assert!(html.starts_with("<!DOCTYPE html>"));
     assert!(html.contains("what is the answer?"));
     assert!(html.contains("the answer is 42"));
+}
+
+#[test]
+fn run_binary_discovers_skills_from_an_ad_hoc_skill_path() {
+    // pi: coding-agent/skills.test.ts, "should load from explicit skillPaths" — `--skill <path>`
+    // (repeatable), a discovery root beyond the two standard ones. Deliberately no `--trust-project`:
+    // an operator-supplied CLI path is an explicit, deliberate choice, unlike auto-discovered
+    // project-local content, so it isn't trust-gated the way `.claude/skills` in the repo itself is.
+    let dir = tempfile::tempdir().unwrap();
+    let extra_skill_dir = dir.path().join("shared-skills/greet");
+    std::fs::create_dir_all(&extra_skill_dir).unwrap();
+    std::fs::write(
+        extra_skill_dir.join("SKILL.md"),
+        "---\nname: greet\ndescription: an ad-hoc skill\n---\nAD-HOC-SKILL-MARKER-456",
+    )
+    .unwrap();
+    let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "/skill:greet",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--skill",
+            dir.path().join("shared-skills").to_str().unwrap(),
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[0].contains("AD-HOC-SKILL-MARKER-456"),
+        "the ad-hoc skill's body must be expanded into the first message: {}",
+        bodies[0]
+    );
+}
+
+#[test]
+fn run_binary_name_sets_the_session_title() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl");
+    let (base, _bodies) = spawn_model_server(vec![turn_text("hi")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "hello",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--session",
+            session_file.to_str().unwrap(),
+            "--name",
+            "my-named-run",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let on_disk = std::fs::read_to_string(&session_file).unwrap();
+    assert!(
+        on_disk.contains("my-named-run"),
+        "the session's title must be persisted: {on_disk}"
+    );
+}
+
+#[test]
+fn run_binary_rejects_a_whitespace_only_name_and_persists_nothing() {
+    // pi: startup-session-name.test.ts — a whitespace-only `--name` is rejected with a clear error
+    // ("--name requires a non-empty value") rather than silently producing a blank/meaningless title,
+    // and must fail before any session file is created at all.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl");
+    let (base, _bodies) = spawn_model_server(vec![turn_text("hi")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "hello",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--session",
+            session_file.to_str().unwrap(),
+            "--name",
+            "   ",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        !output.status.success(),
+        "a whitespace-only --name must fail the run"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--name requires a non-empty value"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !session_file.exists(),
+        "nothing must be persisted when --name is rejected"
+    );
+}
+
+#[test]
+fn run_binary_prompt_guideline_flag_reaches_the_system_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "hi",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--prompt-guideline",
+            "Always run tests before finishing.",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[0].contains("Always run tests before finishing."),
+        "the extra guideline must reach the system prompt: {}",
+        bodies[0]
+    );
 }

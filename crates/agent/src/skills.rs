@@ -33,15 +33,26 @@ const MAX_DEPTH: usize = 8;
 /// The user root is **never** gated on `project_trusted`: it's the operator's own machine-wide
 /// directory, not something the current (possibly untrusted) project checkout controls, so an untrusted
 /// project must not blank it out along with its own — see [`discover_with_diagnostics`].
-pub fn discover(cwd: &Path, project_trusted: bool) -> Vec<Skill> {
-    discover_with_diagnostics(cwd, project_trusted).0
+pub fn discover(cwd: &Path, project_trusted: bool, extra_roots: &[String]) -> Vec<Skill> {
+    discover_with_diagnostics(cwd, project_trusted, extra_roots).0
 }
 
 /// Like [`discover`], but also reports name collisions — the same skill `name` declared by more than
 /// one `SKILL.md`/loose-`.md` file, silently shadowed by `discover` (the later root, or the later file
 /// within one root, wins) — as human-readable strings naming both paths, for `get_commands` to surface
 /// as a diagnostic rather than a client having no way to notice a skill was shadowed.
-pub fn discover_with_diagnostics(cwd: &Path, project_trusted: bool) -> (Vec<Skill>, Vec<String>) {
+///
+/// `extra_roots` are additional, ad-hoc discovery roots beyond the two standard ones — pi's own
+/// `--skill <path>` (repeatable). Unlike the two standard roots (routinely absent — that's normal, not
+/// worth a diagnostic), an operator-supplied extra root that doesn't exist is a likely typo/mistake, so
+/// it's reported through the same diagnostics channel `discover_with_diagnostics` already has, rather
+/// than silently contributing nothing. Checked and applied *after* the standard roots, so an extra root
+/// wins on a name collision — an operator passing `--skill` is deliberately overriding, not just adding.
+pub fn discover_with_diagnostics(
+    cwd: &Path,
+    project_trusted: bool,
+    extra_roots: &[String],
+) -> (Vec<Skill>, Vec<String>) {
     let mut found: Vec<Skill> = Vec::new();
     let mut collisions: Vec<String> = Vec::new();
     let mut roots: Vec<PathBuf> = Vec::new();
@@ -50,6 +61,16 @@ pub fn discover_with_diagnostics(cwd: &Path, project_trusted: bool) -> (Vec<Skil
     }
     if project_trusted {
         roots.push(cwd.join(".claude/skills"));
+    }
+    for extra in extra_roots {
+        let root = PathBuf::from(extra);
+        if !root.is_dir() {
+            let message = format!("--skill path does not exist or is not a directory: {extra}");
+            tracing::warn!("{message}");
+            collisions.push(message);
+            continue;
+        }
+        roots.push(root);
     }
 
     for root in roots {
@@ -110,6 +131,16 @@ fn walk(root: &Path, out: &mut Vec<Skill>) {
         // placed within it should still be honored either way, not only when `require_git`'s default
         // finds an enclosing `.git`.
         .require_git(false)
+        // LOW pi-parity gap (fixed): pi's `skills.ts` hardcodes skipping `node_modules` unconditionally
+        // ("avoid scanning dependencies"), not just relying on a `.gitignore` mentioning it. Ignore-file
+        // coverage alone doesn't reach here reliably: `follow_links(true)` above exists specifically so
+        // a shared skills library symlinked into `.claude/skills` is visible, but that symlink can lead
+        // *outside* this walk's own root — into a separately-published npm package with its own nested
+        // `node_modules` and no `.gitignore` of its own, or one whose gitignore lives in a different
+        // repository the walk never crosses back into. `filter_entry` prunes the walk itself (skips
+        // descending), not just the final results, so this also fixes the performance cost of scanning
+        // a potentially enormous dependency tree, not merely the risk of a false-positive `SKILL.md`.
+        .filter_entry(|entry| entry.file_name() != "node_modules")
         .build()
         .flatten() // missing/unreadable/inaccessible entries are the normal case, not an error
         .filter(|entry| {
@@ -252,7 +283,11 @@ fn validate_skill_description(description: &str) -> Vec<String> {
 /// joined with spaces, a `|` (literal) block with newlines; both let a long `description:` wrap across
 /// lines. Anything fancier (anchors, nested maps) is out of scope and ignored. No frontmatter fence at
 /// all (or an unterminated one) returns an empty map and the whole input as the body, unchanged.
-fn parse_frontmatter(text: &str) -> (HashMap<String, String>, &str) {
+///
+/// `pub(crate)`: shared with [`crate::prompts`], whose own frontmatter (`description:`/
+/// `argument-hint:`) is the exact same shape — one parser rather than two so a fix (or a future
+/// format extension) doesn't have to land twice.
+pub(crate) fn parse_frontmatter(text: &str) -> (HashMap<String, String>, &str) {
     let mut map = HashMap::new();
     // Iterate raw, newline-inclusive lines and track how many bytes have been consumed, so the body can
     // be sliced out byte-exact once the closing fence is found — `Lines` alone discards that offset.
@@ -454,7 +489,7 @@ mod tests {
             "two",
             "---\nname: dup\ndescription: second\n---\n",
         );
-        let (found, collisions) = discover_with_diagnostics(tmp.path(), true);
+        let (found, collisions) = discover_with_diagnostics(tmp.path(), true, &[]);
         assert_eq!(
             found.iter().filter(|s| s.name == "dup").count(),
             1,
@@ -487,7 +522,7 @@ mod tests {
 
         let capture = crate::tracing_test::CaptureSubscriber::default();
         tracing::subscriber::with_default(capture.clone(), || {
-            discover_with_diagnostics(tmp.path(), true);
+            discover_with_diagnostics(tmp.path(), true, &[]);
         });
         let messages = capture.messages();
         assert!(
@@ -505,8 +540,68 @@ mod tests {
             "solo",
             "---\nname: solo\ndescription: alone\n---\n",
         );
-        let (_, collisions) = discover_with_diagnostics(tmp.path(), true);
+        let (_, collisions) = discover_with_diagnostics(tmp.path(), true, &[]);
         assert!(collisions.is_empty(), "got: {collisions:?}");
+    }
+
+    #[test]
+    fn discover_with_diagnostics_loads_from_an_explicit_extra_root() {
+        // pi: coding-agent/skills.test.ts — "should load from explicit skillPaths".
+        let tmp = tempfile::tempdir().unwrap();
+        let extra_root = tmp.path().join("shared-skills");
+        write_skill(
+            &extra_root,
+            "shared",
+            "---\nname: shared\ndescription: from an ad-hoc --skill path\n---\n",
+        );
+        // A directory with no `.claude/skills` at all — the skill must still surface via `extra_roots`.
+        let cwd = tmp.path().join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let (found, _) =
+            discover_with_diagnostics(&cwd, true, &[extra_root.to_string_lossy().into_owned()]);
+        assert!(found.iter().any(|s| s.name == "shared"), "got: {found:?}");
+    }
+
+    #[test]
+    fn discover_with_diagnostics_warns_when_an_extra_root_does_not_exist() {
+        // pi: coding-agent/skills.test.ts — "should warn when skill path does not exist".
+        // `discover_with_diagnostics` also scans the developer's real `~/.claude/skills`, so this
+        // doesn't assert `found` is empty (matching this file's other `discover_with_diagnostics`
+        // tests, which check `collisions` only for the same reason) — only that the missing path is
+        // reported.
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        let (_, collisions) =
+            discover_with_diagnostics(tmp.path(), true, &[missing.to_string_lossy().into_owned()]);
+        assert!(
+            collisions
+                .iter()
+                .any(|c| c.contains("does not exist") && c.contains("does-not-exist")),
+            "got: {collisions:?}"
+        );
+    }
+
+    #[test]
+    fn discover_with_diagnostics_extra_root_wins_over_a_standard_root_on_collision() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(
+            &tmp.path().join(".claude/skills"),
+            "dup",
+            "---\nname: dup\ndescription: standard root version\n---\n",
+        );
+        let extra_root = tmp.path().join("extra");
+        write_skill(
+            &extra_root,
+            "dup",
+            "---\nname: dup\ndescription: extra root version\n---\n",
+        );
+        let (found, _) = discover_with_diagnostics(
+            tmp.path(),
+            true,
+            &[extra_root.to_string_lossy().into_owned()],
+        );
+        let dup = found.iter().find(|s| s.name == "dup").unwrap();
+        assert_eq!(dup.description, "extra root version");
     }
 
     #[test]
@@ -604,6 +699,64 @@ mod tests {
         let skills = discover_in(tmp.path());
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "Bad_Name");
+    }
+
+    #[test]
+    fn skill_name_need_not_match_its_parent_directory() {
+        // pi: coding-agent/skills.test.ts, "should allow names that don't match parent directory" —
+        // `parse_skill` never compares `name` to the containing directory, so a frontmatter `name:`
+        // that differs from the directory it lives in is fine, not just a lucky accident.
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(
+            tmp.path(),
+            "some-directory",
+            "---\nname: totally-different-name\ndescription: still discoverable\n---\n",
+        );
+        let skills = discover_in(tmp.path());
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "totally-different-name");
+    }
+
+    #[test]
+    fn unknown_frontmatter_keys_are_silently_ignored() {
+        // pi: coding-agent/skills.test.ts — extra, unrecognized frontmatter keys must not break
+        // discovery or leak into the parsed `Skill`.
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(
+            tmp.path(),
+            "extra",
+            "---\nname: extra\ndescription: has extra keys\nversion: 3\nauthor: someone\n---\nBody.",
+        );
+        let skills = discover_in(tmp.path());
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "extra");
+        assert_eq!(skills[0].description, "has extra keys");
+    }
+
+    #[test]
+    fn malformed_frontmatter_degrades_gracefully_without_panicking() {
+        // The hand-rolled parser has no real YAML error path by design (see `parse_frontmatter`'s doc
+        // comment); the useful guarantee here isn't a specific error shape, it's that adversarial/
+        // malformed input can't panic discovery. An unclosed bracket value and an unterminated fence
+        // (no closing `---` at all) are both plausible ways a hand-edited SKILL.md goes wrong.
+        let (fm, _) = parse_frontmatter("---\nname: x\ndescription: [unclosed\n---\nBody");
+        assert_eq!(fm.get("description").map(String::as_str), Some("[unclosed"));
+
+        // No closing fence at all — must not panic or hang; every line is consumed as (attempted)
+        // frontmatter and the body comes back empty rather than the parser reading past EOF.
+        let (fm2, body2) = parse_frontmatter("---\nname: y\ndescription: z\n");
+        assert_eq!(fm2.get("name").map(String::as_str), Some("y"));
+        assert_eq!(body2, "");
+
+        // End-to-end through discovery too: a skill with an unterminated fence must not panic the walk,
+        // whatever it ultimately decides to do with the file.
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(
+            tmp.path(),
+            "broken",
+            "---\nname: broken\ndescription: no closing fence\n",
+        );
+        let _ = discover_in(tmp.path()); // must not panic
     }
 
     #[test]
@@ -737,6 +890,32 @@ mod tests {
         write_skill(
             &tmp.path().join("vendor"),
             "leaked",
+            "---\nname: leaked\ndescription: should not surface\n---\n",
+        );
+        write_skill(
+            tmp.path(),
+            "real",
+            "---\nname: real\ndescription: a real skill\n---\n",
+        );
+        let names: Vec<String> = discover_in(tmp.path())
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names, vec!["real".to_string()]);
+    }
+
+    #[test]
+    fn node_modules_directories_are_never_walked_even_without_an_ignore_file() {
+        // LOW pi-parity gap (fixed): pi's `skills.ts` hardcodes skipping `node_modules` unconditionally
+        // ("avoid scanning dependencies"), not merely relying on ignore-file coverage. Deliberately no
+        // `.gitignore`/`.ignore`/`.fdignore` here at all — `discover`'s `follow_links(true)` exists so a
+        // shared skills library symlinked in is visible, and such a library can lead *outside* this
+        // root into a foreign npm package with its own nested `node_modules` and no ignore file of its
+        // own, so the ignore-file mechanism alone can't be relied on to catch this case.
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(
+            &tmp.path().join("node_modules"),
+            "some-package",
             "---\nname: leaked\ndescription: should not surface\n---\n",
         );
         write_skill(

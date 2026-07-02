@@ -88,9 +88,10 @@ pub mod turn {
         vec![
             StreamEvent::MessageStart,
             StreamEvent::TextDelta {
+                index: 0,
                 text: s.to_string(),
             },
-            StreamEvent::ContentBlockStop,
+            StreamEvent::ContentBlockStop { index: 0 },
             StreamEvent::MessageStop {
                 stop_reason: StopReason::EndTurn,
             },
@@ -103,9 +104,10 @@ pub mod turn {
         vec![
             StreamEvent::MessageStart,
             StreamEvent::TextDelta {
+                index: 0,
                 text: s.to_string(),
             },
-            StreamEvent::ContentBlockStop,
+            StreamEvent::ContentBlockStop { index: 0 },
             StreamEvent::MessageStop {
                 stop_reason: StopReason::Refusal,
             },
@@ -117,13 +119,15 @@ pub mod turn {
         vec![
             StreamEvent::MessageStart,
             StreamEvent::ToolUseStart {
+                index: 0,
                 id: id.to_string(),
                 name: name.to_string(),
             },
             StreamEvent::InputJsonDelta {
+                index: 0,
                 partial_json: args_json.to_string(),
             },
-            StreamEvent::ContentBlockStop,
+            StreamEvent::ContentBlockStop { index: 0 },
             StreamEvent::MessageStop {
                 stop_reason: StopReason::ToolUse,
             },

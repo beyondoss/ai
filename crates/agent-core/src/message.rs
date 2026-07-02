@@ -23,8 +23,20 @@ pub enum Role {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
-    /// Plain text — a prompt fragment or assistant prose.
-    Text { text: String },
+    /// Plain text — a prompt fragment or assistant prose. `id`/`phase` are OpenAI Responses-only
+    /// replay metadata (`None` for every other dialect and for text authored locally, e.g. a
+    /// compaction summary): `id` is the wire message id, restamped verbatim on replay so the API's
+    /// reasoning-item pairing keeps working; `phase` labels the block as `"commentary"` (an
+    /// intermediate, non-final message) or `"final_answer"` for models with a channel-split output —
+    /// OpenAI's own docs say dropping it on replay measurably degrades those models. See
+    /// `dialect::openai_responses::push_assistant_content`.
+    Text {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phase: Option<String>,
+    },
     /// Extended-thinking output. The wire shape is Anthropic's `{"type":"thinking", thinking, signature}`;
     /// the `signature` is load-bearing — Anthropic rejects a later tool turn whose prior thinking block
     /// is missing or unsigned, so the loop must replay the block verbatim (see the dialect's `build_body`).
@@ -58,6 +70,18 @@ pub enum ContentBlock {
     /// An image attachment (base64). The wire shape is Anthropic's
     /// `{"type":"image","source":{"type":"base64", media_type, data}}`.
     Image { source: ImageSource },
+}
+
+impl ContentBlock {
+    /// A plain text block with no replay metadata — the common case for every dialect but OpenAI
+    /// Responses (see `Text`'s doc comment).
+    pub fn text(text: impl Into<String>) -> Self {
+        ContentBlock::Text {
+            text: text.into(),
+            id: None,
+            phase: None,
+        }
+    }
 }
 
 /// A base64-encoded image source, in Anthropic's nested wire shape.
@@ -103,7 +127,7 @@ impl Message {
     pub fn user(text: impl Into<String>) -> Self {
         Self {
             role: Role::User,
-            content: vec![ContentBlock::Text { text: text.into() }],
+            content: vec![ContentBlock::text(text)],
             model_id: None,
         }
     }
@@ -123,7 +147,7 @@ impl Message {
         let mut content = Vec::with_capacity(images.len() + 1);
         let text = text.into();
         if !text.is_empty() {
-            content.push(ContentBlock::Text { text });
+            content.push(ContentBlock::text(text));
         }
         for source in images {
             content.push(ContentBlock::Image { source });
@@ -246,37 +270,57 @@ pub struct TokenUsage {
 
 /// An incremental event from a streaming model response. The dialect adapters normalize both
 /// providers' SSE shapes into this sequence; the loop consumes it to assemble assistant messages.
+///
+/// Every block-scoped variant (everything between `MessageStart`/`MessageStop` that isn't `Usage`)
+/// carries an `index`: which content block it belongs to. This is what lets [`crate::agent`]'s
+/// `Accumulator` track more than one block open at once — e.g. two tool calls whose argument deltas
+/// genuinely interleave on the wire (OpenAI Responses' `output_index`; Anthropic's own
+/// `content_block_start.index`) stream live, in whatever order their deltas actually arrive, instead of
+/// one being buffered and replayed as a single burst once the other closes. A dialect whose wire never
+/// interleaves (Anthropic in practice, OpenAI Chat Completions' non-tool text) simply always emits
+/// `index: 0` for the one block it ever has open at a time — the field costs it nothing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamEvent {
     /// The assistant turn has begun.
     MessageStart,
-    /// A chunk of assistant text.
-    TextDelta { text: String },
-    /// A chunk of extended-thinking text.
-    ThinkingDelta { text: String },
-    /// The cryptographic signature closing a thinking block (arrives after its text). Captured so the
-    /// block can be replayed verbatim on the next request.
-    SignatureDelta { signature: String },
-    /// A complete redacted (encrypted) thinking block — self-contained, no deltas follow.
-    RedactedThinking { data: String },
-    /// A tool-call block opened; `id` and `name` are known before its arguments stream in.
-    ToolUseStart { id: String, name: String },
-    /// A chunk of the in-progress tool call's JSON arguments.
-    InputJsonDelta { partial_json: String },
-    /// The provider's own authoritative, complete tool-call arguments for the currently-open block,
-    /// *replacing* (not appending to) whatever `InputJsonDelta` fragments accumulated so far. Some
-    /// wire shapes (currently only OpenAI Responses' `function_call_arguments.done` and
-    /// `output_item.done`'s `item.arguments`) supply this as a resync point, so a single dropped or
-    /// duplicated mid-stream delta — a relay hiccup with no transport-level error, nothing else would
-    /// ever catch — can't silently leave the final call corrupted.
-    InputJsonFinal { full_json: String },
-    /// The provider's own authoritative, complete text for the currently-open block, replacing
-    /// whatever `TextDelta` fragments accumulated so far. Same resync purpose as `InputJsonFinal`, for
-    /// a text/refusal item.
-    TextFinal { text: String },
-    /// The current content block finished (text or tool-call).
-    ContentBlockStop,
+    /// A chunk of assistant text for block `index`.
+    TextDelta { index: usize, text: String },
+    /// A chunk of extended-thinking text for block `index`.
+    ThinkingDelta { index: usize, text: String },
+    /// The cryptographic signature closing block `index`'s thinking block (arrives after its text).
+    /// Captured so the block can be replayed verbatim on the next request.
+    SignatureDelta { index: usize, signature: String },
+    /// A complete redacted (encrypted) thinking block at `index` — self-contained, no deltas follow.
+    RedactedThinking { index: usize, data: String },
+    /// A tool-call block opened at `index`; `id` and `name` are known before its arguments stream in.
+    ToolUseStart {
+        index: usize,
+        id: String,
+        name: String,
+    },
+    /// A chunk of block `index`'s in-progress tool-call JSON arguments.
+    InputJsonDelta { index: usize, partial_json: String },
+    /// The provider's own authoritative, complete tool-call arguments for block `index`, *replacing*
+    /// (not appending to) whatever `InputJsonDelta` fragments accumulated so far. Some wire shapes
+    /// (currently only OpenAI Responses' `function_call_arguments.done` and `output_item.done`'s
+    /// `item.arguments`) supply this as a resync point, so a single dropped or duplicated mid-stream
+    /// delta — a relay hiccup with no transport-level error, nothing else would ever catch — can't
+    /// silently leave the final call corrupted.
+    InputJsonFinal { index: usize, full_json: String },
+    /// The provider's own authoritative, complete text for block `index`, replacing whatever
+    /// `TextDelta` fragments accumulated so far. Same resync purpose as `InputJsonFinal`, for a
+    /// text/refusal item. `id`/`phase` are OpenAI Responses' replay metadata for the finished
+    /// message item (see `ContentBlock::Text`'s doc comment) — always `None` from every other
+    /// dialect, which never emits this event at all.
+    TextFinal {
+        index: usize,
+        text: String,
+        id: Option<String>,
+        phase: Option<String>,
+    },
+    /// Block `index` finished (text or tool-call).
+    ContentBlockStop { index: usize },
     /// Token accounting. May arrive at end-of-stream (OpenAI) or alongside other events (Anthropic).
     /// A newtype over [`TokenUsage`] so the wire shape stays `{"type":"usage", …fields}` while the
     /// loop, the session, and future fields all share one struct.
@@ -323,9 +367,7 @@ mod tests {
     #[test]
     fn tool_uses_extracts_only_tool_calls() {
         let msg = Message::assistant(vec![
-            ContentBlock::Text {
-                text: "let me look".into(),
-            },
+            ContentBlock::text("let me look"),
             ContentBlock::ToolUse {
                 id: "a".into(),
                 name: "read".into(),
@@ -344,6 +386,7 @@ mod tests {
     #[test]
     fn stream_event_tag_is_snake_case() {
         let ev = StreamEvent::InputJsonDelta {
+            index: 0,
             partial_json: "{\"p\":".into(),
         };
         assert_eq!(

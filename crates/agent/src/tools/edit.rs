@@ -350,7 +350,10 @@ fn strip_crlf_with_map(body: &str) -> (String, Vec<u32>) {
 }
 
 /// Accept either the `edits` array form (pi-style) or the single old_string/new_string form. Also
-/// recovers the case where a model sends `edits` as a JSON-encoded *string* instead of an array.
+/// recovers the case where a model sends `edits` as a JSON-encoded *string* instead of an array. When
+/// a call sends **both** an `edits` array and top-level `old_string`/`new_string`, the legacy pair is
+/// appended as an extra edit rather than silently discarded — matches pi's behavior (a model that
+/// carries both shapes over from a prior turn/retry means both, not just the array).
 ///
 /// `pub(crate)`: also used by `export` to render an `edit` tool call's before/after as a real diff
 /// instead of raw JSON — reusing this rather than re-parsing `input` independently keeps the exported
@@ -361,11 +364,18 @@ pub(crate) fn parse_edits(input: &Value) -> Result<Vec<(String, String)>, ToolEr
         Some(Value::String(s)) => serde_json::from_str::<Value>(s).ok(),
         other => other.cloned(),
     };
+    let legacy = match (
+        input.get("old_string").and_then(Value::as_str),
+        input.get("new_string").and_then(Value::as_str),
+    ) {
+        (Some(o), Some(n)) => Some((o.to_string(), n.to_string())),
+        _ => None,
+    };
     if let Some(arr) = edits_value.as_ref().and_then(Value::as_array) {
         if arr.is_empty() {
             return Err(ToolError::InvalidInput("`edits` is empty".into()));
         }
-        return arr
+        let mut edits: Vec<(String, String)> = arr
             .iter()
             .map(|e| {
                 let old = e.get("old_string").and_then(Value::as_str);
@@ -377,16 +387,13 @@ pub(crate) fn parse_edits(input: &Value) -> Result<Vec<(String, String)>, ToolEr
                     )),
                 }
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
+        edits.extend(legacy);
+        return Ok(edits);
     }
-    let old = input.get("old_string").and_then(Value::as_str);
-    let new = input.get("new_string").and_then(Value::as_str);
-    match (old, new) {
-        (Some(o), Some(n)) => Ok(vec![(o.to_string(), n.to_string())]),
-        _ => Err(ToolError::InvalidInput(
-            "provide `edits`, or `old_string` and `new_string`".into(),
-        )),
-    }
+    legacy.map(|pair| vec![pair]).ok_or_else(|| {
+        ToolError::InvalidInput("provide `edits`, or `old_string` and `new_string`".into())
+    })
 }
 
 #[cfg(test)]
@@ -648,6 +655,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fuzzy_matches_fullwidth_cjk_punctuation_as_ascii() {
+        // pi: tools.test.ts, fullwidth CJK comma/parens folding to ASCII. NFKC (applied first, before
+        // `fold_char`) already maps the Fullwidth-Forms block to its ASCII counterparts, so this should
+        // hold without `fold_char` needing its own entry — pinning it as a real end-to-end test rather
+        // than trusting that by reading the Unicode tables.
+        let f = write_tmp("call(a\u{ff0c}b)"); // fullwidth comma U+FF0C, fullwidth parens U+FF08/FF09
+        let p = f.path().to_str().unwrap();
+        Edit.run(json!({ "path": p, "old_string": "call(a,b)", "new_string": "call(a, b)" }))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(p).unwrap(), "call(a, b)");
+    }
+
+    #[tokio::test]
+    async fn preserves_lf_line_endings_for_an_lf_only_file() {
+        // Every other line-ending test covers mixed-CRLF or pure-CRLF files; this proves the ordinary
+        // pure-LF case (the common one) explicitly rather than only by absence of a CRLF-specific test.
+        let f = write_tmp("line one\nline two\nline three\n");
+        let p = f.path().to_str().unwrap();
+        Edit.run(json!({ "path": p, "old_string": "line two", "new_string": "LINE TWO" }))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(p).unwrap(),
+            "line one\nLINE TWO\nline three\n"
+        );
+    }
+
+    #[tokio::test]
     async fn exact_and_fuzzy_duplicate_together_are_ambiguous() {
         // An ASCII-quoted exact match and a curly-quoted near-duplicate both fold to the same
         // normalized text — a real ambiguity, even though only one is byte-exact. The reference
@@ -673,6 +709,131 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::fs::read_to_string(p).unwrap(), "X and something else");
+    }
+
+    #[tokio::test]
+    async fn appends_legacy_replacement_to_existing_edits() {
+        // Both `edits` and top-level `old_string`/`new_string` present: the legacy pair must be
+        // applied too, not silently dropped (pi: edit-tool-legacy-input.test.ts, "appends legacy
+        // replacement to existing edits").
+        let f = write_tmp("foo and bar and baz");
+        let p = f.path().to_str().unwrap();
+        Edit.run(json!({
+            "path": p,
+            "edits": [{ "old_string": "foo", "new_string": "FOO" }],
+            "old_string": "baz",
+            "new_string": "BAZ",
+        }))
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(p).unwrap(), "FOO and bar and BAZ");
+    }
+
+    #[tokio::test]
+    async fn empty_edits_array_is_invalid_input() {
+        let f = write_tmp("hello");
+        let err = Edit
+            .run(json!({ "path": f.path().to_str().unwrap(), "edits": [] }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn editing_a_nonexistent_path_is_an_execution_error() {
+        let err = Edit
+            .run(json!({
+                "path": "/nonexistent/definitely-not-here.txt",
+                "old_string": "a",
+                "new_string": "b",
+            }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Execution(_)), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn ambiguous_match_error_reports_the_exact_count() {
+        let f = write_tmp("a a a");
+        let err = Edit
+            .run(
+                json!({ "path": f.path().to_str().unwrap(), "old_string": "a", "new_string": "b" }),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::InvalidInput(msg) => assert!(msg.contains('3'), "got: {msg}"),
+            other => panic!("expected InvalidInput mentioning 3 matches, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failing_multi_edit_call_leaves_the_file_byte_for_byte_unchanged() {
+        // One edit in the batch has an `old_string` that isn't found. Every edit's span is resolved
+        // before any write happens, so the file must come back out exactly as it went in — no partial
+        // application (pi: tools.test.ts, "keeps the file unchanged when any edit in the batch fails").
+        let original = "foo and bar and baz";
+        let f = write_tmp(original);
+        let p = f.path().to_str().unwrap();
+        let err = Edit
+            .run(json!({
+                "path": p,
+                "edits": [
+                    { "old_string": "foo", "new_string": "FOO" },
+                    { "old_string": "does not exist", "new_string": "X" }
+                ]
+            }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidInput(_)));
+        assert_eq!(std::fs::read_to_string(p).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn preserves_a_byte_order_mark_across_a_single_edit() {
+        let f = write_tmp("\u{feff}foo bar");
+        let p = f.path().to_str().unwrap();
+        Edit.run(json!({ "path": p, "old_string": "foo", "new_string": "baz" }))
+            .await
+            .unwrap();
+        let out = std::fs::read_to_string(p).unwrap();
+        assert!(out.starts_with('\u{feff}'), "BOM was dropped: {out:?}");
+        assert_eq!(out, "\u{feff}baz bar");
+    }
+
+    #[tokio::test]
+    async fn preserves_a_byte_order_mark_with_crlf_and_multiple_edits() {
+        let f = write_tmp("\u{feff}foo\r\nbar\r\n");
+        let p = f.path().to_str().unwrap();
+        Edit.run(json!({
+            "path": p,
+            "edits": [
+                { "old_string": "foo", "new_string": "FOO" },
+                { "old_string": "bar", "new_string": "BAR" }
+            ]
+        }))
+        .await
+        .unwrap();
+        let out = std::fs::read_to_string(p).unwrap();
+        assert_eq!(out, "\u{feff}FOO\r\nBAR\r\n");
+    }
+
+    #[tokio::test]
+    async fn fuzzy_match_works_across_a_multi_edit_array_not_just_single_edits() {
+        // Every fuzzy-matching test above uses the single-edit form; the `edits` array path shares
+        // `find_spans` per-edit, but nothing previously proved that end-to-end.
+        let f = write_tmp("\u{201c}hello\u{201d} and \u{2014}world\u{2014}");
+        let p = f.path().to_str().unwrap();
+        Edit.run(json!({
+            "path": p,
+            "edits": [
+                { "old_string": "\"hello\"", "new_string": "greeting" },
+                { "old_string": "-world-", "new_string": "planet" }
+            ]
+        }))
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(p).unwrap(), "greeting and planet");
     }
 
     #[tokio::test]

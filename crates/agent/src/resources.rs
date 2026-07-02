@@ -18,14 +18,19 @@ pub struct PromptOptions<'a> {
     /// `APPEND_SYSTEM.md` (project, then user — same discovery/trust order as `SYSTEM.md`) is used
     /// instead, if one exists; an explicit `append` here wins outright rather than combining with it.
     pub append: Option<&'a str>,
-    /// The working directory whose project-instruction files and skills to load.
+    /// The working directory whose project-instruction files to load.
     pub cwd: &'a Path,
     /// Whether to discover and inject `AGENTS.md`/`CLAUDE.md` project-instruction files.
     pub include_context_files: bool,
-    /// Whether to discover and advertise skills at all — an independent on/off switch, not a trust
-    /// gate (see `project_trusted` below for that). A real caller always passes `true`; tests pass
-    /// `false` to skip touching the developer's actual `~/.claude/skills`.
-    pub include_skills: bool,
+    /// Already-discovered skills to advertise (empty renders no `<available_skills>` section at all).
+    /// Discovery itself — `skills::discover`/`discover_with_diagnostics` — is the caller's job, not
+    /// this function's: every real caller (`main.rs`'s `run`, `serve.rs`'s startup/`reload`) already
+    /// discovers skills separately for its own purposes (expanding a `/skill:name` invocation,
+    /// `get_commands`'s collision diagnostics), so re-discovering here as well would walk the exact
+    /// same directories twice per startup/reload for no reason. Pass `&[]` (and skip discovery
+    /// upstream, matching `--no-skills`'s existing "skip outright rather than discover-then-discard"
+    /// pattern) to build a prompt with no skills at all.
+    pub skills: &'a [Skill],
     /// Whether `cwd` is a trusted project (an explicit `--trust-project`/RPC override, or recorded in
     /// `TrustStore`). Gates the *project-local* `SYSTEM.md`/`APPEND_SYSTEM.md` overrides and the
     /// project-local skills root (`<cwd>/.claude/skills`, see `skills::discover`) — an untrusted
@@ -84,12 +89,9 @@ pub fn build_static_system_prompt(opts: &PromptOptions) -> String {
         }
     }
 
-    if opts.include_skills {
-        let skills: Vec<Skill> = skills::discover(opts.cwd, opts.project_trusted);
-        if !skills.is_empty() {
-            s.push_str("\n\n");
-            s.push_str(&skills::format_available(&skills));
-        }
+    if !opts.skills.is_empty() {
+        s.push_str("\n\n");
+        s.push_str(&skills::format_available(opts.skills));
     }
 
     s
@@ -433,7 +435,7 @@ mod tests {
             append: None,
             cwd: tmp.path(),
             include_context_files: false,
-            include_skills: false,
+            skills: &[],
             project_trusted: true,
         });
         assert!(prompt.contains("OVERRIDE IDENTITY"));
@@ -458,11 +460,40 @@ mod tests {
             append: None,
             cwd: tmp.path(),
             include_context_files: false,
-            include_skills: false,
+            skills: &[],
             project_trusted: false,
         });
         assert!(prompt.contains("DEFAULT IDENTITY"));
         assert!(!prompt.contains("MALICIOUS OVERRIDE"));
+    }
+
+    #[test]
+    fn build_static_system_prompt_advertises_the_passed_in_skills_without_discovering_its_own() {
+        // LOW pi-parity gap (fixed): this used to call `skills::discover` itself, re-walking the exact
+        // same directories every caller had already walked for its own purposes (expanding a
+        // `/skill:name` invocation, `get_commands`'s collision diagnostics) — a second filesystem walk
+        // per startup/reload for no reason. `opts.cwd` here has no `.claude/skills` directory at all, so
+        // a real discovery would find nothing; the skill below only appears in the rendered prompt
+        // because `build_static_system_prompt` trusts the list it was given instead.
+        let tmp = tempfile::tempdir().unwrap();
+        let skill = Skill {
+            name: "already-discovered".into(),
+            description: "found by the caller, not by this function".into(),
+            path: tmp.path().join("SKILL.md"),
+            disable_model_invocation: false,
+        };
+        let prompt = build_system_prompt(&PromptOptions {
+            base: "DEFAULT IDENTITY",
+            append: None,
+            cwd: tmp.path(),
+            include_context_files: false,
+            skills: std::slice::from_ref(&skill),
+            project_trusted: true,
+        });
+        assert!(
+            prompt.contains("already-discovered") && prompt.contains("found by the caller"),
+            "got: {prompt}"
+        );
     }
 
     #[test]
@@ -477,7 +508,7 @@ mod tests {
             append: None,
             cwd: tmp.path(),
             include_context_files: false,
-            include_skills: false,
+            skills: &[],
             project_trusted: true,
         });
         assert!(prompt.contains("DEFAULT IDENTITY"));
@@ -499,7 +530,7 @@ mod tests {
             append: None,
             cwd: tmp.path(),
             include_context_files: false,
-            include_skills: false,
+            skills: &[],
             project_trusted: false,
         });
         assert!(!prompt.contains("MALICIOUS EXTRA RULES"));
@@ -517,7 +548,7 @@ mod tests {
             append: Some("CLI APPEND"),
             cwd: tmp.path(),
             include_context_files: false,
-            include_skills: false,
+            skills: &[],
             project_trusted: true,
         });
         assert!(prompt.contains("CLI APPEND"));
@@ -584,7 +615,7 @@ mod tests {
             append: Some("Stay terse."),
             cwd: tmp.path(),
             include_context_files: true,
-            include_skills: false,
+            skills: &[],
             project_trusted: false,
         });
         assert!(prompt.contains("You are an agent."));
@@ -610,7 +641,7 @@ mod tests {
             append: None,
             cwd: tmp.path(),
             include_context_files: false,
-            include_skills: false,
+            skills: &[],
             project_trusted: false,
         };
         let full = build_system_prompt(&opts);
@@ -637,7 +668,7 @@ mod tests {
             append: None,
             cwd: tmp.path(),
             include_context_files: false,
-            include_skills: false,
+            skills: &[],
             project_trusted: false,
         });
         assert!(!prompt.contains("<project_context>"));

@@ -57,6 +57,28 @@ fn serve_cmd(bin: &str, base: &str, session_file: &str) -> Command {
     c
 }
 
+/// Like `serve_cmd`, but with an explicit `--model` instead of the hardcoded `"claude-test"` — for
+/// tests exercising model-specific reasoning-effort clamping, where the test model itself matters.
+fn serve_cmd_with_model(bin: &str, base: &str, session_file: &str, model: &str) -> Command {
+    let mut c = Command::new(bin);
+    c.args([
+        "serve",
+        "--gateway-url",
+        base,
+        "--key",
+        "bai_v1.test",
+        "--model",
+        model,
+        "--session-file",
+        session_file,
+    ])
+    .env("HOME", ISOLATED_HOME)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
+    c
+}
+
 fn serve_dir_cmd(bin: &str, base: &str, session_dir: &str) -> Command {
     let mut c = Command::new(bin);
     c.args([
@@ -723,6 +745,311 @@ fn serve_follow_up_queued_while_idle_is_picked_up_by_next_prompt() {
 }
 
 #[test]
+fn serve_follow_up_expands_a_skill_invocation_while_idle() {
+    // MEDIUM pi-parity gap (fixed): `follow_up`/`steer` (and `prompt` with `streaming_behavior`) used
+    // to push the raw message straight into the steering queue with no `/skill:name`/`/name`
+    // expansion — only a fresh top-level `prompt` got that. A `/skill:name` sent through `follow_up`
+    // must reach the model as the skill's expanded body, exactly like a fresh `prompt` would, not as
+    // the literal unexpanded string.
+    let dir = tempfile::tempdir().unwrap();
+    let skill_dir = dir.path().join(".claude/skills/foo");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: foo\ndescription: a test skill\n---\nSKILL-BODY-MARKER-456",
+    )
+    .unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+
+    let (base, bodies) = spawn_model_server(vec![
+        turn_text("first answer"),
+        turn_text("answered the skill"),
+    ]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut cmd = serve_cmd(bin, &base, &session_file);
+    cmd.arg("--trust-project").current_dir(dir.path());
+    let mut child = cmd.spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    // Queue the skill invocation while genuinely idle, via `follow_up`.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "follow_up", "id": "f0", "message": "/skill:foo" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "follow_up");
+    assert!(
+        frames
+            .iter()
+            .any(|f| f["command"] == "follow_up" && f["success"] == true),
+        "follow_up while idle must be acknowledged: {frames:#?}"
+    );
+
+    // Turn 1 ends with no tool calls, so the queued follow-up is injected at that stop boundary and
+    // turn 2 sees it — all within this one `prompt` call.
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "start" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "prompt");
+    assert!(
+        frames.last().unwrap()["success"] == true,
+        "prompt should succeed: {frames:#?}"
+    );
+    drop(stdin);
+    child.wait().unwrap();
+
+    let recorded = bodies.lock().unwrap();
+    assert!(
+        recorded.iter().any(|b| b.contains("SKILL-BODY-MARKER-456")),
+        "the skill's body must be expanded into the follow-up message before it reaches the model: \
+         {recorded:#?}"
+    );
+    assert!(
+        recorded.iter().all(|b| !b.contains("/skill:foo")),
+        "the raw, unexpanded invocation must never reach the model: {recorded:#?}"
+    );
+}
+
+#[test]
+fn serve_mid_run_steer_expands_a_skill_invocation() {
+    // Same gap as `serve_follow_up_expands_a_skill_invocation_while_idle`, but for the *other* code
+    // path: a `steer` sent while a run is genuinely in flight (the busy-loop's own command handler,
+    // architecturally distinct from the idle handler above) must expand a `/skill:name` invocation too.
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let skill_dir = dir.path().join(".claude/skills/foo");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: foo\ndescription: a test skill\n---\nSKILL-BODY-MARKER-789",
+    )
+    .unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+
+    // turn 1 runs a 1s sleep (keeps the run in flight long enough to steer), turn 2 ends the turn —
+    // at which point the steered skill invocation is injected and answered.
+    let turn1 = turn_tool_use(
+        "toolu_s",
+        "bash",
+        &json!({ "command": "sleep 1" }).to_string(),
+    );
+    let (base, bodies) = spawn_model_server(vec![turn1, turn_text("answered the skill")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut cmd = serve_cmd(bin, &base, &session_file);
+    cmd.arg("--trust-project").current_dir(dir.path());
+    let mut child = cmd.spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "start" })).unwrap();
+    stdin.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "steer", "id": "s1", "message": "/skill:foo" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+
+    let frames = read_until_response(&mut stdout, "prompt");
+    assert!(
+        frames
+            .iter()
+            .any(|f| f["command"] == "steer" && f["success"] == true),
+        "steer should be acknowledged: {frames:#?}"
+    );
+    drop(stdin);
+    child.wait().unwrap();
+
+    let recorded = bodies.lock().unwrap();
+    assert!(
+        recorded.iter().any(|b| b.contains("SKILL-BODY-MARKER-789")),
+        "the skill's body must be expanded into the steered message before it reaches the model: \
+         {recorded:#?}"
+    );
+    assert!(
+        recorded.iter().all(|b| !b.contains("/skill:foo")),
+        "the raw, unexpanded invocation must never reach the model: {recorded:#?}"
+    );
+}
+
+#[test]
+fn serve_follow_up_carries_image_attachments_to_the_model() {
+    // MEDIUM pi-parity gap (fixed): `follow_up`/`steer` used to have nowhere to put an `images` field
+    // at all — a client attaching a screenshot to a queued follow-up had it silently dropped, unlike a
+    // fresh `prompt`, which has always supported `images`.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+
+    let (base, bodies) =
+        spawn_model_server(vec![turn_text("first answer"), turn_text("saw the image")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({
+            "type": "follow_up",
+            "id": "f0",
+            "message": "look at this",
+            "images": [{ "media_type": "image/png", "data": "aGVsbG8taW1hZ2UtZGF0YQ==" }],
+        })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "follow_up");
+    assert!(
+        frames
+            .iter()
+            .any(|f| f["command"] == "follow_up" && f["success"] == true),
+        "follow_up with images should be acknowledged: {frames:#?}"
+    );
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "start" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "prompt");
+    assert!(
+        frames.last().unwrap()["success"] == true,
+        "prompt should succeed: {frames:#?}"
+    );
+    drop(stdin);
+    child.wait().unwrap();
+
+    let recorded = bodies.lock().unwrap();
+    assert!(
+        recorded
+            .iter()
+            .any(|b| b.contains("aGVsbG8taW1hZ2UtZGF0YQ==")),
+        "the follow-up's image data must reach the model, not be silently dropped: {recorded:#?}"
+    );
+}
+
+#[test]
+fn serve_no_skills_prevents_discovery_and_leaves_an_invocation_unexpanded() {
+    // MEDIUM pi-parity gap (fixed): `serve` had no `--no-skills`/`--no-prompt-templates` at all — only
+    // `run` did — so an operator wanting a hardened, no-custom-content `serve` deployment had no way to
+    // refuse project-supplied skills. Same fixture/assertions as `run`'s own `--no-skills` test.
+    let dir = tempfile::tempdir().unwrap();
+    let skill_dir = dir.path().join(".claude/skills/foo");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: foo\ndescription: a test skill\n---\nSKILL-BODY-MARKER-999",
+    )
+    .unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+
+    let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut cmd = serve_cmd(bin, &base, &session_file);
+    cmd.args(["--trust-project", "--no-skills"])
+        .current_dir(dir.path());
+    let mut child = cmd.spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "get_commands" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_commands");
+    let commands = frames.last().unwrap()["data"]["commands"]
+        .as_array()
+        .unwrap();
+    assert!(
+        commands.is_empty(),
+        "--no-skills must prevent the skill from being discovered/advertised at all: {commands:?}"
+    );
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "/skill:foo" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+    drop(stdin);
+    child.wait().unwrap();
+
+    let recorded = bodies.lock().unwrap();
+    assert!(
+        recorded
+            .iter()
+            .all(|b| !b.contains("SKILL-BODY-MARKER-999")),
+        "the skill's body must never reach the model when --no-skills is set: {recorded:#?}"
+    );
+    assert!(
+        recorded.iter().any(|b| b.contains("/skill:foo")),
+        "the raw invocation must reach the model unexpanded: {recorded:#?}"
+    );
+}
+
+#[test]
+fn serve_no_prompt_templates_prevents_discovery_and_leaves_an_invocation_unexpanded() {
+    let dir = tempfile::tempdir().unwrap();
+    let prompt_dir = dir.path().join(".claude/prompts");
+    std::fs::create_dir_all(&prompt_dir).unwrap();
+    std::fs::write(prompt_dir.join("bar.md"), "TEMPLATE-BODY-MARKER-999: $1").unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+
+    let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut cmd = serve_cmd(bin, &base, &session_file);
+    cmd.args(["--trust-project", "--no-prompt-templates"])
+        .current_dir(dir.path());
+    let mut child = cmd.spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "get_commands" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_commands");
+    let commands = frames.last().unwrap()["data"]["commands"]
+        .as_array()
+        .unwrap();
+    assert!(
+        commands.is_empty(),
+        "--no-prompt-templates must prevent the template from being discovered/advertised at all: \
+         {commands:?}"
+    );
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "/bar arg" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+    drop(stdin);
+    child.wait().unwrap();
+
+    let recorded = bodies.lock().unwrap();
+    assert!(
+        recorded
+            .iter()
+            .all(|b| !b.contains("TEMPLATE-BODY-MARKER-999")),
+        "the template's body must never reach the model when --no-prompt-templates is set: \
+         {recorded:#?}"
+    );
+    assert!(
+        recorded.iter().any(|b| b.contains("/bar arg")),
+        "the raw invocation must reach the model unexpanded: {recorded:#?}"
+    );
+}
+
+#[test]
 fn serve_default_queue_mode_drains_queued_follow_ups_one_at_a_time() {
     // pi's `PendingMessageQueue` default: several messages queued in quick succession land as
     // *separate* turns, one at a time — not folded into a single injection. Two follow-ups queued
@@ -1335,6 +1662,112 @@ fn serve_set_reasoning_effort_wins_over_a_stale_set_thinking_override() {
         data["thinking"], 2048,
         "the level's own budget must win, not the stale 4096 override: {data:#?}"
     );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_starts_clamped_not_off_for_a_model_that_cannot_disable_reasoning() {
+    // The CRITICAL bug this closes: a session on a model with a reasoning mechanism it can't
+    // explicitly disable (`gpt-5-codex`: `reasoning_disableable == false`) must never start at the
+    // stored level `Off` — that would silently omit the `reasoning` field from every request and let
+    // the provider apply its own hidden default effort, with the operator believing reasoning is off.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd_with_model(bin, &base, &session_file, "gpt-5-codex")
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_state");
+    let data = &frames.last().unwrap()["data"];
+    assert_eq!(
+        data["thinking_level"], "minimal",
+        "gpt-5-codex's floor is minimal; a fresh session with no --reasoning-effort must start \
+         there, not at off: got {data:#?}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_set_model_reclamps_off_when_switching_onto_a_non_disableable_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    // `claude-test` is disable-capable, so the session starts at a legal "off".
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_state");
+    assert_eq!(frames.last().unwrap()["data"]["thinking_level"], "off");
+
+    // Switching to a model that can't disable reasoning must bump the still-stored "off" up to that
+    // model's own floor, not silently carry an illegal level across the switch.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_model", "model": "gpt-5-codex" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "set_model");
+    let data = &frames.last().unwrap()["data"];
+    assert_eq!(data["reasoning_effort"], "minimal", "got: {data:#?}");
+
+    writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_state");
+    assert_eq!(
+        frames.last().unwrap()["data"]["thinking_level"],
+        "minimal",
+        "get_state must reflect the re-clamped level too, not just the set_model response"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_cycle_thinking_level_never_gets_stuck_for_a_model_without_xhigh_or_off() {
+    // Regression guard for a bug the naive fix would have introduced: a plain `level.next()` then
+    // re-clamp bounces forever between `high` and a re-clamped `xhigh` for a model lacking xhigh
+    // support, since `xhigh` always clamps back down to the very `high` it started from. This model
+    // additionally can't reach `off` at all (`reasoning_disableable == false`), so the full available
+    // ladder is exactly minimal/low/medium/high, wrapping.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd_with_model(bin, &base, &session_file, "gpt-5-codex")
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    // Starts clamped at "minimal" (see the dedicated startup-clamp test above).
+    let expected = ["low", "medium", "high", "minimal", "low", "medium", "high"];
+    for level in expected {
+        writeln!(stdin, "{}", json!({ "type": "cycle_thinking_level" })).unwrap();
+        stdin.flush().unwrap();
+        let frames = read_until_response(&mut stdout, "cycle_thinking_level");
+        let data = &frames.last().unwrap()["data"];
+        assert_eq!(data["level"], level, "got: {data:#?}");
+    }
 
     drop(stdin);
     child.wait().unwrap();
@@ -4201,6 +4634,81 @@ fn serve_survives_a_hard_crash_mid_run_with_the_first_round_trip_already_durable
 }
 
 #[test]
+fn serve_reports_success_when_a_failed_checkpoint_is_superseded_by_a_successful_final_persist() {
+    // LOW pi-parity gap (fixed): `persist_error` used to be set the moment any mid-run checkpoint
+    // failed and never cleared, so a checkpoint hiccup early in a run made the terminal `prompt`
+    // response report failure even when the run's actual final state was later persisted just fine.
+    // Root-only environments can't exercise this (permission bits don't restrict root), so skip there.
+    if std::env::var("USER").as_deref() == Ok("root") {
+        return;
+    }
+
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+
+    let turn1 = turn_tool_use(
+        "toolu_1",
+        "bash",
+        &json!({ "command": "printf first-round-marker" }).to_string(),
+    );
+    let turn2 = turn_tool_use(
+        "toolu_2",
+        "bash",
+        &json!({ "command": "sleep 1" }).to_string(),
+    );
+    let (base, _bodies) = spawn_model_server(vec![turn1, turn2, turn_text("done")]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    // Consume the ready frame — by now `Persistence::open` has already created the file with normal
+    // permissions, so this doesn't race the file's own creation.
+    let mut ready = String::new();
+    stdout.read_line(&mut ready).unwrap();
+
+    // Make the session file read-only *before* sending the prompt, so the first round-trip's
+    // mid-run checkpoint (fired right after `toolu_1` completes) fails to append to it.
+    std::fs::set_permissions(&session_file, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "go" })).unwrap();
+    stdin.flush().unwrap();
+
+    // The first round-trip (a fast `printf`) completes and its checkpoint attempt fails well within
+    // this window; the second turn's `sleep 1` is still running when permissions are restored.
+    std::thread::sleep(Duration::from_millis(500));
+    std::fs::set_permissions(&session_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    // The run ends once `sleep 1` finishes and the model's concluding "done" turn is emitted; the
+    // unconditional final persist right after that must now succeed against the writable-again file.
+    let frames = read_until_response(&mut stdout, "prompt");
+    drop(stdin);
+    child.wait().unwrap();
+
+    let response = frames.last().unwrap();
+    assert_eq!(
+        response["success"], true,
+        "the run's true final state was persisted successfully — an earlier, superseded checkpoint \
+         failure must not surface as a false failure: {response:#?}"
+    );
+    assert!(
+        response.get("error").is_none() || response["error"].is_null(),
+        "got: {response:#?}"
+    );
+
+    // And the final persist genuinely did land on disk, not just "no error was reported."
+    let on_disk = std::fs::read_to_string(&session_file).unwrap();
+    assert!(
+        on_disk.contains("first-round-marker"),
+        "the final persist must have actually written the transcript: {on_disk}"
+    );
+}
+
+#[test]
 fn serve_stdout_stays_valid_json_even_when_a_load_warning_fires() {
     // A prior bug (output-guard gap): the tracing subscriber defaulted to stdout, the same stream
     // `serve`'s NDJSON protocol writes to. A `tracing::warn!` on a live path (here: `session_store.rs`
@@ -4349,6 +4857,379 @@ fn new_session_reports_failure_and_leaves_the_old_session_active_when_persist_fa
     assert_eq!(
         after_dump, before_dump,
         "a failed new_session must leave the previous session's transcript untouched: {after_dump}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_bare_prompt_while_busy_is_rejected_not_queued() {
+    // pi: agent-session-concurrent.test.ts / agent-session-prompt.test.ts — a bare `prompt` (no
+    // `streaming_behavior`) sent while one is already in flight must be rejected as busy, distinct
+    // from the accepted case (`serve_busy_prompt_with_streaming_behavior_is_accepted_not_rejected`
+    // above, which carries `streaming_behavior`).
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+
+    let turn1 = turn_tool_use(
+        "toolu_busy",
+        "bash",
+        &json!({ "command": "sleep 1" }).to_string(),
+    );
+    let (base, _bodies) = spawn_model_server(vec![turn1, turn_text("done")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "start" })).unwrap();
+    stdin.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "id": "p2", "message": "also handle this" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+
+    let rejection = read_until_response(&mut stdout, "prompt");
+    let p2 = rejection
+        .iter()
+        .find(|f| f["id"] == "p2")
+        .expect("p2's own response frame");
+    assert_eq!(p2["success"], false, "got: {p2:#?}");
+    assert!(
+        p2["error"].as_str().unwrap_or_default().contains("busy"),
+        "got: {p2:#?}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_unknown_command_type_reports_a_clear_failure_frame() {
+    // pi: suite/regressions/5868-rpc-unknown-command-id.test.ts — an unrecognized `type` must still
+    // produce a well-formed response frame (echoing both `id` and the unrecognized `command`), not a
+    // dropped connection or a malformed/missing reply.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![turn_text("hi")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "foobar", "id": "test" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "foobar");
+    let resp = frames.last().unwrap();
+    assert_eq!(resp["id"], "test");
+    assert_eq!(resp["command"], "foobar");
+    assert_eq!(resp["success"], false, "got: {resp:#?}");
+    assert!(resp.get("error").is_some(), "got: {resp:#?}");
+
+    // The connection must still be alive afterward — a genuinely recognized command works normally.
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
+    stdin.flush().unwrap();
+    let ok = read_until_response(&mut stdout, "prompt");
+    assert_eq!(ok.last().unwrap()["success"], true);
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_get_session_stats_reports_context_usage_after_a_real_turn() {
+    // Companion e2e proof for `session_stats`'s `context_usage` field (unit-tested directly in
+    // `serve.rs`'s own test module) — end-to-end through the real RPC surface: null before any turn,
+    // populated with a plausible `percent` after one.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![turn_text("hi there")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "get_session_stats" })).unwrap();
+    stdin.flush().unwrap();
+    let before = read_until_response(&mut stdout, "get_session_stats");
+    assert_eq!(
+        before.last().unwrap()["data"]["context_usage"],
+        Value::Null,
+        "no turn has run yet: {before:#?}"
+    );
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hello" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    writeln!(stdin, "{}", json!({ "type": "get_session_stats" })).unwrap();
+    stdin.flush().unwrap();
+    let after = read_until_response(&mut stdout, "get_session_stats");
+    let usage = &after.last().unwrap()["data"]["context_usage"];
+    assert!(usage["tokens"].as_u64().unwrap() > 0, "got: {usage:#?}");
+    assert!(
+        usage["context_window"].as_u64().unwrap() > 0,
+        "got: {usage:#?}"
+    );
+    assert!(usage["percent"].as_f64().unwrap() >= 0.0, "got: {usage:#?}");
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_set_session_name_and_get_last_assistant_text() {
+    // pi: rpc.test.ts "should set and get session name" / "get_last_assistant_text" — both were
+    // implemented but had zero e2e coverage: `set_session_name` persists a `session_info` entry
+    // reflected by `get_state`, and `get_last_assistant_text` reports the most recent assistant reply.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![turn_text("the actual reply")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    // No name set yet, no assistant reply yet.
+    writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
+    stdin.flush().unwrap();
+    let initial = read_until_response(&mut stdout, "get_state");
+    assert!(
+        initial.last().unwrap()["data"]
+            .get("title")
+            .is_none_or(Value::is_null),
+        "got: {initial:#?}"
+    );
+    writeln!(stdin, "{}", json!({ "type": "get_last_assistant_text" })).unwrap();
+    stdin.flush().unwrap();
+    let none_yet = read_until_response(&mut stdout, "get_last_assistant_text");
+    let text = &none_yet.last().unwrap()["data"]["text"];
+    assert!(
+        text.as_str().unwrap_or_default().is_empty() || text.is_null(),
+        "got: {none_yet:#?}"
+    );
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_session_name", "title": "my-test-session" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let set_resp = read_until_response(&mut stdout, "set_session_name");
+    assert_eq!(
+        set_resp.last().unwrap()["success"],
+        true,
+        "got: {set_resp:#?}"
+    );
+
+    writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
+    stdin.flush().unwrap();
+    let after_name = read_until_response(&mut stdout, "get_state");
+    assert_eq!(
+        after_name.last().unwrap()["data"]["title"],
+        "my-test-session",
+        "got: {after_name:#?}"
+    );
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    writeln!(stdin, "{}", json!({ "type": "get_last_assistant_text" })).unwrap();
+    stdin.flush().unwrap();
+    let after_reply = read_until_response(&mut stdout, "get_last_assistant_text");
+    assert!(
+        after_reply.last().unwrap()["data"]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("the actual reply"),
+        "got: {after_reply:#?}"
+    );
+
+    // The name survives on disk too (a single `session_info` entry, not lost on the next reattach).
+    let on_disk = std::fs::read_to_string(&session_file).unwrap();
+    assert!(
+        on_disk.contains("my-test-session"),
+        "session name must be persisted: {on_disk}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_auto_retry_exhausts_all_attempts_and_reports_failure() {
+    // Companion to `serve_auto_retries_a_whole_run_after_mid_stream_retry_is_exhausted` above, which
+    // only proves attempt 1 recovers — this drives all `MAX_RUN_RETRIES` (3) whole-run attempts to
+    // fail, ending in a reported failure with no recovery. Each whole-run attempt itself exhausts
+    // agent-core's own mid-stream retry (1 initial + 3 retried, all truncated) before this layer even
+    // sees it, so 3 whole-run attempts need 12 truncated stream chunks total, no successful turn at
+    // the end. Slow (~15-20s of real backoff sleep) but this is the only way to observe the real
+    // exponential-backoff schedule end to end.
+    let truncated = "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![truncated.to_string(); 12]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "prompt");
+
+    let auto_retry_frames: Vec<&Value> = frames
+        .iter()
+        .filter(|f| f.get("type").and_then(Value::as_str) == Some("auto_retry"))
+        .collect();
+    assert_eq!(
+        auto_retry_frames.len(),
+        3,
+        "expected exactly 3 auto_retry notices (attempts 1, 2, 3): {frames:#?}"
+    );
+    let attempts: Vec<i64> = auto_retry_frames
+        .iter()
+        .map(|f| f["attempt"].as_i64().unwrap())
+        .collect();
+    assert_eq!(attempts, vec![1, 2, 3]);
+
+    let auto_retry_end_frames: Vec<&Value> = frames
+        .iter()
+        .filter(|f| f.get("type").and_then(Value::as_str) == Some("auto_retry_end"))
+        .collect();
+    assert_eq!(auto_retry_end_frames.len(), 1, "got: {frames:#?}");
+    assert_eq!(auto_retry_end_frames[0]["success"], false);
+    assert_eq!(auto_retry_end_frames[0]["attempt"], 3);
+    assert!(
+        auto_retry_end_frames[0].get("final_error").is_some(),
+        "an exhausted retry sequence must carry a final_error: {:?}",
+        auto_retry_end_frames[0]
+    );
+
+    // The prompt command's own terminal response reports failure too — no silent success.
+    let prompt_resp = frames
+        .iter()
+        .rev()
+        .find(|f| f["type"] == "response" && f["command"] == "prompt")
+        .unwrap();
+    assert_eq!(prompt_resp["success"], false, "got: {prompt_resp:#?}");
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn get_state_reports_session_file_and_is_streaming_idle_vs_mid_run() {
+    // LOW pi-parity gap (fixed): `get_state` used to omit pi's `sessionFile`/`isStreaming`/
+    // `isCompacting` fields entirely. This proves `session_file` matches the real `--session-file`
+    // path in both the idle and mid-run handlers (architecturally distinct code paths — one keyed off
+    // `live_stats`, the other off `session_stats`), and that `is_streaming` correctly flips true only
+    // while a `prompt` genuinely has a turn in flight. `is_compacting` isn't forced here (doing so
+    // reliably would need a real network delay the shared mock server doesn't support) — its own
+    // event-driven state machine (`CompactionStart` before `Compacted`, with the right `reason`) is
+    // proven directly at the `agent-core` level instead; this test still confirms it reads back
+    // `false` in both idle and this (non-compacting) mid-run case, i.e. it never falsely reports
+    // `true` for an ordinary run.
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+
+    let turn1 = turn_tool_use(
+        "toolu_gs",
+        "bash",
+        &json!({ "command": "sleep 1" }).to_string(),
+    );
+    let (base, _bodies) = spawn_model_server(vec![turn1, turn_text("done")]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+
+    // Idle, before any prompt: `is_streaming`/`is_compacting` must both already read `false`, and
+    // `session_file` must already resolve to the real on-disk path (`Persistence::open` created it at
+    // startup, before any turn ever ran).
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
+    stdin.flush().unwrap();
+    let idle_frames = read_until_response(&mut stdout, "get_state");
+    let idle_state = &idle_frames.last().unwrap()["data"];
+    assert_eq!(idle_state["is_streaming"], false, "got: {idle_state:#?}");
+    assert_eq!(idle_state["is_compacting"], false, "got: {idle_state:#?}");
+    assert_eq!(
+        idle_state["session_file"].as_str(),
+        Some(session_file.as_str()),
+        "got: {idle_state:#?}"
+    );
+
+    // Mid-run: the sleeping tool call keeps a turn in flight long enough to query `get_state` from
+    // the busy-loop's own (architecturally distinct) handler.
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "go" })).unwrap();
+    stdin.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
+    stdin.flush().unwrap();
+
+    let frames = read_until_response(&mut stdout, "prompt");
+    let mid_run_state = &frames
+        .iter()
+        .find(|f| f["type"] == "response" && f["command"] == "get_state")
+        .expect("a get_state response while the prompt is in flight")["data"];
+    assert_eq!(
+        mid_run_state["is_streaming"], true,
+        "got: {mid_run_state:#?}"
+    );
+    assert_eq!(
+        mid_run_state["is_compacting"], false,
+        "got: {mid_run_state:#?}"
+    );
+    assert_eq!(
+        mid_run_state["session_file"].as_str(),
+        Some(session_file.as_str()),
+        "got: {mid_run_state:#?}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_name_flag_sets_the_initial_session_title() {
+    // Companion to `run`'s own `--name` e2e coverage (`run_e2e.rs`) — `serve`'s version only applies
+    // to a genuinely fresh session (see `ServeConfig::name`'s doc comment), which a brand-new
+    // `--session-file` always is.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![turn_text("hi")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file)
+        .args(["--name", "my-serve-session"])
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
+    stdin.flush().unwrap();
+    let state = read_until_response(&mut stdout, "get_state");
+    assert_eq!(
+        state.last().unwrap()["data"]["title"],
+        "my-serve-session",
+        "got: {state:#?}"
     );
 
     drop(stdin);

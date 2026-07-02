@@ -129,7 +129,7 @@ impl Session {
             message.content.retain_mut(|block| match block {
                 ContentBlock::Thinking { text, .. } if !text.is_empty() => {
                     let text = std::mem::take(text);
-                    *block = ContentBlock::Text { text };
+                    *block = ContentBlock::text(text);
                     true
                 }
                 ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => false,
@@ -181,9 +181,7 @@ mod tests {
                 ContentBlock::RedactedThinking {
                     data: "opaque".into(),
                 },
-                ContentBlock::Text {
-                    text: "answer".into(),
-                },
+                ContentBlock::text("answer"),
             ])
             .with_model_id("claude-opus-4-8"),
         );
@@ -200,16 +198,9 @@ mod tests {
         );
         assert_eq!(
             s.messages[1].content[0],
-            ContentBlock::Text {
-                text: "let me reason".into()
-            }
+            ContentBlock::text("let me reason")
         );
-        assert_eq!(
-            s.messages[1].content[1],
-            ContentBlock::Text {
-                text: "answer".into()
-            }
-        );
+        assert_eq!(s.messages[1].content[1], ContentBlock::text("answer"));
     }
 
     #[test]
@@ -256,12 +247,7 @@ mod tests {
             signature: "sig".into(),
         }]));
         s.scrub_cross_model_state("gpt-5");
-        assert_eq!(
-            s.messages[0].content,
-            vec![ContentBlock::Text {
-                text: "reasoning".into()
-            }]
-        );
+        assert_eq!(s.messages[0].content, vec![ContentBlock::text("reasoning")]);
     }
 
     #[test]

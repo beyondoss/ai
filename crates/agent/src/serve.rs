@@ -149,7 +149,27 @@
 //! whole-run auto-retry attempt (see `set_auto_retry` above), also correlated via `id` — or
 //! `{type:"auto_retry_end", id?, command:"prompt", success, attempt, final_error?}`, the terminal
 //! notice for a retry sequence that made at least one attempt.
+//!
+//! **Structural stdout guard:** every byte on stdout must be a protocol frame — a stray line (a
+//! debug `println!`, a misconfigured logger) would corrupt the NDJSON stream a remote client is
+//! reading line-by-line. pi's equivalent (`output-guard.ts`'s `takeOverStdout`) monkey-patches
+//! `process.stdout.write` globally so *any* code, including a dependency's own stray `console.log`,
+//! is transparently redirected to stderr — the only sanctioned writer left is its own
+//! `writeRawStdout`. That specific mechanism has no honest Rust equivalent here: it requires
+//! reopening/redirecting the raw fd, and this workspace forbids `unsafe_code` outright (see the
+//! workspace `Cargo.toml`), so fd-level interception is off the table on principle, not oversight.
+//! The right *Rust*-appropriate backstop is a static one instead: `#![deny(clippy::print_stdout)]`
+//! below makes any `println!`/`print!` in this module (including a future one, accidentally left in
+//! from local debugging) a hard compile error — the only sanctioned stdout writer is already the
+//! single `tokio::io::stdout()` task below, and nothing in this module has ever needed `println!`/
+//! `print!` directly, so this costs nothing today and closes the most realistic version of this gap
+//! (our own code, not a dependency's) permanently. It doesn't
+//! reach into a third-party dependency the way pi's runtime patch does, but idiomatic Rust crates
+//! overwhelmingly log through `tracing`/`log`, not raw stdout writes — a materially smaller residual
+//! risk than in the Node ecosystem pi targets, where ad hoc `console.log` debug output is common.
+#![deny(clippy::print_stdout)]
 
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -245,6 +265,29 @@ pub struct ServeConfig {
     pub exclude_tools: Option<Vec<String>>,
     /// Register no tools at all. Wins over `tools`/`exclude_tools`.
     pub no_tools: bool,
+    /// Disable skills discovery/loading entirely — no `<available_skills>` listing in the system
+    /// prompt, and a `/skill:name` invocation is sent through unexpanded. Matches pi's own
+    /// `--no-skills`, and `run`'s identical flag (`main.rs`'s `Run::no_skills`) — `serve` previously had
+    /// no equivalent, so an operator wanting a hardened, no-custom-content deployment had no way to
+    /// refuse project-supplied skills the way a one-shot `run` could. Skips discovery outright (like
+    /// `run`) rather than discovering and then discarding, applied on every `reload` too.
+    pub no_skills: bool,
+    /// Disable prompt-template discovery/loading entirely — a `/name` invocation is sent through
+    /// unexpanded instead of being resolved against `.claude/prompts/*.md`. Matches pi's own
+    /// `--no-prompt-templates` and `run`'s identical flag; see `no_skills`'s doc comment for why `serve`
+    /// needed this too.
+    pub no_prompt_templates: bool,
+    /// Additional, ad-hoc skill-discovery roots beyond the two standard ones — pi's own
+    /// `--skill <path>` (repeatable). Applied on every `reload` too, same as the standard roots.
+    pub extra_skill_paths: Vec<String>,
+    /// Additional, ad-hoc prompt-template-discovery roots — pi's own `--prompt-template <path>`
+    /// (repeatable). See `extra_skill_paths`'s doc comment; applies identically.
+    pub extra_prompt_template_paths: Vec<String>,
+    /// Set the session's title up front, if a *new* session is minted at startup (persistence
+    /// configured, no existing session reattached) — pi's own `--name`. Never renames an existing
+    /// session just because the process happened to be started with this flag again; already validated
+    /// non-whitespace by `main.rs` before this struct is even constructed.
+    pub name: Option<String>,
     /// Restrict `cycle_model`'s candidate list — and what `get_available_models` reports — to exactly
     /// these ids, in this order (`--models`, comma-separated). `set_model` is unaffected: it still
     /// accepts any id, scoped or not, matching pi's own `--models` flag (`resolveModelScope`/
@@ -445,6 +488,13 @@ impl Persistence {
 
     fn session_id(&self) -> &str {
         &self.meta.id
+    }
+
+    /// The active session's on-disk JSONL path — pi's `sessionFile` — or `None` when persistence is
+    /// disabled entirely (`--no-session-persistence`, an in-memory-only run). Repo and single-file
+    /// modes both populate `store`, so this covers either without needing to distinguish them.
+    fn session_file(&self) -> Option<&Path> {
+        self.store.as_ref().map(SessionStore::path)
     }
 
     /// Persist the session after a turn: non-destructively rewrite the transcript (see
@@ -866,6 +916,18 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
     let (mut persistence, mut session) = Persistence::open(&cfg)?;
     timing.mark("open persistence");
 
+    // `--name`: only for a genuinely fresh session (no messages, no title yet) — a resumed session
+    // (repo mode reattaching to an existing cwd session, or a `--session-file` that already has
+    // content) must not be silently renamed just because the process happened to be started with this
+    // flag again.
+    if let Some(name) = &cfg.name {
+        if session.messages.is_empty() && persistence.meta.title.is_none() {
+            if let Err(e) = persistence.set_title(name) {
+                eprintln!("serve: failed to set initial session name: {e}");
+            }
+        }
+    }
+
     // Assemble the system prompt from the base identity + this repo's project instructions + skills +
     // environment, so the agent behaves like it belongs in the working directory. Split into a static
     // half (this discovery-based block — expensive, rebuilt only on `set_model`/`set_thinking`/`reload`)
@@ -874,19 +936,13 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = crate::session_store::canonical_cwd(&std::env::current_dir().unwrap_or_default());
     let mut project_trusted = !cfg.force_untrusted
         && (cfg.trust_project || crate::trust_store::TrustStore::open_default().is_trusted(&cwd));
-    let mut static_system =
-        crate::resources::build_static_system_prompt(&crate::resources::PromptOptions {
-            base: &cfg.system,
-            append: cfg.append_system.as_deref(),
-            cwd: &cwd,
-            include_context_files: cfg.context_files,
-            include_skills: true,
-            project_trusted,
-        });
-    timing.mark("build static system prompt");
 
-    // Slash-command prompt templates (`/name args`) and discoverable skills, for `get_commands` and
-    // for expanding a `/name`/`/skill:name` prompt before it reaches the model.
+    // Slash-command prompt templates (`/name args`) and discoverable skills, for `get_commands`, for
+    // expanding a `/name`/`/skill:name` prompt before it reaches the model, and — for skills — to
+    // advertise in the system prompt below. Discovered *before* building the system prompt (rather
+    // than after, as this and the `reload` arm's own discovery used to be ordered) so
+    // `build_static_system_prompt` can take the already-discovered list instead of re-walking the same
+    // skills directories a second time itself.
     //
     // Prompt templates are gated on trust wholesale: an untrusted repo's `.claude/prompts` is
     // attacker-controlled instructions, so it's neither advertised nor invocable until the directory is
@@ -900,11 +956,36 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
     // The `_with_diagnostics` variant also reports name collisions (the same `/name` or skill name
     // shadowed across roots), surfaced via `get_commands`'s `collisions` field rather than silently
     // resolved with no way for a client to notice.
-    let (mut prompt_templates, mut prompt_collisions) =
-        crate::prompts::discover_with_diagnostics(&cwd, project_trusted);
-    let (mut skills, mut skill_collisions) =
-        crate::skills::discover_with_diagnostics(&cwd, project_trusted);
+    //
+    // `--no-skills`/`--no-prompt-templates` skip discovery outright rather than discovering and then
+    // discarding — matching `run`'s identical flags (`main.rs`), and avoiding a needless filesystem walk
+    // when the operator has already said neither is wanted.
+    let (mut prompt_templates, mut prompt_collisions) = if cfg.no_prompt_templates {
+        (Vec::new(), Vec::new())
+    } else {
+        crate::prompts::discover_with_diagnostics(
+            &cwd,
+            project_trusted,
+            &cfg.extra_prompt_template_paths,
+        )
+    };
+    let (mut skills, mut skill_collisions) = if cfg.no_skills {
+        (Vec::new(), Vec::new())
+    } else {
+        crate::skills::discover_with_diagnostics(&cwd, project_trusted, &cfg.extra_skill_paths)
+    };
     timing.mark("discover prompt templates/skills");
+
+    let mut static_system =
+        crate::resources::build_static_system_prompt(&crate::resources::PromptOptions {
+            base: &cfg.system,
+            append: cfg.append_system.as_deref(),
+            cwd: &cwd,
+            include_context_files: cfg.context_files,
+            skills: &skills,
+            project_trusted,
+        });
+    timing.mark("build static system prompt");
 
     // Keep the transport in an `Arc` we can clone: `set_model`/`set_thinking` rebuild the `Agent` at
     // runtime (a new model id picks a new dialect), and each rebuild reuses this one HTTP client.
@@ -935,10 +1016,17 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
     // always takes effect: `build_agent` derives both the thinking budget *and* the reasoning effort
     // from it via `agent_core::thinking_for_level`, correctly for whichever mechanism `current_model`
     // actually uses.
-    let starting_level = cfg
-        .reasoning_effort
-        .map(agent_core::ThinkingLevel::from)
-        .unwrap_or(agent_core::ThinkingLevel::Off);
+    // Clamped against `current_model`'s capabilities immediately: a model that has a reasoning
+    // mechanism but can't explicitly disable it (`reasoning_disableable == false`, e.g. most of the
+    // OpenAI gpt-5 codex/pro line) has no legal `Off` state at all — leaving it there would silently
+    // omit the reasoning field on every request and let the provider apply its own hidden default
+    // effort, with the operator believing reasoning is off. See `agent_core::clamp_thinking_level`.
+    let starting_level = agent_core::clamp_thinking_level(
+        &agent_core::capabilities(&current_model),
+        cfg.reasoning_effort
+            .map(agent_core::ThinkingLevel::from)
+            .unwrap_or(agent_core::ThinkingLevel::Off),
+    );
     // The runtime-mutable level starts at `starting_level`, but `switch_branch` needs the original
     // starting value too — as the fallback for a branch that never recorded its own thinking-level
     // change (see `Persistence::model_and_level_at`), so switching to it lands on the process's real
@@ -1111,11 +1199,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     ));
                     continue;
                 };
-                // Expand an explicit `/skill:name` invocation first (its own prefix, so it can't
-                // collide with a `/name` prompt template), then fall through to prompt-template
-                // expansion — a no-op on whichever message reaches it unmatched.
-                let message = crate::skills::expand_if_skill_invocation(message, &skills);
-                let message = crate::prompts::expand_if_slash(&message, &prompt_templates);
+                let message = expand_message(message, &skills, &prompt_templates);
                 // Optional image attachments: `images: [{media_type, data}]` (base64). Builds a
                 // multimodal user turn; absent or empty → a plain text turn.
                 let images = parse_images(cmd.get("images"));
@@ -1141,6 +1225,17 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 // multi-turn run is superseded once the model goes on to call tools or answer plainly).
                 // Also reset per retry attempt, for the same reason as `tokens_before`.
                 let refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                // Whether an auto-triggered compaction is *currently* in flight this instant — pi's
+                // `isCompacting`, surfaced from `get_state`. Set on `AgentEvent::CompactionStart`,
+                // cleared on `Compacted` *or* the very next event of any other kind (`TurnStart` for the
+                // run's next turn, ordinarily) — `Agent::compact` can end without ever emitting
+                // `Compacted` (an empty-summary no-op, or a propagated error), and its own model call
+                // uses a discarding inner sink, so nothing else can arrive between `CompactionStart` and
+                // whatever naturally follows it; clearing on "anything else" is exact, not a guess.
+                // Manual `compact`/branch-summary-on-`switch_branch` don't touch this: both only ever
+                // run from the idle main loop, which processes one command to completion before reading
+                // the next — no concurrent `get_state` could ever observe them in flight anyway.
+                let is_compacting = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
                 // Drive the run while staying responsive to stdin: `abort` cancels it, `steer` queues a
                 // mid-run injection and `follow_up` a stop-boundary one; any other command is
@@ -1166,20 +1261,23 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 // `retry::RUN_RETRY_MAX_BACKOFF`, this window is short enough not to be worth the much
                 // larger restructuring a truly gapless fix would need.
                 let mut retry_attempt: u32 = 0;
-                // Set if a mid-run checkpoint or the final post-attempt persist fails to write to
-                // disk. Surfaced in the terminal `prompt` response instead of being silently
-                // swallowed — an agent run that appears to succeed while its transcript failed to
-                // persist is exactly the failure mode this exists to catch. Reset per attempt, same as
-                // `tokens_before`/`refused`: a retry runs a clean turn, so an earlier attempt's
-                // checkpoint failures don't apply to it.
+                // Whether the final post-attempt persist (below) failed to write to disk — surfaced in
+                // the terminal `prompt` response instead of being silently swallowed, since an agent run
+                // that appears to succeed while its transcript failed to persist is exactly the failure
+                // mode this exists to catch. Always set from *that* persist's own outcome alone, once
+                // per attempt: it re-persists the whole current session state fresh, so it's a strict
+                // superset of any mid-run checkpoint along the way (see the `checkpoint_rx.recv()` arm's
+                // comment below) — a checkpoint that failed but was then followed by a successful final
+                // persist must report success, not a stale failure the superseding write already fixed.
                 let mut persist_error: Option<String>;
                 let result = 'retry: loop {
                     tokens_before.store(0, Ordering::Relaxed);
                     refused.store(false, Ordering::Relaxed);
-                    persist_error = None;
+                    is_compacting.store(false, Ordering::Relaxed);
                     let tx = out_tx.clone();
                     let tokens_before_sink = tokens_before.clone();
                     let refused_sink = refused.clone();
+                    let is_compacting_sink = is_compacting.clone();
                     // Live token/step counters a `get_state`/`get_session_stats` sent while this run is in
                     // flight can answer from (see the busy-loop's own arms for those types below) — seeded
                     // fresh from the session's *current* totals every attempt (a retry may follow a partial,
@@ -1192,6 +1290,13 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                         let run = agent.run_events_steered(
                             &mut session,
                             move |ev| {
+                                // Set on `CompactionStart`, cleared on literally anything else — see
+                                // `is_compacting`'s own declaration above for why that's exact, not a
+                                // conservative approximation.
+                                is_compacting_sink.store(
+                                    matches!(ev, AgentEvent::CompactionStart { .. }),
+                                    Ordering::Relaxed,
+                                );
                                 if let AgentEvent::Compacted { tokens_before, .. } = ev {
                                     tokens_before_sink.store(tokens_before, Ordering::Relaxed);
                                 }
@@ -1237,8 +1342,12 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                                 Some(messages) = checkpoint_rx.recv() => {
                                     let (p, r) = persist_messages_blocking(persistence, messages).await;
                                     persistence = p;
+                                    // Logged, not tracked in `persist_error`: the unconditional final
+                                    // persist below re-persists the whole session fresh regardless, so
+                                    // this checkpoint's own outcome never affects what's reported to the
+                                    // client — only worth knowing about here for operational visibility.
                                     if let Err(e) = r {
-                                        persist_error = Some(e.to_string());
+                                        tracing::warn!(error = %e, "mid-run checkpoint failed to persist");
                                     }
                                 }
                                 maybe_line = lines.next_line(), if stdin_open => match maybe_line {
@@ -1271,6 +1380,18 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                                             cmd @ ("steer" | "follow_up") => {
                                                 match c.get("message").and_then(Value::as_str) {
                                                     Some(m) => {
+                                                        // Same expansion (and the same optional
+                                                        // `images` attachments) a fresh `prompt` gets —
+                                                        // a `/skill:name`/`/name` invocation, or an
+                                                        // image, steered or queued this way must not
+                                                        // reach the model unexpanded/dropped just
+                                                        // because it arrived on a different command
+                                                        // type.
+                                                        let m = expand_message(m, &skills, &prompt_templates);
+                                                        let m = agent_core::SteeringMessage::new(
+                                                            m,
+                                                            parse_images(c.get("images")),
+                                                        );
                                                         // `steer` redirects mid-run (injected at the next
                                                         // tool turn); `follow_up` waits for the stop
                                                         // boundary. Two separate lanes.
@@ -1298,10 +1419,20 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                                                     c.get("message").and_then(Value::as_str),
                                                 ) {
                                                     (Some("steer"), Some(m)) => {
+                                                        let m = expand_message(m, &skills, &prompt_templates);
+                                                        let m = agent_core::SteeringMessage::new(
+                                                            m,
+                                                            parse_images(c.get("images")),
+                                                        );
                                                         steering.push_steer(m);
                                                         let _ = out_tx.send(response(cid, "prompt", true, Some(json!({ "queued_as": "steer" })), None));
                                                     }
                                                     (Some("follow_up"), Some(m)) => {
+                                                        let m = expand_message(m, &skills, &prompt_templates);
+                                                        let m = agent_core::SteeringMessage::new(
+                                                            m,
+                                                            parse_images(c.get("images")),
+                                                        );
                                                         steering.push(m);
                                                         let _ = out_tx.send(response(cid, "prompt", true, Some(json!({ "queued_as": "follow_up" })), None));
                                                     }
@@ -1328,6 +1459,9 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                                                     m.insert("message_count".into(), Value::Null);
                                                     m.insert("title".into(), json!(persistence.meta.title));
                                                     m.insert("cwd_stale".into(), json!(cwd_is_stale(&persistence.meta.cwd, &cwd)));
+                                                    m.insert("session_file".into(), json!(persistence.session_file().map(|p| p.display().to_string())));
+                                                    m.insert("is_streaming".into(), json!(true));
+                                                    m.insert("is_compacting".into(), json!(is_compacting.load(Ordering::Relaxed)));
                                                     if let Value::Object(rt) = runtime_settings(current_level, current_auto_compaction, current_auto_retry, &steering) {
                                                         m.extend(rt);
                                                     }
@@ -1419,9 +1553,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                             persist_blocking(persistence, session.clone(), compacted_tokens_before)
                                 .await;
                         persistence = p;
-                        if let Err(e) = r {
-                            persist_error = Some(e.to_string());
-                        }
+                        persist_error = r.err().map(|e| e.to_string());
                     }
 
                     match &attempt_result {
@@ -1530,7 +1662,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
 
                 let frame = match result {
                     Ok(()) => {
-                        let mut data = session_stats(&session);
+                        let mut data = session_stats(&session, &current_model);
                         if let Value::Object(m) = &mut data {
                             m.insert("refused".into(), json!(refused.load(Ordering::Relaxed)));
                         }
@@ -1562,6 +1694,9 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
             cmd_type @ ("steer" | "follow_up") => {
                 match cmd.get("message").and_then(Value::as_str) {
                     Some(m) => {
+                        let m = expand_message(m, &skills, &prompt_templates);
+                        let m =
+                            agent_core::SteeringMessage::new(m, parse_images(cmd.get("images")));
                         if cmd_type == "steer" {
                             steering.push_steer(m);
                         } else {
@@ -1598,7 +1733,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 emit!(response(id, "stop_after_turn", true, None, None));
             }
             "get_state" => {
-                let mut data = session_stats(&session);
+                let mut data = session_stats(&session, &current_model);
                 if let Value::Object(m) = &mut data {
                     m.insert("session_id".into(), json!(persistence.session_id()));
                     m.insert("model".into(), json!(current_model));
@@ -1608,6 +1743,16 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                         "cwd_stale".into(),
                         json!(cwd_is_stale(&persistence.meta.cwd, &cwd)),
                     );
+                    m.insert(
+                        "session_file".into(),
+                        json!(persistence.session_file().map(|p| p.display().to_string())),
+                    );
+                    // Both hardcoded, not stale placeholders: no `prompt`/compaction can possibly be
+                    // in flight here at all — this arm only ever runs from the idle main loop, which
+                    // processes one command to completion before reading the next, so there is no
+                    // concurrently-running turn or compaction this response could be racing.
+                    m.insert("is_streaming".into(), json!(false));
+                    m.insert("is_compacting".into(), json!(false));
                     if let Value::Object(rt) = runtime_settings(
                         current_level,
                         current_auto_compaction,
@@ -2001,7 +2146,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     id,
                     "get_session_stats",
                     true,
-                    Some(session_stats(&session)),
+                    Some(session_stats(&session, &current_model)),
                     None
                 ));
             }
@@ -2039,20 +2184,34 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 project_trusted = !cfg.force_untrusted
                     && (cfg.trust_project
                         || crate::trust_store::TrustStore::open_default().is_trusted(&cwd));
+                (prompt_templates, prompt_collisions) = if cfg.no_prompt_templates {
+                    (Vec::new(), Vec::new())
+                } else {
+                    crate::prompts::discover_with_diagnostics(
+                        &cwd,
+                        project_trusted,
+                        &cfg.extra_prompt_template_paths,
+                    )
+                };
+                (skills, skill_collisions) = if cfg.no_skills {
+                    (Vec::new(), Vec::new())
+                } else {
+                    crate::skills::discover_with_diagnostics(
+                        &cwd,
+                        project_trusted,
+                        &cfg.extra_skill_paths,
+                    )
+                };
                 static_system = crate::resources::build_static_system_prompt(
                     &crate::resources::PromptOptions {
                         base: &cfg.system,
                         append: cfg.append_system.as_deref(),
                         cwd: &cwd,
                         include_context_files: cfg.context_files,
-                        include_skills: true,
+                        skills: &skills,
                         project_trusted,
                     },
                 );
-                (prompt_templates, prompt_collisions) =
-                    crate::prompts::discover_with_diagnostics(&cwd, project_trusted);
-                (skills, skill_collisions) =
-                    crate::skills::discover_with_diagnostics(&cwd, project_trusted);
                 agent.set_system(full_system(&static_system, &cwd));
                 emit!(response(id, "reload", true, None, None));
             }
@@ -2089,6 +2248,13 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                             // already stamped with the model we're switching to.
                             session.scrub_cross_model_state(model);
                             current_model = model.to_string();
+                            // Re-clamp the *existing* level against the *new* model: e.g. a session
+                            // sitting at `Off` on a disable-capable model must not silently carry that
+                            // `Off` over to a model that can't actually disable reasoning.
+                            current_level = agent_core::clamp_thinking_level(
+                                &agent_core::capabilities(&current_model),
+                                current_level,
+                            );
                             agent = build_agent(
                                 client.clone(),
                                 &full_system(&static_system, &cwd),
@@ -2106,7 +2272,10 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                                 id,
                                 "set_model",
                                 true,
-                                Some(json!({ "model": current_model })),
+                                Some(json!({
+                                    "model": current_model,
+                                    "reasoning_effort": current_level.as_str(),
+                                })),
                                 None,
                             ));
                         }
@@ -2197,6 +2366,14 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 };
                 match parsed {
                     Some(level) => {
+                        // Clamp against `current_model`'s capabilities before storing or recording:
+                        // an explicit `"off"` request is only honored if the model can actually
+                        // disable reasoning; otherwise it's bumped to the model's own floor rather
+                        // than silently persisted as a level the wire can't represent.
+                        let level = agent_core::clamp_thinking_level(
+                            &agent_core::capabilities(&current_model),
+                            level,
+                        );
                         let record_result = if level != current_level {
                             persistence.record_thinking_level_change(level.as_str())
                         } else {
@@ -2272,6 +2449,11 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     Ok(()) => {
                         session.scrub_cross_model_state(&next_model);
                         current_model = next_model;
+                        // See `set_model`'s identical re-clamp for why this can't be skipped.
+                        current_level = agent_core::clamp_thinking_level(
+                            &agent_core::capabilities(&current_model),
+                            current_level,
+                        );
                         agent = build_agent(
                             client.clone(),
                             &full_system(&static_system, &cwd),
@@ -2289,9 +2471,11 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                             id,
                             "cycle_model",
                             true,
-                            Some(
-                                json!({ "model": current_model, "scoped": !cfg.models.is_empty() })
-                            ),
+                            Some(json!({
+                                "model": current_model,
+                                "scoped": !cfg.models.is_empty(),
+                                "reasoning_effort": current_level.as_str(),
+                            })),
                             None,
                         ));
                     }
@@ -2310,7 +2494,14 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 // silently mask the level having just changed. `thinking_for_level` reports what the
                 // new level actually resolves to for `current_model` specifically, so the response
                 // reflects reality rather than a number that may be meaningless for this model's shape.
-                let next_level = current_level.next();
+                // Advances through only the levels `current_model` actually supports (see
+                // `next_available_thinking_level`'s doc comment) rather than the raw 6-rung ladder —
+                // a blind `.next()` would let the cycle land on (and durably record) an `Off` or
+                // `xhigh` state the active model can't represent on the wire.
+                let next_level = agent_core::next_available_thinking_level(
+                    &agent_core::capabilities(&current_model),
+                    current_level,
+                );
                 match persistence.record_thinking_level_change(next_level.as_str()) {
                     Ok(()) => {
                         current_level = next_level;
@@ -2537,6 +2728,14 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                             // `model_and_level_at`'s doc comment.
                             let (restored_model, restored_level) =
                                 persistence.model_and_level_at(&target_id, starting_level);
+                            // Clamp against the *restored* model's capabilities, not the model that
+                            // was active before the switch — a branch recorded at `Off` on a model
+                            // that's since been superseded by a non-disable-capable one must not
+                            // resurrect an illegal `Off` state.
+                            let restored_level = agent_core::clamp_thinking_level(
+                                &agent_core::capabilities(&restored_model),
+                                restored_level,
+                            );
                             let mut rebuild_needed = false;
                             if restored_model != current_model {
                                 session.scrub_cross_model_state(&restored_model);
@@ -2888,12 +3087,28 @@ fn last_assistant_text(session: &Session) -> String {
             m.content
                 .iter()
                 .filter_map(|b| match b {
-                    agent_core::ContentBlock::Text { text } => Some(text.as_str()),
+                    agent_core::ContentBlock::Text { text, .. } => Some(text.as_str()),
                     _ => None,
                 })
                 .collect::<String>()
         })
         .unwrap_or_default()
+}
+
+/// Expand an explicit `/skill:name` invocation first (its own prefix, so it can't collide with a
+/// `/name` prompt template), then fall through to prompt-template expansion — a no-op on whichever
+/// message reaches it unmatched. Shared by every command that queues raw user-authored text as a turn
+/// or steering message (`prompt`, `steer`, `follow_up`, and `prompt`'s `streaming_behavior` variant) —
+/// a message queued through `steer`/`follow_up` must get the same expansion a fresh `prompt` would, or
+/// a `/skill:name`/`/name` invocation sent through one of those paths silently reaches the model
+/// unexpanded instead of triggering the skill/template it names.
+fn expand_message(
+    message: &str,
+    skills: &[crate::skills::Skill],
+    prompt_templates: &[crate::prompts::PromptTemplate],
+) -> String {
+    let message = crate::skills::expand_if_skill_invocation(message, skills);
+    crate::prompts::expand_if_slash(&message, prompt_templates)
 }
 
 /// Parse a `prompt`'s optional `images` array into base64 image sources. Each entry is
@@ -2915,7 +3130,24 @@ fn parse_images(images: Option<&Value>) -> Vec<agent_core::ImageSource> {
 
 /// Token + step accounting for a session, including the prompt-cache reads/writes that make the
 /// Anthropic cache breakpoints observable. Shared by the `prompt` response and `get_state`.
-fn session_stats(session: &Session) -> Value {
+/// `model` is the session's *currently active* model, not necessarily the one that produced
+/// `last_input_tokens` — a `set_model`/`cycle_model` mid-session means the context-window figure is
+/// always reported against what a client would actually be constrained by on the *next* turn, matching
+/// how a client would use this value (to decide whether compaction is coming soon), not as a historical
+/// record of what the previous turn's provider reported.
+fn session_stats(session: &Session, model: &str) -> Value {
+    let context_window = agent_core::models::capabilities(model).context_window;
+    // `last_input_tokens == 0` covers both "no turn has run yet" and pi's "immediately after
+    // compaction, before a new reply" case (compaction never sets this field itself — only a real
+    // provider response does) — both genuinely have no current-context figure to report, so `null`
+    // rather than a misleading `0%`. Matches pi's `contextUsage` being `null` in the same situations.
+    let context_usage = (session.last_input_tokens > 0).then(|| {
+        json!({
+            "tokens": session.last_input_tokens,
+            "context_window": context_window,
+            "percent": (session.last_input_tokens as f64 / context_window as f64 * 100.0),
+        })
+    });
     json!({
         "steps": session.steps,
         "input_tokens": session.input_tokens,
@@ -2925,6 +3157,7 @@ fn session_stats(session: &Session) -> Value {
         "cache_write_1h_tokens": session.cache_write_1h_tokens,
         "reasoning_tokens": session.reasoning_tokens,
         "last_input_tokens": session.last_input_tokens,
+        "context_usage": context_usage,
     })
 }
 
@@ -3162,4 +3395,47 @@ async fn write_frame(out: &mut tokio::io::Stdout, line: &str) -> std::io::Result
     out.write_all(line.as_bytes()).await?;
     out.write_all(b"\n").await?;
     out.flush().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_stats_reports_no_context_usage_before_any_turn_has_run() {
+        // pi: agent-session-stats.test.ts — `contextUsage` is `null` when nothing has run yet (and,
+        // by the same field, immediately after a compaction that hasn't been followed by a real reply
+        // — compaction never sets `last_input_tokens` itself, only a real provider response does).
+        let session = Session::new();
+        let stats = session_stats(&session, "claude-opus-4-8");
+        assert_eq!(stats["context_usage"], Value::Null, "got: {stats}");
+    }
+
+    #[test]
+    fn session_stats_reports_context_usage_against_the_currently_active_model() {
+        let mut session = Session::new();
+        session.last_input_tokens = 50_000;
+        let stats = session_stats(&session, "claude-opus-4-8");
+        let usage = &stats["context_usage"];
+        assert_eq!(usage["tokens"], 50_000);
+        let context_window = agent_core::models::capabilities("claude-opus-4-8").context_window;
+        assert_eq!(usage["context_window"], context_window);
+        let expected_percent = 50_000.0 / context_window as f64 * 100.0;
+        assert!(
+            (usage["percent"].as_f64().unwrap() - expected_percent).abs() < f64::EPSILON,
+            "got: {usage}"
+        );
+    }
+
+    #[test]
+    fn session_stats_context_window_reflects_a_model_switch_not_the_original_model() {
+        // The window reported is always for the model the *next* turn would actually run against —
+        // a session that ran under one model and then switched (`set_model`/`cycle_model`) must report
+        // the new model's window, not the one that produced `last_input_tokens`.
+        let mut session = Session::new();
+        session.last_input_tokens = 10_000;
+        let stats = session_stats(&session, "gpt-5-mini");
+        let expected_window = agent_core::models::capabilities("gpt-5-mini").context_window;
+        assert_eq!(stats["context_usage"]["context_window"], expected_window);
+    }
 }

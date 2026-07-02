@@ -683,6 +683,12 @@ impl SessionStore {
         &self.meta
     }
 
+    /// The on-disk path this session's JSONL file lives at — pi's `sessionFile`, surfaced via
+    /// `get_state` for a client that wants to know exactly what's being written to.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Ids of the active path's messages, root-first — parallel to the `Session.messages` this store
     /// last produced (via `open`, `append_new`, `rewrite`, or `switch_active`). What a caller quotes
     /// back to [`Self::switch_active`] to navigate to a specific point in the history.
@@ -1852,7 +1858,7 @@ fn first_user_text(msg: &Message) -> Option<&str> {
         return None;
     }
     msg.content.iter().find_map(|b| match b {
-        ContentBlock::Text { text } => Some(text.as_str()),
+        ContentBlock::Text { text, .. } => Some(text.as_str()),
         _ => None,
     })
 }
@@ -1869,7 +1875,7 @@ fn message_search_text(msg: &Message) -> Option<String> {
         .content
         .iter()
         .filter_map(|b| match b {
-            ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -1902,7 +1908,7 @@ fn preview_of(text: &str) -> String {
 /// thinking/image turn).
 fn message_text_preview(msg: &Message) -> Option<String> {
     msg.content.iter().find_map(|b| match b {
-        ContentBlock::Text { text } if !text.trim().is_empty() => Some(preview_of(text)),
+        ContentBlock::Text { text, .. } if !text.trim().is_empty() => Some(preview_of(text)),
         _ => None,
     })
 }
@@ -3296,9 +3302,9 @@ mod tests {
         let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
         let mut session = Session::new();
         session.user("what's broken?");
-        session.push(Message::assistant(vec![ContentBlock::Text {
-            text: "the bug is in unique-marker-xyz.rs".into(),
-        }]));
+        session.push(Message::assistant(vec![ContentBlock::text(
+            "the bug is in unique-marker-xyz.rs",
+        )]));
         store.append_new(&session.messages).unwrap();
 
         let listings = repo.list().unwrap();
@@ -3824,7 +3830,7 @@ mod tests {
             .unwrap();
         assert_eq!(messages.len(), 2);
         let summary_text = match &messages[1].content[0] {
-            ContentBlock::Text { text } => text,
+            ContentBlock::Text { text, .. } => text,
             other => panic!("expected a text block, got {other:?}"),
         };
         assert!(summary_text.contains("some recap"));
@@ -3948,8 +3954,8 @@ mod tests {
         // Case 2: target is an ancestor still on the active path (b) — c and d are abandoned.
         let abandoned = store.abandoned_by_switch(&ids[1]);
         assert_eq!(abandoned.len(), 2);
-        assert!(matches!(&abandoned[0].1.content[0], ContentBlock::Text{text} if text == "c"));
-        assert!(matches!(&abandoned[1].1.content[0], ContentBlock::Text{text} if text == "d"));
+        assert!(matches!(&abandoned[0].1.content[0], ContentBlock::Text{text, ..} if text == "c"));
+        assert!(matches!(&abandoned[1].1.content[0], ContentBlock::Text{text, ..} if text == "d"));
 
         // Case 3: unknown target — nothing abandoned (the switch itself will fail).
         assert!(store.abandoned_by_switch("does-not-exist").is_empty());
@@ -3966,7 +3972,7 @@ mod tests {
         // (which lives on the *other* branch, not the one currently active).
         let abandoned = store.abandoned_by_switch(&ids[3]);
         assert_eq!(abandoned.len(), 1);
-        assert!(matches!(&abandoned[0].1.content[0], ContentBlock::Text{text} if text == "e"));
+        assert!(matches!(&abandoned[0].1.content[0], ContentBlock::Text{text, ..} if text == "e"));
     }
 
     #[test]
@@ -4029,8 +4035,8 @@ mod tests {
             2,
             "expected just [c, d] — the walk stops at the missing `b`"
         );
-        assert!(matches!(&orphaned[0].content[0], ContentBlock::Text{text} if text == "c"));
-        assert!(matches!(&orphaned[1].content[0], ContentBlock::Text{text} if text == "d"));
+        assert!(matches!(&orphaned[0].content[0], ContentBlock::Text{text, ..} if text == "c"));
+        assert!(matches!(&orphaned[1].content[0], ContentBlock::Text{text, ..} if text == "d"));
 
         // And a fresh reopen of the file reconstructs the same picture — the orphaning survives a
         // round-trip through disk, not just the in-memory state from the same process. Having
@@ -4091,7 +4097,7 @@ mod tests {
         let texts: Vec<&str> = messages
             .iter()
             .map(|m| match &m.content[0] {
-                ContentBlock::Text { text } => text.as_str(),
+                ContentBlock::Text { text, .. } => text.as_str(),
                 other => panic!("expected a text block, got {other:?}"),
             })
             .collect();

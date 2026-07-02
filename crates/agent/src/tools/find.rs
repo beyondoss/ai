@@ -231,6 +231,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_malformed_glob_pattern_is_a_clear_invalid_input_error() {
+        // pi: tools.test.ts, "should surface fd glob parse errors" — coverage exists for the happy
+        // path only; an unterminated character class must produce a clear tool error, not a panic or a
+        // confusing "no files matching" result.
+        let dir = tempfile::tempdir().unwrap();
+        let err = Find
+            .run(json!({ "pattern": "[", "path": dir.path().to_str().unwrap() }))
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::InvalidInput(msg) => assert!(msg.contains("bad glob"), "got: {msg}"),
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn matches_directories_too() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("node_modules")).unwrap();

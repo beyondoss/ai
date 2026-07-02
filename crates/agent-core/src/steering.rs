@@ -32,7 +32,59 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-type Queue = Arc<Mutex<VecDeque<String>>>;
+use crate::message::ImageSource;
+
+/// A queued steer/follow-up message: text plus optional image attachments — the same shape a fresh
+/// `prompt` accepts (`serve.rs`'s own `images` field), so a message routed through `steer`/`follow_up`
+/// isn't a lesser channel that silently drops attachments a `prompt` would have kept. `From<&str>`/
+/// `From<String>` build a text-only message, so every existing `push`/`push_steer` call site that
+/// only ever handled plain text keeps compiling unchanged; construct the struct directly (or via
+/// [`SteeringMessage::new`]) to attach images.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SteeringMessage {
+    pub text: String,
+    pub images: Vec<ImageSource>,
+}
+
+impl SteeringMessage {
+    /// A message with both text and image attachments.
+    pub fn new(text: impl Into<String>, images: Vec<ImageSource>) -> Self {
+        Self {
+            text: text.into(),
+            images,
+        }
+    }
+}
+
+impl From<&str> for SteeringMessage {
+    fn from(text: &str) -> Self {
+        Self {
+            text: text.to_string(),
+            images: Vec::new(),
+        }
+    }
+}
+
+impl From<String> for SteeringMessage {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            images: Vec::new(),
+        }
+    }
+}
+
+// Lets existing text-only test assertions (`assert_eq!(s.drain_steer(), vec!["x".to_string()])`)
+// keep working unchanged: `Vec<SteeringMessage> == Vec<String>` needs `SteeringMessage: PartialEq<String>`.
+// Compares text only — a caller asserting against a bare string is deliberately not asserting
+// anything about images.
+impl PartialEq<String> for SteeringMessage {
+    fn eq(&self, other: &String) -> bool {
+        &self.text == other
+    }
+}
+
+type Queue = Arc<Mutex<VecDeque<SteeringMessage>>>;
 
 /// How much of a lane [`Steering::drain_steer`]/[`Steering::drain_at_stop`] consumes per call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -71,13 +123,15 @@ impl Steering {
         Self::default()
     }
 
-    /// Queue a **follow-up**: injected when the run next reaches a stop boundary.
-    pub fn push(&self, message: impl Into<String>) {
+    /// Queue a **follow-up**: injected when the run next reaches a stop boundary. Accepts a plain
+    /// string or a [`SteeringMessage`] (with image attachments).
+    pub fn push(&self, message: impl Into<SteeringMessage>) {
         lock(&self.follow_up).push_back(message.into());
     }
 
     /// Queue a **steer**: injected mid-run, at the next tool-results turn, to redirect a busy agent.
-    pub fn push_steer(&self, message: impl Into<String>) {
+    /// Accepts a plain string or a [`SteeringMessage`] (with image attachments).
+    pub fn push_steer(&self, message: impl Into<SteeringMessage>) {
         lock(&self.steer).push_back(message.into());
     }
 
@@ -119,7 +173,7 @@ impl Steering {
     /// Take the queued mid-run steer messages: everything in `All` mode, or just the oldest in
     /// `OneAtATime` mode — the rest stays queued for the next mid-run injection point. Governed by
     /// [`steering_mode`](Self::steering_mode).
-    pub(crate) fn drain_steer(&self) -> Vec<String> {
+    pub(crate) fn drain_steer(&self) -> Vec<SteeringMessage> {
         match self.steering_mode() {
             QueueMode::All => lock(&self.steer).drain(..).collect(),
             QueueMode::OneAtATime => lock(&self.steer).pop_front().into_iter().collect(),
@@ -134,10 +188,10 @@ impl Steering {
     /// `OneAtATime` mode it's just the single oldest message — the follow-up lane first (the primary one
     /// for a stop boundary), falling back to a stranded steer message only if it's empty, the same
     /// priority `All` merges in.
-    pub(crate) fn drain_at_stop(&self) -> Vec<String> {
+    pub(crate) fn drain_at_stop(&self) -> Vec<SteeringMessage> {
         match self.follow_up_mode() {
             QueueMode::All => {
-                let mut out: Vec<String> = lock(&self.follow_up).drain(..).collect();
+                let mut out: Vec<SteeringMessage> = lock(&self.follow_up).drain(..).collect();
                 out.extend(lock(&self.steer).drain(..));
                 out
             }
@@ -178,7 +232,7 @@ impl Steering {
 }
 
 /// Recover the data on a poisoned lock rather than propagating a panic into the loop.
-fn lock(q: &Queue) -> std::sync::MutexGuard<'_, VecDeque<String>> {
+fn lock(q: &Queue) -> std::sync::MutexGuard<'_, VecDeque<SteeringMessage>> {
     q.lock().unwrap_or_else(|e| e.into_inner())
 }
 

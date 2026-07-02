@@ -33,17 +33,22 @@ pub struct PromptTemplate {
 /// body is injected into the model's context the moment `/name` is invoked (see `expand_if_slash`) —
 /// skipping this gate would silently reopen exactly the prompt-injection vector already closed for
 /// skills.
-pub fn discover(cwd: &Path, project_trusted: bool) -> Vec<PromptTemplate> {
-    discover_with_diagnostics(cwd, project_trusted).0
+pub fn discover(cwd: &Path, project_trusted: bool, extra_roots: &[String]) -> Vec<PromptTemplate> {
+    discover_with_diagnostics(cwd, project_trusted, extra_roots).0
 }
 
 /// Like [`discover`], but also reports name collisions — the same `/name` defined by more than one
 /// template file, silently shadowed by `discover` (the later root, or the later file within one root,
 /// wins) — as human-readable strings naming both paths, for `get_commands` to surface as a diagnostic
 /// rather than a client having no way to notice a template was shadowed.
+///
+/// `extra_roots` are additional, ad-hoc discovery roots beyond the two standard ones — pi's own
+/// `--prompt-template <path>` (repeatable); see `skills::discover_with_diagnostics`'s identical
+/// parameter for the missing-path-diagnostic and shadow-order reasoning, which applies here unchanged.
 pub fn discover_with_diagnostics(
     cwd: &Path,
     project_trusted: bool,
+    extra_roots: &[String],
 ) -> (Vec<PromptTemplate>, Vec<String>) {
     let mut found: Vec<PromptTemplate> = Vec::new();
     let mut origins: HashMap<String, PathBuf> = HashMap::new();
@@ -54,6 +59,17 @@ pub fn discover_with_diagnostics(
     }
     if project_trusted {
         roots.push(cwd.join(".claude/prompts"));
+    }
+    for extra in extra_roots {
+        let root = PathBuf::from(extra);
+        if !root.is_dir() {
+            let message =
+                format!("--prompt-template path does not exist or is not a directory: {extra}");
+            tracing::warn!("{message}");
+            collisions.push(message);
+            continue;
+        }
+        roots.push(root);
     }
 
     for root in roots {
@@ -102,37 +118,22 @@ pub fn discover_with_diagnostics(
 /// Split optional `---` frontmatter (reading `argument-hint:` and `description:`) from the body, and
 /// derive a `description` (frontmatter wins; otherwise the first non-empty body line, truncated like
 /// pi to 60 chars). Returns `(argument_hint, description, body)`.
+///
+/// Frontmatter parsing itself is [`crate::skills::parse_frontmatter`] — shared with `skills.rs` rather
+/// than reimplemented here, so a long `description:`/`argument-hint:` written as a YAML block scalar
+/// (`key: |` / `key: >`, its value spanning the following more-indented lines) is understood the same
+/// way a skill's frontmatter already is, instead of silently collapsing to the literal `|`/`>`
+/// character with its continuation lines dropped (LOW pi-parity gap, fixed).
 fn parse(text: &str) -> (Option<String>, String, String) {
-    let mut lines = text.lines();
-    let has_frontmatter = lines.next().map(str::trim) == Some("---");
-
-    let mut hint = None;
-    let mut description = None;
-    let body = if has_frontmatter {
-        let mut rest = String::new();
-        let mut in_frontmatter = true;
-        for line in lines {
-            if in_frontmatter {
-                if line.trim() == "---" {
-                    in_frontmatter = false;
-                    continue;
-                }
-                if let Some(v) = line.trim().strip_prefix("argument-hint:") {
-                    hint = Some(v.trim().trim_matches(['"', '\'']).to_string());
-                } else if let Some(v) = line.trim().strip_prefix("description:") {
-                    description = Some(v.trim().trim_matches(['"', '\'']).to_string());
-                }
-            } else {
-                rest.push_str(line);
-                rest.push('\n');
-            }
-        }
-        rest.trim_end().to_string()
-    } else {
-        text.trim_end().to_string()
-    };
-
-    let description = description
+    let (frontmatter, body) = crate::skills::parse_frontmatter(text);
+    let body = body.trim_end().to_string();
+    let hint = frontmatter
+        .get("argument-hint")
+        .cloned()
+        .filter(|h| !h.is_empty());
+    let description = frontmatter
+        .get("description")
+        .cloned()
         .filter(|d| !d.is_empty())
         .unwrap_or_else(|| first_line_summary(&body));
     (hint, description, body)
@@ -170,7 +171,10 @@ pub fn expand_if_slash(message: &str, templates: &[PromptTemplate]) -> String {
 
 /// Split an argument string into fields, honoring single and double quotes so `"a b" c` is two args
 /// (`a b`, `c`) rather than three. Mirrors pi's `parseCommandArgs`: a quote starts a span that runs to
-/// the matching quote, and the quote characters themselves are dropped.
+/// the matching quote, and the quote characters themselves are dropped. Unquoted newlines are field
+/// separators too, same as spaces/tabs — a multi-line pasted argument (e.g. `/name label\n\ndescription
+/// text`) splits on every line break, not just the trailing ones; a quoted span still preserves an
+/// embedded newline verbatim.
 pub fn parse_command_args(input: &str) -> Vec<String> {
     let mut args = Vec::new();
     let mut current = String::new();
@@ -191,7 +195,7 @@ pub fn parse_command_args(input: &str) -> Vec<String> {
                     quote = Some(ch);
                     started = true;
                 }
-                ' ' | '\t' => {
+                ' ' | '\t' | '\n' => {
                     if started {
                         args.push(std::mem::take(&mut current));
                         started = false;
@@ -364,13 +368,13 @@ mod tests {
         )
         .unwrap();
 
-        let trusted = discover(tmp.path(), true);
+        let trusted = discover(tmp.path(), true, &[]);
         assert!(
             trusted.iter().any(|t| t.name == "untrusted-only"),
             "sanity check: the template must be discoverable when trusted"
         );
 
-        let untrusted = discover(tmp.path(), false);
+        let untrusted = discover(tmp.path(), false, &[]);
         assert!(
             !untrusted.iter().any(|t| t.name == "untrusted-only"),
             "an untrusted project's own prompt templates must not be discovered: {untrusted:?}"
@@ -396,7 +400,7 @@ mod tests {
 
         // `discover` also scans the developer's real `~/.claude/prompts`; assert on our template by
         // name rather than the total count.
-        let templates = discover(tmp.path(), true);
+        let templates = discover(tmp.path(), true, &[]);
         let fix = templates
             .iter()
             .find(|t| t.name == "fix")
@@ -420,11 +424,56 @@ mod tests {
         // in principle carry a same-named file — vanishingly unlikely for this fixture's name, and
         // consistent with how this module's other `discover` (not `discover_in`) tests already accept
         // scanning the real user root.
-        let (_, collisions) = discover_with_diagnostics(tmp.path(), true);
+        let (_, collisions) = discover_with_diagnostics(tmp.path(), true, &[]);
         assert!(
             !collisions.iter().any(|c| c.contains("solo")),
             "got: {collisions:?}"
         );
+    }
+
+    #[test]
+    fn discover_with_diagnostics_loads_from_an_explicit_extra_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let extra_root = tmp.path().join("shared-prompts");
+        fs::create_dir_all(&extra_root).unwrap();
+        fs::write(extra_root.join("deploy.md"), "Deploy the thing.").unwrap();
+        let cwd = tmp.path().join("project");
+        fs::create_dir_all(&cwd).unwrap();
+        let (found, _) =
+            discover_with_diagnostics(&cwd, true, &[extra_root.to_string_lossy().into_owned()]);
+        assert!(found.iter().any(|t| t.name == "deploy"), "got: {found:?}");
+    }
+
+    #[test]
+    fn discover_with_diagnostics_warns_when_an_extra_root_does_not_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        let (_, collisions) =
+            discover_with_diagnostics(tmp.path(), true, &[missing.to_string_lossy().into_owned()]);
+        assert!(
+            collisions
+                .iter()
+                .any(|c| c.contains("does not exist") && c.contains("does-not-exist")),
+            "got: {collisions:?}"
+        );
+    }
+
+    #[test]
+    fn discover_with_diagnostics_extra_root_wins_over_a_standard_root_on_collision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pdir = tmp.path().join(".claude/prompts");
+        fs::create_dir_all(&pdir).unwrap();
+        fs::write(pdir.join("dup.md"), "standard root version").unwrap();
+        let extra_root = tmp.path().join("extra");
+        fs::create_dir_all(&extra_root).unwrap();
+        fs::write(extra_root.join("dup.md"), "extra root version").unwrap();
+        let (found, _) = discover_with_diagnostics(
+            tmp.path(),
+            true,
+            &[extra_root.to_string_lossy().into_owned()],
+        );
+        let dup = found.iter().find(|t| t.name == "dup").unwrap();
+        assert_eq!(dup.body, "extra root version");
     }
 
     #[test]
@@ -506,6 +555,79 @@ mod tests {
     }
 
     #[test]
+    fn an_arg_value_containing_dollar_arguments_is_not_recursively_resubstituted() {
+        // pi: args.test.ts, CRITICAL — `substituteArgs("$ARGUMENTS", ["$1", "$ARGUMENTS"])` must yield
+        // the literal joined args, not re-scan the result for further `$`-tokens. `substitute` only
+        // ever iterates over `body`'s bytes, never over what it already wrote to `out`, so this should
+        // already hold by construction — pinning it so a future rewrite can't regress it silently.
+        let t = template("$ARGUMENTS");
+        let expanded = expand_if_slash(r#"/x "$1" "$ARGUMENTS""#, &[t]);
+        assert_eq!(expanded, "$1 $ARGUMENTS");
+    }
+
+    #[test]
+    fn a_present_arg_plugged_into_a_default_placeholder_is_not_resubstituted() {
+        // pi: args.test.ts — `${1:-7}` with args `["$ARGUMENTS"]` must yield the literal arg value.
+        let t = template("${1:-7}");
+        let expanded = expand_if_slash(r#"/x "$ARGUMENTS""#, &[t]);
+        assert_eq!(expanded, "$ARGUMENTS");
+    }
+
+    #[test]
+    fn the_default_text_itself_is_not_resubstituted_even_when_it_fires() {
+        // pi: args.test.ts — `${3:-$ARGUMENTS}` with only 2 args (index 3 missing, default fires) must
+        // yield the literal default text, not expand `$ARGUMENTS` inside it.
+        let t = template("${3:-$ARGUMENTS}");
+        let expanded = expand_if_slash("/x a b", &[t]);
+        assert_eq!(expanded, "$ARGUMENTS");
+    }
+
+    #[test]
+    fn an_empty_string_positional_still_triggers_the_default() {
+        // pi: args.test.ts — `${1:-brief}` with args `[""]` (an explicit empty positional, not a
+        // missing one) must still fall back to the default.
+        let t = template("${1:-brief}");
+        let expanded = expand_if_slash(r#"/x """#, &[t]);
+        assert_eq!(expanded, "brief");
+    }
+
+    #[test]
+    fn unquoted_newlines_split_arguments_like_spaces() {
+        // pi: args.test.ts, "should treat unquoted newlines as separators" —
+        // `parseCommandArgs("label-2\n\nHere is some description #2.")` → 6 tokens.
+        let args = parse_command_args("label-2\n\nHere is some description #2.");
+        assert_eq!(
+            args,
+            vec!["label-2", "Here", "is", "some", "description", "#2."]
+        );
+    }
+
+    #[test]
+    fn parse_command_args_edge_cases() {
+        // pi: args.test.ts — empty input, whitespace collapsing (spaces and tabs), and passthrough of
+        // special characters/unicode.
+        assert_eq!(parse_command_args(""), Vec::<String>::new());
+        assert_eq!(parse_command_args("a  b   c"), vec!["a", "b", "c"]);
+        assert_eq!(parse_command_args("a\tb\tc"), vec!["a", "b", "c"]);
+        assert_eq!(
+            parse_command_args("$100 @user #tag"),
+            vec!["$100", "@user", "#tag"]
+        );
+        assert_eq!(parse_command_args("héllo wörld"), vec!["héllo", "wörld"]);
+        assert_eq!(
+            parse_command_args("  leading and trailing  "),
+            vec!["leading", "and", "trailing"]
+        );
+    }
+
+    #[test]
+    fn empty_argument_hint_is_treated_as_absent() {
+        // pi: prompt-templates.test.ts, "should ignore empty argument-hint".
+        let (hint, _, _) = parse("---\nargument-hint: \"\"\n---\nBody");
+        assert_eq!(hint, None);
+    }
+
+    #[test]
     fn description_from_frontmatter_then_first_line() {
         assert_eq!(
             parse("---\ndescription: Do the thing\n---\nBody line").1,
@@ -518,6 +640,28 @@ mod tests {
         );
         // No frontmatter at all → first non-empty line of the whole text.
         assert_eq!(parse("Just a body").1, "Just a body");
+    }
+
+    #[test]
+    fn description_and_argument_hint_support_yaml_block_scalars() {
+        // LOW pi-parity gap (fixed): this used to hand-scan frontmatter lines directly, understanding
+        // quoted values but not a YAML block scalar (`key: |` / `key: >`) — a `description: |` would
+        // parse as the literal one-character string `"|"`, silently dropping every continuation line.
+        // Delegating to `skills::parse_frontmatter` (already block-scalar-aware) fixes both fields.
+        let (hint, description, body) = parse(
+            "---\ndescription: >\n  A folded description\n  that wraps across lines.\n\
+             argument-hint: |\n  <first arg>\n  <second arg>\n---\nBody line",
+        );
+        assert_eq!(
+            description, "A folded description that wraps across lines.",
+            "a folded (>) block scalar joins its lines with spaces"
+        );
+        assert_eq!(
+            hint.as_deref(),
+            Some("<first arg>\n<second arg>"),
+            "a literal (|) block scalar joins its lines with newlines"
+        );
+        assert_eq!(body, "Body line");
     }
 
     /// A template with an empty hint/description and the given body, for substitution tests.

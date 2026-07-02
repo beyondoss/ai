@@ -67,6 +67,7 @@ async fn gateway_client_decodes_sse_over_socket() {
     }
 
     assert!(events.contains(&StreamEvent::TextDelta {
+        index: 0,
         text: "hi over the wire".into()
     }));
     assert!(events.iter().any(|e| matches!(
@@ -135,6 +136,7 @@ async fn gateway_client_reassembles_utf8_split_across_chunks() {
 
     assert!(
         events.contains(&StreamEvent::TextDelta {
+            index: 0,
             text: "hi 🌍 world".into()
         }),
         "emoji split across chunks must reassemble intact, got: {events:?}"
@@ -210,6 +212,28 @@ async fn gateway_client_sends_x_client_request_id_for_openai_responses_with_a_ca
 }
 
 #[tokio::test]
+async fn gateway_client_sends_session_id_header_alongside_x_client_request_id() {
+    // MEDIUM pi-parity gap (fixed): pi sends *both* `session_id` (`compat.sendSessionIdHeader`, true
+    // by default for native OpenAI) and `x-client-request-id`, carrying the same value — ours only
+    // ever sent the latter, risking cache/session-affinity routing landing on a different backend node
+    // per turn even though `x-client-request-id` was already correct.
+    let (base, captured) = spawn_request_capturing_server();
+    let client = GatewayClient::new(base, "bai_v1.test").expect("client");
+    let req =
+        ModelRequest::new("gpt-5", vec![Message::user("hi")], 64).with_cache_key("session-abc");
+    let mut stream = client.stream(req).await.expect("stream");
+    let _ = stream.next().await;
+
+    let request = captured.lock().unwrap().clone();
+    assert!(
+        request
+            .to_ascii_lowercase()
+            .contains("session_id: session-abc"),
+        "the OpenAI Responses dialect must also send the session_id header: {request}"
+    );
+}
+
+#[tokio::test]
 async fn gateway_client_omits_x_client_request_id_without_a_cache_key() {
     let (base, captured) = spawn_request_capturing_server();
     let client = GatewayClient::new(base, "bai_v1.test").expect("client");
@@ -218,8 +242,13 @@ async fn gateway_client_omits_x_client_request_id_without_a_cache_key() {
     let _ = stream.next().await;
 
     let request = captured.lock().unwrap().clone();
+    let lower = request.to_ascii_lowercase();
     assert!(
-        !request.to_ascii_lowercase().contains("x-client-request-id"),
+        !lower.contains("x-client-request-id"),
+        "no session id to route by — the header must be omitted: {request}"
+    );
+    assert!(
+        !lower.contains("session_id"),
         "no session id to route by — the header must be omitted: {request}"
     );
 }
@@ -236,8 +265,13 @@ async fn gateway_client_omits_x_client_request_id_for_anthropic() {
     let _ = stream.next().await;
 
     let request = captured.lock().unwrap().clone();
+    let lower = request.to_ascii_lowercase();
     assert!(
-        !request.to_ascii_lowercase().contains("x-client-request-id"),
+        !lower.contains("x-client-request-id"),
+        "the Anthropic dialect must not send the OpenAI-Responses-specific header: {request}"
+    );
+    assert!(
+        !lower.contains("session_id"),
         "the Anthropic dialect must not send the OpenAI-Responses-specific header: {request}"
     );
 }
@@ -280,6 +314,7 @@ async fn gateway_client_retries_transient_503_then_succeeds() {
     }
     assert!(
         events.contains(&StreamEvent::TextDelta {
+            index: 0,
             text: "hi over the wire".into()
         }),
         "retry must transparently deliver the real stream, got: {events:?}"

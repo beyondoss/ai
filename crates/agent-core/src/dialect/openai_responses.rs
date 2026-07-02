@@ -23,12 +23,13 @@
 //!
 //! **Stream shape vs Chat Completions:** items open with `response.output_item.added` and close with
 //! `response.output_item.done` — genuine block boundaries, unlike Chat Completions' implicit
-//! index-keyed deltas. The API can genuinely interleave two items' deltas (concurrent tool calls),
-//! but the shared `StreamEvent`/`Accumulator` contract only ever tracks one open block at a time —
-//! see [`Decoder::pending`] for how a preempted item's events are buffered and replayed rather than
-//! being force-closed and truncated. Usage and the terminal stop reason arrive together on
-//! `response.completed`/`response.incomplete`, so (unlike the Chat Completions decoder) `MessageStop`
-//! is emitted immediately rather than deferred to `finish()`.
+//! index-keyed deltas. The API can genuinely interleave two items' deltas (concurrent tool calls);
+//! since `StreamEvent`'s block-scoped variants all carry an `index` and `Accumulator` (agent-core's
+//! stream-to-`ContentBlock` fold) natively tracks as many concurrently-open indices as the wire
+//! actually has, this decoder just emits every event with its own true `output_index` immediately, in
+//! real arrival order — no buffering, no "focus" item, no replay-on-close. Usage and the terminal stop
+//! reason arrive together on `response.completed`/`response.incomplete`, so (unlike the Chat
+//! Completions decoder) `MessageStop` is emitted immediately rather than deferred to `finish()`.
 //!
 //! **Resync at block close:** `response.function_call_arguments.done` and `output_item.done`'s own
 //! `item.arguments`/`item.content` are the provider's own authoritative, complete values for the
@@ -48,7 +49,7 @@ fn text_of(blocks: &[ContentBlock]) -> String {
     blocks
         .iter()
         .filter_map(|b| match b {
-            ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect()
@@ -159,7 +160,7 @@ fn push_user_content(input: &mut Vec<Value>, blocks: &[ContentBlock], supports_v
     let mut had_image = false;
     for b in blocks {
         match b {
-            ContentBlock::Text { text } if !text.is_empty() => {
+            ContentBlock::Text { text, .. } if !text.is_empty() => {
                 parts.push(json!({ "type": "input_text", "text": text }));
             }
             ContentBlock::Image { source } if supports_vision => {
@@ -227,15 +228,66 @@ fn push_tool_results(input: &mut Vec<Value>, blocks: &[ContentBlock], supports_v
     }
 }
 
-fn push_assistant_content(input: &mut Vec<Value>, blocks: &[ContentBlock]) {
+/// A message item's replay id when the block never captured a real one from the wire (locally
+/// authored text — a compaction/branch summary — or a session persisted before this field existed).
+/// Deterministic and stable across rebuilds of the same request so it doesn't churn the prompt-cache
+/// prefix turn to turn: `msg_{msg_index}` for a message's first text block, `msg_{msg_index}_{n}` for
+/// any further one (a model rarely emits more than one text block per turn, but nothing stops it).
+fn fallback_message_id(msg_index: usize, text_block_index: usize) -> String {
+    if text_block_index == 0 {
+        format!("msg_{msg_index}")
+    } else {
+        format!("msg_{msg_index}_{text_block_index}")
+    }
+}
+
+/// Push one assistant `message` item, stamping the `id`/`status`/`phase` OpenAI requires to replay it
+/// (see `ContentBlock::Text`'s doc comment) — `id` real when the block carries one from the wire,
+/// else the deterministic fallback; `status` always `"completed"` (the only status a *replayed*, i.e.
+/// already-finished, block can have); `phase` passed through only when the original block had one —
+/// omitting it is fine wire-wise, but OpenAI's own docs say dropping it on replay for gpt-5.3-codex
+/// and later degrades those models, so a captured phase is never silently dropped.
+fn push_text_message(
+    input: &mut Vec<Value>,
+    text: &str,
+    id: Option<&str>,
+    phase: Option<&str>,
+    msg_index: usize,
+    text_block_index: usize,
+) {
+    let mut obj = Map::new();
+    obj.insert("type".into(), json!("message"));
+    obj.insert("role".into(), json!("assistant"));
+    obj.insert(
+        "content".into(),
+        json!([{ "type": "output_text", "text": text }]),
+    );
+    obj.insert("status".into(), json!("completed"));
+    let id = match id {
+        Some(id) if !id.is_empty() => id.to_string(),
+        _ => fallback_message_id(msg_index, text_block_index),
+    };
+    obj.insert("id".into(), json!(id));
+    if let Some(phase) = phase {
+        obj.insert("phase".into(), json!(phase));
+    }
+    input.push(Value::Object(obj));
+}
+
+fn push_assistant_content(input: &mut Vec<Value>, blocks: &[ContentBlock], msg_index: usize) {
+    let mut text_block_index = 0;
     for b in blocks {
         match b {
-            ContentBlock::Text { text } if !text.is_empty() => {
-                input.push(json!({
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{ "type": "output_text", "text": text }],
-                }));
+            ContentBlock::Text { text, id, phase } if !text.is_empty() => {
+                push_text_message(
+                    input,
+                    text,
+                    id.as_deref(),
+                    phase.as_deref(),
+                    msg_index,
+                    text_block_index,
+                );
+                text_block_index += 1;
             }
             ContentBlock::Thinking { text, signature } => {
                 if !signature.is_empty() {
@@ -248,11 +300,8 @@ fn push_assistant_content(input: &mut Vec<Value>, blocks: &[ContentBlock]) {
                 // genuinely foreign block. Can't be replayed as a reasoning item — degrade to plain
                 // text so the content isn't silently dropped (mirrors pi's `isSameModel` downgrade).
                 if !text.is_empty() {
-                    input.push(json!({
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{ "type": "output_text", "text": text }],
-                    }));
+                    push_text_message(input, text, None, None, msg_index, text_block_index);
+                    text_block_index += 1;
                 }
             }
             ContentBlock::ToolUse {
@@ -289,7 +338,7 @@ pub fn build_body(req: &ModelRequest) -> Value {
     if let Some(system) = &req.system {
         input.push(json!({ "role": instruction_role(&caps), "content": system }));
     }
-    for m in req.messages.iter() {
+    for (msg_index, m) in req.messages.iter().enumerate() {
         match m.role {
             Role::System => {
                 input.push(json!({
@@ -301,7 +350,7 @@ pub fn build_body(req: &ModelRequest) -> Value {
                 push_user_content(&mut input, &m.content, caps.supports_vision);
                 push_tool_results(&mut input, &m.content, caps.supports_vision);
             }
-            Role::Assistant => push_assistant_content(&mut input, &m.content),
+            Role::Assistant => push_assistant_content(&mut input, &m.content, msg_index),
         }
     }
 
@@ -312,7 +361,17 @@ pub fn build_body(req: &ModelRequest) -> Value {
     // Stateless harness: every turn resends the full history, so nothing should be retained
     // server-side to reference via `previous_response_id`.
     map.insert("store".into(), json!(false));
-    map.insert("max_output_tokens".into(), json!(req.max_tokens));
+    // A queueing/latency class, not purely a pricing knob — omitted entirely (leaving OpenAI's own
+    // default tier) unless the caller explicitly asked for one.
+    if let Some(tier) = req.service_tier {
+        map.insert("service_tier".into(), json!(tier.as_str()));
+    }
+    // Clamped so the estimated prompt plus this ceiling doesn't already exceed the model's context
+    // window — see `super::clamp_max_tokens_to_context`'s doc comment for why this can't be skipped.
+    map.insert(
+        "max_output_tokens".into(),
+        json!(super::clamp_max_tokens_to_context(req, &caps)),
+    );
 
     if !req.tools.is_empty() {
         let tools: Vec<Value> = req
@@ -341,9 +400,12 @@ pub fn build_body(req: &ModelRequest) -> Value {
     if caps.reasoning_effort {
         if let Some(effort) = req.reasoning_effort {
             let effort = crate::models::clamp_reasoning_effort(&caps, effort);
+            let summary = req
+                .reasoning_summary
+                .unwrap_or(crate::transport::ReasoningSummary::Auto);
             map.insert(
                 "reasoning".into(),
-                json!({ "effort": effort.as_str(), "summary": "auto" }),
+                json!({ "effort": effort.as_str(), "summary": summary.as_str() }),
             );
             map.insert("include".into(), json!(["reasoning.encrypted_content"]));
         } else if caps.reasoning_disableable {
@@ -441,27 +503,31 @@ fn message_item_text(item: Option<&Value>) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// Decodes Responses SSE. Items are genuine block boundaries (`output_item.added`/`.done`), so this
-/// tracks only which output index is currently open — closing it on any switch — rather than
-/// inferring boundaries from deltas the way the Chat Completions decoder does.
+/// A `message`-type item's `id` and `phase` (see `ContentBlock::Text`'s doc comment) — captured at
+/// `output_item.done` alongside its authoritative text so the block can be restamped verbatim on
+/// replay. Both are simply absent on models with no channel concept; `phase` is `None` there too.
+fn message_item_id_phase(item: Option<&Value>) -> (Option<String>, Option<String>) {
+    let id = item
+        .and_then(|i| i.get("id"))
+        .and_then(Value::as_str)
+        .map(String::from);
+    let phase = item
+        .and_then(|i| i.get("phase"))
+        .and_then(Value::as_str)
+        .map(String::from);
+    (id, phase)
+}
+
+/// Decodes Responses SSE. Items are genuine block boundaries (`output_item.added`/`.done`); every
+/// event is emitted with its own true `output_index` and forwarded immediately — no buffering, no
+/// "focus" concept (see the module doc comment). `open_indices` (insertion-ordered, so tests and
+/// `finalize`'s defensive close-everything-left-open path stay deterministic) exists purely so this
+/// decoder knows which indices are still open, for two purposes: (1) a stray `done`/delta for an index
+/// that was never opened is recognized as stale/duplicate and dropped, and (2) `finalize` can close out
+/// anything a malformed/truncated stream left open.
 pub struct Decoder {
     started: bool,
-    open_index: Option<i64>,
-    /// Items that have started (`output_item.added`) or are accruing deltas but aren't the
-    /// currently-open block (`open_index`) because a *different* item opened first and hasn't closed
-    /// yet. The Responses API can genuinely interleave two items' deltas — concurrent tool calls being
-    /// the common case with agentic gpt-5.x models — even though our shared `StreamEvent`/
-    /// `Accumulator` contract (deliberately kept provider-agnostic and simple, shared with the
-    /// Anthropic and Chat Completions dialects) only ever tracks one open block at a time. Rather than
-    /// force-close and truncate whichever item is preempted (the previous, lossy behavior — see
-    /// `route`), each non-focus item's would-be events are buffered here under its own index and
-    /// replayed as one normal, fully-formed block once the focus item closes (`promote_pending`) —
-    /// correct in the end state (no truncated/corrupted arguments), at the cost of a buffered item's
-    /// own deltas not reaching a live streaming consumer (e.g. `tool_progress`) until it's promoted.
-    /// `pending_order` preserves first-seen order so multiple buffered items are promoted in the order
-    /// they actually started, not hash-map iteration order.
-    pending: std::collections::HashMap<i64, Vec<StreamEvent>>,
-    pending_order: Vec<i64>,
+    open_indices: Vec<i64>,
     saw_terminal: bool,
     failed: Option<String>,
     saw_tool_call: bool,
@@ -473,9 +539,7 @@ impl Default for Decoder {
     fn default() -> Self {
         Self {
             started: false,
-            open_index: None,
-            pending: std::collections::HashMap::new(),
-            pending_order: Vec::new(),
+            open_indices: Vec::new(),
             saw_terminal: false,
             failed: None,
             saw_tool_call: false,
@@ -486,75 +550,34 @@ impl Default for Decoder {
 }
 
 impl Decoder {
-    /// Route one item-index-scoped event: append straight to `out` if `index` is (or, if nothing is
-    /// currently open, becomes) the focus block; otherwise buffer it under `index` in `pending` for
-    /// later replay via `promote_pending`. See the `pending` field doc for why this exists instead of
-    /// force-closing on an index switch.
-    fn route(&mut self, out: &mut Vec<StreamEvent>, index: i64, ev: StreamEvent) {
-        match self.open_index {
-            None => {
-                self.open_index = Some(index);
-                out.push(ev);
-            }
-            Some(open) if open == index => out.push(ev),
-            Some(_) => {
-                let buf = self.pending.entry(index).or_default();
-                if buf.is_empty() {
-                    self.pending_order.push(index);
-                }
-                buf.push(ev);
-            }
+    /// Emit `ev` for `index`, marking it open (a no-op if it already is).
+    fn emit(&mut self, out: &mut Vec<StreamEvent>, index: i64, ev: StreamEvent) {
+        if !self.open_indices.contains(&index) {
+            self.open_indices.push(index);
         }
+        out.push(ev);
     }
 
-    /// Close the focus block, then promote the earliest still-pending item (if any) to take its place.
-    fn close_focus_and_promote(&mut self, out: &mut Vec<StreamEvent>) {
-        out.push(StreamEvent::ContentBlockStop);
-        self.open_index = None;
-        self.promote_pending(out);
-    }
-
-    /// Promote the earliest still-pending item to focus, replaying its buffered events verbatim. If
-    /// that item had already fully closed while it was buffered (its own `output_item.done` arrived
-    /// before it got promoted — see the `output_item.done` handler), the replay already ends with its
-    /// own `ContentBlockStop`; recurse to promote the next one instead of leaving `open_index` pointed
-    /// at a block the `Accumulator` has already flushed.
-    fn promote_pending(&mut self, out: &mut Vec<StreamEvent>) {
-        let Some(next) = (!self.pending_order.is_empty()).then(|| self.pending_order.remove(0))
-        else {
-            return;
-        };
-        let Some(events) = self.pending.remove(&next) else {
-            // `pending_order` and `pending` are always kept in sync by `route`; unreachable in
-            // practice, but recurse rather than silently stalling if it ever isn't.
-            return self.promote_pending(out);
-        };
-        let already_closed = matches!(events.last(), Some(StreamEvent::ContentBlockStop));
-        self.open_index = Some(next);
-        out.extend(events);
-        if already_closed {
-            self.open_index = None;
-            self.promote_pending(out);
+    /// Close `index`, if it's actually open — a `done` for an index never opened is a stale/duplicate
+    /// event, silently ignored rather than emitting a spurious close for a block that doesn't exist.
+    fn close(&mut self, out: &mut Vec<StreamEvent>, index: i64) {
+        if let Some(pos) = self.open_indices.iter().position(|&i| i == index) {
+            self.open_indices.remove(pos);
+            out.push(StreamEvent::ContentBlockStop {
+                index: index as usize,
+            });
         }
     }
 
     fn finalize(&mut self, data: &Value, out: &mut Vec<StreamEvent>) {
         self.saw_terminal = true;
-        // Defensive: normally every item is closed (directly or via `promote_pending`) before the
-        // terminal event arrives — but a malformed/truncated stream must not silently drop the
-        // currently-open block, or any item still sitting in `pending` waiting for promotion.
-        if self.open_index.is_some() {
-            out.push(StreamEvent::ContentBlockStop);
-            self.open_index = None;
-        }
-        while !self.pending_order.is_empty() {
-            let next = self.pending_order.remove(0);
-            if let Some(mut events) = self.pending.remove(&next) {
-                if !matches!(events.last(), Some(StreamEvent::ContentBlockStop)) {
-                    events.push(StreamEvent::ContentBlockStop);
-                }
-                out.extend(events);
-            }
+        // Defensive: normally every item is closed via its own `output_item.done` before the terminal
+        // event arrives — but a malformed/truncated stream must not silently drop whatever's still
+        // open, at any index.
+        for index in std::mem::take(&mut self.open_indices) {
+            out.push(StreamEvent::ContentBlockStop {
+                index: index as usize,
+            });
         }
 
         let response = data.get("response");
@@ -625,48 +648,64 @@ impl StreamDecoder for Decoder {
                     } else {
                         combine_tool_id(call_id, item_id)
                     };
-                    self.route(&mut out, index, StreamEvent::ToolUseStart { id, name });
+                    self.emit(
+                        &mut out,
+                        index,
+                        StreamEvent::ToolUseStart {
+                            index: index as usize,
+                            id,
+                            name,
+                        },
+                    );
                 }
                 // A message/reasoning item has no explicit "start" `StreamEvent` — it opens implicitly
-                // on its first delta, which `route` handles lazily. Nothing to emit here for those.
+                // on its first delta, which `emit` handles lazily (marking it open on first mention).
+                // Nothing to emit here for those.
             }
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
                 let index = i64_at(data, "output_index");
-                self.route(
+                self.emit(
                     &mut out,
                     index,
                     StreamEvent::ThinkingDelta {
+                        index: index as usize,
                         text: str_at(Some(data), "delta").to_string(),
                     },
                 );
             }
             "response.reasoning_summary_part.done" => {
                 let index = i64_at(data, "output_index");
-                let delta = StreamEvent::ThinkingDelta {
-                    text: "\n\n".to_string(),
-                };
-                if self.open_index == Some(index) {
-                    out.push(delta);
-                } else if let Some(buf) = self.pending.get_mut(&index) {
-                    buf.push(delta);
+                // Only meaningful for an index that's already open (accrued some reasoning text) —
+                // otherwise there's nothing to add a paragraph break to.
+                if self.open_indices.contains(&index) {
+                    self.emit(
+                        &mut out,
+                        index,
+                        StreamEvent::ThinkingDelta {
+                            index: index as usize,
+                            text: "\n\n".to_string(),
+                        },
+                    );
                 }
             }
             "response.output_text.delta" | "response.refusal.delta" => {
                 let index = i64_at(data, "output_index");
-                self.route(
+                self.emit(
                     &mut out,
                     index,
                     StreamEvent::TextDelta {
+                        index: index as usize,
                         text: str_at(Some(data), "delta").to_string(),
                     },
                 );
             }
             "response.function_call_arguments.delta" => {
                 let index = i64_at(data, "output_index");
-                self.route(
+                self.emit(
                     &mut out,
                     index,
                     StreamEvent::InputJsonDelta {
+                        index: index as usize,
                         partial_json: str_at(Some(data), "delta").to_string(),
                     },
                 );
@@ -677,60 +716,72 @@ impl StreamDecoder for Decoder {
                 // (a relay hiccup with no transport-level error — nothing else would ever catch it)
                 // can't silently leave the final call's arguments corrupted.
                 let index = i64_at(data, "output_index");
-                self.route(
+                self.emit(
                     &mut out,
                     index,
                     StreamEvent::InputJsonFinal {
+                        index: index as usize,
                         full_json: str_at(Some(data), "arguments").to_string(),
                     },
                 );
             }
             "response.output_item.done" => {
                 let index = i64_at(data, "output_index");
-                let item = data.get("item");
-                let item_type = item.and_then(|i| i.get("type")).and_then(Value::as_str);
-                let mut pre_close: Vec<StreamEvent> = Vec::new();
-                match item_type {
-                    Some("reasoning") => {
-                        // The whole item, JSON-stringified, is the block's replayable signature — see
-                        // the module doc comment.
-                        pre_close.push(StreamEvent::SignatureDelta {
-                            signature: item.map(ToString::to_string).unwrap_or_default(),
-                        });
-                    }
-                    Some("function_call") => {
-                        // Ground-truth resync, same as `function_call_arguments.done` above — belt and
-                        // suspenders for a provider that only ever sends the item-level `done` and
-                        // skips the dedicated per-field one.
-                        if let Some(args) = item
-                            .and_then(|i| i.get("arguments"))
-                            .and_then(Value::as_str)
-                        {
-                            pre_close.push(StreamEvent::InputJsonFinal {
-                                full_json: args.to_string(),
-                            });
+                if !self.open_indices.contains(&index) {
+                    // A `done` for an index we never saw open — duplicate/stale event, ignored.
+                } else {
+                    let item = data.get("item");
+                    let item_type = item.and_then(|i| i.get("type")).and_then(Value::as_str);
+                    match item_type {
+                        Some("reasoning") => {
+                            // The whole item, JSON-stringified, is the block's replayable signature —
+                            // see the module doc comment.
+                            self.emit(
+                                &mut out,
+                                index,
+                                StreamEvent::SignatureDelta {
+                                    index: index as usize,
+                                    signature: item.map(ToString::to_string).unwrap_or_default(),
+                                },
+                            );
                         }
-                    }
-                    Some("message") => {
-                        if let Some(text) = message_item_text(item) {
-                            pre_close.push(StreamEvent::TextFinal { text });
+                        Some("function_call") => {
+                            // Ground-truth resync, same as `function_call_arguments.done` above — belt
+                            // and suspenders for a provider that only ever sends the item-level `done`
+                            // and skips the dedicated per-field one.
+                            if let Some(args) = item
+                                .and_then(|i| i.get("arguments"))
+                                .and_then(Value::as_str)
+                            {
+                                self.emit(
+                                    &mut out,
+                                    index,
+                                    StreamEvent::InputJsonFinal {
+                                        index: index as usize,
+                                        full_json: args.to_string(),
+                                    },
+                                );
+                            }
                         }
+                        Some("message") => {
+                            if let Some(text) = message_item_text(item) {
+                                let (id, phase) = message_item_id_phase(item);
+                                self.emit(
+                                    &mut out,
+                                    index,
+                                    StreamEvent::TextFinal {
+                                        index: index as usize,
+                                        text,
+                                        id,
+                                        phase,
+                                    },
+                                );
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
+                    self.close(&mut out, index);
                 }
-                if self.open_index == Some(index) {
-                    out.extend(pre_close);
-                    self.close_focus_and_promote(&mut out);
-                } else if let Some(buf) = self.pending.get_mut(&index) {
-                    // The item finished while it was still buffered, waiting for promotion (e.g. it
-                    // opened, streamed some deltas, and finished entirely before the item that opened
-                    // ahead of it did). Append its own close to its own buffer — see `promote_pending`
-                    // for how an already-closed buffered item is handled once promoted.
-                    buf.extend(pre_close);
-                    buf.push(StreamEvent::ContentBlockStop);
-                }
-                // A `done` for neither the focus nor a pending index is a duplicate/stale event —
-                // ignored, as before.
             }
             "response.completed" | "response.incomplete" => self.finalize(data, &mut out),
             "response.failed" => {
@@ -773,9 +824,7 @@ mod tests {
             vec![
                 Message::user("weather?"),
                 Message::assistant(vec![
-                    ContentBlock::Text {
-                        text: "checking".into(),
-                    },
+                    ContentBlock::text("checking"),
                     ContentBlock::ToolUse {
                         id: "call_1|fc_1".into(),
                         name: "get_weather".into(),
@@ -808,6 +857,15 @@ mod tests {
         );
         assert_eq!(body["input"][2]["type"], "message");
         assert_eq!(body["input"][2]["content"][0]["text"], "checking");
+        // No captured wire id (a locally-authored/plain-text block) still gets the fields OpenAI
+        // requires to replay an assistant message item: `status: "completed"` always, and a
+        // deterministic fallback `id` — never omitted just because nothing was captured to replay.
+        assert_eq!(body["input"][2]["status"], "completed");
+        assert_eq!(body["input"][2]["id"], "msg_1");
+        assert!(
+            body["input"][2].get("phase").is_none(),
+            "no phase was ever captured for this block, so none should be invented on replay"
+        );
         // ToolUse round-trips the combined id back into call_id + id.
         assert_eq!(body["input"][3]["type"], "function_call");
         assert_eq!(body["input"][3]["call_id"], "call_1");
@@ -822,6 +880,31 @@ mod tests {
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["name"], "get_weather");
         assert!(body["tools"][0].get("function").is_none());
+    }
+
+    #[test]
+    fn max_output_tokens_is_clamped_when_the_live_prompt_nears_the_context_window() {
+        // HIGH pi-parity gap (fixed): `clamp_max_tokens_to_context` was implemented for the Anthropic
+        // dialect only; this Responses dialect wrote `req.max_tokens` straight onto the wire unclamped
+        // as `max_output_tokens`. "gpt-5": 400_000 context window. A ~350_000-token prompt (1_400_000
+        // chars, the chars/4 estimator) leaves 400_000 - 350_000 - 4_096 (the shared margin) = 45_904
+        // tokens of headroom — less than the request's own (artificially large) max_tokens.
+        let big_text = "x".repeat(1_400_000);
+        let req = ModelRequest::new("gpt-5", vec![Message::user(big_text)], 100_000);
+        let body = build_body(&req);
+        assert_eq!(
+            body["max_output_tokens"], 45_904,
+            "max_output_tokens must be clamped down to the actual remaining context headroom, not \
+             sent as the static 100_000 ceiling regardless of how much of the window the prompt \
+             already fills"
+        );
+    }
+
+    #[test]
+    fn max_output_tokens_is_unchanged_for_a_prompt_nowhere_near_the_context_window() {
+        let req = ModelRequest::new("gpt-5", vec![Message::user("hi")], 8_192);
+        let body = build_body(&req);
+        assert_eq!(body["max_output_tokens"], 8_192);
     }
 
     #[test]
@@ -851,6 +934,48 @@ mod tests {
         let req = ModelRequest::new("gpt-4o", vec![Message::user("hi")], 64)
             .with_reasoning_effort(ReasoningEffort::High);
         assert!(build_body(&req).get("reasoning").is_none());
+    }
+
+    #[test]
+    fn reasoning_summary_is_configurable_not_hardcoded_to_auto() {
+        // MEDIUM pi-parity gap (fixed): `reasoning.summary` was hardcoded to `"auto"` with no
+        // `ModelRequest` field to vary it; pi exposes `reasoningSummary` as a first-class caller option
+        // defaulted to `"auto"` only when unset.
+        use crate::transport::{ReasoningEffort, ReasoningSummary};
+
+        let req = ModelRequest::new("o3-mini", vec![Message::user("hi")], 64)
+            .with_reasoning_effort(ReasoningEffort::High)
+            .with_reasoning_summary(ReasoningSummary::Detailed);
+        assert_eq!(build_body(&req)["reasoning"]["summary"], "detailed");
+
+        let req = ModelRequest::new("o3-mini", vec![Message::user("hi")], 64)
+            .with_reasoning_effort(ReasoningEffort::High)
+            .with_reasoning_summary(ReasoningSummary::Concise);
+        assert_eq!(build_body(&req)["reasoning"]["summary"], "concise");
+
+        // Omitted entirely: still defaults to "auto", matching pi's own default.
+        let req = ModelRequest::new("o3-mini", vec![Message::user("hi")], 64)
+            .with_reasoning_effort(ReasoningEffort::High);
+        assert_eq!(build_body(&req)["reasoning"]["summary"], "auto");
+    }
+
+    #[test]
+    fn service_tier_is_omitted_unless_explicitly_requested() {
+        // MEDIUM pi-parity gap (fixed): pi forwards `OpenAIResponsesOptions.serviceTier` to
+        // `params.service_tier` — a queueing/latency class (flex/priority), not purely a pricing knob
+        // — but `ModelRequest` had no field to carry it at all.
+        use crate::transport::ServiceTier;
+
+        let req = ModelRequest::new("gpt-4o", vec![Message::user("hi")], 64);
+        assert!(build_body(&req).get("service_tier").is_none());
+
+        let req = ModelRequest::new("gpt-4o", vec![Message::user("hi")], 64)
+            .with_service_tier(ServiceTier::Flex);
+        assert_eq!(build_body(&req)["service_tier"], "flex");
+
+        let req = ModelRequest::new("gpt-4o", vec![Message::user("hi")], 64)
+            .with_service_tier(ServiceTier::Priority);
+        assert_eq!(build_body(&req)["service_tier"], "priority");
     }
 
     #[test]
@@ -885,7 +1010,7 @@ mod tests {
                         text: "step one".into(),
                         signature: item.to_string(),
                     },
-                    ContentBlock::Text { text: "42".into() },
+                    ContentBlock::text("42"),
                 ]),
             ],
             64,
@@ -893,6 +1018,60 @@ mod tests {
         let body = build_body(&req);
         assert_eq!(body["input"][1], item);
         assert_eq!(body["input"][2]["content"][0]["text"], "42");
+    }
+
+    #[test]
+    fn assistant_text_replay_stamps_the_wires_own_captured_id_and_phase_verbatim() {
+        // LOW pi-parity gap (fixed): a text block's `id`/`phase` — captured from a prior
+        // `output_item.done` (see `text_item_resyncs_...`/`text_items_phase_is_captured_...` below) —
+        // must round-trip onto the *next* request's replayed message item exactly as OpenAI sent it,
+        // not be silently dropped. OpenAI's own docs: dropping `phase` on replay measurably degrades
+        // gpt-5.3-codex and later.
+        let req = ModelRequest::new(
+            "gpt-5.3-codex",
+            vec![
+                Message::user("keep going"),
+                Message::assistant(vec![ContentBlock::Text {
+                    text: "still working on it".into(),
+                    id: Some("msg_real_abc123".into()),
+                    phase: Some("commentary".into()),
+                }]),
+            ],
+            64,
+        );
+        let body = build_body(&req);
+        assert_eq!(body["input"][1]["type"], "message");
+        assert_eq!(body["input"][1]["id"], "msg_real_abc123");
+        assert_eq!(body["input"][1]["status"], "completed");
+        assert_eq!(body["input"][1]["phase"], "commentary");
+        assert_eq!(
+            body["input"][1]["content"][0]["text"],
+            "still working on it"
+        );
+    }
+
+    #[test]
+    fn text_items_phase_is_captured_from_output_item_done_alongside_its_id() {
+        const SSE: &str = r#"
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1"}}
+
+data: {"type":"response.output_text.delta","output_index":0,"delta":"ok"}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1","phase":"final_answer","content":[{"type":"output_text","text":"ok"}]}}
+
+data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, SSE).unwrap();
+        assert!(
+            events.contains(&StreamEvent::TextFinal {
+                index: 0,
+                text: "ok".into(),
+                id: Some("msg_1".into()),
+                phase: Some("final_answer".into()),
+            }),
+            "expected the item's phase captured alongside its id and text: {events:#?}"
+        );
     }
 
     #[test]
@@ -906,7 +1085,7 @@ mod tests {
                         text: "leftover reasoning".into(),
                         signature: "not-json".into(),
                     },
-                    ContentBlock::Text { text: "42".into() },
+                    ContentBlock::text("42"),
                 ]),
             ],
             64,
@@ -1078,20 +1257,22 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
         assert_eq!(
             events[1],
             StreamEvent::ThinkingDelta {
+                index: 0,
                 text: "Let me check.".into()
             }
         );
         assert!(matches!(events[2], StreamEvent::SignatureDelta { .. }));
-        if let StreamEvent::SignatureDelta { signature } = &events[2] {
+        if let StreamEvent::SignatureDelta { signature, .. } = &events[2] {
             let parsed: Value = serde_json::from_str(signature).unwrap();
             assert_eq!(parsed["type"], "reasoning");
             assert_eq!(parsed["id"], "rs_1");
         }
-        assert_eq!(events[3], StreamEvent::ContentBlockStop);
+        assert_eq!(events[3], StreamEvent::ContentBlockStop { index: 0 });
         // Tool call.
         assert_eq!(
             events[4],
             StreamEvent::ToolUseStart {
+                index: 1,
                 id: "call_42|fc_1".into(),
                 name: "get_weather".into()
             }
@@ -1099,12 +1280,14 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
         assert_eq!(
             events[5],
             StreamEvent::InputJsonDelta {
+                index: 1,
                 partial_json: "{\"city\":".into()
             }
         );
         assert_eq!(
             events[6],
             StreamEvent::InputJsonDelta {
+                index: 1,
                 partial_json: "\"SF\"}".into()
             }
         );
@@ -1113,10 +1296,11 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
         assert_eq!(
             events[7],
             StreamEvent::InputJsonFinal {
+                index: 1,
                 full_json: "{\"city\":\"SF\"}".into()
             }
         );
-        assert_eq!(events[8], StreamEvent::ContentBlockStop);
+        assert_eq!(events[8], StreamEvent::ContentBlockStop { index: 1 });
         // Terminal: usage + a ToolUse-upgraded stop reason (status was "completed", but a tool call
         // happened).
         let usage = events
@@ -1213,12 +1397,14 @@ data: {"type":"response.output_text.delta","output_index":0,"delta":"partial"}
     }
 
     #[test]
-    fn interleaved_output_indices_force_close_the_previous_block() {
-        // A provider genuinely interleaving two items' deltas (rather than the API's documented
-        // added→...→done sequencing per item) must still produce exactly one ContentBlockStop per
-        // item, whether the second item is buffered-then-promoted or closed while still buffered (see
-        // `Decoder::pending`'s doc comment) — never zero (a leaked open block) or more than one
-        // (a double-close).
+    fn interleaved_output_indices_stay_open_concurrently_until_each_closes() {
+        // Two items genuinely interleaved (item 1 opens while item 0 is still open) must each produce
+        // exactly one ContentBlockStop — item 1's own explicit `output_item.done`, item 0's *implicit*
+        // close via `finalize`'s defensive sweep (a malformed/truncated stream must not leave it open
+        // forever). Since `Accumulator` now natively tracks as many concurrently-open indices as the
+        // wire actually has, index 1 opening does *not* force-close index 0 the way a single-focus
+        // design would — never zero closes (a leaked open block) or more than one (a double-close) per
+        // item either way.
         const SSE: &str = r#"
 data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"a"}}
 
@@ -1230,30 +1416,44 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
 "#;
         let mut dec = Decoder::default();
         let events = decode_sse(&mut dec, SSE).unwrap();
-        // Index 1 opening while index 0 was still open force-closes index 0; index 1's own
-        // `output_item.done` closes it explicitly — two ToolUseStart, two ContentBlockStop, no more.
         let tool_starts = events
             .iter()
             .filter(|e| matches!(e, StreamEvent::ToolUseStart { .. }))
             .count();
         let stops = events
             .iter()
-            .filter(|e| matches!(e, StreamEvent::ContentBlockStop))
+            .filter(|e| matches!(e, StreamEvent::ContentBlockStop { .. }))
             .count();
         assert_eq!(tool_starts, 2);
         assert_eq!(stops, 2);
+        // Both items' `ToolUseStart`s arrive back-to-back, live — no buffering delays index 1's own
+        // events until index 0 (which never even gets its own explicit close here) does something.
+        assert_eq!(
+            events[1],
+            StreamEvent::ToolUseStart {
+                index: 0,
+                id: combine_tool_id("call_1", "fc_1"),
+                name: "a".into(),
+            }
+        );
+        assert_eq!(
+            events[2],
+            StreamEvent::ToolUseStart {
+                index: 1,
+                id: combine_tool_id("call_2", "fc_2"),
+                name: "b".into(),
+            }
+        );
     }
 
     #[test]
-    fn stale_output_item_done_does_not_close_a_different_open_block() {
-        // Item 0 opens and stays focus; item 1 opens while item 0 is still open, so it's buffered
-        // rather than preempting item 0 (see `Decoder::pending`). Item 0's own `output_item.done`
-        // closes it and promotes item 1's buffered `ToolUseStart`/delta into focus in one step, so the
-        // resulting event order happens to match what a naive unconditional-close-on-`done` would have
-        // produced for this particular non-overlapping-closure shape — but for the correct reason
-        // (buffering + promotion, not a dropped/truncated block), and the two IDs' arguments never
-        // cross-contaminate (proven more directly by
-        // `preempted_items_arguments_are_never_truncated_or_dropped` below).
+    fn genuinely_interleaved_items_stream_live_not_buffered() {
+        // The core of the pi-parity fix this decoder exists to demonstrate: item 1's deltas, which
+        // arrive *while item 0 is still open*, are emitted immediately in real arrival order — not
+        // buffered and replayed as a single burst once item 0 finally closes. `Accumulator` on the
+        // consuming side tracks both indices concurrently and still assembles them in declaration
+        // order in the final message, but the *live event stream* itself now shows genuine
+        // interleaving, which a client watching for real-time argument-typing progress can observe.
         const SSE: &str = r#"
 data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"a"}}
 
@@ -1276,32 +1476,40 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
             vec![
                 StreamEvent::MessageStart,
                 StreamEvent::ToolUseStart {
+                    index: 0,
                     id: combine_tool_id("call_1", "fc_1"),
                     name: "a".into(),
                 },
-                // Item 0's own `output_item.done` (its arguments never streamed any deltas, so this
-                // resync is the *only* source of its final value) closes it and promotes item 1's
-                // already-buffered `ToolUseStart`/delta in the same step.
-                StreamEvent::InputJsonFinal {
-                    full_json: "{}".into(),
-                },
-                StreamEvent::ContentBlockStop,
                 StreamEvent::ToolUseStart {
+                    index: 1,
                     id: combine_tool_id("call_2", "fc_2"),
                     name: "b".into(),
                 },
+                // Index 1's delta arrives live, right where the wire put it — between index 0's start
+                // and its eventual close, not deferred until index 0 finishes.
                 StreamEvent::InputJsonDelta {
+                    index: 1,
                     partial_json: "{\"y\":2}".into(),
                 },
+                // Index 0's own `output_item.done` (its arguments never streamed any deltas, so this
+                // resync is the *only* source of its final value) closes it — index 1 stays open,
+                // untouched.
+                StreamEvent::InputJsonFinal {
+                    index: 0,
+                    full_json: "{}".into(),
+                },
+                StreamEvent::ContentBlockStop { index: 0 },
                 StreamEvent::InputJsonDelta {
+                    index: 1,
                     partial_json: "more".into(),
                 },
                 // Item 1's own `output_item.done` resyncs and closes it — the only close attributable
-                // to item 1, and index 0's earlier `done` (step above) never touches it.
+                // to item 1; index 0's earlier `done` never touched it.
                 StreamEvent::InputJsonFinal {
+                    index: 1,
                     full_json: "{\"y\":2}more".into(),
                 },
-                StreamEvent::ContentBlockStop,
+                StreamEvent::ContentBlockStop { index: 1 },
                 StreamEvent::Usage(TokenUsage {
                     input_tokens: 1,
                     output_tokens: 1,
@@ -1316,37 +1524,44 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
 
     /// Reconstructs each tool call's full concatenated JSON-argument buffer from a flat `StreamEvent`
     /// list, mirroring `agent_core::agent::Accumulator::apply` exactly: everything between a
-    /// `ToolUseStart` and the next `ContentBlockStop` belongs to that call, `InputJsonDelta` appends,
-    /// and `InputJsonFinal` *replaces* the buffer outright (the resync this module's tests exist to
-    /// prove). Panics on malformed event shapes (a `ContentBlockStop`/`InputJsonDelta`/`InputJsonFinal`
-    /// with no open call) — this test-only helper is meant to fail loudly on a genuinely corrupted
-    /// sequence, not silently produce a wrong map.
+    /// `ToolUseStart` at some `index` and the next `ContentBlockStop` *at that same index* belongs to
+    /// that call, `InputJsonDelta` appends, and `InputJsonFinal` *replaces* the buffer outright (the
+    /// resync this module's tests exist to prove). Keyed by index — not a single `Option`, since two
+    /// calls can now be genuinely open at once — so this test-only helper actually exercises the same
+    /// concurrent-tracking behavior the real `Accumulator` does, not the old single-current-block
+    /// assumption. Panics on malformed event shapes (an `InputJsonDelta`/`InputJsonFinal` with no open
+    /// call at that index, or two `ToolUseStart`s at the same still-open index) — meant to fail loudly
+    /// on a genuinely corrupted sequence, not silently produce a wrong map.
     fn reconstruct_tool_args(events: &[StreamEvent]) -> std::collections::HashMap<String, String> {
         let mut out = std::collections::HashMap::new();
-        let mut open: Option<(String, String)> = None;
+        let mut open: std::collections::HashMap<usize, (String, String)> =
+            std::collections::HashMap::new();
         for ev in events {
             match ev {
-                StreamEvent::ToolUseStart { id, .. } => {
+                StreamEvent::ToolUseStart { index, id, .. } => {
                     assert!(
-                        open.is_none(),
-                        "a ToolUseStart while another call is still open"
+                        !open.contains_key(index),
+                        "a ToolUseStart at index {index} while another call at that index is still open"
                     );
-                    open = Some((id.clone(), String::new()));
+                    open.insert(*index, (id.clone(), String::new()));
                 }
-                StreamEvent::InputJsonDelta { partial_json } => {
-                    open.as_mut()
-                        .expect("an InputJsonDelta with no open tool call")
+                StreamEvent::InputJsonDelta {
+                    index,
+                    partial_json,
+                } => {
+                    open.get_mut(index)
+                        .expect("an InputJsonDelta with no open tool call at this index")
                         .1
                         .push_str(partial_json);
                 }
-                StreamEvent::InputJsonFinal { full_json } => {
-                    open.as_mut()
-                        .expect("an InputJsonFinal with no open tool call")
+                StreamEvent::InputJsonFinal { index, full_json } => {
+                    open.get_mut(index)
+                        .expect("an InputJsonFinal with no open tool call at this index")
                         .1
                         .clone_from(full_json);
                 }
-                StreamEvent::ContentBlockStop => {
-                    if let Some((id, args)) = open.take() {
+                StreamEvent::ContentBlockStop { index } => {
+                    if let Some((id, args)) = open.remove(index) {
                         out.insert(id, args);
                     }
                 }
@@ -1358,14 +1573,14 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
 
     #[test]
     fn preempted_items_arguments_are_never_truncated_or_dropped() {
-        // The concrete failure this whole buffering/promotion design (`Decoder::pending`) exists to
-        // fix: two genuinely interleaved parallel tool calls (item 0 opens, item 1 opens before item
-        // 0's own `done`, item 1 closes *while still buffered*, item 0 keeps streaming more arguments
-        // afterward, then item 0 finally closes). Before the fix, item 1 opening would force-close item
-        // 0 immediately via `close_if_switching`, permanently truncating item 0's arguments at whatever
-        // had streamed so far ("{\"a\":" here) — the rest ("1}") would either be silently lost or
-        // corrupt item 1's own accumulating buffer. Both calls must end up with their complete,
-        // uncorrupted argument strings.
+        // The concrete failure this decoder's per-index tracking exists to prevent: two genuinely
+        // interleaved parallel tool calls (item 0 opens, item 1 opens before item 0's own `done`, item
+        // 1 closes while item 0 is still open, item 0 keeps streaming more arguments afterward, then
+        // item 0 finally closes). A single-focus design would force-close item 0 the moment item 1
+        // opened, permanently truncating item 0's arguments at whatever had streamed so far
+        // ("{\"a\":" here) — the rest ("1}") would either be silently lost or corrupt item 1's own
+        // accumulating buffer. Both calls must end up with their complete, uncorrupted argument
+        // strings.
         const SSE: &str = r#"
 data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"a"}}
 
@@ -1414,7 +1629,7 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
         assert_eq!(
             events
                 .iter()
-                .filter(|e| matches!(e, StreamEvent::ContentBlockStop))
+                .filter(|e| matches!(e, StreamEvent::ContentBlockStop { .. }))
                 .count(),
             2
         );
@@ -1480,9 +1695,13 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
         let events = decode_sse(&mut dec, SSE).unwrap();
         assert!(
             events.contains(&StreamEvent::TextFinal {
-                text: "Hello, world!".into()
+                index: 0,
+                text: "Hello, world!".into(),
+                id: Some("msg_1".into()),
+                phase: None,
             }),
-            "expected a TextFinal resync to the item's authoritative content: {events:#?}"
+            "expected a TextFinal resync to the item's authoritative content, carrying its real \
+             wire id for replay: {events:#?}"
         );
     }
 
