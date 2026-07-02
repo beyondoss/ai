@@ -26,7 +26,10 @@ pub fn build_body(req: &ModelRequest) -> Value {
     let caps = crate::models::capabilities(&req.model);
     let mut map = Map::new();
     map.insert("model".into(), Value::String(req.model.clone()));
-    map.insert("max_tokens".into(), Value::from(req.max_tokens));
+    map.insert(
+        "max_tokens".into(),
+        Value::from(clamp_max_tokens_to_context(req, &caps)),
+    );
     map.insert("stream".into(), Value::Bool(true));
 
     // The 1-hour TTL is only valid on models that support long cache retention; Anthropic 400s
@@ -122,7 +125,58 @@ pub fn build_body(req: &ModelRequest) -> Value {
     if let Some(choice) = &req.tool_choice {
         map.insert("tool_choice".into(), tool_choice(choice));
     }
+    // Anthropic-specific abuse-detection/rate-limiting hint — see `ModelRequest::user_id`'s doc
+    // comment. Unset by default, matching pi's own `metadata` passthrough (never populated by its own
+    // CLI, but available to a caller embedding the library).
+    if let Some(user_id) = &req.user_id {
+        map.insert("metadata".into(), json!({ "user_id": user_id }));
+    }
     Value::Object(map)
+}
+
+/// A floor under [`clamp_max_tokens_to_context`]'s result: never clamp down to something so small the
+/// turn can't produce a useful response. pi uses no explicit floor of its own (its clamp can only ever
+/// reduce `maxTokens`, and a near-zero `available` there is already a sign compaction is badly overdue
+/// — this floor is a defensive addition, not a divergence from its behavior in practice).
+const MIN_CLAMPED_MAX_TOKENS: u32 = 1_024;
+/// Held back below `context_window` on top of the estimated prompt size — matches pi's
+/// `clampMaxTokensToContext` margin (`packages/ai/src/api/simple-options.ts`). Token *estimates* (ours:
+/// chars/4, see [`crate::compaction::estimate_tokens`]) are approximate; this absorbs that slop so the
+/// clamp doesn't itself become the thing that pushes a request over the edge.
+const CONTEXT_CLAMP_MARGIN: u32 = 4_096;
+
+/// Clamp `req.max_tokens` down so `estimated prompt tokens + max_tokens` doesn't already exceed the
+/// model's context window — mirroring pi's `clampMaxTokensToContext`. Without this, a long-running
+/// session sends its *static* `max_tokens` ceiling on every turn regardless of how much of the window
+/// the live conversation has already consumed: once the prompt passes `context_window - max_tokens`,
+/// every further turn is a guaranteed-to-400 request, recovered only reactively (see
+/// `agent::is_context_overflow`) after paying for a wasted round-trip. Never *raises* `max_tokens` (a
+/// short prompt still gets the model's real ceiling), and never clamps below what a configured
+/// [`crate::transport::ThinkingConfig`] budget requires (Anthropic requires `max_tokens >
+/// budget_tokens`) — a request that's already this close to the window is a case for compaction to
+/// have caught, not for this clamp to make worse by triggering a *different* 400.
+fn clamp_max_tokens_to_context(req: &ModelRequest, caps: &crate::models::ModelCaps) -> u32 {
+    let estimated_prompt: u32 = req
+        .messages
+        .iter()
+        .map(crate::compaction::estimate_message_tokens)
+        .fold(0u32, |acc, n| acc.saturating_add(n))
+        .saturating_add(
+            req.system
+                .as_deref()
+                .map(crate::compaction::estimate_tokens)
+                .unwrap_or(0),
+        );
+    let available = caps
+        .context_window
+        .saturating_sub(estimated_prompt)
+        .saturating_sub(CONTEXT_CLAMP_MARGIN);
+    let floor = req
+        .thinking
+        .map(|t| t.budget_tokens.saturating_add(1))
+        .unwrap_or(0)
+        .max(MIN_CLAMPED_MAX_TOKENS);
+    req.max_tokens.min(available.max(floor))
 }
 
 /// Map a [`ToolChoice`] to Anthropic's `tool_choice` object. Anthropic spells "must call some tool"
@@ -180,6 +234,12 @@ fn mark_last_block(messages: &mut Value, cc: &Value) {
 /// in versus pi), but a non-conformant proxy, or a bug that delivers `message_stop` before a thinking
 /// block's `signature_delta`, would otherwise send an empty `signature` Anthropic likely rejects rather
 /// than degrading gracefully. A no-op for the common case (every thinking block already signed).
+///
+/// An unsigned block whose `thinking` text is *also* empty (e.g. a stream aborted before any delta
+/// landed) is dropped rather than downgraded: Anthropic's `text` content block requires non-empty
+/// text, so emitting `{"type": "text", "text": ""}` would just trade one 400 for another. Mirrors
+/// [`crate::session::Session::scrub_cross_model_state`]'s same empty-thinking-drops-instead-of-degrades
+/// rule.
 fn downgrade_unsigned_thinking(messages: &mut Value) {
     let Some(msgs) = messages.as_array_mut() else {
         return;
@@ -188,27 +248,31 @@ fn downgrade_unsigned_thinking(messages: &mut Value) {
         let Some(content) = m.get_mut("content").and_then(Value::as_array_mut) else {
             continue;
         };
-        for block in content.iter_mut() {
+        content.retain_mut(|block| {
             let Some(obj) = block.as_object_mut() else {
-                continue;
+                return true;
             };
             if obj.get("type").and_then(Value::as_str) != Some("thinking") {
-                continue;
+                return true;
             }
             let signed = obj
                 .get("signature")
                 .and_then(Value::as_str)
                 .is_some_and(|s| !s.is_empty());
             if signed {
-                continue;
+                return true;
             }
             let text = obj
                 .get("thinking")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
+            if text.is_empty() {
+                return false;
+            }
             *block = json!({ "type": "text", "text": text });
-        }
+            true
+        });
     }
 }
 
@@ -1173,6 +1237,35 @@ data: {"type":"message_stop"}
     }
 
     #[test]
+    fn unsigned_thinking_block_with_no_text_is_dropped_not_downgraded_to_an_empty_text_block() {
+        // A stream aborted before any `thinking_delta` landed leaves both `signature` and `thinking`
+        // empty. Downgrading that to `{"type": "text", "text": ""}` would just trade one 400 for
+        // another — Anthropic's text block requires non-empty text — so it must be dropped instead.
+        let req = ModelRequest::new(
+            "claude-opus-4-8",
+            vec![
+                Message::user("think then answer"),
+                Message::assistant(vec![
+                    ContentBlock::Thinking {
+                        text: String::new(),
+                        signature: String::new(),
+                    },
+                    ContentBlock::Text {
+                        text: "answer".into(),
+                    },
+                ]),
+                Message::user("again"),
+            ],
+            8192,
+        );
+        let body = build_body(&req);
+        let content = body["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1, "{content:?}");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "answer");
+    }
+
+    #[test]
     fn decodes_thinking_then_text_stream() {
         const THINKING: &str = r#"
 event: message_start
@@ -1376,6 +1469,17 @@ data: {"type":"message_stop"}
     }
 
     #[test]
+    fn user_id_is_sent_as_metadata_user_id_when_present_and_omitted_otherwise() {
+        let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 64);
+        assert!(build_body(&req).get("metadata").is_none());
+
+        let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 64)
+            .with_user_id("hashed-user-abc123");
+        let body = build_body(&req);
+        assert_eq!(body["metadata"], json!({ "user_id": "hashed-user-abc123" }));
+    }
+
+    #[test]
     fn truncated_stream_is_rejected() {
         // Opens but never delivers `message_stop`.
         const TRUNCATED: &str = r#"
@@ -1407,5 +1511,52 @@ data: {"type":"error","error":{"type":"overloaded_error","message":"server overl
             }
             other => panic!("expected transport error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn max_tokens_is_clamped_when_the_live_prompt_nears_the_context_window() {
+        // claude-3-5-sonnet: 200_000 context window. A ~150_000-token prompt (600_000 chars, the
+        // chars/4 estimator) leaves 200_000 - 150_000 - 4_096 (CONTEXT_CLAMP_MARGIN) = 45_904 tokens of
+        // headroom — less than the request's own (artificially large, to force the clamp) max_tokens.
+        let big_text = "x".repeat(600_000);
+        let req = ModelRequest::new("claude-3-5-sonnet", vec![Message::user(big_text)], 50_000);
+        let body = build_body(&req);
+        assert_eq!(
+            body["max_tokens"], 45_904,
+            "max_tokens must be clamped down to the actual remaining context headroom, not sent as \
+             the static 50_000 ceiling regardless of how much of the window the prompt already fills"
+        );
+    }
+
+    #[test]
+    fn max_tokens_is_unchanged_for_a_prompt_nowhere_near_the_context_window() {
+        // The clamp must never *raise* max_tokens, and must not needlessly reduce it either — a short
+        // prompt has ample headroom, so the request's own ceiling should reach the wire untouched.
+        let req = ModelRequest::new("claude-3-5-sonnet", vec![Message::user("hi")], 8_192);
+        let body = build_body(&req);
+        assert_eq!(body["max_tokens"], 8_192);
+    }
+
+    #[test]
+    fn max_tokens_clamp_never_drops_below_the_configured_thinking_budget() {
+        // Anthropic requires max_tokens > thinking.budget_tokens. Even when the live prompt is so
+        // close to the window that the naive headroom computation would fall below that, the clamp
+        // must not introduce a *second*, different 400 by clamping under the budget it's itself
+        // configured to reserve — a request this close to the window is a case compaction should have
+        // already caught, not one this clamp should make worse.
+        let huge_text = "x".repeat(796_000); // ~199_000 estimated tokens
+        let req = ModelRequest::new("claude-opus-4-5", vec![Message::user(huge_text)], 50_000)
+            .with_thinking(10_000);
+        let body = build_body(&req);
+        let max_tokens = body["max_tokens"].as_u64().unwrap();
+        assert!(
+            max_tokens > 10_000,
+            "max_tokens ({max_tokens}) must stay above the thinking budget (10_000) even under \
+             extreme context pressure"
+        );
+        assert_eq!(
+            max_tokens, 10_001,
+            "expected the exact thinking-budget-plus-one floor"
+        );
     }
 }

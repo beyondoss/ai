@@ -108,6 +108,14 @@ pub struct ModelRequest {
     /// non-conversational request (no follow-up turn to amortize the write against) should opt out
     /// rather than eating that premium for a cache entry nothing will ever read.
     pub no_cache: bool,
+    /// An opaque, caller-chosen identifier for the end user on whose behalf this request runs — sent as
+    /// Anthropic's `metadata.user_id` (should be a hashed/anonymized id, per Anthropic's own guidance,
+    /// never a raw name/email), which Anthropic uses for abuse detection and rate limiting. `None`
+    /// (the default) omits the field entirely — matches pi's own `CompletionOptions.metadata`, a generic
+    /// passthrough its library layer exposes but its own CLI never populates; the dialects that don't
+    /// understand `metadata.user_id` (OpenAI-shaped ones) simply ignore it, same as pi's provider
+    /// implementations only extracting the fields they recognize.
+    pub user_id: Option<String>,
 }
 
 impl ModelRequest {
@@ -129,6 +137,7 @@ impl ModelRequest {
             cache_key: None,
             cache_long: false,
             no_cache: false,
+            user_id: None,
         }
     }
 
@@ -180,6 +189,13 @@ impl ModelRequest {
     /// follow-up turn to amortize the cache-write premium against.
     pub fn with_no_cache(mut self, no_cache: bool) -> Self {
         self.no_cache = no_cache;
+        self
+    }
+
+    /// Builder-style: set the end-user identifier sent as Anthropic's `metadata.user_id`. See the
+    /// field's own doc comment for the hashed/anonymized-id expectation.
+    pub fn with_user_id(mut self, user_id: impl Into<String>) -> Self {
+        self.user_id = Some(user_id.into());
         self
     }
 }

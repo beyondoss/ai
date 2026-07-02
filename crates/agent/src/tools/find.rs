@@ -117,6 +117,7 @@ impl Tool for Find {
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing `pattern`".into()))?;
         let root = input.get("path").and_then(Value::as_str).unwrap_or(".");
+        let root = &super::normalize_path(root);
         let limit = input
             .get("limit")
             .and_then(Value::as_u64)
@@ -191,6 +192,21 @@ mod tests {
         assert!(out.contains("main.rs"));
         assert!(out.contains("lib.rs"));
         assert!(!out.contains("README.md"));
+    }
+
+    #[tokio::test]
+    async fn run_normalizes_the_path_argument() {
+        // Proves `run` actually calls `super::normalize_path`, via its `@`-prefix-strip behavior
+        // (needs no `$HOME` mutation — see `expand_tilde`'s own direct unit tests for that half).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "").unwrap();
+        let at_prefixed = format!("@{}", dir.path().to_str().unwrap());
+        let out = Find
+            .run(json!({ "pattern": "*.rs", "path": at_prefixed }))
+            .await
+            .unwrap()
+            .text;
+        assert!(out.contains("main.rs"));
     }
 
     #[tokio::test]

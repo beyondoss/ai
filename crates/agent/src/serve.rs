@@ -18,22 +18,25 @@
 //!     `streaming_behavior` is `"steer"` or `"follow_up"`, in which case `message` is queued through
 //!     the same `Steering` lane an explicit `steer`/`follow_up` command would use.
 //!   - `{type:"abort"}`                  cancel the in-flight `prompt` (if any), else a no-op ack
+//!   - `{type:"abort_retry"}`            interrupt a pending whole-run auto-retry backoff (see below),
+//!     surfacing the real underlying error that triggered it rather than waiting the delay out; a
+//!     no-op ack when no retry is pending (a run is actively streaming, or none is in flight at all)
 //!   - `{type:"stop_after_turn"}`        request a graceful stop at the next turn boundary — the
 //!     current turn's tool calls (if any) still finish and their results are committed, unlike
 //!     `abort`. A no-op ack when no `prompt` is in flight (never affects a *future* prompt).
 //!   - `{type:"get_state"}`              → `data: {session_id, model, steps, message_count, title,
-//!     thinking_level, auto_compaction, auto_retry, queue_mode, pending_messages, …}` — the last five
-//!     are the runtime-mutable settings and current steer/follow-up queue depth (`Steering::
-//!     pending_count`), so a client can render current settings without a second round trip
+//!     thinking_level, auto_compaction, auto_retry, steering_mode, follow_up_mode, pending_messages, …}`
+//!     — the last six are the runtime-mutable settings and current steer/follow-up queue depth
+//!     (`Steering::pending_count`), so a client can render current settings without a second round trip
 //!   - `{type:"get_messages", since?}`   → `data: {messages: [...]}` (each tagged with its tree `id`
 //!     when persistence is configured, so a client can fork from any point via `switch_branch`);
 //!     `since` (a tree id the client already has) returns only the messages appended after it — pi's
 //!     own `get_entries({since})` — an error, not a silent full re-fetch, when `since` names no known
 //!     id (or persistence isn't configured, so nothing is tagged at all)
-//!   - `{type:"new_session"}`            start a fresh session → `data: {session_id, parent}` (repo
-//!     mode: `parent` is whatever session id was active immediately before this call — pi's own
-//!     `parentSession` lineage marker, provenance only, not a fork; `null` in single-file/in-memory
-//!     mode, where there's no *new* id to link)
+//!   - `{type:"new_session", parent_session?}` start a fresh session → `data: {session_id, parent}`
+//!     (repo mode: `parent` is `parent_session` when given, else whatever session id was active
+//!     immediately before this call — pi's own `parentSession` lineage marker, provenance only, not a
+//!     fork; `null` in single-file/in-memory mode, where there's no *new* id to link)
 //!   - `{type:"list_sessions"}`          (repo mode) → `data: {sessions: [SessionMeta + updated_at/
 //!     message_count/preview/search_text…]}` (via `SessionMeta::to_listing_json` — those four fields are
 //!     `#[serde(skip)]` on the struct itself), this project's sessions only (matched by the default
@@ -44,10 +47,16 @@
 //!     `list_sessions`, across every project's own session directory, not just this one's — each entry's
 //!     own `cwd` field says which project it belongs to (pi's cross-project `listAll`)
 //!   - `{type:"switch_session", session_id}` (repo mode) load another session
+//!   - `{type:"delete_session", session_id}` (repo mode) soft-delete another session (moved to
+//!     `.trash`, not the currently active one — see `Persistence::delete`'s doc comment); idempotent
 //!   - `{type:"fork", upto?, target_id?, before?}` (repo mode) copy a prefix into a new session, switch
 //!     to it. `target_id` (any tree entry, on or off the active path) wins over `upto` (a message-count
 //!     prefix of just the active path) when given; `before:true` excludes `target_id` itself from the
 //!     copied prefix (fork right before it), the default `false` includes it.
+//!   - `{type:"clone"}` (repo mode) `fork` with no arguments — the current session's active path in
+//!     full, at its current tip. pi's own `clone`: a thin, argument-free alias, not a separate code
+//!     path (pi needs it because pi's own `fork` requires an explicit entry id; this crate's `fork`
+//!     already defaults to the same behavior when called bare).
 //!   - `{type:"get_fork_messages", session_id?, upto?, target_id?, before?}` (repo mode) preview what
 //!     `fork` would produce — no new session, no switch
 //!   - `{type:"set_session_name", title}` set the session's title
@@ -62,7 +71,11 @@
 //!   - `{type:"reload"}`                 re-run project-instruction/skill/prompt-template discovery and
 //!     re-check trust, refreshing the static half of the system prompt (the cheap date/cwd footer is
 //!     already refreshed every turn regardless)
-//!   - `{type:"set_model", model}`       switch the model for subsequent prompts → `data: {model}`
+//!   - `{type:"set_model", model}`       switch the model for subsequent prompts → `data: {model}`.
+//!     `model` is trimmed and rejected if empty/whitespace-only — the one mistake this process can
+//!     catch on its own; an unrecognized-but-well-formed id is *not* rejected (every id is forwarded
+//!     verbatim through the gateway, with no local registry here to validate a real one against —
+//!     `available_models()` is a non-exhaustive picker hint, not an allowlist)
 //!   - `{type:"set_thinking", budget}`   set/clear an explicit raw thinking-budget override (integer,
 //!     or `null` to disable it and defer back to the portable level below) → `data: {thinking}`
 //!   - `{type:"set_reasoning_effort", effort}` set the portable thinking-depth level directly — one of
@@ -82,13 +95,22 @@
 //!     that's exhausted, automatically re-invoking the *whole* `prompt` run against the same session up
 //!     to 3 more times with backoff (2/4/8s) — pi's `agent-session.ts` auto-retry. Each whole-run retry
 //!     attempt emits an unsolicited `auto_retry` frame (`{type:"auto_retry", id, command:"prompt",
-//!     attempt, max_attempts, delay_ms, error}`) before its backoff sleep.
-//!   - `{type:"set_queue_mode", mode}` toggle how much of the steer/follow-up queue a single drain
-//!     point consumes (`agent_core::QueueMode`) — `"one_at_a_time"` (the default, matching pi): only
-//!     the oldest queued message is injected per mid-run/stop-boundary drain, the rest stays queued for
-//!     the next one; `"all"`: everything queued is folded into one injection. Takes effect immediately
-//!     (owned by the `Steering` handle itself, no `Agent` rebuild), including mid-run.
-//!   - `{type:"get_available_models"}`   → `data: {models: […]}` (a known, non-exhaustive id list)
+//!     attempt, max_attempts, delay_ms, error}`) before its backoff sleep. A sequence that made at
+//!     least one attempt ends with exactly one `auto_retry_end` frame (`{type:"auto_retry_end", id,
+//!     command:"prompt", success, attempt, final_error?}`) — `success:true` when a retried attempt
+//!     recovers, `success:false` (with `final_error`) when retries are exhausted, the failure turns out
+//!     non-retryable, or the pending backoff itself is interrupted via `abort`/`abort_retry`
+//!     (`final_error:"retry cancelled"`) — mirroring pi's own `auto_retry_end` event.
+//!   - `{type:"set_steering_mode", mode}`/`{type:"set_follow_up_mode", mode}` toggle how much of the
+//!     steer lane (mid-run drain) / follow-up lane (stop-boundary drain, including any stranded steer
+//!     messages swept in there) a single drain point consumes (`agent_core::QueueMode`) —
+//!     `"one_at_a_time"` (the default, matching pi): only the oldest queued message is injected per
+//!     drain, the rest stays queued for the next one; `"all"`: everything queued is folded into one
+//!     injection. The two lanes have independent settings, matching pi's own `steeringMode`/
+//!     `followUpMode`. Takes effect immediately (owned by the `Steering` handle itself, no `Agent`
+//!     rebuild), including mid-run.
+//!   - `{type:"get_available_models"}`   → `data: {models: […]}` — the `--models` scope when given,
+//!     else a known, non-exhaustive id list (same source `cycle_model` steps through)
 //!   - `{type:"list_branches"}`          → `data: {branches: [BranchInfo…]}` (the session's *leaves*)
 //!   - `{type:"get_tree"}`               → `data: {nodes: [TreeNode…]}` (every message on every
 //!     branch, not just the leaves `list_branches` reports)
@@ -124,7 +146,9 @@
 //! total}` — zero or more unsolicited progress updates a `list_sessions`/`list_all_sessions` scan emits
 //! while in flight, correlated to the request via the same `id` its eventual `response` carries — or
 //! `{type:"auto_retry", id?, command:"prompt", attempt, max_attempts, delay_ms, error}`, one per
-//! whole-run auto-retry attempt (see `set_auto_retry` above), also correlated via `id`.
+//! whole-run auto-retry attempt (see `set_auto_retry` above), also correlated via `id` — or
+//! `{type:"auto_retry_end", id?, command:"prompt", success, attempt, final_error?}`, the terminal
+//! notice for a retry sequence that made at least one attempt.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -207,6 +231,11 @@ pub struct ServeConfig {
     /// Default `bash` command timeout when the model omits `timeout_ms`. `None` keeps the tool's
     /// built-in default.
     pub bash_timeout_ms: Option<u64>,
+    /// Run `bash` commands through this shell instead of the auto-resolved one (`/bin/bash`, else
+    /// `bash` on `$PATH`, else `sh`). Already validated to exist by the time it reaches here (see
+    /// `--bash-shell-path` in `main.rs`) — `build_tools` trusts it rather than re-checking on every
+    /// rebuild.
+    pub bash_shell_path: Option<String>,
     /// Restrict the tool set to exactly these names, dropping everything else. Combine with
     /// `exclude_tools` to carve one back out of the allow-list. Fixed for the process — like `system`,
     /// there's no runtime RPC to change it, but it does survive a `set_model`/`set_thinking` rebuild
@@ -216,10 +245,12 @@ pub struct ServeConfig {
     pub exclude_tools: Option<Vec<String>>,
     /// Register no tools at all. Wins over `tools`/`exclude_tools`.
     pub no_tools: bool,
-    /// Restrict `cycle_model`'s candidate list to exactly these ids, in this order (`--models`,
-    /// comma-separated). `set_model`/`get_available_models` are unaffected — this only scopes what
-    /// `cycle_model` steps through, matching pi's `--models` flag (`resolveModelScope`/
-    /// `_scopedModels`). Empty or absent falls back to the full [`available_models`] list.
+    /// Restrict `cycle_model`'s candidate list — and what `get_available_models` reports — to exactly
+    /// these ids, in this order (`--models`, comma-separated). `set_model` is unaffected: it still
+    /// accepts any id, scoped or not, matching pi's own `--models` flag (`resolveModelScope`/
+    /// `_scopedModels`) and its `get_available_models` (a live query against the actually-configured
+    /// registry, not a static hint list oblivious to how the process was launched). Empty or absent
+    /// falls back to the full [`available_models`] list.
     pub models: Vec<String>,
 }
 
@@ -276,19 +307,19 @@ async fn persist_blocking(
     mut persistence: Persistence,
     session: Session,
     tokens_before: Option<u32>,
-) -> Persistence {
-    // `persist` never panics itself (it handles its own I/O errors internally), and this task is
-    // never cancelled (always awaited directly, never `.abort()`ed) — so a `JoinError` here can only
-    // mean the closure panicked. Re-raise that panic rather than `.expect()`ing (denied by the
-    // workspace's panic-surface lints) on what would otherwise look like an ordinary recoverable
-    // error.
+) -> (Persistence, std::io::Result<()>) {
+    // `persist` never panics itself (it handles its own I/O errors internally — see the `Err` arm
+    // below for what a caller does with the returned `Result`), and this task is never cancelled
+    // (always awaited directly, never `.abort()`ed) — so a `JoinError` here can only mean the closure
+    // panicked. Re-raise that panic rather than `.expect()`ing (denied by the workspace's
+    // panic-surface lints) on what would otherwise look like an ordinary recoverable error.
     match tokio::task::spawn_blocking(move || {
-        persistence.persist(&session, tokens_before);
-        persistence
+        let r = persistence.persist(&session, tokens_before);
+        (persistence, r)
     })
     .await
     {
-        Ok(persistence) => persistence,
+        Ok(result) => result,
         Err(e) => std::panic::resume_unwind(e.into_panic()),
     }
 }
@@ -299,14 +330,14 @@ async fn persist_blocking(
 async fn persist_messages_blocking(
     mut persistence: Persistence,
     messages: Arc<Vec<agent_core::Message>>,
-) -> Persistence {
+) -> (Persistence, std::io::Result<()>) {
     match tokio::task::spawn_blocking(move || {
-        persistence.persist_messages(&messages);
-        persistence
+        let r = persistence.persist_messages(&messages);
+        (persistence, r)
     })
     .await
     {
-        Ok(persistence) => persistence,
+        Ok(result) => result,
         Err(e) => std::panic::resume_unwind(e.into_panic()),
     }
 }
@@ -349,7 +380,11 @@ impl Persistence {
         }
         if let Some(path) = &cfg.session_file {
             let path = std::path::PathBuf::from(path);
-            let (store, session) = if path.exists() {
+            // A zero-byte file at `path` (e.g. `touch`'d ahead of time, or left over from a crash
+            // before the header write landed) has nothing to open — route it through `create`, which
+            // now initializes an empty file in place rather than failing (see its own doc comment).
+            let has_content = path.metadata().is_ok_and(|m| m.len() > 0);
+            let (store, session) = if has_content {
                 SessionStore::open(path)?
             } else {
                 let store = SessionStore::create(path, SessionMeta::new(&cwd, &cfg.model))?;
@@ -416,29 +451,34 @@ impl Persistence {
     /// `SessionStore::rewrite_compacted`) if compaction fired this round, otherwise append just the
     /// new messages. `tokens_before` is `Some` (carrying `AgentEvent::Compacted`'s own value) exactly
     /// when a compaction fired.
-    fn persist(&mut self, session: &Session, tokens_before: Option<u32>) {
-        if let Some(store) = &mut self.store {
-            let r = match tokens_before {
-                Some(tokens_before) => {
-                    store.rewrite_compacted(&session.messages, CompactionMeta { tokens_before })
-                }
-                None => store.append_new(&session.messages),
-            };
-            if let Err(e) = r {
-                eprintln!("serve: failed to persist session: {e}");
+    fn persist(&mut self, session: &Session, tokens_before: Option<u32>) -> std::io::Result<()> {
+        let Some(store) = &mut self.store else {
+            return Ok(());
+        };
+        let r = match tokens_before {
+            Some(tokens_before) => {
+                store.rewrite_compacted(&session.messages, CompactionMeta { tokens_before })
             }
+            None => store.append_new(&session.messages),
+        };
+        if let Err(e) = &r {
+            eprintln!("serve: failed to persist session: {e}");
         }
+        r
     }
 
     /// Incremental persist for a mid-run checkpoint (see [`ChannelCheckpoint`]) — always a plain
     /// append, never a compacted rewrite: compaction only ever runs at a turn's *start*, strictly
     /// before that turn's own checkpoint(s), so the session a checkpoint carries is never mid-compaction.
-    fn persist_messages(&mut self, messages: &[agent_core::Message]) {
-        if let Some(store) = &mut self.store {
-            if let Err(e) = store.append_new(messages) {
-                eprintln!("serve: failed to persist checkpoint: {e}");
-            }
+    fn persist_messages(&mut self, messages: &[agent_core::Message]) -> std::io::Result<()> {
+        let Some(store) = &mut self.store else {
+            return Ok(());
+        };
+        let r = store.append_new(messages);
+        if let Err(e) = &r {
+            eprintln!("serve: failed to persist checkpoint: {e}");
         }
+        r
     }
 
     /// The working directory, for new session metadata — canonicalized, so a session created via
@@ -454,32 +494,52 @@ impl Persistence {
     /// resets the existing file (keeping its id); in-memory it just mints new metadata.
     ///
     /// In repo mode, the fresh session's `parent` records whatever session id was active immediately
-    /// before this call — pi's own `parentSession` lineage marker on a `/new`-equivalent reset. It's
-    /// provenance only (no shared history, unlike an actual `fork`): a client browsing sessions can
-    /// still trace "this fresh one followed that one" in the same directory/conversation. Not recorded
-    /// in single-file mode (there's no *new* id to link — the file/id just gets cleared in place) or
-    /// in-memory mode (nothing persists a "previous" id anywhere a client could look it up later),
-    /// matching pi's own `this.persist ? previousSessionFile : undefined`.
-    fn new_session(&mut self, model: &str) -> Session {
+    /// before this call, unless `parent_session` explicitly names a different one — pi's own
+    /// `parentSession` lineage marker on a `/new`-equivalent reset (pi's own default, absent an
+    /// explicit override, is no parent at all; this crate's default deliberately differs, always
+    /// linking to the previously-active session, since that provenance is used elsewhere — e.g. tree
+    /// navigation in the HTML export). It's provenance only (no shared history, unlike an actual
+    /// `fork`): a client browsing sessions can still trace "this fresh one followed that one" in the
+    /// same directory/conversation, or — with an explicit `parent_session` — "this one continues a
+    /// *different* lineage than whatever happened to be active." Not recorded in single-file mode
+    /// (there's no *new* id to link — the file/id just gets cleared in place) or in-memory mode
+    /// (nothing persists a "previous" id anywhere a client could look it up later), matching pi's own
+    /// `this.persist ? previousSessionFile : undefined`.
+    ///
+    /// On failure, nothing is mutated (no partial state) — the caller keeps whatever session was
+    /// already active, matching the source of truth still on disk. This matters: silently returning a
+    /// fresh in-memory `Session` while the on-disk reset actually failed would desync `SessionStore`'s
+    /// persisted-message-count bookkeeping from what the caller believes is live, so a *subsequent*
+    /// successful `persist` could look like a no-op append and silently drop every message of the
+    /// "new" session (`SessionStore::append_new`'s own dedup guard, `messages.len() <= self.persisted`).
+    fn new_session(
+        &mut self,
+        model: &str,
+        parent_session: Option<&str>,
+    ) -> std::io::Result<Session> {
         let cwd = Self::cwd();
         if let Some(repo) = &self.repo {
             let mut meta = SessionMeta::new(&cwd, model);
-            meta.parent = Some(self.meta.id.clone());
+            meta.parent = Some(parent_session.unwrap_or(&self.meta.id).to_string());
             match repo.create(meta) {
                 Ok(store) => {
                     self.meta = store.meta().clone();
                     self.store = Some(store);
                 }
-                Err(e) => eprintln!("serve: failed to create session: {e}"),
+                Err(e) => {
+                    eprintln!("serve: failed to create session: {e}");
+                    return Err(e);
+                }
             }
         } else if let Some(store) = &mut self.store {
             if let Err(e) = store.rewrite(&[]) {
                 eprintln!("serve: failed to reset session: {e}");
+                return Err(e);
             }
         } else {
             self.meta = SessionMeta::new(&cwd, model);
         }
-        Session::new()
+        Ok(Session::new())
     }
 
     /// Switch to another session by id (repo mode only).
@@ -525,12 +585,29 @@ impl Persistence {
     ) -> std::io::Result<Vec<agent_core::Message>> {
         let repo = self.repo.as_ref().ok_or_else(not_in_repo_mode)?;
         if let Some(entry_id) = entry_id {
-            let (_, session) = repo.fork_at_entry(session_id, entry_id, before)?;
-            return Ok(session.messages.to_vec());
+            return repo.fork_at_entry_messages(session_id, entry_id, before);
         }
         let (_, session) = repo.open_id(session_id)?;
         let upto = upto.min(session.messages.len());
         Ok(session.messages[..upto].to_vec())
+    }
+
+    /// Delete a session by id (repo mode only) — [`SessionRepo::delete`](crate::session_store::SessionRepo::delete)'s
+    /// soft-delete-to-`.trash`, idempotent whether or not `id` still exists. Refuses to delete the
+    /// *currently active* session (the one this `Persistence` itself is pointed at): that would move the
+    /// file out from under an in-memory `Session` a client is still actively using — with no session
+    /// file left to persist the next turn into — a footgun no legitimate caller needs, since `list_
+    /// sessions`/`list_all_sessions` responses report which id is current. A client that genuinely wants
+    /// that must `new_session`/`switch_session` away first.
+    fn delete(&self, id: &str) -> std::io::Result<()> {
+        let repo = self.repo.as_ref().ok_or_else(not_in_repo_mode)?;
+        if id == self.session_id() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "cannot delete the currently active session — switch to another session first",
+            ));
+        }
+        repo.delete(id)
     }
 
     /// All sessions' metadata, newest first (empty unless in repo mode). `on_progress(scanned, total)`
@@ -709,42 +786,57 @@ impl Persistence {
     /// Record that the active model changed — a no-op when persistence isn't configured (in-memory
     /// mode has nothing to append to). The caller (`set_model`/`cycle_model`) only calls this once it
     /// has already confirmed the model actually changed.
-    fn record_model_change(&mut self, model: &str) {
-        if let Some(store) = &mut self.store {
-            if let Err(e) = store.record_model_change(model) {
-                eprintln!("serve: failed to record model change: {e}");
-            }
+    fn record_model_change(&mut self, model: &str) -> std::io::Result<()> {
+        let Some(store) = &mut self.store else {
+            return Ok(());
+        };
+        let r = store.record_model_change(model);
+        if let Err(e) = &r {
+            eprintln!("serve: failed to record model change: {e}");
         }
+        r
     }
 
     /// Same idea as [`Self::record_model_change`], for the portable thinking level.
-    fn record_thinking_level_change(&mut self, level: &str) {
-        if let Some(store) = &mut self.store {
-            if let Err(e) = store.record_thinking_level_change(level) {
-                eprintln!("serve: failed to record thinking-level change: {e}");
-            }
+    fn record_thinking_level_change(&mut self, level: &str) -> std::io::Result<()> {
+        let Some(store) = &mut self.store else {
+            return Ok(());
+        };
+        let r = store.record_thinking_level_change(level);
+        if let Err(e) = &r {
+            eprintln!("serve: failed to record thinking-level change: {e}");
         }
+        r
     }
 
     /// The model/thinking-level to restore when switching to `target_id` (see
-    /// `SessionStore::model_at`/`thinking_level_at`). The model always resolves to *something* —
-    /// whatever `SessionStore::model_at` finds, or this session's own creation-time model
-    /// (`self.meta.model`) if nothing was ever recorded reaching that point — since every session has a
-    /// real starting model, "no change recorded yet" must restore that starting point, not be read as
-    /// "leave whatever's currently active alone" (which would wrongly keep a *later* branch's model
-    /// active after switching to an earlier point that predates it). The thinking level has no
-    /// equivalent creation-time baseline to fall back to (it isn't part of `SessionMeta`), so `None`
-    /// there genuinely does mean "nothing to restore, leave it as-is".
-    fn model_and_level_at(&self, target_id: &str) -> (String, Option<String>) {
+    /// `SessionStore::model_at`/`thinking_level_at`). Both always resolve to *something* concrete, never
+    /// "leave whatever's currently active alone" — that would let a sibling branch's `set_model`/
+    /// `cycle_thinking_level` bleed across a switch to a branch that never touched it, instead of
+    /// landing on that branch's own actual state. The model falls back to this session's own
+    /// creation-time model (`self.meta.model`) if nothing was ever recorded reaching that point — every
+    /// session has a real starting model. The thinking level has no equivalent creation-time baseline
+    /// in `SessionMeta`, so the caller passes `process_starting_level` (the level the process itself
+    /// started at, from `--reasoning-effort`/`ThinkingLevel::Off`) as its fallback instead — the same
+    /// "no change recorded yet" logic, just sourced from the process's own starting config rather than
+    /// the session's.
+    fn model_and_level_at(
+        &self,
+        target_id: &str,
+        process_starting_level: agent_core::ThinkingLevel,
+    ) -> (String, agent_core::ThinkingLevel) {
         let Some(store) = &self.store else {
-            return (self.meta.model.clone(), None);
+            return (self.meta.model.clone(), process_starting_level);
         };
         (
             store
                 .model_at(target_id)
                 .map(str::to_string)
                 .unwrap_or_else(|| self.meta.model.clone()),
-            store.thinking_level_at(target_id).map(str::to_string),
+            store
+                .thinking_level_at(target_id)
+                .and_then(agent_core::ThinkingLevel::parse)
+                .unwrap_or(process_starting_level),
         )
     }
 }
@@ -843,10 +935,15 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
     // always takes effect: `build_agent` derives both the thinking budget *and* the reasoning effort
     // from it via `agent_core::thinking_for_level`, correctly for whichever mechanism `current_model`
     // actually uses.
-    let mut current_level = cfg
+    let starting_level = cfg
         .reasoning_effort
         .map(agent_core::ThinkingLevel::from)
         .unwrap_or(agent_core::ThinkingLevel::Off);
+    // The runtime-mutable level starts at `starting_level`, but `switch_branch` needs the original
+    // starting value too — as the fallback for a branch that never recorded its own thinking-level
+    // change (see `Persistence::model_and_level_at`), so switching to it lands on the process's real
+    // starting depth instead of silently keeping whatever a *different* branch last set.
+    let mut current_level = starting_level;
     let mut current_auto_compaction = true;
     // Mid-stream transport-failure retry (`agent_core::Agent::with_auto_retry`) — on by default;
     // `set_auto_retry` lets an operator debugging a flaky network hop disable it to see the raw failure
@@ -1051,25 +1148,35 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 // mid-run, cancel and drain. The block scopes the run's `&mut session` borrow so we can
                 // persist after.
                 let mut stdin_open = true;
-                // A run that ends in a transient-looking `Err` (the same classification `run_turn`'s own
-                // mid-stream retry uses — `agent_core::agent::is_retryable_mid_stream`, `pub` exactly for
-                // this) is automatically re-invoked against the *same* session — resuming from wherever
-                // it left off, not restarting the turn — up to `MAX_RUN_RETRIES` times with backoff.
-                // pi's `agent-session.ts` equivalent (`_prepareRetry`/`isRetryableAssistantError`); ours
-                // is gated by the same `current_auto_retry` toggle as the mid-stream layer below it (one
+                // A run that ends in a transient-looking `Err` (`crate::retry::is_retryable_whole_run`
+                // — a superset of `run_turn`'s own mid-stream retry's `is_retryable_mid_stream`, plus
+                // raw HTTP status digits appropriate only at this outer layer) is automatically
+                // re-invoked against the *same* session — resuming from wherever it left off, not
+                // restarting the turn — up to `retry::MAX_RUN_RETRIES` times with backoff. pi's
+                // `agent-session.ts` equivalent (`_prepareRetry`/`isRetryableAssistantError`); ours is
+                // gated by the same `current_auto_retry` toggle as the mid-stream layer below it (one
                 // user-facing "retries on/off" concept, even though internally it's two layers), and
-                // never retries past a client disconnect or an explicit `abort` (`is_retryable_mid_stream`
-                // already excludes `Error::Cancelled`, and `stdin_open`/`cancel.is_cancelled()` below are
+                // never retries past a client disconnect or an explicit `abort`
+                // (`is_retryable_whole_run` already excludes `Error::Cancelled` transitively through
+                // `is_retryable_mid_stream`, and `stdin_open`/`cancel.is_cancelled()` below are
                 // redundant, cheap belt-and-suspenders on top of that). The backoff sleep itself isn't
                 // raced against `abort`/shutdown — both are only read inside an attempt's own `select!`
                 // below — so a client abort during backoff takes effect once the next attempt's stdin
-                // read resumes, not instantly; bounded by `MAX_RUN_RETRIES`/`RUN_RETRY_MAX_BACKOFF`, this
-                // window is short enough not to be worth the much larger restructuring a truly gapless
-                // fix would need.
+                // read resumes, not instantly; bounded by `retry::MAX_RUN_RETRIES`/
+                // `retry::RUN_RETRY_MAX_BACKOFF`, this window is short enough not to be worth the much
+                // larger restructuring a truly gapless fix would need.
                 let mut retry_attempt: u32 = 0;
+                // Set if a mid-run checkpoint or the final post-attempt persist fails to write to
+                // disk. Surfaced in the terminal `prompt` response instead of being silently
+                // swallowed — an agent run that appears to succeed while its transcript failed to
+                // persist is exactly the failure mode this exists to catch. Reset per attempt, same as
+                // `tokens_before`/`refused`: a retry runs a clean turn, so an earlier attempt's
+                // checkpoint failures don't apply to it.
+                let mut persist_error: Option<String>;
                 let result = 'retry: loop {
                     tokens_before.store(0, Ordering::Relaxed);
                     refused.store(false, Ordering::Relaxed);
+                    persist_error = None;
                     let tx = out_tx.clone();
                     let tokens_before_sink = tokens_before.clone();
                     let refused_sink = refused.clone();
@@ -1128,7 +1235,11 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                                 // checkpoint left undrained when the run ends is harmless — the unconditional
                                 // full persist right after this loop (below) is a strict superset of it.
                                 Some(messages) = checkpoint_rx.recv() => {
-                                    persistence = persist_messages_blocking(persistence, messages).await;
+                                    let (p, r) = persist_messages_blocking(persistence, messages).await;
+                                    persistence = p;
+                                    if let Err(e) = r {
+                                        persist_error = Some(e.to_string());
+                                    }
                                 }
                                 maybe_line = lines.next_line(), if stdin_open => match maybe_line {
                                     Ok(Some(l)) => {
@@ -1228,10 +1339,10 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                                             }
                                             "get_commands" => {
                                                 let mut commands: Vec<Value> = skills.iter().map(|s| {
-                                                    json!({ "name": s.name, "source": "skill", "description": s.description })
+                                                    json!({ "name": format!("skill:{}", s.name), "source": "skill", "description": s.description })
                                                 }).collect();
                                                 commands.extend(prompt_templates.iter().map(|t| {
-                                                    json!({ "name": t.name, "source": "prompt", "description": t.argument_hint })
+                                                    json!({ "name": t.name, "source": "prompt", "description": t.description })
                                                 }));
                                                 let collisions: Vec<&str> = skill_collisions.iter().chain(prompt_collisions.iter()).map(String::as_str).collect();
                                                 let _ = out_tx.send(response(cid, "get_commands", true, Some(json!({ "commands": commands, "collisions": collisions })), None));
@@ -1272,10 +1383,17 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                                                 }
                                             }
                                             "get_available_models" => {
-                                                let _ = out_tx.send(response(cid, "get_available_models", true, Some(json!({ "models": available_models() })), None));
+                                                let _ = out_tx.send(response(cid, "get_available_models", true, Some(json!({ "models": cycle_models })), None));
+                                            }
+                                            // A run is actively in flight — no retry backoff is pending yet
+                                            // (that only happens after an attempt fails, outside this loop),
+                                            // so there's nothing to cancel. Acknowledge idempotently, same
+                                            // as `abort`'s own idle-mode no-op below.
+                                            "abort_retry" => {
+                                                let _ = out_tx.send(response(cid, "abort_retry", true, None, None));
                                             }
                                             other => {
-                                                let _ = out_tx.send(response(cid, other, false, None, Some("busy: a prompt is running; only `abort`/`steer`/`follow_up`, or a handful of read-only commands (get_state/get_session_stats/get_commands/list_branches/get_tree/list_sessions/list_all_sessions/get_available_models), are accepted")));
+                                                let _ = out_tx.send(response(cid, other, false, None, Some("busy: a prompt is running; only `abort`/`abort_retry`/`steer`/`follow_up`, or a handful of read-only commands (get_state/get_session_stats/get_commands/list_branches/get_tree/list_sessions/list_all_sessions/get_available_models), are accepted")));
                                             }
                                         }
                                     }
@@ -1296,31 +1414,117 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                         0 => None,
                         n => Some(n),
                     };
-                    persistence =
-                        persist_blocking(persistence, session.clone(), compacted_tokens_before)
-                            .await;
+                    {
+                        let (p, r) =
+                            persist_blocking(persistence, session.clone(), compacted_tokens_before)
+                                .await;
+                        persistence = p;
+                        if let Err(e) = r {
+                            persist_error = Some(e.to_string());
+                        }
+                    }
 
                     match &attempt_result {
                         Err(e)
                             if current_auto_retry
                                 && stdin_open
                                 && !cancel.is_cancelled()
-                                && retry_attempt < MAX_RUN_RETRIES
-                                && agent_core::agent::is_retryable_mid_stream(e) =>
+                                && retry_attempt < crate::retry::MAX_RUN_RETRIES
+                                && crate::retry::is_retryable_whole_run(e) =>
                         {
                             retry_attempt += 1;
-                            let delay = run_retry_backoff(retry_attempt);
+                            let delay = crate::retry::backoff(retry_attempt);
                             let _ = out_tx.send(auto_retry_frame(
                                 id.clone(),
                                 retry_attempt,
-                                MAX_RUN_RETRIES,
+                                crate::retry::MAX_RUN_RETRIES,
                                 delay.as_millis() as u64,
                                 &e.to_string(),
                             ));
-                            tokio::time::sleep(delay).await;
+                            // Race the backoff itself against `abort`/`abort_retry`/shutdown, instead
+                            // of a bare `sleep` no command can interrupt — no run is in flight during
+                            // this wait, so only those two commands (plus stdin closing) are accepted;
+                            // anything else is rejected as busy, the same shape the live-run busy-loop
+                            // uses. A cancelled retry surfaces the *real* underlying error that
+                            // triggered it (`attempt_result`, set below), not a synthetic
+                            // `Error::Cancelled` — nothing was actually cancelled mid-flight, the
+                            // automatic retry was just declined.
+                            let mut retry_cancelled = false;
+                            let sleep = tokio::time::sleep(delay);
+                            tokio::pin!(sleep);
+                            loop {
+                                tokio::select! {
+                                    biased;
+                                    () = &mut sleep => break,
+                                    () = shutdown.wait() => {
+                                        stdin_open = false;
+                                        retry_cancelled = true;
+                                        break;
+                                    }
+                                    maybe_line = lines.next_line(), if stdin_open => match maybe_line {
+                                        Ok(Some(l)) => {
+                                            let l = l.trim();
+                                            if l.is_empty() {
+                                                continue;
+                                            }
+                                            let c: Value = match serde_json::from_str(l) {
+                                                Ok(v) => v,
+                                                Err(e) => {
+                                                    let _ = out_tx.send(response(None, "?", false, None, Some(&format!("invalid JSON: {e}"))));
+                                                    continue;
+                                                }
+                                            };
+                                            let cid = c.get("id").and_then(Value::as_str).map(str::to_string);
+                                            let cmd_type = c.get("type").and_then(Value::as_str).unwrap_or("");
+                                            match cmd_type {
+                                                "abort" | "abort_retry" => {
+                                                    retry_cancelled = true;
+                                                    let _ = out_tx.send(response(cid, cmd_type, true, None, None));
+                                                    break;
+                                                }
+                                                other => {
+                                                    let _ = out_tx.send(response(cid, other, false, None, Some("busy: retrying after a transient error; only `abort`/`abort_retry` are accepted until the retry starts")));
+                                                }
+                                            }
+                                        }
+                                        Ok(None) | Err(_) => {
+                                            stdin_open = false;
+                                            retry_cancelled = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if retry_cancelled {
+                                let _ = out_tx.send(auto_retry_end_frame(
+                                    id.clone(),
+                                    false,
+                                    retry_attempt,
+                                    Some("retry cancelled"),
+                                ));
+                                break 'retry attempt_result;
+                            }
                             continue 'retry;
                         }
-                        _ => break 'retry attempt_result,
+                        _ => {
+                            // A terminal notice only for a sequence that actually retried at least
+                            // once — a first-attempt success or an immediately-non-retryable failure
+                            // never emitted `auto_retry`, so it needs no "the retries ended" notice
+                            // either. Mirrors pi's own `this._retryAttempt > 0` guard.
+                            if retry_attempt > 0 {
+                                let (success, final_error) = match &attempt_result {
+                                    Ok(_) => (true, None),
+                                    Err(e) => (false, Some(e.to_string())),
+                                };
+                                let _ = out_tx.send(auto_retry_end_frame(
+                                    id.clone(),
+                                    success,
+                                    retry_attempt,
+                                    final_error.as_deref(),
+                                ));
+                            }
+                            break 'retry attempt_result;
+                        }
                     }
                 };
 
@@ -1330,7 +1534,19 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                         if let Value::Object(m) = &mut data {
                             m.insert("refused".into(), json!(refused.load(Ordering::Relaxed)));
                         }
-                        response(id.clone(), "prompt", true, Some(data), None)
+                        match &persist_error {
+                            // The run itself succeeded, but its transcript failed to durably persist —
+                            // report failure rather than a false success (still with `data`: the run
+                            // did produce a real result, just not one safely on disk yet).
+                            Some(e) => response(
+                                id.clone(),
+                                "prompt",
+                                false,
+                                Some(data),
+                                Some(&format!("run completed but failed to persist: {e}")),
+                            ),
+                            None => response(id.clone(), "prompt", true, Some(data), None),
+                        }
                     }
                     Err(e) => response(id.clone(), "prompt", false, None, Some(&e.to_string())),
                 };
@@ -1366,6 +1582,12 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 // No run is in flight (a mid-run abort is handled inside the `prompt` arm above), so
                 // there is nothing to cancel — acknowledge idempotently.
                 emit!(response(id, "abort", true, None, None));
+            }
+            "abort_retry" => {
+                // Same idea as `abort` above: interrupting a pending whole-run-retry backoff only
+                // means something while a `prompt` is between attempts (handled inside that arm's own
+                // retry loop) — idle, there's no backoff in progress to cancel.
+                emit!(response(id, "abort_retry", true, None, None));
             }
             "stop_after_turn" => {
                 // No run is in flight, so there is no turn boundary to stop at. Unlike `steer`/
@@ -1449,21 +1671,33 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     None,
                 ));
             }
-            "new_session" => {
-                session = persistence.new_session(&current_model);
-                steering.clear();
-                emit!(response(
+            "new_session" => match persistence.new_session(
+                &current_model,
+                cmd.get("parent_session").and_then(Value::as_str),
+            ) {
+                Ok(s) => {
+                    session = s;
+                    steering.clear();
+                    emit!(response(
+                        id,
+                        "new_session",
+                        true,
+                        Some(json!({
+                            "session_id": persistence.session_id(),
+                            "cwd_stale": cwd_is_stale(&persistence.meta.cwd, &cwd),
+                            "parent": persistence.meta.parent,
+                        })),
+                        None,
+                    ));
+                }
+                Err(e) => emit!(response(
                     id,
                     "new_session",
-                    true,
-                    Some(json!({
-                        "session_id": persistence.session_id(),
-                        "cwd_stale": cwd_is_stale(&persistence.meta.cwd, &cwd),
-                        "parent": persistence.meta.parent,
-                    })),
+                    false,
                     None,
-                ));
-            }
+                    Some(&e.to_string())
+                )),
+            },
             "list_sessions" => {
                 let progress_id = id.clone();
                 let sessions: Vec<Value> = persistence
@@ -1552,6 +1786,28 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     Some("missing `session_id`")
                 )),
             },
+            // Soft-deletes (moves to `.trash`) another session — never the one currently active, see
+            // `Persistence::delete`'s doc comment. Idempotent: deleting an absent (or already-deleted)
+            // session id is a successful no-op.
+            "delete_session" => match cmd.get("session_id").and_then(Value::as_str) {
+                Some(target) => match persistence.delete(target) {
+                    Ok(()) => emit!(response(id, "delete_session", true, None, None)),
+                    Err(e) => emit!(response(
+                        id,
+                        "delete_session",
+                        false,
+                        None,
+                        Some(&e.to_string())
+                    )),
+                },
+                None => emit!(response(
+                    id,
+                    "delete_session",
+                    false,
+                    None,
+                    Some("missing `session_id`")
+                )),
+            },
             "fork" => {
                 // `upto` messages to copy into the new session; absent = clone the whole session.
                 // `target_id`, when given, forks at that specific tree entry instead — anywhere in the
@@ -1582,6 +1838,28 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     Err(e) => emit!(response(id, "fork", false, None, Some(&e.to_string()))),
                 }
             }
+            // pi's own `clone` — fork the current session at its current tip, with no arguments —
+            // exists there because pi's `fork` *requires* an explicit `entryId`; this crate's `fork`
+            // already defaults to exactly that (no `upto`/`target_id` given), so `clone` is a thin,
+            // deliberately-argument-free alias over the same call for a client speaking pi's protocol
+            // shape, not a second code path.
+            "clone" => match persistence.fork(usize::MAX, None, false) {
+                Ok(s) => {
+                    session = s;
+                    steering.clear();
+                    emit!(response(
+                        id,
+                        "clone",
+                        true,
+                        Some(json!({
+                            "session_id": persistence.session_id(),
+                            "cwd_stale": cwd_is_stale(&persistence.meta.cwd, &cwd),
+                        })),
+                        None,
+                    ));
+                }
+                Err(e) => emit!(response(id, "clone", false, None, Some(&e.to_string()))),
+            },
             "get_fork_messages" => {
                 // A read-only preview of what `fork` would produce for `session_id` (default: the
                 // current session) at `upto` messages — no new session file, no switch. Lets a client
@@ -1661,6 +1939,9 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
             },
             "compact" => {
                 // Manual compaction (no run in flight here). Streams a `compacted` event if it cuts.
+                // `custom_instructions`, when given, steers what the summary emphasizes — pi's own
+                // `compact(customInstructions)` — rather than replacing the structured template.
+                let custom_instructions = cmd.get("custom_instructions").and_then(Value::as_str);
                 let tx = out_tx.clone();
                 let mut compacted_tokens_before: Option<u32> = None;
                 let result = agent
@@ -1676,20 +1957,31 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                                 let _ = tx.send(frame);
                             }
                         },
+                        custom_instructions,
                     )
                     .await;
                 match result {
                     Ok(did) => {
-                        persistence =
+                        let (p, persist_result) =
                             persist_blocking(persistence, session.clone(), compacted_tokens_before)
                                 .await;
-                        emit!(response(
-                            id,
-                            "compact",
-                            true,
-                            Some(json!({ "compacted": did })),
-                            None
-                        ));
+                        persistence = p;
+                        match persist_result {
+                            Ok(()) => emit!(response(
+                                id,
+                                "compact",
+                                true,
+                                Some(json!({ "compacted": did })),
+                                None
+                            )),
+                            Err(e) => emit!(response(
+                                id,
+                                "compact",
+                                false,
+                                None,
+                                Some(&format!("compacted but failed to persist: {e}"))
+                            )),
+                        }
                     }
                     Err(e) => emit!(response(id, "compact", false, None, Some(&e.to_string()))),
                 }
@@ -1718,12 +2010,12 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 let mut commands: Vec<Value> = skills
                     .iter()
                     .map(|s| {
-                        json!({ "name": s.name, "source": "skill", "description": s.description })
+                        json!({ "name": format!("skill:{}", s.name), "source": "skill", "description": s.description })
                     })
                     .collect();
-                commands.extend(prompt_templates.iter().map(|t| {
-                    json!({ "name": t.name, "source": "prompt", "description": t.argument_hint })
-                }));
+                commands.extend(prompt_templates.iter().map(
+                    |t| json!({ "name": t.name, "source": "prompt", "description": t.description }),
+                ));
                 // Every shadowed name (a skill or template defined at more than one path) is otherwise
                 // silently resolved with no way for a client to notice — surfaced here instead.
                 let collisions: Vec<&str> = skill_collisions
@@ -1764,45 +2056,71 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 agent.set_system(full_system(&static_system, &cwd));
                 emit!(response(id, "reload", true, None, None));
             }
-            "set_model" => match cmd.get("model").and_then(Value::as_str) {
+            // Rejects only an empty/whitespace-only id, not an unrecognized one: unlike pi (which talks
+            // directly to each provider and can validate against a live, authoritative registry of what
+            // it's actually configured to reach), every model id here is forwarded verbatim through the
+            // gateway (`AI_GATEWAY_URL`) — this process has no local source of truth to validate a real
+            // id against, and `available_models()` is explicitly documented as a non-exhaustive picker
+            // hint, not an allowlist (see its own doc comment). What IS a genuine, unambiguous mistake
+            // regardless of the gateway's own model set — an empty string sneaking through `Value::as_str`
+            // and getting durably recorded via `record_model_change` — is caught here, the same class of
+            // fix `set_session_name` already got (reject empty, don't pretend to validate against a list
+            // this process can't actually authoritatively check).
+            "set_model" => match cmd
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
                 Some(model) => {
-                    // Rebuild the agent so subsequent prompts use the new model (and, via the id, its
-                    // dialect + capabilities). A signed thinking block is only valid for replay to the
-                    // model that produced it, and a combined OpenAI-Responses tool-call id only means
-                    // anything back to that same model — scrub both from any message not already
-                    // stamped with the model we're switching to.
-                    session.scrub_cross_model_state(model);
-                    if model != current_model {
-                        persistence.record_model_change(model);
+                    // Persist the lineage marker *before* applying the switch in memory: if it fails
+                    // to write, leave the live model unchanged too, rather than forking live state
+                    // away from what's durably recorded (an `Err` here aborts the whole switch).
+                    let record_result = if model != current_model {
+                        persistence.record_model_change(model)
+                    } else {
+                        Ok(())
+                    };
+                    match record_result {
+                        Ok(()) => {
+                            // A signed thinking block is only valid for replay to the model that
+                            // produced it, and a combined OpenAI-Responses tool-call id only means
+                            // anything back to that same model — scrub both from any message not
+                            // already stamped with the model we're switching to.
+                            session.scrub_cross_model_state(model);
+                            current_model = model.to_string();
+                            agent = build_agent(
+                                client.clone(),
+                                &full_system(&static_system, &cwd),
+                                &cfg,
+                                &current_model,
+                                current_thinking,
+                                current_level,
+                                current_auto_compaction,
+                                current_auto_retry,
+                                persistence.session_id(),
+                                &write_locks,
+                                &checkpoint,
+                            );
+                            emit!(response(
+                                id,
+                                "set_model",
+                                true,
+                                Some(json!({ "model": current_model })),
+                                None,
+                            ));
+                        }
+                        Err(e) => {
+                            emit!(response(id, "set_model", false, None, Some(&e.to_string())))
+                        }
                     }
-                    current_model = model.to_string();
-                    agent = build_agent(
-                        client.clone(),
-                        &full_system(&static_system, &cwd),
-                        &cfg,
-                        &current_model,
-                        current_thinking,
-                        current_level,
-                        current_auto_compaction,
-                        current_auto_retry,
-                        persistence.session_id(),
-                        &write_locks,
-                        &checkpoint,
-                    );
-                    emit!(response(
-                        id,
-                        "set_model",
-                        true,
-                        Some(json!({ "model": current_model })),
-                        None,
-                    ));
                 }
                 None => emit!(response(
                     id,
                     "set_model",
                     false,
                     None,
-                    Some("missing `model`")
+                    Some("missing or empty `model`")
                 )),
             },
             "set_thinking" => {
@@ -1879,39 +2197,52 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 };
                 match parsed {
                     Some(level) => {
-                        if level != current_level {
-                            persistence.record_thinking_level_change(level.as_str());
+                        let record_result = if level != current_level {
+                            persistence.record_thinking_level_change(level.as_str())
+                        } else {
+                            Ok(())
+                        };
+                        match record_result {
+                            Ok(()) => {
+                                current_level = level;
+                                current_thinking = None;
+                                agent = build_agent(
+                                    client.clone(),
+                                    &full_system(&static_system, &cwd),
+                                    &cfg,
+                                    &current_model,
+                                    current_thinking,
+                                    current_level,
+                                    current_auto_compaction,
+                                    current_auto_retry,
+                                    persistence.session_id(),
+                                    &write_locks,
+                                    &checkpoint,
+                                );
+                                let (thinking, reasoning_effort) = agent_core::thinking_for_level(
+                                    &agent_core::capabilities(&current_model),
+                                    current_level,
+                                );
+                                emit!(response(
+                                    id,
+                                    "set_reasoning_effort",
+                                    true,
+                                    Some(json!({
+                                        "level": current_level.as_str(),
+                                        "thinking": thinking,
+                                        "reasoning_effort": reasoning_effort.map(|e| e.as_str()),
+                                    })),
+                                    None,
+                                ));
+                            }
+                            Err(e) => emit!(response(
+                                id,
+                                "set_reasoning_effort",
+                                false,
+                                None,
+                                Some(&e.to_string())
+                            )),
                         }
-                        current_level = level;
-                        current_thinking = None;
-                        agent = build_agent(
-                            client.clone(),
-                            &full_system(&static_system, &cwd),
-                            &cfg,
-                            &current_model,
-                            current_thinking,
-                            current_level,
-                            current_auto_compaction,
-                            current_auto_retry,
-                            persistence.session_id(),
-                            &write_locks,
-                            &checkpoint,
-                        );
-                        let (thinking, reasoning_effort) = agent_core::thinking_for_level(
-                            &agent_core::capabilities(&current_model),
-                            current_level,
-                        );
-                        emit!(response(
-                            id,
-                            "set_reasoning_effort",
-                            true,
-                            Some(json!({
-                                "level": current_level.as_str(),
-                                "thinking": thinking,
-                                "reasoning_effort": reasoning_effort.map(|e| e.as_str()),
-                            })),
-                            None,
-                        ));
                     }
                     None => emit!(response(
                         id,
@@ -1932,31 +2263,46 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     .position(|m| m == &current_model)
                     .map_or(0, |i| (i + 1) % cycle_models.len());
                 let next_model = cycle_models[next_idx].clone();
-                session.scrub_cross_model_state(&next_model);
-                if next_model != current_model {
-                    persistence.record_model_change(&next_model);
+                let record_result = if next_model != current_model {
+                    persistence.record_model_change(&next_model)
+                } else {
+                    Ok(())
+                };
+                match record_result {
+                    Ok(()) => {
+                        session.scrub_cross_model_state(&next_model);
+                        current_model = next_model;
+                        agent = build_agent(
+                            client.clone(),
+                            &full_system(&static_system, &cwd),
+                            &cfg,
+                            &current_model,
+                            current_thinking,
+                            current_level,
+                            current_auto_compaction,
+                            current_auto_retry,
+                            persistence.session_id(),
+                            &write_locks,
+                            &checkpoint,
+                        );
+                        emit!(response(
+                            id,
+                            "cycle_model",
+                            true,
+                            Some(
+                                json!({ "model": current_model, "scoped": !cfg.models.is_empty() })
+                            ),
+                            None,
+                        ));
+                    }
+                    Err(e) => emit!(response(
+                        id,
+                        "cycle_model",
+                        false,
+                        None,
+                        Some(&e.to_string())
+                    )),
                 }
-                current_model = next_model;
-                agent = build_agent(
-                    client.clone(),
-                    &full_system(&static_system, &cwd),
-                    &cfg,
-                    &current_model,
-                    current_thinking,
-                    current_level,
-                    current_auto_compaction,
-                    current_auto_retry,
-                    persistence.session_id(),
-                    &write_locks,
-                    &checkpoint,
-                );
-                emit!(response(
-                    id,
-                    "cycle_model",
-                    true,
-                    Some(json!({ "model": current_model, "scoped": !cfg.models.is_empty() })),
-                    None,
-                ));
             }
             "cycle_thinking_level" => {
                 // Advance the portable Off/Minimal/Low/Medium/High/XHigh ladder, wrapping, and clear
@@ -1964,37 +2310,48 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 // silently mask the level having just changed. `thinking_for_level` reports what the
                 // new level actually resolves to for `current_model` specifically, so the response
                 // reflects reality rather than a number that may be meaningless for this model's shape.
-                current_level = current_level.next();
-                persistence.record_thinking_level_change(current_level.as_str());
-                current_thinking = None;
-                agent = build_agent(
-                    client.clone(),
-                    &full_system(&static_system, &cwd),
-                    &cfg,
-                    &current_model,
-                    current_thinking,
-                    current_level,
-                    current_auto_compaction,
-                    current_auto_retry,
-                    persistence.session_id(),
-                    &write_locks,
-                    &checkpoint,
-                );
-                let (thinking, reasoning_effort) = agent_core::thinking_for_level(
-                    &agent_core::capabilities(&current_model),
-                    current_level,
-                );
-                emit!(response(
-                    id,
-                    "cycle_thinking_level",
-                    true,
-                    Some(json!({
-                        "level": current_level.as_str(),
-                        "thinking": thinking,
-                        "reasoning_effort": reasoning_effort.map(|e| e.as_str()),
-                    })),
-                    None,
-                ));
+                let next_level = current_level.next();
+                match persistence.record_thinking_level_change(next_level.as_str()) {
+                    Ok(()) => {
+                        current_level = next_level;
+                        current_thinking = None;
+                        agent = build_agent(
+                            client.clone(),
+                            &full_system(&static_system, &cwd),
+                            &cfg,
+                            &current_model,
+                            current_thinking,
+                            current_level,
+                            current_auto_compaction,
+                            current_auto_retry,
+                            persistence.session_id(),
+                            &write_locks,
+                            &checkpoint,
+                        );
+                        let (thinking, reasoning_effort) = agent_core::thinking_for_level(
+                            &agent_core::capabilities(&current_model),
+                            current_level,
+                        );
+                        emit!(response(
+                            id,
+                            "cycle_thinking_level",
+                            true,
+                            Some(json!({
+                                "level": current_level.as_str(),
+                                "thinking": thinking,
+                                "reasoning_effort": reasoning_effort.map(|e| e.as_str()),
+                            })),
+                            None,
+                        ));
+                    }
+                    Err(e) => emit!(response(
+                        id,
+                        "cycle_thinking_level",
+                        false,
+                        None,
+                        Some(&e.to_string())
+                    )),
+                }
             }
             "set_auto_compaction" => match cmd.get("enabled").and_then(Value::as_bool) {
                 Some(enabled) => {
@@ -2060,28 +2417,29 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     Some("missing boolean `enabled`")
                 )),
             },
-            // Toggle how much of the steer/follow-up queue a single drain point consumes (see
+            // Toggle how much of the steer lane a single mid-run drain point consumes (see
             // `agent_core::QueueMode`) — pi's default is `"one_at_a_time"`, one queued message per
             // drain, leaving the rest queued for the next one; `"all"` folds everything queued into a
-            // single injection (this crate's original behavior). Owned entirely by the `Steering`
-            // handle itself (shared with the loop, no `Agent` rebuild needed), so this takes effect
-            // immediately, including mid-run.
-            "set_queue_mode" => match cmd.get("mode").and_then(Value::as_str) {
+            // single injection (this crate's original behavior). Independent of `set_follow_up_mode`
+            // below — pi carries the same split (`steeringMode`/`followUpMode`). Owned entirely by the
+            // `Steering` handle itself (shared with the loop, no `Agent` rebuild needed), so this takes
+            // effect immediately, including mid-run.
+            "set_steering_mode" => match cmd.get("mode").and_then(Value::as_str) {
                 Some("one_at_a_time") => {
-                    steering.set_mode(agent_core::QueueMode::OneAtATime);
+                    steering.set_steering_mode(agent_core::QueueMode::OneAtATime);
                     emit!(response(
                         id,
-                        "set_queue_mode",
+                        "set_steering_mode",
                         true,
                         Some(json!({ "mode": "one_at_a_time" })),
                         None,
                     ));
                 }
                 Some("all") => {
-                    steering.set_mode(agent_core::QueueMode::All);
+                    steering.set_steering_mode(agent_core::QueueMode::All);
                     emit!(response(
                         id,
-                        "set_queue_mode",
+                        "set_steering_mode",
                         true,
                         Some(json!({ "mode": "all" })),
                         None,
@@ -2089,7 +2447,38 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 _ => emit!(response(
                     id,
-                    "set_queue_mode",
+                    "set_steering_mode",
+                    false,
+                    None,
+                    Some("missing `mode`; expected \"one_at_a_time\" or \"all\"")
+                )),
+            },
+            // Same idea, for the follow-up lane drained at a stop boundary (plus any stranded steer
+            // messages swept in there — see `Steering::drain_at_stop`).
+            "set_follow_up_mode" => match cmd.get("mode").and_then(Value::as_str) {
+                Some("one_at_a_time") => {
+                    steering.set_follow_up_mode(agent_core::QueueMode::OneAtATime);
+                    emit!(response(
+                        id,
+                        "set_follow_up_mode",
+                        true,
+                        Some(json!({ "mode": "one_at_a_time" })),
+                        None,
+                    ));
+                }
+                Some("all") => {
+                    steering.set_follow_up_mode(agent_core::QueueMode::All);
+                    emit!(response(
+                        id,
+                        "set_follow_up_mode",
+                        true,
+                        Some(json!({ "mode": "all" })),
+                        None,
+                    ));
+                }
+                _ => emit!(response(
+                    id,
+                    "set_follow_up_mode",
                     false,
                     None,
                     Some("missing `mode`; expected \"one_at_a_time\" or \"all\"")
@@ -2100,7 +2489,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     id,
                     "get_available_models",
                     true,
-                    Some(json!({ "models": available_models() })),
+                    Some(json!({ "models": cycle_models })),
                     None,
                 ));
             }
@@ -2141,27 +2530,23 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                             // Restore whichever model/thinking-level was actually active on this
                             // branch, rather than silently continuing with the process's current
                             // global setting (which may have since moved on via a `set_model`/
-                            // `cycle_thinking_level` made on a *different* branch). The model always
-                            // resolves to something real (falling back to the session's own
-                            // creation-time model — see `model_and_level_at`'s doc comment); the level
-                            // has no such baseline, so `None` there means nothing to restore.
+                            // `cycle_thinking_level` made on a *different* branch — that's the bleed
+                            // this guards against). Both always resolve to something real: the model
+                            // falls back to the session's own creation-time model, the level to the
+                            // process's own starting level (`starting_level`) — see
+                            // `model_and_level_at`'s doc comment.
                             let (restored_model, restored_level) =
-                                persistence.model_and_level_at(&target_id);
+                                persistence.model_and_level_at(&target_id, starting_level);
                             let mut rebuild_needed = false;
                             if restored_model != current_model {
                                 session.scrub_cross_model_state(&restored_model);
                                 current_model = restored_model;
                                 rebuild_needed = true;
                             }
-                            if let Some(level) = restored_level
-                                .as_deref()
-                                .and_then(agent_core::ThinkingLevel::parse)
-                            {
-                                if level != current_level {
-                                    current_level = level;
-                                    current_thinking = None;
-                                    rebuild_needed = true;
-                                }
+                            if restored_level != current_level {
+                                current_level = restored_level;
+                                current_thinking = None;
+                                rebuild_needed = true;
                             }
                             if rebuild_needed {
                                 agent = build_agent(
@@ -2462,7 +2847,8 @@ fn build_agent(
 /// from the model's own tool set also disables the host command rather than leaving a side door open
 /// around an operator's explicit restriction.
 fn build_tools(cfg: &ServeConfig) -> agent_core::ToolRegistry {
-    let mut registry = tools::default_registry_with(cfg.bash_timeout_ms);
+    let mut registry =
+        tools::default_registry_with(cfg.bash_timeout_ms, cfg.bash_shell_path.as_deref());
     tools::apply_filter(
         &mut registry,
         cfg.tools.as_deref(),
@@ -2557,7 +2943,11 @@ fn runtime_settings(
         "thinking_level": current_level.as_str(),
         "auto_compaction": current_auto_compaction,
         "auto_retry": current_auto_retry,
-        "queue_mode": match steering.mode() {
+        "steering_mode": match steering.steering_mode() {
+            agent_core::QueueMode::OneAtATime => "one_at_a_time",
+            agent_core::QueueMode::All => "all",
+        },
+        "follow_up_mode": match steering.follow_up_mode() {
             agent_core::QueueMode::OneAtATime => "one_at_a_time",
             agent_core::QueueMode::All => "all",
         },
@@ -2667,22 +3057,6 @@ fn list_progress_frame(id: Option<String>, command: &str, scanned: usize, total:
     Value::Object(m)
 }
 
-/// Ceiling on automatic whole-run retries after a `prompt` ends in a transient-looking error (see the
-/// `"prompt"` arm's retry loop) — pi's own default (`agent-session.ts`'s `maxRetries`).
-const MAX_RUN_RETRIES: u32 = 3;
-const RUN_RETRY_BASE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
-const RUN_RETRY_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Exponential backoff for a whole-run retry: `RUN_RETRY_BASE_BACKOFF · 2^(attempt-1)`, capped at
-/// `RUN_RETRY_MAX_BACKOFF`. `attempt` is 1-based. Coarser than `agent_core`'s own
-/// `mid_stream_backoff` (250ms base/5s cap) — this gates a whole extra model turn's worth of retry,
-/// not a resumed stream, so pi's slower 2/4/8s cadence is the better fit.
-fn run_retry_backoff(attempt: u32) -> std::time::Duration {
-    RUN_RETRY_BASE_BACKOFF
-        .saturating_mul(1u32 << attempt.saturating_sub(1).min(16))
-        .min(RUN_RETRY_MAX_BACKOFF)
-}
-
 /// Build an `auto_retry` frame — an unsolicited notice that a `prompt`'s run failed with what looks
 /// like a transient error and is about to be automatically retried, correlated to the eventual
 /// `response` frame via the same request `id`. Sent once per attempt, immediately before the backoff
@@ -2704,6 +3078,32 @@ fn auto_retry_frame(
     m.insert("max_attempts".into(), json!(max_attempts));
     m.insert("delay_ms".into(), json!(delay_ms));
     m.insert("error".into(), json!(error));
+    Value::Object(m)
+}
+
+/// Build an `auto_retry_end` frame — the terminal notice for a whole-run retry sequence that made at
+/// least one attempt: either a later attempt succeeded (`success: true`), or the sequence gave up
+/// (`success: false`, `final_error` set) — including the backoff itself being interrupted by
+/// `abort`/`abort_retry` (`final_error: "retry cancelled"`). Mirrors pi's own `auto_retry_end` event.
+/// Never sent when no retry ever started (a first-attempt success, or a failure that was never
+/// retryable in the first place, needs no "the retries ended" notice — nothing began to end).
+fn auto_retry_end_frame(
+    id: Option<String>,
+    success: bool,
+    attempt: u32,
+    final_error: Option<&str>,
+) -> Value {
+    let mut m = Map::new();
+    m.insert("type".into(), json!("auto_retry_end"));
+    if let Some(id) = id {
+        m.insert("id".into(), json!(id));
+    }
+    m.insert("command".into(), json!("prompt"));
+    m.insert("success".into(), json!(success));
+    m.insert("attempt".into(), json!(attempt));
+    if let Some(err) = final_error {
+        m.insert("final_error".into(), json!(err));
+    }
     Value::Object(m)
 }
 

@@ -20,11 +20,13 @@
 //! results are durably committed — so it never leaves an orphaned `tool_use` behind. It's a flag, not a
 //! queue: a second request before the first is observed is indistinguishable from one.
 //!
-//! A fourth setting — [`QueueMode`] — governs how much of a lane a single drain point consumes: `All`
-//! (the historical behavior here) folds everything queued into one injection; `OneAtATime` (pi's
-//! `PendingMessageQueue` default) takes only the oldest message, leaving the rest queued for the *next*
-//! drain point, so several quick messages from a client land as separate turns instead of one merged
-//! one.
+//! A fourth and fifth setting — [`QueueMode`], one per lane — govern how much of that lane a single
+//! drain point consumes: `All` (the historical behavior here) folds everything queued into one
+//! injection; `OneAtATime` (pi's `PendingMessageQueue` default) takes only the oldest message, leaving
+//! the rest queued for the *next* drain point, so several quick messages from a client land as separate
+//! turns instead of one merged one. The steer and follow-up lanes carry **independent** `QueueMode`
+//! settings (matching pi's own separate `steeringMode`/`followUpMode`) — a client may want, say, every
+//! mid-run redirect folded together while follow-ups still land one at a time, or vice versa.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,9 +57,12 @@ pub struct Steering {
     follow_up: Queue,
     /// Set by [`request_stop`](Self::request_stop); consumed by the loop at the next turn boundary.
     stop_requested: Arc<AtomicBool>,
-    /// How much of a lane a single drain consumes — see [`QueueMode`]. A setting, not per-run state:
-    /// `clear()` deliberately leaves it untouched.
-    mode: Arc<Mutex<QueueMode>>,
+    /// How much of the steer lane [`drain_steer`](Self::drain_steer) consumes per call — see
+    /// [`QueueMode`]. A setting, not per-run state: `clear()` deliberately leaves it untouched.
+    steer_mode: Arc<Mutex<QueueMode>>,
+    /// How much of the follow-up (plus any stranded steer) lane [`drain_at_stop`](Self::drain_at_stop)
+    /// consumes per call — independent of `steer_mode`, matching pi's separate `followUpMode`.
+    follow_up_mode: Arc<Mutex<QueueMode>>,
 }
 
 impl Steering {
@@ -87,21 +92,35 @@ impl Steering {
         lock(&self.steer).len() + lock(&self.follow_up).len()
     }
 
-    /// Set how much of a lane a single drain consumes (see [`QueueMode`]). Takes effect on the next
-    /// drain — a call already past its `drain_steer`/`drain_at_stop` this turn is unaffected.
-    pub fn set_mode(&self, mode: QueueMode) {
-        *lock_mode(&self.mode) = mode;
+    /// Set how much of the steer lane a single [`drain_steer`](Self::drain_steer) consumes (see
+    /// [`QueueMode`]). Takes effect on the next drain — a call already past its `drain_steer` this turn
+    /// is unaffected. Independent of [`set_follow_up_mode`](Self::set_follow_up_mode).
+    pub fn set_steering_mode(&self, mode: QueueMode) {
+        *lock_mode(&self.steer_mode) = mode;
     }
 
-    /// The current [`QueueMode`] (`OneAtATime` by default, matching pi).
-    pub fn mode(&self) -> QueueMode {
-        *lock_mode(&self.mode)
+    /// The current steer-lane [`QueueMode`] (`OneAtATime` by default, matching pi).
+    pub fn steering_mode(&self) -> QueueMode {
+        *lock_mode(&self.steer_mode)
+    }
+
+    /// Set how much of the follow-up (plus stranded-steer) lane a single
+    /// [`drain_at_stop`](Self::drain_at_stop) consumes (see [`QueueMode`]). Independent of
+    /// [`set_steering_mode`](Self::set_steering_mode).
+    pub fn set_follow_up_mode(&self, mode: QueueMode) {
+        *lock_mode(&self.follow_up_mode) = mode;
+    }
+
+    /// The current follow-up-lane [`QueueMode`] (`OneAtATime` by default, matching pi).
+    pub fn follow_up_mode(&self) -> QueueMode {
+        *lock_mode(&self.follow_up_mode)
     }
 
     /// Take the queued mid-run steer messages: everything in `All` mode, or just the oldest in
-    /// `OneAtATime` mode — the rest stays queued for the next mid-run injection point.
+    /// `OneAtATime` mode — the rest stays queued for the next mid-run injection point. Governed by
+    /// [`steering_mode`](Self::steering_mode).
     pub(crate) fn drain_steer(&self) -> Vec<String> {
-        match self.mode() {
+        match self.steering_mode() {
             QueueMode::All => lock(&self.steer).drain(..).collect(),
             QueueMode::OneAtATime => lock(&self.steer).pop_front().into_iter().collect(),
         }
@@ -109,11 +128,14 @@ impl Steering {
 
     /// Take what's queued for a stop boundary: the follow-up lane, plus any steer messages that were
     /// queued but never reached a mid-run injection point (e.g. a turn with no tool calls), so nothing
-    /// is stranded. In `All` mode that's everything in both lanes; in `OneAtATime` mode it's just the
-    /// single oldest message — the follow-up lane first (the primary one for a stop boundary), falling
-    /// back to a stranded steer message only if it's empty, the same priority `All` merges in.
+    /// is stranded. Governed by [`follow_up_mode`](Self::follow_up_mode) — "how much to inject when the
+    /// agent is about to stop" is one decision, whether the pending work originated in the follow-up
+    /// lane or was left over in the steer lane. In `All` mode that's everything in both lanes; in
+    /// `OneAtATime` mode it's just the single oldest message — the follow-up lane first (the primary one
+    /// for a stop boundary), falling back to a stranded steer message only if it's empty, the same
+    /// priority `All` merges in.
     pub(crate) fn drain_at_stop(&self) -> Vec<String> {
-        match self.mode() {
+        match self.follow_up_mode() {
             QueueMode::All => {
                 let mut out: Vec<String> = lock(&self.follow_up).drain(..).collect();
                 out.extend(lock(&self.steer).drain(..));
@@ -199,9 +221,10 @@ mod tests {
     #[test]
     fn drain_at_stop_sweeps_stranded_steer_messages() {
         // A steer queued on a turn that never ran tools must still be injected at the stop boundary —
-        // in `All` mode, in one combined drain.
+        // in `All` mode, in one combined drain. Governed by `follow_up_mode`, not `steering_mode` —
+        // "how much to inject at a stop boundary" is one decision regardless of which lane it came from.
         let s = Steering::new();
-        s.set_mode(QueueMode::All);
+        s.set_follow_up_mode(QueueMode::All);
         s.push_steer("stranded");
         s.push("follow");
         assert_eq!(
@@ -213,13 +236,14 @@ mod tests {
     #[test]
     fn default_mode_is_one_at_a_time_matching_pi() {
         let s = Steering::new();
-        assert_eq!(s.mode(), QueueMode::OneAtATime);
+        assert_eq!(s.steering_mode(), QueueMode::OneAtATime);
+        assert_eq!(s.follow_up_mode(), QueueMode::OneAtATime);
     }
 
     #[test]
     fn one_at_a_time_mode_drains_a_single_message_per_call_leaving_the_rest_queued() {
         let s = Steering::new();
-        assert_eq!(s.mode(), QueueMode::OneAtATime, "default");
+        assert_eq!(s.follow_up_mode(), QueueMode::OneAtATime, "default");
         s.push("first");
         s.push("second");
         s.push("third");
@@ -263,11 +287,58 @@ mod tests {
     fn set_mode_takes_effect_immediately_and_is_shared_across_clones() {
         let a = Steering::new();
         let b = a.clone();
-        a.set_mode(QueueMode::All);
-        assert_eq!(b.mode(), QueueMode::All, "mode is shared, like the queues");
+        a.set_follow_up_mode(QueueMode::All);
+        assert_eq!(
+            b.follow_up_mode(),
+            QueueMode::All,
+            "mode is shared, like the queues"
+        );
         b.push("x");
         b.push("y");
         assert_eq!(a.drain_at_stop(), vec!["x".to_string(), "y".to_string()]);
+    }
+
+    #[test]
+    fn steering_mode_and_follow_up_mode_are_independent() {
+        // The whole point of the split: a client can fold every mid-run redirect together while
+        // follow-ups still land one at a time, or vice versa — setting one must not touch the other.
+        let s = Steering::new();
+        s.set_steering_mode(QueueMode::All);
+        assert_eq!(s.steering_mode(), QueueMode::All);
+        assert_eq!(
+            s.follow_up_mode(),
+            QueueMode::OneAtATime,
+            "follow-up mode must be untouched by a steering-mode change"
+        );
+
+        s.set_follow_up_mode(QueueMode::All);
+        s.set_steering_mode(QueueMode::OneAtATime);
+        assert_eq!(
+            s.steering_mode(),
+            QueueMode::OneAtATime,
+            "steering mode must be untouched by a follow-up-mode change"
+        );
+        assert_eq!(s.follow_up_mode(), QueueMode::All);
+
+        s.push_steer("a");
+        s.push_steer("b");
+        assert_eq!(
+            s.drain_steer(),
+            vec!["a".to_string()],
+            "steer lane still drains one-at-a-time"
+        );
+        assert_eq!(
+            s.drain_steer(),
+            vec!["b".to_string()],
+            "draining the leftover steer message too, so it can't strand into the next assertion"
+        );
+        s.push("x");
+        s.push("y");
+        assert_eq!(
+            s.drain_at_stop(),
+            vec!["x".to_string(), "y".to_string()],
+            "follow-up lane still drains everything at once"
+        );
     }
 
     #[test]

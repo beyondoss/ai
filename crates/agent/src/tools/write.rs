@@ -30,7 +30,8 @@ impl Tool for Write {
         input
             .get("path")
             .and_then(Value::as_str)
-            .map(super::canonical_write_target)
+            .map(super::normalize_path)
+            .map(|p| super::canonical_write_target(&p))
     }
 
     async fn run(&self, input: Value) -> Result<ToolOutput, ToolError> {
@@ -38,6 +39,7 @@ impl Tool for Write {
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing `path`".into()))?;
+        let path = &super::normalize_path(path);
         let content = input
             .get("content")
             .and_then(Value::as_str)
@@ -73,6 +75,37 @@ mod tests {
             .text;
         assert!(out.contains("5 bytes"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
+    }
+
+    #[tokio::test]
+    async fn run_normalizes_the_path_argument() {
+        // Proves `run` actually calls `super::normalize_path` (not just that the shared function
+        // itself works — see `tools::tests` for that) via its `@`-prefix-strip behavior, which needs
+        // no `$HOME` mutation to exercise safely in a parallel test run.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        let at_prefixed = format!("@{}", path.to_str().unwrap());
+        Write
+            .run(json!({ "path": at_prefixed, "content": "hello" }))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
+    }
+
+    #[tokio::test]
+    async fn write_target_normalizes_the_path_argument_too() {
+        // `write_target` computes the same-turn concurrency-grouping key from a *different* code path
+        // than `run` — both must normalize identically, or `write("~/f")` and `edit("~/f")` in the same
+        // turn would get different canonical keys and lose the write-race protection between them.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        std::fs::write(&path, "x").unwrap();
+        let at_prefixed = format!("@{}", path.to_str().unwrap());
+        let plain = Write
+            .write_target(&json!({ "path": path.to_str().unwrap() }))
+            .unwrap();
+        let normalized = Write.write_target(&json!({ "path": at_prefixed })).unwrap();
+        assert_eq!(plain, normalized);
     }
 
     #[tokio::test]

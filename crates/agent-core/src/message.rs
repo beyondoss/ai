@@ -264,6 +264,17 @@ pub enum StreamEvent {
     ToolUseStart { id: String, name: String },
     /// A chunk of the in-progress tool call's JSON arguments.
     InputJsonDelta { partial_json: String },
+    /// The provider's own authoritative, complete tool-call arguments for the currently-open block,
+    /// *replacing* (not appending to) whatever `InputJsonDelta` fragments accumulated so far. Some
+    /// wire shapes (currently only OpenAI Responses' `function_call_arguments.done` and
+    /// `output_item.done`'s `item.arguments`) supply this as a resync point, so a single dropped or
+    /// duplicated mid-stream delta — a relay hiccup with no transport-level error, nothing else would
+    /// ever catch — can't silently leave the final call corrupted.
+    InputJsonFinal { full_json: String },
+    /// The provider's own authoritative, complete text for the currently-open block, replacing
+    /// whatever `TextDelta` fragments accumulated so far. Same resync purpose as `InputJsonFinal`, for
+    /// a text/refusal item.
+    TextFinal { text: String },
     /// The current content block finished (text or tool-call).
     ContentBlockStop,
     /// Token accounting. May arrive at end-of-stream (OpenAI) or alongside other events (Anthropic).

@@ -435,8 +435,14 @@ impl Agent {
             // Proactive compaction: once the live prompt crosses the threshold, summarize the prefix
             // before building the next request so the run never walks into the context wall.
             if self.compaction.enabled && compaction::should_compact(session, &self.compaction) {
-                self.compact(session, CompactionReason::Threshold, &cancel, &mut sink)
-                    .await?;
+                self.compact(
+                    session,
+                    CompactionReason::Threshold,
+                    &cancel,
+                    &mut sink,
+                    None,
+                )
+                .await?;
             } else if !self.compaction.enabled
                 && compaction::is_hard_overflow(
                     session,
@@ -451,8 +457,14 @@ impl Agent {
                 // requests that are already guaranteed to overflow. See `is_hard_overflow`'s doc
                 // comment for why this bypasses the `enabled` gate but the threshold check above
                 // doesn't.
-                self.compact(session, CompactionReason::Overflow, &cancel, &mut sink)
-                    .await?;
+                self.compact(
+                    session,
+                    CompactionReason::Overflow,
+                    &cancel,
+                    &mut sink,
+                    None,
+                )
+                .await?;
             }
 
             sink(AgentEvent::TurnStart {
@@ -493,7 +505,13 @@ impl Agent {
                 // retry the same turn; if it still overflows (or there's nothing to compact), give up.
                 Err(e) if is_context_overflow(&e) && !overflow_recovered => {
                     if self
-                        .compact(session, CompactionReason::Overflow, &cancel, &mut sink)
+                        .compact(
+                            session,
+                            CompactionReason::Overflow,
+                            &cancel,
+                            &mut sink,
+                            None,
+                        )
                         .await?
                     {
                         overflow_recovered = true;
@@ -937,12 +955,18 @@ impl Agent {
     /// [`CompactionProvenance`]), and emits an [`AgentEvent::Compacted`]. Returns `false` (a no-op)
     /// when there's no worthwhile prefix to summarize or the model returns an empty summary. Exposed
     /// so a headless server can offer a manual `compact` command (pass [`CompactionReason::Manual`]).
+    ///
+    /// `custom_instructions`, when given, steers *what* the summary emphasizes (see
+    /// [`compaction::summary_request`]'s doc comment) — a manual compaction's client-supplied focus.
+    /// An automatic trigger ([`CompactionReason::Threshold`]/[`CompactionReason::Overflow`]) has no
+    /// client in the loop to ask, so it always passes `None`.
     pub async fn compact(
         &self,
         session: &mut Session,
         reason: CompactionReason,
         cancel: &CancellationToken,
         sink: &mut dyn FnMut(AgentEvent),
+        custom_instructions: Option<&str>,
     ) -> Result<bool> {
         let Some(cut) =
             compaction::find_split_cut(&session.messages, self.compaction.keep_recent_tokens)
@@ -963,6 +987,7 @@ impl Agent {
                     &prefix,
                     self.compaction.summary_max_tokens,
                     &file_ops,
+                    custom_instructions,
                 );
                 turn_text(&self.run_turn(req, &mut |_| {}, cancel).await?)
             }
@@ -1001,15 +1026,21 @@ impl Agent {
                         &session.messages[..turn_start],
                         self.compaction.summary_max_tokens,
                         &file_ops,
+                        custom_instructions,
                     );
                     Ok::<_, Error>(turn_text(&self.run_turn(req, &mut |_| {}, cancel).await?))
                 };
+                // Unlike `history` above, the turn-prefix call never takes `custom_instructions` — it
+                // summarizes the SPLIT_TURN_INSTRUCTION template's "context for the retained suffix,"
+                // not the closed-off conversation `custom_instructions` is meant to steer. Matches pi's
+                // `generateTurnPrefixSummary`, whose signature doesn't accept custom instructions at all.
                 let turn_prefix = async {
                     let req = compaction::summary_request(
                         &self.model,
                         &session.messages[turn_start..first_kept],
                         turn_prefix_max_tokens,
                         &file_ops,
+                        None,
                     );
                     Ok::<_, Error>(turn_text(&self.run_turn(req, &mut |_| {}, cancel).await?))
                 };
@@ -1222,7 +1253,12 @@ const OVERFLOW_PATTERNS: &[&str] = &[
 
 /// Whether a transport error is the provider rejecting the request for exceeding its context window —
 /// the signal to compact and retry. Matched on the error text (the wire shape varies by provider).
-fn is_context_overflow(e: &Error) -> bool {
+///
+/// `pub` (not just internal): a whole-run retry classifier one layer up (`crates/agent::retry`) needs
+/// the same exclusion `is_retryable_mid_stream` already applies — an overflow error retried blindly
+/// (without compacting first) just fails identically again, wasting a whole-run retry attempt for no
+/// benefit.
+pub fn is_context_overflow(e: &Error) -> bool {
     let Error::Transport(msg) = e else {
         return false;
     };
@@ -1327,8 +1363,8 @@ fn mid_stream_backoff(attempt: u32) -> Duration {
 /// from pi's `repairJson` (`packages/ai/src/utils/json-parse.ts`) — a single pass that only touches
 /// bytes *inside* a string literal, so well-formed structural JSON (braces, commas, already-valid
 /// escapes) passes through unchanged. Not a full JSON5-style parser: it can't repair a buffer that's
-/// merely incomplete (cut off mid-stream with an unclosed brace) — that class still falls through to
-/// [`Accumulator::flush_block`]'s existing malformed-call recovery.
+/// merely incomplete (cut off mid-stream with an unclosed brace) — that class falls through to
+/// [`close_incomplete_json`] instead, tried next in [`Accumulator::flush_block`]'s fallback chain.
 fn repair_json(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut in_string = false;
@@ -1369,6 +1405,73 @@ fn repair_json(s: &str) -> String {
         }
     }
     out
+}
+
+/// Best-effort recovery for tool-call JSON that's genuinely *incomplete* — cut off mid-stream by an
+/// output-token ceiling, not merely mis-escaped (`repair_json`'s job, tried first in
+/// [`Accumulator::flush_block`]'s fallback chain). Closes whatever string literal and structural
+/// containers (`{`/`[`) were still open when the buffer ended, so a large `write`/`edit` call whose
+/// argument value got cut off mid-string (the common real case — the value being streamed, e.g. file
+/// content, is typically the longest and thus likeliest field to still be open when a `max_tokens`
+/// ceiling hits) recovers a partial object instead of being discarded to `{}` entirely. Ported in
+/// spirit from pi's fallback to the `partial-json` library (`json-parse.ts`), hand-rolled here rather
+/// than pulling in a dependency for it.
+///
+/// Not a full JSON5-style parser: doesn't attempt to complete a truncated literal (a bare `tru`, a
+/// lone `-`) or synthesize a value for a key truncated before its `:value` ever started — those
+/// remain invalid JSON and fall through to [`Accumulator::flush_block`]'s existing malformed-call
+/// recovery unchanged, exactly as they did before this function existed. Returns `None` when there's
+/// nothing to close (a balanced string that simply failed to parse for some other reason — this
+/// function isn't the right tool for that, and returning the input unchanged would just loop the
+/// caller back to the same failure).
+fn close_incomplete_json(s: &str) -> Option<String> {
+    let mut stack: Vec<char> = Vec::new();
+    let mut in_string = false;
+    let mut escape = false;
+    for c in s.chars() {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '{' | '[' => stack.push(c),
+            '}' if stack.last() == Some(&'{') => {
+                stack.pop();
+            }
+            ']' if stack.last() == Some(&'[') => {
+                stack.pop();
+            }
+            _ => {}
+        }
+    }
+    if !in_string && stack.is_empty() {
+        return None; // nothing unclosed — not this function's failure mode to fix
+    }
+    let mut out = s.to_string();
+    if in_string {
+        out.push('"');
+    }
+    // A dangling trailing comma or colon (cut off between a completed element/key and whatever would
+    // have followed it) never parses even once containers below it close — trimming it back to the
+    // last complete element is cheap and safe: if it doesn't help, the result is no more or less
+    // parseable than leaving it in.
+    let trimmed_len = out.trim_end().len();
+    if let Some(last) = out[..trimmed_len].chars().next_back() {
+        if last == ',' || last == ':' {
+            out.truncate(trimmed_len - last.len_utf8());
+        }
+    }
+    while let Some(open) = stack.pop() {
+        out.push(if open == '{' { '}' } else { ']' });
+    }
+    Some(out)
 }
 
 /// The assembled result of one model turn.
@@ -1436,6 +1539,12 @@ impl Accumulator {
                     buf.push_str(partial_json);
                 }
             }
+            StreamEvent::InputJsonFinal { full_json } => {
+                if let Some((_, _, buf)) = &mut self.tool {
+                    buf.clone_from(full_json);
+                }
+            }
+            StreamEvent::TextFinal { text } => self.text.clone_from(text),
             StreamEvent::ContentBlockStop => self.flush_block(),
             StreamEvent::Usage(usage) => self.usage = *usage,
             StreamEvent::MessageStop { stop_reason } => self.stop_reason = *stop_reason,
@@ -1457,14 +1566,19 @@ impl Accumulator {
             let input = if args.trim().is_empty() {
                 json!({})
             } else {
-                match serde_json::from_str(&args)
+                let parsed = serde_json::from_str(&args)
                     .or_else(|_| serde_json::from_str(&repair_json(&args)))
-                {
+                    .or_else(|e| match close_incomplete_json(&args) {
+                        Some(closed) => serde_json::from_str(&closed),
+                        None => Err(e),
+                    });
+                match parsed {
                     Ok(v) => v,
-                    // Still doesn't parse even after the repair pass — a genuine protocol glitch, not
-                    // a tool failure. Keep the tool_use block (with an empty, wire-valid input object
-                    // so the next request doesn't 400) and record the call as malformed; the loop
-                    // feeds back an error result the model can correct, instead of aborting the run.
+                    // Still doesn't parse even after both repair passes — a genuine protocol glitch,
+                    // not a tool failure. Keep the tool_use block (with an empty, wire-valid input
+                    // object so the next request doesn't 400) and record the call as malformed; the
+                    // loop feeds back an error result the model can correct, instead of aborting the
+                    // run.
                     Err(_) => {
                         self.malformed.push((id.clone(), args));
                         json!({})
@@ -2750,6 +2864,55 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_tool_call_truncated_mid_value_string_recovers_a_partial_object_not_an_empty_one() {
+        // Unlike `malformed_tool_args_become_recoverable_error_result` above (truncated right after a
+        // key, before any value — genuinely unrecoverable), this stream is cut off mid-*value*, the
+        // shape `close_incomplete_json` exists to fix: the tool must see the actual partial content
+        // it received, not an empty `{}` with the call flagged as malformed.
+        let truncated_turn = vec![
+            StreamEvent::MessageStart,
+            StreamEvent::ToolUseStart {
+                id: "tu_1".into(),
+                name: "echo".into(),
+            },
+            StreamEvent::InputJsonDelta {
+                // `text` matches `EchoTool`'s own required field, so a successful recovery both
+                // produces a valid `tool_use` input *and* lets the tool actually run and echo it back
+                // — not merely parse, but genuinely usable end to end.
+                partial_json: r#"{"text":"hello wor"#.into(),
+            },
+            StreamEvent::ContentBlockStop,
+            StreamEvent::MessageStop {
+                stop_reason: StopReason::ToolUse,
+            },
+        ];
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        let (agent, _mock) = agent_with(vec![truncated_turn, turn::text("done")], tools);
+        let mut session = Session::new();
+        session.user("go");
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        match &session.messages[1].content[0] {
+            ContentBlock::ToolUse { input, .. } => {
+                assert_eq!(input["text"], "hello wor", "got: {input:?}");
+            }
+            other => panic!("expected a tool_use block, got {other:?}"),
+        }
+        // Not flagged as malformed, and the tool actually ran on the recovered partial value — a real
+        // echoed result, not an error placeholder.
+        match &session.messages[2].content[0] {
+            ContentBlock::ToolResult {
+                is_error, content, ..
+            } => {
+                assert!(!is_error, "recovered call must not be treated as malformed");
+                assert_eq!(content, "hello wor");
+            }
+            other => panic!("expected a tool_result block, got {other:?}"),
+        }
+    }
+
     #[test]
     fn repair_json_escapes_a_raw_control_character_inside_a_string() {
         // A large `write`/`edit` argument streamed with a literal newline byte instead of `\n` — the
@@ -2794,6 +2957,56 @@ mod tests {
         // string literal are ever rewritten.
         let raw = "{\n  \"a\": 1,\n  \"b\": 2\n}";
         assert_eq!(repair_json(raw), raw);
+    }
+
+    #[test]
+    fn close_incomplete_json_recovers_a_value_string_truncated_mid_stream() {
+        // The concrete motivating case: a long write/edit argument value cut off by an output-token
+        // ceiling, not a transport error — no ContentBlockStop/ToolUseStart malformed shape, just the
+        // buffer ending mid-string.
+        let truncated = r#"{"path":"foo.txt","content":"hello wor"#;
+        let closed = close_incomplete_json(truncated).expect("must find something to close");
+        let v: Value = serde_json::from_str(&closed).expect("result must be valid JSON");
+        assert_eq!(v["path"], "foo.txt");
+        assert_eq!(v["content"], "hello wor");
+    }
+
+    #[test]
+    fn close_incomplete_json_closes_nested_containers_in_the_correct_order() {
+        let truncated = r#"{"edits":[{"old_string":"a","new_string":"b"},{"old_string":"c"#;
+        let closed = close_incomplete_json(truncated).expect("must find something to close");
+        let v: Value = serde_json::from_str(&closed).expect("result must be valid JSON");
+        assert_eq!(v["edits"][0]["new_string"], "b");
+        assert_eq!(v["edits"][1]["old_string"], "c");
+    }
+
+    #[test]
+    fn close_incomplete_json_trims_a_dangling_trailing_comma() {
+        // Cut off right after a completed element, before the next one started — the trailing comma
+        // alone (even once containers close) is otherwise still invalid JSON.
+        let truncated = r#"{"a":1,"#;
+        let closed = close_incomplete_json(truncated).expect("must find something to close");
+        let v: Value = serde_json::from_str(&closed).expect("result must be valid JSON");
+        assert_eq!(v["a"], 1);
+    }
+
+    #[test]
+    fn close_incomplete_json_returns_none_for_already_balanced_input() {
+        // Not this function's failure mode — nothing structural is open, so there's nothing to close.
+        assert_eq!(close_incomplete_json(r#"{"a":1}"#), None);
+    }
+
+    #[test]
+    fn close_incomplete_json_leaves_a_key_truncated_before_its_value_unparseable() {
+        // Deliberately out of scope (see the function's own doc comment): a key cut off before its
+        // `:value` ever started can't be recovered without guessing at a value — the result must
+        // still fail to parse, matching pre-existing malformed-call behavior, not silently invent one.
+        let truncated = r#"{"text":"#;
+        let closed = close_incomplete_json(truncated).unwrap();
+        assert!(
+            serde_json::from_str::<Value>(&closed).is_err(),
+            "must not fabricate a value for a truncated key: {closed:?}"
+        );
     }
 
     #[tokio::test]
@@ -3153,7 +3366,13 @@ mod tests {
         });
         let cancel = CancellationToken::new();
         let compacted = agent
-            .compact(&mut session, CompactionReason::Manual, &cancel, &mut |_| {})
+            .compact(
+                &mut session,
+                CompactionReason::Manual,
+                &cancel,
+                &mut |_| {},
+                None,
+            )
             .await
             .unwrap();
 
@@ -3243,7 +3462,13 @@ mod tests {
             });
         let cancel = CancellationToken::new();
         agent
-            .compact(&mut session, CompactionReason::Manual, &cancel, &mut |_| {})
+            .compact(
+                &mut session,
+                CompactionReason::Manual,
+                &cancel,
+                &mut |_| {},
+                None,
+            )
             .await
             .unwrap();
 
@@ -3291,7 +3516,13 @@ mod tests {
         });
         let cancel = CancellationToken::new();
         agent
-            .compact(&mut session, CompactionReason::Manual, &cancel, &mut |_| {})
+            .compact(
+                &mut session,
+                CompactionReason::Manual,
+                &cancel,
+                &mut |_| {},
+                None,
+            )
             .await
             .unwrap();
 
@@ -3347,7 +3578,13 @@ mod tests {
         });
         let cancel = CancellationToken::new();
         let compacted = agent
-            .compact(&mut session, CompactionReason::Manual, &cancel, &mut |_| {})
+            .compact(
+                &mut session,
+                CompactionReason::Manual,
+                &cancel,
+                &mut |_| {},
+                None,
+            )
             .await
             .unwrap();
 

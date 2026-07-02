@@ -63,6 +63,20 @@ fn turn_text(text: &str) -> String {
     sse(&events)
 }
 
+/// Build an Anthropic SSE turn that ends with `stop_reason: "refusal"` — a distinct terminal
+/// condition from a normal end-of-turn (see `agent_core::message::StopReason::Refusal`).
+fn turn_refusal(text: &str) -> String {
+    let events = [
+        json!({ "type": "message_start", "message": { "usage": { "input_tokens": 12, "output_tokens": 1 } } }),
+        json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }),
+        json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": text } }),
+        json!({ "type": "content_block_stop", "index": 0 }),
+        json!({ "type": "message_delta", "delta": { "stop_reason": "refusal" }, "usage": { "output_tokens": 6 } }),
+        json!({ "type": "message_stop" }),
+    ];
+    sse(&events)
+}
+
 fn sse(events: &[serde_json::Value]) -> String {
     events.iter().map(|e| format!("data: {e}\n\n")).collect()
 }
@@ -195,6 +209,102 @@ fn run_binary_performs_tool_round_trip() {
 }
 
 #[test]
+fn run_binary_exits_nonzero_on_a_refusal_in_text_mode() {
+    // Track L18: a refusal in text mode previously still exited 0, indistinguishable from a normal
+    // completion — a script/CI caller has no other signal to key off of in that mode.
+    let (base, _bodies) = spawn_model_server(vec![turn_refusal("I can't help with that.")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "do something the model refuses",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        !output.status.success(),
+        "a refusal in text mode must exit non-zero.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn run_binary_a_normal_completion_in_text_mode_still_exits_zero() {
+    // The exit-code check must not misfire on an ordinary end-of-turn — only an actual refusal.
+    let (base, _bodies) = spawn_model_server(vec![turn_text("all done")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "hi",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn run_binary_refusal_exit_code_check_is_scoped_to_text_mode() {
+    // `--json` mode already carries `stop_reason` on every `TurnEnd` event in its own output stream —
+    // a caller there is expected to inspect it programmatically, not rely on the process exit code.
+    let (base, _bodies) = spawn_model_server(vec![turn_refusal("I can't help with that.")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "do something the model refuses",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--json",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "--json mode must not apply the text-mode-only refusal exit code.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"refusal\"") || stdout.contains("refusal"),
+        "the refusal must still be observable in the JSON event stream itself: {stdout}"
+    );
+}
+
+#[test]
 fn run_binary_json_mode_streams_structured_agent_events_not_text() {
     // `--json` must emit a leading session header, then one `AgentEvent` object per line — the full
     // observation surface (tool_start/tool_end included, not just raw text deltas) — instead of the
@@ -283,6 +393,49 @@ fn run_binary_json_mode_streams_structured_agent_events_not_text() {
     assert!(
         carries_final_text,
         "final assistant text must appear in a stream/text_delta event: {stdout}"
+    );
+}
+
+#[test]
+fn run_binary_session_id_flag_gives_a_deterministic_id_for_an_ephemeral_run() {
+    // Track L6: `--session-id` (matching pi's own flag) lets a script/test harness pick a known,
+    // predictable id instead of parsing a randomly-generated one back out of the run's own output —
+    // for a plain ephemeral run (no `--session`/`--continue`), the case that previously had no way to
+    // override the id at all.
+    let dir = tempfile::tempdir().unwrap();
+    let (base, _bodies) = spawn_model_server(vec![turn_text("ok")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "hi",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--session-id",
+            "deterministic-test-id-42",
+            "--json",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let header: Value = serde_json::from_str(stdout.lines().next().unwrap()).unwrap();
+    assert_eq!(header["kind"], "session");
+    assert_eq!(
+        header["id"], "deterministic-test-id-42",
+        "the ephemeral run must report exactly the requested id, not a generated one: {header:#?}"
     );
 }
 
@@ -736,6 +889,112 @@ fn run_binary_expands_a_prompt_template_in_the_first_message() {
 }
 
 #[test]
+fn run_binary_no_skills_leaves_a_skill_invocation_unexpanded() {
+    // Same fixture as `run_binary_expands_a_skill_invocation_in_the_first_message`, but with
+    // `--no-skills` — the skill must not be discovered at all, so `/skill:greet` reaches the model
+    // as a literal, unexpanded string instead of the skill's body.
+    let dir = tempfile::tempdir().unwrap();
+    let skill_dir = dir.path().join(".claude/skills/greet");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: greet\ndescription: a test skill\n---\nSKILL-BODY-MARKER-123",
+    )
+    .unwrap();
+    let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "/skill:greet",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--trust-project",
+            "--no-skills",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        !bodies[0].contains("SKILL-BODY-MARKER-123"),
+        "--no-skills must prevent the skill from being discovered/expanded at all: {}",
+        bodies[0]
+    );
+    assert!(
+        bodies[0].contains("/skill:greet"),
+        "the raw invocation must reach the model unexpanded: {}",
+        bodies[0]
+    );
+}
+
+#[test]
+fn run_binary_no_prompt_templates_leaves_a_template_invocation_unexpanded() {
+    // Same fixture as `run_binary_expands_a_prompt_template_in_the_first_message`, but with
+    // `--no-prompt-templates` — the template must not be discovered at all, so `/fix foo.rs` reaches
+    // the model as a literal, unexpanded string instead of the template's body.
+    let dir = tempfile::tempdir().unwrap();
+    let prompt_dir = dir.path().join(".claude/prompts");
+    std::fs::create_dir_all(&prompt_dir).unwrap();
+    std::fs::write(
+        prompt_dir.join("fix.md"),
+        "Fix the bug in $1 — TEMPLATE-BODY-MARKER-456",
+    )
+    .unwrap();
+    let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "/fix foo.rs",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--trust-project",
+            "--no-prompt-templates",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        !bodies[0].contains("TEMPLATE-BODY-MARKER-456"),
+        "--no-prompt-templates must prevent the template from being discovered/expanded at all: {}",
+        bodies[0]
+    );
+    assert!(
+        bodies[0].contains("/fix foo.rs"),
+        "the raw invocation must reach the model unexpanded: {}",
+        bodies[0]
+    );
+}
+
+#[test]
 fn run_binary_list_models_prints_known_model_ids_with_no_gateway_or_key() {
     // A pure informational query — no `--gateway-url`/`--key` needed, matching `tools`'s own shape.
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
@@ -818,6 +1077,48 @@ fn run_binary_session_flag_persists_and_resumes_across_invocations() {
     );
     assert!(bodies2[0].contains("first answer"));
     assert!(bodies2[0].contains("what was the marker?"));
+}
+
+#[test]
+fn run_binary_initializes_an_existing_empty_session_file_instead_of_hard_failing() {
+    // Track L8: `--session <path>` pointing at a zero-byte file (e.g. `touch`'d ahead of time by a
+    // caller that wants the path to already exist) must initialize it in place, not hard-fail with
+    // "session file has no header."
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl");
+    std::fs::write(&session_file, b"").unwrap(); // pre-create as an empty file
+    assert_eq!(std::fs::metadata(&session_file).unwrap().len(), 0);
+
+    let (base, _bodies) = spawn_model_server(vec![turn_text("ok")]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "hi",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--session",
+            session_file.to_str().unwrap(),
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        std::fs::metadata(&session_file).unwrap().len() > 0,
+        "the session file must actually have a real header now"
+    );
 }
 
 #[test]

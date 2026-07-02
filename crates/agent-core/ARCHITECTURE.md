@@ -29,10 +29,13 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   (`StopReason::Refusal`) is a distinct terminal condition: the run ends immediately without draining
   either lane, since injecting a new turn right after a refusal would likely just be refused again — the
   queue is left intact for whatever run reads the same `Steering` handle next. How much of a lane one
-  drain call consumes is `QueueMode` (`Steering::set_mode`/`mode`): `OneAtATime` (the default, matching
-  pi's `PendingMessageQueue`) takes only the oldest queued message, leaving the rest queued for the
-  *next* drain point, so several messages queued in quick succession land as separate turns; `All`
-  folds everything queued into one injection (this crate's original behavior, still available).
+  drain call consumes is `QueueMode`, one **independent** setting per lane (`Steering::set_steering_mode`/
+  `steering_mode` for the steer lane, `set_follow_up_mode`/`follow_up_mode` for the follow-up-plus-
+  stranded-steer stop-boundary drain — matching pi's own separate `steeringMode`/`followUpMode`, not one
+  shared toggle): `OneAtATime` (the default, matching pi's `PendingMessageQueue`) takes only the oldest
+  queued message, leaving the rest queued for the *next* drain point, so several messages queued in
+  quick succession land as separate turns; `All` folds everything queued into one injection (this
+  crate's original behavior, still available).
   `Steering::pending_count` peeks the combined depth of both lanes without draining either — pi's
   `pendingMessageCount` — for a host surface (e.g. `serve`'s `get_state`) that wants to report queue
   depth to a client.
@@ -51,13 +54,19 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   `NoHooks`.
 - **Compaction** — when the live prompt crosses `context_window − reserve` (or the provider rejects an
   overflow), [`compaction`](src/compaction.rs) summarizes the prefix via one model call and splices a
-  summary in, keeping recent turns verbatim (`Agent::compact`, auto-trigger, compact-and-retry). A
-  _second_ compaction is incremental: a prior summary (tagged `SUMMARY_MARKER`) is fed forward and
-  updated rather than re-summarized, so early context isn't lost (and re-billed) each cycle. A cut
-  landing mid-turn splits into a **closed-history** call and a **turn-prefix** call (run concurrently,
-  `SPLIT_TURN_PREFIX_SCALE` × the summary token budget for the smaller one), merged under a "Turn
-  Context (split turn)" header — closer to pi's two-template approach than summarizing the whole prefix
-  with one minimal-context call. `summary_max_tokens` scales from the model's own `max_output` rather
+  summary in, keeping recent turns verbatim (`Agent::compact`, auto-trigger, compact-and-retry).
+  `Agent::compact`'s `custom_instructions: Option<&str>` steers what the summary emphasizes — a manual
+  (client-triggered) compaction's own focus, matching pi's `compact(customInstructions)`; every
+  automatic trigger passes `None`, having no client in the loop to ask. A _second_ compaction is
+  incremental: a prior summary (tagged `SUMMARY_MARKER`) is fed forward and updated rather than
+  re-summarized, so early context isn't lost (and re-billed) each cycle. A cut landing mid-turn splits
+  into a **closed-history** call (gets `custom_instructions`) and a **turn-prefix** call (does not —
+  matches pi's own split — run *sequentially*, not concurrently: pi originally ran them via
+  `Promise.all`, then fixed exactly this itself so a single-concurrency local provider doesn't reject
+  the second of two simultaneous completions; `SPLIT_TURN_PREFIX_SCALE` × the summary token budget for
+  the smaller one), merged under a "Turn Context (split turn)" header — closer to pi's two-template
+  approach than summarizing the whole prefix with one minimal-context call. `summary_max_tokens` scales
+  from the model's own `max_output` rather
   than a flat constant (`agent::scaled_summary_max_tokens`) — seeded by `Agent::new` and *rescaled* by
   `with_compaction` whenever the incoming config still carries the struct's own flat default, so a
   caller replacing the whole config wholesale (e.g. `serve.rs`'s `build_agent`, to override just
@@ -74,7 +83,14 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   lands where the live prompt plus the next turn's full output budget would meet it (the window, not
   `max_tokens`, is plausibly the real constraint), the run compacts anyway — disabling proactive
   compaction is a preference about timing with headroom to spare, not license to keep sending requests
-  already guaranteed to overflow.
+  already guaranteed to overflow. Complementary and proactive, on the Anthropic dialect specifically:
+  `dialect/anthropic::clamp_max_tokens_to_context` estimates the live prompt from `req.messages`/
+  `req.system` directly and clamps the *request's own* `max_tokens` down to whatever headroom is left
+  under `context_window` (minus a margin absorbing estimation slop) — so a long-running session doesn't
+  keep sending its static output ceiling on every turn regardless of how much of the window the prompt
+  has already consumed, paying for a wasted round-trip each time before the reactive path above ever
+  gets a chance to compact. Never clamps below a configured thinking budget, and never raises
+  `max_tokens` above what was asked.
 - **Thinking** — `ContentBlock::Thinking`/`RedactedThinking` + `ThinkingDelta`/`SignatureDelta` stream
   events; signatures replay verbatim (Anthropic requires it with tools). `with_thinking(budget)`; the
   thinking _shape_ (Anthropic enabled-budget vs adaptive) is chosen per model from the capability
@@ -130,10 +146,17 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   omitting the field and trusting the provider's undocumented default.
 - **Cross-model state scrubbing** — `Message::model_id` (stamped on every assistant turn from
   `Agent`'s own `model`) records which model produced it; `Session::scrub_cross_model_state(new_model)`
-  drops `Thinking`/`RedactedThinking` blocks and truncates a combined OpenAI-Responses tool-call id
-  (`"call_id|item_id"` → `"call_id"`) from any message not stamped with `new_model` — a signed thinking
-  block or a Responses-specific combined id is only valid for replay to the model that produced it.
-  `model_id: None` (a message from before this field existed) is always treated as foreign.
+  downgrades a non-empty signed `Thinking` block to a plain `Text` block (preserving the visible
+  reasoning trace as context rather than erasing it — only the block's *replayability as thinking* is
+  model-specific, not the prose itself), drops an empty `Thinking` block or any `RedactedThinking`
+  block outright (opaque ciphertext, nothing to preserve), and truncates a combined OpenAI-Responses
+  tool-call id (`"call_id|item_id"` → `"call_id"`) — all from any message not stamped with
+  `new_model`. `model_id: None` (a message from before this field existed) is always treated as
+  foreign. `anthropic::build_body`'s own `downgrade_unsigned_thinking` (an unsigned — not
+  cross-model — thinking block, e.g. from an aborted stream) follows the same empty-drops-instead-of-
+  degrades rule: a block whose `thinking` text is also empty is dropped rather than downgraded to
+  `{"type": "text", "text": ""}`, which Anthropic's non-empty-text requirement would just as readily
+  reject.
 - **Tool choice** — `ModelRequest::tool_choice` (`Auto`/`None`/`Required`/`Tool(name)`) maps to each
   dialect's vocabulary; unset emits nothing (provider default), so the common request shape is intact.
 - **Transport resilience** — `GatewayClient` retries transient failures (429/5xx/connection, honoring
@@ -274,9 +297,14 @@ text deltas accrue into a `String` buffer; a `ToolUseStart` flushes any open tex
 `(id, name, json-buffer)` tuple; `InputJsonDelta` fragments append to that buffer; `ContentBlockStop`
 finalizes whichever is open (parsing the buffered JSON, or `{}` if it was empty). A thinking block
 accrues `(text, signature)` from `ThinkingDelta`/`SignatureDelta` and flushes to a `Thinking` block.
-If the buffered tool arguments never parse as JSON, the tool call is recorded in `Turn::malformed`
-and its `ToolUse` block keeps a wire-valid empty `{}` input; the loop then feeds an error
-`tool_result` ("arguments were not valid JSON") back to the model so it can correct, rather than
+Parsing a non-empty buffer tries three tiers in order before giving up: the raw buffer as-is; then
+`repair_json` (fixes mis-escaping — a raw control byte or stray backslash inside a string, not a
+structural problem); then `close_incomplete_json` (closes whatever string/`{`/`[` were still open when
+the buffer ended — a genuinely *incomplete* stream, e.g. a long `write`/`edit` value cut off by an
+output-token ceiling, recovering a partial object instead of discarding it to `{}`). If the buffered
+tool arguments still never parse as JSON after all three, the tool call is recorded in
+`Turn::malformed` and its `ToolUse` block keeps a wire-valid empty `{}` input; the loop then feeds an
+error `tool_result` ("arguments were not valid JSON") back to the model so it can correct, rather than
 aborting the run.
 
 Edge case: `stop_reason` defaults to `StopReason::EndTurn` and usage defaults to `0`/`0` if the stream
@@ -391,7 +419,7 @@ in `benches/decode.rs` (framing is ~4× faster on coalesced chunks: ~2 allocatio
 | none open     | `ToolUseStart`     | tool open | Opens `(id, name, "")`                                                                                                                                                                        |
 | tool open     | `InputJsonDelta`   | tool open | Appends to the JSON argument buffer                                                                                                                                                           |
 | text open     | `ContentBlockStop` | none open | Flushes text block                                                                                                                                                                            |
-| tool open     | `ContentBlockStop` | none open | Parses the JSON buffer; on parse failure, records the call in `Turn::malformed` and pushes `ToolUse` with a wire-valid empty `{}` input (the loop then feeds back a recoverable error result) |
+| tool open     | `ContentBlockStop` | none open | Parses the JSON buffer (raw, then `repair_json`, then `close_incomplete_json`); on parse failure even after both repairs, records the call in `Turn::malformed` and pushes `ToolUse` with a wire-valid empty `{}` input (the loop then feeds back a recoverable error result) |
 | thinking open | `ContentBlockStop` | none open | Flushes a `Thinking { text, signature }` block (from `ThinkingDelta`/`SignatureDelta`)                                                                                                        |
 
 ## Why It Behaves This Way
@@ -464,7 +492,12 @@ Cache hits require a byte-identical prefix, so `ToolRegistry::definitions()` sor
 `HashMap` iteration order would otherwise cold-miss the anchor after every process restart / `serve`
 reattach. The decoder reads `cache_read_input_tokens`/`cache_creation_input_tokens` back into
 `TokenUsage`, so hits are observable. The OpenAI dialect needs no breakpoints — its provider caches
-prefixes automatically — but sets `prompt_cache_key` (from `cache_key`) for cache-node affinity.
+prefixes automatically — but sets `prompt_cache_key` (from `cache_key`) for cache-node affinity, gated
+on `capabilities(model).supports_long_cache` (the same flag `cache_long`/24h-retention reuses just
+below it): `openai.rs`'s Chat Completions dialect is the fallback for every third-party
+OpenAI-compatible provider (`Dialect::for_model` routes native OpenAI ids to the Responses dialect
+instead), and a strict-schema third-party endpoint can 400 the whole request over an unrecognized
+field — `ModelCaps::unknown()`'s conservative default omits it unless a capability-table entry opts in.
 
 ### Why malformed streamed tool arguments are recoverable, not fatal
 
@@ -533,20 +566,20 @@ cross-provider thinking history) degrades to plain text instead of erroring.
 | `lib.rs`                      | Crate root: module list, public re-exports, and the crate-wide `#![cfg_attr(test, allow(...))]` panic-free gate                                                                                                                                                                                                                                                                            |
 | `agent.rs`                    | `Agent` config + `run`/`run_events`/`run_events_cancellable`/`run_events_steered` loop, `Accumulator`, concurrent tool dispatch (threading text/images/`terminate`), tool-driven termination, mid-run + stop-boundary steering, `with_reasoning_effort`, model-aware `new` defaults, hooks, auto-compaction + overflow retry                                                               |
 | `message.rs`                  | `Role`/`ContentBlock`(+ `Thinking`/`RedactedThinking`/`Image`; `ToolResult` carries optional `images`)/`Message`/`ToolDef`/`StopReason`(+ `Refusal`)/`StreamEvent`/`TokenUsage`(+ `reasoning_tokens`) — the internal model                                                                                                                                                                 |
-| `compaction.rs`               | Context compaction: trigger, cut-point search, summary-prompt build, file-op extraction, and incremental update (`previous_summary`/`SUMMARY_MARKER` fold-forward) — the network-free half of `Agent::compact`                                                                                                                                                                             |
+| `compaction.rs`               | Context compaction: trigger, cut-point search, summary-prompt build (`summary_request` takes an optional `custom_instructions`, appended as "Additional focus: …" — a manual compaction's client-supplied steering, matching pi's `generateSummary`; never applied to the split-turn prefix call, matching pi's `generateTurnPrefixSummary` not accepting one at all), file-op extraction, and incremental update (`previous_summary`/`SUMMARY_MARKER` fold-forward) — the network-free half of `Agent::compact`                                                                                                                                                                             |
 | `models.rs`                   | `capabilities(model) -> ModelCaps`: minimal per-model wire table (max-tokens field, long-cache, vision, thinking shape, reasoning-effort, context window), matched by id prefix; consumed by the dialects and `Agent::new`                                                                                                                                                                 |
 | `hooks.rs`                    | `AgentHooks` interception trait (`before_tool_call`/`after_tool_call`, both cancellation-aware) + `NoHooks` default                                                                                                                                                                                                                                                                        |
-| `steering.rs`                 | `Steering` — two shared queues: `push_steer` (mid-run, folded onto the tool-results turn) and `push`/follow-up (injected at would-stop boundaries); `pending_count` peeks the combined depth of both lanes without draining; plus `request_stop`/`take_stop_requested`, a graceful-stop flag checked at turn boundaries; `clear()` drops both lanes and the stop flag without returning them, for a caller about to swap in a different session's conversation     |
+| `steering.rs`                 | `Steering` — two shared queues: `push_steer` (mid-run, folded onto the tool-results turn) and `push`/follow-up (injected at would-stop boundaries), each with its own independent `QueueMode` (`set_steering_mode`/`set_follow_up_mode`); `pending_count` peeks the combined depth of both lanes without draining; plus `request_stop`/`take_stop_requested`, a graceful-stop flag checked at turn boundaries; `clear()` drops both lanes and the stop flag without returning them, for a caller about to swap in a different session's conversation     |
 | `write_lock.rs`               | `WriteLockRegistry` — a process-scoped, path-keyed async-mutex map (`Agent::with_write_locks`) extending same-path write exclusivity across `Agent` rebuilds (a `set_model`/`set_thinking` rebuild, or multiple sessions sharing one registry), layered on top of the per-turn write-target grouping below                                                                                |
 | `tool.rs`                     | `Tool` trait (`run -> ToolOutput`, optional streaming `run_streaming` + `ToolProgress` sink) + `ToolOutput { text, images, terminate }` + `ToolRegistry` (name-keyed `Arc<dyn Tool>` map, last-registration-wins, name-sorted `definitions`)                                                                                                                                               |
-| `transport.rs`                | `ModelRequest` (system/tools/thinking/`reasoning_effort`/`tool_choice`/cache_key/cache_long), `ReasoningEffort` + `ToolChoice` enums, `ModelTransport` trait, `EventStream` alias                                                                                                                                                                                                          |
-| `client.rs`                   | `GatewayClient`: production `ModelTransport`; retry-with-backoff (`Retry-After` delta-seconds _or_ HTTP-date), chunked-SSE byte framing into whole UTF-8 lines                                                                                                                                                                                                                             |
+| `transport.rs`                | `ModelRequest` (system/tools/thinking/`reasoning_effort`/`tool_choice`/cache_key/cache_long/`user_id` — Anthropic's `metadata.user_id` abuse-detection hint, unset by default), `ReasoningEffort` + `ToolChoice` enums, `ModelTransport` trait, `EventStream` alias                                                                                                                                                                                                          |
+| `client.rs`                   | `GatewayClient`: production `ModelTransport`; retry-with-backoff (`Retry-After` delta-seconds _or_ HTTP-date), chunked-SSE byte framing into whole UTF-8 lines; sends `x-client-request-id: <cache_key>` for the OpenAI Responses dialect only, when a `cache_key` is set — connection-level session-affinity routing, distinct from `prompt_cache_key`'s cache-node affinity in the body, matching pi's `openai-responses.ts`                                                                                                                                                                                                                            |
 | `dialect/mod.rs`              | `Dialect` enum (model-id → wire selection), `StreamDecoder` trait, SSE line-splitting (`push_sse_line`/`decode_sse`)                                                                                                                                                                                                                                                                       |
 | `dialect/anthropic.rs`        | `/v1/messages` body builder (three prompt-cache breakpoints, capability-gated 1h TTL, per-model thinking shape, `tool_choice`, tool-result image rewrite) + decoder (text/thinking/tool/cache-usage, reasoning-token breakout, `pause_turn`/refusal-explanation, in-band error + truncation detection)                                                                                     |
 | `dialect/openai.rs`           | `/v1/chat/completions` body builder + decoder — real translation: flattened messages, string-encoded tool args, `image_url` data-URIs (user + fanned-out tool-result images), `max_completion_tokens` vs `max_tokens`, `reasoning_effort`, `tool_choice`, synthesized block-stop events                                                                                                    |
-| `dialect/openai_responses.rs` | `/v1/responses` body builder (flat `input` array of typed items, flat tool defs, `max_output_tokens`, `reasoning.effort` + `include:["reasoning.encrypted_content"]`, `store:false`) + decoder — genuine item-boundary events (`output_item.added`/`.done`), not implicit index-keyed deltas; a reasoning item's whole JSON becomes the `Thinking` block's `signature` for verbatim replay |
-| `branch_summary.rs`           | `branch_summary_request`: the (network-free) prompt builder for summarizing an abandoned tree branch on navigation — reuses `compaction`'s `render_prefix`/`SUMMARY_SYSTEM`/`extract_file_ops` unchanged, framed by its own instruction (no incremental-update path; a branch is summarized once)                                                                                          |
-| `session.rs`                  | `Session`: Arc-shared copy-on-write message history + step/token counters + `last_usage_message_count`, serde round-trippable; `scrub_cross_model_state(new_model)` drops thinking blocks / truncates combined tool-call ids from any message not stamped with `new_model`                                                                                                                |
+| `dialect/openai_responses.rs` | `/v1/responses` body builder (flat `input` array of typed items, flat tool defs, `max_output_tokens`, `reasoning.effort` + `include:["reasoning.encrypted_content"]`, `store:false`) + decoder — genuine item-boundary events (`output_item.added`/`.done`), not implicit index-keyed deltas; a reasoning item's whole JSON becomes the `Thinking` block's `signature` for verbatim replay; genuinely interleaved items (concurrent tool calls) are buffered per-index and replayed as one fully-formed block once the focus item closes, rather than force-closed and truncated, since the shared `StreamEvent`/`Accumulator` contract only ever tracks one open block at a time; `function_call_arguments.done`/`output_item.done`'s own `arguments`/`content` resync (replace, not append) whatever the streamed deltas produced, so a single dropped/duplicated delta can't silently corrupt the final block |
+| `branch_summary.rs`           | `branch_summary_request`: the (network-free) prompt builder for summarizing an abandoned tree branch on navigation — reuses `compaction`'s `render_prefix`/`SUMMARY_SYSTEM`/`extract_file_ops` unchanged, framed by its own instruction (no incremental-update path; a branch is summarized once); `windowed_by_budget` trims the rendered tail to fit the summarization call's own context, privileging a nested compaction/branch-summary entry (a dense recap, not raw conversation) past the ordinary cutoff as long as the accumulated tail is still under 90% of budget, matching pi's `prepareBranchEntries` |
+| `session.rs`                  | `Session`: Arc-shared copy-on-write message history + step/token counters + `last_usage_message_count`, serde round-trippable; `scrub_cross_model_state(new_model)` downgrades a non-empty signed `Thinking` block to `Text` (drops it only if empty), drops `RedactedThinking`, and truncates a combined tool-call id — all from any message not stamped with `new_model`                                                                                                                |
 | `error.rs`                    | `Error` (loop/transport, aborts the run) and `ToolError` (tool failure, becomes an error `tool_result`)                                                                                                                                                                                                                                                                                    |
 | `mock.rs`                     | `MockTransport` + `turn::{text, tool_call}` builders — scripted, no-network loop testing                                                                                                                                                                                                                                                                                                   |
 | `tests/client_socket.rs`      | `GatewayClient` over a real TCP socket: SSE decode, UTF-8 chunk-split reassembly, HTTP-error surfacing                                                                                                                                                                                                                                                                                     |

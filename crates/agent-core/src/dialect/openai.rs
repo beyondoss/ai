@@ -239,11 +239,22 @@ pub fn build_body(req: &ModelRequest) -> Value {
     // stable per-conversation key keeps a session pinned to a warm cache node. (OpenAI caches prefixes
     // automatically — there are no explicit breakpoints to set, only this routing hint.) The key has a
     // hard length cap; a caller-supplied key over it would otherwise 400 the request.
-    if let Some(key) = &req.cache_key {
-        map.insert(
-            "prompt_cache_key".into(),
-            json!(clamp_prompt_cache_key(key)),
-        );
+    //
+    // Gated on `caps.supports_long_cache` (the same per-model capability flag the 24h-retention opt-in
+    // just below reuses) rather than sent unconditionally: this dialect is the fallback for every
+    // third-party OpenAI-compatible provider the gateway routes to (a native OpenAI id speaks the
+    // Responses API instead — see `dialect::Dialect::for_model`), and a strict-schema endpoint with no
+    // concept of OpenAI's own caching extensions can 400 the whole request over an unrecognized field.
+    // `ModelCaps::unknown()`'s conservative default (`supports_long_cache: false`) means an
+    // unrecognized third-party model id omits the field unless a future capability-table entry opts it
+    // in explicitly.
+    if caps.supports_long_cache {
+        if let Some(key) = &req.cache_key {
+            map.insert(
+                "prompt_cache_key".into(),
+                json!(clamp_prompt_cache_key(key)),
+            );
+        }
     }
     // Opt into the 24h cache-retention tier (vs the default, shorter one) when the caller asked and the
     // model's capability entry allows it — mirrors the Anthropic dialect's `cache_long` gating.
@@ -601,6 +612,17 @@ mod tests {
             .with_cache_key("session-abc");
         let body = build_body(&req);
         assert_eq!(body["prompt_cache_key"], "session-abc");
+    }
+
+    #[test]
+    fn prompt_cache_key_is_omitted_for_a_model_that_does_not_support_long_cache() {
+        // An unrecognized id resolves to `ModelCaps::unknown()` (supports_long_cache: false) — this
+        // dialect is the fallback for every third-party OpenAI-compatible provider, and a
+        // strict-schema endpoint can 400 the whole request over an unrecognized field.
+        let req = ModelRequest::new("some-third-party-model", vec![Message::user("hi")], 64)
+            .with_cache_key("session-abc");
+        let body = build_body(&req);
+        assert!(body.get("prompt_cache_key").is_none());
     }
 
     #[test]

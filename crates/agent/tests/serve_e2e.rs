@@ -511,9 +511,11 @@ fn serve_export_html_includes_abandoned_branches_not_just_the_active_path() {
     assert_eq!(frames.last().unwrap()["success"], true, "{frames:#?}");
 
     let html = std::fs::read_to_string(&output_path).unwrap();
+    // The abandoned branch renders inline, as a collapsible <details> block positioned right after
+    // the message it diverged from — not a separate flat "Other branches" section.
     let split = html
-        .find("Other branches")
-        .unwrap_or_else(|| panic!("the abandoned branch must get its own section: {html}"));
+        .find("<details class=\"branch\">")
+        .unwrap_or_else(|| panic!("the abandoned branch must get its own <details> block: {html}"));
     let (active_section, branches_section) = html.split_at(split);
     assert!(active_section.contains("first"), "the active path: {html}");
     assert!(
@@ -781,6 +783,8 @@ fn serve_default_queue_mode_drains_queued_follow_ups_one_at_a_time() {
 fn serve_set_queue_mode_all_folds_queued_follow_ups_into_one_injection() {
     // The opt-in `"all"` mode (this crate's original behavior, before pi-parity default flipped it):
     // both queued follow-ups are folded into the *same* next request, not drained one at a time.
+    // Follow-ups are governed by `set_follow_up_mode`, not `set_steering_mode` — the two lanes have
+    // independent settings.
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
 
@@ -795,11 +799,11 @@ fn serve_set_queue_mode_all_folds_queued_follow_ups_into_one_injection() {
     writeln!(
         stdin,
         "{}",
-        json!({ "type": "set_queue_mode", "mode": "all" })
+        json!({ "type": "set_follow_up_mode", "mode": "all" })
     )
     .unwrap();
     stdin.flush().unwrap();
-    let frames = read_until_response(&mut stdout, "set_queue_mode");
+    let frames = read_until_response(&mut stdout, "set_follow_up_mode");
     assert_eq!(frames.last().unwrap()["success"], true, "got: {frames:#?}");
     assert_eq!(frames.last().unwrap()["data"]["mode"], "all");
 
@@ -830,6 +834,68 @@ fn serve_set_queue_mode_all_folds_queued_follow_ups_into_one_injection() {
         "both follow-ups should reach the model in the same request: {}",
         bodies[1]
     );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_steering_mode_and_follow_up_mode_are_independent_rpc_settings() {
+    // Track M12: `set_queue_mode` split into `set_steering_mode`/`set_follow_up_mode` — setting one
+    // via RPC must not clobber the other, and `get_state` must report both independently.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_steering_mode", "mode": "all" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "set_steering_mode");
+
+    writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_state");
+    let data = &frames.last().unwrap()["data"];
+    assert_eq!(data["steering_mode"], "all", "{data:#?}");
+    assert_eq!(
+        data["follow_up_mode"], "one_at_a_time",
+        "follow_up_mode must be untouched by a steering-mode change: {data:#?}"
+    );
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_follow_up_mode", "mode": "all" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "set_follow_up_mode");
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_steering_mode", "mode": "one_at_a_time" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "set_steering_mode");
+
+    writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_state");
+    let data = &frames.last().unwrap()["data"];
+    assert_eq!(
+        data["steering_mode"], "one_at_a_time",
+        "steering_mode must be untouched by a follow-up-mode change: {data:#?}"
+    );
+    assert_eq!(data["follow_up_mode"], "all", "{data:#?}");
 
     drop(stdin);
     child.wait().unwrap();
@@ -961,6 +1027,24 @@ fn serve_switches_model_and_thinking_at_runtime() {
     let frames = read_until_response(&mut stdout, "set_model");
     assert_eq!(frames.last().unwrap()["success"], false);
 
+    // Track L19: an empty/whitespace-only `model` is rejected too — the narrow, unambiguous mistake
+    // this process CAN catch on its own (unlike a merely-unrecognized-but-otherwise-well-formed id,
+    // which it can't: every id is forwarded verbatim through the gateway, with no local registry to
+    // validate a real one against — see the RPC handler's own doc comment). The live model must be
+    // left exactly as `gpt-4o` set it above, not reset to empty.
+    writeln!(stdin, "{}", json!({ "type": "set_model", "model": "   " })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "set_model");
+    assert_eq!(frames.last().unwrap()["success"], false);
+    writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_state");
+    assert_eq!(
+        frames.last().unwrap()["data"]["model"],
+        "gpt-4o",
+        "a rejected empty model must not disturb the live model: {frames:#?}"
+    );
+
     // Set then clear the thinking budget.
     writeln!(
         stdin,
@@ -1072,7 +1156,9 @@ fn serve_cycle_model_scoped_by_the_models_flag_ignores_the_rest_of_the_known_lis
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
-    // `get_available_models` must stay the full, unscoped list — `--models` only narrows `cycle_model`.
+    // `get_available_models` must reflect the `--models` scope — matching pi's own
+    // `get_available_models`, a live query against the configured registry, not a static hardcoded
+    // list that ignores the operator's own `--models` configuration.
     writeln!(stdin, "{}", json!({ "type": "get_available_models" })).unwrap();
     stdin.flush().unwrap();
     let frames = read_until_response(&mut stdout, "get_available_models");
@@ -1082,9 +1168,10 @@ fn serve_cycle_model_scoped_by_the_models_flag_ignores_the_rest_of_the_known_lis
         .iter()
         .map(|m| m.as_str().unwrap().to_string())
         .collect();
-    assert!(
-        all_models.len() > 2,
-        "the full known-model list must be larger than the 2-entry --models scope"
+    assert_eq!(
+        all_models,
+        vec!["claude-opus-4-8".to_string(), "gpt-4o".to_string()],
+        "get_available_models must report exactly the --models scope, in order"
     );
 
     // Pin to the scoped list's first entry so cycling from a known position is unambiguous.
@@ -1301,6 +1388,82 @@ fn serve_set_auto_compaction_toggles_and_rejects_a_non_boolean() {
 }
 
 #[test]
+fn serve_compact_forwards_custom_instructions_to_the_summarization_call() {
+    // Track M14: `compact`'s `custom_instructions` must actually reach the summarization model call —
+    // matching pi's own `compact(customInstructions)` — not just be silently ignored.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+
+    // Two ordinary conversational turns (4 messages: user/assistant/user/assistant) build up enough
+    // history for `find_cut` to find a real cut point once `--compaction-keep-recent-tokens` is tiny;
+    // the third response is what the manual `compact` call's own summarization request receives.
+    let (base, bodies) = spawn_model_server(vec![
+        turn_text("answer one"),
+        turn_text("answer two"),
+        turn_text("SUMMARY"),
+    ]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = Command::new(bin)
+        .args([
+            "serve",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--session-file",
+            &session_file,
+            "--compaction-keep-recent-tokens",
+            "1",
+        ])
+        .env("HOME", ISOLATED_HOME)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    for msg in ["hello", "again"] {
+        writeln!(stdin, "{}", json!({ "type": "prompt", "message": msg })).unwrap();
+        stdin.flush().unwrap();
+        read_until_response(&mut stdout, "prompt");
+    }
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({
+            "type": "compact",
+            "custom_instructions": "keep every detail about the auth refactor"
+        })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "compact");
+    assert_eq!(frames.last().unwrap()["success"], true, "{frames:#?}");
+    assert_eq!(
+        frames.last().unwrap()["data"]["compacted"],
+        true,
+        "{frames:#?}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+
+    let recorded = bodies.lock().unwrap();
+    assert!(
+        recorded
+            .iter()
+            .any(|b| b.contains("Additional focus: keep every detail about the auth refactor")),
+        "the custom instructions must reach the summarization call: {recorded:#?}"
+    );
+}
+
+#[test]
 fn serve_set_auto_retry_toggles_and_rejects_a_non_boolean() {
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
@@ -1437,6 +1600,24 @@ fn serve_auto_retries_a_whole_run_after_mid_stream_retry_is_exhausted() {
         "got: {auto_retry_frames:#?}"
     );
 
+    // The terminal notice for the retry sequence: the retried attempt succeeded.
+    let auto_retry_end_frames: Vec<&Value> = frames
+        .iter()
+        .filter(|f| f.get("type").and_then(Value::as_str) == Some("auto_retry_end"))
+        .collect();
+    assert_eq!(
+        auto_retry_end_frames.len(),
+        1,
+        "expected exactly one auto_retry_end notice, got: {frames:#?}"
+    );
+    assert_eq!(auto_retry_end_frames[0]["success"], true);
+    assert_eq!(auto_retry_end_frames[0]["attempt"], 1);
+    assert!(
+        auto_retry_end_frames[0].get("final_error").is_none(),
+        "a successful retry must not carry a final_error: {:?}",
+        auto_retry_end_frames[0]
+    );
+
     let response = frames.last().unwrap();
     assert_eq!(response["success"], true, "got: {response:#?}");
     assert_eq!(
@@ -1458,6 +1639,110 @@ fn serve_auto_retries_a_whole_run_after_mid_stream_retry_is_exhausted() {
         "exactly one user turn + one assistant turn, no duplicate: {dump}"
     );
     assert!(dump.contains("recovered"), "got: {dump}");
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_abort_retry_interrupts_a_pending_whole_run_retry_backoff() {
+    // Same failure shape as the auto-retry test above (agent-core's own mid-stream retry exhausts
+    // after 4 attempts, handing an `Err` to the whole-run retry layer) — but here the client cancels
+    // the pending backoff instead of letting it run its course. Confirms the backoff wait is
+    // genuinely interruptible (not a bare `sleep` nothing can touch) and that cancelling it surfaces
+    // the real underlying error rather than either hanging for the full delay or silently retrying
+    // anyway.
+    let truncated = "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, bodies) = spawn_model_server(vec![
+        truncated.to_string(),
+        truncated.to_string(),
+        truncated.to_string(),
+        truncated.to_string(),
+        turn_text("would have recovered"),
+    ]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
+    stdin.flush().unwrap();
+
+    // Read frames one at a time until the `auto_retry` notice arrives — sent right before the
+    // 2-second whole-run backoff wait starts, *after* agent-core's own mid-stream retry has already
+    // spent its own ~1.75s of internal backoff exhausting itself — then immediately cancel it. Timing
+    // starts here, not at the `prompt` send, so the assertion below isolates just the whole-run
+    // backoff-interruption latency from that unrelated, expected mid-stream delay.
+    let mut line = String::new();
+    loop {
+        line.clear();
+        assert!(
+            stdout.read_line(&mut line).unwrap() > 0,
+            "stdout closed before an auto_retry notice arrived"
+        );
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let v: Value = serde_json::from_str(trimmed).unwrap();
+        if v.get("type").and_then(Value::as_str) == Some("auto_retry") {
+            break;
+        }
+    }
+    let start = std::time::Instant::now();
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "abort_retry", "id": "cancel-1" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+
+    let abort_frames = read_until_response(&mut stdout, "abort_retry");
+    assert_eq!(
+        abort_frames.last().unwrap()["success"],
+        true,
+        "{abort_frames:#?}"
+    );
+
+    // The still-pending `prompt` must resolve right after — not wait out the full 2s backoff — with
+    // the *original* mid-stream error, and the 5th (would-be-recovering) request must never fire.
+    let frames = read_until_response(&mut stdout, "prompt");
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_millis(1000),
+        "abort_retry must interrupt the 2s backoff near-instantly, not wait most/all of it out: \
+         took {elapsed:?}"
+    );
+    let response = frames.last().unwrap();
+    assert_eq!(response["success"], false, "got: {response:#?}");
+    assert!(
+        response["error"].as_str().unwrap().contains("stream ended"),
+        "must surface the real underlying error, not a synthetic cancellation: {response:#?}"
+    );
+    assert_eq!(
+        bodies.lock().unwrap().len(),
+        4,
+        "the cancelled retry must never have fired the 5th, would-be-recovering request: {:?}",
+        bodies.lock().unwrap()
+    );
+
+    // The terminal notice for the retry sequence: it never got to retry — the backoff was cancelled.
+    let auto_retry_end_frames: Vec<&Value> = frames
+        .iter()
+        .filter(|f| f.get("type").and_then(Value::as_str) == Some("auto_retry_end"))
+        .collect();
+    assert_eq!(
+        auto_retry_end_frames.len(),
+        1,
+        "expected exactly one auto_retry_end notice, got: {frames:#?}"
+    );
+    assert_eq!(auto_retry_end_frames[0]["success"], false);
+    assert_eq!(auto_retry_end_frames[0]["attempt"], 1);
+    assert_eq!(auto_retry_end_frames[0]["final_error"], "retry cancelled");
 
     drop(stdin);
     child.wait().unwrap();
@@ -1634,7 +1919,7 @@ fn serve_gates_skills_and_prompts_on_project_trust() {
             .unwrap();
         let names: Vec<&str> = commands.iter().filter_map(|c| c["name"].as_str()).collect();
         assert!(
-            names.contains(&"foo"),
+            names.contains(&"skill:foo"),
             "trusted project should list the skill: {names:?}"
         );
         assert!(
@@ -1694,7 +1979,7 @@ fn serve_force_untrusted_overrides_a_persisted_trust_grant() {
             .filter_map(|c| c["name"].as_str())
             .collect();
         assert!(
-            names.contains(&"foo"),
+            names.contains(&"skill:foo"),
             "the persisted trust grant should be honored: {names:?}"
         );
 
@@ -1772,11 +2057,11 @@ fn serve_untrusted_project_still_advertises_and_invokes_a_user_global_skill() {
         .unwrap();
     let names: Vec<&str> = commands.iter().filter_map(|c| c["name"].as_str()).collect();
     assert!(
-        names.contains(&"mine"),
+        names.contains(&"skill:mine"),
         "an untrusted project must still advertise the user-global skill: {names:?}"
     );
     assert!(
-        !names.contains(&"theirs"),
+        !names.contains(&"skill:theirs"),
         "the untrusted project's own skill must stay gated: {names:?}"
     );
 
@@ -1834,7 +2119,7 @@ fn serve_get_commands_reports_a_cross_root_skill_collision() {
     let commands = data["commands"].as_array().unwrap();
     let dup_count = commands
         .iter()
-        .filter(|c| c["name"].as_str() == Some("dup"))
+        .filter(|c| c["name"].as_str() == Some("skill:dup"))
         .count();
     assert_eq!(
         dup_count, 1,
@@ -1846,6 +2131,52 @@ fn serve_get_commands_reports_a_cross_root_skill_collision() {
             .iter()
             .any(|c| c.as_str().is_some_and(|s| s.contains("dup"))),
         "collisions must report the shadowed skill: {collisions:?}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_get_commands_reports_the_prompt_templates_own_description_not_its_argument_hint() {
+    // A prompt template's `get_commands` entry must surface its `description:` frontmatter, not the
+    // separate `argument-hint:` field — the two are deliberately distinct (a hint like "<file>" isn't
+    // a human-readable summary a client's command palette should display as one).
+    let home = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let prompt_dir = dir.path().join(".claude/prompts");
+    std::fs::create_dir_all(&prompt_dir).unwrap();
+    std::fs::write(
+        prompt_dir.join("fix.md"),
+        "---\nargument-hint: <file>\ndescription: Fix a bug in the given file\n---\nFix $1.",
+    )
+    .unwrap();
+
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![turn_text("ok")]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut cmd = serve_cmd(bin, &base, &session_file);
+    cmd.arg("--trust-project")
+        .current_dir(dir.path())
+        .env("HOME", home.path());
+    let mut child = cmd.spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "get_commands" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_commands");
+    let commands = frames.last().unwrap()["data"]["commands"]
+        .as_array()
+        .unwrap();
+    let fix = commands
+        .iter()
+        .find(|c| c["name"].as_str() == Some("fix"))
+        .unwrap_or_else(|| panic!("prompt template \"fix\" not listed: {commands:?}"));
+    assert_eq!(
+        fix["description"].as_str(),
+        Some("Fix a bug in the given file"),
+        "description field must be the template's own description, not its argument hint: {fix:?}"
     );
 
     drop(stdin);
@@ -2270,6 +2601,191 @@ fn serve_repo_lists_switches_and_forks_sessions() {
 }
 
 #[test]
+fn serve_clone_forks_the_current_session_at_its_current_tip() {
+    // Track L17: pi's own `clone` command — a thin, argument-free alias over `fork` at the session's
+    // current tip. This crate's `fork` already defaults to exactly that when called with no
+    // `upto`/`target_id`, so `clone` must behave identically to a bare `fork`, just under pi's name.
+    let dir = tempfile::tempdir().unwrap();
+    let session_dir = dir.path().join("sessions").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![turn_text("first answer")]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_dir_cmd(bin, &base, &session_dir).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    let mut ready = String::new();
+    stdout.read_line(&mut ready).unwrap();
+    let ready: Value = serde_json::from_str(ready.trim()).unwrap();
+    let source_id = ready["session_id"].as_str().unwrap().to_string();
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    writeln!(stdin, "{}", json!({ "type": "clone" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "clone");
+    let resp = frames.last().unwrap();
+    assert_eq!(resp["success"], true, "frames: {frames:#?}");
+    let clone_id = resp["data"]["session_id"].as_str().unwrap().to_string();
+    assert_ne!(clone_id, source_id, "a clone is a distinct session");
+
+    // The clone must carry the source's full transcript (the same active-path-at-current-tip a bare
+    // `fork` would copy) — not an empty session.
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_messages");
+    let dump = frames.last().unwrap()["data"]["messages"].to_string();
+    assert!(
+        dump.contains("first answer") && dump.contains("\"hi\""),
+        "clone must carry the source session's full transcript: {dump}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_new_session_parent_session_overrides_the_default_lineage() {
+    // Track L17: `new_session`'s `parent` previously always pointed at whatever session was active
+    // immediately before the call, with no way to link a fresh session to a *different* one instead.
+    let dir = tempfile::tempdir().unwrap();
+    let session_dir = dir.path().join("sessions").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_dir_cmd(bin, &base, &session_dir).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    let mut ready = String::new();
+    stdout.read_line(&mut ready).unwrap();
+    let ready: Value = serde_json::from_str(ready.trim()).unwrap();
+    let active_id = ready["session_id"].as_str().unwrap().to_string();
+
+    // A `new_session` with no override still links to whatever was active — the pre-existing default,
+    // unchanged by adding the override.
+    writeln!(stdin, "{}", json!({ "type": "new_session" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "new_session");
+    let default_data = &frames.last().unwrap()["data"];
+    assert_eq!(
+        default_data["parent"], active_id,
+        "omitting parent_session must keep linking to whatever was active: {default_data:#?}"
+    );
+
+    // An explicit `parent_session` naming an unrelated id wins outright, even though it names neither
+    // the session that was active before this call nor the one just created above.
+    let explicit_parent = "some-other-session-id-entirely";
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "new_session", "parent_session": explicit_parent })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "new_session");
+    let override_data = &frames.last().unwrap()["data"];
+    assert_eq!(
+        override_data["parent"], explicit_parent,
+        "an explicit parent_session must override the default lineage: {override_data:#?}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_delete_session_soft_deletes_another_session_but_refuses_the_active_one() {
+    // Track L5: `SessionRepo::delete` had no RPC command wired to it at all — genuinely unreachable in
+    // production. Deleting a *different* session must remove it from `list_sessions` (moved to
+    // `.trash`, not gone outright); deleting the *currently active* one must be refused, since that
+    // would move the file out from under the in-memory `Session` a client is still using.
+    let dir = tempfile::tempdir().unwrap();
+    let session_dir = dir.path().join("sessions").to_string_lossy().into_owned();
+
+    let (base, _bodies) = spawn_model_server(vec![turn_text("first answer")]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_dir_cmd(bin, &base, &session_dir).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    let mut ready = String::new();
+    stdout.read_line(&mut ready).unwrap();
+    let ready: Value = serde_json::from_str(ready.trim()).unwrap();
+    let first_id = ready["session_id"].as_str().unwrap().to_string();
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    // A second session becomes active; the first is now just another entry in the repo.
+    writeln!(stdin, "{}", json!({ "type": "new_session" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "new_session");
+    let second_id = frames.last().unwrap()["data"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(first_id, second_id);
+
+    // Refuses to delete the currently active session (session 2).
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "delete_session", "session_id": second_id })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "delete_session");
+    let resp = frames.last().unwrap();
+    assert_eq!(
+        resp["success"], false,
+        "must refuse to delete the currently active session: {resp:#?}"
+    );
+
+    // Deletes the *other* session (session 1) successfully.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "delete_session", "session_id": first_id })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "delete_session");
+    assert_eq!(frames.last().unwrap()["success"], true, "{frames:#?}");
+
+    // No longer listed.
+    writeln!(stdin, "{}", json!({ "type": "list_sessions" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "list_sessions");
+    let sessions = frames.last().unwrap()["data"]["sessions"]
+        .as_array()
+        .unwrap();
+    assert!(
+        !sessions.iter().any(|s| s["id"] == first_id),
+        "the deleted session must no longer be listed: {sessions:#?}"
+    );
+
+    // Idempotent: deleting it again (already gone) is still a success, not an error.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "delete_session", "session_id": first_id })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "delete_session");
+    assert_eq!(
+        frames.last().unwrap()["success"],
+        true,
+        "deleting an already-deleted session must be a no-op success: {frames:#?}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
 fn serve_fork_by_target_id_reaches_an_off_active_path_branch() {
     // `fork`'s `upto` count only ever copies a prefix of whatever is *currently* the active path — it
     // has no way to reach a branch the client has since navigated away from. `target_id` does: fork
@@ -2335,6 +2851,15 @@ fn serve_fork_by_target_id_reaches_an_off_active_path_branch() {
     // `get_fork_messages` targeting b's own user turn (off-branch) with `before:true` previews just
     // [a, a-reply] — b's user message excluded (its own parent is a-reply, so excluding just b's
     // message, not "the whole b pair", is exactly what `before` means: fork right before this entry).
+    writeln!(stdin, "{}", json!({ "type": "list_sessions" })).unwrap();
+    stdin.flush().unwrap();
+    let count_before_preview = read_until_response(&mut stdout, "list_sessions")
+        .last()
+        .unwrap()["data"]["sessions"]
+        .as_array()
+        .unwrap()
+        .len();
+
     writeln!(
         stdin,
         "{}",
@@ -2351,6 +2876,21 @@ fn serve_fork_by_target_id_reaches_an_off_active_path_branch() {
         preview_messages.len(),
         2,
         "before:true at b's own user turn excludes it, leaving just a's turn: {preview_messages:#?}"
+    );
+
+    // The `target_id`-based preview must not have created a session file either — it previously did,
+    // permanently polluting `list_sessions` on every branch-point preview (the documented common case).
+    writeln!(stdin, "{}", json!({ "type": "list_sessions" })).unwrap();
+    stdin.flush().unwrap();
+    let count_after_preview = read_until_response(&mut stdout, "list_sessions")
+        .last()
+        .unwrap()["data"]["sessions"]
+        .as_array()
+        .unwrap()
+        .len();
+    assert_eq!(
+        count_after_preview, count_before_preview,
+        "get_fork_messages with target_id must not create a session file"
     );
 
     // A real `fork` at c's assistant reply (off-branch), `before:false` (the default) — includes it,
@@ -2844,6 +3384,71 @@ fn serve_switch_branch_restores_the_model_active_on_that_branch() {
 }
 
 #[test]
+fn serve_switch_branch_resets_thinking_level_instead_of_bleeding_a_sibling_branchs_setting() {
+    // Track L4: a `set_reasoning_effort` recorded on one branch must not silently keep applying after
+    // switching to a point that never had it — that point genuinely never had a level recorded, so it
+    // must resolve to the *process's own starting level* (here, the default "off"), not whatever the
+    // global runtime setting happens to still be from the branch just abandoned.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+
+    let (base, _bodies) = spawn_model_server(vec![turn_text("first answer")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "first" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    // The tip right now (after "first answer") never has — and never will have — its own recorded
+    // thinking-level change; the upcoming `set_reasoning_effort` is anchored *after* it.
+    let ids = message_ids(&session_file);
+    assert_eq!(ids.len(), 2, "expected 2 persisted messages: {ids:?}");
+    let anchor = ids[1].clone();
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_reasoning_effort", "effort": "high" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "set_reasoning_effort");
+    assert_eq!(frames.last().unwrap()["success"], true, "got: {frames:#?}");
+    assert_eq!(frames.last().unwrap()["data"]["level"], "high");
+
+    // Switch back to the anchor — a point that predates the level change entirely, and has no
+    // ThinkingLevelChange of its own anchored at-or-before it.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "switch_branch", "target_id": anchor, "summarize": false })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "switch_branch");
+    let resp = frames.last().unwrap();
+    assert_eq!(resp["success"], true, "got: {resp:#?}");
+    assert_eq!(
+        resp["data"]["reasoning_effort"], "off",
+        "switching to a point with no recorded level change must reset to the process's own \
+         starting level, not bleed the abandoned branch's \"high\": {resp:#?}"
+    );
+
+    // `get_state` (not just the switch_branch response) must reflect the reset level too.
+    writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_state");
+    assert_eq!(frames.last().unwrap()["data"]["thinking_level"], "off");
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
 fn serve_get_messages_ids_enable_forking_from_any_point() {
     // Closes the gap `list_branches` alone leaves: it only ever reports a branch's *leaf*, so a
     // client that wants to fork from an arbitrary point in the middle of the visible transcript needs
@@ -3198,6 +3803,64 @@ fn serve_bash_is_rejected_when_the_tool_is_excluded() {
 }
 
 #[test]
+#[cfg(unix)]
+fn serve_bash_shell_path_overrides_the_auto_resolved_shell() {
+    if !std::path::Path::new("/bin/sh").exists() {
+        return; // no alternate shell on this host to prove the override actually took effect
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut cmd = serve_cmd(bin, &base, &session_file);
+    cmd.args(["--bash-shell-path", "/bin/sh"]);
+    let mut child = cmd.spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    // `$BASH_VERSION` is set only by bash itself; `/bin/sh` on this host is dash, which leaves it
+    // unset — the POSIX `${VAR:-default}` expansion below works identically under both, so the
+    // *value* it prints is the only thing that can differ.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "bash", "command": "echo ${BASH_VERSION:-no-bash}" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "bash");
+    drop(stdin);
+    child.wait().unwrap();
+
+    let resp = frames.last().unwrap();
+    assert_eq!(resp["success"], true, "frames: {frames:#?}");
+    assert_eq!(resp["data"]["result"], "no-bash\n", "frames: {frames:#?}");
+}
+
+#[test]
+fn serve_fails_fast_when_bash_shell_path_does_not_exist() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut cmd = serve_cmd(bin, &base, &session_file);
+    cmd.args(["--bash-shell-path", "/no/such/shell-binary"]);
+    cmd.stderr(Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    drop(child.stdin.take()); // the process must exit before ever trying to read a command line
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    let status = child.wait().unwrap();
+    assert!(!status.success(), "stderr: {stderr}");
+    assert!(stderr.contains("--bash-shell-path"), "stderr: {stderr}");
+}
+
+#[test]
 fn serve_abort_bash_cancels_a_running_host_command() {
     use std::time::{Duration, Instant};
 
@@ -3322,7 +3985,8 @@ fn serve_get_state_reports_runtime_settings_and_queue_depth() {
     assert_eq!(data["thinking_level"], "off", "{data:#?}");
     assert_eq!(data["auto_compaction"], true, "{data:#?}");
     assert_eq!(data["auto_retry"], true, "{data:#?}");
-    assert_eq!(data["queue_mode"], "one_at_a_time", "{data:#?}");
+    assert_eq!(data["steering_mode"], "one_at_a_time", "{data:#?}");
+    assert_eq!(data["follow_up_mode"], "one_at_a_time", "{data:#?}");
     assert_eq!(data["pending_messages"], 0, "{data:#?}");
 
     // Queue two follow-ups (idle `follow_up`, no prompt in flight) and flip auto_compaction/queue_mode;
@@ -3623,4 +4287,70 @@ fn serve_stdout_stays_valid_json_even_when_a_load_warning_fires() {
         "the load warning must actually have fired (on stderr, not stdout) for this test to mean \
          anything: stderr was {stderr_text:?}"
     );
+}
+
+#[test]
+fn new_session_reports_failure_and_leaves_the_old_session_active_when_persist_fails() {
+    // `Persistence::new_session` used to unconditionally return a fresh, empty in-memory `Session`
+    // even when the on-disk reset actually failed — reporting RPC success on a session that was never
+    // really created, while `SessionStore`'s own persisted-message-count bookkeeping (correctly)
+    // stayed untouched. A subsequent real `persist` would then see the small "new" in-memory message
+    // count against that stale-large persisted count and silently no-op via `append_new`'s own dedup
+    // guard, discarding every message of the "new" session with no error at all. The fix: report
+    // failure over RPC, and leave the *old* session active rather than switching to a phantom one.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+
+    let (base, _bodies) = spawn_model_server(vec![turn_text("hello-reply")]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hello" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let before = read_until_response(&mut stdout, "get_messages");
+    let before_dump = before.last().unwrap()["data"]["messages"].to_string();
+    assert!(
+        before_dump.contains("hello-reply"),
+        "the first prompt must have actually persisted: {before_dump}"
+    );
+
+    // Force the *next* write to `session_file` to fail: replace it with a directory of the same name.
+    // `new_session`'s single-file-mode reset (`SessionStore::rewrite`) writes a temp file then renames
+    // it onto this path — a rename can never land a file onto an existing directory, so this reliably
+    // reproduces a real write failure without needing root or a special filesystem.
+    std::fs::remove_file(&session_file).unwrap();
+    std::fs::create_dir(&session_file).unwrap();
+
+    writeln!(stdin, "{}", json!({ "type": "new_session" })).unwrap();
+    stdin.flush().unwrap();
+    let new_session_response = read_until_response(&mut stdout, "new_session");
+    let resp = new_session_response.last().unwrap();
+    assert_eq!(
+        resp["success"], false,
+        "a failed on-disk reset must be reported as failure, not silent success: {resp:#?}"
+    );
+    assert!(
+        resp.get("error").is_some(),
+        "failure must carry an error message: {resp:#?}"
+    );
+
+    // The old session must still be the active one — not silently swapped for an empty one that was
+    // never actually persisted.
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let after = read_until_response(&mut stdout, "get_messages");
+    let after_dump = after.last().unwrap()["data"]["messages"].to_string();
+    assert_eq!(
+        after_dump, before_dump,
+        "a failed new_session must leave the previous session's transcript untouched: {after_dump}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
 }

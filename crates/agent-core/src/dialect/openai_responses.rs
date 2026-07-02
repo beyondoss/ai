@@ -23,10 +23,19 @@
 //!
 //! **Stream shape vs Chat Completions:** items open with `response.output_item.added` and close with
 //! `response.output_item.done` — genuine block boundaries, unlike Chat Completions' implicit
-//! index-keyed deltas — so this decoder closes the previously-open block on any index switch rather
-//! than inferring it from a `finish_reason`. Usage and the terminal stop reason arrive together on
+//! index-keyed deltas. The API can genuinely interleave two items' deltas (concurrent tool calls),
+//! but the shared `StreamEvent`/`Accumulator` contract only ever tracks one open block at a time —
+//! see [`Decoder::pending`] for how a preempted item's events are buffered and replayed rather than
+//! being force-closed and truncated. Usage and the terminal stop reason arrive together on
 //! `response.completed`/`response.incomplete`, so (unlike the Chat Completions decoder) `MessageStop`
 //! is emitted immediately rather than deferred to `finish()`.
+//!
+//! **Resync at block close:** `response.function_call_arguments.done` and `output_item.done`'s own
+//! `item.arguments`/`item.content` are the provider's own authoritative, complete values for the
+//! block that's closing — emitted as [`crate::message::StreamEvent::InputJsonFinal`]/`TextFinal`,
+//! which *replace* (not append to) whatever the streamed deltas accumulated. This is what keeps a
+//! single dropped or duplicated mid-stream delta (a relay hiccup with no transport-level error —
+//! nothing else would ever catch it) from silently corrupting the final block.
 
 use serde_json::{Map, Value, json};
 
@@ -411,12 +420,48 @@ fn failure_message(data: &Value) -> String {
     "unknown error (no error details in response)".to_string()
 }
 
+/// Concatenate a `message`-type item's `content` parts' text (`output_text`/`refusal` parts) — the
+/// same text `response.output_text.delta`/`response.refusal.delta` events already streamed, used at
+/// `output_item.done` as a resync ground truth. `None` when the item has no content array or no
+/// text-bearing parts (nothing to resync against).
+fn message_item_text(item: Option<&Value>) -> Option<String> {
+    let parts = item?.get("content")?.as_array()?;
+    let mut text = String::new();
+    for part in parts {
+        match part.get("type").and_then(Value::as_str) {
+            Some("output_text") => {
+                text.push_str(part.get("text").and_then(Value::as_str).unwrap_or(""));
+            }
+            Some("refusal") => {
+                text.push_str(part.get("refusal").and_then(Value::as_str).unwrap_or(""));
+            }
+            _ => {}
+        }
+    }
+    (!text.is_empty()).then_some(text)
+}
+
 /// Decodes Responses SSE. Items are genuine block boundaries (`output_item.added`/`.done`), so this
 /// tracks only which output index is currently open — closing it on any switch — rather than
 /// inferring boundaries from deltas the way the Chat Completions decoder does.
 pub struct Decoder {
     started: bool,
     open_index: Option<i64>,
+    /// Items that have started (`output_item.added`) or are accruing deltas but aren't the
+    /// currently-open block (`open_index`) because a *different* item opened first and hasn't closed
+    /// yet. The Responses API can genuinely interleave two items' deltas — concurrent tool calls being
+    /// the common case with agentic gpt-5.x models — even though our shared `StreamEvent`/
+    /// `Accumulator` contract (deliberately kept provider-agnostic and simple, shared with the
+    /// Anthropic and Chat Completions dialects) only ever tracks one open block at a time. Rather than
+    /// force-close and truncate whichever item is preempted (the previous, lossy behavior — see
+    /// `route`), each non-focus item's would-be events are buffered here under its own index and
+    /// replayed as one normal, fully-formed block once the focus item closes (`promote_pending`) —
+    /// correct in the end state (no truncated/corrupted arguments), at the cost of a buffered item's
+    /// own deltas not reaching a live streaming consumer (e.g. `tool_progress`) until it's promoted.
+    /// `pending_order` preserves first-seen order so multiple buffered items are promoted in the order
+    /// they actually started, not hash-map iteration order.
+    pending: std::collections::HashMap<i64, Vec<StreamEvent>>,
+    pending_order: Vec<i64>,
     saw_terminal: bool,
     failed: Option<String>,
     saw_tool_call: bool,
@@ -429,6 +474,8 @@ impl Default for Decoder {
         Self {
             started: false,
             open_index: None,
+            pending: std::collections::HashMap::new(),
+            pending_order: Vec::new(),
             saw_terminal: false,
             failed: None,
             saw_tool_call: false,
@@ -439,27 +486,75 @@ impl Default for Decoder {
 }
 
 impl Decoder {
-    /// Force-close the previously-open block if this event's index names a different one. The
-    /// Responses API always closes an item (`output_item.done`) before opening the next, so this is
-    /// defensive — but it's what keeps the decoder correct (rather than corrupting state) if a
-    /// provider ever does interleave two items' deltas, since the loop's `Accumulator` can only ever
-    /// hold one block open at a time.
-    fn close_if_switching(&mut self, out: &mut Vec<StreamEvent>, index: i64) {
-        if let Some(open) = self.open_index {
-            if open != index {
-                out.push(StreamEvent::ContentBlockStop);
-                self.open_index = None;
+    /// Route one item-index-scoped event: append straight to `out` if `index` is (or, if nothing is
+    /// currently open, becomes) the focus block; otherwise buffer it under `index` in `pending` for
+    /// later replay via `promote_pending`. See the `pending` field doc for why this exists instead of
+    /// force-closing on an index switch.
+    fn route(&mut self, out: &mut Vec<StreamEvent>, index: i64, ev: StreamEvent) {
+        match self.open_index {
+            None => {
+                self.open_index = Some(index);
+                out.push(ev);
             }
+            Some(open) if open == index => out.push(ev),
+            Some(_) => {
+                let buf = self.pending.entry(index).or_default();
+                if buf.is_empty() {
+                    self.pending_order.push(index);
+                }
+                buf.push(ev);
+            }
+        }
+    }
+
+    /// Close the focus block, then promote the earliest still-pending item (if any) to take its place.
+    fn close_focus_and_promote(&mut self, out: &mut Vec<StreamEvent>) {
+        out.push(StreamEvent::ContentBlockStop);
+        self.open_index = None;
+        self.promote_pending(out);
+    }
+
+    /// Promote the earliest still-pending item to focus, replaying its buffered events verbatim. If
+    /// that item had already fully closed while it was buffered (its own `output_item.done` arrived
+    /// before it got promoted — see the `output_item.done` handler), the replay already ends with its
+    /// own `ContentBlockStop`; recurse to promote the next one instead of leaving `open_index` pointed
+    /// at a block the `Accumulator` has already flushed.
+    fn promote_pending(&mut self, out: &mut Vec<StreamEvent>) {
+        let Some(next) = (!self.pending_order.is_empty()).then(|| self.pending_order.remove(0))
+        else {
+            return;
+        };
+        let Some(events) = self.pending.remove(&next) else {
+            // `pending_order` and `pending` are always kept in sync by `route`; unreachable in
+            // practice, but recurse rather than silently stalling if it ever isn't.
+            return self.promote_pending(out);
+        };
+        let already_closed = matches!(events.last(), Some(StreamEvent::ContentBlockStop));
+        self.open_index = Some(next);
+        out.extend(events);
+        if already_closed {
+            self.open_index = None;
+            self.promote_pending(out);
         }
     }
 
     fn finalize(&mut self, data: &Value, out: &mut Vec<StreamEvent>) {
         self.saw_terminal = true;
-        // Defensive: `output_item.done` should always precede the terminal event, but a
-        // malformed/truncated stream must not silently drop an unclosed block.
+        // Defensive: normally every item is closed (directly or via `promote_pending`) before the
+        // terminal event arrives — but a malformed/truncated stream must not silently drop the
+        // currently-open block, or any item still sitting in `pending` waiting for promotion.
         if self.open_index.is_some() {
             out.push(StreamEvent::ContentBlockStop);
             self.open_index = None;
+        }
+        while !self.pending_order.is_empty() {
+            let next = self.pending_order.remove(0);
+            if let Some(mut events) = self.pending.remove(&next) {
+                if !matches!(events.last(), Some(StreamEvent::ContentBlockStop)) {
+                    events.push(StreamEvent::ContentBlockStop);
+                }
+                out.extend(events);
+            }
         }
 
         let response = data.get("response");
@@ -518,8 +613,6 @@ impl StreamDecoder for Decoder {
         match kind {
             "response.output_item.added" => {
                 let index = i64_at(data, "output_index");
-                self.close_if_switching(&mut out, index);
-                self.open_index = Some(index);
                 let item = data.get("item");
                 if item.and_then(|i| i.get("type")).and_then(Value::as_str) == Some("function_call")
                 {
@@ -532,59 +625,112 @@ impl StreamDecoder for Decoder {
                     } else {
                         combine_tool_id(call_id, item_id)
                     };
-                    out.push(StreamEvent::ToolUseStart { id, name });
+                    self.route(&mut out, index, StreamEvent::ToolUseStart { id, name });
                 }
+                // A message/reasoning item has no explicit "start" `StreamEvent` — it opens implicitly
+                // on its first delta, which `route` handles lazily. Nothing to emit here for those.
             }
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
                 let index = i64_at(data, "output_index");
-                self.close_if_switching(&mut out, index);
-                self.open_index = Some(index);
-                out.push(StreamEvent::ThinkingDelta {
-                    text: str_at(Some(data), "delta").to_string(),
-                });
+                self.route(
+                    &mut out,
+                    index,
+                    StreamEvent::ThinkingDelta {
+                        text: str_at(Some(data), "delta").to_string(),
+                    },
+                );
             }
             "response.reasoning_summary_part.done" => {
-                if self.open_index.is_some() {
-                    out.push(StreamEvent::ThinkingDelta {
-                        text: "\n\n".to_string(),
-                    });
+                let index = i64_at(data, "output_index");
+                let delta = StreamEvent::ThinkingDelta {
+                    text: "\n\n".to_string(),
+                };
+                if self.open_index == Some(index) {
+                    out.push(delta);
+                } else if let Some(buf) = self.pending.get_mut(&index) {
+                    buf.push(delta);
                 }
             }
             "response.output_text.delta" | "response.refusal.delta" => {
                 let index = i64_at(data, "output_index");
-                self.close_if_switching(&mut out, index);
-                self.open_index = Some(index);
-                out.push(StreamEvent::TextDelta {
-                    text: str_at(Some(data), "delta").to_string(),
-                });
+                self.route(
+                    &mut out,
+                    index,
+                    StreamEvent::TextDelta {
+                        text: str_at(Some(data), "delta").to_string(),
+                    },
+                );
             }
             "response.function_call_arguments.delta" => {
                 let index = i64_at(data, "output_index");
-                self.close_if_switching(&mut out, index);
-                self.open_index = Some(index);
-                out.push(StreamEvent::InputJsonDelta {
-                    partial_json: str_at(Some(data), "delta").to_string(),
-                });
+                self.route(
+                    &mut out,
+                    index,
+                    StreamEvent::InputJsonDelta {
+                        partial_json: str_at(Some(data), "delta").to_string(),
+                    },
+                );
+            }
+            "response.function_call_arguments.done" => {
+                // The provider's own authoritative, complete arguments string — resyncs over whatever
+                // the streamed deltas produced so far, so a single dropped/duplicated mid-stream delta
+                // (a relay hiccup with no transport-level error — nothing else would ever catch it)
+                // can't silently leave the final call's arguments corrupted.
+                let index = i64_at(data, "output_index");
+                self.route(
+                    &mut out,
+                    index,
+                    StreamEvent::InputJsonFinal {
+                        full_json: str_at(Some(data), "arguments").to_string(),
+                    },
+                );
             }
             "response.output_item.done" => {
                 let index = i64_at(data, "output_index");
-                // Guarded the same way `close_if_switching` is: a `done` for an index that isn't the
-                // one currently open (a duplicate, a late/out-of-order event, or one that was already
-                // force-closed by an interleaving `close_if_switching` elsewhere) must not close
-                // whatever block actually *is* open right now — the `Accumulator` can only ever hold
-                // one open, so an unguarded close here would silently truncate it.
-                if self.open_index == Some(index) {
-                    let item = data.get("item");
-                    if item.and_then(|i| i.get("type")).and_then(Value::as_str) == Some("reasoning")
-                    {
+                let item = data.get("item");
+                let item_type = item.and_then(|i| i.get("type")).and_then(Value::as_str);
+                let mut pre_close: Vec<StreamEvent> = Vec::new();
+                match item_type {
+                    Some("reasoning") => {
                         // The whole item, JSON-stringified, is the block's replayable signature — see
                         // the module doc comment.
-                        let sig = item.map(ToString::to_string).unwrap_or_default();
-                        out.push(StreamEvent::SignatureDelta { signature: sig });
+                        pre_close.push(StreamEvent::SignatureDelta {
+                            signature: item.map(ToString::to_string).unwrap_or_default(),
+                        });
                     }
-                    out.push(StreamEvent::ContentBlockStop);
-                    self.open_index = None;
+                    Some("function_call") => {
+                        // Ground-truth resync, same as `function_call_arguments.done` above — belt and
+                        // suspenders for a provider that only ever sends the item-level `done` and
+                        // skips the dedicated per-field one.
+                        if let Some(args) = item
+                            .and_then(|i| i.get("arguments"))
+                            .and_then(Value::as_str)
+                        {
+                            pre_close.push(StreamEvent::InputJsonFinal {
+                                full_json: args.to_string(),
+                            });
+                        }
+                    }
+                    Some("message") => {
+                        if let Some(text) = message_item_text(item) {
+                            pre_close.push(StreamEvent::TextFinal { text });
+                        }
+                    }
+                    _ => {}
                 }
+                if self.open_index == Some(index) {
+                    out.extend(pre_close);
+                    self.close_focus_and_promote(&mut out);
+                } else if let Some(buf) = self.pending.get_mut(&index) {
+                    // The item finished while it was still buffered, waiting for promotion (e.g. it
+                    // opened, streamed some deltas, and finished entirely before the item that opened
+                    // ahead of it did). Append its own close to its own buffer — see `promote_pending`
+                    // for how an already-closed buffered item is handled once promoted.
+                    buf.extend(pre_close);
+                    buf.push(StreamEvent::ContentBlockStop);
+                }
+                // A `done` for neither the focus nor a pending index is a duplicate/stale event —
+                // ignored, as before.
             }
             "response.completed" | "response.incomplete" => self.finalize(data, &mut out),
             "response.failed" => {
@@ -962,7 +1108,15 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
                 partial_json: "\"SF\"}".into()
             }
         );
-        assert_eq!(events[7], StreamEvent::ContentBlockStop);
+        // `output_item.done` resyncs to the provider's own authoritative arguments before closing —
+        // see `message_item_text`'s sibling `Some("function_call")` resync arm.
+        assert_eq!(
+            events[7],
+            StreamEvent::InputJsonFinal {
+                full_json: "{\"city\":\"SF\"}".into()
+            }
+        );
+        assert_eq!(events[8], StreamEvent::ContentBlockStop);
         // Terminal: usage + a ToolUse-upgraded stop reason (status was "completed", but a tool call
         // happened).
         let usage = events
@@ -1060,10 +1214,11 @@ data: {"type":"response.output_text.delta","output_index":0,"delta":"partial"}
 
     #[test]
     fn interleaved_output_indices_force_close_the_previous_block() {
-        // Defensive case: if a provider ever interleaves two items' deltas (rather than the API's
-        // documented added→...→done sequencing), the decoder must still produce exactly one
-        // ContentBlockStop per item rather than corrupting the Accumulator's single-open-block state
-        // (which can only ever hold one block open — see `close_if_switching`'s doc comment).
+        // A provider genuinely interleaving two items' deltas (rather than the API's documented
+        // added→...→done sequencing per item) must still produce exactly one ContentBlockStop per
+        // item, whether the second item is buffered-then-promoted or closed while still buffered (see
+        // `Decoder::pending`'s doc comment) — never zero (a leaked open block) or more than one
+        // (a double-close).
         const SSE: &str = r#"
 data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"a"}}
 
@@ -1091,11 +1246,14 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
 
     #[test]
     fn stale_output_item_done_does_not_close_a_different_open_block() {
-        // Item 0 opens, item 1 opens (force-closing item 0 via `close_if_switching`), then item 0's
-        // own `output_item.done` arrives *late* — after item 1 is already the one open. Before the
-        // fix, `output_item.done`'s `ContentBlockStop` fired unconditionally, so this stale event
-        // would prematurely close item 1's still-accumulating block even though its index (0) doesn't
-        // match what's actually open (1).
+        // Item 0 opens and stays focus; item 1 opens while item 0 is still open, so it's buffered
+        // rather than preempting item 0 (see `Decoder::pending`). Item 0's own `output_item.done`
+        // closes it and promotes item 1's buffered `ToolUseStart`/delta into focus in one step, so the
+        // resulting event order happens to match what a naive unconditional-close-on-`done` would have
+        // produced for this particular non-overlapping-closure shape — but for the correct reason
+        // (buffering + promotion, not a dropped/truncated block), and the two IDs' arguments never
+        // cross-contaminate (proven more directly by
+        // `preempted_items_arguments_are_never_truncated_or_dropped` below).
         const SSE: &str = r#"
 data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"a"}}
 
@@ -1121,7 +1279,12 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
                     id: combine_tool_id("call_1", "fc_1"),
                     name: "a".into(),
                 },
-                // Item 1 opening force-closes item 0 — the only close attributable to item 0.
+                // Item 0's own `output_item.done` (its arguments never streamed any deltas, so this
+                // resync is the *only* source of its final value) closes it and promotes item 1's
+                // already-buffered `ToolUseStart`/delta in the same step.
+                StreamEvent::InputJsonFinal {
+                    full_json: "{}".into(),
+                },
                 StreamEvent::ContentBlockStop,
                 StreamEvent::ToolUseStart {
                     id: combine_tool_id("call_2", "fc_2"),
@@ -1130,12 +1293,14 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
                 StreamEvent::InputJsonDelta {
                     partial_json: "{\"y\":2}".into(),
                 },
-                // Item 0's stale `output_item.done` (index 0) is dropped here — item 1 (index 1) is
-                // what's actually open, so no ContentBlockStop/SignatureDelta fires for it.
                 StreamEvent::InputJsonDelta {
                     partial_json: "more".into(),
                 },
-                // Item 1's own `output_item.done` closes it — the only close attributable to item 1.
+                // Item 1's own `output_item.done` resyncs and closes it — the only close attributable
+                // to item 1, and index 0's earlier `done` (step above) never touches it.
+                StreamEvent::InputJsonFinal {
+                    full_json: "{\"y\":2}more".into(),
+                },
                 StreamEvent::ContentBlockStop,
                 StreamEvent::Usage(TokenUsage {
                     input_tokens: 1,
@@ -1146,6 +1311,178 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
                     stop_reason: StopReason::ToolUse,
                 },
             ]
+        );
+    }
+
+    /// Reconstructs each tool call's full concatenated JSON-argument buffer from a flat `StreamEvent`
+    /// list, mirroring `agent_core::agent::Accumulator::apply` exactly: everything between a
+    /// `ToolUseStart` and the next `ContentBlockStop` belongs to that call, `InputJsonDelta` appends,
+    /// and `InputJsonFinal` *replaces* the buffer outright (the resync this module's tests exist to
+    /// prove). Panics on malformed event shapes (a `ContentBlockStop`/`InputJsonDelta`/`InputJsonFinal`
+    /// with no open call) — this test-only helper is meant to fail loudly on a genuinely corrupted
+    /// sequence, not silently produce a wrong map.
+    fn reconstruct_tool_args(events: &[StreamEvent]) -> std::collections::HashMap<String, String> {
+        let mut out = std::collections::HashMap::new();
+        let mut open: Option<(String, String)> = None;
+        for ev in events {
+            match ev {
+                StreamEvent::ToolUseStart { id, .. } => {
+                    assert!(
+                        open.is_none(),
+                        "a ToolUseStart while another call is still open"
+                    );
+                    open = Some((id.clone(), String::new()));
+                }
+                StreamEvent::InputJsonDelta { partial_json } => {
+                    open.as_mut()
+                        .expect("an InputJsonDelta with no open tool call")
+                        .1
+                        .push_str(partial_json);
+                }
+                StreamEvent::InputJsonFinal { full_json } => {
+                    open.as_mut()
+                        .expect("an InputJsonFinal with no open tool call")
+                        .1
+                        .clone_from(full_json);
+                }
+                StreamEvent::ContentBlockStop => {
+                    if let Some((id, args)) = open.take() {
+                        out.insert(id, args);
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn preempted_items_arguments_are_never_truncated_or_dropped() {
+        // The concrete failure this whole buffering/promotion design (`Decoder::pending`) exists to
+        // fix: two genuinely interleaved parallel tool calls (item 0 opens, item 1 opens before item
+        // 0's own `done`, item 1 closes *while still buffered*, item 0 keeps streaming more arguments
+        // afterward, then item 0 finally closes). Before the fix, item 1 opening would force-close item
+        // 0 immediately via `close_if_switching`, permanently truncating item 0's arguments at whatever
+        // had streamed so far ("{\"a\":" here) — the rest ("1}") would either be silently lost or
+        // corrupt item 1's own accumulating buffer. Both calls must end up with their complete,
+        // uncorrupted argument strings.
+        const SSE: &str = r#"
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"a"}}
+
+data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"a\":"}
+
+data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_2","call_id":"call_2","name":"b"}}
+
+data: {"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"b\":2"}
+
+data: {"type":"response.function_call_arguments.delta","output_index":1,"delta":"}"}
+
+data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc_2","call_id":"call_2","name":"b","arguments":"{\"b\":2}"}}
+
+data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"1}"}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"a","arguments":"{\"a\":1}"}}
+
+data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, SSE).unwrap();
+        let args = reconstruct_tool_args(&events);
+        assert_eq!(
+            args.get(&combine_tool_id("call_1", "fc_1"))
+                .map(String::as_str),
+            Some("{\"a\":1}"),
+            "item 0's arguments must survive item 1 interleaving whole, not truncated at the \
+             preemption point: {args:#?}"
+        );
+        assert_eq!(
+            args.get(&combine_tool_id("call_2", "fc_2"))
+                .map(String::as_str),
+            Some("{\"b\":2}"),
+            "item 1 (buffered, closed before it was ever promoted) must still surface its own \
+             complete arguments once promoted, not be dropped: {args:#?}"
+        );
+        // Exactly two ToolUseStart/ContentBlockStop pairs — no phantom third block from either the
+        // promotion or the finalize-time flush double-closing something.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, StreamEvent::ToolUseStart { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, StreamEvent::ContentBlockStop))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn dropped_mid_stream_delta_is_corrected_by_the_final_resync() {
+        // The other concrete failure this design fixes: a relay/proxy hiccup silently drops one
+        // `function_call_arguments.delta` chunk with no transport-level error at all — nothing else
+        // would ever catch this. Before the fix, the decoder never resynced to the provider's own
+        // authoritative `function_call_arguments.done`/`output_item.done` value, so the final tool call
+        // would silently carry the corrupted (missing-a-chunk) arguments. Simulated here by simply never
+        // sending the "missing" delta in the first place — from the decoder's point of view, indis-
+        // tinguishable from one that was sent and lost in transit — and asserting the resync event
+        // still lands the correct, complete value.
+        const SSE: &str = r#"
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"get_weather"}}
+
+data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"city\":"}
+
+data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\"city\":\"SF\"}"}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"get_weather","arguments":"{\"city\":\"SF\"}"}}
+
+data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, SSE).unwrap();
+        let args = reconstruct_tool_args(&events);
+        assert_eq!(
+            args.get(&combine_tool_id("call_1", "fc_1"))
+                .map(String::as_str),
+            Some("{\"city\":\"SF\"}"),
+            "the dedicated function_call_arguments.done resync must recover the complete value even \
+             though the streamed deltas alone only ever summed to '{{\"city\":': {args:#?}"
+        );
+        // Both the dedicated `function_call_arguments.done` and `output_item.done`'s own
+        // belt-and-suspenders resync fire here (this test's SSE includes both) — each individually
+        // correct and idempotent (same authoritative value both times), so at least one, not
+        // necessarily exactly one.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::InputJsonFinal { .. })),
+            "expected at least one resync event: {events:#?}"
+        );
+    }
+
+    #[test]
+    fn text_item_resyncs_to_its_authoritative_content_on_output_item_done() {
+        // Same resync guarantee as tool-call arguments, for a plain text/refusal item — `output_item
+        // .done`'s `item.content` is the ground truth `message_item_text` extracts from.
+        const SSE: &str = r#"
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1"}}
+
+data: {"type":"response.output_text.delta","output_index":0,"delta":"Hel"}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1","content":[{"type":"output_text","text":"Hello, world!"}]}}
+
+data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, SSE).unwrap();
+        assert!(
+            events.contains(&StreamEvent::TextFinal {
+                text: "Hello, world!".into()
+            }),
+            "expected a TextFinal resync to the item's authoritative content: {events:#?}"
         );
     }
 

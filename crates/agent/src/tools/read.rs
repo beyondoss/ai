@@ -111,6 +111,7 @@ impl Tool for Read {
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing `path`".into()))?;
+        let path = super::normalize_path(path);
 
         // An image file is returned as an attachment the multimodal model can see, not decoded as
         // UTF-8 text (which would hand back garbage). Routing is decided primarily by sniffing the
@@ -122,8 +123,15 @@ impl Tool for Read {
         // below, so may as well route it through the clearer "image, but unreadable" error instead of a
         // confusing UTF-8-decode one. `read_image` re-sniffs internally too (for the *reported* format,
         // once it has the full file, not just this prefix).
-        if let Some(format) = sniff_image_format(path).or_else(|| extension_image_format(path)) {
-            return read_image(path, format);
+        if let Some(format) = sniff_image_format(&path).or_else(|| extension_image_format(&path)) {
+            // Decode/resize/re-encode is CPU-bound and can run for a while on a large image — matching
+            // pi's `resizeImageInProcess`, which runs its WASM decode/resize/encode in a worker thread
+            // specifically so it doesn't stall the event loop, keep it off this async runtime's worker
+            // threads too (same pattern as `grep`/`find`'s own blocking walks).
+            let path = path.clone();
+            return tokio::task::spawn_blocking(move || read_image(&path, format))
+                .await
+                .map_err(|e| ToolError::Execution(format!("image read task failed: {e}")))?;
         }
 
         let offset = input
@@ -140,7 +148,7 @@ impl Tool for Read {
         // Stream the file line-by-line rather than slurping it whole: a windowed read
         // (`offset`/`limit`) into a huge file shouldn't allocate the entire file first — we hold at
         // most one line plus the bounded output window.
-        let file = std::fs::File::open(path)
+        let file = std::fs::File::open(&path)
             .map_err(|e| ToolError::Execution(format!("read {path}: {e}")))?;
         let mut reader = BufReader::new(file);
 
@@ -337,6 +345,17 @@ fn read_image(path: &str, ext_format: image::ImageFormat) -> Result<ToolOutput, 
     let media_type = media_type_of(format);
 
     if base64_len(bytes.len()) <= MAX_IMAGE_BASE64_BYTES as usize {
+        // Magic-byte sniffing only confirms the file *starts like* an image; a truncated download, a
+        // bit-rotted file, or a crafted polyglot could still fail to actually decode. Validate before
+        // sending it to the model as one — matching pi's `resizeImageInProcess`, which always decodes
+        // first (even on its own already-fits fast path) rather than shipping raw bytes through
+        // unchecked. The original bytes are still sent unmodified on success — this only rules out
+        // sending something that isn't really a decodable image.
+        if let Err(e) = image::load_from_memory_with_format(&bytes, format) {
+            return Err(ToolError::InvalidInput(format!(
+                "image {path} does not decode as a valid {media_type} file: {e}"
+            )));
+        }
         let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
         return Ok(ToolOutput::image(
             format!("Read image {path} ({media_type}, {} bytes).", bytes.len()),
@@ -580,6 +599,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_normalizes_the_path_argument() {
+        // Proves `run` actually calls `super::normalize_path`, via its `@`-prefix-strip behavior
+        // (needs no `$HOME` mutation — see `expand_tilde`'s own direct unit tests for that half).
+        let f = tmp_file("alpha\n");
+        let at_prefixed = format!("@{}", f.path().to_str().unwrap());
+        let out = Read.run(json!({ "path": at_prefixed })).await.unwrap().text;
+        assert!(out.contains("alpha"));
+    }
+
+    #[tokio::test]
     async fn output_byte_budget_matches_the_shared_50kb_cap_not_a_bespoke_larger_one() {
         // `read`'s aggregate output budget used to be a bespoke 256KB constant, 5x pi's (and this
         // crate's other tools': grep/find/ls all share `output::DEFAULT_MAX_BYTES`, 50KB) uniform
@@ -670,11 +699,20 @@ mod tests {
 
     #[tokio::test]
     async fn reads_an_image_as_an_attachment() {
-        // A .png is returned as a base64 image attachment, not UTF-8-decoded into garbage text.
+        // A .png is returned as a base64 image attachment, not UTF-8-decoded into garbage text. Must
+        // be a genuinely decodable PNG, not just the 8-byte magic-number signature — `read_image`
+        // validates the bytes actually decode before sending them as an attachment.
+        let img = image::RgbImage::from_pixel(4, 4, image::Rgb([10, 20, 30]));
+        let mut png_bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut png_bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("shot.png");
-        // A minimal PNG header byte sequence is enough — we only base64 the bytes.
-        std::fs::write(&path, [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]).unwrap();
+        std::fs::write(&path, &png_bytes).unwrap();
         let out = Read
             .run(json!({ "path": path.to_str().unwrap() }))
             .await
@@ -689,6 +727,26 @@ mod tests {
         assert!(
             out.text.contains("Read image"),
             "a text note accompanies it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_small_file_with_valid_magic_bytes_but_no_real_image_body_is_rejected() {
+        // Magic-byte sniffing only looks at the leading signature — a truncated download, bit-rotted
+        // file, or crafted polyglot can pass that check without being a real, decodable image. Before
+        // this fix, a small-enough-to-skip-resizing file like this would be base64'd and sent to the
+        // model completely unvalidated.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt.png");
+        // The real 8-byte PNG signature, but nothing resembling an actual PNG chunk stream after it.
+        std::fs::write(&path, [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]).unwrap();
+        let err = Read
+            .run(json!({ "path": path.to_str().unwrap() }))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidInput(_)),
+            "a non-decodable image must be a clear tool error, not silently forwarded: {err:?}"
         );
     }
 
@@ -745,6 +803,50 @@ mod tests {
             out.text.contains("resized from"),
             "the resize must be noted in the text: {}",
             out.text
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn image_decode_and_resize_does_not_block_the_async_runtime() {
+        // On a `current_thread` runtime there is exactly one thread driving async tasks. If
+        // `read_image`'s CPU-bound decode/resize/encode ran inline instead of on `spawn_blocking`'s
+        // separate pool, it would monopolize that one thread and the concurrent ticker task below
+        // could make *zero* progress until the read finished — deterministic, not a timing threshold.
+        let width = MAX_IMAGE_DIMENSION + 800;
+        let height = 600;
+        let img = image::RgbImage::from_fn(width, height, |x, y| {
+            let h = (x.wrapping_mul(2654435761) ^ y.wrapping_mul(40503)).wrapping_add(0x9e3779b9);
+            image::Rgb([
+                (h & 0xff) as u8,
+                ((h >> 8) & 0xff) as u8,
+                ((h >> 16) & 0xff) as u8,
+            ])
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.bmp");
+        image::DynamicImage::ImageRgb8(img)
+            .save_with_format(&path, image::ImageFormat::Bmp)
+            .unwrap();
+
+        let ticks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ticks_task = ticks.clone();
+        let ticker = tokio::spawn(async move {
+            loop {
+                ticks_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        });
+
+        let out = Read
+            .run(json!({ "path": path.to_str().unwrap() }))
+            .await
+            .unwrap();
+        ticker.abort();
+
+        assert_eq!(out.images.len(), 1, "the read must still succeed");
+        assert!(
+            ticks.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "a concurrent async task must make progress while image decode/resize is running"
         );
     }
 

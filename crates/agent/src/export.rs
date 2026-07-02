@@ -1,17 +1,23 @@
 //! Export a session's transcript as a single, self-contained HTML file — pi's `export_html`, for
 //! sharing or reviewing a conversation outside the control protocol (no client, no server, just a
-//! browser). Deliberately plain: one static page, inline CSS, no external assets or JS, so the file
-//! is portable and viewable offline exactly as generated. Message text is rendered as markdown
-//! (`render_markdown`, via `pulldown-cmark`) — server-side, at export time, rather than pi's own
-//! approach of vendoring `marked`/`highlight.js` and running them client-side inside the exported
-//! file — so this crate's "no JS" design holds even for formatted output. Deliberately **not**
-//! paired with a real syntax-highlighting crate (e.g. `syntect`): that bundles several MB of
+//! browser). Deliberately plain: one static page, inline CSS, no external assets or **client-side**
+//! JS, so the file is portable and viewable offline exactly as generated — `<details>`/`<summary>`
+//! (native HTML, no script) is used for the one genuinely interactive piece, branch navigation (see
+//! [`render_branches_diverging_at`]), so that stays true even though the page isn't purely static
+//! reading order anymore. Message text is rendered as markdown (`render_markdown`, via
+//! `pulldown-cmark`) — server-side, at export time, rather than pi's own approach of vendoring
+//! `marked`/`highlight.js` and running them client-side inside the exported file. Deliberately
+//! **not** paired with a real syntax-highlighting crate (e.g. `syntect`): that bundles several MB of
 //! syntax/theme data and would slow every build of this CLI, including `run`/`serve`, which never
 //! touch export, for a nice-to-have that fenced code blocks already get a useful approximation of via
 //! plain `<pre><code class="language-x">` (language-tagged, monospaced, just not token-colored) —
 //! except a `diff`-tagged block, or any tool-result content shaped like a unified diff, which does get
 //! real per-line +/- coloring (`diff_html`/`looks_like_diff`), since that needs no language-specific
-//! lexer at all.
+//! lexer at all. The most common file-mutating/shell tool calls (`edit`/`write`/`bash`/`read`) get a
+//! dedicated renderer (`render_tool_call`) instead of raw pretty-printed JSON — `edit` in particular
+//! reuses the diff-coloring machinery to show its before/after as a real (if not line-diffed) diff;
+//! everything else (`grep`/`find`/`ls`, the Beyond platform tools) falls back to generic JSON, which
+//! already reads fine for those.
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -52,42 +58,55 @@ pub fn render_html(
         messages.len()
     ));
     out.push_str("</header>\n<main>\n");
-    for message in messages {
+    // Every branch is rendered *inline*, immediately after the message it actually diverged from
+    // (`shared` is a message-count prefix — the branch shares `messages[..shared]` with the active
+    // path) — a real tree laid out in reading order, rather than one flat "other branches" dump
+    // disconnected from the point it forked from at the bottom of the page. `shared == 0` branches
+    // (forked before the very first message) render before the loop starts. Numbered in the order
+    // they appear so a reader can refer to "branch 2" unambiguously even though they're scattered
+    // through the page rather than listed together.
+    let mut branch_number = render_branches_diverging_at(&mut out, branches, 0, 1);
+    for (i, message) in messages.iter().enumerate() {
         render_message(&mut out, message);
+        branch_number = render_branches_diverging_at(&mut out, branches, i + 1, branch_number);
     }
     out.push_str("</main>\n");
-    if !branches.is_empty() {
-        render_branches(&mut out, branches);
-    }
     out.push_str("</body>\n</html>\n");
     out
 }
 
-/// Render every abandoned branch as its own labeled section after the main transcript — only the part
-/// that actually diverges from `messages` (`branch[shared..]`), so the shared prefix already shown
-/// above isn't duplicated. A session that's never branched never calls this ([`render_html`] skips it
-/// when `branches` is empty), so the common case renders exactly as it always has.
-fn render_branches(out: &mut String, branches: &[(usize, Vec<Message>)]) {
-    out.push_str("<section class=\"branches\">\n");
-    out.push_str(&format!("<h2>Other branches ({})</h2>\n", branches.len()));
-    for (i, (shared, branch_messages)) in branches.iter().enumerate() {
-        out.push_str("<div class=\"branch\">\n");
+/// Render every branch whose `shared` divergence point equals `at`, as a collapsed-by-default
+/// `<details>` block — expandable inline without leaving the reader's place in the main transcript,
+/// and with zero JS (`<details>`/`<summary>` is native HTML). `next_number` is threaded through by the
+/// caller's loop so branch numbering stays sequential across every divergence point in one document,
+/// not just within one call. Only the part that actually diverges from the active path
+/// (`branch[shared..]`) is rendered — the shared prefix is already shown once, in the main transcript.
+fn render_branches_diverging_at(
+    out: &mut String,
+    branches: &[(usize, Vec<Message>)],
+    at: usize,
+    next_number: usize,
+) -> usize {
+    let mut n = next_number;
+    for (shared, branch_messages) in branches.iter().filter(|(shared, _)| *shared == at) {
         let note = if *shared == 0 {
             "forked from the start".to_string()
         } else {
             format!("forked after message {shared}")
         };
         out.push_str(&format!(
-            "<div class=\"branch-title\">Branch {} &middot; {}</div>\n",
-            i + 1,
-            html_escape(&note)
+            "<details class=\"branch\"><summary>Branch {n} &middot; {} &middot; {} message(s)\
+             </summary>\n<div class=\"branch-body\">\n",
+            html_escape(&note),
+            branch_messages.len() - shared
         ));
         for message in &branch_messages[*shared..] {
             render_message(out, message);
         }
-        out.push_str("</div>\n");
+        out.push_str("</div>\n</details>\n");
+        n += 1;
     }
-    out.push_str("</section>\n");
+    n
 }
 
 const STYLE: &str = "<style>\n\
@@ -110,10 +129,13 @@ border-radius: 4px; overflow-x: auto; margin: 0.25rem 0; }\n\
 .thinking { font-style: italic; color: #888; border-left: 3px solid #555; padding-left: 0.75rem; \
 margin: 0.5rem 0; }\n\
 img.attachment { max-width: 100%; border-radius: 4px; margin: 0.5rem 0; display: block; }\n\
-.branches { border-top: 1px dashed #444; margin-top: 2rem; padding-top: 1rem; }\n\
-.branches h2 { font-size: 1rem; color: #aaa; margin: 0 0 1rem; }\n\
-.branch { border: 1px dashed #444; border-radius: 6px; padding: 0.75rem; margin-bottom: 1rem; }\n\
-.branch-title { font-size: 0.8rem; color: #999; margin-bottom: 0.5rem; }\n\
+.branch { border: 1px dashed #555; border-radius: 6px; padding: 0.5rem 0.75rem; margin: 0.75rem 0; \
+background: #232323; }\n\
+.branch summary { cursor: pointer; font-size: 0.8rem; color: #bbb; user-select: none; }\n\
+.branch summary:hover { color: #fff; }\n\
+.branch[open] summary { margin-bottom: 0.5rem; color: #fff; }\n\
+.branch-body { border-left: 2px solid #555; padding-left: 0.75rem; }\n\
+.bash-command { color: #7ee2a8; }\n\
 .markdown { line-height: 1.5; }\n\
 .markdown p { margin: 0.4rem 0; }\n\
 .markdown p:first-child { margin-top: 0; }\n\
@@ -177,14 +199,7 @@ fn render_block(out: &mut String, block: &ContentBlock) {
         ContentBlock::RedactedThinking { .. } => {
             out.push_str("<div class=\"thinking\">[redacted thinking]</div>\n");
         }
-        ContentBlock::ToolUse { name, input, .. } => {
-            out.push_str(&format!(
-                "<div class=\"tool-call\"><div class=\"tool-title\">Called <code>{}</code></div>\n\
-                 <pre>{}</pre></div>\n",
-                html_escape(name),
-                html_escape(&serde_json::to_string_pretty(input).unwrap_or_default())
-            ));
-        }
+        ContentBlock::ToolUse { name, input, .. } => render_tool_call(out, name, input),
         ContentBlock::ToolResult {
             content,
             is_error,
@@ -216,6 +231,123 @@ fn render_block(out: &mut String, block: &ContentBlock) {
         }
         ContentBlock::Image { source } => render_image(out, &source.media_type, &source.data),
     }
+}
+
+/// Dispatch a tool call to a renderer that understands its specific argument shape, falling back to
+/// generic pretty-printed JSON for anything not specially handled (`grep`/`find`/`ls`/the Beyond
+/// platform tools) — a structured render for the common file-mutating/shell tools is worth the
+/// specific-casing; the rest already read fine as JSON (a pattern, a path, a glob).
+fn render_tool_call(out: &mut String, name: &str, input: &serde_json::Value) {
+    match name {
+        "edit" => render_edit_call(out, input),
+        "write" => render_write_call(out, input),
+        "bash" => render_bash_call(out, input),
+        "read" => render_read_call(out, input),
+        _ => render_generic_call(out, name, input),
+    }
+}
+
+fn render_generic_call(out: &mut String, name: &str, input: &serde_json::Value) {
+    out.push_str(&format!(
+        "<div class=\"tool-call\"><div class=\"tool-title\">Called <code>{}</code></div>\n\
+         <pre>{}</pre></div>\n",
+        html_escape(name),
+        html_escape(&serde_json::to_string_pretty(input).unwrap_or_default())
+    ));
+}
+
+/// Render an `edit` call as a real diff (reusing [`diff_html`]'s `+`/`-` coloring) instead of raw
+/// JSON — each old/new pair becomes a `-`-colored block of the old text followed by a `+`-colored
+/// block of the new text. Falls back to the generic JSON renderer if `input` doesn't parse as a valid
+/// edit shape (`crate::tools::edit::parse_edits`, the same parser the tool itself uses, so exported
+/// rendering never disagrees with what actually ran).
+fn render_edit_call(out: &mut String, input: &serde_json::Value) {
+    let path = input.get("path").and_then(serde_json::Value::as_str);
+    let Ok(edits) = crate::tools::edit::parse_edits(input) else {
+        return render_generic_call(out, "edit", input);
+    };
+    let title = match path {
+        Some(p) => format!("Edited <code>{}</code>", html_escape(p)),
+        None => "Edit".to_string(),
+    };
+    out.push_str(&format!(
+        "<div class=\"tool-call\"><div class=\"tool-title\">{title}</div>\n"
+    ));
+    for (old, new) in &edits {
+        out.push_str(&diff_pair_html(old, new));
+    }
+    out.push_str("</div>\n");
+}
+
+/// Render an old/new string pair with the same per-line `+`/`-` coloring [`diff_html`] gives a real
+/// unified diff — every line of `old` colored as removed, every line of `new` as added. Not a real
+/// line-level diff (no common-prefix/suffix detection — that's a bigger algorithm than this static,
+/// no-JS export needs), just old-then-new, clearly colored.
+fn diff_pair_html(old: &str, new: &str) -> String {
+    let mut out = String::from("<pre><code class=\"language-diff\">");
+    for line in old.lines() {
+        out.push_str(&format!(
+            "<span class=\"diff-del\">-{}</span>\n",
+            html_escape(line)
+        ));
+    }
+    for line in new.lines() {
+        out.push_str(&format!(
+            "<span class=\"diff-add\">+{}</span>\n",
+            html_escape(line)
+        ));
+    }
+    out.push_str("</code></pre>\n");
+    out
+}
+
+/// Render a `write` call: the target path as the title, full content in a plain `<pre>` (not
+/// markdown — it's raw file content).
+fn render_write_call(out: &mut String, input: &serde_json::Value) {
+    let path = input.get("path").and_then(serde_json::Value::as_str);
+    let content = input.get("content").and_then(serde_json::Value::as_str);
+    let title = match path {
+        Some(p) => format!("Wrote <code>{}</code>", html_escape(p)),
+        None => "Write".to_string(),
+    };
+    out.push_str(&format!(
+        "<div class=\"tool-call\"><div class=\"tool-title\">{title}</div>\n"
+    ));
+    if let Some(content) = content {
+        out.push_str(&format!("<pre>{}</pre>", html_escape(content)));
+    }
+    out.push_str("</div>\n");
+}
+
+/// Render a `bash` call as a shell-prompt-styled command line, optionally noting a non-default `cwd`.
+fn render_bash_call(out: &mut String, input: &serde_json::Value) {
+    let command = input.get("command").and_then(serde_json::Value::as_str);
+    let cwd = input.get("cwd").and_then(serde_json::Value::as_str);
+    out.push_str("<div class=\"tool-call\"><div class=\"tool-title\">Ran a shell command");
+    if let Some(cwd) = cwd {
+        out.push_str(&format!(" in <code>{}</code>", html_escape(cwd)));
+    }
+    out.push_str("</div>\n");
+    if let Some(command) = command {
+        out.push_str(&format!(
+            "<pre class=\"bash-command\">$ {}</pre>",
+            html_escape(command)
+        ));
+    }
+    out.push_str("</div>\n");
+}
+
+/// Render a `read` call: just the path being read — the tool's own args carry nothing else worth a
+/// title beyond that.
+fn render_read_call(out: &mut String, input: &serde_json::Value) {
+    let path = input.get("path").and_then(serde_json::Value::as_str);
+    let title = match path {
+        Some(p) => format!("Read <code>{}</code>", html_escape(p)),
+        None => "Read".to_string(),
+    };
+    out.push_str(&format!(
+        "<div class=\"tool-call\"><div class=\"tool-title\">{title}</div></div>\n"
+    ));
 }
 
 /// Render `text` as HTML via CommonMark plus a few GFM extensions (strikethrough/tables/task lists) —
@@ -413,21 +545,86 @@ mod tests {
 
     #[test]
     fn renders_text_tool_use_and_tool_result_blocks() {
+        // `grep` (and every other tool without a dedicated renderer — see
+        // `renders_edit_write_bash_and_read_calls_with_dedicated_rendering` below for those) still
+        // falls back to generic pretty-printed JSON.
         let messages = vec![
-            Message::user("please read a.rs"),
+            Message::user("please search a.rs"),
             Message::assistant(vec![ContentBlock::ToolUse {
                 id: "1".into(),
-                name: "read".into(),
-                input: serde_json::json!({ "path": "a.rs" }),
+                name: "grep".into(),
+                input: serde_json::json!({ "pattern": "fn main", "path": "a.rs" }),
             }]),
             Message::tool_result("1", "fn main() {}", false),
         ];
         let html = render_html(&meta(), &messages, &[]);
-        assert!(html.contains("please read a.rs"));
-        assert!(html.contains("Called <code>read</code>"));
-        assert!(html.contains("&quot;path&quot;"));
+        assert!(html.contains("please search a.rs"));
+        assert!(html.contains("Called <code>grep</code>"));
+        assert!(html.contains("&quot;pattern&quot;"));
         assert!(html.contains("fn main() {}"));
         assert!(html.contains("class=\"tool-result\""));
+    }
+
+    #[test]
+    fn renders_edit_write_bash_and_read_calls_with_dedicated_rendering() {
+        let messages = vec![
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "1".into(),
+                name: "edit".into(),
+                input: serde_json::json!({
+                    "path": "src/main.rs",
+                    "old_string": "let x = 1;",
+                    "new_string": "let x = 2;",
+                }),
+            }]),
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "2".into(),
+                name: "write".into(),
+                input: serde_json::json!({ "path": "notes.md", "content": "hello world" }),
+            }]),
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "3".into(),
+                name: "bash".into(),
+                input: serde_json::json!({ "command": "cargo test", "cwd": "/proj" }),
+            }]),
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "4".into(),
+                name: "read".into(),
+                input: serde_json::json!({ "path": "README.md" }),
+            }]),
+        ];
+        let html = render_html(&meta(), &messages, &[]);
+
+        // edit: a real diff, not raw JSON — old text `-`-colored, new text `+`-colored.
+        assert!(html.contains("Edited <code>src/main.rs</code>"));
+        assert!(html.contains("class=\"diff-del\">-let x = 1;"));
+        assert!(html.contains("class=\"diff-add\">+let x = 2;"));
+        assert!(
+            !html.contains("&quot;old_string&quot;"),
+            "must not fall back to raw JSON: {html}"
+        );
+
+        // write: path as title, content verbatim.
+        assert!(html.contains("Wrote <code>notes.md</code>"));
+        assert!(html.contains("hello world"));
+
+        // bash: shell-prompt-styled command line, cwd noted.
+        assert!(html.contains("Ran a shell command in <code>/proj</code>"));
+        assert!(html.contains("$ cargo test"));
+
+        // read: just the path.
+        assert!(html.contains("Read <code>README.md</code>"));
+    }
+
+    #[test]
+    fn edit_call_falls_back_to_generic_rendering_when_input_does_not_parse_as_an_edit() {
+        let messages = vec![Message::assistant(vec![ContentBlock::ToolUse {
+            id: "1".into(),
+            name: "edit".into(),
+            input: serde_json::json!({ "path": "src/main.rs" }), // missing old_string/new_string
+        }])];
+        let html = render_html(&meta(), &messages, &[]);
+        assert!(html.contains("Called <code>edit</code>"));
     }
 
     #[test]
@@ -529,7 +726,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_abandoned_branches_after_the_main_transcript_skipping_the_shared_prefix() {
+    fn renders_abandoned_branches_inline_after_the_message_they_diverged_from() {
         let messages = vec![Message::user("what should I do?")];
         let branches = vec![(
             1usize,
@@ -539,19 +736,63 @@ mod tests {
             ],
         )];
         let html = render_html(&meta(), &messages, &branches);
-        assert!(html.contains("Other branches (1)"));
+        // A collapsible <details> block — expandable inline, positioned right after the message it
+        // actually forked from, not a separate flat section at the bottom of the page.
+        assert!(html.contains("<details class=\"branch\">"));
+        assert!(html.contains("Branch 1"));
         assert!(html.contains("forked after message 1"));
         assert!(html.contains("this is the divergent branch content"));
         // The shared prefix (message 0, "what should I do?") must appear exactly once — from the main
-        // transcript — not duplicated inside the branch section.
+        // transcript — not duplicated inside the branch's own body.
         assert_eq!(html.matches("what should I do?").count(), 1);
+        // The branch content appears strictly after the message it diverged from, not before it or in
+        // a wholly separate part of the document.
+        let main_msg_pos = html.find("what should I do?").unwrap();
+        let branch_pos = html.find("this is the divergent branch content").unwrap();
+        assert!(branch_pos > main_msg_pos);
+    }
+
+    #[test]
+    fn a_branch_diverging_before_the_first_message_renders_before_it() {
+        let messages = vec![Message::user("second path")];
+        let branches = vec![(0usize, vec![Message::user("first path, abandoned")])];
+        let html = render_html(&meta(), &messages, &branches);
+        assert!(html.contains("forked from the start"));
+        let branch_pos = html.find("first path, abandoned").unwrap();
+        let main_msg_pos = html.find("second path").unwrap();
+        assert!(branch_pos < main_msg_pos);
+    }
+
+    #[test]
+    fn multiple_branches_at_different_points_are_numbered_sequentially() {
+        let messages = vec![Message::user("a"), Message::user("b")];
+        let branches = vec![
+            (
+                1usize,
+                vec![Message::user("a"), Message::user("branch-one")],
+            ),
+            (
+                2usize,
+                vec![
+                    Message::user("a"),
+                    Message::user("b"),
+                    Message::user("branch-two"),
+                ],
+            ),
+        ];
+        let html = render_html(&meta(), &messages, &branches);
+        assert!(html.contains("Branch 1"));
+        assert!(html.contains("Branch 2"));
+        let b1 = html.find("branch-one").unwrap();
+        let b2 = html.find("branch-two").unwrap();
+        assert!(b1 < b2, "branches must appear in divergence order: {html}");
     }
 
     #[test]
     fn no_branches_section_when_there_are_no_abandoned_branches() {
         let html = render_html(&meta(), &[Message::user("hi")], &[]);
-        assert!(!html.contains("<section class=\"branches\">"));
-        assert!(!html.contains("Other branches"));
+        assert!(!html.contains("<details class=\"branch\">"));
+        assert!(!html.contains("forked"));
     }
 
     #[test]

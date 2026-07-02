@@ -268,7 +268,7 @@ fn expand_brace(inner: &str, args: &[String], all: &str) -> String {
             Some((s, l)) => (s, Some(l)),
             None => (spec, None),
         };
-        let Some(start) = parse_index(start_str) else {
+        let Some(start) = parse_slice_start(start_str) else {
             return String::new();
         };
         let slice: &[String] = match len_str.and_then(parse_usize) {
@@ -314,6 +314,15 @@ fn positional<'a>(args: &'a [String], digits: &str) -> &'a str {
 fn parse_index(s: &str) -> Option<usize> {
     let n: usize = s.parse().ok()?;
     n.checked_sub(1)
+}
+
+/// Parse a `${@:N}` slice-start number into a 0-based index, matching pi's own bash-convention clamp:
+/// `N=0` means "from the start" (same as `N=1`), not "one before the first argument" — unlike
+/// [`parse_index`] (used for `$N`/`${N:-default}`, where a positional `$0` has no meaning and stays
+/// empty), a slice start is always a valid index, so `saturating_sub` clamps instead of failing.
+fn parse_slice_start(s: &str) -> Option<usize> {
+    let n: usize = s.parse().ok()?;
+    Some(n.saturating_sub(1))
 }
 
 fn parse_usize(s: &str) -> Option<usize> {
@@ -431,6 +440,15 @@ mod tests {
     }
 
     #[test]
+    fn positional_zero_is_empty() {
+        // `$0`/`${0:-default}` have no meaning in this 1-based scheme and stay empty — unlike
+        // `${@:0}` (see `array_slice_start_zero_clamps_to_all_args`), where 0 is a valid slice start
+        // that bash convention clamps to 1, not an invalid positional index.
+        let t = template("a=[$0] b=[${0:-fallback}]");
+        assert_eq!(expand_if_slash("/x one two", &[t]), "a=[] b=[fallback]");
+    }
+
+    #[test]
     fn quoted_arguments_stay_together() {
         let args = parse_command_args(r#"foo "bar baz" 'qux quux' end"#);
         assert_eq!(args, vec!["foo", "bar baz", "qux quux", "end"]);
@@ -455,6 +473,17 @@ mod tests {
         let t = template("rest=[${@:2}] two=[${@:2:2}]");
         let expanded = expand_if_slash("/x a b c d e", &[t]);
         assert_eq!(expanded, "rest=[b c d e] two=[b c]");
+    }
+
+    #[test]
+    fn array_slice_start_zero_clamps_to_all_args() {
+        // pi treats `${@:0}` the same as `${@:1}` — bash convention that positional args start at 1,
+        // so a slice start of 0 means "from the start" rather than an invalid/negative index. Unlike
+        // a bare `$0` (no meaning here, stays empty — see `positional_zero_is_empty`), `${@:0}` is a
+        // slice and every slice start is valid.
+        let t = template("all=[${@:0}] two=[${@:0:2}]");
+        let expanded = expand_if_slash("/x a b c d e", &[t]);
+        assert_eq!(expanded, "all=[a b c d e] two=[a b]");
     }
 
     #[test]

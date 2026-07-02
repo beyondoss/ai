@@ -112,11 +112,30 @@ enum Command {
         /// Register no tools at all — a pure-conversation run. Wins over `--tools`/`--exclude-tools`.
         #[arg(long, default_value_t = false)]
         no_tools: bool,
+        /// Disable skills discovery/loading — no `<available_skills>` listing in the system prompt, and
+        /// a `/skill:name` invocation in the task message is sent through unexpanded. Matches pi's own
+        /// `--no-skills`. A one-shot `run` has no `reload` to re-enable it mid-process, unlike `serve`.
+        #[arg(long, default_value_t = false)]
+        no_skills: bool,
+        /// Disable prompt-template discovery/loading — a `/name` invocation in the task message is sent
+        /// through unexpanded instead of being resolved against `.claude/prompts/*.md`. Matches pi's own
+        /// `--no-prompt-templates`.
+        #[arg(long, default_value_t = false)]
+        no_prompt_templates: bool,
         /// Persist this run to a specific session file, creating it if missing or continuing it if it
         /// already exists — so a later `run --session <path>` picks up where this one left off. Wins
         /// over `--continue` if both are given.
         #[arg(long)]
         session: Option<String>,
+        /// Use this exact session id instead of a freshly generated one — a caller (a script, a test
+        /// harness) that wants a known, predictable id to correlate against rather than parsing it back
+        /// out of the run's own output. Applies whenever a *new* `SessionMeta` is minted: a fresh
+        /// `--session <path>` (one that doesn't already exist) or a plain ephemeral run with neither
+        /// `--session` nor `--continue`; ignored when reopening an existing `--session <path>` or
+        /// resuming via `--continue` (the id is already fixed by whatever's on disk). Matches pi's own
+        /// `--session-id` flag.
+        #[arg(long)]
+        session_id: Option<String>,
         /// Continue the most recent session for the current directory (the same
         /// `~/.claude/sessions/<encoded-cwd>/` repo `serve` defaults to), creating one if this is the
         /// first run here. Ignored if `--session` is also given.
@@ -217,6 +236,14 @@ enum Command {
         /// reference agent's no-default.
         #[arg(long, env = "AI_AGENT_BASH_TIMEOUT_MS")]
         bash_timeout_ms: Option<u64>,
+        /// Run `bash` commands through this shell instead of the auto-resolved one (`/bin/bash`, else
+        /// `bash` on `$PATH`, else `sh`) — for a non-standard environment (Cygwin, a container without
+        /// `/bin/bash` at the expected path, a hardened/audited shell wrapper) where auto-detection
+        /// would pick the wrong binary. Matches pi's own `shellPath` setting. Checked to exist once
+        /// here, at startup — a bad path fails the process immediately instead of surfacing as a
+        /// confusing spawn error on the first `bash` call.
+        #[arg(long, env = "AI_AGENT_BASH_SHELL_PATH")]
+        bash_shell_path: Option<String>,
         /// Restrict the tool set to exactly these names (comma-separated), dropping everything else.
         /// Fixed for the process, like `--system-prompt`; survives `set_model`/`set_thinking` rebuilds.
         #[arg(long, env = "AI_AGENT_TOOLS", value_delimiter = ',')]
@@ -300,7 +327,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tools,
             exclude_tools,
             no_tools,
+            no_skills,
+            no_prompt_templates,
             session,
+            session_id,
             r#continue,
             export,
             json,
@@ -316,7 +346,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tools,
                 exclude_tools,
                 no_tools,
+                no_skills,
+                no_prompt_templates,
                 session,
+                session_id,
                 r#continue,
                 export,
                 json,
@@ -345,6 +378,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             retry_max_retries,
             retry_base_delay_ms,
             bash_timeout_ms,
+            bash_shell_path,
             tools,
             exclude_tools,
             no_tools,
@@ -352,8 +386,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let key = key
                 .ok_or("no gateway key: pass --key or set AI_AGENT_KEY (a bai_v1… virtual key)")?;
+            if let Some(path) = &bash_shell_path {
+                if !std::path::Path::new(path).exists() {
+                    return Err(format!("--bash-shell-path not found: {path}").into());
+                }
+            }
             let system = system_prompt.unwrap_or_else(|| {
-                let mut reg = tools::default_registry_with(bash_timeout_ms);
+                // Shell-path override doesn't affect this registry's use (listing tool
+                // names/descriptions for the default system prompt) — `describe()` doesn't mention it.
+                let mut reg = tools::default_registry_with(bash_timeout_ms, None);
                 tools::apply_filter(
                     &mut reg,
                     tools.as_deref(),
@@ -384,6 +425,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 retry_max_retries,
                 retry_base_delay_ms: retry_base_delay_ms.map(std::time::Duration::from_millis),
                 bash_timeout_ms,
+                bash_shell_path,
                 tools,
                 exclude_tools,
                 no_tools,
@@ -501,22 +543,68 @@ fn read_stdin_if_piped() -> Option<String> {
     }
 }
 
+/// [`run_turn_once`], wrapped with the same whole-run auto-retry `serve.rs`'s `"prompt"` command gets
+/// (see `beyond_ai_agent::retry`) — a run that ends in a transient-looking error (one already
+/// exhausted `agent_core`'s own within-turn retries) is re-invoked from scratch against the same
+/// session, up to `retry::MAX_RUN_RETRIES` times with backoff, rather than failing a whole `agent run`
+/// invocation (plausibly unattended — a cron job, a CI step) outright on a hiccup that `serve` would
+/// have quietly recovered from. A retried attempt's own streamed output (text/JSON events) follows
+/// directly after a `[retrying...]` stderr notice — nothing is erased, matching how `serve` demarcates
+/// attempts with an `auto_retry` frame rather than hiding the failed one.
+async fn run_turn(
+    agent: &Agent,
+    session: &mut Session,
+    json: bool,
+) -> agent_core::Result<agent_core::StopReason> {
+    let mut attempt = 0u32;
+    loop {
+        let result = run_turn_once(agent, session, json).await;
+        match &result {
+            Err(e)
+                if attempt < beyond_ai_agent::retry::MAX_RUN_RETRIES
+                    && beyond_ai_agent::retry::is_retryable_whole_run(e) =>
+            {
+                attempt += 1;
+                let delay = beyond_ai_agent::retry::backoff(attempt);
+                eprintln!(
+                    "\n[transient error, retrying {attempt}/{}: {e}]",
+                    beyond_ai_agent::retry::MAX_RUN_RETRIES
+                );
+                tokio::time::sleep(delay).await;
+            }
+            _ => return result,
+        }
+    }
+}
+
 /// Stream one turn's assistant reply to stdout. In text mode (`json: false`): live text, a
 /// `[tool: name]` marker when the model calls one, then a trailing blank line once the turn ends. In
 /// JSON mode (`--json`): one `AgentEvent` object per line — the full observation surface (tool
 /// calls/results, turn boundaries, compaction), the same shape `serve`'s NDJSON protocol streams,
 /// rather than only the raw model-stream deltas `StreamEvent` carries.
-async fn run_turn(agent: &Agent, session: &mut Session, json: bool) -> agent_core::Result<()> {
+///
+/// Returns the turn's final [`agent_core::StopReason`] — the *last* one observed, for a multi-step
+/// turn that made several model round-trips before actually finishing — so the caller can tell a
+/// refusal apart from a normal completion after streaming ends (`run_task`'s exit-code check).
+async fn run_turn_once(
+    agent: &Agent,
+    session: &mut Session,
+    json: bool,
+) -> agent_core::Result<agent_core::StopReason> {
+    let mut stop_reason = agent_core::StopReason::default();
     if json {
         agent
             .run_events(session, |ev| {
+                if let agent_core::AgentEvent::TurnEnd { stop_reason: r, .. } = &ev {
+                    stop_reason = *r;
+                }
                 if let Ok(line) = serde_json::to_string(&ev) {
                     println!("{line}");
                     let _ = std::io::stdout().flush();
                 }
             })
             .await?;
-        return Ok(());
+        return Ok(stop_reason);
     }
     agent
         .run(session, |ev| match ev {
@@ -535,10 +623,55 @@ async fn run_turn(agent: &Agent, session: &mut Session, json: bool) -> agent_cor
                 print!("{partial_json}");
                 let _ = std::io::stdout().flush();
             }
+            StreamEvent::MessageStop { stop_reason: r } => {
+                stop_reason = *r;
+            }
             _ => {}
         })
         .await?;
     println!();
+    Ok(stop_reason)
+}
+
+/// A [`agent_core::CheckpointHook`] for one-shot `run`. Unlike `serve`'s channel-based
+/// `ChannelCheckpoint` (which forwards through an `mpsc` channel to avoid stalling a `select!` loop
+/// reading stdin concurrently), `run` has no concurrent event source to interleave with — a direct
+/// blocking append inside the async callback is the simplest correct thing here, not a missing
+/// optimization. Persists every mid-run checkpoint incrementally, the same guarantee `serve` gives
+/// every session: without this, only the *end* of each whole turn was ever persisted (via
+/// `persist_run_tail`, after `run_turn` returns), so a crash mid-turn — after several tool
+/// round-trips already ran real commands or edited real files — lost all record of them, with the
+/// session file (if any) unable to distinguish that from "nothing happened yet".
+struct DirectCheckpoint(Arc<std::sync::Mutex<Option<SessionStore>>>);
+
+#[async_trait::async_trait]
+impl agent_core::CheckpointHook for DirectCheckpoint {
+    async fn checkpoint(&self, session: &Session) {
+        // Best-effort, matching `serve`'s own checkpoint hook: the run itself must not fail just
+        // because incremental persistence couldn't (a real I/O failure here is still surfaced —
+        // eprintln, not silently swallowed — and the next successful persist, or `persist_run_tail`
+        // after the turn ends, will catch up whatever this attempt missed).
+        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(store) = guard.as_mut() {
+            if let Err(e) = store.append_new(&session.messages) {
+                eprintln!("run: failed to persist checkpoint: {e}");
+            }
+        }
+    }
+}
+
+/// Persist whatever's new in `session` since the last append — the tail-covering persist after a
+/// whole turn ends (a checkpoint never fires for the turn's own final assistant message; see
+/// `agent_core::Agent::run_turn`'s doc comment on where checkpoints land). A no-op when `run` isn't
+/// persisting at all (`store`'s inner `Option` is `None`) or when `DirectCheckpoint` already covered
+/// everything (`SessionStore::append_new`'s own `messages.len() <= self.persisted` dedup guard).
+fn persist_run_tail(
+    store: &Arc<std::sync::Mutex<Option<SessionStore>>>,
+    session: &Session,
+) -> std::io::Result<()> {
+    if let Some(store) = store.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        store.append_new(&session.messages)?;
+    }
     Ok(())
 }
 
@@ -566,7 +699,10 @@ async fn run_task(
     tools_allow: Option<Vec<String>>,
     tools_exclude: Option<Vec<String>>,
     no_tools: bool,
+    no_skills: bool,
+    no_prompt_templates: bool,
     session_path: Option<String>,
+    session_id: Option<String>,
     continue_session: bool,
     export: Option<String>,
     json: bool,
@@ -609,8 +745,19 @@ async fn run_task(
     // `serve`. `/skill:name` and `/name` prompt-template invocations are expanded here exactly like
     // `serve`'s own "prompt" handler does — this was previously silently skipped in `run`, so a message
     // starting with either was sent to the model as a literal, unexpanded string instead.
-    let skills = beyond_ai_agent::skills::discover(&cwd, project_trusted);
-    let prompt_templates = beyond_ai_agent::prompts::discover(&cwd, project_trusted);
+    // `--no-skills`/`--no-prompt-templates` skip discovery outright rather than discovering and then
+    // discarding — matching pi's own flags, and avoiding a needless filesystem walk when the operator
+    // has already said neither is wanted.
+    let skills = if no_skills {
+        Vec::new()
+    } else {
+        beyond_ai_agent::skills::discover(&cwd, project_trusted)
+    };
+    let prompt_templates = if no_prompt_templates {
+        Vec::new()
+    } else {
+        beyond_ai_agent::prompts::discover(&cwd, project_trusted)
+    };
     timing.mark("discover skills/prompt templates");
     let mut registry = tools::default_registry();
     tools::apply_filter(
@@ -626,29 +773,35 @@ async fn run_task(
             append: None,
             cwd: &cwd,
             include_context_files: true,
-            include_skills: true,
+            include_skills: !no_skills,
             project_trusted,
         },
     );
     timing.mark("build system prompt");
 
-    let client = GatewayClient::new(gateway, key)?;
-    let agent = Agent::new(Arc::new(client), model.clone())
-        .with_tools(registry)
-        .with_system(system)
-        .with_max_steps(max_steps);
-
     // `--session`/`--continue` persist this run (and load prior history to continue it) exactly like
     // `serve`'s own repo/file modes; neither given keeps `run` in-memory-only, as before.
     let cwd_str = cwd.to_string_lossy().into_owned();
-    let (mut store, mut session) = match session_path {
+    // `--session-id`, when given, applies only where a *new* `SessionMeta` is actually minted below —
+    // reopening an existing `--session <path>` or resuming via `--continue` already has a fixed id from
+    // disk. Matches pi's own `--session-id`: a known, predictable id for a script/test harness to
+    // correlate against, instead of parsing it back out of the run's own output.
+    let fresh_meta = || match &session_id {
+        Some(id) => SessionMeta::with_id(id.clone(), &cwd_str, &model),
+        None => SessionMeta::new(&cwd_str, &model),
+    };
+    let (store, mut session) = match session_path {
         Some(path) => {
             let path = PathBuf::from(path);
-            if path.exists() {
+            // A zero-byte file at `path` (e.g. `touch`'d ahead of time, or left over from a crash
+            // before the header write landed) has nothing to open — route it through `create`, which
+            // now initializes an empty file in place rather than failing (see its own doc comment).
+            let has_content = path.metadata().is_ok_and(|m| m.len() > 0);
+            if has_content {
                 let (store, session) = SessionStore::open(path)?;
                 (Some(store), session)
             } else {
-                let store = SessionStore::create(path, SessionMeta::new(&cwd_str, &model))?;
+                let store = SessionStore::create(path, fresh_meta())?;
                 (Some(store), Session::new())
             }
         }
@@ -662,9 +815,23 @@ async fn run_task(
     let meta = store
         .as_ref()
         .map(|s| s.meta().clone())
-        .unwrap_or_else(|| SessionMeta::new(&cwd_str, &model));
+        .unwrap_or_else(fresh_meta);
     timing.mark("open session");
     timing.print();
+
+    let client = GatewayClient::new(gateway, key)?;
+    // Shared with `DirectCheckpoint` below (built before `agent`, so the hook can be installed at
+    // construction) so a long multi-step turn (many tool round-trips) is persisted incrementally —
+    // the same guarantee `serve` gives every session. Without this, only the *end* of each whole
+    // turn was ever persisted (the `persist_run_tail` calls below, after `run_turn` returns), so a
+    // crash mid-turn — after several tool round-trips already ran real commands/edited real files —
+    // lost all record of them with no session trace at all.
+    let store = Arc::new(std::sync::Mutex::new(store));
+    let agent = Agent::new(Arc::new(client), model.clone())
+        .with_tools(registry)
+        .with_system(system)
+        .with_max_steps(max_steps)
+        .with_checkpoint_hook(Arc::new(DirectCheckpoint(store.clone())));
 
     if json {
         // A leading header line so a `--json` consumer can identify the session before any event
@@ -679,20 +846,18 @@ async fn run_task(
     }
 
     session.user(expand_message(&initial_message, &skills, &prompt_templates));
-    run_turn(&agent, &mut session, json).await?;
-    if let Some(store) = &mut store {
-        store.append_new(&session.messages)?;
-    }
+    let mut stop_reason = run_turn(&agent, &mut session, json).await?;
+    persist_run_tail(&store, &session)?;
     for message in messages {
         session.user(expand_message(&message, &skills, &prompt_templates));
-        run_turn(&agent, &mut session, json).await?;
-        if let Some(store) = &mut store {
-            store.append_new(&session.messages)?;
-        }
+        stop_reason = run_turn(&agent, &mut session, json).await?;
+        persist_run_tail(&store, &session)?;
     }
 
     if let Some(export) = export {
         let branches = store
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .map(|s| s.abandoned_branches())
             .unwrap_or_default();
@@ -711,12 +876,126 @@ async fn run_task(
         "[done in {} step(s); {} in / {} out tokens]",
         session.steps, session.input_tokens, session.output_tokens
     );
+    // Text mode has no other failure signal a script/CI caller could key off of — a refusal would
+    // otherwise still exit 0, indistinguishable from a normal completion, unless the last turn's
+    // stop reason is checked explicitly here. JSON mode already carries `stop_reason` on every
+    // `TurnEnd` event in its own output stream, so it's unaffected either way — that exit code stays
+    // reserved for a genuine process failure. Matches pi's own print-mode, which treats a refusal
+    // (folded into its generic "error" stop reason there, unlike this crate's distinct `Refusal`
+    // variant) the same way, in text mode only.
+    if !json && stop_reason == agent_core::StopReason::Refusal {
+        eprintln!("[refused]");
+        std::process::exit(1);
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_core::Error;
+    use agent_core::mock::{MockTransport, turn};
+
+    #[tokio::test]
+    async fn direct_checkpoint_persists_incrementally_during_a_multi_tool_round_trip_run() {
+        // Two tool round-trips, then a final text turn. `DirectCheckpoint` must have already written
+        // both round-trips' worth of messages to disk by the time they happen — not just once, at the
+        // very end, via `persist_run_tail` (which only ever runs after `run_turn` returns `Ok`, and so
+        // never covers a crash or hard failure partway through a long multi-step turn). Proven here by
+        // reading the session file back with a *fresh* `SessionStore::open` before `run_turn` even
+        // returns — a completely independent read path from anything `run_task`'s own bookkeeping
+        // could accidentally make look right.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        std::fs::write(&target, "hello").unwrap();
+        let session_path = dir.path().join("s.jsonl");
+        let store =
+            SessionStore::create(session_path.clone(), SessionMeta::new("/w", "claude-test"))
+                .unwrap();
+        let store = Arc::new(std::sync::Mutex::new(Some(store)));
+
+        let read_args = serde_json::json!({ "path": target.to_str().unwrap() }).to_string();
+        let transport = Arc::new(MockTransport::new(vec![
+            turn::tool_call("1", "read", &read_args),
+            turn::tool_call("2", "read", &read_args),
+            turn::text("done"),
+        ]));
+        let agent = Agent::new(transport, "claude-test")
+            .with_tools(tools::default_registry())
+            .with_checkpoint_hook(Arc::new(DirectCheckpoint(store.clone())));
+
+        let mut session = Session::new();
+        session.user("read the file twice");
+        run_turn(&agent, &mut session, false).await.unwrap();
+
+        // Read independently of `store` (which the test itself still holds a live handle to) —
+        // exactly what a process restarting after a crash would do.
+        let (_, disk_session) = SessionStore::open(session_path).unwrap();
+        assert!(
+            disk_session.messages.len() >= 4,
+            "checkpoints during the run must have persisted the tool round-trips that already \
+             happened, not just whatever `persist_run_tail` would add after the fact: {:?}",
+            disk_session.messages
+        );
+    }
+
+    /// `agent_core::Agent::run_turn`'s own within-turn retry exhausts after this many *failed*
+    /// attempts (`agent.rs::MAX_MID_STREAM_RETRIES`) before propagating the error to the caller — the
+    /// point our own whole-run retry (`run_turn`, this file) is meant to catch. Scripting exactly this
+    /// many failing turns, then a real one, exercises our layer specifically without depending on
+    /// exactly *why* the inner layer gave up.
+    const INNER_RETRY_ATTEMPTS: usize = 4;
+
+    #[tokio::test]
+    async fn run_turn_recovers_from_a_whole_run_transient_failure() {
+        // Every attempt agent_core's own mid-stream retry makes fails with a retryable error (matches
+        // `is_retryable_mid_stream`'s "overloaded" check), exhausting it — the resulting `Err` is
+        // exactly what propagates out to `agent.run(...)` inside `run_turn_once`. Our new whole-run
+        // wrapper (`run_turn`) must catch that and retry the whole call again, which finally succeeds.
+        let mut turns: Vec<Vec<Result<StreamEvent, Error>>> = (0..INNER_RETRY_ATTEMPTS)
+            .map(|_| vec![Err(Error::Transport("overloaded_error: overloaded".into()))])
+            .collect();
+        turns.push(turn::text("recovered").into_iter().map(Ok).collect());
+        let transport = std::sync::Arc::new(MockTransport::scripted(turns));
+        let agent = Agent::new(transport.clone(), "claude-test");
+        let mut session = Session::new();
+        session.user("hi");
+
+        run_turn(&agent, &mut session, false)
+            .await
+            .expect("the whole-run retry must recover once a real turn is finally scripted");
+
+        // agent_core's own internal retry consumed the 4 failing turns; ours consumed the 5th
+        // (successful) one on its first — and only necessary — retry.
+        assert_eq!(transport.calls(), INNER_RETRY_ATTEMPTS + 1);
+        let dump = format!("{:?}", session.messages);
+        assert!(
+            dump.contains("recovered"),
+            "session must contain the recovered reply: {dump}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_turn_gives_up_after_max_run_retries_of_whole_run_failures() {
+        // Every single attempt (both agent_core's own retries AND every one of our whole-run retries)
+        // fails — after `retry::MAX_RUN_RETRIES` whole-run retries, `run_turn` must give up and
+        // propagate the error rather than retrying forever.
+        let total_attempts =
+            (beyond_ai_agent::retry::MAX_RUN_RETRIES as usize + 1) * INNER_RETRY_ATTEMPTS;
+        let turns: Vec<Vec<Result<StreamEvent, Error>>> = (0..total_attempts)
+            .map(|_| vec![Err(Error::Transport("overloaded_error: overloaded".into()))])
+            .collect();
+        let transport = std::sync::Arc::new(MockTransport::scripted(turns));
+        let agent = Agent::new(transport.clone(), "claude-test");
+        let mut session = Session::new();
+        session.user("hi");
+
+        let err = run_turn(&agent, &mut session, false)
+            .await
+            .expect_err("must eventually give up, not retry forever");
+        assert!(matches!(err, Error::Transport(_)));
+        assert_eq!(transport.calls(), total_attempts);
+    }
 
     #[test]
     fn default_system_prompt_lists_every_registered_tool() {

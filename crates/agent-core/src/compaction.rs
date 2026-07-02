@@ -536,11 +536,17 @@ pub fn merge_split_summary(history: &str, turn_prefix: &str) -> String {
 /// `file_ops` is the *already-merged* provenance (see [`merge_file_ops`]) — the read/modified-file
 /// tags embedded in the prompt reflect every round so far, not just this one's new activity, so the
 /// model doesn't lose file awareness the previous round recorded.
+///
+/// `custom_instructions`, when given, is appended to whichever instruction template applies —
+/// "Additional focus: {custom_instructions}" — matching pi's own `generateSummary`. This is how a
+/// manual (client-triggered) compaction can steer *what* the summary emphasizes (e.g. "keep every
+/// detail about the auth refactor") without replacing the structured Markdown format itself.
 pub fn summary_request(
     model: &str,
     prefix: &[Message],
     max_tokens: u32,
     file_ops: &CompactionProvenance,
+    custom_instructions: Option<&str>,
 ) -> ModelRequest {
     let (read, modified) = (&file_ops.read_files, &file_ops.modified_files);
 
@@ -578,6 +584,10 @@ pub fn summary_request(
         ));
     }
     prompt.push_str(instruction);
+    if let Some(custom) = custom_instructions {
+        prompt.push_str("\n\nAdditional focus: ");
+        prompt.push_str(custom);
+    }
 
     ModelRequest::new(model, Arc::new(vec![Message::user(prompt)]), max_tokens)
         .with_system(SUMMARY_SYSTEM)
@@ -986,7 +996,7 @@ mod tests {
             &messages,
             CompactionReason::Manual,
         );
-        let req = summary_request("claude-test", &messages, 512, &file_ops);
+        let req = summary_request("claude-test", &messages, 512, &file_ops, None);
         let text = match &req.messages[0].content[0] {
             ContentBlock::Text { text } => text,
             other => panic!("expected text, got {other:?}"),
@@ -1074,7 +1084,7 @@ mod tests {
             &prefix,
             CompactionReason::Manual,
         );
-        let req = summary_request("claude-test", &prefix, 512, &file_ops);
+        let req = summary_request("claude-test", &prefix, 512, &file_ops, None);
         let ContentBlock::Text { text } = &req.messages[0].content[0] else {
             panic!("expected text");
         };
@@ -1131,7 +1141,7 @@ mod tests {
 
         // The summarization prompt itself carries the *merged* tags, not just this round's activity —
         // the model doing the summarizing sees the full file history, not a truncated one.
-        let req = summary_request("claude-test", &round2_prefix, 512, &round2_ops);
+        let req = summary_request("claude-test", &round2_prefix, 512, &round2_ops, None);
         let ContentBlock::Text { text } = &req.messages[0].content[0] else {
             panic!("expected text");
         };
@@ -1191,7 +1201,7 @@ mod tests {
             prefix,
             CompactionReason::Threshold,
         );
-        let req = summary_request("claude-test", prefix, 512, &file_ops);
+        let req = summary_request("claude-test", prefix, 512, &file_ops, None);
         let ContentBlock::Text { text } = &req.messages[0].content[0] else {
             panic!("expected text");
         };
@@ -1209,12 +1219,58 @@ mod tests {
             &messages,
             CompactionReason::Threshold,
         );
-        let req = summary_request("claude-test", &messages, 512, &file_ops);
+        let req = summary_request("claude-test", &messages, 512, &file_ops, None);
         let ContentBlock::Text { text } = &req.messages[0].content[0] else {
             panic!("expected text");
         };
         assert!(text.contains("## Goal"));
         assert!(!text.contains("## Original Request"));
+    }
+
+    #[test]
+    fn summary_request_appends_custom_instructions_as_additional_focus() {
+        // Matches pi's own `generateSummary`: "Additional focus: {customInstructions}" appended after
+        // the structured instruction template, not replacing it — a manual compaction's client-supplied
+        // steering, not a wholesale prompt override.
+        let messages = convo();
+        let file_ops = merge_file_ops(
+            &CompactionProvenance::default(),
+            &messages,
+            CompactionReason::Manual,
+        );
+        let req = summary_request(
+            "claude-test",
+            &messages,
+            512,
+            &file_ops,
+            Some("keep every detail about the auth refactor"),
+        );
+        let ContentBlock::Text { text } = &req.messages[0].content[0] else {
+            panic!("expected text");
+        };
+        assert!(
+            text.contains("## Goal"),
+            "the structured template survives: {text}"
+        );
+        assert!(
+            text.contains("Additional focus: keep every detail about the auth refactor"),
+            "the custom instructions must be appended: {text}"
+        );
+    }
+
+    #[test]
+    fn summary_request_omits_additional_focus_when_no_custom_instructions_given() {
+        let messages = convo();
+        let file_ops = merge_file_ops(
+            &CompactionProvenance::default(),
+            &messages,
+            CompactionReason::Threshold,
+        );
+        let req = summary_request("claude-test", &messages, 512, &file_ops, None);
+        let ContentBlock::Text { text } = &req.messages[0].content[0] else {
+            panic!("expected text");
+        };
+        assert!(!text.contains("Additional focus"));
     }
 
     #[test]

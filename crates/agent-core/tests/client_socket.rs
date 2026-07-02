@@ -167,6 +167,81 @@ async fn gateway_client_surfaces_http_error() {
     assert!(first.is_err(), "a 403 must surface as a stream error");
 }
 
+/// Capture the raw bytes of the first request a one-shot server receives, then answer with a minimal
+/// empty-body SSE response. Returns the shared buffer the caller reads after driving the request.
+fn spawn_request_capturing_server() -> (String, std::sync::Arc<std::sync::Mutex<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let captured2 = captured.clone();
+    thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            *captured2.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            );
+            let _ = stream.flush();
+        }
+    });
+    (format!("http://{addr}"), captured)
+}
+
+#[tokio::test]
+async fn gateway_client_sends_x_client_request_id_for_openai_responses_with_a_cache_key() {
+    // "gpt-5" is a native OpenAI id — routes through the Responses dialect per `Dialect::for_model`.
+    // Matches pi's own `openai-responses.ts`, which sends this header for connection-level
+    // session-affinity routing whenever a session id is available.
+    let (base, captured) = spawn_request_capturing_server();
+    let client = GatewayClient::new(base, "bai_v1.test").expect("client");
+    let req =
+        ModelRequest::new("gpt-5", vec![Message::user("hi")], 64).with_cache_key("session-abc");
+    let mut stream = client.stream(req).await.expect("stream");
+    let _ = stream.next().await;
+
+    let request = captured.lock().unwrap().clone();
+    assert!(
+        request
+            .to_ascii_lowercase()
+            .contains("x-client-request-id: session-abc"),
+        "the OpenAI Responses dialect must send the session-affinity header: {request}"
+    );
+}
+
+#[tokio::test]
+async fn gateway_client_omits_x_client_request_id_without_a_cache_key() {
+    let (base, captured) = spawn_request_capturing_server();
+    let client = GatewayClient::new(base, "bai_v1.test").expect("client");
+    let req = ModelRequest::new("gpt-5", vec![Message::user("hi")], 64); // no cache_key
+    let mut stream = client.stream(req).await.expect("stream");
+    let _ = stream.next().await;
+
+    let request = captured.lock().unwrap().clone();
+    assert!(
+        !request.to_ascii_lowercase().contains("x-client-request-id"),
+        "no session id to route by — the header must be omitted: {request}"
+    );
+}
+
+#[tokio::test]
+async fn gateway_client_omits_x_client_request_id_for_anthropic() {
+    // The header is Responses-API-specific; Anthropic (and OpenAI Chat Completions) never send it,
+    // even with a cache_key set — matches pi's own dialect split.
+    let (base, captured) = spawn_request_capturing_server();
+    let client = GatewayClient::new(base, "bai_v1.test").expect("client");
+    let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 64)
+        .with_cache_key("session-abc");
+    let mut stream = client.stream(req).await.expect("stream");
+    let _ = stream.next().await;
+
+    let request = captured.lock().unwrap().clone();
+    assert!(
+        !request.to_ascii_lowercase().contains("x-client-request-id"),
+        "the Anthropic dialect must not send the OpenAI-Responses-specific header: {request}"
+    );
+}
+
 #[tokio::test]
 async fn gateway_client_retries_transient_503_then_succeeds() {
     // The server returns a retryable 503 on the first connection and the real SSE body on the second.

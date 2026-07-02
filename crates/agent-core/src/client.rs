@@ -107,6 +107,14 @@ impl ModelTransport for GatewayClient {
         let base_backoff = self.base_backoff;
 
         let is_anthropic = dialect == Dialect::Anthropic;
+        // OpenAI's Responses API uses this for connection-level session-affinity routing, distinct
+        // from `prompt_cache_key`'s cache-node affinity in the body — matches pi's
+        // `openai-responses.ts` (`headers["x-client-request-id"] = sessionId`), reusing the same
+        // per-conversation `cache_key` value pi's own `sessionId` carries.
+        let session_affinity_header = (dialect == Dialect::OpenAiResponses)
+            .then_some(req.cache_key.as_deref())
+            .flatten()
+            .map(str::to_string);
         // Interleaved thinking lets the model weave thinking between tool calls across a turn — but
         // it's only meaningful for the `Budget` shape; `Adaptive` models interleave by default, and
         // sending the beta opt-in for them is a harmless no-op at best, so skip it to keep the header
@@ -129,6 +137,7 @@ impl ModelTransport for GatewayClient {
                 is_anthropic,
                 needs_interleaved_beta,
                 needs_fine_grained_tool_streaming_beta,
+                session_affinity_header.as_deref(),
                 max_retries,
                 base_backoff,
             )
@@ -266,7 +275,7 @@ fn anthropic_betas(
 
 /// POST the request body, retrying transient failures with exponential backoff until a successful
 /// response or the retry budget is exhausted. Honors a `Retry-After` header when the server sends one.
-// 8 arguments, all independent inputs a single call site (`GatewayClient::stream`) already has in
+// 9 arguments, all independent inputs a single call site (`GatewayClient::stream`) already has in
 // scope from `self`/the request — bundling them into a struct would just be a second place those same
 // fields live, not a reduction in what the function needs to know. Private, single-caller helper, not
 // a public API shape, so the usual "too many params signals a missing abstraction" concern doesn't
@@ -280,12 +289,16 @@ async fn send_with_retry(
     is_anthropic: bool,
     needs_interleaved_beta: bool,
     needs_fine_grained_tool_streaming_beta: bool,
+    session_affinity_header: Option<&str>,
     max_retries: u32,
     base_backoff: Duration,
 ) -> Result<reqwest::Response> {
     let mut attempt = 0u32;
     loop {
         let mut builder = http.post(url).bearer_auth(api_key).json(body);
+        if let Some(session_id) = session_affinity_header {
+            builder = builder.header("x-client-request-id", session_id);
+        }
         if is_anthropic {
             builder = builder.header("anthropic-version", ANTHROPIC_VERSION);
             let betas = anthropic_betas(

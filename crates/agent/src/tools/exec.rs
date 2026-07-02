@@ -284,24 +284,40 @@ impl Capture {
     }
 }
 
-/// SIGKILL an entire process group via the `kill` binary (`kill -KILL -<pgid>`). Shelling out keeps
-/// this free of `unsafe`/`libc`, which the workspace forbids.
+/// SIGKILL an entire process group via the `kill` binary (`kill -KILL -<pgid>`), falling back to
+/// directly killing just the original process (`kill -KILL <pgid>`, no leading `-`) if the group kill
+/// doesn't succeed — matching pi's own `killProcessTree` (`process.kill(-pid, "SIGKILL")`, falling back
+/// to `process.kill(pid, "SIGKILL")` on failure). `pgid` doubles as the original child's own pid here:
+/// the child is spawned as its own process-group leader (`process_group(0)`), so pid and pgid are the
+/// same number. Shelling out keeps this free of `unsafe`/`libc`, which the workspace forbids.
 #[cfg(unix)]
 async fn kill_process_group(pgid: u32) {
-    match tokio::process::Command::new("kill")
+    let group_result = tokio::process::Command::new("kill")
         .arg("-KILL")
         .arg(format!("-{pgid}"))
         .status()
+        .await;
+    // A non-success here (including `kill`'s own exit code, e.g. ESRCH because the group already
+    // exited on its own between the timeout firing and this running) isn't worth logging on its own —
+    // the group kill covers the overwhelmingly common case, so try the direct fallback next regardless
+    // of *why* it didn't succeed; a no-op fallback against an already-gone process is harmless.
+    if matches!(&group_result, Ok(status) if status.success()) {
+        return;
+    }
+    match tokio::process::Command::new("kill")
+        .arg("-KILL")
+        .arg(pgid.to_string())
+        .status()
         .await
     {
-        // `kill`'s own exit code (e.g. ESRCH because the group already exited on its own between
-        // the timeout firing and this running) isn't worth logging — only a failure to even run it.
+        // Still only the "couldn't even run `kill`" case is worth a warning — a non-zero exit here
+        // most likely just means the process (or its whole group) was already gone.
         Ok(_) => {}
         Err(e) => {
             // If `kill` itself couldn't run (missing binary, restrictive sandboxing), a backgrounded
             // grandchild from the timed-out command may be left running with nothing else to reap
             // it — surface that instead of silently losing the signal.
-            tracing::warn!(pgid, error = %e, "failed to run `kill` to reap a timed-out process group");
+            tracing::warn!(pgid, error = %e, "failed to run `kill` to reap a timed-out process");
         }
     }
 }
@@ -391,6 +407,25 @@ mod tests {
             streamed, "hello\nworld\n",
             "streamed chunks must reconstruct stdout"
         );
+    }
+
+    #[tokio::test]
+    async fn kill_process_group_completes_promptly_when_the_group_kill_finds_nothing_to_kill() {
+        // Track L10: exercises the two-attempt sequence end to end. Once the process has already
+        // exited and been reaped, the group kill (`kill -KILL -pgid`) finds nothing (ESRCH) and the
+        // direct-pid fallback that follows must also complete cleanly — no hang, no panic — rather
+        // than the two-step sequence somehow blocking on a process that's already gone.
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("true")
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        child.wait().await.unwrap(); // let it actually exit and get reaped
+
+        tokio::time::timeout(Duration::from_secs(5), kill_process_group(pid))
+            .await
+            .expect("kill_process_group must not hang when there's nothing left to kill");
     }
 
     #[test]

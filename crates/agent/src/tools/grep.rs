@@ -39,6 +39,12 @@ const HARD_CAP: usize = 10_000;
 /// Ceiling on the `before`/`after` context window. Context lines aren't bounded by `HARD_CAP` (which
 /// counts matches), so clamp them to keep a huge `after` on a match-dense file from ballooning memory.
 const MAX_CONTEXT: usize = 100;
+/// Suffix [`clip`] appends to a line it truncates. `Tool::run` checks surviving hit text for this
+/// suffix to decide whether to append an aggregate "some lines truncated" notice (matching pi's own
+/// grep, which surfaces that as an actionable notice alongside the match-limit/byte-cap ones) — a
+/// single source of truth instead of threading a separate "was this line clipped" flag through
+/// `Hit`/`Collector` just for one summary line.
+const LINE_TRUNCATED_SUFFIX: &str = "… [truncated]";
 
 pub struct Grep;
 
@@ -260,7 +266,7 @@ fn clip(line: &str) -> String {
     while !line.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}… [truncated]", &line[..end])
+    format!("{}{LINE_TRUNCATED_SUFFIX}", &line[..end])
 }
 
 #[async_trait]
@@ -297,6 +303,7 @@ impl Tool for Grep {
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing `pattern`".into()))?;
         let root = input.get("path").and_then(Value::as_str).unwrap_or(".");
+        let root = &super::normalize_path(root);
         let ignore_case = input
             .get("ignore_case")
             .and_then(Value::as_bool)
@@ -343,12 +350,16 @@ impl Tool for Grep {
             return Ok(no_match.into());
         }
         let mut out = String::new();
+        let mut lines_truncated = false;
         for (path, line, text, is_match) in &matches {
             // Write straight into `out` instead of allocating a `format!` temp String per line — same
             // fix as `read`/`ls`'s formatting loops. Match lines use `path:line:` (ripgrep's
             // separator); context lines use `path-line-` so a reader (and the model) can tell a hit
             // from its surrounding context at a glance. `writeln!` into a `String` can't fail, so the
             // `Result` is discarded.
+            if text.ends_with(LINE_TRUNCATED_SUFFIX) {
+                lines_truncated = true;
+            }
             let display_path = format_path(path, &root);
             let _ = if *is_match {
                 writeln!(out, "{display_path}:{line}: {text}")
@@ -356,22 +367,27 @@ impl Tool for Grep {
                 writeln!(out, "{display_path}-{line}- {text}")
             };
         }
-        // The byte cap is checked *before* the match-count marker is appended, and takes priority when
-        // both would otherwise fire — see `cap_listing_bytes`'s doc comment. The byte-cap marker's own
-        // "narrow the pattern, path, or context" guidance already covers the match-count case, so
-        // dropping the more specific marker in favor of it loses nothing actionable.
+        // The byte cap is checked *before* any count/line marker is appended, and takes priority when
+        // any would otherwise fire — see `cap_listing_bytes`'s doc comment. The byte-cap marker's own
+        // "narrow the pattern, path, or context" guidance already covers both cases, so dropping the
+        // more specific markers in favor of it loses nothing actionable.
         let byte_capped = super::output::cap_listing_bytes(
             &mut out,
             "narrow the pattern, path, or context to see more",
         );
-        if !byte_capped && truncated {
-            let _ = writeln!(
-                out,
-                "{}",
-                super::output::marker(format_args!(
+        if !byte_capped {
+            let mut notices = Vec::new();
+            if truncated {
+                notices.push(format!(
                     "match limit {limit} reached; narrow the pattern or raise `limit`"
-                ))
-            );
+                ));
+            }
+            if lines_truncated {
+                notices.push("some lines truncated; use the read tool to see them in full".into());
+            }
+            if !notices.is_empty() {
+                let _ = writeln!(out, "{}", super::output::marker(notices.join(". ")));
+            }
         }
         Ok(out.into())
     }
@@ -463,6 +479,21 @@ mod tests {
         assert!(out.contains("a.txt:1: hello"));
         assert!(out.contains("a.txt:3: hello again"));
         assert!(!out.contains("b.log"));
+    }
+
+    #[tokio::test]
+    async fn run_normalizes_the_path_argument() {
+        // Proves `run` actually calls `super::normalize_path`, via its `@`-prefix-strip behavior
+        // (needs no `$HOME` mutation — see `expand_tilde`'s own direct unit tests for that half).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
+        let at_prefixed = format!("@{}", dir.path().to_str().unwrap());
+        let out = Grep
+            .run(json!({ "pattern": "hello", "path": at_prefixed }))
+            .await
+            .unwrap()
+            .text;
+        assert!(out.contains("a.txt:1: hello"));
     }
 
     #[tokio::test]
@@ -616,6 +647,73 @@ mod tests {
         assert!(
             !out.contains("match limit"),
             "match-count marker must not co-fire when count never exceeded the limit"
+        );
+        assert!(
+            !out.contains("some lines truncated"),
+            "the aggregate line-truncation notice must not survive the byte cap either — same \
+             precedence as the match-count marker, and for the same reason (it could be sliced \
+             through by the truncation it would be describing)"
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregate_notice_reports_when_lines_were_individually_clipped() {
+        let dir = tempfile::tempdir().unwrap();
+        // One over-long matching line among otherwise-short ones: neither the match-count marker nor
+        // the byte-cap marker fires (both stay well clear of their thresholds), isolating the
+        // aggregate "some lines truncated" notice as the only truncation signal in the output.
+        let long_line = format!("needle {}", "x".repeat(600));
+        let body = format!("{long_line}\nneedle short\n");
+        std::fs::write(dir.path().join("a.txt"), &body).unwrap();
+        let out = Grep
+            .run(json!({
+                "pattern": "needle",
+                "path": dir.path().to_str().unwrap(),
+            }))
+            .await
+            .unwrap()
+            .text;
+        assert!(
+            out.contains(LINE_TRUNCATED_SUFFIX),
+            "per-line clip missing: {out}"
+        );
+        assert!(
+            out.contains("[some lines truncated; use the read tool to see them in full]"),
+            "aggregate notice missing: {out}"
+        );
+        assert!(
+            !out.contains("match limit"),
+            "match-count marker must not co-fire: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregate_notice_joins_match_limit_and_line_truncation_when_both_fire() {
+        let dir = tempfile::tempdir().unwrap();
+        // First matching line is over-long (individually clipped); many more short matches follow so
+        // the match-count marker also fires. A single file keeps in-file line order deterministic
+        // (unlike a multi-file walk), so the over-long first line is guaranteed to survive the
+        // `limit` truncation and both notices are guaranteed to co-fire.
+        let long_line = format!("needle {}", "x".repeat(600));
+        let mut lines = vec![long_line];
+        lines.extend(std::iter::repeat_n("needle short".to_string(), 20));
+        let body = lines.join("\n");
+        std::fs::write(dir.path().join("a.txt"), &body).unwrap();
+        let out = Grep
+            .run(json!({
+                "pattern": "needle",
+                "path": dir.path().to_str().unwrap(),
+                "limit": 5,
+            }))
+            .await
+            .unwrap()
+            .text;
+        assert!(
+            out.contains(
+                "[match limit 5 reached; narrow the pattern or raise `limit`. some lines \
+                 truncated; use the read tool to see them in full]"
+            ),
+            "joined notice missing or in the wrong order: {out}"
         );
     }
 

@@ -39,6 +39,7 @@ impl Tool for Ls {
 
     async fn run(&self, input: Value) -> Result<ToolOutput, ToolError> {
         let path = input.get("path").and_then(Value::as_str).unwrap_or(".");
+        let path = &super::normalize_path(path);
         let all = input.get("all").and_then(Value::as_bool).unwrap_or(false);
         let limit = input
             .get("limit")
@@ -124,6 +125,17 @@ mod tests {
             .unwrap()
             .text;
         assert!(all.contains(".hidden"));
+    }
+
+    #[tokio::test]
+    async fn run_normalizes_the_path_argument() {
+        // Proves `run` actually calls `super::normalize_path`, via its `@`-prefix-strip behavior
+        // (needs no `$HOME` mutation — see `expand_tilde`'s own direct unit tests for that half).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file.txt"), "x").unwrap();
+        let at_prefixed = format!("@{}", dir.path().to_str().unwrap());
+        let out = Ls.run(json!({ "path": at_prefixed })).await.unwrap().text;
+        assert!(out.contains("file.txt"));
     }
 
     #[tokio::test]

@@ -18,6 +18,58 @@ pub mod output;
 pub mod read;
 pub mod write;
 
+/// Normalize a filesystem tool's `path` argument the way `bash` gets for free from the real shell it
+/// spawns: expand a leading `~` or `~/` to the user's home directory, fold non-ASCII Unicode space
+/// characters (a pasted non-breaking space, common when a path is copied from a terminal or rich-text
+/// source) to a plain ASCII one, and strip a leading `@` (pi's own `@file` CLI convention, occasionally
+/// forwarded verbatim by a caller that composed the argument from a `run --json`-style transcript).
+///
+/// Every filesystem tool (`read`/`write`/`edit`/`grep`/`find`/`ls`) calls this on its path/root
+/// argument before any `std::fs`/walk call. Without it, `~/notes.md` behaved inconsistently within the
+/// very same turn: `bash: cat ~/notes.md` succeeds (the spawned shell expands `~` itself), while
+/// `read({"path": "~/notes.md"})` failed with a confusing `ENOENT` — `std::fs` has no shell and treats
+/// `~` as a literal directory name.
+///
+/// Falls back to returning `path` unchanged if `$HOME` isn't set (or is empty) rather than erroring —
+/// consistent with every other tool here, which surface a filesystem error at the point of actual use
+/// rather than pre-validating input that might still resolve to something real.
+pub(crate) fn normalize_path(path: &str) -> String {
+    let path = path.strip_prefix('@').unwrap_or(path);
+    let folded: String = path
+        .chars()
+        .map(|c| {
+            if c != ' ' && c != '\t' && c != '\n' && c != '\r' && c.is_whitespace() {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    expand_tilde(&folded, home_dir().as_deref())
+}
+
+fn home_dir() -> Option<String> {
+    std::env::var("HOME").ok().filter(|h| !h.is_empty())
+}
+
+/// Split from [`normalize_path`] so tilde-expansion logic is unit-testable without mutating the
+/// process's `$HOME` — unsafe to do from a test that may run in parallel with others reading it (same
+/// concern as `resources::tz_string_offset`). `home: None` (unset or empty `$HOME`) leaves `path`
+/// unchanged rather than erroring, consistent with every tool here surfacing a filesystem error at the
+/// point of actual use rather than pre-validating input that might still resolve to something real.
+fn expand_tilde(path: &str, home: Option<&str>) -> String {
+    let Some(home) = home else {
+        return path.to_string();
+    };
+    if path == "~" {
+        return home.to_string();
+    }
+    match path.strip_prefix("~/") {
+        Some(rest) => format!("{}/{rest}", home.trim_end_matches('/')),
+        None => path.to_string(),
+    }
+}
+
 /// Overwrite `path` atomically: write a sibling temp file, then `rename` it over the target.
 /// `rename(2)` is atomic within one filesystem, so a concurrent reader — or a crash mid-write — sees
 /// either the original file or the fully-written one, never a half-written file. The temp file is a
@@ -130,14 +182,20 @@ pub(crate) fn canonical_write_target(path: &str) -> String {
 /// The default tool set: pi's seven coding tools (read, write, edit, bash, ls, grep, find) plus the
 /// Beyond platform tools (fork, sync, logs).
 pub fn default_registry() -> ToolRegistry {
-    default_registry_with(None)
+    default_registry_with(None, None)
 }
 
 /// Like [`default_registry`], overriding `bash`'s default timeout (applied when the model omits
-/// `timeout_ms`) when `bash_timeout_ms` is `Some` — an operator-tunable knob (`--bash-timeout-ms`),
-/// distinct from `default_registry`'s fixed default so callers that don't need the override (the
-/// `tools` listing command, tests) don't have to pass one.
-pub fn default_registry_with(bash_timeout_ms: Option<u64>) -> ToolRegistry {
+/// `timeout_ms`) when `bash_timeout_ms` is `Some`, and/or which shell it runs commands through when
+/// `bash_shell_path` is `Some` — operator-tunable knobs (`--bash-timeout-ms`/`--bash-shell-path`),
+/// distinct from `default_registry`'s fixed defaults so callers that don't need either override (the
+/// `tools` listing command, tests) don't have to pass one. `bash_shell_path` is trusted as already
+/// validated (see `--bash-shell-path` in `main.rs`, checked once at CLI-argument time) rather than
+/// re-checked on every rebuild this feeds (`set_model`/`set_thinking` each rebuild the registry).
+pub fn default_registry_with(
+    bash_timeout_ms: Option<u64>,
+    bash_shell_path: Option<&str>,
+) -> ToolRegistry {
     let mut reg = ToolRegistry::new();
     reg.register(Arc::new(read::Read));
     reg.register(Arc::new(write::Write));
@@ -145,10 +203,13 @@ pub fn default_registry_with(bash_timeout_ms: Option<u64>) -> ToolRegistry {
     reg.register(Arc::new(ls::Ls));
     reg.register(Arc::new(grep::Grep));
     reg.register(Arc::new(find::Find));
-    let bash = match bash_timeout_ms {
+    let mut bash = match bash_timeout_ms {
         Some(ms) => bash::Bash::real().with_default_timeout_ms(ms),
         None => bash::Bash::real(),
     };
+    if let Some(path) = bash_shell_path {
+        bash = bash.with_shell_path(path);
+    }
     reg.register(Arc::new(bash));
     reg.register(Arc::new(beyond::Fork::real()));
     reg.register(Arc::new(beyond::Sync::real()));
@@ -185,6 +246,54 @@ pub fn apply_filter(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expand_tilde_expands_bare_tilde_to_home() {
+        assert_eq!(expand_tilde("~", Some("/home/jared")), "/home/jared");
+    }
+
+    #[test]
+    fn expand_tilde_expands_tilde_slash_prefix() {
+        assert_eq!(
+            expand_tilde("~/notes.md", Some("/home/jared")),
+            "/home/jared/notes.md"
+        );
+    }
+
+    #[test]
+    fn expand_tilde_does_not_touch_a_tilde_in_the_middle_of_a_path() {
+        // Only a *leading* `~`/`~/` is a home-directory reference — `foo/~bar` is a literal filename.
+        assert_eq!(expand_tilde("foo/~bar", Some("/home/jared")), "foo/~bar");
+    }
+
+    #[test]
+    fn expand_tilde_leaves_path_unchanged_when_home_is_unavailable() {
+        assert_eq!(expand_tilde("~/notes.md", None), "~/notes.md");
+    }
+
+    #[test]
+    fn expand_tilde_trims_a_trailing_slash_on_home_before_joining() {
+        assert_eq!(
+            expand_tilde("~/notes.md", Some("/home/jared/")),
+            "/home/jared/notes.md"
+        );
+    }
+
+    #[test]
+    fn normalize_path_strips_a_leading_at_prefix() {
+        assert_eq!(normalize_path("@/etc/hosts"), "/etc/hosts");
+    }
+
+    #[test]
+    fn normalize_path_folds_a_non_breaking_space_to_a_plain_space() {
+        // U+00A0 NBSP — a common artifact of copy-pasting a path from a terminal or rich-text source.
+        assert_eq!(normalize_path("foo\u{00A0}bar.txt"), "foo bar.txt");
+    }
+
+    #[test]
+    fn normalize_path_is_a_no_op_for_an_ordinary_absolute_path() {
+        assert_eq!(normalize_path("/etc/hosts"), "/etc/hosts");
+    }
 
     #[test]
     fn write_atomic_cleans_up_temp_on_rename_failure() {
@@ -375,13 +484,16 @@ mod tests {
 
     #[test]
     fn default_registry_with_none_matches_default_registry() {
-        // `default_registry()` must genuinely delegate to `default_registry_with(None)`, not just
-        // happen to look similar — same tool set either way.
-        assert_eq!(default_registry().len(), default_registry_with(None).len());
+        // `default_registry()` must genuinely delegate to `default_registry_with(None, None)`, not
+        // just happen to look similar — same tool set either way.
+        assert_eq!(
+            default_registry().len(),
+            default_registry_with(None, None).len()
+        );
         for name in [
             "read", "write", "edit", "bash", "ls", "grep", "find", "fork", "sync", "logs",
         ] {
-            assert!(default_registry_with(None).get(name).is_some());
+            assert!(default_registry_with(None, None).get(name).is_some());
         }
     }
 }

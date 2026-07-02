@@ -13,8 +13,10 @@
 
 use std::sync::Arc;
 
-use crate::compaction::{SUMMARY_SYSTEM, estimate_message_tokens, extract_file_ops, render_prefix};
-use crate::message::Message;
+use crate::compaction::{
+    SUMMARY_MARKER, SUMMARY_SYSTEM, estimate_message_tokens, extract_file_ops, render_prefix,
+};
+use crate::message::{ContentBlock, Message};
 use crate::transport::ModelRequest;
 
 /// The instruction appended after the rendered branch transcript. Adapted from pi's
@@ -31,6 +33,16 @@ identifiers (file paths, function names, commands) verbatim and omitting pleasan
 /// branch rather than being organic conversation content.
 pub const BRANCH_SUMMARY_MARKER: &str = "[Explored a different branch before returning here]";
 
+/// Whether `m` is itself a nested summary — a prior compaction or branch-summary message (tagged with
+/// [`SUMMARY_MARKER`]/[`BRANCH_SUMMARY_MARKER`]) folded into this branch's own history.
+fn is_nested_summary(m: &Message) -> bool {
+    matches!(
+        m.content.first(),
+        Some(ContentBlock::Text { text })
+            if text.starts_with(SUMMARY_MARKER) || text.starts_with(BRANCH_SUMMARY_MARKER)
+    )
+}
+
 /// Keep only as much of the *tail* of `messages` as fits within `budget_tokens`, walking newest-to-
 /// oldest and stopping once the accumulated estimate would exceed it — pi's `prepareBranchEntries`
 /// windowing, so an oversized abandoned branch can't blow out the summarization call's own context
@@ -39,12 +51,23 @@ pub const BRANCH_SUMMARY_MARKER: &str = "[Explored a different branch before ret
 /// one-off prompt discarded right after the call — no alternation constraint, so a plain budget walk
 /// suffices. Always keeps at least the single most recent message, even alone over budget, so a
 /// pathologically large final message doesn't window down to nothing.
+///
+/// A nested compaction/branch-summary message — already a dense recap of a lot of history, not raw
+/// conversation — gets one exception: if it's the entry that would tip the budget over, it's kept
+/// anyway as long as the accumulated tail is still under 90% of budget (matching pi's
+/// `totalTokens < tokenBudget * 0.9`), rather than being dropped like an ordinary message would be.
+/// Losing a compaction/branch-summary's condensed recap of everything *behind* it is a much bigger
+/// loss of context per token than trimming a few more raw messages, so it's worth stretching for when
+/// there's still reasonable room.
 fn windowed_by_budget(messages: &[Message], budget_tokens: u32) -> &[Message] {
     let mut acc = 0u32;
     let mut start = messages.len();
     for (i, m) in messages.iter().enumerate().rev() {
         let cost = estimate_message_tokens(m);
         if start != messages.len() && acc.saturating_add(cost) > budget_tokens {
+            if is_nested_summary(m) && acc < budget_tokens.saturating_mul(9) / 10 {
+                start = i;
+            }
             break;
         }
         acc = acc.saturating_add(cost);
@@ -174,6 +197,55 @@ mod tests {
         let messages = branch();
         let windowed = windowed_by_budget(&messages, 1_000_000);
         assert_eq!(windowed.len(), messages.len());
+    }
+
+    #[test]
+    fn windowed_by_budget_privileges_a_nested_compaction_summary_over_the_ordinary_cutoff() {
+        // The recent tail alone (1 token) leaves plenty of room under the budget (10 tokens, so the
+        // 90% privilege threshold is 9) — pi keeps a nested summary in that case even though it, on
+        // its own, blows well past the remaining budget: losing its condensed recap of everything
+        // *behind* it is a bigger loss than trimming a bit more of the raw tail.
+        let messages = vec![
+            Message::user(format!("{SUMMARY_MARKER}\n\n{}", "x".repeat(400))),
+            Message::user("abcd"),
+        ];
+        let windowed = windowed_by_budget(&messages, 10);
+        assert_eq!(
+            windowed.len(),
+            2,
+            "the nested compaction summary must survive alongside the recent tail"
+        );
+    }
+
+    #[test]
+    fn windowed_by_budget_does_not_privilege_an_ordinary_oversized_message() {
+        // Same shape as the privileged case, but the oversized old message carries no summary marker
+        // — it's dropped like any other message that would blow the budget.
+        let messages = vec![Message::user("y".repeat(400)), Message::user("abcd")];
+        let windowed = windowed_by_budget(&messages, 10);
+        assert_eq!(
+            windowed.len(),
+            1,
+            "an ordinary oversized message must be dropped"
+        );
+    }
+
+    #[test]
+    fn windowed_by_budget_still_drops_a_nested_summary_once_the_tail_already_fills_the_budget() {
+        // The privilege only applies with "reasonable room" left (< 90% of budget already spent).
+        // Two recent messages already accumulate to the full 10-token budget, so a nested summary
+        // behind them gets dropped exactly like the unprivileged case above.
+        let messages = vec![
+            Message::user(format!("{SUMMARY_MARKER}\n\n{}", "x".repeat(400))),
+            Message::user("a".repeat(20)), // 5 tokens
+            Message::user("b".repeat(20)), // 5 tokens
+        ];
+        let windowed = windowed_by_budget(&messages, 10);
+        assert_eq!(
+            windowed.len(),
+            2,
+            "no room left for the privilege exception once the tail already spends ~all the budget"
+        );
     }
 
     #[test]

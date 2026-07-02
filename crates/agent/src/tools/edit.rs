@@ -48,7 +48,8 @@ impl Tool for Edit {
         input
             .get("path")
             .and_then(Value::as_str)
-            .map(super::canonical_write_target)
+            .map(super::normalize_path)
+            .map(|p| super::canonical_write_target(&p))
     }
 
     async fn run(&self, input: Value) -> Result<ToolOutput, ToolError> {
@@ -56,6 +57,7 @@ impl Tool for Edit {
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing `path`".into()))?;
+        let path = &super::normalize_path(path);
         let edits = parse_edits(&input)?;
         let replace_all = input
             .get("replace_all")
@@ -146,6 +148,10 @@ impl Tool for Edit {
         super::write_atomic(path, restored.as_bytes())
             .map_err(|e| ToolError::Execution(format!("write {path}: {e}")))?;
         let applied = ranges.len();
+        // No diff/patch attached, deliberately: pi computes both too, but only for its interactive
+        // terminal's own rendering — the model gets this same bare confirmation there as well. See
+        // ARCHITECTURE.md's "Why `edit`'s result carries no diff/patch data" for the full reasoning
+        // (no reader exists today on the model, wire-protocol, or export side).
         Ok(format!(
             "edited {path} ({applied} replacement{})",
             if applied == 1 { "" } else { "s" }
@@ -345,7 +351,11 @@ fn strip_crlf_with_map(body: &str) -> (String, Vec<u32>) {
 
 /// Accept either the `edits` array form (pi-style) or the single old_string/new_string form. Also
 /// recovers the case where a model sends `edits` as a JSON-encoded *string* instead of an array.
-fn parse_edits(input: &Value) -> Result<Vec<(String, String)>, ToolError> {
+///
+/// `pub(crate)`: also used by `export` to render an `edit` tool call's before/after as a real diff
+/// instead of raw JSON — reusing this rather than re-parsing `input` independently keeps the exported
+/// rendering in sync with whatever shape this tool actually accepts (including the JSON-string quirk).
+pub(crate) fn parse_edits(input: &Value) -> Result<Vec<(String, String)>, ToolError> {
     // Some models emit `edits` as a JSON string; parse it back into a value first.
     let edits_value = match input.get("edits") {
         Some(Value::String(s)) => serde_json::from_str::<Value>(s).ok(),
@@ -398,6 +408,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::fs::read_to_string(p).unwrap(), "the slow brown fox");
+    }
+
+    #[tokio::test]
+    async fn run_normalizes_the_path_argument() {
+        // Proves `run` actually calls `super::normalize_path`, via its `@`-prefix-strip behavior
+        // (needs no `$HOME` mutation — see `expand_tilde`'s own direct unit tests for that half).
+        let f = write_tmp("the quick brown fox");
+        let at_prefixed = format!("@{}", f.path().to_str().unwrap());
+        Edit.run(json!({ "path": at_prefixed, "old_string": "quick", "new_string": "slow" }))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(f.path()).unwrap(),
+            "the slow brown fox"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_target_normalizes_the_path_argument_too() {
+        // Same-turn concurrency-grouping key must match `run`'s own normalization, or `write("~/f")`
+        // and `edit("~/f")` in one turn would get different canonical keys.
+        let f = write_tmp("x");
+        let p = f.path().to_str().unwrap();
+        let at_prefixed = format!("@{p}");
+        let plain = Edit.write_target(&json!({ "path": p })).unwrap();
+        let normalized = Edit.write_target(&json!({ "path": at_prefixed })).unwrap();
+        assert_eq!(plain, normalized);
     }
 
     #[tokio::test]

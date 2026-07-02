@@ -70,8 +70,14 @@ const VERSION: u32 = 1;
 const PREVIEW_MAX: usize = 80;
 /// How many characters of accumulated user-*and*-assistant-message text a listing's `search_text`
 /// keeps — enough to substring-match a session by topic without opening every transcript, capped so a
-/// huge session doesn't bloat every listing response.
-const SEARCH_TEXT_MAX_CHARS: usize = 2_000;
+/// huge session doesn't bloat every listing response. pi's own `allMessagesText` is fully uncapped; this
+/// stays capped (rather than matching that exactly) because `list_all_sessions` holds one of these per
+/// session across a fan-out scan of potentially hundreds of files at once — an uncapped string per
+/// session risks real memory pressure at that scale. 50,000 (25x the original 2,000, matching the
+/// `50 * 1024`-byte "generous but bounded" budget `tools::output::DEFAULT_MAX_BYTES` already uses
+/// elsewhere in this codebase) comfortably covers a realistic session's worth of conversation text —
+/// the old 2,000-char cap could truncate after as little as a couple of turns.
+const SEARCH_TEXT_MAX_CHARS: usize = 50_000;
 
 /// Stable identity + metadata for one session, persisted as the file's header line.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -445,19 +451,45 @@ pub struct SessionStore {
 }
 
 impl SessionStore {
-    /// Create a new session file at `path`, writing its header. Errors if the file already exists.
+    /// Create a new session file at `path`, writing its header. Errors if the file already exists —
+    /// *unless* it's empty: a zero-byte file at `path` (e.g. `touch`'d ahead of time by a caller that
+    /// wants the path to already exist, or left over from a crash before the header write landed) is
+    /// indistinguishable in intent from "not created yet," so it's initialized in place instead of
+    /// failing (idempotent per this crate's "check before create; don't error if it's [effectively]
+    /// gone" convention). A genuinely non-empty file at `path` is real, possibly conflicting data, and
+    /// is never silently clobbered.
     pub fn create(path: PathBuf, meta: SessionMeta) -> std::io::Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut opts = OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut f = opts.open(&path)?;
+        let open = |truncate_existing: bool| -> std::io::Result<File> {
+            let mut opts = OpenOptions::new();
+            opts.write(true);
+            if truncate_existing {
+                opts.truncate(true);
+            } else {
+                opts.create_new(true);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            opts.open(&path)
+        };
+        let mut f = match open(false) {
+            Ok(f) => f,
+            // The atomic fast path failed because *something* is already there — only initialize in
+            // place if it's genuinely empty; otherwise propagate the original error rather than risk
+            // clobbering real data on a race.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::AlreadyExists
+                    && fs::metadata(&path).is_ok_and(|m| m.len() == 0) =>
+            {
+                open(true)?
+            }
+            Err(e) => return Err(e),
+        };
         write_line(&mut f, &Entry::Session(meta.clone()))?;
         // Durability: get the header bytes (and the new file's directory entry) onto stable storage
         // before returning, so a crash right after `create` can't lose the session entirely.
@@ -603,7 +635,7 @@ impl SessionStore {
                 // is read, since the header entry is always first.
                 Ok(Entry::TitleChange { title, .. }) => {
                     if let Some(m) = &mut meta {
-                        m.title = Some(title);
+                        m.title = title_or_clear(title);
                     }
                 }
                 // A line that read fully (valid UTF-8, under the size cap) but failed to deserialize as
@@ -1278,17 +1310,50 @@ impl SessionStore {
     /// comment), not a rewrite of the whole file. A rename used to cost a full rewrite (every message
     /// in the session) just to update the header's `title` field; renaming a long session is now as
     /// cheap as renaming a brand-new one.
+    ///
+    /// `title` is sanitized first (see [`sanitize_title`]): a caller-supplied title can come straight
+    /// from an RPC client or extension, and a raw newline would otherwise split a session-list line or
+    /// corrupt a terminal display. A title that sanitizes to empty explicitly clears the session's
+    /// title (mirrors pi's `session_info` handling — "empty names explicitly clear the session title")
+    /// rather than persisting a blank string that would render as an empty-but-present title.
     pub fn set_title(&mut self, title: impl Into<String>) -> std::io::Result<()> {
-        let title = title.into();
+        let title = sanitize_title(&title.into());
         let entry = Entry::TitleChange {
             id: new_id(),
             parent_id: self.active.last().cloned(),
             title: title.clone(),
         };
         append_line(&self.path, &entry)?;
-        self.meta.title = Some(title);
+        self.meta.title = title_or_clear(title);
         Ok(())
     }
+}
+
+/// Collapse any run of `\r`/`\n` into a single space and trim, matching pi's `appendSessionInfo`
+/// (`name.replace(/[\r\n]+/g, " ").trim()`) — a title is a single display line (session lists, HTML
+/// export headers), so embedded newlines would otherwise corrupt that rendering.
+fn sanitize_title(title: &str) -> String {
+    let mut out = String::with_capacity(title.len());
+    let mut last_was_newline_run = false;
+    for c in title.chars() {
+        if c == '\r' || c == '\n' {
+            if !last_was_newline_run {
+                out.push(' ');
+            }
+            last_was_newline_run = true;
+        } else {
+            out.push(c);
+            last_was_newline_run = false;
+        }
+    }
+    out.trim().to_string()
+}
+
+/// A title that sanitizes to empty explicitly clears the session's title, matching pi's
+/// `getSessionName` ("empty names explicitly clear the session title") rather than persisting a blank
+/// string that would display as a present-but-empty title.
+fn title_or_clear(title: String) -> Option<String> {
+    if title.is_empty() { None } else { Some(title) }
 }
 
 /// A directory of session files.
@@ -1375,7 +1440,7 @@ impl SessionRepo {
             );
         }
         let mut metas = scan_listings(paths, &on_progress);
-        metas.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        metas.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         Ok(metas)
     }
 
@@ -1389,10 +1454,10 @@ impl SessionRepo {
         SessionStore::create(self.path_for(&meta), meta)
     }
 
-    /// All sessions' metadata, newest first (by `created_at`; clients can re-sort by `updated_at`). Each
-    /// entry carries the derived listing fields (`updated_at`, `message_count`, `preview`,
-    /// `search_text`). Files that fail to read, lack a header, or carry an unreadable version are
-    /// skipped.
+    /// All sessions' metadata, most-recently-active first (by `updated_at` — matches pi's own session
+    /// list, sorted by `modified`). Each entry carries the derived listing fields (`updated_at`,
+    /// `message_count`, `preview`, `search_text`). Files that fail to read, lack a header, or carry an
+    /// unreadable version are skipped.
     pub fn list(&self) -> std::io::Result<Vec<SessionMeta>> {
         self.list_with_progress(|_, _| {})
     }
@@ -1418,7 +1483,7 @@ impl SessionRepo {
             }
         }
         let mut metas = scan_listings(paths, &on_progress);
-        metas.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        metas.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         Ok(metas)
     }
 
@@ -1490,6 +1555,24 @@ impl SessionRepo {
         entry_id: &str,
         before: bool,
     ) -> std::io::Result<(SessionStore, Session)> {
+        let (meta, prefix) = self.fork_at_entry_prefix(id, entry_id, before)?;
+        let mut store = self.create(meta)?;
+        store.rewrite(&prefix)?;
+        let mut session = Session::new();
+        session.messages = Arc::new(prefix);
+        Ok((store, session))
+    }
+
+    /// Compute what [`fork_at_entry`](Self::fork_at_entry) would write, without writing it: the
+    /// would-be child's metadata and message prefix. Pure/in-memory beyond the initial `open_id` read —
+    /// no file is created. Used both by `fork_at_entry` itself (to avoid duplicating the prefix logic)
+    /// and by [`fork_at_entry_messages`](Self::fork_at_entry_messages) for side-effect-free previews.
+    fn fork_at_entry_prefix(
+        &self,
+        id: &str,
+        entry_id: &str,
+        before: bool,
+    ) -> std::io::Result<(SessionMeta, Vec<Message>)> {
         let (src, _src_session) = self.open_id(id)?;
         if !src.nodes.contains_key(entry_id) {
             return Err(std::io::Error::new(
@@ -1501,7 +1584,6 @@ impl SessionRepo {
         meta.parent = Some(id.to_string());
         meta.title = src.meta.title.clone();
 
-        let mut store = self.create(meta)?;
         let mut path = path_from_root(&src.nodes, Some(entry_id));
         if before {
             path.pop();
@@ -1510,10 +1592,20 @@ impl SessionRepo {
             .iter()
             .map(|id| src.nodes[id].message.clone())
             .collect();
-        store.rewrite(&prefix)?;
-        let mut session = Session::new();
-        session.messages = Arc::new(prefix);
-        Ok((store, session))
+        Ok((meta, prefix))
+    }
+
+    /// Preview what [`fork_at_entry`](Self::fork_at_entry) would produce — the exact message prefix —
+    /// without creating a new session file. The read-only counterpart to `fork_at_entry`, for a client
+    /// browsing a fork point before committing to it (see `fork_messages` in `serve.rs`).
+    pub fn fork_at_entry_messages(
+        &self,
+        id: &str,
+        entry_id: &str,
+        before: bool,
+    ) -> std::io::Result<Vec<Message>> {
+        let (_meta, prefix) = self.fork_at_entry_prefix(id, entry_id, before)?;
+        Ok(prefix)
     }
 
     fn find_path(&self, id: &str) -> Option<PathBuf> {
@@ -1728,7 +1820,7 @@ fn read_listing(path: &Path) -> Option<SessionMeta> {
             | Ok(Entry::ThinkingLevelChange { .. }) => {}
             // Whole-session-scoped: the most recent one anywhere in the file wins.
             Ok(Entry::TitleChange { title, .. }) => {
-                meta.title = Some(title);
+                meta.title = title_or_clear(title);
             }
             // A fully-read line that failed to deserialize — skip just this one and keep scanning,
             // same relaxed recovery as `SessionStore::open` (see its comment): we know this line's
@@ -2057,6 +2149,43 @@ mod tests {
             0o600,
             "rewrite's temp-file-then-rename must not loosen permissions"
         );
+    }
+
+    #[test]
+    fn create_initializes_an_existing_empty_file_in_place_instead_of_failing() {
+        // Track L8: a zero-byte file at the target path (e.g. `touch`'d ahead of time, or left over
+        // from a crash before the header write landed) must not hard-fail `create` — it's
+        // indistinguishable in intent from "not created yet."
+        let dir = tmpdir();
+        let path = dir.path().join("s.jsonl");
+        std::fs::write(&path, b"").unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            0,
+            "must start empty"
+        );
+
+        let store = SessionStore::create(path.clone(), SessionMeta::new("/w", "m")).unwrap();
+        assert_eq!(store.meta().cwd, "/w");
+
+        // The header actually landed on disk, not just in memory.
+        let (reopened, session) = SessionStore::open(path).unwrap();
+        assert_eq!(reopened.meta().id, store.meta().id);
+        assert_eq!(session.messages.len(), 0);
+    }
+
+    #[test]
+    fn create_still_refuses_a_genuinely_non_empty_existing_file() {
+        // The empty-file allowance must not become a general "overwrite anything" escape hatch — a
+        // file that already holds real (even non-session) content is never silently clobbered.
+        let dir = tmpdir();
+        let path = dir.path().join("s.jsonl");
+        std::fs::write(&path, b"not a session file, but definitely not empty").unwrap();
+
+        match SessionStore::create(path, SessionMeta::new("/w", "m")) {
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists),
+            Ok(_) => panic!("must not silently clobber a non-empty existing file"),
+        }
     }
 
     #[test]
@@ -2761,14 +2890,68 @@ mod tests {
         let repo_a = SessionRepo::open(root.path().join("proj-a")).unwrap();
         let older = repo_a.create(SessionMeta::new("/a", "m")).unwrap();
         let repo_b = SessionRepo::open(root.path().join("proj-b")).unwrap();
-        let mut newer_meta = SessionMeta::new("/b", "m");
-        newer_meta.created_at = older.meta().created_at + 1;
-        repo_b.create(newer_meta).unwrap();
+        let newer = repo_b.create(SessionMeta::new("/b", "m")).unwrap();
+
+        // Stamp mtimes explicitly (the sort key, `updated_at`, falls back to mtime for a session with
+        // no messages) rather than relying on real wall-clock ordering between two back-to-back
+        // creates, which can tie at second granularity.
+        let earlier = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        let later = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_100);
+        fs::File::options()
+            .write(true)
+            .open(repo_a.path_for(older.meta()))
+            .unwrap()
+            .set_modified(earlier)
+            .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(repo_b.path_for(newer.meta()))
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
 
         let all = SessionRepo::list_all(root.path()).unwrap();
         assert_eq!(all.len(), 2);
-        assert_eq!(all[0].cwd, "/b", "the newer session must sort first");
+        assert_eq!(
+            all[0].cwd, "/b",
+            "the more recently active session must sort first"
+        );
         assert_eq!(all[1].cwd, "/a");
+    }
+
+    #[test]
+    fn list_sorts_by_last_activity_not_creation_time() {
+        // `older` is created first but is the one touched most recently — a listing ordered by last
+        // activity (matching pi's own session list, sorted by `modified`) must surface it first
+        // despite `newer_by_creation` having a later `created_at`.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let older = repo.create(SessionMeta::new("/older", "m")).unwrap();
+        let older_id = older.meta().id.clone();
+        let newer_by_creation = repo.create(SessionMeta::new("/newer", "m")).unwrap();
+        let newer_id = newer_by_creation.meta().id.clone();
+
+        let earlier = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        let later = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_100);
+        fs::File::options()
+            .write(true)
+            .open(repo.path_for(newer_by_creation.meta()))
+            .unwrap()
+            .set_modified(earlier)
+            .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(repo.path_for(older.meta()))
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+
+        let metas = repo.list().unwrap();
+        assert_eq!(
+            metas[0].id, older_id,
+            "last-activity ordering must beat creation order"
+        );
+        assert_eq!(metas[1].id, newer_id);
     }
 
     #[test]
@@ -2850,6 +3033,42 @@ mod tests {
 
         let listed = read_listing(&path).unwrap();
         assert_eq!(listed.title.as_deref(), Some("Second"));
+    }
+
+    #[test]
+    fn set_title_strips_newlines() {
+        // Matches pi's `appendSessionInfo` sanitization: a raw newline in a caller-supplied title
+        // (RPC client, extension) would otherwise split a session-list line or corrupt a terminal
+        // display — collapse any run of them into a single space instead.
+        let dir = tmpdir();
+        let path = dir.path().join("s.jsonl");
+        let mut store = SessionStore::create(path.clone(), SessionMeta::new("/w", "m")).unwrap();
+        store.set_title("hello\nworld\r\nagain").unwrap();
+        assert_eq!(store.meta().title.as_deref(), Some("hello world again"));
+
+        let (reopened, _session) = SessionStore::open(path.clone()).unwrap();
+        assert_eq!(reopened.meta().title.as_deref(), Some("hello world again"));
+        let listed = read_listing(&path).unwrap();
+        assert_eq!(listed.title.as_deref(), Some("hello world again"));
+    }
+
+    #[test]
+    fn set_title_to_empty_or_whitespace_clears_the_title() {
+        // Matches pi's "empty names explicitly clear the session title" — a blank title isn't a
+        // present-but-empty display value, it's the caller asking to unset the title entirely.
+        let dir = tmpdir();
+        let path = dir.path().join("s.jsonl");
+        let mut store = SessionStore::create(path.clone(), SessionMeta::new("/w", "m")).unwrap();
+        store.set_title("My Session").unwrap();
+        assert_eq!(store.meta().title.as_deref(), Some("My Session"));
+
+        store.set_title("   \n\r\n  ").unwrap();
+        assert_eq!(store.meta().title, None);
+
+        let (reopened, _session) = SessionStore::open(path.clone()).unwrap();
+        assert_eq!(reopened.meta().title, None);
+        let listed = read_listing(&path).unwrap();
+        assert_eq!(listed.title, None);
     }
 
     #[test]
@@ -3043,6 +3262,28 @@ mod tests {
             search_text.chars().count()
         );
         assert!(!search_text.contains("this must not appear"));
+    }
+
+    #[test]
+    fn search_text_captures_a_marker_well_beyond_the_original_2000_char_cap() {
+        // Track L7: the cap was raised from 2,000 to 50,000 chars — a session whose distinguishing
+        // text lands past where the *old* cap would have cut it off must still be findable. This
+        // padding is comfortably past 2,000 chars but still well under the new cap.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("x".repeat(10_000));
+        session.user("findable-only-past-the-old-cap-marker");
+        store.append_new(&session.messages).unwrap();
+
+        let listings = repo.list().unwrap();
+        assert!(
+            listings[0]
+                .search_text
+                .contains("findable-only-past-the-old-cap-marker"),
+            "a marker past the old 2,000-char cap must still be captured under the raised cap"
+        );
     }
 
     #[test]

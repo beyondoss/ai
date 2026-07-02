@@ -29,6 +29,13 @@ use super::output::{OutputAccumulator, OutputSnapshot, TruncatedBy, format_outpu
 /// backstop. 30 minutes is generous enough to never bite a real build/test/install, while still
 /// bounding a truly stuck command instead of leaving it to hang a turn forever.
 const DEFAULT_TIMEOUT_MS: u64 = 1_800_000;
+/// Ceiling on a model-supplied `timeout_ms` — matches pi's own `MAX_TIMEOUT_MS` (`i32::MAX`
+/// milliseconds, ~24.8 days; Node's `setTimeout` silently misbehaves past a 32-bit delay, the original
+/// reason for the exact number, but kept here too for parity and because the sanity bound it enforces
+/// — reject an absurd value instead of quietly running an effectively-unbounded command — applies
+/// regardless of platform). Without this, an accidental or pathological huge value (a model typo, or a
+/// deliberately adversarial one) would defeat the whole point of having a timeout at all.
+const MAX_TIMEOUT_MS: u64 = 2_147_483_647;
 /// Minimum gap between streamed progress snapshots — pi's `BASH_UPDATE_THROTTLE_MS`. Keeps a chatty
 /// command from flooding the event stream; the final snapshot is always emitted regardless.
 const UPDATE_THROTTLE: Duration = Duration::from_millis(100);
@@ -60,6 +67,30 @@ fn resolve_shell() -> &'static str {
 pub struct Bash {
     runner: Arc<dyn CommandRunner>,
     default_timeout_ms: u64,
+    /// Overrides `resolve_shell()`'s auto-detection when set — see [`with_shell_path`](Self::with_shell_path).
+    shell_path: Option<String>,
+    /// Rendered once (at construction, and again if `with_default_timeout_ms` changes the default) —
+    /// see [`describe`] — rather than a `'static` literal, so a customized default actually shows up
+    /// in what the model sees instead of the tool description silently going stale for a deployment
+    /// that overrides it via `--bash-timeout-ms`.
+    description: String,
+}
+
+/// Build the model-facing tool description, stating the *actual* default timeout (a model omitting
+/// `timeout_ms` has no other way to know a command will be killed after this long, unlike the
+/// truncation budget below, which is at least self-discoverable via the `"Full output: <path>"` marker
+/// once it actually happens) and the output truncation budget (matching pi's own bash tool description,
+/// which documents both) — the model shouldn't have to learn either from a failed run.
+fn describe(default_timeout_ms: u64) -> String {
+    format!(
+        "Run a shell command via a resolved bash (falls back to sh) and return its combined \
+         stdout/stderr. Supports an optional `cwd` and `timeout_ms` (defaults to {default_timeout_ms} ms \
+         / {} minutes if omitted). Output is truncated to the last {} lines or {}, whichever is hit \
+         first; if truncated, the complete output is saved to a temp file you can read.",
+        default_timeout_ms / 60_000,
+        super::output::DEFAULT_MAX_LINES,
+        super::output::format_size(super::output::DEFAULT_MAX_BYTES as u64),
+    )
 }
 
 impl Bash {
@@ -68,12 +99,28 @@ impl Bash {
         Self {
             runner: Arc::new(RealRunner),
             default_timeout_ms: DEFAULT_TIMEOUT_MS,
+            shell_path: None,
+            description: describe(DEFAULT_TIMEOUT_MS),
         }
     }
 
     /// Builder-style: override the default timeout applied when the model omits `timeout_ms`.
     pub fn with_default_timeout_ms(mut self, ms: u64) -> Self {
         self.default_timeout_ms = ms;
+        self.description = describe(ms);
+        self
+    }
+
+    /// Builder-style: run commands through this shell instead of the auto-resolved one
+    /// (`resolve_shell()`: `/bin/bash`, else `bash` on `$PATH`, else `sh`) — for a non-standard
+    /// environment (Cygwin, a container without `/bin/bash` at the expected path, a hardened/audited
+    /// shell wrapper) where auto-detection would pick the wrong binary. Matches pi's own `shellPath`
+    /// setting (`getShellConfig(customShellPath)`). Existence is the caller's responsibility to check
+    /// up front (see `--bash-shell-path` in `main.rs`) — failing fast at CLI-argument time, once, is
+    /// simpler than threading a `Result` through every tool-registry rebuild this would otherwise
+    /// touch (`set_model`/`set_thinking` each rebuild the registry from `ServeConfig`).
+    pub fn with_shell_path(mut self, path: impl Into<String>) -> Self {
+        self.shell_path = Some(path.into());
         self
     }
 
@@ -83,7 +130,17 @@ impl Bash {
         Self {
             runner,
             default_timeout_ms: DEFAULT_TIMEOUT_MS,
+            shell_path: None,
+            description: describe(DEFAULT_TIMEOUT_MS),
         }
+    }
+
+    /// The shell `exec()` invokes: the override from [`with_shell_path`](Self::with_shell_path) if
+    /// set, else the auto-resolved default.
+    fn shell(&self) -> &str {
+        self.shell_path
+            .as_deref()
+            .unwrap_or_else(|| resolve_shell())
     }
 
     /// Shared body for [`Tool::run`] and [`Tool::run_streaming`]. Raw output feeds one accumulator; when
@@ -99,15 +156,21 @@ impl Bash {
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing `command`".into()))?;
         let cwd = input.get("cwd").and_then(Value::as_str);
-        // A present `timeout_ms` must be a positive integer — 0 would pass straight through as an
-        // instant, confusingly-worded timeout ("Command timed out after 0 seconds"), and a negative
-        // value previously fell silently back to the default instead of being rejected as the obvious
-        // caller mistake it is (matching pi's `resolveTimeoutMs` validation). A missing key still means
-        // "use the default", not an error.
+        // A present `timeout_ms` must be a positive integer no larger than `MAX_TIMEOUT_MS` — 0 would
+        // pass straight through as an instant, confusingly-worded timeout ("Command timed out after 0
+        // seconds"), a negative value previously fell silently back to the default instead of being
+        // rejected as the obvious caller mistake it is, and an absurdly large one would defeat the
+        // whole point of having a timeout at all (matching pi's `resolveTimeoutMs` validation, upper
+        // bound included). A missing key still means "use the default", not an error.
         let timeout_ms = match input.get("timeout_ms") {
             None | Some(Value::Null) => self.default_timeout_ms,
             Some(v) => match v.as_u64() {
-                Some(ms) if ms > 0 => ms,
+                Some(ms) if ms > 0 && ms <= MAX_TIMEOUT_MS => ms,
+                Some(ms) if ms > MAX_TIMEOUT_MS => {
+                    return Err(ToolError::InvalidInput(format!(
+                        "`timeout_ms` must be at most {MAX_TIMEOUT_MS}, got {ms}"
+                    )));
+                }
                 _ => {
                     return Err(ToolError::InvalidInput(format!(
                         "`timeout_ms` must be a positive integer, got {v}"
@@ -151,7 +214,7 @@ impl Bash {
             };
             let sink: ChunkSink<'_> = &sink;
             self.runner
-                .run_streaming(resolve_shell(), &args, cwd, dur, sink)
+                .run_streaming(self.shell(), &args, cwd, dur, sink)
                 .await
         }
         .map_err(|e| ToolError::Execution(format!("spawn failed: {e}")))?;
@@ -210,8 +273,7 @@ impl Tool for Bash {
         "bash"
     }
     fn description(&self) -> &str {
-        "Run a shell command via bash and return its combined stdout/stderr. Supports an optional \
-         `cwd` and `timeout_ms`."
+        &self.description
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -334,7 +396,7 @@ fn clean(s: String) -> String {
 mod tests {
     use super::*;
     use crate::tools::exec::ExecResult;
-    use crate::tools::output::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, Truncation};
+    use crate::tools::output::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, Truncation, format_size};
 
     #[test]
     fn truncation_details_nests_the_full_record_under_a_truncation_key() {
@@ -437,6 +499,24 @@ mod tests {
         assert_eq!(args, vec!["-c".to_string(), "echo hi".to_string()]);
     }
 
+    #[tokio::test]
+    async fn with_shell_path_overrides_the_auto_resolved_shell() {
+        let runner = recording(ExecResult {
+            code: Some(0),
+            stdout: "hi\n".into(),
+            ..Default::default()
+        });
+        Bash::with_runner(runner.clone())
+            .with_shell_path("/bin/dash")
+            .run(json!({ "command": "echo hi" }))
+            .await
+            .unwrap();
+        let (prog, _, _) = runner.last.lock().unwrap().clone().unwrap();
+        assert_eq!(prog, "/bin/dash");
+        // The auto-resolution path is unaffected when no override is set.
+        assert_ne!(resolve_shell(), "/bin/dash");
+    }
+
     #[test]
     fn resolve_shell_never_panics_and_returns_a_plausible_path() {
         let shell = resolve_shell();
@@ -475,6 +555,28 @@ mod tests {
         assert_eq!(timeout2, Duration::from_millis(5_000));
     }
 
+    #[test]
+    fn description_documents_the_default_timeout_and_truncation_budget() {
+        let desc = Bash::real().description().to_string();
+        assert!(
+            desc.contains(&DEFAULT_TIMEOUT_MS.to_string()) && desc.contains("30 minutes"),
+            "description should state the default timeout, got: {desc}"
+        );
+        assert!(
+            desc.contains(&DEFAULT_MAX_LINES.to_string())
+                && desc.contains(&format_size(DEFAULT_MAX_BYTES as u64)),
+            "description should state the truncation budget, got: {desc}"
+        );
+
+        // A customized default must show up too — a stale literal wouldn't reflect it.
+        let custom = Bash::real().with_default_timeout_ms(90_000);
+        assert!(
+            custom.description().contains("90000") && custom.description().contains("1 minutes"),
+            "description should reflect a customized default, got: {}",
+            custom.description()
+        );
+    }
+
     #[tokio::test]
     async fn zero_or_negative_timeout_ms_is_rejected_not_silently_coerced() {
         let runner = recording(ExecResult {
@@ -502,6 +604,31 @@ mod tests {
 
         // A missing `timeout_ms` still means "use the default" — not an error.
         bash.run(json!({ "command": "echo hi" })).await.unwrap();
+        assert!(runner.last.lock().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_timeout_ms_past_the_max_is_rejected_not_treated_as_effectively_unbounded() {
+        // Matches pi's `resolveTimeoutMs` upper-bound check: an absurdly large value (a typo, or a
+        // deliberately adversarial one) would otherwise defeat the entire point of having a timeout —
+        // `Duration::from_millis` happily accepts it and the command just never gets killed.
+        let runner = recording(ExecResult {
+            code: Some(0),
+            ..Default::default()
+        });
+        let bash = Bash::with_runner(runner.clone());
+
+        let err = bash
+            .run(json!({ "command": "echo hi", "timeout_ms": MAX_TIMEOUT_MS + 1 }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidInput(_)), "got: {err:?}");
+        assert!(runner.last.lock().unwrap().is_none());
+
+        // The max itself is still accepted (an inclusive bound, not exclusive).
+        bash.run(json!({ "command": "echo hi", "timeout_ms": MAX_TIMEOUT_MS }))
+            .await
+            .unwrap();
         assert!(runner.last.lock().unwrap().is_some());
     }
 

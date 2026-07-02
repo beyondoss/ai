@@ -103,8 +103,14 @@ impl Session {
     /// Scrub state that doesn't survive a model switch, ahead of resuming the conversation on
     /// `new_model`. Two things are per-producing-model, not portable:
     ///
-    /// - Signed `Thinking`/`RedactedThinking` blocks — Anthropic can reject a later turn that replays
-    ///   one to a different model than produced it.
+    /// - Signed `Thinking` blocks and encrypted `RedactedThinking` blocks — Anthropic can reject a
+    ///   later turn that replays a *signed* one to a different model than produced it, and a redacted
+    ///   block is opaque ciphertext meaningless to any other model. A signed `Thinking` block's own
+    ///   *text*, though, is ordinary prose — pi downgrades it to a plain `Text` block instead of
+    ///   discarding it outright, preserving the visible reasoning trace as context for the new model
+    ///   rather than silently erasing every prior turn's chain of thought on a model switch. An
+    ///   *empty*-text `Thinking` block (nothing worth preserving) is dropped like `RedactedThinking`,
+    ///   not downgraded into a useless empty `Text` block.
     /// - Combined OpenAI-Responses tool-call ids (`"call_id|item_id"`) — the `item_id` half only pairs
     ///   with a `reasoning` item on the *same* model/dialect; replayed to a foreign model it's at best
     ///   dead weight, at worst rejected.
@@ -121,6 +127,11 @@ impl Session {
                 continue;
             }
             message.content.retain_mut(|block| match block {
+                ContentBlock::Thinking { text, .. } if !text.is_empty() => {
+                    let text = std::mem::take(text);
+                    *block = ContentBlock::Text { text };
+                    true
+                }
                 ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => false,
                 ContentBlock::ToolUse { id, .. } => {
                     *id = crate::dialect::openai_responses::call_id_only(id);
@@ -158,7 +169,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scrub_cross_model_state_drops_thinking_blocks_from_a_foreign_model() {
+    fn scrub_cross_model_state_downgrades_signed_thinking_to_text_and_drops_redacted() {
         let mut s = Session::new();
         s.push(Message::user("think then answer"));
         s.push(
@@ -178,12 +189,46 @@ mod tests {
         );
         s.scrub_cross_model_state("gpt-5");
         assert_eq!(s.messages[0].content.len(), 1); // user text untouched
-        assert_eq!(s.messages[1].content.len(), 1); // only the Text block survives
+        // The redacted (opaque ciphertext) block is dropped; the signed thinking block's own text
+        // survives, downgraded to a plain Text block — visible reasoning context for the new model,
+        // not silently erased.
+        assert_eq!(
+            s.messages[1].content.len(),
+            2,
+            "{:?}",
+            s.messages[1].content
+        );
         assert_eq!(
             s.messages[1].content[0],
             ContentBlock::Text {
+                text: "let me reason".into()
+            }
+        );
+        assert_eq!(
+            s.messages[1].content[1],
+            ContentBlock::Text {
                 text: "answer".into()
             }
+        );
+    }
+
+    #[test]
+    fn scrub_cross_model_state_drops_an_empty_thinking_block_instead_of_downgrading_it() {
+        // Nothing worth preserving — must not become a useless empty Text block, which some
+        // providers (Anthropic in particular) reject outright as an invalid content block.
+        let mut s = Session::new();
+        s.push(
+            Message::assistant(vec![ContentBlock::Thinking {
+                text: String::new(),
+                signature: String::new(),
+            }])
+            .with_model_id("claude-opus-4-8"),
+        );
+        s.scrub_cross_model_state("gpt-5");
+        assert!(
+            s.messages[0].content.is_empty(),
+            "{:?}",
+            s.messages[0].content
         );
     }
 
@@ -204,14 +249,19 @@ mod tests {
     #[test]
     fn scrub_cross_model_state_treats_a_message_with_no_model_id_as_foreign() {
         // Persisted before this field existed (or from a source that never stamped it) — always
-        // scrubbed, matching the conservative default `strip_thinking_blocks` used to apply to all.
+        // scrubbed (downgraded, for a non-empty signed Thinking block — see the two tests above).
         let mut s = Session::new();
         s.push(Message::assistant(vec![ContentBlock::Thinking {
             text: "reasoning".into(),
             signature: "sig".into(),
         }]));
         s.scrub_cross_model_state("gpt-5");
-        assert!(s.messages[0].content.is_empty());
+        assert_eq!(
+            s.messages[0].content,
+            vec![ContentBlock::Text {
+                text: "reasoning".into()
+            }]
+        );
     }
 
     #[test]
