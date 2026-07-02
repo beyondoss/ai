@@ -38,44 +38,134 @@ pub fn discover(cwd: &Path, project_trusted: bool, extra_roots: &[String]) -> Ve
 }
 
 /// Like [`discover`], but also reports name collisions — the same skill `name` declared by more than
-/// one `SKILL.md`/loose-`.md` file, silently shadowed by `discover` (the later root, or the later file
-/// within one root, wins) — as human-readable strings naming both paths, for `get_commands` to surface
-/// as a diagnostic rather than a client having no way to notice a skill was shadowed.
+/// one `SKILL.md`/loose-`.md` file, silently shadowed by `discover` (the later standard root wins) — as
+/// human-readable strings naming both paths, for `get_commands` to surface as a diagnostic rather than a
+/// client having no way to notice a skill was shadowed.
 ///
 /// `extra_roots` are additional, ad-hoc discovery roots beyond the two standard ones — pi's own
-/// `--skill <path>` (repeatable). Unlike the two standard roots (routinely absent — that's normal, not
-/// worth a diagnostic), an operator-supplied extra root that doesn't exist is a likely typo/mistake, so
-/// it's reported through the same diagnostics channel `discover_with_diagnostics` already has, rather
-/// than silently contributing nothing. Checked and applied *after* the standard roots, so an extra root
-/// wins on a name collision — an operator passing `--skill` is deliberately overriding, not just adding.
+/// `--skill <path>` (repeatable), which accepts either a directory (walked like a standard root) or a
+/// single standalone `.md` file (one skill, no directory of its own resources — pi's other skill shape).
+/// Unlike the two standard roots (routinely absent — that's normal, not worth a diagnostic), an
+/// operator-supplied extra root that doesn't exist (or isn't a directory or `.md` file) is a likely
+/// typo/mistake, so it's reported through the same diagnostics channel `discover_with_diagnostics`
+/// already has, rather than silently contributing nothing. On a name collision, a **standard** root always wins over an
+/// extra one — matching pi (`resource-loader.ts` appends `--skill` paths after project/user skills, and
+/// `addSkills`' collision resolution keeps whichever was seen *first*, making the CLI paths lowest
+/// priority) — so `--skill` fills gaps rather than silently overriding a project's own skill of the same
+/// name. Extra roots collide among *themselves* on later-wins, same as the two standard roots do.
 pub fn discover_with_diagnostics(
     cwd: &Path,
     project_trusted: bool,
     extra_roots: &[String],
 ) -> (Vec<Skill>, Vec<String>) {
+    discover_with_diagnostics_impl(cwd, project_trusted, extra_roots, true)
+}
+
+/// Like [`discover_with_diagnostics`], but skips *both* standard roots (`~/.claude/skills` and
+/// `<cwd>/.claude/skills`) entirely, keeping only `extra_roots` — what `--no-skills` needs, since pi's
+/// own `noSkills` still honors an explicit `--skill` path passed alongside it (a documented, tested
+/// combination: `resource-loader.test.ts`, "should still load additional skill paths when noSkills is
+/// true" — pi-parity fix, M2). `discover_with_diagnostics(cwd, false, extra_roots)` can't express this on
+/// its own: the user standard root is never gated on `project_trusted` (see [`discover`]'s doc comment),
+/// so there's no way to suppress *both* standard roots through its existing parameters — this needs an
+/// actual "skip standard roots" switch.
+pub fn discover_extra_only(extra_roots: &[String]) -> (Vec<Skill>, Vec<String>) {
+    discover_with_diagnostics_impl(Path::new(""), false, extra_roots, false)
+}
+
+fn discover_with_diagnostics_impl(
+    cwd: &Path,
+    project_trusted: bool,
+    extra_roots: &[String],
+    include_standard_roots: bool,
+) -> (Vec<Skill>, Vec<String>) {
     let mut found: Vec<Skill> = Vec::new();
     let mut collisions: Vec<String> = Vec::new();
-    let mut roots: Vec<PathBuf> = Vec::new();
-    if let Some(home) = home_dir() {
-        roots.push(home.join(".claude/skills"));
+    let mut standard_roots: Vec<PathBuf> = Vec::new();
+    if include_standard_roots {
+        if let Some(home) = home_dir() {
+            standard_roots.push(home.join(".claude/skills"));
+        }
+        if project_trusted {
+            standard_roots.push(cwd.join(".claude/skills"));
+        }
     }
-    if project_trusted {
-        roots.push(cwd.join(".claude/skills"));
-    }
+    // Each extra root's own skills, kept as separate groups (rather than one flat Vec) so root order
+    // is still visible below for the "later extra wins over an earlier extra" tie-break.
+    let mut extra_root_skills: Vec<Vec<Skill>> = Vec::new();
     for extra in extra_roots {
-        let root = PathBuf::from(extra);
-        if !root.is_dir() {
-            let message = format!("--skill path does not exist or is not a directory: {extra}");
+        // pi-parity fix (L8): pi's own `resolveCliPaths`→`resolvePath` expands a leading `~` on a
+        // `--skill` path; ours previously took it verbatim — usually masked by the shell expanding it
+        // first, but not for a quoted argument (`--skill "~/foo"`) or one built programmatically.
+        let home = home_dir();
+        let expanded = crate::tools::expand_tilde(extra, home.as_deref().and_then(|p| p.to_str()));
+        let root = PathBuf::from(expanded);
+        if root.is_dir() {
+            extra_root_skills.push(discover_in(&root));
+        } else if root.extension().and_then(|e| e.to_str()) == Some("md") {
+            // pi's other `--skill` shape: a single standalone `.md` file, one skill, no directory of
+            // its own resources — `skills.ts`'s `stats.isFile() && resolvedPath.endsWith(".md")`.
+            match parse_skill(&root) {
+                Some(skill) => extra_root_skills.push(vec![skill]),
+                None => {
+                    let message = format!(
+                        "--skill file has no usable frontmatter (needs a non-empty description): \
+                         {extra}"
+                    );
+                    tracing::warn!("{message}");
+                    collisions.push(message);
+                }
+            }
+        } else {
+            let message = format!(
+                "--skill path does not exist, or is not a directory or a .md file: {extra}"
+            );
             tracing::warn!("{message}");
             collisions.push(message);
-            continue;
         }
-        roots.push(root);
     }
 
-    for root in roots {
+    for root in standard_roots {
         for skill in discover_in(&root) {
-            // Later roots (project) win over earlier (user) on name collisions.
+            // Later standard roots (project) win over earlier (user) on name collisions.
+            if let Some(existing) = found.iter_mut().find(|s| s.name == skill.name) {
+                let message = format!(
+                    "skill \"{}\" defined at both {} and {} — the latter wins",
+                    skill.name,
+                    existing.path.display(),
+                    skill.path.display()
+                );
+                tracing::warn!("{message}");
+                collisions.push(message);
+                *existing = skill;
+            } else {
+                found.push(skill);
+            }
+        }
+    }
+    // Names claimed by a standard root — snapshotted *before* extra roots are processed, so a
+    // standard-root skill always wins over an extra one, but two extra roots can still shadow each
+    // other (later wins), matching this function's doc comment.
+    let standard_names: std::collections::HashSet<String> =
+        found.iter().map(|s| s.name.clone()).collect();
+    for skills in extra_root_skills {
+        for skill in skills {
+            if let Some(existing) = standard_names
+                .contains(&skill.name)
+                .then(|| found.iter().find(|s| s.name == skill.name))
+                .flatten()
+            {
+                let message = format!(
+                    "skill \"{}\" defined at both {} (standard root) and {} (--skill) — the \
+                     standard root wins",
+                    skill.name,
+                    existing.path.display(),
+                    skill.path.display()
+                );
+                tracing::warn!("{message}");
+                collisions.push(message);
+                continue;
+            }
             if let Some(existing) = found.iter_mut().find(|s| s.name == skill.name) {
                 let message = format!(
                     "skill \"{}\" defined at both {} and {} — the latter wins",
@@ -276,33 +366,46 @@ fn validate_skill_description(description: &str) -> Vec<String> {
 }
 
 /// Parse a leading `---`-fenced YAML frontmatter block into its top-level scalar keys, alongside the
-/// remaining body text (everything after the closing `---` fence, verbatim — used to expand a
-/// `/skill:name` invocation without leaking the raw YAML into the model-facing text). Dependency-free
-/// (no `serde_yaml`): enough of YAML for the Agent Skills spec — quoted values, and block scalars
-/// (`key: |` / `key: >`) whose value spans the following more-indented lines. A `>` (folded) block is
-/// joined with spaces, a `|` (literal) block with newlines; both let a long `description:` wrap across
-/// lines. Anything fancier (anchors, nested maps) is out of scope and ignored. No frontmatter fence at
-/// all (or an unterminated one) returns an empty map and the whole input as the body, unchanged.
+/// remaining body text (everything after the closing `---` fence — used to expand a `/skill:name`
+/// invocation without leaking the raw YAML into the model-facing text; `\r\n`/`\r` are normalized to
+/// `\n` throughout, matching pi's own `normalizeNewlines`, applied unconditionally before any fence
+/// detection). Dependency-free (no `serde_yaml`): enough of YAML for the Agent Skills spec — quoted
+/// values, and block scalars (`key: |` / `key: >`) whose value spans the following more-indented lines.
+/// A `>` (folded) block is joined with spaces, a `|` (literal) block with newlines; both let a long
+/// `description:` wrap across lines, and both keep exactly one trailing `\n` on the joined value —
+/// real YAML's default "clip" chomping, which a real parser (pi's) applies to either block style, not
+/// just `|`. Anything fancier (anchors, nested maps) is out of scope and ignored.
+///
+/// No opening fence at all (the first line isn't `---`) *or* an unterminated one (no closing `---`
+/// found before EOF) both return an empty map and the **entire original input**, verbatim, as the body
+/// — matching pi's own `extractFrontmatter` (`indexOf("\n---", 3) === -1` falls back to `{ yamlString:
+/// null, body: normalized }` exactly like the no-fence-at-all case). Getting the unterminated case wrong
+/// is a real content-loss bug, not just a shape mismatch: greedily parsing every remaining line as
+/// (attempted) frontmatter key/value pairs would make a skill with a typo'd closing fence still discover
+/// and advertise successfully (name/description often parse fine from the greedily-consumed text) while
+/// silently losing its *entire* instructional body — the one thing `/skill:name` is supposed to expand.
 ///
 /// `pub(crate)`: shared with [`crate::prompts`], whose own frontmatter (`description:`/
 /// `argument-hint:`) is the exact same shape — one parser rather than two so a fix (or a future
 /// format extension) doesn't have to land twice.
-pub(crate) fn parse_frontmatter(text: &str) -> (HashMap<String, String>, &str) {
+pub(crate) fn parse_frontmatter(text: &str) -> (HashMap<String, String>, String) {
     let mut map = HashMap::new();
     // Iterate raw, newline-inclusive lines and track how many bytes have been consumed, so the body can
     // be sliced out byte-exact once the closing fence is found — `Lines` alone discards that offset.
     let mut lines = text.split_inclusive('\n').peekable();
     let Some(first) = lines.next() else {
-        return (map, text);
+        return (map, normalize_newlines(text));
     };
     if first.trim_end_matches(['\n', '\r']) != "---" {
-        return (map, text);
+        return (map, normalize_newlines(text));
     }
     let mut consumed = first.len();
+    let mut closed = false;
     while let Some(line) = lines.next() {
         consumed += line.len();
         let line = line.trim_end_matches(['\n', '\r']);
         if line.trim() == "---" {
+            closed = true;
             break;
         }
         // Top-level keys are unindented; an indented line is a continuation already consumed by the
@@ -336,13 +439,30 @@ pub(crate) fn parse_frontmatter(text: &str) -> (HashMap<String, String>, &str) {
                 } else {
                     parts.join("\n")
                 };
-                joined.trim().to_string()
+                // pi-parity fix (L9): real YAML's default "clip" chomping keeps exactly one trailing
+                // newline on a block scalar's value — ours used to `.trim()` it away entirely. Applies
+                // to both `|` and `>`; only the *internal* line joining differs between them.
+                format!("{joined}\n")
             }
             _ => unquote(raw),
         };
         map.insert(key, value);
     }
-    (map, text.get(consumed..).unwrap_or(""))
+    if !closed {
+        // pi-parity fix (M4): an unterminated fence is "no frontmatter", full stop — see this
+        // function's doc comment. Discard whatever key/value pairs were greedily parsed above; they
+        // were never really frontmatter, just text that happened to look like it.
+        return (HashMap::new(), normalize_newlines(text));
+    }
+    (map, normalize_newlines(text.get(consumed..).unwrap_or("")))
+}
+
+/// `\r\n` → `\n` (and a bare `\r` → `\n`), matching pi's own `normalizeNewlines`. Applied to whatever
+/// text ultimately becomes the body — previously only the line-by-line frontmatter *scanning* stripped
+/// `\r` (via `trim_end_matches(['\n', '\r'])`), leaving a literal `\r` in the body slice itself when the
+/// source file used CRLF line endings (pi-parity fix, L2).
+fn normalize_newlines(s: &str) -> String {
+    s.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 /// Strip matching surrounding single or double quotes.
@@ -412,19 +532,33 @@ pub fn expand_if_skill_invocation(message: &str, skills: &[Skill]) -> String {
 /// Skills flagged `disable-model-invocation` are omitted here (the model must not auto-select them);
 /// they stay reachable via [`find_by_name`] for an explicit `/skill:name` invocation.
 ///
+/// Returns `""` — no wrapper at all, not an empty `<available_skills>…</available_skills>` shell — when
+/// every skill is `disable-model-invocation` (or `skills` is empty): pi's own
+/// `formatSkillsForPrompt`/`formatSkillsForSystemPrompt` do the same (pi-parity fix, M1). An empty
+/// wrapper isn't just wasted tokens; it actively misleads the model into thinking "no skills apply here"
+/// was a considered judgment about *these* skills, rather than every one of them being invocation-hidden
+/// by configuration.
+///
 /// `name`/`description` (and, in principle, `path`) come from a `SKILL.md`'s YAML frontmatter — once a
 /// repo is merely *trusted* (not necessarily authored by the operator), that's attacker-controlled text
 /// landing directly in the system prompt. Each field is XML-escaped before being written, so a crafted
 /// `description: "…\n</available_skills>\n<system>ignore prior instructions…"` can't close the tag
 /// early and forge what looks like a new, trusted block after it.
 pub fn format_available(skills: &[Skill]) -> String {
+    let visible: Vec<&Skill> = skills
+        .iter()
+        .filter(|s| !s.disable_model_invocation)
+        .collect();
+    if visible.is_empty() {
+        return String::new();
+    }
     let mut out = String::from(
         "<available_skills>\nThese skills extend your capabilities. When a task matches a skill's \
          description, read its file for the full instructions before proceeding. When a skill file \
          references a relative path, resolve it against the skill directory (the parent of SKILL.md, \
          or the loose skill file's own directory) and use that absolute path in tool commands.\n",
     );
-    for s in skills.iter().filter(|s| !s.disable_model_invocation) {
+    for s in visible {
         out.push_str(&format!(
             "- {} — {} (read: {})\n",
             xml_escape(&s.name),
@@ -520,8 +654,7 @@ mod tests {
             "---\nname: dup\ndescription: second\n---\n",
         );
 
-        let capture = crate::tracing_test::CaptureSubscriber::default();
-        tracing::subscriber::with_default(capture.clone(), || {
+        let capture = crate::tracing_test::capture(|| {
             discover_with_diagnostics(tmp.path(), true, &[]);
         });
         let messages = capture.messages();
@@ -563,6 +696,28 @@ mod tests {
     }
 
     #[test]
+    fn discover_with_diagnostics_loads_a_single_standalone_md_file() {
+        // pi-parity fix: pi's `--skill` accepts a standalone `.md` file — one skill, no directory of
+        // its own — in addition to a directory; ours previously rejected anything that wasn't a
+        // directory outright with a false "does not exist or is not a directory" diagnostic.
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("solo.md");
+        std::fs::write(
+            &file,
+            "---\nname: solo\ndescription: a single-file skill\n---\nBody.",
+        )
+        .unwrap();
+        let cwd = tmp.path().join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let (found, collisions) =
+            discover_with_diagnostics(&cwd, true, &[file.to_string_lossy().into_owned()]);
+        assert!(
+            found.iter().any(|s| s.name == "solo"),
+            "got: {found:?}, collisions: {collisions:?}"
+        );
+    }
+
+    #[test]
     fn discover_with_diagnostics_warns_when_an_extra_root_does_not_exist() {
         // pi: coding-agent/skills.test.ts — "should warn when skill path does not exist".
         // `discover_with_diagnostics` also scans the developer's real `~/.claude/skills`, so this
@@ -582,7 +737,50 @@ mod tests {
     }
 
     #[test]
-    fn discover_with_diagnostics_extra_root_wins_over_a_standard_root_on_collision() {
+    fn discover_extra_only_skips_standard_roots_but_keeps_an_explicit_extra_root() {
+        // pi-parity fix (M2): pi's `--no-skills` still honors an explicit `--skill` path passed
+        // alongside it (`resource-loader.test.ts`, "should still load additional skill paths when
+        // noSkills is true" — a documented, tested combination). Ours used to zero out *both* the
+        // standard roots and any `extra_roots`/`--skill` path together, discarding an operator-supplied
+        // path they explicitly asked to keep.
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(
+            &tmp.path().join(".claude/skills"),
+            "standard",
+            "---\nname: standard\ndescription: standard root skill\n---\n",
+        );
+        let extra_root = tmp.path().join("custom-skills");
+        write_skill(
+            &extra_root,
+            "custom",
+            "---\nname: custom\ndescription: custom root skill\n---\n",
+        );
+
+        // Sanity check / positive control: with normal discovery (not `--no-skills`), the project
+        // standard root's own skill *is* found — proving the assertion below is actually exercising a
+        // skip, not just a location `discover_extra_only` was never going to look at regardless.
+        let (normally_found, _) = discover_with_diagnostics(tmp.path(), true, &[]);
+        assert!(
+            normally_found.iter().any(|s| s.name == "standard"),
+            "sanity check: the standard root must be discoverable normally: {normally_found:?}"
+        );
+
+        let (found, _) = discover_extra_only(&[extra_root.to_string_lossy().into_owned()]);
+        assert!(
+            found.iter().any(|s| s.name == "custom"),
+            "an explicit extra root must still load: {found:?}"
+        );
+        assert!(
+            !found.iter().any(|s| s.name == "standard"),
+            "the standard root must be skipped entirely: {found:?}"
+        );
+    }
+
+    #[test]
+    fn discover_with_diagnostics_a_standard_root_wins_over_an_extra_root_on_collision() {
+        // pi-parity fix: pi appends `--skill` paths *after* project/user skills and keeps whichever
+        // name it sees *first* — an operator-supplied extra root fills a gap, it doesn't silently
+        // override a project's own skill of the same name.
         let tmp = tempfile::tempdir().unwrap();
         write_skill(
             &tmp.path().join(".claude/skills"),
@@ -595,13 +793,46 @@ mod tests {
             "dup",
             "---\nname: dup\ndescription: extra root version\n---\n",
         );
-        let (found, _) = discover_with_diagnostics(
+        let (found, collisions) = discover_with_diagnostics(
             tmp.path(),
             true,
             &[extra_root.to_string_lossy().into_owned()],
         );
         let dup = found.iter().find(|s| s.name == "dup").unwrap();
-        assert_eq!(dup.description, "extra root version");
+        assert_eq!(dup.description, "standard root version");
+        assert!(
+            collisions
+                .iter()
+                .any(|c| c.contains("dup") && c.contains("standard root wins")),
+            "got: {collisions:?}"
+        );
+    }
+
+    #[test]
+    fn discover_with_diagnostics_two_extra_roots_still_shadow_each_other_later_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let extra1 = tmp.path().join("extra1");
+        let extra2 = tmp.path().join("extra2");
+        write_skill(
+            &extra1,
+            "dup",
+            "---\nname: dup\ndescription: first extra\n---\n",
+        );
+        write_skill(
+            &extra2,
+            "dup",
+            "---\nname: dup\ndescription: second extra\n---\n",
+        );
+        let (found, _) = discover_with_diagnostics(
+            tmp.path(),
+            true,
+            &[
+                extra1.to_string_lossy().into_owned(),
+                extra2.to_string_lossy().into_owned(),
+            ],
+        );
+        let dup = found.iter().find(|s| s.name == "dup").unwrap();
+        assert_eq!(dup.description, "second extra");
     }
 
     #[test]
@@ -666,7 +897,6 @@ mod tests {
 
     #[test]
     fn an_oversized_description_is_logged() {
-        let capture = crate::tracing_test::CaptureSubscriber::default();
         let tmp = tempfile::tempdir().unwrap();
         write_skill(
             tmp.path(),
@@ -676,7 +906,7 @@ mod tests {
                 "a".repeat(MAX_SKILL_DESCRIPTION_LEN + 1)
             ),
         );
-        tracing::subscriber::with_default(capture.clone(), || {
+        let capture = crate::tracing_test::capture(|| {
             discover_in(tmp.path());
         });
         let messages = capture.messages();
@@ -736,27 +966,67 @@ mod tests {
     #[test]
     fn malformed_frontmatter_degrades_gracefully_without_panicking() {
         // The hand-rolled parser has no real YAML error path by design (see `parse_frontmatter`'s doc
-        // comment); the useful guarantee here isn't a specific error shape, it's that adversarial/
-        // malformed input can't panic discovery. An unclosed bracket value and an unterminated fence
-        // (no closing `---` at all) are both plausible ways a hand-edited SKILL.md goes wrong.
+        // comment) — pi's real YAML parser would throw and skip the skill with a diagnostic (see
+        // `discover_with_diagnostics_accepts_malformed_yaml_values_silently_by_design` below for that
+        // documented deviation); ours instead accepts the value as a literal string. The guarantee this
+        // test pins isn't a specific error shape, it's that adversarial/malformed input can't panic
+        // discovery.
         let (fm, _) = parse_frontmatter("---\nname: x\ndescription: [unclosed\n---\nBody");
         assert_eq!(fm.get("description").map(String::as_str), Some("[unclosed"));
+    }
 
-        // No closing fence at all — must not panic or hang; every line is consumed as (attempted)
-        // frontmatter and the body comes back empty rather than the parser reading past EOF.
-        let (fm2, body2) = parse_frontmatter("---\nname: y\ndescription: z\n");
-        assert_eq!(fm2.get("name").map(String::as_str), Some("y"));
-        assert_eq!(body2, "");
+    #[test]
+    fn discover_with_diagnostics_accepts_malformed_yaml_values_silently_by_design() {
+        // pi: frontmatter.test.ts, "throws on invalid YAML frontmatter" / skills.test.ts, "should warn
+        // and skip skill when YAML frontmatter is invalid" — pi's real YAML parser throws on `[unclosed`
+        // (an unterminated flow sequence) and the skill is skipped with an `invalid_metadata`-shaped
+        // diagnostic. Ours has no real YAML error path (a documented, deliberate simplification — see
+        // `parse_frontmatter`'s doc comment): the value is accepted as the literal string `"[unclosed"`,
+        // so the skill still discovers successfully instead of being skipped. Pinning this as *known*,
+        // not silently regressable, rather than a gap to close.
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(
+            tmp.path(),
+            "shrug",
+            "---\nname: shrug\ndescription: [unclosed\n---\nBody.",
+        );
+        let skills = discover_in(tmp.path());
+        assert_eq!(skills.len(), 1, "got: {skills:?}");
+        assert_eq!(skills[0].description, "[unclosed");
+    }
 
-        // End-to-end through discovery too: a skill with an unterminated fence must not panic the walk,
-        // whatever it ultimately decides to do with the file.
+    #[test]
+    fn unterminated_frontmatter_fence_treats_the_whole_file_as_body_not_as_frontmatter() {
+        // pi-parity fix (M4): pi's `extractFrontmatter` treats a missing closing `---` as "no
+        // frontmatter at all" — the entire original input becomes the body, verbatim. Ours used to
+        // greedily parse every remaining line as an (attempted) frontmatter key/value pair, so `name`/
+        // `description` still parsed fine (from text that was never really frontmatter) while the body
+        // came back completely empty — a skill's entire instructional content silently lost to a typo'd
+        // closing fence, even though the skill still discovered and advertised successfully.
+        let (fm, body) = parse_frontmatter("---\nname: y\ndescription: z\nThe rest of the body.\n");
+        assert!(
+            fm.is_empty(),
+            "an unterminated fence must yield no frontmatter at all: {fm:?}"
+        );
+        assert_eq!(
+            body,
+            "---\nname: y\ndescription: z\nThe rest of the body.\n"
+        );
+
+        // End-to-end through discovery: with no closing fence, there's no `description:` frontmatter
+        // key to find (it's all just body now) — the skill fails discovery's required-description
+        // check, matching pi's own "no usable frontmatter" outcome, rather than discovering successfully
+        // with an empty body.
         let tmp = tempfile::tempdir().unwrap();
         write_skill(
             tmp.path(),
             "broken",
-            "---\nname: broken\ndescription: no closing fence\n",
+            "---\nname: broken\ndescription: no closing fence\nMore body text that must not be lost.\n",
         );
-        let _ = discover_in(tmp.path()); // must not panic
+        assert!(
+            discover_in(tmp.path()).is_empty(),
+            "an unterminated fence has no frontmatter, so no description — must not discover"
+        );
     }
 
     #[test]
@@ -840,7 +1110,23 @@ mod tests {
             "---\nname: wrapped\ndescription: >\n  first line\n  second line\n---\nBody.",
         );
         let skills = discover_in(tmp.path());
-        assert_eq!(skills[0].description, "first line second line");
+        // pi-parity fix (L3): real YAML's default "clip" chomping keeps exactly one trailing `\n` on a
+        // block scalar's value (folded `>` included, not just literal `|`) — ours used to `.trim()` it
+        // away.
+        assert_eq!(skills[0].description, "first line second line\n");
+    }
+
+    #[test]
+    fn literal_block_scalar_preserves_internal_newlines_and_one_trailing_newline() {
+        // pi: frontmatter.test.ts, "parses | multiline yaml syntax" —
+        // `description: |\n  Line one\n  Line two\n` → `"Line one\nLine two\n"` (internal line breaks
+        // kept verbatim, unlike `>`'s space-join, plus the one trailing newline clip-mode chomping
+        // always keeps).
+        let (fm, _) = parse_frontmatter("---\ndescription: |\n  Line one\n  Line two\n---\n\nBody");
+        assert_eq!(
+            fm.get("description").map(String::as_str),
+            Some("Line one\nLine two\n")
+        );
     }
 
     #[test]
@@ -856,6 +1142,16 @@ mod tests {
         let (fm, body) = parse_frontmatter("just plain text, no frontmatter at all");
         assert!(fm.is_empty());
         assert_eq!(body, "just plain text, no frontmatter at all");
+    }
+
+    #[test]
+    fn parse_frontmatter_normalizes_crlf_in_both_keys_and_the_returned_body() {
+        // pi: frontmatter.test.ts, "normalizes newlines and handles CRLF" (pi-parity fix, L2) — CRLF
+        // was already normalized while *scanning* frontmatter keys (`trim_end_matches(['\n', '\r'])`),
+        // but the returned body slice was whatever raw bytes followed the closing fence, `\r` and all.
+        let (fm, body) = parse_frontmatter("---\r\nname: test\r\n---\r\nLine one\r\nLine two");
+        assert_eq!(fm.get("name").map(String::as_str), Some("test"));
+        assert_eq!(body, "Line one\nLine two");
     }
 
     #[test]
@@ -1072,6 +1368,44 @@ mod tests {
         // The model needs to be told how to resolve a relative path a skill file references, or it
         // may hand a tool a path relative to the wrong directory.
         assert!(rendered.contains("resolve it against the skill directory"));
+    }
+
+    #[test]
+    fn format_available_returns_empty_string_when_every_skill_is_model_invisible() {
+        // pi: harness/system-prompt.test.ts, "returns an empty string when no skills are
+        // model-visible" / coding-agent/skills.test.ts, "should return empty string when all skills
+        // have disableModelInvocation" (pi-parity fix, M1). Ours used to still emit an empty
+        // `<available_skills>…</available_skills>` shell — wasted tokens, and actively misleading: it
+        // reads as "no skill applies here" rather than "every skill is invocation-hidden".
+        let skills = vec![Skill {
+            name: "hidden".into(),
+            description: "Hidden".into(),
+            path: PathBuf::from("/x/.claude/skills/hidden/SKILL.md"),
+            disable_model_invocation: true,
+        }];
+        assert_eq!(format_available(&skills), "");
+        assert_eq!(format_available(&[]), "");
+    }
+
+    #[test]
+    fn format_available_still_lists_a_visible_skill_alongside_a_hidden_one() {
+        let skills = vec![
+            Skill {
+                name: "visible".into(),
+                description: "Visible".into(),
+                path: PathBuf::from("/x/.claude/skills/visible/SKILL.md"),
+                disable_model_invocation: false,
+            },
+            Skill {
+                name: "hidden".into(),
+                description: "Hidden".into(),
+                path: PathBuf::from("/x/.claude/skills/hidden/SKILL.md"),
+                disable_model_invocation: true,
+            },
+        ];
+        let rendered = format_available(&skills);
+        assert!(rendered.contains("visible"));
+        assert!(!rendered.contains("hidden — Hidden"));
     }
 
     #[test]

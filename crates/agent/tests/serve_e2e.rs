@@ -1318,15 +1318,22 @@ fn serve_switches_model_and_thinking_at_runtime() {
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
-    // The known-model list is returned and non-empty.
+    // The known-model list is returned and non-empty, each entry a structured capability object (F-M2:
+    // pi's `Model<any>` shape — `id`/`contextWindow`/`reasoning`, minus pricing — not a bare id string).
     writeln!(stdin, "{}", json!({ "type": "get_available_models" })).unwrap();
     stdin.flush().unwrap();
     let frames = read_until_response(&mut stdout, "get_available_models");
     let models = frames.last().unwrap()["data"]["models"].as_array().unwrap();
+    let opus = models
+        .iter()
+        .find(|m| m["id"] == "claude-opus-4-8")
+        .unwrap_or_else(|| panic!("model list should include the default opus id: {models:#?}"));
     assert!(
-        models.iter().any(|m| m == "claude-opus-4-8"),
-        "model list should include the default opus id: {models:#?}"
+        opus["context_window"].as_u64().unwrap() > 0,
+        "got: {opus:#?}"
     );
+    assert!(opus["reasoning"].is_boolean(), "got: {opus:#?}");
+    assert_eq!(opus["provider"], "anthropic", "got: {opus:#?}");
 
     // Switch the model; the response echoes it and `get_state` reflects it.
     writeln!(
@@ -1417,7 +1424,7 @@ fn serve_cycle_model_advances_and_wraps() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|m| m.as_str().unwrap().to_string())
+        .map(|m| m["id"].as_str().unwrap().to_string())
         .collect();
 
     // Pin the model to the list's *last* entry first, so cycling from a known position is
@@ -1454,7 +1461,7 @@ fn serve_cycle_model_advances_and_wraps() {
 }
 
 #[test]
-fn serve_cycle_model_scoped_by_the_models_flag_ignores_the_rest_of_the_known_list() {
+fn serve_cycle_model_scoped_by_the_models_flag_cycles_only_the_scope_but_lists_the_full_catalog() {
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
@@ -1483,9 +1490,10 @@ fn serve_cycle_model_scoped_by_the_models_flag_ignores_the_rest_of_the_known_lis
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
-    // `get_available_models` must reflect the `--models` scope — matching pi's own
-    // `get_available_models`, a live query against the configured registry, not a static hardcoded
-    // list that ignores the operator's own `--models` configuration.
+    // `get_available_models` is deliberately NOT scoped by `--models` — that flag only narrows
+    // `cycle_model`'s own candidate list (asserted below). A client's model *picker* still needs to
+    // see the full catalog to offer a "show everything" view, same as pi's own `/model` selector can
+    // Tab out of its scope-defaulted view.
     writeln!(stdin, "{}", json!({ "type": "get_available_models" })).unwrap();
     stdin.flush().unwrap();
     let frames = read_until_response(&mut stdout, "get_available_models");
@@ -1493,12 +1501,15 @@ fn serve_cycle_model_scoped_by_the_models_flag_ignores_the_rest_of_the_known_lis
         .as_array()
         .unwrap()
         .iter()
-        .map(|m| m.as_str().unwrap().to_string())
+        .map(|m| m["id"].as_str().unwrap().to_string())
         .collect();
     assert_eq!(
         all_models,
-        vec!["claude-opus-4-8".to_string(), "gpt-4o".to_string()],
-        "get_available_models must report exactly the --models scope, in order"
+        beyond_ai_agent::serve::available_models()
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
+        "get_available_models must report the full catalog, unaffected by --models scoping"
     );
 
     // Pin to the scoped list's first entry so cycling from a known position is unambiguous.
@@ -1524,6 +1535,185 @@ fn serve_cycle_model_scoped_by_the_models_flag_ignores_the_rest_of_the_known_lis
     stdin.flush().unwrap();
     let frames = read_until_response(&mut stdout, "cycle_model");
     assert_eq!(frames.last().unwrap()["data"]["model"], "claude-opus-4-8");
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_models_flag_expands_a_glob_against_the_known_catalog() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = Command::new(bin)
+        .args([
+            "serve",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--session-file",
+            &session_file,
+            "--models",
+            "claude-*",
+        ])
+        .env("HOME", ISOLATED_HOME)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    // Pin to the first claude-* entry in catalog order so cycling from a known position is
+    // unambiguous, then walk the whole scoped cycle and confirm it's exactly the claude-* subset of
+    // `available_models()`, in catalog order, wrapping back to the start — never a gpt-*/o*-series id.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_model", "model": "claude-opus-4-8" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "set_model");
+
+    let expected: Vec<&str> = beyond_ai_agent::serve::available_models()
+        .iter()
+        .copied()
+        .filter(|id| id.starts_with("claude-"))
+        .collect();
+    assert!(
+        expected.len() >= 2,
+        "fixture assumption: the known catalog has multiple claude-* ids"
+    );
+
+    let cycle_order: Vec<&str> = expected[1..]
+        .iter()
+        .chain(expected[..1].iter())
+        .copied()
+        .collect();
+    for want in &cycle_order {
+        writeln!(stdin, "{}", json!({ "type": "cycle_model" })).unwrap();
+        stdin.flush().unwrap();
+        let frames = read_until_response(&mut stdout, "cycle_model");
+        let last = frames.last().unwrap();
+        assert_eq!(last["data"]["model"], *want);
+        assert_eq!(last["data"]["scoped"], true);
+    }
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_models_flag_pattern_level_suffix_pins_that_models_thinking_level_on_cycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = Command::new(bin)
+        .args([
+            "serve",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--session-file",
+            &session_file,
+            "--models",
+            "claude-opus-4-8:high,gpt-4o",
+        ])
+        .env("HOME", ISOLATED_HOME)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    // Pin to the unpinned scoped entry first so cycling onto the pinned one is unambiguous.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_model", "model": "gpt-4o" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "set_model");
+
+    // Cycling onto "claude-opus-4-8:high" must land with reasoning_effort "high", the level its
+    // `--models` pattern pinned — not whatever level happened to be active before.
+    writeln!(stdin, "{}", json!({ "type": "cycle_model" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "cycle_model");
+    let last = frames.last().unwrap();
+    assert_eq!(last["data"]["model"], "claude-opus-4-8");
+    assert_eq!(last["data"]["reasoning_effort"], "high");
+
+    // Cycling onto the unpinned "gpt-4o" must not carry the pinned level along — it keeps whatever
+    // was already active (still "high" here, since nothing unpins it), matching pi's own
+    // "unpinned entries inherit the session's current level" rule rather than resetting to off.
+    writeln!(stdin, "{}", json!({ "type": "cycle_model" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "cycle_model");
+    let last = frames.last().unwrap();
+    assert_eq!(last["data"]["model"], "gpt-4o");
+    assert_eq!(last["data"]["reasoning_effort"], "high");
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_models_flag_rejects_an_invalid_thinking_level_suffix_as_part_of_the_literal_id() {
+    // "claude-opus-4-8:bogus" has no valid thinking-level suffix, so the whole string is kept as a
+    // literal id (pi's own scope-mode fallback) rather than silently dropping ":bogus" — since our
+    // catalog match is glob-only, a literal that doesn't equal any catalog entry is still forwarded
+    // verbatim (see `available_models`'s "hint, not an allowlist" contract), so cycling reaches it too.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = Command::new(bin)
+        .args([
+            "serve",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--session-file",
+            &session_file,
+            "--models",
+            "claude-opus-4-8:bogus",
+        ])
+        .env("HOME", ISOLATED_HOME)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "cycle_model" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "cycle_model");
+    assert_eq!(
+        frames.last().unwrap()["data"]["model"],
+        "claude-opus-4-8:bogus"
+    );
 
     drop(stdin);
     child.wait().unwrap();
@@ -1897,6 +2087,187 @@ fn serve_compact_forwards_custom_instructions_to_the_summarization_call() {
 }
 
 #[test]
+fn serve_proactively_compacts_a_resumed_large_session_on_its_very_next_prompt() {
+    // B-M14 pi-parity gap (fixed): a large session persisted by an *earlier* process (no live
+    // `Session` in memory to carry `last_input_tokens` forward) used to resume with that field at
+    // its zero default — `SessionStore::open` never restored it from the persisted transcript — so
+    // `should_compact` couldn't fire until a fresh turn produced real usage, one whole turn later
+    // than it should. Matches pi's own `pre-prompt-compaction-no-continue` regression: the very
+    // first prompt sent to a resumed, already-over-threshold session must trigger compaction before
+    // that prompt's own answer, not after some wasted extra turn.
+    let dir = tempfile::tempdir().unwrap();
+
+    // Seed the session file directly (as an earlier, now-exited process would have left it) with
+    // enough text that its char/4 estimate comfortably exceeds the tiny threshold below — four
+    // messages so `find_cut` (which declines short conversations) has a real boundary to find.
+    let session_file = {
+        use agent_core::{ContentBlock, Message, Session};
+        use beyond_ai_agent::session_store::{SessionMeta, SessionRepo};
+
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "claude-test")).unwrap();
+        let mut seed = Session::new();
+        seed.user("u".repeat(400)); // ~100 estimated tokens
+        seed.push(Message::assistant(vec![ContentBlock::text(
+            "a".repeat(400),
+        )]));
+        seed.user("u".repeat(400));
+        seed.push(Message::assistant(vec![ContentBlock::text(
+            "a".repeat(400),
+        )]));
+        store.append_new(&seed.messages).unwrap();
+        store.path().to_string_lossy().into_owned()
+    };
+
+    // Scripted in order: the proactive compaction's own summarization call, then the real answer to
+    // the new prompt — if compaction didn't fire before the prompt's own turn, the second scripted
+    // response would be consumed as the (unsummarized) prompt's answer instead, and this test's
+    // assertions on call count / compacted-event ordering would catch the mismatch.
+    let (base, bodies) = spawn_model_server(vec![turn_text("SUMMARY"), turn_text("answered")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = Command::new(bin)
+        .args([
+            "serve",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--session-file",
+            &session_file,
+            "--context-window",
+            "200",
+            "--compaction-reserve-tokens",
+            "50",
+            "--compaction-keep-recent-tokens",
+            "1",
+        ])
+        .env("HOME", ISOLATED_HOME)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    // The very first prompt this (freshly-spawned, freshly-resumed) process ever sends.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "one more thing" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "prompt");
+    assert_eq!(frames.last().unwrap()["success"], true, "{frames:#?}");
+
+    drop(stdin);
+    child.wait().unwrap();
+
+    // Exactly two model calls: the proactive compaction, then the real answer — not three (which
+    // would mean compaction was skipped this turn and only caught up reactively on an overflow, or
+    // deferred to a second prompt).
+    assert_eq!(
+        bodies.lock().unwrap().len(),
+        2,
+        "compaction must fire on this very first prompt, not after it"
+    );
+    let compacted = frames.iter().any(|f| {
+        f.get("type").and_then(Value::as_str) == Some("event")
+            && f["event"]["kind"] == json!("compacted")
+    });
+    assert!(
+        compacted,
+        "expected a compacted event during this prompt's own processing: {frames:#?}"
+    );
+}
+
+#[test]
+fn serve_compact_preserves_pre_compaction_entries_in_get_tree() {
+    // F-M3 (pi: rpc.test.ts:328-340): the storage layer's own non-destructive-compaction guarantee
+    // (`session_store.rs`'s `rewrite_compacted_preserves_folded_messages_and_records_provenance`) was
+    // never proven end-to-end through the live RPC surface — a `compact` command followed by `get_tree`
+    // must still show the folded, pre-compaction messages (matching this codebase's append-only
+    // compaction posture: folded away from the *active* path, never deleted from disk).
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+
+    let (base, _bodies) = spawn_model_server(vec![
+        turn_text("answer one"),
+        turn_text("answer two"),
+        turn_text("SUMMARY"),
+    ]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = Command::new(bin)
+        .args([
+            "serve",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--session-file",
+            &session_file,
+            "--compaction-keep-recent-tokens",
+            "1",
+        ])
+        .env("HOME", ISOLATED_HOME)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    for msg in ["pre-compaction-hello", "pre-compaction-again"] {
+        writeln!(stdin, "{}", json!({ "type": "prompt", "message": msg })).unwrap();
+        stdin.flush().unwrap();
+        read_until_response(&mut stdout, "prompt");
+    }
+
+    writeln!(stdin, "{}", json!({ "type": "compact" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "compact");
+    assert_eq!(frames.last().unwrap()["success"], true, "{frames:#?}");
+    assert_eq!(
+        frames.last().unwrap()["data"]["compacted"],
+        true,
+        "{frames:#?}"
+    );
+
+    writeln!(stdin, "{}", json!({ "type": "get_tree" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_tree");
+    let nodes = frames.last().unwrap()["data"]["nodes"].as_array().unwrap();
+
+    // Every pre-compaction message is still readable by its original node, even though none of them
+    // are reachable from the new active tip anymore (the compacted summary starts a fresh, detached
+    // chain — see `SessionStore::rewrite_compacted`'s own doc comment).
+    for text in [
+        "pre-compaction-hello",
+        "answer one",
+        "pre-compaction-again",
+        "answer two",
+    ] {
+        assert!(
+            nodes
+                .iter()
+                .any(|n| n["preview"].as_str().is_some_and(|p| p.contains(text))),
+            "folded pre-compaction message {text:?} must still be present in get_tree: {nodes:#?}"
+        );
+    }
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
 fn serve_set_auto_retry_toggles_and_rejects_a_non_boolean() {
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
@@ -2072,6 +2443,125 @@ fn serve_auto_retries_a_whole_run_after_mid_stream_retry_is_exhausted() {
         "exactly one user turn + one assistant turn, no duplicate: {dump}"
     );
     assert!(dump.contains("recovered"), "got: {dump}");
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_whole_run_retry_recovery_attempt_can_itself_dispatch_tool_calls() {
+    // B-L3 pi-parity test gap (fixed): every existing whole-run-retry test recovers into a plain text
+    // turn. Nothing proved the retried attempt can continue normally into a *tool-dispatch* turn — a
+    // structurally different path through `run_events_steered` (another model round trip after the
+    // tool result, real `bash` execution, a second assistant message).
+    let truncated = "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, bodies) = spawn_model_server(vec![
+        truncated.to_string(),
+        truncated.to_string(),
+        truncated.to_string(),
+        truncated.to_string(),
+        turn_tool_use(
+            "toolu_retry",
+            "bash",
+            &json!({ "command": "echo recovered-tool" }).to_string(),
+        ),
+        turn_text("done after tool"),
+    ]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "prompt");
+
+    let response = frames.last().unwrap();
+    assert_eq!(response["success"], true, "got: {response:#?}");
+    assert_eq!(
+        bodies.lock().unwrap().len(),
+        6,
+        "4 exhausted mid-stream attempts + the recovered tool-call turn + its follow-up text turn"
+    );
+
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_messages");
+    let dump = frames.last().unwrap()["data"]["messages"].to_string();
+    assert!(dump.contains("recovered-tool"), "tool actually ran: {dump}");
+    assert!(dump.contains("done after tool"), "got: {dump}");
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_whole_run_retry_succeeds_on_its_second_attempt_not_its_first() {
+    // B-L4 pi-parity test gap (fixed): every existing whole-run-retry test hits one of the two
+    // boundary cases (first retry attempt succeeds, or all `MAX_RUN_RETRIES` attempts are exhausted).
+    // This pins the middle case — the first whole-run retry attempt *also* fails, and the second one
+    // recovers — proving the loop actually keeps going past attempt 1 rather than only ever handling
+    // "succeeds immediately" or "never succeeds".
+    let truncated = "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    // Each block of 4 truncated responses exhausts one whole-run attempt's own mid-stream retry
+    // budget (`MAX_MID_STREAM_RETRIES = 3`, so 1 initial + 3 retries per attempt) before the whole-run
+    // layer re-invokes the entire run from scratch, with a fresh mid-stream budget of its own.
+    let (base, bodies) = spawn_model_server(vec![
+        truncated.to_string(),
+        truncated.to_string(),
+        truncated.to_string(),
+        truncated.to_string(),
+        truncated.to_string(),
+        truncated.to_string(),
+        truncated.to_string(),
+        truncated.to_string(),
+        turn_text("recovered on the second whole-run attempt"),
+    ]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "prompt");
+
+    let auto_retry_frames: Vec<&Value> = frames
+        .iter()
+        .filter(|f| f.get("type").and_then(Value::as_str) == Some("auto_retry"))
+        .collect();
+    assert_eq!(
+        auto_retry_frames.len(),
+        2,
+        "expected two auto_retry notices (attempt 1 failed too, attempt 2 was tried): {frames:#?}"
+    );
+    assert_eq!(auto_retry_frames[0]["attempt"], 1);
+    assert_eq!(auto_retry_frames[1]["attempt"], 2);
+
+    let auto_retry_end_frames: Vec<&Value> = frames
+        .iter()
+        .filter(|f| f.get("type").and_then(Value::as_str) == Some("auto_retry_end"))
+        .collect();
+    assert_eq!(
+        auto_retry_end_frames.len(),
+        1,
+        "only one terminal notice, once the sequence actually settles: {frames:#?}"
+    );
+    assert_eq!(auto_retry_end_frames[0]["success"], true);
+    assert_eq!(
+        auto_retry_end_frames[0]["attempt"], 2,
+        "must report which attempt actually succeeded, not just that one eventually did"
+    );
+
+    let response = frames.last().unwrap();
+    assert_eq!(response["success"], true, "got: {response:#?}");
+    assert_eq!(bodies.lock().unwrap().len(), 9);
 
     drop(stdin);
     child.wait().unwrap();
@@ -3743,6 +4233,152 @@ fn serve_switch_branch_summarizes_abandoned_activity_and_navigates() {
     child.wait().unwrap();
 }
 
+/// A model server whose first `fast.len()` requests get an instant response, and whose next request
+/// (the summarization call a `switch_branch{summarize:true}` triggers) sends only a partial SSE body —
+/// proving the request genuinely reached the server and started streaming — then stalls for `stall`
+/// before completing, giving a test a reliable window to `abort` a provably in-flight call instead of
+/// racing a near-instant local round trip.
+fn spawn_model_server_with_stalled_response(
+    fast: Vec<String>,
+    stall: std::time::Duration,
+) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for resp in fast {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let http = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{resp}"
+                );
+                let _ = stream.write_all(http.as_bytes());
+                let _ = stream.flush();
+            }
+        }
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let preamble = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
+                data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n";
+            let _ = stream.write_all(preamble.as_bytes());
+            let _ = stream.flush();
+            std::thread::sleep(stall);
+            // Finishes the turn normally as a fallback safety net in case a test using this doesn't
+            // abort before `stall` elapses — a silently-hanging server would fail such a test far more
+            // confusingly than a completed-but-too-late response would.
+            let rest = "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+                data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"recap\"}}\n\n\
+                data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+                data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n\
+                data: {\"type\":\"message_stop\"}\n\n";
+            let _ = stream.write_all(rest.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    format!("http://{addr}")
+}
+
+#[test]
+fn serve_switch_branch_abort_cancels_summarization_and_leaves_session_unchanged() {
+    use std::time::{Duration, Instant};
+
+    // pi-parity fix (`packages/coding-agent/test/agent-session-tree-navigation.test.ts:175-212`,
+    // "should handle abort during summarization"): `switch_branch{summarize:true}`'s LLM call used to
+    // run on a fresh, unreachable `CancellationToken` with no way for a client `abort` to ever reach
+    // it — the whole RPC loop just blocked until the call finished, however long that took. This
+    // proves `abort` actually interrupts a provably in-flight branch summarization promptly, the
+    // response reports `cancelled`/`aborted` rather than an error, and the session (branches/leaf) is
+    // left completely unchanged, matching pi's `{cancelled:true, aborted:true, summaryEntry:undefined}`
+    // contract.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+
+    let base = spawn_model_server_with_stalled_response(
+        vec![turn_text("first answer"), turn_text("second answer")],
+        Duration::from_secs(5),
+    );
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "first" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "second" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    writeln!(stdin, "{}", json!({ "type": "list_branches" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "list_branches");
+    let branches_before = frames.last().unwrap()["data"]["branches"].clone();
+    assert_eq!(branches_before.as_array().unwrap().len(), 1);
+
+    let ids = message_ids(&session_file);
+    assert_eq!(ids.len(), 4, "expected 4 persisted messages: {ids:?}");
+    let rewind_to = ids[1].clone();
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "switch_branch", "target_id": rewind_to, "summarize": true })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+
+    // Give the summarization request time to actually reach the stalled server (it writes a partial
+    // body immediately on accept, well before its 5s stall completes) before aborting.
+    std::thread::sleep(Duration::from_millis(300));
+    let start = Instant::now();
+    writeln!(stdin, "{}", json!({ "type": "abort", "id": "a1" })).unwrap();
+    stdin.flush().unwrap();
+
+    let abort_frames = read_until_response(&mut stdout, "abort");
+    assert_eq!(abort_frames.last().unwrap()["success"], true);
+
+    let frames = read_until_response(&mut stdout, "switch_branch");
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "abort must interrupt the stalled summarization promptly, not wait out its 5s stall: {elapsed:?}"
+    );
+    let resp = frames.last().unwrap();
+    assert_eq!(
+        resp["success"], true,
+        "a cancelled switch is not an RPC-level failure: {resp:#?}"
+    );
+    assert_eq!(resp["data"]["cancelled"], true);
+    assert_eq!(resp["data"]["aborted"], true);
+
+    // The session must be completely unchanged: still one branch, still 4 messages, no partial
+    // summary entry anywhere in the persisted file.
+    writeln!(stdin, "{}", json!({ "type": "list_branches" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "list_branches");
+    let branches_after = frames.last().unwrap()["data"]["branches"].clone();
+    assert_eq!(
+        branches_after, branches_before,
+        "branch structure must be untouched by a cancelled switch"
+    );
+    assert_eq!(message_ids(&session_file).len(), 4);
+    let raw = std::fs::read_to_string(&session_file).unwrap();
+    assert!(
+        !raw.contains("\"branch_summary\""),
+        "a cancelled summarization must not persist a partial summary entry:\n{raw}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
 #[test]
 fn serve_switch_branch_restores_the_model_active_on_that_branch() {
     // `set_model` between two turns records a branch-local change (H6); navigating back to the point
@@ -4202,6 +4838,79 @@ fn serve_bash_runs_a_host_command_independent_of_the_model() {
 }
 
 #[test]
+fn serve_bash_records_its_result_into_session_context_by_default() {
+    // pi-parity fix (M13): the host `bash` RPC command never touched `session` at all — the calling
+    // client saw the result, but the model never would on a later turn. Matches pi's own
+    // `recordBashResult`, which records by default.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "bash", "command": "printf host-bash-context-marker" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "bash");
+
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_messages");
+    let dump = frames.last().unwrap()["data"]["messages"].to_string();
+    assert!(
+        dump.contains("host-bash-context-marker"),
+        "the host bash command's own output must reach session context: {dump}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_bash_exclude_from_context_keeps_the_session_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({
+            "type": "bash",
+            "command": "printf should-not-reach-context",
+            "exclude_from_context": true,
+        })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "bash");
+    let resp = frames.last().unwrap();
+    assert_eq!(resp["data"]["result"], "should-not-reach-context");
+
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_messages");
+    let dump = frames.last().unwrap()["data"]["messages"].to_string();
+    assert!(
+        !dump.contains("should-not-reach-context"),
+        "exclude_from_context: true must keep the session untouched: {dump}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
 fn serve_bash_is_rejected_when_the_tool_is_excluded() {
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
@@ -4397,6 +5106,62 @@ fn serve_get_state_and_get_session_stats_answer_live_during_a_prompt() {
 }
 
 #[test]
+fn serve_get_state_reports_pending_tool_ids_while_a_tool_is_running() {
+    use std::time::Duration;
+
+    // B-L1 pi-parity gap (fixed): pi's `agent.state.pendingToolCalls` (a live, in-process reactive
+    // set) has no RPC equivalent — a client had to reconstruct "which calls are still in flight"
+    // itself from the raw event stream. `get_state` now mirrors it directly, live, mid-run.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let turn1 = turn_tool_use(
+        "toolu_pending",
+        "bash",
+        &json!({ "command": "sleep 0.5" }).to_string(),
+    );
+    let (base, _bodies) = spawn_model_server(vec![turn1, turn_text("done")]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "go" })).unwrap();
+    stdin.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(150)); // mid-`sleep 0.5`, the bash call is in flight
+
+    writeln!(stdin, "{}", json!({ "type": "get_state", "id": "mid" })).unwrap();
+    stdin.flush().unwrap();
+
+    let frames = read_until_response(&mut stdout, "prompt");
+
+    let mid_resp = frames
+        .iter()
+        .find(|f| f["command"] == "get_state" && f["id"] == "mid")
+        .unwrap_or_else(|| panic!("no mid-run get_state response: {frames:#?}"));
+    assert_eq!(
+        mid_resp["data"]["pending_tool_ids"],
+        json!(["toolu_pending"]),
+        "the running bash call must be reported as pending: {mid_resp:#?}"
+    );
+
+    // The whole run has now finished (both turns) on this same live process — a fresh `get_state`
+    // proves `tool_ended` actually cleared the id, not just that `tool_started` populated it.
+    writeln!(stdin, "{}", json!({ "type": "get_state", "id": "after" })).unwrap();
+    stdin.flush().unwrap();
+    let after_frames = read_until_response(&mut stdout, "get_state");
+    let after_resp = after_frames.last().unwrap();
+    assert_eq!(after_resp["id"], "after");
+    assert_eq!(
+        after_resp["data"]["pending_tool_ids"],
+        json!([]),
+        "the completed call must no longer be pending: {after_resp:#?}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
 fn serve_get_state_reports_runtime_settings_and_queue_depth() {
     // `get_state` must carry the runtime-mutable settings (thinking level, auto-compaction, auto-retry,
     // queue mode) and the current queue depth — pi's `get_state` carries the same shape
@@ -4571,6 +5336,72 @@ fn serve_switch_session_reports_cwd_stale_for_the_newly_active_session() {
     let response = frames.last().unwrap();
     assert_eq!(response["success"], true, "got: {response:#?}");
     assert_eq!(response["data"]["cwd_stale"], true, "got: {response:#?}");
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_switch_session_restores_the_reopened_sessions_own_model() {
+    // pi-parity fix: `current_model` used to be seeded once from the server's own `--model` startup
+    // flag and never reconciled with the session actually being switched to — reattaching to a session
+    // last driven on a different model silently kept using the server's startup model instead, with no
+    // warning. `switch_branch` already restored this correctly within one session's tree; this proves
+    // `switch_session` (a *different* session's own store entirely) now does too.
+    let dir = tempfile::tempdir().unwrap();
+    let session_dir = dir.path().join("sessions");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let other_header = json!({
+        "type": "session",
+        "id": "other-model-target",
+        "created_at": 1,
+        "cwd": "/definitely/does/not/exist/beyond-ai-agent-test-fixture",
+        "model": "claude-test-restored",
+    });
+    std::fs::write(
+        session_dir.join("1_other-model-target.jsonl"),
+        format!("{other_header}\n"),
+    )
+    .unwrap();
+
+    // The server starts on `claude-test` (see `serve_dir_cmd`) — deliberately different from the
+    // planted session's own `claude-test-restored`, so a successful restore is unambiguous.
+    let (base, _bodies) = spawn_model_server(vec![]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_dir_cmd(bin, &base, &session_dir.to_string_lossy())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    let mut ready = String::new();
+    stdout.read_line(&mut ready).unwrap();
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "switch_session", "session_id": "other-model-target" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "switch_session");
+    let response = frames.last().unwrap();
+    assert_eq!(response["success"], true, "got: {response:#?}");
+    assert_eq!(
+        response["data"]["model"], "claude-test-restored",
+        "switch_session must restore the target session's own model, not keep the server's startup \
+         model: {response:#?}"
+    );
+
+    writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_state");
+    let response = frames.last().unwrap();
+    assert_eq!(
+        response["data"]["model"], "claude-test-restored",
+        "the restored model must also be what a subsequent turn would actually use, not just what \
+         the switch response reported: {response:#?}"
+    );
 
     drop(stdin);
     child.wait().unwrap();
@@ -4946,6 +5777,128 @@ fn serve_unknown_command_type_reports_a_clear_failure_frame() {
 }
 
 #[test]
+fn serve_jsonl_framing_preserves_u2028_and_u2029_inside_a_payload() {
+    // F-L1 (pi: rpc-jsonl.test.ts "splits on LF only and preserves U+2028/U+2029 inside payloads"):
+    // U+2028 (LINE SEPARATOR) and U+2029 (PARAGRAPH SEPARATOR) are not ASCII `\n`, so a byte-oriented
+    // NDJSON reader that only splits on `0x0A` must pass them straight through as ordinary payload
+    // bytes rather than treating them as line breaks. `tokio::io::AsyncBufReadExt::lines()` (this
+    // server's stdin reader — see `serve()`) only ever splits on `0x0A`/strips a trailing `\r`, so this
+    // is expected to already be correct; proven here rather than assumed.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    let title = "a\u{2028}b\u{2029}c";
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_session_name", "title": title })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "set_session_name");
+    assert_eq!(frames.last().unwrap()["success"], true, "{frames:#?}");
+    // No embedded `\r`/`\n`, so `sanitize_title` leaves it untouched — the separators round-trip
+    // byte-for-byte, proving neither the client-side serializer nor this server's line reader treated
+    // them as a line break mid-payload.
+    assert_eq!(
+        frames.last().unwrap()["data"]["title"],
+        title,
+        "got: {frames:#?}"
+    );
+
+    writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
+    stdin.flush().unwrap();
+    let state = read_until_response(&mut stdout, "get_state");
+    assert_eq!(state.last().unwrap()["data"]["title"], title, "{state:#?}");
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_jsonl_framing_handles_crlf_delimited_commands() {
+    // F-L1 (pi: rpc-jsonl.test.ts "handles CRLF-delimited input"): a client on Windows, or one that
+    // simply writes `\r\n`, must have each command recognized as its own line — `tokio::io::
+    // AsyncBufReadExt::lines()` strips a trailing `\r` after splitting on `\n` (see `lines.rs`'s
+    // `poll_next_line`), so two `\r\n`-terminated commands in the same write must parse as two clean
+    // JSON lines, not one line with a stray `\r` corrupting the trailing `}` or the two commands
+    // merging into one.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    let cmd_a = json!({ "id": "a", "type": "set_session_name", "title": "first" }).to_string();
+    let cmd_b = json!({ "id": "b", "type": "set_session_name", "title": "second" }).to_string();
+    write!(stdin, "{cmd_a}\r\n{cmd_b}\r\n").unwrap();
+    stdin.flush().unwrap();
+
+    let frames_a = read_until_response(&mut stdout, "set_session_name");
+    let resp_a = frames_a
+        .iter()
+        .find(|f| f["type"] == "response" && f["id"] == "a")
+        .unwrap_or_else(|| panic!("expected a response to id \"a\": {frames_a:#?}"));
+    assert_eq!(resp_a["success"], true, "{resp_a:#?}");
+    assert_eq!(resp_a["data"]["title"], "first", "{resp_a:#?}");
+
+    let frames_b = read_until_response(&mut stdout, "set_session_name");
+    let resp_b = frames_b
+        .iter()
+        .find(|f| f["type"] == "response" && f["id"] == "b")
+        .unwrap_or_else(|| panic!("expected a response to id \"b\": {frames_b:#?}"));
+    assert_eq!(resp_b["success"], true, "{resp_b:#?}");
+    assert_eq!(resp_b["data"]["title"], "second", "{resp_b:#?}");
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_jsonl_framing_handles_a_final_command_with_no_trailing_newline() {
+    // F-L1 (pi: rpc-jsonl.test.ts "emits a final line without trailing LF"): a client that closes
+    // stdin right after its last command, with no trailing `\n`, must still have that command
+    // processed — `AsyncBufReadExt::lines()` yields the trailing partial line once at EOF (`n == 0`
+    // with a non-empty buffer still returns `Some(buf)`; only a truly empty read returns `None`), so
+    // this server's `lines.next_line()` loop sees and processes it before observing stdin's close.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    // No trailing `\n` at all — `write!`, not `writeln!` — then drop `stdin` to close the pipe.
+    write!(
+        stdin,
+        "{}",
+        json!({ "id": "last", "type": "set_session_name", "title": "no newline" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    drop(stdin);
+
+    let frames = read_until_response(&mut stdout, "set_session_name");
+    let resp = frames.last().unwrap();
+    assert_eq!(resp["id"], "last", "{resp:#?}");
+    assert_eq!(resp["success"], true, "{resp:#?}");
+    assert_eq!(resp["data"]["title"], "no newline", "{resp:#?}");
+
+    child.wait().unwrap();
+}
+
+#[test]
 fn serve_get_session_stats_reports_context_usage_after_a_real_turn() {
     // Companion e2e proof for `session_stats`'s `context_usage` field (unit-tested directly in
     // `serve.rs`'s own test module) — end-to-end through the real RPC surface: null before any turn,
@@ -5063,6 +6016,62 @@ fn serve_set_session_name_and_get_last_assistant_text() {
     assert!(
         on_disk.contains("my-test-session"),
         "session name must be persisted: {on_disk}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_set_session_name_strips_newlines_and_pushes_a_session_info_changed_frame() {
+    // F-M4 (pi: 5996-session-name-newlines.test.ts:14-22): newline sanitization was only proven at the
+    // storage-unit level (`session_store.rs`'s `set_title_strips_newlines`), never through the actual
+    // `set_session_name` RPC command + `get_state` readback.
+    //
+    // F-M1 (pi: 3686-session-name-event.test.ts, `session_info_changed` — `rpc-mode.ts:632-639`): the
+    // rename response previously carried no `data` at all, and nothing told a client the *sanitized*
+    // final name without a follow-up `get_state`. Both are proven together here: the same round trip
+    // exercises the sanitization and the new `data`/unsolicited-frame push.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "id": "n1", "type": "set_session_name", "title": "hello\nworld\r\nagain" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "set_session_name");
+
+    // The unsolicited `session_info_changed` push frame carries the sanitized name, correlated by id.
+    let pushed = frames
+        .iter()
+        .find(|f| f["type"] == "session_info_changed")
+        .unwrap_or_else(|| panic!("expected a session_info_changed frame: {frames:#?}"));
+    assert_eq!(pushed["id"], "n1", "got: {pushed:#?}");
+    assert_eq!(pushed["title"], "hello world again", "got: {pushed:#?}");
+
+    // The response itself also carries the final sanitized name — no second round trip needed.
+    let resp = frames.last().unwrap();
+    assert_eq!(resp["success"], true, "got: {resp:#?}");
+    assert_eq!(resp["data"]["title"], "hello world again", "got: {resp:#?}");
+
+    // And `get_state` reads back the same sanitized value, with no embedded newlines.
+    writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
+    stdin.flush().unwrap();
+    let state = read_until_response(&mut stdout, "get_state");
+    let title = state.last().unwrap()["data"]["title"].as_str().unwrap();
+    assert_eq!(title, "hello world again", "got: {state:#?}");
+    assert!(
+        !title.contains('\n') && !title.contains('\r'),
+        "got: {title:?}"
     );
 
     drop(stdin);

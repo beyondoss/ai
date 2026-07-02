@@ -65,9 +65,19 @@ impl Tool for Ls {
             let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
             entries.push((name.into_owned(), is_dir));
         }
-        // Directories first, then alphabetical by bare name — stable, predictable output for the model.
+        // Directories first, then case-insensitive alphabetical by bare name — matches pi's
+        // `a.toLowerCase().localeCompare(b.toLowerCase())`, not a byte-order compare (which would sort
+        // every uppercase-leading name before every lowercase one, e.g. "Zebra.txt" before "apple.txt",
+        // unlike what a human — or pi — would expect). Falls back to a case-sensitive compare only to
+        // break an exact case-insensitive tie (e.g. "Foo"/"foo" coexisting in one directory), so the
+        // order stays deterministic instead of depending on the OS's arbitrary `readdir` order.
         entries.sort_by(|(a_name, a_dir), (b_name, b_dir)| {
-            b_dir.cmp(a_dir).then_with(|| a_name.cmp(b_name))
+            b_dir.cmp(a_dir).then_with(|| {
+                a_name
+                    .to_lowercase()
+                    .cmp(&b_name.to_lowercase())
+                    .then_with(|| a_name.cmp(b_name))
+            })
         });
         let mut entries: Vec<String> = entries
             .into_iter()
@@ -153,6 +163,36 @@ mod tests {
             .unwrap()
             .text;
         assert_eq!(out, "src/\nsrc-old/", "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn sorts_case_insensitively_like_pi_not_by_raw_byte_order() {
+        // pi-parity fix: a byte-order compare sorts every uppercase-leading name before every
+        // lowercase one ('Z' is 0x5A, 'a' is 0x61) — "Zebra.txt" would sort before "apple.txt", unlike
+        // pi's `a.toLowerCase().localeCompare(b.toLowerCase())` or what a human expects.
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["Zebra.txt", "apple.txt", "banana.txt"] {
+            std::fs::write(dir.path().join(name), "x").unwrap();
+        }
+        let out = Ls
+            .run(json!({ "path": dir.path().to_str().unwrap() }))
+            .await
+            .unwrap()
+            .text;
+        assert_eq!(out, "apple.txt\nbanana.txt\nZebra.txt", "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn breaks_a_case_insensitive_tie_deterministically() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Foo.txt"), "x").unwrap();
+        std::fs::write(dir.path().join("foo.txt"), "x").unwrap();
+        let out = Ls
+            .run(json!({ "path": dir.path().to_str().unwrap() }))
+            .await
+            .unwrap()
+            .text;
+        assert_eq!(out, "Foo.txt\nfoo.txt", "got: {out}");
     }
 
     #[tokio::test]

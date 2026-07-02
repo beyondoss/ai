@@ -470,6 +470,16 @@ struct TailTruncation {
 /// a port of pi's `truncateTail`. Never returns a partial line except the one edge case where a
 /// single line alone exceeds `max_bytes`, in which case its trailing `max_bytes` are kept and
 /// `last_line_partial` is set.
+///
+/// No `truncate_head` (pi's opposite-end counterpart, `truncate.ts`) exists here, deliberately: every
+/// caller in this crate wants the *end* of a stream (`bash`'s live/final output — errors and results
+/// live at the tail of a long-running command — via [`OutputAccumulator::snapshot`], the only caller of
+/// this function) or does its own byte-capping a different way entirely (`grep`/`find`/`ls`'s
+/// [`cap_listing_bytes`], a straight truncate-the-whole-assembled-string-and-append-a-marker, not a
+/// line-aware head/tail split). `read`'s own windowed `offset`/`limit` reads (see that module's doc
+/// comment on `MAX_LINE_BYTES`) solve the same "don't return partial lines" problem `truncate_head`
+/// exists for, but via streaming line-at-a-time capping rather than truncating an already-assembled
+/// string — so there's no genuine head-truncation need anywhere in this codebase to port it for.
 fn truncate_tail(content: &str, max_lines: usize, max_bytes: usize) -> TailTruncation {
     let total_bytes = content.len(); // Rust `str` length is already the UTF-8 byte length.
 
@@ -932,5 +942,86 @@ mod tests {
         assert_eq!(r.content, "a\nb\nc\n");
         assert_eq!(r.output_lines, 3);
         assert!(!r.last_line_partial);
+    }
+
+    // Multi-byte UTF-8 boundary coverage for `truncate_tail`/`truncate_str_to_bytes_from_end` — pi:
+    // `packages/agent/test/harness/truncate.test.ts`. The single existing test above is ASCII-only, so
+    // none of these boundary-splitting cases were previously exercised at all: truncating mid-codepoint
+    // must never produce invalid UTF-8 (a `&str` slice on a non-boundary index panics outright, so any
+    // of these would fail loudly rather than silently corrupt output — but only if something actually
+    // runs them).
+
+    #[test]
+    fn truncate_tail_keeps_a_whole_multi_byte_character_and_drops_the_rest_of_the_line() {
+        // pi: truncate.test.ts, "truncates tail on UTF-8 boundaries when only a partial last line
+        // fits" — `"aé🙂b"` is a *single* line (no newline), 8 bytes total (a=1, é=2, 🙂=4, b=1). At a
+        // 5-byte budget the byte cap bites on the one oversized line; the kept suffix must land exactly
+        // on the 🙂/b boundary, not split the 4-byte emoji.
+        let r = truncate_tail("aé🙂b", 10, 5);
+        assert_eq!(r.content, "🙂b");
+        assert_eq!(r.truncated_by, Some(TruncatedBy::Bytes));
+        assert!(r.last_line_partial);
+        assert_eq!(r.output_bytes, 5);
+    }
+
+    #[test]
+    fn truncate_tail_drops_a_trailing_multi_byte_character_that_cannot_fit_the_byte_budget() {
+        // pi: truncate.test.ts, "drops an oversized trailing character when it cannot fit in tail byte
+        // limit" — `"abc🙂"` at a 3-byte budget: the last 3 bytes of the 7-byte line would land inside
+        // the 4-byte 🙂 (bytes 3..7), which isn't a valid boundary to cut on, so the boundary-skipping
+        // walk in `truncate_str_to_bytes_from_end` advances past the *entire* character, correctly
+        // yielding an empty fragment rather than a truncated, invalid one.
+        let r = truncate_tail("abc🙂", 10, 3);
+        assert_eq!(r.content, "");
+        assert_eq!(r.truncated_by, Some(TruncatedBy::Bytes));
+        assert!(r.last_line_partial);
+        assert_eq!(r.output_bytes, 0);
+    }
+
+    #[test]
+    fn truncate_tail_caps_an_oversized_single_line_with_a_trailing_newline_on_a_char_boundary() {
+        // pi: truncate.test.ts, "truncates an oversized single line with a trailing newline" — an
+        // ASCII fixture at pi's own scale (300_000 bytes), confirming the single-huge-line path (also
+        // exercised with multi-byte content by the two tests above) handles a large fragment correctly
+        // too, not just a handful of bytes.
+        let input = format!("{}\n", "X".repeat(300_000));
+        let r = truncate_tail(&input, 100, 1024);
+        assert_eq!(r.content, "X".repeat(1024));
+        assert_eq!(r.output_bytes, 1024);
+        assert_eq!(r.output_lines, 1);
+        assert!(r.last_line_partial);
+        assert_eq!(r.truncated_by, Some(TruncatedBy::Bytes));
+    }
+
+    #[test]
+    fn truncate_tail_multi_byte_content_within_budget_is_not_truncated() {
+        // The mirror image of the ASCII-only no-truncation test above: multi-byte content that fits
+        // entirely within both limits must come back completely unchanged, not just avoid a crash.
+        let content = "café 🙂 中文\n второй line\n";
+        let r = truncate_tail(content, 2000, 50 * 1024);
+        assert!(r.truncated_by.is_none());
+        assert_eq!(r.content, content);
+        assert!(!r.last_line_partial);
+    }
+
+    #[test]
+    fn truncate_str_to_bytes_from_end_never_splits_a_multi_byte_character() {
+        // Direct coverage of the helper itself across every cut point through a run of 3-byte
+        // characters (`中`) — for every `max_bytes` from 0 to just past the string's total length, the
+        // result must (a) never exceed the budget and (b) be a valid `&str` (guaranteed by the type
+        // system here: a non-boundary slice would have already panicked before `assert!` even runs).
+        let s = "中文测试"; // 4 characters, 3 bytes each = 12 bytes total
+        for max_bytes in 0..=(s.len() + 2) {
+            let got = truncate_str_to_bytes_from_end(s, max_bytes);
+            assert!(
+                got.len() <= max_bytes,
+                "max_bytes={max_bytes} got {} bytes: {got:?}",
+                got.len()
+            );
+            assert!(
+                s.ends_with(got),
+                "result must be a genuine suffix of the input: {got:?}"
+            );
+        }
     }
 }

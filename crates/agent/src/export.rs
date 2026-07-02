@@ -734,6 +734,7 @@ mod tests {
                 id: "1".into(),
                 name: "some_future_tool".into(),
                 input: serde_json::json!({ "pattern": "fn main", "path": "a.rs" }),
+                thought_signature: None,
             }]),
             Message::tool_result("1", "fn main() {}", false),
         ];
@@ -755,31 +756,37 @@ mod tests {
                 id: "1".into(),
                 name: "grep".into(),
                 input: serde_json::json!({ "pattern": "fn main", "path": "src", "glob": "*.rs" }),
+                thought_signature: None,
             }]),
             Message::assistant(vec![ContentBlock::ToolUse {
                 id: "2".into(),
                 name: "find".into(),
                 input: serde_json::json!({ "pattern": "*.rs", "path": "src" }),
+                thought_signature: None,
             }]),
             Message::assistant(vec![ContentBlock::ToolUse {
                 id: "3".into(),
                 name: "ls".into(),
                 input: serde_json::json!({}),
+                thought_signature: None,
             }]),
             Message::assistant(vec![ContentBlock::ToolUse {
                 id: "4".into(),
                 name: "fork".into(),
                 input: serde_json::json!({ "app": "myapp", "name": "sandbox" }),
+                thought_signature: None,
             }]),
             Message::assistant(vec![ContentBlock::ToolUse {
                 id: "5".into(),
                 name: "sync".into(),
                 input: serde_json::json!({}),
+                thought_signature: None,
             }]),
             Message::assistant(vec![ContentBlock::ToolUse {
                 id: "6".into(),
                 name: "logs".into(),
                 input: serde_json::json!({ "app": "myapp", "query": "level:error" }),
+                thought_signature: None,
             }]),
         ];
         let html = render_html(&meta(), &messages, &[]);
@@ -821,21 +828,25 @@ mod tests {
                     "old_string": "let x = 1;",
                     "new_string": "let x = 2;",
                 }),
+                thought_signature: None,
             }]),
             Message::assistant(vec![ContentBlock::ToolUse {
                 id: "2".into(),
                 name: "write".into(),
                 input: serde_json::json!({ "path": "notes.md", "content": "hello world" }),
+                thought_signature: None,
             }]),
             Message::assistant(vec![ContentBlock::ToolUse {
                 id: "3".into(),
                 name: "bash".into(),
                 input: serde_json::json!({ "command": "cargo test", "cwd": "/proj" }),
+                thought_signature: None,
             }]),
             Message::assistant(vec![ContentBlock::ToolUse {
                 id: "4".into(),
                 name: "read".into(),
                 input: serde_json::json!({ "path": "README.md" }),
+                thought_signature: None,
             }]),
         ];
         let html = render_html(&meta(), &messages, &[]);
@@ -867,6 +878,7 @@ mod tests {
             id: "1".into(),
             name: "edit".into(),
             input: serde_json::json!({ "path": "src/main.rs" }), // missing old_string/new_string
+            thought_signature: None,
         }])];
         let html = render_html(&meta(), &messages, &[]);
         assert!(html.contains("Called <code>edit</code>"));

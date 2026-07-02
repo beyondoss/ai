@@ -154,16 +154,22 @@ fn cache_control(long: bool) -> Value {
     }
 }
 
-/// Remove the internal-only `model_id` key from every message object — `Message` derives `Serialize`
-/// directly (for session persistence), so a straight `serde_json::to_value` of the whole history
-/// carries it along unless stripped here first. Anthropic rejects a message object with any field
-/// outside its schema, so leaking this 400s the entire request.
+/// Remove every internal-only key from each message object — `Message` derives `Serialize` directly
+/// (for session persistence), so a straight `serde_json::to_value` of the whole history carries all of
+/// them along unless stripped here first. Anthropic rejects a message object with any field outside
+/// its schema, so leaking any one of these 400s the entire request. `model_id` was the first (a live
+/// 400 proved it); `error_message`/`aborted` (`Message::error`/`Message::with_aborted`) are the same
+/// leak class — both are `Some`/`true` on exactly the synthetic closing records those constructors
+/// exist to persist, i.e. the ones now most likely to actually reach a real request after a whole-run
+/// retry or a follow-up prompt.
 fn strip_model_id(messages: &mut Value) {
     let Some(msgs) = messages.as_array_mut() else {
         return;
     };
     for m in msgs.iter_mut().filter_map(Value::as_object_mut) {
         m.remove("model_id");
+        m.remove("error_message");
+        m.remove("aborted");
     }
 }
 
@@ -190,9 +196,15 @@ fn mark_last_block(messages: &mut Value, cc: &Value) {
 /// block's `signature_delta`, would otherwise send an empty `signature` Anthropic likely rejects rather
 /// than degrading gracefully. A no-op for the common case (every thinking block already signed).
 ///
-/// An unsigned block whose `thinking` text is *also* empty (e.g. a stream aborted before any delta
-/// landed) is dropped rather than downgraded: Anthropic's `text` content block requires non-empty
-/// text, so emitting `{"type": "text", "text": ""}` would just trade one 400 for another. Mirrors
+/// A block whose `thinking` text is empty or whitespace-only (e.g. a stream aborted before any
+/// delta landed) is dropped rather than downgraded — *before* the signed/unsigned distinction is
+/// even considered, matching pi's own ordering (`anthropic-messages.ts`'s `convertMessages`:
+/// `if (block.thinking.trim().length === 0) continue;` runs ahead of its signature check). This
+/// applies even to a *signed* empty block: Anthropic's `thinking` content block requires non-empty
+/// text just as its `text` block does, so a signed-but-empty block would just trade one 400
+/// (missing signature) for another (empty text) if kept as-is, and downgrading it would trade that
+/// for a third (`{"type": "text", "text": ""}`). Only a non-empty block reaches the signed/unsigned
+/// branch below: signed survives verbatim for replay, unsigned downgrades to `text`. Mirrors
 /// [`crate::session::Session::scrub_cross_model_state`]'s same empty-thinking-drops-instead-of-degrades
 /// rule.
 fn downgrade_unsigned_thinking(messages: &mut Value) {
@@ -210,20 +222,20 @@ fn downgrade_unsigned_thinking(messages: &mut Value) {
             if obj.get("type").and_then(Value::as_str) != Some("thinking") {
                 return true;
             }
+            let text = obj
+                .get("thinking")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if text.trim().is_empty() {
+                return false;
+            }
             let signed = obj
                 .get("signature")
                 .and_then(Value::as_str)
                 .is_some_and(|s| !s.is_empty());
             if signed {
                 return true;
-            }
-            let text = obj
-                .get("thinking")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            if text.is_empty() {
-                return false;
             }
             *block = json!({ "type": "text", "text": text });
             true
@@ -585,6 +597,16 @@ impl StreamDecoder for Decoder {
     fn is_terminal(&self) -> bool {
         self.saw_stop
     }
+
+    // pi-parity fix: pi tolerates a malformed-but-recoverable Anthropic event body (an invalid
+    // backslash escape, a raw control character inside a string value) by repairing it before
+    // parsing — see `StreamDecoder::repairs_json`'s doc comment and
+    // `packages/ai/test/anthropic-sse-parsing.test.ts:82-167`. Anthropic is the only dialect that
+    // opts in, matching pi's own scoping (every other dialect's outer SSE parse is owned by that
+    // provider's SDK, not hand-rolled the way Anthropic's is).
+    fn repairs_json(&self) -> bool {
+        true
+    }
 }
 
 fn str_at<'a>(v: Option<&'a Value>, key: &str) -> &'a str {
@@ -657,6 +679,37 @@ mod tests {
             assert!(
                 m.get("model_id").is_none(),
                 "model_id must never reach the wire: {m}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_body_never_leaks_error_message_or_aborted_onto_the_wire() {
+        // Same leak class as `model_id` above, caught before it ever reached a live request: a
+        // `Message::error`/`Message::with_aborted` closing record is exactly the kind of message a
+        // whole-run retry or a client's follow-up `prompt` replays on a real request, and Anthropic
+        // rejects any message object carrying a field outside its schema.
+        let req = ModelRequest::new(
+            "claude-opus-4-8",
+            vec![
+                Message::user("hi"),
+                Message::error("transport error: boom"),
+                Message::user("try again"),
+                Message::assistant(vec![ContentBlock::text("partial")])
+                    .with_model_id("claude-opus-4-8")
+                    .with_aborted(),
+            ],
+            256,
+        );
+        let body = build_body(&req);
+        for m in body["messages"].as_array().unwrap() {
+            assert!(
+                m.get("error_message").is_none(),
+                "error_message must never reach the wire: {m}"
+            );
+            assert!(
+                m.get("aborted").is_none(),
+                "aborted must never reach the wire: {m}"
             );
         }
     }
@@ -795,11 +848,11 @@ mod tests {
             "claude-opus-4-8",
             vec![
                 Message::user("weather?"),
-                Message::assistant(vec![ContentBlock::ToolUse {
-                    id: "toolu_1".into(),
-                    name: "get_weather".into(),
-                    input: json!({ "city": "SF" }),
-                }]),
+                Message::assistant(vec![ContentBlock::tool_use(
+                    "toolu_1",
+                    "get_weather",
+                    json!({ "city": "SF" }),
+                )]),
                 Message::tool_result("toolu_1", "72F", false),
             ],
             256,
@@ -1045,6 +1098,35 @@ data: {"type":"message_stop"}
     }
 
     #[test]
+    fn a_tool_result_with_only_an_image_and_no_text_omits_the_empty_text_block() {
+        // A-L8 pi-parity test gap (fixed, `packages/ai/test/image-tool-result.test.ts`): a tool that
+        // returns only an image (no text) — a screenshot tool, say — must not pad the wire content
+        // array with a spurious empty `{"type":"text","text":""}` block ahead of the real image.
+        use crate::message::ImageSource;
+        let req = ModelRequest::new(
+            "claude-opus-4-8",
+            vec![Message::tool_results(vec![ContentBlock::ToolResult {
+                tool_use_id: "tu_1".into(),
+                content: String::new(),
+                is_error: false,
+                images: vec![ImageSource::base64("image/png", "AAAA")],
+            }])],
+            256,
+        );
+        let body = build_body(&req);
+        let content = body["messages"][0]["content"][0]["content"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            content.len(),
+            1,
+            "expected only the image block: {content:#?}"
+        );
+        assert_eq!(content[0]["type"], "image");
+        assert_eq!(content[0]["source"]["data"], "AAAA");
+    }
+
+    #[test]
     fn images_are_downgraded_to_a_placeholder_for_a_non_vision_model() {
         use crate::message::ImageSource;
         // No current Anthropic id has `supports_vision: false`, so exercise the fallback
@@ -1102,6 +1184,61 @@ data: {"type":"message_stop"}
         );
         let body = build_body(&req);
         assert_eq!(body["messages"][0]["content"][1]["type"], "image");
+    }
+
+    #[test]
+    fn a_run_of_consecutive_images_collapses_into_one_placeholder_scoped_to_the_run() {
+        // [A-M12] `downgrade_unsupported_images`'s collapse loop is a small state machine (`pending_placeholder`)
+        // meant to fold a *run* of consecutive `{"type":"image"}` blocks into a single placeholder —
+        // every existing regression here only ever fed it a single image, so the run-collapsing
+        // behavior itself (as opposed to the single-image case, which a stateless per-block map would
+        // also get right) was unexercised. Three consecutive images in one run, plus a second, separate
+        // single-image run later in the same message, both bracketed by ordinary text: proves a run of
+        // 3 collapses into exactly 1 placeholder (not 3, and not 0), and that the collapse is scoped to
+        // each consecutive run rather than bleeding into the surrounding text or merging across runs.
+        use crate::message::{ImageSource, Role};
+        let req = ModelRequest::new(
+            "some-future-anthropic-model",
+            vec![Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::text("before"),
+                    ContentBlock::Image {
+                        source: ImageSource::base64("image/png", "AAAA"),
+                    },
+                    ContentBlock::Image {
+                        source: ImageSource::base64("image/png", "BBBB"),
+                    },
+                    ContentBlock::Image {
+                        source: ImageSource::base64("image/png", "CCCC"),
+                    },
+                    ContentBlock::text("between"),
+                    ContentBlock::Image {
+                        source: ImageSource::base64("image/png", "DDDD"),
+                    },
+                    ContentBlock::text("after"),
+                ],
+                model_id: None,
+                error_message: None,
+                aborted: false,
+            }],
+            256,
+        )
+        .with_no_cache(true);
+        let body = build_body(&req);
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        let placeholder = json!({ "type": "text", "text": USER_IMAGE_PLACEHOLDER });
+        assert_eq!(
+            content,
+            &vec![
+                json!({ "type": "text", "text": "before" }),
+                placeholder.clone(),
+                json!({ "type": "text", "text": "between" }),
+                placeholder,
+                json!({ "type": "text", "text": "after" }),
+            ],
+            "a run of 3 images must collapse into exactly one placeholder, scoped to the run: {content:?}"
+        );
     }
 
     #[test]
@@ -1237,6 +1374,44 @@ data: {"type":"message_stop"}
                     ContentBlock::Thinking {
                         text: String::new(),
                         signature: String::new(),
+                    },
+                    ContentBlock::text("answer"),
+                ]),
+                Message::user("again"),
+            ],
+            8192,
+        );
+        let body = build_body(&req);
+        let content = body["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1, "{content:?}");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "answer");
+    }
+
+    #[test]
+    fn a_signed_thinking_block_with_empty_or_whitespace_only_text_is_dropped_not_kept_or_downgraded()
+     {
+        // [A-M1] pi (`anthropic-messages.ts`'s `convertMessages`) checks
+        // `block.thinking.trim().length === 0` *before* the signature check — an empty-text thinking
+        // block is dropped outright regardless of whether it carries a signature. A prior version of
+        // this function checked `signed` first and returned early, so a *signed* empty/whitespace-only
+        // block would survive verbatim as `{"type": "thinking", "thinking": "", "signature": "sig"}` —
+        // a shape Anthropic's `thinking` content block (which requires non-empty text, same as `text`)
+        // rejects just as it would reject the unsigned case this file already covered. Two signed
+        // blocks — genuinely empty and whitespace-only — must both be dropped, not kept and not
+        // downgraded to an empty `text` block.
+        let req = ModelRequest::new(
+            "claude-opus-4-8",
+            vec![
+                Message::user("think then answer"),
+                Message::assistant(vec![
+                    ContentBlock::Thinking {
+                        text: String::new(),
+                        signature: "sig-empty".into(),
+                    },
+                    ContentBlock::Thinking {
+                        text: "   ".into(),
+                        signature: "sig-whitespace".into(),
                     },
                     ContentBlock::text("answer"),
                 ]),
@@ -1559,6 +1734,142 @@ data: not-json-at-all
         let mut dec = Decoder::default();
         let err = decode_sse(&mut dec, GARBAGE_MID_STREAM).unwrap_err();
         assert!(matches!(err, Error::Transport(_)));
+    }
+
+    #[test]
+    fn a_bad_backslash_escape_in_an_sse_event_body_is_repaired_not_a_hard_error() {
+        // pi: anthropic-sse-parsing.test.ts:82-167 (`repairJson`, `packages/ai/src/utils/json-parse.ts`)
+        // tolerates a backslash that isn't a valid JSON escape — e.g. a Windows path streamed without
+        // escaping its own backslashes — by doubling it before the first parse attempt, rather than
+        // failing the whole event. `\U`/`\x` are not valid JSON escapes, so this must fail a raw parse
+        // and only succeed via `StreamDecoder::repairs_json`'s repair pass.
+        const BAD_ESCAPE: &str = r#"
+event: message_start
+data: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":5,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"C:\Users\x"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}
+
+event: message_stop
+data: {"type":"message_stop"}
+"#;
+        assert!(
+            serde_json::from_str::<Value>(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"C:\Users\x"}}"#
+            )
+            .is_err(),
+            "fixture must actually be invalid JSON first"
+        );
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, BAD_ESCAPE).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::TextDelta { text, .. } if text == r"C:\Users\x")),
+            "the stray backslashes must survive as literal backslashes, not abort the turn: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_raw_control_character_in_an_sse_event_body_is_repaired_not_a_hard_error() {
+        // pi: anthropic-sse-parsing.test.ts:82-167. A raw control byte inside a JSON string value
+        // (here a literal tab — not a newline, which would split the SSE `data:` line itself) must be
+        // escaped and recovered rather than failing the event outright.
+        const RAW_CONTROL_CHAR: &str = "
+event: message_start
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}
+
+event: content_block_start
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}
+
+event: content_block_delta
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"col1\tcol2\"}}
+
+event: content_block_stop
+data: {\"type\":\"content_block_stop\",\"index\":0}
+
+event: message_delta
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}
+
+event: message_stop
+data: {\"type\":\"message_stop\"}
+";
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, RAW_CONTROL_CHAR).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::TextDelta { text, .. } if text == "col1\tcol2")),
+            "the raw tab must survive as an escaped-then-recovered tab, not abort the turn: {events:?}"
+        );
+    }
+
+    #[test]
+    fn repairs_malformed_sse_json_and_malformed_streamed_tool_json() {
+        // pi: anthropic-sse-parsing.test.ts:82-167, `malformedToolJsonDelta` — the exact compound
+        // fixture: an `input_json_delta` whose `partial_json` string itself contains an escaped JSON
+        // object with an invalid `\H` escape *and* a raw embedded tab. This is the two-layer case pi's
+        // test exists for: `parseJsonWithRepair` must repair the *outer* SSE event body (this decoder's
+        // job — the bug this test guards) before the resulting `partial_json` fragment ever reaches the
+        // *inner* accumulated-tool-args repair pi's test also exercises (already ported on the Rust side
+        // as `agent::repair_json`, applied to the fully accumulated buffer in `Accumulator::flush_block`,
+        // not retested here).
+        const MALFORMED_TOOL_JSON: &str = r#"
+event: message_start
+data: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":12,"output_tokens":0}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_test","name":"edit","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"A\H\",\"text\":\"col1	col2\"}"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}
+
+event: message_stop
+data: {"type":"message_stop"}
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, MALFORMED_TOOL_JSON).unwrap();
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::ToolUseStart { name, .. } if name == "edit")),
+            "got: {events:?}"
+        );
+        // One repair pass at the outer-event layer: the invalid `\H` escape survives as a literal
+        // backslash + `H`, and the raw tab survives as an actual tab byte — exactly what a *second*,
+        // already-ported repair pass (`agent::repair_json`, over the fully accumulated buffer) expects
+        // to receive and itself resolve into `{"path": "A\\H", "text": "col1\tcol2"}`.
+        let expected_partial_json = "{\"path\":\"A\\H\",\"text\":\"col1\tcol2\"}";
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                StreamEvent::InputJsonDelta { partial_json, .. } if partial_json == expected_partial_json
+            )),
+            "got: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                StreamEvent::MessageStop { stop_reason } if *stop_reason == StopReason::ToolUse
+            )),
+            "a malformed-but-recoverable event must not abort the turn: {events:?}"
+        );
     }
 
     #[test]

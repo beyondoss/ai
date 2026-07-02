@@ -34,6 +34,9 @@ pub mod write;
 /// consistent with every other tool here, which surface a filesystem error at the point of actual use
 /// rather than pre-validating input that might still resolve to something real.
 pub(crate) fn normalize_path(path: &str) -> String {
+    if let Some(decoded) = decode_file_url(path) {
+        return decoded;
+    }
     let path = path.strip_prefix('@').unwrap_or(path);
     let folded: String = path
         .chars()
@@ -48,8 +51,45 @@ pub(crate) fn normalize_path(path: &str) -> String {
     expand_tilde(&folded, home_dir().as_deref())
 }
 
+/// Unwrap a `file://` URL argument into a plain filesystem path — pi's `normalizePath` does the same
+/// (`fileURLToPath`) before any other normalization, so a path a model composed from something it saw
+/// as a URL (a log line, an editor deep-link) still resolves instead of every fs tool reporting a
+/// confusing "not found". POSIX-only (an empty or `localhost` host, matching Node's `fileURLToPath` on
+/// non-Windows) — fine for this Linux-only target. Returns `None` for anything not `file://`-prefixed,
+/// so the caller falls through to the normal tilde/space-folding path unchanged.
+fn decode_file_url(path: &str) -> Option<String> {
+    let rest = path.strip_prefix("file://")?;
+    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    Some(
+        percent_encoding::percent_decode_str(rest)
+            .decode_utf8_lossy()
+            .into_owned(),
+    )
+}
+
 fn home_dir() -> Option<String> {
     std::env::var("HOME").ok().filter(|h| !h.is_empty())
+}
+
+/// Whether `root` (or any of its ancestors) contains a `.git` entry — a lightweight, dependency-free
+/// approximation of git's own repository discovery. `find`/`grep` use this to decide whether their
+/// `ignore::WalkBuilder` should git-boundary-respect (inside a repo — a nested repo's own `.gitignore`
+/// then can't leak parent rules across the boundary, matching pi's own `fd`/`rg` invocation, which is
+/// only forced `--no-require-git` *outside* a git repo) or unconditionally honor `.gitignore` files as
+/// plain ignore files (outside a repo, where there's no `.git` to anchor git-aware behavior at all).
+pub(crate) fn root_is_inside_git_repo(root: &std::path::Path) -> bool {
+    let mut dir = if root.is_dir() {
+        Some(root)
+    } else {
+        root.parent()
+    };
+    while let Some(d) = dir {
+        if d.join(".git").exists() {
+            return true;
+        }
+        dir = d.parent();
+    }
+    false
 }
 
 /// Split from [`normalize_path`] so tilde-expansion logic is unit-testable without mutating the
@@ -57,7 +97,12 @@ fn home_dir() -> Option<String> {
 /// concern as `resources::tz_string_offset`). `home: None` (unset or empty `$HOME`) leaves `path`
 /// unchanged rather than erroring, consistent with every tool here surfacing a filesystem error at the
 /// point of actual use rather than pre-validating input that might still resolve to something real.
-fn expand_tilde(path: &str, home: Option<&str>) -> String {
+///
+/// `pub(crate)` (not just used by `normalize_path` here): `skills`/`prompts` reuse it for
+/// `--skill`/`--prompt-template`'s extra discovery-root paths, which previously weren't tilde-expanded
+/// at all — usually masked by the shell doing it first, but not for a quoted argument or one built
+/// programmatically.
+pub(crate) fn expand_tilde(path: &str, home: Option<&str>) -> String {
     let Some(home) = home else {
         return path.to_string();
     };
@@ -248,6 +293,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn root_is_inside_git_repo_detects_a_git_dir_at_the_root_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        assert!(root_is_inside_git_repo(dir.path()));
+    }
+
+    #[test]
+    fn root_is_inside_git_repo_detects_a_git_dir_in_an_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let nested = dir.path().join("src").join("deep");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert!(root_is_inside_git_repo(&nested));
+    }
+
+    #[test]
+    fn root_is_inside_git_repo_is_false_with_no_git_dir_anywhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert!(!root_is_inside_git_repo(&nested));
+    }
+
+    #[test]
     fn expand_tilde_expands_bare_tilde_to_home() {
         assert_eq!(expand_tilde("~", Some("/home/jared")), "/home/jared");
     }
@@ -293,6 +362,37 @@ mod tests {
     #[test]
     fn normalize_path_is_a_no_op_for_an_ordinary_absolute_path() {
         assert_eq!(normalize_path("/etc/hosts"), "/etc/hosts");
+    }
+
+    #[test]
+    fn normalize_path_unwraps_a_file_url() {
+        // pi-parity gap (fixed): every fs tool rejected `file://`-prefixed paths outright, unlike
+        // pi's `normalizePath` (`fileURLToPath`) — a model that composed a path from something it saw
+        // as a URL (a log line, an editor deep-link) got a confusing "not found" from all six tools.
+        assert_eq!(normalize_path("file:///etc/hosts"), "/etc/hosts");
+    }
+
+    #[test]
+    fn normalize_path_unwraps_a_file_url_with_an_explicit_localhost_host() {
+        assert_eq!(normalize_path("file://localhost/etc/hosts"), "/etc/hosts");
+    }
+
+    #[test]
+    fn normalize_path_percent_decodes_a_file_url() {
+        assert_eq!(
+            normalize_path("file:///home/jared/my%20notes.md"),
+            "/home/jared/my notes.md"
+        );
+    }
+
+    #[test]
+    fn normalize_path_file_url_bypasses_tilde_and_at_handling() {
+        // A `file://` URL's path is already absolute and already decoded — it isn't a `~`-prefixed or
+        // `@`-prefixed argument, so those normalizations must not additionally apply to it.
+        assert_eq!(
+            normalize_path("file:///home/jared/~weird@name.txt"),
+            "/home/jared/~weird@name.txt"
+        );
     }
 
     #[test]
@@ -460,6 +560,18 @@ mod tests {
         assert!(reg.get("read").is_some());
         assert!(reg.get("ls").is_some());
         assert!(reg.get("bash").is_none());
+    }
+
+    #[test]
+    fn apply_filter_empty_allow_list_disables_every_tool() {
+        // pi: regression #2835, "disables all tools when the allowlist is empty" — an empty `tools:
+        // []` array (distinct from `no_tools`/omitting the field entirely) must still empty the
+        // registry via the ordinary allow-list path: `retain(|name| [].iter().any(|a| a == name))` is
+        // `false` for every name, same end state as `no_tools`, but reached through a different branch
+        // than `apply_filter_no_tools_wins_outright` exercises.
+        let mut reg = default_registry();
+        apply_filter(&mut reg, Some(&[]), None, false);
+        assert!(reg.is_empty(), "expected zero tools, got {}", reg.len());
     }
 
     #[test]

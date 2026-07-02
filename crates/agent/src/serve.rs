@@ -59,14 +59,18 @@
 //!     already defaults to the same behavior when called bare).
 //!   - `{type:"get_fork_messages", session_id?, upto?, target_id?, before?}` (repo mode) preview what
 //!     `fork` would produce — no new session, no switch
-//!   - `{type:"set_session_name", title}` set the session's title
+//!   - `{type:"set_session_name", title}` set the session's title → `data: {title}` (the final,
+//!     sanitized value — see `session_store::sanitize_title` — `null` if it sanitized to empty); also
+//!     pushes an unsolicited `session_info_changed` frame carrying the same `title`, so a client doesn't
+//!     need a follow-up `get_state` to learn what was actually recorded (pi's own `session_info_changed`)
 //!   - `{type:"export_html", output_path?}` render the active session's transcript as a single
 //!     self-contained HTML file → `data: {path}`. `output_path` defaults to a timestamped
 //!     `session-<unix-seconds>.html` in the current directory; parent directories are created as
 //!     needed.
 //!   - `{type:"compact"}`                summarize the prefix now → `data: {compacted: bool}`
 //!   - `{type:"get_last_assistant_text"}` → `data: {text}` (the latest assistant reply)
-//!   - `{type:"get_session_stats"}`      → token/step accounting
+//!   - `{type:"get_session_stats"}`      → token/step accounting + message-type breakdown
+//!     (`user_messages`/`assistant_messages`/`tool_calls`/`tool_results`/`total_messages`)
 //!   - `{type:"get_commands"}`           → discoverable skills + prompt templates
 //!   - `{type:"reload"}`                 re-run project-instruction/skill/prompt-template discovery and
 //!     re-check trust, refreshing the static half of the system prompt (the cheap date/cwd footer is
@@ -83,7 +87,9 @@
 //!     mechanism the active model actually uses (an Anthropic token budget, an Anthropic adaptive
 //!     effort, or an OpenAI `reasoning_effort`); see `agent_core::ThinkingLevel` → `data: {level,
 //!     thinking, reasoning_effort}`
-//!   - `{type:"cycle_model"}`            advance through `get_available_models`'s list, wrapping
+//!   - `{type:"cycle_model"}`            advance through the `--models` scope when given (else the
+//!     full known-model list `get_available_models` reports), wrapping — a `pattern:<level>` entry in
+//!     `--models` pins that model's thinking level for as long as cycling stays on it
 //!   - `{type:"cycle_thinking_level"}`   advance the same portable level one rung, wrapping from
 //!     `xhigh` back to `off` → `data: {level, thinking, reasoning_effort}`
 //!   - `{type:"set_auto_compaction", enabled}` toggle threshold-triggered compaction (manual `compact`
@@ -109,22 +115,31 @@
 //!     injection. The two lanes have independent settings, matching pi's own `steeringMode`/
 //!     `followUpMode`. Takes effect immediately (owned by the `Steering` handle itself, no `Agent`
 //!     rebuild), including mid-run.
-//!   - `{type:"get_available_models"}`   → `data: {models: […]}` — the `--models` scope when given,
-//!     else a known, non-exhaustive id list (same source `cycle_model` steps through)
+//!   - `{type:"get_available_models"}`   → `data: {models: [{id, provider, context_window, reasoning}
+//!     …]}` — always the full, non-exhaustive known-model hint list, never narrowed by `--models`
+//!     (that only scopes `cycle_model`'s own candidate list — see its entry above), each entry's
+//!     capability fields read from the same `agent_core::capabilities` table every wire decision
+//!     already consults (pi's own structured `Model<any>`, minus pricing — gateway-owned, out of scope
+//!     here)
 //!   - `{type:"list_branches"}`          → `data: {branches: [BranchInfo…]}` (the session's *leaves*)
 //!   - `{type:"get_tree"}`               → `data: {nodes: [TreeNode…]}` (every message on every
 //!     branch, not just the leaves `list_branches` reports)
-//!   - `{type:"switch_branch", target_id, summarize?}` navigate to another point in the tree,
-//!     summarizing the abandoned branch's activity first unless `summarize:false` → `data: {target_id,
-//!     model, reasoning_effort}` — also restores whichever model/thinking-level was actually active at
+//!   - `{type:"switch_branch", target_id, summarize?, custom_instructions?}` navigate to another point
+//!     in the tree, summarizing the abandoned branch's activity first unless `summarize:false` (an
+//!     optional `custom_instructions` string steers what that recap emphasizes, the same "Additional
+//!     focus" framing `compact`'s own `custom_instructions` supports; ignored when `summarize:false`,
+//!     since no summarization call happens at all) → `data: {target_id, model, reasoning_effort}` —
+//!     also restores whichever model/thinking-level was actually active at
 //!     `target_id` (a `set_model`/`cycle_model`/`set_reasoning_effort`/`cycle_thinking_level` made
 //!     *after* leaving that point doesn't leak backward into it), rebuilding the `Agent` if either
 //!     differs from what's currently active
-//!   - `{type:"bash", command, cwd?, timeout_ms?}` run a shell command directly — independent of the
-//!     model's own tool-call loop, and of any conversation/session state — streaming `tool_progress`/
-//!     `tool_end` events exactly like a model-invoked `bash` call. Rejected if `bash` isn't registered
-//!     for this process (`--exclude-tools bash` / `--no-tools`). While it runs, only `abort_bash`/
-//!     `abort` (cancel it) are accepted; everything else is rejected as busy.
+//!   - `{type:"bash", command, cwd?, timeout_ms?, exclude_from_context?}` run a shell command directly
+//!     — independent of the model's own tool-call loop — streaming `tool_progress`/`tool_end` events
+//!     exactly like a model-invoked `bash` call. Recorded into the session as a plain informational
+//!     message by default (so the model sees it on its next turn — pi's `recordBashResult`), unless
+//!     `exclude_from_context: true`. Rejected if `bash` isn't registered for this process
+//!     (`--exclude-tools bash` / `--no-tools`). While it runs, only `abort_bash`/`abort` (cancel it) are
+//!     accepted; everything else is rejected as busy.
 //!   - `{type:"abort_bash"}`             cancel an in-flight host `bash` command, else a no-op ack
 //!
 //! While a `prompt` runs, the loop keeps reading stdin so an `abort` can cancel it, or `steer` /
@@ -148,7 +163,9 @@
 //! `{type:"auto_retry", id?, command:"prompt", attempt, max_attempts, delay_ms, error}`, one per
 //! whole-run auto-retry attempt (see `set_auto_retry` above), also correlated via `id` — or
 //! `{type:"auto_retry_end", id?, command:"prompt", success, attempt, final_error?}`, the terminal
-//! notice for a retry sequence that made at least one attempt.
+//! notice for a retry sequence that made at least one attempt — or `{type:"session_info_changed", id?,
+//! command:"set_session_name", title}`, pushed once per successful `set_session_name` (pi's own
+//! `session_info_changed`; see `set_session_name` above).
 //!
 //! **Structural stdout guard:** every byte on stdout must be a protocol frame — a stray line (a
 //! debug `println!`, a misconfigured logger) would corrupt the NDJSON stream a remote client is
@@ -265,17 +282,22 @@ pub struct ServeConfig {
     pub exclude_tools: Option<Vec<String>>,
     /// Register no tools at all. Wins over `tools`/`exclude_tools`.
     pub no_tools: bool,
-    /// Disable skills discovery/loading entirely — no `<available_skills>` listing in the system
-    /// prompt, and a `/skill:name` invocation is sent through unexpanded. Matches pi's own
+    /// Disable *standard-root* skills discovery/loading (`~/.claude/skills`, `<cwd>/.claude/skills`) —
+    /// no `<available_skills>` listing in the system prompt from either, and a `/skill:name` invocation
+    /// is sent through unexpanded unless it resolves against a `--skill` path instead. Matches pi's own
     /// `--no-skills`, and `run`'s identical flag (`main.rs`'s `Run::no_skills`) — `serve` previously had
     /// no equivalent, so an operator wanting a hardened, no-custom-content deployment had no way to
-    /// refuse project-supplied skills the way a one-shot `run` could. Skips discovery outright (like
-    /// `run`) rather than discovering and then discarding, applied on every `reload` too.
+    /// refuse project-supplied skills the way a one-shot `run` could. Skips standard-root discovery
+    /// outright (like `run`) rather than discovering and then discarding, applied on every `reload` too
+    /// — but an explicit `--skill <path>` is still honored even so, matching pi's own `--no-skills` (a
+    /// documented, tested combination: `--no-skills` means "nothing auto-discovered", not "no skills at
+    /// all" — see `skills::discover_extra_only`'s doc comment).
     pub no_skills: bool,
-    /// Disable prompt-template discovery/loading entirely — a `/name` invocation is sent through
-    /// unexpanded instead of being resolved against `.claude/prompts/*.md`. Matches pi's own
-    /// `--no-prompt-templates` and `run`'s identical flag; see `no_skills`'s doc comment for why `serve`
-    /// needed this too.
+    /// Disable *standard-root* prompt-template discovery/loading (`~/.claude/prompts`,
+    /// `<cwd>/.claude/prompts`) — a `/name` invocation is sent through unexpanded unless it resolves
+    /// against a `--prompt-template` path instead. Matches pi's own `--no-prompt-templates` and `run`'s
+    /// identical flag; see `no_skills`'s doc comment for why `serve` needed this too, and for the
+    /// explicit-extra-path carve-out that applies here identically.
     pub no_prompt_templates: bool,
     /// Additional, ad-hoc skill-discovery roots beyond the two standard ones — pi's own
     /// `--skill <path>` (repeatable). Applied on every `reload` too, same as the standard roots.
@@ -288,12 +310,15 @@ pub struct ServeConfig {
     /// session just because the process happened to be started with this flag again; already validated
     /// non-whitespace by `main.rs` before this struct is even constructed.
     pub name: Option<String>,
-    /// Restrict `cycle_model`'s candidate list — and what `get_available_models` reports — to exactly
-    /// these ids, in this order (`--models`, comma-separated). `set_model` is unaffected: it still
-    /// accepts any id, scoped or not, matching pi's own `--models` flag (`resolveModelScope`/
-    /// `_scopedModels`) and its `get_available_models` (a live query against the actually-configured
-    /// registry, not a static hint list oblivious to how the process was launched). Empty or absent
-    /// falls back to the full [`available_models`] list.
+    /// Restrict `cycle_model`'s candidate list to exactly these patterns, resolved in this order
+    /// (`--models`, comma-separated; see `resolve_model_scope` for the exact grammar — literal ids,
+    /// globs against [`available_models`], and an optional `:<thinking-level>` suffix pinning that
+    /// entry's depth) — pi's own `--models` flag (`resolveModelScopeWithDiagnostics`/`_scopedModels`).
+    /// `set_model` is unaffected: it still accepts any id, scoped or not. `get_available_models` is
+    /// unaffected too — unlike pi's own scope-defaulted `/model` picker, this RPC has no secondary
+    /// "show everything" toggle, so it always reports the full list and leaves any scoped-vs-all UI
+    /// distinction to the client. Empty or absent falls back to the full [`available_models`] list for
+    /// cycling as well.
     pub models: Vec<String>,
 }
 
@@ -751,11 +776,18 @@ impl Persistence {
     /// `agent` and persists it *before* switching — mirroring pi's `navigateTree`. A summarization
     /// failure (a network error, or the model returning nothing) is logged and the switch proceeds
     /// anyway: losing the recap is far better than being unable to navigate away from a branch at all.
+    ///
+    /// `custom_instructions`, when given, steers *what* the branch recap emphasizes — the same
+    /// "Additional focus" framing manual `compact` already supports — threaded straight through to
+    /// [`Agent::summarize_branch`]; ignored (no summarization call happens at all) when `summarize` is
+    /// `false`.
     async fn switch_branch(
         &mut self,
         agent: &Agent,
         target_id: &str,
         summarize: bool,
+        custom_instructions: Option<&str>,
+        cancel: &CancellationToken,
     ) -> std::io::Result<Session> {
         let store = self.store.as_mut().ok_or_else(|| {
             std::io::Error::new(
@@ -776,7 +808,7 @@ impl Persistence {
                     let (ids, messages): (Vec<String>, Vec<agent_core::Message>) =
                         abandoned.into_iter().unzip();
                     match agent
-                        .summarize_branch(&messages, &CancellationToken::new())
+                        .summarize_branch(&messages, cancel, custom_instructions)
                         .await
                     {
                         Ok(summary) if !summary.trim().is_empty() => {
@@ -805,6 +837,17 @@ impl Persistence {
                             summary_to_apply = Some((summary, from_id, details));
                         }
                         Ok(_) => {} // empty summary — nothing worth recording
+                        // A client-requested abort mid-summarization: unlike a genuine failure below,
+                        // this must not fall through to switching anyway — pi's own contract
+                        // (`navigateTree`'s `abortBranchSummary`) leaves the session completely
+                        // unchanged on cancel, distinct from `cancelled: true` in the response the
+                        // caller builds from this `Err`.
+                        Err(agent_core::Error::Cancelled) => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::Interrupted,
+                                "branch summarization cancelled",
+                            ));
+                        }
                         Err(e) => {
                             eprintln!("serve: branch summarization failed, switching anyway: {e}")
                         }
@@ -889,6 +932,26 @@ impl Persistence {
                 .unwrap_or(process_starting_level),
         )
     }
+
+    /// [`Self::model_and_level_at`] resolved at the *currently active* session's own tip — what a
+    /// caller that just opened a different session entirely (`switch`), rather than a different branch
+    /// within the same one (`switch_branch`), needs: `switch`'s `self.store = Some(store)` swap means
+    /// `model_and_level_at`'s own tree lookups already operate on the newly-opened session, so only the
+    /// target id needs to come from *this* session's own active tip instead of an RPC-supplied one.
+    fn model_and_level_at_active(
+        &self,
+        process_starting_level: agent_core::ThinkingLevel,
+    ) -> (String, agent_core::ThinkingLevel) {
+        let Some(target_id) = self
+            .store
+            .as_ref()
+            .and_then(|s| s.active_ids().last())
+            .cloned()
+        else {
+            return (self.meta.model.clone(), process_starting_level);
+        };
+        self.model_and_level_at(&target_id, process_starting_level)
+    }
 }
 
 fn not_in_repo_mode() -> std::io::Error {
@@ -906,7 +969,7 @@ fn not_in_repo_mode() -> std::io::Error {
 /// one). Surfaced (as `cwd_stale` on the relevant responses) so a client can warn before the model's
 /// tools proceed against a mismatched or nonexistent directory instead of silently producing confusing
 /// results.
-fn cwd_is_stale(meta_cwd: &str, actual_cwd: &std::path::Path) -> bool {
+pub fn cwd_is_stale(meta_cwd: &str, actual_cwd: &std::path::Path) -> bool {
     !std::path::Path::new(meta_cwd).is_dir() || meta_cwd != actual_cwd.to_string_lossy()
 }
 
@@ -919,7 +982,10 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
     // `--name`: only for a genuinely fresh session (no messages, no title yet) — a resumed session
     // (repo mode reattaching to an existing cwd session, or a `--session-file` that already has
     // content) must not be silently renamed just because the process happened to be started with this
-    // flag again.
+    // flag again. Deliberately diverges from pi, whose `--name` renames unconditionally on every
+    // invocation (last-write-wins) — a script that resumes the same session on a schedule would
+    // otherwise get its title rewritten to the same value every single run, and there's no way for an
+    // operator to tell "rename this" from "just start it the way I always do" apart on pi's side.
     if let Some(name) = &cfg.name {
         if session.messages.is_empty() && persistence.meta.title.is_none() {
             if let Err(e) = persistence.set_title(name) {
@@ -957,11 +1023,14 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
     // shadowed across roots), surfaced via `get_commands`'s `collisions` field rather than silently
     // resolved with no way for a client to notice.
     //
-    // `--no-skills`/`--no-prompt-templates` skip discovery outright rather than discovering and then
-    // discarding — matching `run`'s identical flags (`main.rs`), and avoiding a needless filesystem walk
-    // when the operator has already said neither is wanted.
+    // `--no-skills`/`--no-prompt-templates` skip *standard-root* discovery outright rather than
+    // discovering and then discarding — matching `run`'s identical flags (`main.rs`), and avoiding a
+    // needless filesystem walk when the operator has already said neither standard root is wanted. An
+    // explicit `--skill`/`--prompt-template` extra path is still honored even so — pi's own
+    // `noSkills`/`noPromptTemplates` do the same (a documented, tested combination; see
+    // `skills::discover_extra_only`'s doc comment — pi-parity fix, M2).
     let (mut prompt_templates, mut prompt_collisions) = if cfg.no_prompt_templates {
-        (Vec::new(), Vec::new())
+        crate::prompts::discover_extra_only(&cfg.extra_prompt_template_paths)
     } else {
         crate::prompts::discover_with_diagnostics(
             &cwd,
@@ -970,7 +1039,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
         )
     };
     let (mut skills, mut skill_collisions) = if cfg.no_skills {
-        (Vec::new(), Vec::new())
+        crate::skills::discover_extra_only(&cfg.extra_skill_paths)
     } else {
         crate::skills::discover_with_diagnostics(&cwd, project_trusted, &cfg.extra_skill_paths)
     };
@@ -1001,12 +1070,17 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
     // (transport, tools, system prompt, loop bounds, cache settings) is fixed for the process.
     // `build_agent` folds the mutable trio into a fresh `Agent` whenever any of them changes.
     let mut current_model = cfg.model.clone();
-    // `cycle_model`'s candidate list: the operator-scoped `--models` set when given, else the full
-    // known-model hint list. Fixed for the process, like `tools` — there's no runtime RPC to change it.
-    let cycle_models: Vec<String> = if cfg.models.is_empty() {
+    // `cycle_model`'s candidate list: the operator-scoped `--models` set when given (parsed by
+    // `resolve_model_scope` — comma-separated patterns, each an exact id, a glob against
+    // `available_models()`, or either suffixed with `:<thinking-level>` to pin that entry's depth —
+    // pi's own `--models`/`resolveModelScopeWithDiagnostics`), else the full known-model hint list.
+    // Fixed for the process, like `tools` — there's no runtime RPC to change it. `get_available_models`
+    // is deliberately NOT scoped by this — see that handler's own comment.
+    let scoped_models: Vec<ScopedModel> = resolve_model_scope(&cfg.models, available_models());
+    let cycle_models: Vec<String> = if scoped_models.is_empty() {
         available_models().iter().map(|s| s.to_string()).collect()
     } else {
-        cfg.models.clone()
+        scoped_models.iter().map(|m| m.id.clone()).collect()
     };
     let mut current_thinking = cfg.thinking;
     // The portable thinking-depth level (see `agent_core::ThinkingLevel`) — the runtime-mutable
@@ -1227,11 +1301,13 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 let refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 // Whether an auto-triggered compaction is *currently* in flight this instant — pi's
                 // `isCompacting`, surfaced from `get_state`. Set on `AgentEvent::CompactionStart`,
-                // cleared on `Compacted` *or* the very next event of any other kind (`TurnStart` for the
-                // run's next turn, ordinarily) — `Agent::compact` can end without ever emitting
-                // `Compacted` (an empty-summary no-op, or a propagated error), and its own model call
-                // uses a discarding inner sink, so nothing else can arrive between `CompactionStart` and
-                // whatever naturally follows it; clearing on "anything else" is exact, not a guess.
+                // cleared on `Compacted`/`CompactionFailed` *or* the very next event of any other kind
+                // (`TurnStart` for the run's next turn, ordinarily) — `Agent::compact` can end without
+                // ever emitting `Compacted` (an empty-summary no-op, or a failure reported via
+                // `CompactionFailed` rather than propagated — see that event's doc comment), and its own
+                // model call uses a discarding inner sink, so nothing else can arrive between
+                // `CompactionStart` and whatever naturally follows it; clearing on "anything else" is
+                // exact, not a guess.
                 // Manual `compact`/branch-summary-on-`switch_branch` don't touch this: both only ever
                 // run from the idle main loop, which processes one command to completion before reading
                 // the next — no concurrent `get_state` could ever observe them in flight anyway.
@@ -1254,12 +1330,10 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 // never retries past a client disconnect or an explicit `abort`
                 // (`is_retryable_whole_run` already excludes `Error::Cancelled` transitively through
                 // `is_retryable_mid_stream`, and `stdin_open`/`cancel.is_cancelled()` below are
-                // redundant, cheap belt-and-suspenders on top of that). The backoff sleep itself isn't
-                // raced against `abort`/shutdown — both are only read inside an attempt's own `select!`
-                // below — so a client abort during backoff takes effect once the next attempt's stdin
-                // read resumes, not instantly; bounded by `retry::MAX_RUN_RETRIES`/
-                // `retry::RUN_RETRY_MAX_BACKOFF`, this window is short enough not to be worth the much
-                // larger restructuring a truly gapless fix would need.
+                // redundant, cheap belt-and-suspenders on top of that). The backoff sleep itself *is*
+                // raced against `abort`/`abort_retry`/shutdown (see the `select!` around the `sleep`
+                // below) — a client abort during backoff takes effect immediately, not just once the
+                // next attempt starts.
                 let mut retry_attempt: u32 = 0;
                 // Whether the final post-attempt persist (below) failed to write to disk — surfaced in
                 // the terminal `prompt` response instead of being silently swallowed, since an agent run
@@ -1309,6 +1383,15 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 if let AgentEvent::Stream(StreamEvent::Usage(usage)) = &ev {
                                     live_stats_sink.record_usage(usage);
+                                }
+                                // B-L1: mirrors the same events into `pending_tool_ids`, so `get_state`
+                                // can answer "which calls are still running" mid-turn — see that
+                                // field's own doc comment.
+                                if let AgentEvent::ToolStart { id, .. } = &ev {
+                                    live_stats_sink.tool_started(id.clone());
+                                }
+                                if let AgentEvent::ToolEnd { id, .. } = &ev {
+                                    live_stats_sink.tool_ended(id);
                                 }
                                 // Best-effort: a sync sink can't break the control loop. If the writer is
                                 // gone the send fails here and the terminal response send below detects it
@@ -1517,7 +1600,10 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                                                 }
                                             }
                                             "get_available_models" => {
-                                                let _ = out_tx.send(response(cid, "get_available_models", true, Some(json!({ "models": cycle_models })), None));
+                                                // Always the full known-model hint list, never scoped by `--models` — see the
+                                                // idle-mode handler's identical comment for why.
+                                                let models: Vec<Value> = available_models().iter().map(|m| model_info(m)).collect();
+                                                let _ = out_tx.send(response(cid, "get_available_models", true, Some(json!({ "models": models })), None));
                                             }
                                             // A run is actively in flight — no retry backoff is pending yet
                                             // (that only happens after an attempt fails, outside this loop),
@@ -1636,6 +1722,12 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                                 ));
                                 break 'retry attempt_result;
                             }
+                            // The failed attempt's closing error record (`run_events_steered` always
+                            // persists one on an `Err`-ending run — see `Message::error`'s doc comment)
+                            // must not survive into the retry: this is the *same* run resuming from
+                            // scratch, not a client's own fresh prompt, so it needs to be genuinely
+                            // invisible in the transcript, not stacked under the retry's real response.
+                            session.pop_error_record();
                             continue 'retry;
                         }
                         _ => {
@@ -1753,6 +1845,9 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     // concurrently-running turn or compaction this response could be racing.
                     m.insert("is_streaming".into(), json!(false));
                     m.insert("is_compacting".into(), json!(false));
+                    // Same reasoning as `is_streaming`/`is_compacting` above: idle means nothing is
+                    // dispatching a tool call either.
+                    m.insert("pending_tool_ids".into(), json!(Vec::<String>::new()));
                     if let Value::Object(rt) = runtime_settings(
                         current_level,
                         current_auto_compaction,
@@ -1904,6 +1999,45 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     Ok(s) => {
                         session = s;
                         steering.clear();
+                        // Restore whichever model/thinking-level this session was actually last
+                        // running on, the same way `switch_branch` already does — without this, the
+                        // process's current global model/level (possibly set on a *different* session
+                        // entirely) silently bled into the reattached session: reopening a session last
+                        // driven on `gpt-5` without re-passing `--model` would continue it on whatever
+                        // the process happened to be running, with no warning. See
+                        // `model_and_level_at_active`'s doc comment.
+                        let (restored_model, restored_level) =
+                            persistence.model_and_level_at_active(starting_level);
+                        let restored_level = agent_core::clamp_thinking_level(
+                            &agent_core::capabilities(&restored_model),
+                            restored_level,
+                        );
+                        let mut rebuild_needed = false;
+                        if restored_model != current_model {
+                            session.scrub_cross_model_state(&restored_model);
+                            current_model = restored_model;
+                            rebuild_needed = true;
+                        }
+                        if restored_level != current_level {
+                            current_level = restored_level;
+                            current_thinking = None;
+                            rebuild_needed = true;
+                        }
+                        if rebuild_needed {
+                            agent = build_agent(
+                                client.clone(),
+                                &full_system(&static_system, &cwd),
+                                &cfg,
+                                &current_model,
+                                current_thinking,
+                                current_level,
+                                current_auto_compaction,
+                                current_auto_retry,
+                                persistence.session_id(),
+                                &write_locks,
+                                &checkpoint,
+                            );
+                        }
                         emit!(response(
                             id,
                             "switch_session",
@@ -1911,6 +2045,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                             Some(json!({
                                 "session_id": persistence.session_id(),
                                 "cwd_stale": cwd_is_stale(&persistence.meta.cwd, &cwd),
+                                "model": current_model,
                             })),
                             None,
                         ));
@@ -2065,7 +2200,24 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
             }
             "set_session_name" => match cmd.get("title").and_then(Value::as_str) {
                 Some(title) => match persistence.set_title(title) {
-                    Ok(()) => emit!(response(id, "set_session_name", true, None, None)),
+                    Ok(()) => {
+                        // pi: `session_info_changed` (`rpc-mode.ts:632-639`) — a push notification so a
+                        // client learns the final *sanitized* name (newlines collapsed, or cleared
+                        // entirely if the sanitized result is empty — see `sanitize_title`) without a
+                        // second `get_state` round trip. Sent as its own unsolicited frame (like
+                        // `list_progress`/`auto_retry` above) *and* echoed on the response's own `data`,
+                        // since unlike pi's multi-subscriber extension model this protocol has exactly
+                        // one client and the response is already the more direct notification path.
+                        let title = persistence.meta.title.clone();
+                        let _ = out_tx.send(session_info_changed_frame(id.clone(), title.clone()));
+                        emit!(response(
+                            id,
+                            "set_session_name",
+                            true,
+                            Some(json!({ "title": title })),
+                            None,
+                        ));
+                    }
                     Err(e) => emit!(response(
                         id,
                         "set_session_name",
@@ -2184,8 +2336,11 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 project_trusted = !cfg.force_untrusted
                     && (cfg.trust_project
                         || crate::trust_store::TrustStore::open_default().is_trusted(&cwd));
+                // `--no-skills`/`--no-prompt-templates` still honor an explicit `--skill`/
+                // `--prompt-template` extra path (pi-parity fix, M2) — see the identical reasoning at
+                // this function's startup discovery, above.
                 (prompt_templates, prompt_collisions) = if cfg.no_prompt_templates {
-                    (Vec::new(), Vec::new())
+                    crate::prompts::discover_extra_only(&cfg.extra_prompt_template_paths)
                 } else {
                     crate::prompts::discover_with_diagnostics(
                         &cwd,
@@ -2194,7 +2349,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     )
                 };
                 (skills, skill_collisions) = if cfg.no_skills {
-                    (Vec::new(), Vec::new())
+                    crate::skills::discover_extra_only(&cfg.extra_skill_paths)
                 } else {
                     crate::skills::discover_with_diagnostics(
                         &cwd,
@@ -2440,6 +2595,14 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     .position(|m| m == &current_model)
                     .map_or(0, |i| (i + 1) % cycle_models.len());
                 let next_model = cycle_models[next_idx].clone();
+                // A `pattern:level` pin from `--models` (e.g. `gpt-4o:high`) rides along whenever
+                // cycling lands on that model — pi's own `ScopedModel.thinkingLevel`/
+                // `_cycleScopedModel`. Landing on an unpinned model just keeps whatever level was
+                // already active, same as pi.
+                let pinned_level = scoped_models
+                    .iter()
+                    .find(|m| m.id == next_model)
+                    .and_then(|m| m.thinking_level);
                 let record_result = if next_model != current_model {
                     persistence.record_model_change(&next_model)
                 } else {
@@ -2449,6 +2612,13 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     Ok(()) => {
                         session.scrub_cross_model_state(&next_model);
                         current_model = next_model;
+                        if let Some(level) = pinned_level {
+                            // Same staleness hazard `cycle_thinking_level` already guards against:
+                            // a stale raw-budget override must not silently outlive the level it
+                            // was pinned over.
+                            current_thinking = None;
+                            current_level = level;
+                        }
                         // See `set_model`'s identical re-clamp for why this can't be skipped.
                         current_level = agent_core::clamp_thinking_level(
                             &agent_core::capabilities(&current_model),
@@ -2676,11 +2846,17 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 )),
             },
             "get_available_models" => {
+                // Deliberately the full known-model hint list, not `cycle_models` — `--models` scopes
+                // what `cycle_model` steps through, not what a client's model *picker* can see. pi's
+                // own `/model` selector defaults its view to the scope but still lets the operator Tab
+                // to the full catalog; since this RPC has no such secondary toggle, it always answers
+                // with the unscoped list and leaves any scoped-vs-all UI distinction to the client.
+                let models: Vec<Value> = available_models().iter().map(|m| model_info(m)).collect();
                 emit!(response(
                     id,
                     "get_available_models",
                     true,
-                    Some(json!({ "models": cycle_models })),
+                    Some(json!({ "models": models })),
                     None,
                 ));
             }
@@ -2710,11 +2886,77 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                         .get("summarize")
                         .and_then(Value::as_bool)
                         .unwrap_or(true);
+                    // Steers what the abandoned branch's recap emphasizes — the same "Additional
+                    // focus" framing the `compact` command already supports (see its own
+                    // `custom_instructions` handling above). Ignored when `summarize` is false, since
+                    // no summarization call happens at all in that case.
+                    let custom_instructions =
+                        cmd.get("custom_instructions").and_then(Value::as_str);
                     let target_id = target_id.to_string();
-                    match persistence
-                        .switch_branch(&agent, &target_id, summarize)
-                        .await
-                    {
+                    // Branch summarization is one LLM call, but it's still a real network round trip
+                    // — potentially the slowest single operation this loop ever awaits outside a
+                    // `prompt` run. Racing it against stdin (mirroring `prompt`'s own busy-select
+                    // below, scaled down to this operation's much narrower surface — pi exposes only
+                    // `abortBranchSummary` here, nothing like steer/follow_up) keeps an `abort` able to
+                    // interrupt it instead of the whole RPC loop going unresponsive until the call
+                    // either lands or times out. A stdin close/shutdown mid-call also cancels, so the
+                    // loop can still unwind and exit cleanly instead of hanging on this one `.await`.
+                    let branch_cancel = CancellationToken::new();
+                    let mut branch_stdin_open = true;
+                    let switch_result = {
+                        let fut = persistence.switch_branch(
+                            &agent,
+                            &target_id,
+                            summarize,
+                            custom_instructions,
+                            &branch_cancel,
+                        );
+                        tokio::pin!(fut);
+                        loop {
+                            tokio::select! {
+                                biased;
+                                r = &mut fut => break r,
+                                () = shutdown.wait() => {
+                                    branch_stdin_open = false;
+                                    branch_cancel.cancel();
+                                }
+                                maybe_line = lines.next_line(), if branch_stdin_open => match maybe_line {
+                                    Ok(Some(l)) => {
+                                        let l = l.trim();
+                                        if l.is_empty() {
+                                            continue;
+                                        }
+                                        let c: Value = match serde_json::from_str(l) {
+                                            Ok(v) => v,
+                                            Err(e) => {
+                                                let _ = out_tx.send(response(None, "?", false, None, Some(&format!("invalid JSON: {e}"))));
+                                                continue;
+                                            }
+                                        };
+                                        let cid = c.get("id").and_then(Value::as_str).map(str::to_string);
+                                        match c.get("type").and_then(Value::as_str).unwrap_or("") {
+                                            "abort" => {
+                                                branch_cancel.cancel();
+                                                let _ = out_tx.send(response(cid, "abort", true, None, None));
+                                            }
+                                            other => {
+                                                let _ = out_tx.send(response(cid, other, false, None, Some("busy: a branch switch is summarizing; only `abort` is accepted until it settles")));
+                                            }
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        branch_stdin_open = false;
+                                        branch_cancel.cancel();
+                                    }
+                                    Err(_) => {
+                                        branch_stdin_open = false;
+                                        branch_cancel.cancel();
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    match switch_result {
                         Ok(s) => {
                             session = s;
                             steering.clear();
@@ -2774,6 +3016,23 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                                 None,
                             ));
                         }
+                        // Not a failure — the client asked to abort, and the session is left exactly
+                        // as it was (no partial summary, no switch): mirrors pi's `navigateTree`
+                        // result shape (`{cancelled:true, aborted:true}`) rather than surfacing this as
+                        // an RPC-level error.
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                            emit!(response(
+                                id,
+                                "switch_branch",
+                                true,
+                                Some(json!({
+                                    "target_id": target_id,
+                                    "cancelled": true,
+                                    "aborted": true,
+                                })),
+                                None,
+                            ));
+                        }
                         Err(e) => emit!(response(
                             id,
                             "switch_branch",
@@ -2816,6 +3075,15 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(timeout_ms) = cmd.get("timeout_ms").and_then(Value::as_u64) {
                     input["timeout_ms"] = json!(timeout_ms);
                 }
+                // Recorded into session context by default — pi's `recordBashResult`, opted out of via
+                // `excludeFromContext` — so a diagnostic command run outside the model's own turn is
+                // still visible to it on the *next* turn. Previously this command never touched
+                // `session` at all: the calling client saw the result, but the model never did.
+                let exclude_from_context = cmd
+                    .get("exclude_from_context")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let command = command.to_string();
                 host_bash_seq += 1;
                 let call_id = format!("host-bash-{host_bash_seq}");
                 if let Some(frame) = event_frame(AgentEvent::ToolStart {
@@ -2931,6 +3199,22 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     is_error,
                 }) {
                     emit!(frame);
+                }
+                // This command has no `tool_use` to pair a `tool_result` against (it never went
+                // through the model), so it's recorded as a plainly-labeled informational user message
+                // instead — structurally impossible to run this arm while a turn is streaming (the
+                // busy-loop above rejects everything but `abort_bash`/`abort` while a host bash command
+                // is in flight, and this command is only reachable from the idle loop to begin with), so
+                // there's no tool_use/tool_result ordering to protect against, unlike pi's own
+                // stream-in-flight deferral.
+                if !exclude_from_context {
+                    session.push(agent_core::Message::user(format!(
+                        "[Host bash command, run outside the model's own turn]\n$ {command}\n\n{}{result_text}",
+                        if is_error { "(error)\n" } else { "" }
+                    )));
+                    if let Err(e) = persistence.persist(&session, None) {
+                        eprintln!("serve: failed to persist host bash result: {e}");
+                    }
                 }
                 emit!(response(
                     id,
@@ -3075,6 +3359,103 @@ pub fn available_models() -> &'static [&'static str] {
     ]
 }
 
+/// One resolved entry in a `--models` scope: a model id plus an optional thinking level pinned via a
+/// trailing `:<level>` suffix on the pattern that produced it. Mirrors pi's own `ScopedModel`
+/// (`model-resolver.ts`), minus the `provider/id` canonical form pi's real multi-provider registry
+/// carries — this crate has no such registry (`model_info`'s doc comment), so a glob only matches
+/// against the bare id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScopedModel {
+    id: String,
+    thinking_level: Option<agent_core::ThinkingLevel>,
+}
+
+/// Parses `--models`'s comma-separated pattern list (already split by clap) into a resolved candidate
+/// set — pi's own `resolveModelScopeWithDiagnostics`. Each pattern, independently:
+///
+/// - has a trailing `:<level>` suffix stripped off and remembered as that entry's pinned thinking
+///   level (one of off/minimal/low/medium/high/xhigh — `agent_core::ThinkingLevel::parse`), applied
+///   whenever `cycle_model` lands on it; a suffix that isn't a valid level is left alone and treated
+///   as part of the id/pattern itself, same as pi's `parseModelPattern` recursion;
+/// - if what's left contains a glob metacharacter (`*`, `?`, `[`), is matched case-insensitively
+///   against every id in `catalog`, expanding to every match in `catalog`'s order — e.g. `claude-*`
+///   or `*sonnet*` — each getting the same pinned level;
+/// - otherwise is kept as a literal id verbatim, whether or not it's in `catalog` — matching
+///   `available_models`'s own "hint, not an allowlist" contract, since the gateway forwards any id
+///   verbatim regardless of what this process happens to know about.
+///
+/// A glob that matches nothing is dropped silently — pi's own resolver only ever warns, never
+/// hard-fails, and cycling still works from whatever else resolved. A duplicate id keeps the first
+/// occurrence's pin, same as pi's `modelsAreEqual` dedup.
+fn resolve_model_scope(patterns: &[String], catalog: &[&str]) -> Vec<ScopedModel> {
+    let mut resolved: Vec<ScopedModel> = Vec::new();
+    for raw in patterns {
+        let pattern = raw.trim();
+        if pattern.is_empty() {
+            continue;
+        }
+        let (base, thinking_level) = match pattern.rfind(':') {
+            Some(idx) => {
+                let suffix = &pattern[idx + 1..];
+                match agent_core::ThinkingLevel::parse(suffix) {
+                    Some(level) => (&pattern[..idx], Some(level)),
+                    None => (pattern, None),
+                }
+            }
+            None => (pattern, None),
+        };
+        let is_glob = base.chars().any(|c| matches!(c, '*' | '?' | '['));
+        if is_glob {
+            let matcher = match globset::GlobBuilder::new(base)
+                .case_insensitive(true)
+                .build()
+            {
+                Ok(g) => g.compile_matcher(),
+                Err(_) => continue,
+            };
+            for &id in catalog {
+                if matcher.is_match(id) && !resolved.iter().any(|m| m.id == id) {
+                    resolved.push(ScopedModel {
+                        id: id.to_string(),
+                        thinking_level,
+                    });
+                }
+            }
+        } else if !resolved.iter().any(|m| m.id == base) {
+            resolved.push(ScopedModel {
+                id: base.to_string(),
+                thinking_level,
+            });
+        }
+    }
+    resolved
+}
+
+/// A `get_available_models` entry: enough per-model capability info (from the same
+/// [`agent_core::capabilities`] table every wire decision already consults) for a client to build a
+/// capability-aware picker without shipping its own hardcoded model registry. pi: `Model<any>`
+/// (`rpc-types.ts:143-146`) — `id`/`contextWindow`/`reasoning` carry the same *kind* of information
+/// here under this codebase's own field-naming convention (snake_case, matching `get_state`/
+/// `get_session_stats`); `provider` is a coarse wire-family hint (`agent_core::dialect::Dialect::
+/// for_model`, "anthropic"/"openai"), not a real routing provider id — this crate has no such registry,
+/// the gateway owns routing. Pricing (pi's `cost`) is deliberately omitted: gateway-owned, out of scope
+/// for this crate (see `ServeConfig`'s module doc).
+fn model_info(model: &str) -> Value {
+    let caps = agent_core::capabilities(model);
+    let provider = match agent_core::dialect::Dialect::for_model(model) {
+        agent_core::dialect::Dialect::Anthropic => "anthropic",
+        agent_core::dialect::Dialect::OpenAi | agent_core::dialect::Dialect::OpenAiResponses => {
+            "openai"
+        }
+    };
+    json!({
+        "id": model,
+        "provider": provider,
+        "context_window": caps.context_window,
+        "reasoning": caps.reasoning_effort || caps.thinking != agent_core::models::ThinkingShape::None,
+    })
+}
+
 /// The concatenated text of the most recent assistant message, for scripting clients that just want
 /// the answer. Empty if there's no assistant turn yet.
 fn last_assistant_text(session: &Session) -> String {
@@ -3148,6 +3529,7 @@ fn session_stats(session: &Session, model: &str) -> Value {
             "percent": (session.last_input_tokens as f64 / context_window as f64 * 100.0),
         })
     });
+    let breakdown = message_type_breakdown(session);
     json!({
         "steps": session.steps,
         "input_tokens": session.input_tokens,
@@ -3158,7 +3540,68 @@ fn session_stats(session: &Session, model: &str) -> Value {
         "reasoning_tokens": session.reasoning_tokens,
         "last_input_tokens": session.last_input_tokens,
         "context_usage": context_usage,
+        "user_messages": breakdown.user_messages,
+        "assistant_messages": breakdown.assistant_messages,
+        "tool_calls": breakdown.tool_calls,
+        "tool_results": breakdown.tool_results,
+        "total_messages": session.messages.len(),
     })
+}
+
+/// pi's `userMessages`/`assistantMessages`/`toolCalls`/`toolResults` (`getSessionStats`) — a client
+/// wanting these previously had to fetch `get_messages` and count client-side.
+///
+/// Adapted, not ported 1:1: pi's message model has a dedicated `toolResult` role, separate from `user`,
+/// so its `userMessages`/`toolResults` split cleanly on role alone. Ours carries a tool result as a
+/// `ContentBlock::ToolResult` *within* a `User`-role message (Anthropic's own convention) — and a
+/// steered mid-run text injection can land in that very same message alongside the tool results (see
+/// `steering.rs`'s module doc: "folded onto the same tool-results user turn"). So a `User` message here
+/// counts as a "user message" when it carries anything *other than* a tool result (real authored
+/// content), and `tool_calls`/`tool_results` count individual content blocks rather than whole messages
+/// — matching pi's own `toolCalls` definition, which already counts blocks within an assistant message,
+/// not messages themselves.
+struct MessageTypeBreakdown {
+    user_messages: u64,
+    assistant_messages: u64,
+    tool_calls: u64,
+    tool_results: u64,
+}
+
+fn message_type_breakdown(session: &Session) -> MessageTypeBreakdown {
+    let mut breakdown = MessageTypeBreakdown {
+        user_messages: 0,
+        assistant_messages: 0,
+        tool_calls: 0,
+        tool_results: 0,
+    };
+    for m in session.messages.iter() {
+        match m.role {
+            agent_core::Role::User => {
+                let has_non_tool_result = m
+                    .content
+                    .iter()
+                    .any(|c| !matches!(c, agent_core::ContentBlock::ToolResult { .. }));
+                if has_non_tool_result {
+                    breakdown.user_messages += 1;
+                }
+                breakdown.tool_results += m
+                    .content
+                    .iter()
+                    .filter(|c| matches!(c, agent_core::ContentBlock::ToolResult { .. }))
+                    .count() as u64;
+            }
+            agent_core::Role::Assistant => {
+                breakdown.assistant_messages += 1;
+                breakdown.tool_calls += m
+                    .content
+                    .iter()
+                    .filter(|c| matches!(c, agent_core::ContentBlock::ToolUse { .. }))
+                    .count() as u64;
+            }
+            agent_core::Role::System => {}
+        }
+    }
+    breakdown
 }
 
 /// The runtime-mutable settings and queue depth `get_state` reports — pi's `get_state` carries the
@@ -3208,6 +3651,14 @@ struct LiveStats {
     cache_write_1h_tokens: std::sync::atomic::AtomicU64,
     reasoning_tokens: std::sync::atomic::AtomicU64,
     last_input_tokens: AtomicU32,
+    /// B-L1 pi-parity gap (fixed): pi's `agent.state.pendingToolCalls` (a live, in-process reactive
+    /// set) has no RPC equivalent — a client watching a long tool-heavy turn had to reconstruct "which
+    /// calls are still running" itself from the raw `tool_start`/`tool_end` event stream. Mirrored from
+    /// those same events (see the `prompt` command's busy-loop sink), so `get_state`/
+    /// `get_session_stats` can answer it directly mid-run, the same way every other field here already
+    /// does. A `Mutex<BTreeSet>` rather than another atomic: ids are strings, and insert/remove need to
+    /// be atomic *with each other*, not just individually.
+    pending_tool_ids: std::sync::Mutex<std::collections::BTreeSet<String>>,
 }
 
 impl LiveStats {
@@ -3223,7 +3674,22 @@ impl LiveStats {
             cache_write_1h_tokens: session.cache_write_1h_tokens.into(),
             reasoning_tokens: session.reasoning_tokens.into(),
             last_input_tokens: AtomicU32::new(session.last_input_tokens),
+            pending_tool_ids: std::sync::Mutex::new(std::collections::BTreeSet::new()),
         }
+    }
+
+    fn tool_started(&self, id: String) {
+        self.pending_tool_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id);
+    }
+
+    fn tool_ended(&self, id: &str) {
+        self.pending_tool_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
     }
 
     /// Fold one turn's usage into the running totals — the same arithmetic as
@@ -3263,6 +3729,13 @@ impl LiveStats {
             "cache_write_1h_tokens": self.cache_write_1h_tokens.load(Ordering::Relaxed),
             "reasoning_tokens": self.reasoning_tokens.load(Ordering::Relaxed),
             "last_input_tokens": self.last_input_tokens.load(Ordering::Relaxed),
+            "pending_tool_ids": self
+                .pending_tool_ids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
         })
     }
 }
@@ -3340,6 +3813,22 @@ fn auto_retry_end_frame(
     Value::Object(m)
 }
 
+/// Build a `session_info_changed` frame — an unsolicited push notice that the session's title changed,
+/// correlated to the triggering `set_session_name` request via the same `id`. pi's own
+/// `session_info_changed` event (`rpc-mode.ts:632-639`) lets a client learn the final *sanitized* title
+/// without a follow-up `get_state`; `title` is `None` when the sanitized result was empty (a caller can
+/// explicitly clear a title — see `sanitize_title`/`title_or_clear`).
+fn session_info_changed_frame(id: Option<String>, title: Option<String>) -> Value {
+    let mut m = Map::new();
+    m.insert("type".into(), json!("session_info_changed"));
+    if let Some(id) = id {
+        m.insert("id".into(), json!(id));
+    }
+    m.insert("command".into(), json!("set_session_name"));
+    m.insert("title".into(), json!(title));
+    Value::Object(m)
+}
+
 /// Build a `response` frame.
 fn response(
     id: Option<String>,
@@ -3412,6 +3901,91 @@ mod tests {
     }
 
     #[test]
+    fn session_stats_reports_the_message_type_breakdown() {
+        // pi-parity fix (M14): `get_session_stats` had no `userMessages`/`assistantMessages`/
+        // `toolCalls`/`toolResults`/`totalMessages` at all — a client wanting these had to fetch
+        // `get_messages` and count client-side.
+        let mut session = Session::new();
+        session.user("first request");
+        session.push(agent_core::Message::assistant(vec![
+            agent_core::ContentBlock::ToolUse {
+                id: "1".into(),
+                name: "read".into(),
+                input: serde_json::json!({ "path": "a.rs" }),
+                thought_signature: None,
+            },
+            agent_core::ContentBlock::ToolUse {
+                id: "2".into(),
+                name: "read".into(),
+                input: serde_json::json!({ "path": "b.rs" }),
+                thought_signature: None,
+            },
+        ]));
+        // A pure tool-results turn — no user-authored content of its own.
+        session.push(agent_core::Message {
+            role: agent_core::Role::User,
+            content: vec![
+                agent_core::ContentBlock::ToolResult {
+                    tool_use_id: "1".into(),
+                    content: "contents of a.rs".into(),
+                    is_error: false,
+                    images: vec![],
+                },
+                agent_core::ContentBlock::ToolResult {
+                    tool_use_id: "2".into(),
+                    content: "contents of b.rs".into(),
+                    is_error: false,
+                    images: vec![],
+                },
+            ],
+            model_id: None,
+            error_message: None,
+            aborted: false,
+        });
+        session.push(agent_core::Message::assistant(vec![
+            agent_core::ContentBlock::text("done reading both files"),
+        ]));
+        session.user("second request");
+
+        let stats = session_stats(&session, "claude-opus-4-8");
+        assert_eq!(stats["total_messages"], 5, "got: {stats}");
+        assert_eq!(
+            stats["user_messages"], 2,
+            "the pure tool-results turn must not count as a user message: {stats}"
+        );
+        assert_eq!(stats["assistant_messages"], 2, "got: {stats}");
+        assert_eq!(stats["tool_calls"], 2, "got: {stats}");
+        assert_eq!(stats["tool_results"], 2, "got: {stats}");
+    }
+
+    #[test]
+    fn session_stats_a_steered_tool_results_turn_still_counts_as_a_user_message() {
+        // The one case a `User` message mixes a tool result with genuine authored content: a steer
+        // injected mid-run lands on the same turn as that turn's own tool results (see `steering.rs`'s
+        // module doc). That message must count as a user message — it does carry real content.
+        let mut session = Session::new();
+        session.push(agent_core::Message {
+            role: agent_core::Role::User,
+            content: vec![
+                agent_core::ContentBlock::ToolResult {
+                    tool_use_id: "1".into(),
+                    content: "result".into(),
+                    is_error: false,
+                    images: vec![],
+                },
+                agent_core::ContentBlock::text("actually, also check the tests"),
+            ],
+            model_id: None,
+            error_message: None,
+            aborted: false,
+        });
+
+        let stats = session_stats(&session, "claude-opus-4-8");
+        assert_eq!(stats["user_messages"], 1, "got: {stats}");
+        assert_eq!(stats["tool_results"], 1, "got: {stats}");
+    }
+
+    #[test]
     fn session_stats_reports_context_usage_against_the_currently_active_model() {
         let mut session = Session::new();
         session.last_input_tokens = 50_000;
@@ -3437,5 +4011,170 @@ mod tests {
         let stats = session_stats(&session, "gpt-5-mini");
         let expected_window = agent_core::models::capabilities("gpt-5-mini").context_window;
         assert_eq!(stats["context_usage"]["context_window"], expected_window);
+    }
+
+    // pi-parity fix (L10): `--models` only ever accepted flat literal ids — no glob against the known
+    // catalog, no `pattern:<level>` suffix to pin a scoped entry's thinking depth. `resolve_model_scope`
+    // is the resolver pi calls `resolveModelScopeWithDiagnostics`.
+
+    #[test]
+    fn resolve_model_scope_keeps_a_literal_id_verbatim_even_outside_the_catalog() {
+        // `available_models` is a hint, not an allowlist (its own doc comment) — the gateway forwards
+        // any id verbatim, so a literal the operator typed must survive resolution unchanged.
+        let scoped = resolve_model_scope(&["totally-custom-id".to_string()], available_models());
+        assert_eq!(
+            scoped,
+            vec![ScopedModel {
+                id: "totally-custom-id".to_string(),
+                thinking_level: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn resolve_model_scope_expands_a_glob_against_the_catalog_in_catalog_order() {
+        let scoped = resolve_model_scope(&["claude-*".to_string()], available_models());
+        let ids: Vec<&str> = scoped.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["claude-opus-4-8", "claude-sonnet-4-5", "claude-haiku-4-5"]
+        );
+    }
+
+    #[test]
+    fn resolve_model_scope_glob_matching_is_case_insensitive() {
+        let scoped = resolve_model_scope(&["CLAUDE-*".to_string()], available_models());
+        assert_eq!(scoped.len(), 3, "got: {scoped:?}");
+    }
+
+    #[test]
+    fn resolve_model_scope_a_glob_matching_nothing_is_dropped_silently() {
+        let scoped = resolve_model_scope(
+            &["no-such-provider/*".to_string(), "gpt-4o".to_string()],
+            available_models(),
+        );
+        assert_eq!(
+            scoped,
+            vec![ScopedModel {
+                id: "gpt-4o".to_string(),
+                thinking_level: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn resolve_model_scope_pattern_level_suffix_pins_a_literal_entry() {
+        let scoped = resolve_model_scope(&["gpt-4o:high".to_string()], available_models());
+        assert_eq!(
+            scoped,
+            vec![ScopedModel {
+                id: "gpt-4o".to_string(),
+                thinking_level: Some(agent_core::ThinkingLevel::High),
+            }]
+        );
+    }
+
+    #[test]
+    fn resolve_model_scope_pattern_level_suffix_pins_every_glob_match_the_same_way() {
+        let scoped = resolve_model_scope(&["claude-*:low".to_string()], available_models());
+        assert!(
+            scoped
+                .iter()
+                .all(|m| m.thinking_level == Some(agent_core::ThinkingLevel::Low)),
+            "got: {scoped:?}"
+        );
+        assert_eq!(scoped.len(), 3);
+    }
+
+    #[test]
+    fn resolve_model_scope_an_invalid_level_suffix_is_kept_as_part_of_the_literal_id() {
+        // pi's own scope-mode fallback: a trailing `:bogus` isn't a real thinking level, so the whole
+        // string — colon included — is treated as the pattern/id rather than silently truncated.
+        let scoped = resolve_model_scope(&["gpt-4o:bogus".to_string()], available_models());
+        assert_eq!(
+            scoped,
+            vec![ScopedModel {
+                id: "gpt-4o:bogus".to_string(),
+                thinking_level: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn resolve_model_scope_dedupes_a_glob_overlapping_a_literal_keeping_the_first_occurrences_pin()
+    {
+        let scoped = resolve_model_scope(
+            &["gpt-4o:high".to_string(), "gpt-*".to_string()],
+            available_models(),
+        );
+        let gpt_4o = scoped.iter().find(|m| m.id == "gpt-4o").unwrap();
+        assert_eq!(gpt_4o.thinking_level, Some(agent_core::ThinkingLevel::High));
+        // The rest of the `gpt-*` glob still resolved past the one duplicate.
+        assert!(scoped.iter().any(|m| m.id == "gpt-5"));
+    }
+
+    #[test]
+    fn resolve_model_scope_trims_whitespace_and_skips_empty_patterns() {
+        let scoped = resolve_model_scope(
+            &[" gpt-4o ".to_string(), "".to_string(), "  ".to_string()],
+            available_models(),
+        );
+        assert_eq!(
+            scoped,
+            vec![ScopedModel {
+                id: "gpt-4o".to_string(),
+                thinking_level: None,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn switch_branch_returns_a_clear_error_when_no_session_persistence_is_configured() {
+        // B-M7 pi-parity gap: in `--no-session-persistence` (pure in-memory) mode there's no tree to
+        // navigate at all — `self.store` is `None` by construction. `switch_branch` must fail with a
+        // clear, documented error rather than panicking or returning a confusing failure; this
+        // codebase has no in-memory tree fallback the way pi does (a deliberate architectural
+        // difference, not a gap to close), so the contract this test protects is simply "fails
+        // cleanly, doesn't crash."
+        let mut persistence = Persistence {
+            repo: None,
+            store: None,
+            meta: SessionMeta::new("/w", "claude-test"),
+        };
+        let agent = Agent::new(
+            Arc::new(agent_core::MockTransport::new(vec![])),
+            "claude-test",
+        );
+        let cancel = CancellationToken::new();
+
+        let err = persistence
+            .switch_branch(&agent, "some-id", true, None, &cancel)
+            .await
+            .expect_err("must fail clearly, not panic, when there's no session tree to navigate");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        assert!(
+            err.to_string()
+                .contains("no session persistence configured"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn fork_returns_a_clear_error_when_no_session_persistence_is_configured() {
+        // Same contract as `switch_branch` above, for `Persistence::fork` — in-memory mode has no
+        // `repo` to fork within either (`--session-file`/`--no-session-persistence` both leave `repo`
+        // `None`; only `--session-dir` sets it).
+        let mut persistence = Persistence {
+            repo: None,
+            store: None,
+            meta: SessionMeta::new("/w", "claude-test"),
+        };
+
+        let err = persistence
+            .fork(usize::MAX, None, false)
+            .expect_err("must fail clearly, not panic, without a repo to fork within");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
     }
 }

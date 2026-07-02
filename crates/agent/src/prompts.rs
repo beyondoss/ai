@@ -38,62 +38,120 @@ pub fn discover(cwd: &Path, project_trusted: bool, extra_roots: &[String]) -> Ve
 }
 
 /// Like [`discover`], but also reports name collisions — the same `/name` defined by more than one
-/// template file, silently shadowed by `discover` (the later root, or the later file within one root,
-/// wins) — as human-readable strings naming both paths, for `get_commands` to surface as a diagnostic
-/// rather than a client having no way to notice a template was shadowed.
+/// template file, silently shadowed by `discover` (the later standard root wins) — as human-readable
+/// strings naming both paths, for `get_commands` to surface as a diagnostic rather than a client having
+/// no way to notice a template was shadowed.
 ///
 /// `extra_roots` are additional, ad-hoc discovery roots beyond the two standard ones — pi's own
-/// `--prompt-template <path>` (repeatable); see `skills::discover_with_diagnostics`'s identical
-/// parameter for the missing-path-diagnostic and shadow-order reasoning, which applies here unchanged.
+/// `--prompt-template <path>` (repeatable), which accepts either a directory (walked like a standard
+/// root) or a single standalone `.md` file (one template, no directory of its own — pi's other
+/// `--prompt-template` shape, `prompt-templates.ts`'s `stats.isFile() && resolvedPath.endsWith(".md")`);
+/// see `skills::discover_with_diagnostics`'s identical parameter for the missing-path-diagnostic and
+/// standard-root-always-wins-over-an-extra-one shadow ordering, which applies here unchanged.
 pub fn discover_with_diagnostics(
     cwd: &Path,
     project_trusted: bool,
     extra_roots: &[String],
 ) -> (Vec<PromptTemplate>, Vec<String>) {
+    discover_with_diagnostics_impl(cwd, project_trusted, extra_roots, true)
+}
+
+/// Like [`discover_with_diagnostics`], but skips *both* standard roots (`~/.claude/prompts` and
+/// `<cwd>/.claude/prompts`) entirely, keeping only `extra_roots` — what `--no-prompt-templates` needs,
+/// mirroring [`crate::skills::discover_extra_only`]'s identical reasoning: pi's own `noPromptTemplates`
+/// still honors an explicit `--prompt-template` path passed alongside it (pi-parity fix, M2).
+pub fn discover_extra_only(extra_roots: &[String]) -> (Vec<PromptTemplate>, Vec<String>) {
+    discover_with_diagnostics_impl(Path::new(""), false, extra_roots, false)
+}
+
+fn discover_with_diagnostics_impl(
+    cwd: &Path,
+    project_trusted: bool,
+    extra_roots: &[String],
+    include_standard_roots: bool,
+) -> (Vec<PromptTemplate>, Vec<String>) {
     let mut found: Vec<PromptTemplate> = Vec::new();
     let mut origins: HashMap<String, PathBuf> = HashMap::new();
     let mut collisions: Vec<String> = Vec::new();
-    let mut roots: Vec<PathBuf> = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        roots.push(home.join(".claude/prompts"));
-    }
-    if project_trusted {
-        roots.push(cwd.join(".claude/prompts"));
-    }
-    for extra in extra_roots {
-        let root = PathBuf::from(extra);
-        if !root.is_dir() {
-            let message =
-                format!("--prompt-template path does not exist or is not a directory: {extra}");
-            tracing::warn!("{message}");
-            collisions.push(message);
-            continue;
+    let mut standard_roots: Vec<PathBuf> = Vec::new();
+    if include_standard_roots {
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            standard_roots.push(home.join(".claude/prompts"));
         }
-        roots.push(root);
+        if project_trusted {
+            standard_roots.push(cwd.join(".claude/prompts"));
+        }
     }
 
-    for root in roots {
-        let Ok(entries) = fs::read_dir(&root) else {
-            continue;
+    fn load_file(path: &Path) -> Option<(String, PathBuf, PromptTemplate)> {
+        let name = path.file_stem().map(|s| s.to_string_lossy().into_owned())?;
+        let text = fs::read_to_string(path).ok()?;
+        let (hint, description, body) = parse(&text);
+        Some((
+            name.clone(),
+            path.to_path_buf(),
+            PromptTemplate {
+                name,
+                argument_hint: hint,
+                description,
+                body,
+            },
+        ))
+    }
+
+    fn load_dir(root: &Path) -> Vec<(String, PathBuf, PromptTemplate)> {
+        let mut out = Vec::new();
+        let Ok(entries) = fs::read_dir(root) else {
+            return out;
         };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("md") {
                 continue;
             }
-            let Some(name) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
-                continue;
-            };
-            let Ok(text) = fs::read_to_string(&path) else {
-                continue;
-            };
-            let (hint, description, body) = parse(&text);
-            let template = PromptTemplate {
-                name: name.clone(),
-                argument_hint: hint,
-                description,
-                body,
-            };
+            if let Some(entry) = load_file(&path) {
+                out.push(entry);
+            }
+        }
+        out
+    }
+
+    // Each extra root's own templates, kept as separate groups (rather than one flat Vec) so root
+    // order is still visible below for the "later extra wins over an earlier extra" tie-break.
+    let mut extra_entries: Vec<Vec<(String, PathBuf, PromptTemplate)>> = Vec::new();
+    for extra in extra_roots {
+        // pi-parity fix (L8): pi's own `resolveCliPaths`→`resolvePath` expands a leading `~` on a
+        // `--prompt-template` path; ours previously took it verbatim — usually masked by the shell
+        // expanding it first, but not for a quoted argument or one built programmatically.
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let expanded = crate::tools::expand_tilde(extra, home.as_deref().and_then(|p| p.to_str()));
+        let root = PathBuf::from(expanded);
+        if root.is_dir() {
+            extra_entries.push(load_dir(&root));
+        } else if root.extension().and_then(|e| e.to_str()) == Some("md") {
+            // pi-parity fix (M3): pi's other `--prompt-template` shape — a single standalone `.md`
+            // file, one template, no directory of its own resources.
+            match load_file(&root) {
+                Some(entry) => extra_entries.push(vec![entry]),
+                None => {
+                    let message = format!("--prompt-template file could not be read: {extra}");
+                    tracing::warn!("{message}");
+                    collisions.push(message);
+                }
+            }
+        } else {
+            let message = format!(
+                "--prompt-template path does not exist, or is not a directory or a .md file: \
+                 {extra}"
+            );
+            tracing::warn!("{message}");
+            collisions.push(message);
+        }
+    }
+
+    for root in &standard_roots {
+        for (name, path, template) in load_dir(root) {
+            // Later standard roots (project) win over earlier (user) on name collisions.
             if let Some(existing_path) = origins.get(&name) {
                 let message = format!(
                     "prompt template \"{name}\" defined at both {} and {} — the latter wins",
@@ -103,7 +161,45 @@ pub fn discover_with_diagnostics(
                 tracing::warn!("{message}");
                 collisions.push(message);
             }
-            origins.insert(name.clone(), path.clone());
+            origins.insert(name.clone(), path);
+            if let Some(existing) = found.iter_mut().find(|t| t.name == name) {
+                *existing = template;
+            } else {
+                found.push(template);
+            }
+        }
+    }
+    // Names claimed by a standard root — snapshotted *before* extra roots are processed, so a
+    // standard-root template always wins over an extra one, but two extra roots can still shadow each
+    // other (later wins), matching this function's doc comment.
+    let standard_names: std::collections::HashSet<String> = origins.keys().cloned().collect();
+    for entries in extra_entries {
+        for (name, path, template) in entries {
+            if let Some(existing_path) = standard_names
+                .contains(&name)
+                .then(|| origins.get(&name))
+                .flatten()
+            {
+                let message = format!(
+                    "prompt template \"{name}\" defined at both {} (standard root) and {} \
+                     (--prompt-template) — the standard root wins",
+                    existing_path.display(),
+                    path.display()
+                );
+                tracing::warn!("{message}");
+                collisions.push(message);
+                continue;
+            }
+            if let Some(existing_path) = origins.get(&name) {
+                let message = format!(
+                    "prompt template \"{name}\" defined at both {} and {} — the latter wins",
+                    existing_path.display(),
+                    path.display()
+                );
+                tracing::warn!("{message}");
+                collisions.push(message);
+            }
+            origins.insert(name.clone(), path);
             if let Some(existing) = found.iter_mut().find(|t| t.name == name) {
                 *existing = template;
             } else {
@@ -175,11 +271,17 @@ pub fn expand_if_slash(message: &str, templates: &[PromptTemplate]) -> String {
 /// separators too, same as spaces/tabs — a multi-line pasted argument (e.g. `/name label\n\ndescription
 /// text`) splits on every line break, not just the trailing ones; a quoted span still preserves an
 /// embedded newline verbatim.
+///
+/// A field is only ever pushed when non-empty — matching pi's own `if (current) args.push(current)`
+/// (JS truthiness: only `""` is falsy for a string, so `" "` still counts and is kept). This means a
+/// truly empty quoted argument (`""`, with nothing between the quotes) is silently dropped rather than
+/// becoming an empty-string token — pi-parity fix (L4): ours previously tracked field-in-progress via a
+/// separate `started` flag set the instant a quote opened, so `""` produced an empty token that shifted
+/// every later `$N` index by one, unlike pi.
 pub fn parse_command_args(input: &str) -> Vec<String> {
     let mut args = Vec::new();
     let mut current = String::new();
     let mut quote: Option<char> = None;
-    let mut started = false; // tracks an in-progress (possibly empty, e.g. `""`) field
 
     for ch in input.chars() {
         match quote {
@@ -193,22 +295,19 @@ pub fn parse_command_args(input: &str) -> Vec<String> {
             None => match ch {
                 '"' | '\'' => {
                     quote = Some(ch);
-                    started = true;
                 }
                 ' ' | '\t' | '\n' => {
-                    if started {
+                    if !current.is_empty() {
                         args.push(std::mem::take(&mut current));
-                        started = false;
                     }
                 }
                 _ => {
                     current.push(ch);
-                    started = true;
                 }
             },
         }
     }
-    if started {
+    if !current.is_empty() {
         args.push(current);
     }
     args
@@ -459,7 +558,67 @@ mod tests {
     }
 
     #[test]
-    fn discover_with_diagnostics_extra_root_wins_over_a_standard_root_on_collision() {
+    fn discover_with_diagnostics_loads_a_single_standalone_md_file() {
+        // pi-parity fix (M3): pi's `--prompt-template` accepts a standalone `.md` file — one template,
+        // no directory of its own — in addition to a directory; ours previously rejected anything that
+        // wasn't a directory outright with a false "does not exist or is not a directory" diagnostic.
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("solo.md");
+        fs::write(
+            &file,
+            "---\nargument-hint: <thing>\n---\nDo the solo thing: $1",
+        )
+        .unwrap();
+        let cwd = tmp.path().join("project");
+        fs::create_dir_all(&cwd).unwrap();
+        let (found, collisions) =
+            discover_with_diagnostics(&cwd, true, &[file.to_string_lossy().into_owned()]);
+        let solo = found.iter().find(|t| t.name == "solo");
+        assert!(solo.is_some(), "got: {found:?}, collisions: {collisions:?}");
+        assert_eq!(solo.unwrap().argument_hint.as_deref(), Some("<thing>"));
+    }
+
+    #[test]
+    fn discover_extra_only_skips_standard_roots_but_keeps_an_explicit_extra_root() {
+        // pi-parity fix (M2): pi's `--no-prompt-templates` still honors an explicit `--prompt-template`
+        // path passed alongside it (`resource-loader.test.ts`, "should still load additional skill
+        // paths when noSkills is true" — the prompt-template equivalent of that same documented,
+        // tested combination). Ours used to zero out *both* the standard roots and any
+        // `extra_roots`/`--prompt-template` path together, discarding an operator-supplied path they
+        // explicitly asked to keep.
+        let tmp = tempfile::tempdir().unwrap();
+        let pdir = tmp.path().join(".claude/prompts");
+        fs::create_dir_all(&pdir).unwrap();
+        fs::write(pdir.join("standard.md"), "Standard template body.").unwrap();
+        let extra_root = tmp.path().join("custom-prompts");
+        fs::create_dir_all(&extra_root).unwrap();
+        fs::write(extra_root.join("custom.md"), "Custom template body.").unwrap();
+
+        // Sanity check / positive control: with normal discovery (not `--no-prompt-templates`), the
+        // standard root's own template *is* found — proving the assertion below is actually exercising
+        // a skip, not just a location `discover_extra_only` was never going to look at regardless.
+        let (normally_found, _) = discover_with_diagnostics(tmp.path(), true, &[]);
+        assert!(
+            normally_found.iter().any(|t| t.name == "standard"),
+            "sanity check: the standard root must be discoverable normally: {normally_found:?}"
+        );
+
+        let (found, _) = discover_extra_only(&[extra_root.to_string_lossy().into_owned()]);
+        assert!(
+            found.iter().any(|t| t.name == "custom"),
+            "an explicit extra root must still load: {found:?}"
+        );
+        assert!(
+            !found.iter().any(|t| t.name == "standard"),
+            "the standard root must be skipped entirely: {found:?}"
+        );
+    }
+
+    #[test]
+    fn discover_with_diagnostics_a_standard_root_wins_over_an_extra_root_on_collision() {
+        // pi-parity fix: pi appends `--prompt-template` paths *after* project/user templates and keeps
+        // whichever name it sees *first* — an operator-supplied extra root fills a gap, it doesn't
+        // silently override a project's own template of the same name.
         let tmp = tempfile::tempdir().unwrap();
         let pdir = tmp.path().join(".claude/prompts");
         fs::create_dir_all(&pdir).unwrap();
@@ -467,13 +626,40 @@ mod tests {
         let extra_root = tmp.path().join("extra");
         fs::create_dir_all(&extra_root).unwrap();
         fs::write(extra_root.join("dup.md"), "extra root version").unwrap();
-        let (found, _) = discover_with_diagnostics(
+        let (found, collisions) = discover_with_diagnostics(
             tmp.path(),
             true,
             &[extra_root.to_string_lossy().into_owned()],
         );
         let dup = found.iter().find(|t| t.name == "dup").unwrap();
-        assert_eq!(dup.body, "extra root version");
+        assert_eq!(dup.body, "standard root version");
+        assert!(
+            collisions
+                .iter()
+                .any(|c| c.contains("dup") && c.contains("standard root wins")),
+            "got: {collisions:?}"
+        );
+    }
+
+    #[test]
+    fn discover_with_diagnostics_two_extra_roots_still_shadow_each_other_later_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let extra1 = tmp.path().join("extra1");
+        let extra2 = tmp.path().join("extra2");
+        fs::create_dir_all(&extra1).unwrap();
+        fs::create_dir_all(&extra2).unwrap();
+        fs::write(extra1.join("dup.md"), "first extra").unwrap();
+        fs::write(extra2.join("dup.md"), "second extra").unwrap();
+        let (found, _) = discover_with_diagnostics(
+            tmp.path(),
+            true,
+            &[
+                extra1.to_string_lossy().into_owned(),
+                extra2.to_string_lossy().into_owned(),
+            ],
+        );
+        let dup = found.iter().find(|t| t.name == "dup").unwrap();
+        assert_eq!(dup.body, "second extra");
     }
 
     #[test]
@@ -501,6 +687,23 @@ mod tests {
     fn quoted_arguments_stay_together() {
         let args = parse_command_args(r#"foo "bar baz" 'qux quux' end"#);
         assert_eq!(args, vec!["foo", "bar baz", "qux quux", "end"]);
+    }
+
+    #[test]
+    fn an_empty_quoted_argument_is_dropped_not_kept_as_an_empty_token() {
+        // pi: prompt-templates.test.ts, "should handle quoted empty string" — pi's own truthiness
+        // check (`if (current) args.push(current)`) drops a truly empty quoted field (`""`) but keeps
+        // one that's merely whitespace (`" "`, a non-empty string) — `parseCommandArgs('"" " "')` →
+        // `[" "]`, one token, not two (pi-parity fix, L4). Ours used to track "a field is in progress"
+        // via a separate flag set the instant a quote opened, so `""` produced an empty-string token
+        // that shifted every later `$N` positional index by one relative to pi.
+        assert_eq!(parse_command_args("\"\" \" \""), vec![" "]);
+
+        // End-to-end: with `""` dropped instead of kept, `$1` lands on the *next* real argument, not on
+        // an empty positional the way it would if the empty quoted field were preserved.
+        let t = template("first=[$1]");
+        let expanded = expand_if_slash(r#"/x "" real"#, &[t]);
+        assert_eq!(expanded, "first=[real]");
     }
 
     #[test]
@@ -653,13 +856,14 @@ mod tests {
              argument-hint: |\n  <first arg>\n  <second arg>\n---\nBody line",
         );
         assert_eq!(
-            description, "A folded description that wraps across lines.",
-            "a folded (>) block scalar joins its lines with spaces"
+            description, "A folded description that wraps across lines.\n",
+            "a folded (>) block scalar joins its lines with spaces, keeping one trailing newline \
+             (real YAML's default \"clip\" chomping — pi-parity fix, L3)"
         );
         assert_eq!(
             hint.as_deref(),
-            Some("<first arg>\n<second arg>"),
-            "a literal (|) block scalar joins its lines with newlines"
+            Some("<first arg>\n<second arg>\n"),
+            "a literal (|) block scalar joins its lines with newlines, keeping one trailing newline"
         );
         assert_eq!(body, "Body line");
     }

@@ -206,12 +206,25 @@ pub(crate) fn estimate_message_tokens(m: &Message) -> u32 {
 /// turns). `should_compact` adds this to `last_input_tokens` so the trigger reflects the prompt's
 /// *actual* current size rather than a size that's already stale by the time it's checked (the check
 /// runs at the top of the next loop iteration, after that turn's own messages were pushed).
+///
+/// The very first trailing message — `messages[last_usage_message_count]`, when it's the assistant
+/// turn that snapshot was taken for (see [`Session::last_output_tokens`]'s doc comment) — uses the
+/// provider's own reported output size instead of the usual char/4 estimate: it's the one message
+/// here whose real size is already known exactly, not guessed. Guarded on `Role::Assistant` so this
+/// never misapplies to an ordinary user/tool-result message at that same index (e.g. before any turn
+/// has completed yet, when both fields are still their zero defaults).
 pub fn trailing_tokens(session: &Session) -> u32 {
     let start = session.last_usage_message_count.min(session.messages.len());
-    session.messages[start..]
-        .iter()
-        .map(estimate_message_tokens)
-        .fold(0u32, |acc, n| acc.saturating_add(n))
+    let mut total = 0u32;
+    for (i, m) in session.messages[start..].iter().enumerate() {
+        let tokens = if i == 0 && m.role == Role::Assistant && session.last_output_tokens > 0 {
+            session.last_output_tokens
+        } else {
+            estimate_message_tokens(m)
+        };
+        total = total.saturating_add(tokens);
+    }
+    total
 }
 
 /// Whether the live prompt has crossed the compaction threshold. Uses the *last turn's* input size
@@ -597,6 +610,34 @@ pub fn summary_request(
         .with_system(SUMMARY_SYSTEM)
 }
 
+/// Render `read_files`/`modified_files` as the same `<read-files>`/`<modified-files>` tags
+/// [`summary_request`] embeds in its *prompt* — but meant to be appended to the summarization model's
+/// *output* instead, so the file list survives into the live conversation deterministically rather
+/// than depending on the summarizing model choosing to mention exact paths in its own prose. Matches
+/// pi's `formatFileOperations` (`compaction/utils.ts`), including the leading `"\n\n"` separator and
+/// returning `""` when both lists are empty (so appending this to a summary is always safe,
+/// unconditionally). Callers: [`crate::agent::Agent::compact`], [`crate::agent::Agent::summarize_branch`].
+pub fn format_file_operations(read_files: &[String], modified_files: &[String]) -> String {
+    let mut sections = Vec::new();
+    if !read_files.is_empty() {
+        sections.push(format!(
+            "<read-files>\n{}\n</read-files>",
+            read_files.join("\n")
+        ));
+    }
+    if !modified_files.is_empty() {
+        sections.push(format!(
+            "<modified-files>\n{}\n</modified-files>",
+            modified_files.join("\n")
+        ));
+    }
+    if sections.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n{}", sections.join("\n\n"))
+    }
+}
+
 /// Splice a summary into `session`, replacing the prefix before `first_kept` with one summary user
 /// message. Resets [`Session::last_input_tokens`] so the freshly-shrunk context doesn't immediately
 /// re-trigger the threshold (the true size is recomputed after the next turn).
@@ -611,6 +652,11 @@ pub fn apply_summary(session: &mut Session, first_kept: usize, summary: &str) {
     // otherwise either panic (out of bounds) or, worse, silently under/over-count `trailing_tokens`
     // against messages that no longer exist at those positions.
     session.last_usage_message_count = session.messages.len();
+    // No message lives at the new `last_usage_message_count` yet (it points one past the end), so
+    // there's nothing this could correctly describe until the next real `record_usage` sets it fresh —
+    // stale, reset alongside the index it's paired with rather than left to (harmlessly, since the
+    // trailing slice is empty either way) dangle.
+    session.last_output_tokens = 0;
 }
 
 #[cfg(test)]
@@ -621,17 +667,17 @@ mod tests {
     fn convo() -> Vec<Message> {
         vec![
             Message::user("the original task: refactor foo"),
-            Message::assistant(vec![ContentBlock::ToolUse {
-                id: "1".into(),
-                name: "read".into(),
-                input: json!({ "path": "src/foo.rs" }),
-            }]),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "1",
+                "read",
+                json!({ "path": "src/foo.rs" }),
+            )]),
             Message::tool_result("1", "fn foo() {}", false),
-            Message::assistant(vec![ContentBlock::ToolUse {
-                id: "2".into(),
-                name: "edit".into(),
-                input: json!({ "path": "src/foo.rs" }),
-            }]),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "2",
+                "edit",
+                json!({ "path": "src/foo.rs" }),
+            )]),
             Message::tool_result("2", "edited", false),
             Message::assistant(vec![ContentBlock::text("done")]),
         ]
@@ -676,6 +722,81 @@ mod tests {
             should_compact(&s, &cfg),
             "trailing tokens since the last usage snapshot must push the trigger over threshold"
         );
+    }
+
+    #[test]
+    fn trailing_tokens_uses_the_precise_reported_output_size_for_the_just_completed_turn() {
+        // The assistant's own reply text is trivially short (~0 estimated tokens via the char/4
+        // heuristic), but the provider reported a much larger real `output_tokens` figure for that
+        // same turn. `trailing_tokens` must use the precise reported number for that one message, not
+        // re-derive a rough (and here, badly wrong) estimate from its rendered text.
+        let mut s = Session::new();
+        s.user("go");
+        s.last_usage_message_count = s.messages.len(); // snapshot taken right before the reply
+        s.last_output_tokens = 5_000;
+        s.push(Message::assistant(vec![ContentBlock::text("ok")])); // ~0 tokens by char/4
+        assert_eq!(trailing_tokens(&s), 5_000);
+    }
+
+    #[test]
+    fn trailing_tokens_still_estimates_messages_after_the_just_completed_turn() {
+        // Only the message at exactly `last_usage_message_count` gets the precise substitution —
+        // anything appended *after* it (a further turn, tool results) still falls back to the usual
+        // char/4 heuristic, since there's no provider-reported figure for those.
+        let mut s = Session::new();
+        s.user("go");
+        s.last_usage_message_count = s.messages.len();
+        s.last_output_tokens = 100;
+        s.push(Message::assistant(vec![ContentBlock::text("ok")]));
+        s.push(Message::user("x".repeat(400))); // ~100 estimated tokens
+        assert_eq!(trailing_tokens(&s), 200);
+    }
+
+    #[test]
+    fn trailing_tokens_ignores_last_output_tokens_when_the_message_at_the_snapshot_is_not_assistant()
+     {
+        // Defensive guard: `last_output_tokens` only ever describes an assistant turn's own output
+        // (set by `record_usage`, which always runs right before that message is pushed) — if the
+        // message actually sitting at `last_usage_message_count` isn't an assistant message (e.g. the
+        // session's initial state, before any turn has completed), the field must not be misapplied
+        // to it.
+        let mut s = Session::new();
+        s.last_output_tokens = 5_000; // stale/default-adjacent value, must not leak in here
+        s.push(Message::user("x".repeat(40))); // ~10 estimated tokens
+        assert_eq!(trailing_tokens(&s), 10);
+    }
+
+    #[test]
+    fn should_compact_fires_one_turn_earlier_using_the_precise_output_token_count() {
+        // Threshold = context_window - reserve_tokens = 5_000. The last recorded prompt size alone
+        // (100) is nowhere near it, and the assistant's own reply text is trivially short — the old
+        // char/4-only estimate would have stayed far under threshold, deferring the trigger a full
+        // extra turn. The provider's real reported output size for that same turn (5_000) closes the
+        // gap immediately.
+        let cfg = CompactionConfig {
+            context_window: 6_000,
+            reserve_tokens: 1_000,
+            ..Default::default()
+        };
+        let mut s = Session::new();
+        s.user("go");
+        s.last_input_tokens = 100;
+        s.last_usage_message_count = s.messages.len();
+        s.last_output_tokens = 5_000;
+        s.push(Message::assistant(vec![ContentBlock::text("ok")]));
+        assert!(
+            should_compact(&s, &cfg),
+            "100 (last prompt) + 5_000 (this turn's real output) meets the 5_000 threshold"
+        );
+    }
+
+    #[test]
+    fn apply_summary_resets_last_output_tokens_alongside_the_usage_snapshot_it_pairs_with() {
+        let mut s = Session::new();
+        s.messages = Arc::new(convo());
+        s.last_output_tokens = 12345;
+        apply_summary(&mut s, 3, "SUMMARY");
+        assert_eq!(s.last_output_tokens, 0);
     }
 
     #[test]
@@ -808,19 +929,19 @@ mod tests {
             Message::user("first request"), // 0
             Message::assistant(vec![ContentBlock::text("first done")]),
             Message::user("second request"), // 2 — the split turn's real start
-            Message::assistant(vec![ContentBlock::ToolUse {
+            Message::assistant(vec![ContentBlock::tool_use(
                 // 3
-                id: "1".into(),
-                name: "read".into(),
-                input: json!({ "path": "a.rs" }),
-            }]),
+                "1",
+                "read",
+                json!({ "path": "a.rs" }),
+            )]),
             Message::tool_result("1", "contents of a.rs", false), // 4
-            Message::assistant(vec![ContentBlock::ToolUse {
+            Message::assistant(vec![ContentBlock::tool_use(
                 // 5
-                id: "2".into(),
-                name: "edit".into(),
-                input: json!({ "path": "a.rs" }),
-            }]),
+                "2",
+                "edit",
+                json!({ "path": "a.rs" }),
+            )]),
             Message::tool_result("2", "edited", false), // 6
         ];
         // A tiny budget forces the cut to land as late as possible; the trailing tool_result-only
@@ -849,11 +970,11 @@ mod tests {
             Message::user("second request"), // 2 — the split turn's real (but far-back) start
         ];
         for i in 0..10 {
-            messages.push(Message::assistant(vec![ContentBlock::ToolUse {
-                id: i.to_string(),
-                name: "read".into(),
-                input: json!({ "path": "a.rs" }),
-            }]));
+            messages.push(Message::assistant(vec![ContentBlock::tool_use(
+                i.to_string(),
+                "read",
+                json!({ "path": "a.rs" }),
+            )]));
             messages.push(Message::tool_result(i.to_string(), big.clone(), false));
         }
         let cut = find_split_cut(&messages, 1).expect("a cut");
@@ -882,17 +1003,17 @@ mod tests {
         // into the closed-off history side of the split.
         let messages = vec![
             Message::user(format!("{SUMMARY_MARKER}\n\nprior summary body")), // 0
-            Message::assistant(vec![ContentBlock::ToolUse {
-                id: "1".into(),
-                name: "read".into(),
-                input: json!({ "path": "a.rs" }),
-            }]), // 1
+            Message::assistant(vec![ContentBlock::tool_use(
+                "1",
+                "read",
+                json!({ "path": "a.rs" }),
+            )]), // 1
             Message::tool_result("1", "contents of a.rs", false),             // 2
-            Message::assistant(vec![ContentBlock::ToolUse {
-                id: "2".into(),
-                name: "edit".into(),
-                input: json!({ "path": "a.rs" }),
-            }]), // 3
+            Message::assistant(vec![ContentBlock::tool_use(
+                "2",
+                "edit",
+                json!({ "path": "a.rs" }),
+            )]), // 3
             Message::tool_result("2", "edited", false),                       // 4
         ];
         let cut = find_split_cut(&messages, 1).expect("a cut");
@@ -920,11 +1041,11 @@ mod tests {
         // vice versa), regardless of which side of a pair the raw accumulation index landed on.
         let mut messages = vec![Message::user("start")];
         for i in 0..8 {
-            messages.push(Message::assistant(vec![ContentBlock::ToolUse {
-                id: i.to_string(),
-                name: "read".into(),
-                input: json!({ "path": format!("f{i}.rs") }),
-            }]));
+            messages.push(Message::assistant(vec![ContentBlock::tool_use(
+                i.to_string(),
+                "read",
+                json!({ "path": format!("f{i}.rs") }),
+            )]));
             messages.push(Message::tool_result(
                 i.to_string(),
                 format!("contents of f{i}"),
@@ -972,11 +1093,11 @@ mod tests {
         let big = "x".repeat(5000);
         let messages = vec![
             Message::user("task"),
-            Message::assistant(vec![ContentBlock::ToolUse {
-                id: "1".into(),
-                name: "read".into(),
-                input: json!({ "path": "a.rs" }),
-            }]),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "1",
+                "read",
+                json!({ "path": "a.rs" }),
+            )]),
             Message::tool_result("1", &big, false),
             // A concluding assistant response — without this the prefix ends on a bare tool_result,
             // which `is_split_turn` (correctly) reads as an in-progress turn and would swap in
@@ -1090,11 +1211,11 @@ mod tests {
         // Round 1: the model read/edited round1.rs. Round 1's provenance records that.
         let round1_prefix = vec![
             Message::user("task"),
-            Message::assistant(vec![ContentBlock::ToolUse {
-                id: "1".into(),
-                name: "read".into(),
-                input: json!({ "path": "round1.rs" }),
-            }]),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "1",
+                "read",
+                json!({ "path": "round1.rs" }),
+            )]),
             Message::tool_result("1", "contents", false),
         ];
         let round1_ops = merge_file_ops(
@@ -1112,11 +1233,11 @@ mod tests {
         // message was replaced by the round-1 summary.
         let round2_prefix = vec![
             Message::user(format!("{SUMMARY_MARKER}\n\nRound 1 summary")),
-            Message::assistant(vec![ContentBlock::ToolUse {
-                id: "2".into(),
-                name: "edit".into(),
-                input: json!({ "path": "round2.rs" }),
-            }]),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "2",
+                "edit",
+                json!({ "path": "round2.rs" }),
+            )]),
             Message::tool_result("2", "edited", false),
         ];
         let round2_ops = merge_file_ops(&round1_ops, &round2_prefix, CompactionReason::Threshold);
@@ -1148,11 +1269,11 @@ mod tests {
             compactions: 1,
             last_reason: Some(CompactionReason::Threshold),
         };
-        let messages = vec![Message::assistant(vec![ContentBlock::ToolUse {
-            id: "1".into(),
-            name: "read".into(),
-            input: json!({ "path": "a.rs" }), // the same file, read again
-        }])];
+        let messages = vec![Message::assistant(vec![ContentBlock::tool_use(
+            "1",
+            "read",
+            json!({ "path": "a.rs" }), // the same file, read again
+        )])];
         let merged = merge_file_ops(&previous, &messages, CompactionReason::Manual);
         assert_eq!(merged.read_files, vec!["a.rs"]); // not duplicated
         assert_eq!(merged.last_reason, Some(CompactionReason::Manual));

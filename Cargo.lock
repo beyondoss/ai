@@ -378,6 +378,7 @@ dependencies = [
  "ignore",
  "image",
  "mimalloc",
+ "percent-encoding",
  "pulldown-cmark",
  "regex",
  "serde",

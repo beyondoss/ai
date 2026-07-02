@@ -126,68 +126,71 @@ pub fn search(job: &GrepJob, threads: usize) -> (Vec<Hit>, bool) {
     // `hidden(false)` includes dotfiles (like ripgrep --hidden); .gitignore is respected by default.
     // `require_git(false)` keeps that respect even outside an actual git repository (e.g. a plain
     // checkout with no `.git`, or a tree copied without its VCS metadata) — the ignore crate's default
-    // otherwise silently stops honoring `.gitignore` the moment there's no repo to find.
-    WalkBuilder::new(&job.root)
-        .hidden(false)
-        .require_git(false)
-        .threads(threads)
-        .build_parallel()
-        .run(|| {
-            let collected = Arc::clone(&collected);
-            let total = Arc::clone(&total);
-            let matcher = &job.matcher;
-            let glob = &job.glob;
-            // One `Searcher` per worker thread (it carries reusable line buffers): ripgrep's engine —
-            // byte-oriented, so non-UTF-8 files search correctly (a `BufReader::read_line` loop would
-            // error out and silently drop them); binary files quit cleanly on a NUL; large files are
-            // mmap'd; line counting is SIMD-accelerated. `before`/`after` context is built in.
-            let mut searcher = SearcherBuilder::new()
-                .line_number(true)
-                .before_context(job.before)
-                .after_context(job.after)
-                .binary_detection(BinaryDetection::quit(b'\x00'))
-                .build();
-            Box::new(move |entry| {
-                if total.load(Ordering::Relaxed) >= stop_at {
+    // otherwise silently stops honoring `.gitignore` the moment there's no repo to find. Only applied
+    // outside a real repo, though — matching pi's own `rg` invocation (`--no-require-git` only when the
+    // root isn't inside a git repo): inside one, the default git-aware walk keeps a nested repo's own
+    // `.gitignore` from leaking parent rules across its boundary.
+    let mut builder = WalkBuilder::new(&job.root);
+    builder.hidden(false);
+    if !super::root_is_inside_git_repo(&job.root) {
+        builder.require_git(false);
+    }
+    builder.threads(threads).build_parallel().run(|| {
+        let collected = Arc::clone(&collected);
+        let total = Arc::clone(&total);
+        let matcher = &job.matcher;
+        let glob = &job.glob;
+        // One `Searcher` per worker thread (it carries reusable line buffers): ripgrep's engine —
+        // byte-oriented, so non-UTF-8 files search correctly (a `BufReader::read_line` loop would
+        // error out and silently drop them); binary files quit cleanly on a NUL; large files are
+        // mmap'd; line counting is SIMD-accelerated. `before`/`after` context is built in.
+        let mut searcher = SearcherBuilder::new()
+            .line_number(true)
+            .before_context(job.before)
+            .after_context(job.after)
+            .binary_detection(BinaryDetection::quit(b'\x00'))
+            .build();
+        Box::new(move |entry| {
+            if total.load(Ordering::Relaxed) >= stop_at {
+                return WalkState::Quit;
+            }
+            let Ok(entry) = entry else {
+                return WalkState::Continue;
+            };
+            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                return WalkState::Continue;
+            }
+            let path = entry.path();
+            if let Some(g) = glob {
+                if !g.is_match(path) {
+                    return WalkState::Continue;
+                }
+            }
+            // Collect this file's hits into one local sink, then push once — one lock per matching
+            // file. An I/O error (unreadable file) skips it, like the prior behavior.
+            // One `Arc<Path>` allocation for this file; every hit clones the pointer (refcount
+            // bump), so a match-dense file no longer pays a `PathBuf` per hit.
+            let mut sink = Collector {
+                path: Arc::from(path),
+                hits: Vec::new(),
+                matches: 0,
+            };
+            if searcher.search_path(matcher, path, &mut sink).is_err() {
+                return WalkState::Continue;
+            }
+            if !sink.hits.is_empty() {
+                let matches = sink.matches;
+                if let Ok(mut guard) = collected.lock() {
+                    guard.extend(sink.hits);
+                }
+                // Only matches count toward the stop threshold (context is bounded per match).
+                if total.fetch_add(matches, Ordering::Relaxed) + matches >= stop_at {
                     return WalkState::Quit;
                 }
-                let Ok(entry) = entry else {
-                    return WalkState::Continue;
-                };
-                if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                    return WalkState::Continue;
-                }
-                let path = entry.path();
-                if let Some(g) = glob {
-                    if !g.is_match(path) {
-                        return WalkState::Continue;
-                    }
-                }
-                // Collect this file's hits into one local sink, then push once — one lock per matching
-                // file. An I/O error (unreadable file) skips it, like the prior behavior.
-                // One `Arc<Path>` allocation for this file; every hit clones the pointer (refcount
-                // bump), so a match-dense file no longer pays a `PathBuf` per hit.
-                let mut sink = Collector {
-                    path: Arc::from(path),
-                    hits: Vec::new(),
-                    matches: 0,
-                };
-                if searcher.search_path(matcher, path, &mut sink).is_err() {
-                    return WalkState::Continue;
-                }
-                if !sink.hits.is_empty() {
-                    let matches = sink.matches;
-                    if let Ok(mut guard) = collected.lock() {
-                        guard.extend(sink.hits);
-                    }
-                    // Only matches count toward the stop threshold (context is bounded per match).
-                    if total.fetch_add(matches, Ordering::Relaxed) + matches >= stop_at {
-                        return WalkState::Quit;
-                    }
-                }
-                WalkState::Continue
-            })
-        });
+            }
+            WalkState::Continue
+        })
+    });
 
     let mut hits = Arc::try_unwrap(collected)
         .ok()
@@ -237,7 +240,7 @@ impl Sink for Collector {
         let lineno = m.line_number().map(|n| n as usize).unwrap_or(0);
         let text = String::from_utf8_lossy(m.bytes());
         self.hits
-            .push((self.path.clone(), lineno, clip(trim_eol(&text)), true));
+            .push((self.path.clone(), lineno, clip(&trim_eol(&text)), true));
         self.matches += 1;
         Ok(true)
     }
@@ -246,15 +249,25 @@ impl Sink for Collector {
         let lineno = c.line_number().map(|n| n as usize).unwrap_or(0);
         let text = String::from_utf8_lossy(c.bytes());
         self.hits
-            .push((self.path.clone(), lineno, clip(trim_eol(&text)), false));
+            .push((self.path.clone(), lineno, clip(&trim_eol(&text)), false));
         Ok(true)
     }
 }
 
-/// Strip a trailing `\n` and then a trailing `\r` (the searcher hands us the line terminator).
-fn trim_eol(s: &str) -> &str {
+/// Strip a trailing `\n` and then a trailing `\r` (the searcher hands us the line terminator), plus —
+/// pi-parity fix — any further embedded `\r` the trailing strip doesn't reach. `grep-searcher` only
+/// splits on `\n`, so a file using old-Mac-style bare-`\r` line endings (or one with stray corrupted
+/// bytes) hands us "lines" that still carry mid-content `\r` characters; pi strips every `\r` in the
+/// line, not just a trailing one. Borrows unchanged in the overwhelming common case (no embedded `\r`
+/// at all) rather than allocating a `String` for every matched line.
+fn trim_eol(s: &str) -> std::borrow::Cow<'_, str> {
     let s = s.strip_suffix('\n').unwrap_or(s);
-    s.strip_suffix('\r').unwrap_or(s)
+    let s = s.strip_suffix('\r').unwrap_or(s);
+    if s.contains('\r') {
+        std::borrow::Cow::Owned(s.replace('\r', ""))
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
 }
 
 /// Clip a long line to `MAX_LINE` bytes at a UTF-8 char boundary (never panics mid-codepoint).
@@ -397,6 +410,35 @@ impl Tool for Grep {
 mod tests {
     use super::*;
 
+    #[test]
+    fn trim_eol_strips_trailing_newline_and_carriage_return() {
+        assert_eq!(trim_eol("hello\r\n"), "hello");
+        assert_eq!(trim_eol("hello\n"), "hello");
+        assert_eq!(trim_eol("hello"), "hello");
+    }
+
+    #[test]
+    fn trim_eol_strips_an_embedded_carriage_return_not_just_a_trailing_one() {
+        // pi-parity fix (L6): `grep-searcher` only splits on `\n`, so a file using old-Mac-style bare
+        // `\r` line endings hands us "lines" that still carry mid-content `\r` characters after the
+        // trailing strip — pi strips every `\r` in the line, not just a trailing one.
+        assert_eq!(trim_eol("first\rsecond\rthird\n"), "firstsecondthird");
+    }
+
+    #[test]
+    fn trim_eol_borrows_when_there_is_nothing_to_strip() {
+        // Not a behavior a caller can observe directly, but worth pinning: the common case (no
+        // embedded `\r`) must not allocate.
+        assert!(matches!(
+            trim_eol("plain line"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            trim_eol("first\rsecond"),
+            std::borrow::Cow::Owned(_)
+        ));
+    }
+
     #[tokio::test]
     async fn literal_mode_searches_verbatim() {
         let dir = tempfile::tempdir().unwrap();
@@ -528,6 +570,29 @@ mod tests {
         assert!(
             !out.contains("ignored.txt"),
             ".gitignore should be honored even without a .git directory: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gitignore_is_still_honored_inside_a_real_git_repository() {
+        // pi-parity fix (L7): `require_git(false)` is now conditional on the search root *not* being
+        // inside a real git repo (matching pi's own `rg --no-require-git` scoping) — this guards
+        // against the conditional accidentally breaking the far more common case, a search root that
+        // *is* inside a real repo, which must still honor `.gitignore` exactly as before.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(dir.path().join("ignored.txt"), "needle\n").unwrap();
+        std::fs::write(dir.path().join("kept.txt"), "needle\n").unwrap();
+        let out = Grep
+            .run(json!({ "pattern": "needle", "path": dir.path().to_str().unwrap() }))
+            .await
+            .unwrap()
+            .text;
+        assert!(out.contains("kept.txt"), "got: {out}");
+        assert!(
+            !out.contains("ignored.txt"),
+            ".gitignore must still be honored inside a real git repository: {out}"
         );
     }
 

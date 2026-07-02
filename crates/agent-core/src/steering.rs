@@ -180,25 +180,28 @@ impl Steering {
         }
     }
 
-    /// Take what's queued for a stop boundary: the follow-up lane, plus any steer messages that were
-    /// queued but never reached a mid-run injection point (e.g. a turn with no tool calls), so nothing
-    /// is stranded. Governed by [`follow_up_mode`](Self::follow_up_mode) — "how much to inject when the
-    /// agent is about to stop" is one decision, whether the pending work originated in the follow-up
-    /// lane or was left over in the steer lane. In `All` mode that's everything in both lanes; in
-    /// `OneAtATime` mode it's just the single oldest message — the follow-up lane first (the primary one
-    /// for a stop boundary), falling back to a stranded steer message only if it's empty, the same
-    /// priority `All` merges in.
+    /// Take what's queued for a stop boundary: any steer messages that were queued but never reached a
+    /// mid-run injection point (e.g. a turn with no tool calls) — the primary lane at a stop boundary,
+    /// since a steer is an urgent redirect a client is waiting on — plus the follow-up lane, so nothing
+    /// queued there is stranded either. Governed by [`follow_up_mode`](Self::follow_up_mode) — "how much
+    /// to inject when the agent is about to stop" is one decision, whether the pending work originated
+    /// in the follow-up lane or was left over in the steer lane. In `All` mode that's everything in both
+    /// lanes, steer first; in `OneAtATime` mode it's just the single oldest message — the steer lane
+    /// first, falling back to the follow-up lane only if it's empty. Matches pi's own priority
+    /// (`agent-loop.ts`'s `getSteeringMessages()` is polled at every stop point before
+    /// `getFollowUpMessages()` is ever reached) — the inverse order here used to leave an urgent steer
+    /// waiting behind a lower-priority follow-up that happened to be queued first.
     pub(crate) fn drain_at_stop(&self) -> Vec<SteeringMessage> {
         match self.follow_up_mode() {
             QueueMode::All => {
-                let mut out: Vec<SteeringMessage> = lock(&self.follow_up).drain(..).collect();
-                out.extend(lock(&self.steer).drain(..));
+                let mut out: Vec<SteeringMessage> = lock(&self.steer).drain(..).collect();
+                out.extend(lock(&self.follow_up).drain(..));
                 out
             }
             QueueMode::OneAtATime => {
-                if let Some(m) = lock(&self.follow_up).pop_front() {
+                if let Some(m) = lock(&self.steer).pop_front() {
                     vec![m]
-                } else if let Some(m) = lock(&self.steer).pop_front() {
+                } else if let Some(m) = lock(&self.follow_up).pop_front() {
                     vec![m]
                 } else {
                     Vec::new()
@@ -275,15 +278,16 @@ mod tests {
     #[test]
     fn drain_at_stop_sweeps_stranded_steer_messages() {
         // A steer queued on a turn that never ran tools must still be injected at the stop boundary —
-        // in `All` mode, in one combined drain. Governed by `follow_up_mode`, not `steering_mode` —
-        // "how much to inject at a stop boundary" is one decision regardless of which lane it came from.
+        // in `All` mode, in one combined drain, steer first (an urgent redirect takes priority over a
+        // "keep going" follow-up). Governed by `follow_up_mode`, not `steering_mode` — "how much to
+        // inject at a stop boundary" is one decision regardless of which lane it came from.
         let s = Steering::new();
         s.set_follow_up_mode(QueueMode::All);
         s.push_steer("stranded");
         s.push("follow");
         assert_eq!(
             s.drain_at_stop(),
-            vec!["follow".to_string(), "stranded".to_string()]
+            vec!["stranded".to_string(), "follow".to_string()]
         );
     }
 
@@ -308,21 +312,23 @@ mod tests {
     }
 
     #[test]
-    fn one_at_a_time_mode_prefers_follow_up_over_a_stranded_steer_then_sweeps_it_next() {
-        // Same priority order as `All`'s merge (follow-up first, steer stragglers after) — just one
-        // message at a time instead of the whole lane at once.
+    fn one_at_a_time_mode_prefers_a_stranded_steer_over_follow_up_then_sweeps_follow_up_next() {
+        // pi-parity fix: same priority order as `All`'s merge (steer first, follow-up after) — just one
+        // message at a time instead of the whole lane at once. This used to be inverted (follow-up
+        // drained first), the opposite of pi's own `agent-loop.ts` priority, which always polls the
+        // steer queue before ever looking at follow-up.
         let s = Steering::new();
         s.push_steer("stranded");
         s.push("follow");
         assert_eq!(
             s.drain_at_stop(),
-            vec!["follow".to_string()],
-            "follow-up drains first"
+            vec!["stranded".to_string()],
+            "the stranded, urgent steer message drains first"
         );
         assert_eq!(
             s.drain_at_stop(),
-            vec!["stranded".to_string()],
-            "the stranded steer message is swept on the next stop-boundary drain"
+            vec!["follow".to_string()],
+            "the follow-up is swept on the next stop-boundary drain"
         );
         assert_eq!(s.drain_at_stop(), Vec::<String>::new());
     }

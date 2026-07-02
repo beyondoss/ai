@@ -46,10 +46,13 @@ The harness layers several capabilities over the bare tools + loop:
   `set_model`/`set_thinking`/an explicit `reload` — and refreshes just the cheap dynamic footer before
   every `prompt`, so a long-running process doesn't re-walk the filesystem every turn just for the date.
   CLI flags: `--system-prompt` (replace), `--append-system-prompt`, `--no-context-files`,
-  `--no-skills`/`--no-prompt-templates` (both `run` and `serve` — skip discovery outright rather than
-  discover-then-discard, so `/skill:name`/`/name` invocations pass through unexpanded and no
-  `<available_skills>` listing is injected; matches pi's own flags; on `serve` these also apply on every
-  `reload`). Skills are
+  `--no-skills`/`--no-prompt-templates` (both `run` and `serve` — skip *standard-root* discovery
+  outright rather than discover-then-discard, so a `/skill:name`/`/name` invocation only passes through
+  unexpanded, and only the standard-root portion of `<available_skills>` is withheld, when it doesn't
+  resolve against an explicit `--skill`/`--prompt-template` extra path instead — that extra path is
+  still honored even with `--no-skills`/`--no-prompt-templates` set (`discover_extra_only`, matching
+  pi's own flags — a documented, tested combination: "nothing auto-discovered", not "no skills at all");
+  on `serve` these also apply on every `reload`). Skills are
   discovered recursively (`SKILL.md` at any depth, following symlinked directories — matching pi's own
   `skills.ts`, so a shared skills library symlinked into `.claude/skills` isn't invisible; a symlink
   loop is caught by `walkdir`'s own detection, not an unbounded walk), honoring `.gitignore`/`.ignore`
@@ -59,10 +62,14 @@ The harness layers several capabilities over the bare tools + loop:
   of ignore-file coverage (`filter_entry`, matching pi's own unconditional skip) — the symlink-follow
   above means a shared skills library can lead *outside* this walk's own root into a foreign npm
   package with its own nested `node_modules` and no ignore file of its own, so relying on ignore-file
-  coverage alone wouldn't reliably catch it; a `disable-model-invocation`
+  coverage alone wouldn't reliably catch it; a `--skill`/`--prompt-template` extra root also accepts a
+  single standalone `.md` file (not just a directory) as one skill/template with no directory of its
+  own, matching pi's other discovery shape for both. A `disable-model-invocation`
   skill is omitted from the listing but still
   reachable by an explicit `/skill:name`, which strips the raw YAML frontmatter and wraps the body in a
-  `<skill name="..." location="...">` tag rather than leaking the frontmatter verbatim. Both
+  `<skill name="..." location="...">` tag rather than leaking the frontmatter verbatim; `format_available`
+  renders no `<available_skills>` wrapper at all (not an empty one) when every skill is
+  `disable-model-invocation`, matching pi. Both
   skill/prompt-template discovery report name collisions (`discover_with_diagnostics`) — the same name
   shadowed across roots or within one root — surfaced via `get_commands`'s `collisions` field *and*
   `tracing::warn!`-logged at the point of detection, so an operator watching server logs notices a
@@ -136,7 +143,19 @@ The harness layers several capabilities over the bare tools + loop:
   path — unlike `fork`'s own `upto`, a message-count prefix of just the active path; a client that wants
   to fork an abandoned branch no longer has to `switch_active`/`switch_branch` to it first just to make
   it forkable. `before: bool` excludes the target entry itself from the copied prefix (fork right before
-  it) instead of including it (the default).
+  it) instead of including it (the default). Every `create`/`fork`/`fork_at_entry` writes its file
+  immediately (the header, then — since `fork`/`fork_at_entry` both call `rewrite` — the copied prefix
+  in the same call), unlike pi's `createBranchedSession`, which defers the actual file write until an
+  assistant message lands, specifically to avoid littering the session directory with a fork that gets
+  abandoned after one user message. This is a deliberate, accepted divergence, not an oversight: pi's
+  deferred-write path exists to paper over its own append-per-entry write model (a fresh, unflushed file
+  would otherwise leave a truncated, header-only session behind); this module's `rewrite` already writes
+  the whole prefix in one atomic temp-file-then-rename call, so there's no truncated-file risk to guard
+  against, and the minimum-effective-abstraction cost of threading a "created but not yet flushed" state
+  through `SessionStore` (and every caller that currently assumes `create`/`fork` leaves a real file on
+  disk) isn't worth paying for a cosmetic directory-listing concern. If `list`/`list_sessions` noise from
+  abandoned single-message forks ever becomes a real operational problem, revisit — until then this is
+  pinned as current, intended behavior (see `session_store::tests` for the pinning test).
 - **Branch-local model/thinking-level** — `set_model`/`cycle_model`/`set_reasoning_effort`/
   `cycle_thinking_level` each append an O(1) `Entry::ModelChange`/`Entry::ThinkingLevelChange` record
   anchored to the *current tip* (`SessionStore::record_model_change`/`record_thinking_level_change`) —
@@ -201,11 +220,15 @@ The harness layers several capabilities over the bare tools + loop:
   `skill:` prefix and a prompt template not)/`reload`,
   `set_model`/`set_thinking`(raw budget override)/`set_reasoning_effort`(the portable
   `agent_core::ThinkingLevel`, correct for whichever mechanism the active model actually
-  uses)/`cycle_model`(steps through `--models`'s scoped list when given — comma-separated ids, in order
-  — else the full known-model hint list; reports `scoped: bool` so a client knows which; `set_model` is
-  unaffected either way, accepting any id)/`get_available_models`(reports that same `--models`-scoped
-  list or hint list — matching pi's own live registry query, not a static list oblivious to how the
-  process was launched)/
+  uses)/`cycle_model`(steps through `--models`'s scoped list when given — comma-separated patterns
+  resolved by `resolve_model_scope`: a literal id kept verbatim, a glob (`*`/`?`/`[`) expanded
+  case-insensitively against `available_models()`, either optionally suffixed `:<thinking-level>` to pin
+  that entry's depth for as long as cycling stays on it — else the full known-model hint list; reports
+  `scoped: bool` so a client knows which; `set_model` is unaffected either way, accepting any id)/
+  `get_available_models`(always the full known-model hint list, *never* narrowed by `--models` — that
+  flag only scopes `cycle_model`'s own candidate list; a client's model picker needs the full catalog to
+  offer a "show everything" view the way pi's own `/model` selector can Tab out of its scope-defaulted
+  view)/
   `cycle_thinking_level`(advances the same portable level)/`set_auto_compaction`/
   `set_auto_retry`(toggle `agent_core::Agent::with_auto_retry` — off surfaces an otherwise-retried
   mid-stream failure on the first attempt, for debugging a flaky connection)
@@ -885,11 +908,12 @@ container/VM — not by this crate restricting its own tools.
 | Variable / Flag                                                | Default                    | What It Controls                                                                                                                 |
 | -------------------------------------------------------------- | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
 | `--model` / `AI_AGENT_MODEL`                                   | `claude-opus-4-8`           | Model id sent in each `ModelRequest`; selects the wire dialect (`agent_core::Dialect::for_model`); `serve`'s `set_model`/`cycle_model` switch it at runtime |
+| `--models` / `AI_AGENT_MODELS` (`serve`-only)                  | none (`cycle_model` steps through the full `available_models()` hint list) | Comma-separated patterns narrowing `cycle_model`'s candidate list — a literal id, a glob (`claude-*`, `*sonnet*`) expanded against `available_models()`, either optionally suffixed `:<thinking-level>` to pin that entry's depth on cycle (`resolve_model_scope`); does **not** affect `set_model` or `get_available_models`, which always sees/accepts the full catalog |
 | `--gateway-url` / `AI_GATEWAY_URL`                             | `http://ai.internal`        | Base URL `GatewayClient` posts completions to                                                                                     |
 | `--key` / `AI_AGENT_KEY`                                       | none (required)             | Bearer token sent to the gateway — a `bai_v1…` virtual key, or a BYO provider key forwarded as-is                                |
 | `--max-steps`                                                  | `agent_core::DEFAULT_MAX_STEPS` (50) | Ceiling on loop iterations (`run`) or per-`prompt` iterations (`serve`) before `Error::MaxSteps` (resumable with a fresh call)     |
 | `--tools` / `--exclude-tools` / `--no-tools` (+ `AI_AGENT_TOOLS`/`AI_AGENT_EXCLUDE_TOOLS` for `serve`) | none (full default registry) | Restrict/drop from the advertised tool set before the process's `Agent`/system prompt are built; `--no-tools` wins outright        |
-| `--no-skills` / `--no-prompt-templates` (`run` and `serve`)    | `false`                     | Skip skill/prompt-template discovery outright — no `<available_skills>` listing, and a `/skill:name`/`/name` invocation passes through unexpanded; matches pi's own flags. On `serve`, applies on every `reload` too |
+| `--no-skills` / `--no-prompt-templates` (`run` and `serve`)    | `false`                     | Skip *standard-root* skill/prompt-template discovery outright (`~/.claude/skills`+`<cwd>/.claude/skills`, `~/.claude/prompts`+`<cwd>/.claude/prompts`) — no `<available_skills>` listing from either, and a `/skill:name`/`/name` invocation passes through unexpanded unless it resolves against a `--skill`/`--prompt-template` extra path instead, which is still honored even so; matches pi's own flags (a documented, tested combination — `discover_extra_only`). On `serve`, applies on every `reload` too |
 | `--no-context-files` (`run` and `serve`)                       | `false`                     | Skip AGENTS.md/CLAUDE.md project-instruction discovery/injection entirely; matches pi's own flag       |
 | `--trust-project`                                              | `false`                     | Trust the cwd for this run only (session-scoped), independent of `agent trust <path>`'s persistent allowlist                     |
 | `--force-untrusted`                                             | `false`                     | Force the cwd *untrusted* for this run only, overriding both `--trust-project` and a persisted `agent trust <path>` grant — pi's own `--no-approve`/`-na`; wins over `--trust-project` if both are given |

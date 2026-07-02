@@ -22,7 +22,10 @@ pub struct PromptOptions<'a> {
     pub cwd: &'a Path,
     /// Whether to discover and inject `AGENTS.md`/`CLAUDE.md` project-instruction files.
     pub include_context_files: bool,
-    /// Already-discovered skills to advertise (empty renders no `<available_skills>` section at all).
+    /// Already-discovered skills to advertise. Renders no `<available_skills>` section at all when
+    /// empty, *or* when every skill in it is `disable-model-invocation` (see `skills::format_available`'s
+    /// doc comment) — a non-empty list with nothing actually model-visible must not still produce an
+    /// empty wrapper.
     /// Discovery itself — `skills::discover`/`discover_with_diagnostics` — is the caller's job, not
     /// this function's: every real caller (`main.rs`'s `run`, `serve.rs`'s startup/`reload`) already
     /// discovers skills separately for its own purposes (expanding a `/skill:name` invocation,
@@ -89,9 +92,14 @@ pub fn build_static_system_prompt(opts: &PromptOptions) -> String {
         }
     }
 
-    if !opts.skills.is_empty() {
+    // pi-parity fix (M1): checking `!opts.skills.is_empty()` guards on the *unfiltered* list — a
+    // non-empty list where every skill is `disable-model-invocation` still built an empty
+    // `<available_skills>…</available_skills>` shell. `format_available` itself now returns `""` in
+    // that case (see its doc comment); check its actual output instead of the raw skill count.
+    let available = skills::format_available(opts.skills);
+    if !available.is_empty() {
         s.push_str("\n\n");
-        s.push_str(&skills::format_available(opts.skills));
+        s.push_str(&available);
     }
 
     s
@@ -493,6 +501,34 @@ mod tests {
         assert!(
             prompt.contains("already-discovered") && prompt.contains("found by the caller"),
             "got: {prompt}"
+        );
+    }
+
+    #[test]
+    fn all_hidden_skills_produce_no_available_skills_wrapper_at_all() {
+        // pi-parity fix (M1): the call site here used to gate on `!opts.skills.is_empty()` — the
+        // *unfiltered* list — so a non-empty list where every skill is `disable-model-invocation` still
+        // produced an empty `<available_skills>\n…\n</available_skills>` shell with no actual entries.
+        // `skills::format_available` itself now returns `""` in that case; this pins the fix at the
+        // level a caller actually observes it: the assembled system prompt.
+        let tmp = tempfile::tempdir().unwrap();
+        let skill = Skill {
+            name: "hidden".into(),
+            description: "Explicit only".into(),
+            path: tmp.path().join("SKILL.md"),
+            disable_model_invocation: true,
+        };
+        let prompt = build_system_prompt(&PromptOptions {
+            base: "DEFAULT IDENTITY",
+            append: None,
+            cwd: tmp.path(),
+            include_context_files: false,
+            skills: std::slice::from_ref(&skill),
+            project_trusted: true,
+        });
+        assert!(
+            !prompt.contains("available_skills"),
+            "no wrapper at all when nothing is model-visible: {prompt}"
         );
     }
 

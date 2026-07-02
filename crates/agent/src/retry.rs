@@ -53,6 +53,14 @@ pub fn is_retryable_whole_run(e: &agent_core::Error) -> bool {
     if agent_core::agent::is_context_overflow(e) {
         return false;
     }
+    // A quota/billing-exhaustion 429 (`"gateway returned 429 …: insufficient_quota…"`) still contains
+    // the raw digits `WHOLE_RUN_RETRYABLE_STATUS_DIGITS` matches on below, but retrying it can never
+    // succeed until the account itself changes — the same reason `client.rs`'s pre-first-byte 429
+    // handling and `is_retryable_mid_stream`'s allowlist both already exclude it. Reuse `client.rs`'s
+    // own heuristic rather than duplicating its phrase list here.
+    if agent_core::client::is_quota_exhausted(msg) {
+        return false;
+    }
     WHOLE_RUN_RETRYABLE_STATUS_DIGITS
         .iter()
         .any(|d| msg.contains(d))
@@ -84,6 +92,42 @@ mod tests {
         assert!(
             is_retryable_whole_run(&e),
             "whole-run layer must catch what the narrower one misses"
+        );
+    }
+
+    #[test]
+    fn whole_run_does_not_retry_a_quota_exhausted_429_even_though_it_contains_the_digit() {
+        // A-M8: mirrors `client.rs::a_429_with_quota_exhaustion_body_is_not_retried`'s exact message
+        // shape (`"gateway returned {status}: {body}"`) — this must fail the same way `client.rs`'s own
+        // pre-first-byte 429 handling and `is_retryable_mid_stream`'s allowlist already do, instead of
+        // slipping through `WHOLE_RUN_RETRYABLE_STATUS_DIGITS`'s raw "429" substring match, which
+        // otherwise can't tell a quota rejection from ordinary rate limiting.
+        let e = Error::Transport(
+            "gateway returned 429 Too Many Requests: {\"error\":{\"type\":\"insufficient_quota\",\"message\":\"You exceeded your current quota\"}}".into(),
+        );
+        assert!(
+            !agent_core::agent::is_retryable_mid_stream(&e),
+            "mid-stream layer's allowlist already excludes this"
+        );
+        assert!(
+            !is_retryable_whole_run(&e),
+            "a quota-exhausted 429 must not be retried at the whole-run layer either — retrying it can \
+             never succeed until the account itself changes"
+        );
+    }
+
+    #[test]
+    fn whole_run_still_retries_a_plain_429_without_quota_language() {
+        // The flip side of the test above: don't regress
+        // `whole_run_retries_a_plain_http_status_digit_mid_stream_never_would`'s guarantee — an ordinary
+        // rate-limit 429 (no quota/billing phrase) must still fall through to the raw-status-digit
+        // fallback and be retried.
+        let e = Error::Transport(
+            "gateway returned 429 Too Many Requests: {\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Too many requests, please slow down\"}}".into(),
+        );
+        assert!(
+            is_retryable_whole_run(&e),
+            "an ordinary rate-limit 429 without quota language must still be retried"
         );
     }
 

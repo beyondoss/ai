@@ -84,11 +84,18 @@ fn windowed_by_budget(messages: &[Message], budget_tokens: u32) -> &[Message] {
 /// [`windowed_by_budget`], with a note when that actually dropped older activity — otherwise a long
 /// branch could overflow the summarization model's own context window, the one failure mode this
 /// windowing exists to prevent.
+///
+/// `custom_instructions`, when given, is appended after [`BRANCH_SUMMARY_INSTRUCTION`] as "Additional
+/// focus: {custom_instructions}" — the same framing [`crate::compaction::summary_request`] uses for a
+/// manual compaction's client-supplied steering, matching pi's own `generateSummary` — so a client
+/// navigating away from a branch can steer what the recap emphasizes without replacing the structured
+/// Markdown format itself.
 pub fn branch_summary_request(
     model: &str,
     messages: &[Message],
     max_tokens: u32,
     input_token_budget: u32,
+    custom_instructions: Option<&str>,
 ) -> ModelRequest {
     let (read, modified) = extract_file_ops(messages);
     let windowed = windowed_by_budget(messages, input_token_budget);
@@ -115,6 +122,10 @@ pub fn branch_summary_request(
         ));
     }
     prompt.push_str(BRANCH_SUMMARY_INSTRUCTION);
+    if let Some(custom) = custom_instructions {
+        prompt.push_str("\n\nAdditional focus: ");
+        prompt.push_str(custom);
+    }
 
     ModelRequest::new(model, Arc::new(vec![Message::user(prompt)]), max_tokens)
         .with_system(SUMMARY_SYSTEM)
@@ -129,17 +140,17 @@ mod tests {
     fn branch() -> Vec<Message> {
         vec![
             Message::user("try approach X"),
-            Message::assistant(vec![ContentBlock::ToolUse {
-                id: "1".into(),
-                name: "read".into(),
-                input: json!({ "path": "src/x.rs" }),
-            }]),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "1",
+                "read",
+                json!({ "path": "src/x.rs" }),
+            )]),
             Message::tool_result("1", "fn x() {}", false),
-            Message::assistant(vec![ContentBlock::ToolUse {
-                id: "2".into(),
-                name: "edit".into(),
-                input: json!({ "path": "src/x.rs" }),
-            }]),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "2",
+                "edit",
+                json!({ "path": "src/x.rs" }),
+            )]),
             Message::tool_result("2", "edited", false),
             Message::assistant(vec![ContentBlock::text("approach X didn't pan out")]),
         ]
@@ -147,7 +158,7 @@ mod tests {
 
     #[test]
     fn branch_summary_request_renders_transcript_and_tags_files() {
-        let req = branch_summary_request("claude-test", &branch(), 512, 100_000);
+        let req = branch_summary_request("claude-test", &branch(), 512, 100_000, None);
         let ContentBlock::Text { text, .. } = &req.messages[0].content[0] else {
             panic!("expected text");
         };
@@ -248,7 +259,7 @@ mod tests {
 
     #[test]
     fn branch_summary_request_notes_when_windowing_dropped_older_activity() {
-        let req = branch_summary_request("claude-test", &branch(), 512, 1);
+        let req = branch_summary_request("claude-test", &branch(), 512, 1, None);
         let ContentBlock::Text { text, .. } = &req.messages[0].content[0] else {
             panic!("expected text");
         };
@@ -263,7 +274,7 @@ mod tests {
         // File awareness is cheap metadata and should span the whole branch — a tiny budget that
         // windows out the early `read`/`edit` calls from the rendered transcript must still surface
         // them in `<read-files>`/`<modified-files>`.
-        let req = branch_summary_request("claude-test", &branch(), 512, 1);
+        let req = branch_summary_request("claude-test", &branch(), 512, 1, None);
         let ContentBlock::Text { text, .. } = &req.messages[0].content[0] else {
             panic!("expected text");
         };
@@ -278,11 +289,44 @@ mod tests {
             Message::user("just chatting"),
             Message::assistant(vec![ContentBlock::text("sure")]),
         ];
-        let req = branch_summary_request("claude-test", &messages, 512, 100_000);
+        let req = branch_summary_request("claude-test", &messages, 512, 100_000, None);
         let ContentBlock::Text { text, .. } = &req.messages[0].content[0] else {
             panic!("expected text");
         };
         assert!(!text.contains("<read-files>"));
         assert!(!text.contains("<modified-files>"));
+    }
+
+    #[test]
+    fn branch_summary_request_appends_custom_instructions_as_additional_focus() {
+        // Matches pi's own `generateSummary`/`compaction::summary_request`: "Additional focus:
+        // {customInstructions}" appended after the structured instruction template, not replacing it.
+        let req = branch_summary_request(
+            "claude-test",
+            &branch(),
+            512,
+            100_000,
+            Some("keep every detail about the auth refactor"),
+        );
+        let ContentBlock::Text { text, .. } = &req.messages[0].content[0] else {
+            panic!("expected text");
+        };
+        assert!(
+            text.contains("different conversation branch"),
+            "the structured template survives: {text}"
+        );
+        assert!(
+            text.contains("Additional focus: keep every detail about the auth refactor"),
+            "the custom instructions must be appended: {text}"
+        );
+    }
+
+    #[test]
+    fn branch_summary_request_omits_additional_focus_when_no_custom_instructions_given() {
+        let req = branch_summary_request("claude-test", &branch(), 512, 100_000, None);
+        let ContentBlock::Text { text, .. } = &req.messages[0].content[0] else {
+            panic!("expected text");
+        };
+        assert!(!text.contains("Additional focus"));
     }
 }

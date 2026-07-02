@@ -11,6 +11,7 @@
 
 use serde_json::Value;
 
+use crate::agent::repair_json;
 use crate::error::{Error, Result};
 use crate::message::{ContentBlock, Message, Role, StreamEvent};
 use crate::models::{ApiKind, ModelCaps};
@@ -237,6 +238,21 @@ pub trait StreamDecoder: Send {
     fn is_terminal(&self) -> bool {
         false
     }
+
+    /// Whether a `data:` payload that fails its first JSON parse should get a repair pass
+    /// (`crate::agent::repair_json`) before [`push_sse_line`] gives up on it. `false` by default.
+    /// Anthropic's raw SSE stream can carry a malformed-but-recoverable event body — a backslash
+    /// that isn't a valid JSON escape (an unescaped Windows path segment) or a raw control
+    /// character inside a string value that should have been escaped (a literal tab/newline) — and
+    /// pi tolerates exactly this by running its `repairJson` pass over the event body before
+    /// parsing (`parseJsonWithRepair`, `packages/ai/src/utils/json-parse.ts`, wired up in
+    /// `iterateAnthropicEvents`, `packages/ai/src/api/anthropic-messages.ts`). Every other pi
+    /// dialect hands its outer per-chunk parsing to that provider's own SDK rather than hand-rolling
+    /// SSE decode, so this repair is never reached for them even though `repairJson` itself is a
+    /// generic utility — `anthropic::Decoder` is the only override, matching that scoping.
+    fn repairs_json(&self) -> bool {
+        false
+    }
 }
 
 /// Decode a complete SSE body into events. Splits on `data:` lines, skips comments/`event:` lines
@@ -277,17 +293,24 @@ pub fn push_sse_line(decoder: &mut dyn StreamDecoder, line: &str) -> Result<Vec<
     // fail-closed behavior below is a considered choice, not an oversight.
     let v: Value = match serde_json::from_str(payload) {
         Ok(v) => v,
-        // A non-JSON `data:` line arriving after the decoder's own terminal event is trailing noise
-        // (a gateway/proxy's keepalive or stats line tacked on after the real message already
-        // completed), not a real transport failure — matching pi, which filters by the SSE `event:`
-        // type before ever attempting to parse `data:` as JSON, so an unrecognized trailing event
-        // never reaches its JSON parser at all. Before the decoder has seen its terminal event, this
-        // is still a hard failure: garbage mid-turn is a genuine corrupted/tampered stream, not noise.
-        Err(e) if decoder.is_terminal() => {
-            tracing::debug!(error = %e, "ignoring non-JSON SSE data after the stream's terminal event");
-            return Ok(Vec::new());
-        }
-        Err(e) => return Err(Error::Transport(format!("malformed SSE json: {e}"))),
+        // A first-parse failure gets one repair attempt (Anthropic only — see
+        // `StreamDecoder::repairs_json`) before falling back to the trailing-noise/hard-error split
+        // below, mirroring pi's `parseJsonWithRepair`.
+        Err(e) => match repair_and_parse(decoder, payload) {
+            Some(v) => v,
+            // A non-JSON `data:` line arriving after the decoder's own terminal event is trailing
+            // noise (a gateway/proxy's keepalive or stats line tacked on after the real message
+            // already completed), not a real transport failure — matching pi, which filters by the
+            // SSE `event:` type before ever attempting to parse `data:` as JSON, so an unrecognized
+            // trailing event never reaches its JSON parser at all. Before the decoder has seen its
+            // terminal event, this is still a hard failure: garbage mid-turn is a genuine
+            // corrupted/tampered stream, not noise.
+            None if decoder.is_terminal() => {
+                tracing::debug!(error = %e, "ignoring non-JSON SSE data after the stream's terminal event");
+                return Ok(Vec::new());
+            }
+            None => return Err(Error::Transport(format!("malformed SSE json: {e}"))),
+        },
     };
     // A provider can report a failure *in-band* mid-stream — Anthropic as `{"type":"error",…}`
     // (preceded by an `event: error` line we don't see here), OpenAI as a bare `{"error":{…}}` chunk.
@@ -297,6 +320,22 @@ pub fn push_sse_line(decoder: &mut dyn StreamDecoder, line: &str) -> Result<Vec<
         return Err(Error::Transport(format!("provider stream error: {msg}")));
     }
     Ok(decoder.push(&v))
+}
+
+/// Second-chance parse for a `data:` payload whose first `serde_json::from_str` failed. Mirrors pi's
+/// `parseJsonWithRepair` (`packages/ai/src/utils/json-parse.ts`): only attempted when the decoder
+/// opts in ([`StreamDecoder::repairs_json`]) and the repair pass actually changed the payload —
+/// an unchanged payload would just fail the same way again, so `None` here falls straight through to
+/// [`push_sse_line`]'s existing trailing-noise/hard-error handling.
+fn repair_and_parse(decoder: &dyn StreamDecoder, payload: &str) -> Option<Value> {
+    if !decoder.repairs_json() {
+        return None;
+    }
+    let repaired = repair_json(payload);
+    if repaired == payload {
+        return None;
+    }
+    serde_json::from_str(&repaired).ok()
 }
 
 /// Extract a provider error message from an SSE `data:` payload, if it is one. Handles three shapes:
@@ -399,11 +438,11 @@ mod tests {
         // a `tool_use` with its matching `tool_result` right after must not be touched — proven via
         // `Cow::Borrowed` (no allocation), not just value equality.
         let messages = vec![
-            Message::assistant(vec![ContentBlock::ToolUse {
-                id: "t1".into(),
-                name: "bash".into(),
-                input: serde_json::json!({}),
-            }]),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "t1",
+                "bash",
+                serde_json::json!({}),
+            )]),
             Message::tool_results(vec![ContentBlock::ToolResult {
                 tool_use_id: "t1".into(),
                 content: "ok".into(),
@@ -425,11 +464,11 @@ mod tests {
         // rather than becoming a new one — two consecutive user-role messages isn't a shape any dialect
         // accepts, so "nevermind" must survive alongside the synthetic result, not be pushed later.
         let messages = vec![
-            Message::assistant(vec![ContentBlock::ToolUse {
-                id: "t1".into(),
-                name: "bash".into(),
-                input: serde_json::json!({}),
-            }]),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "t1",
+                "bash",
+                serde_json::json!({}),
+            )]),
             Message::user("nevermind"),
         ];
         let repaired = repair_orphaned_tool_use(&messages);
@@ -456,17 +495,17 @@ mod tests {
     #[test]
     fn repair_orphaned_tool_use_handles_multiple_gaps_independently() {
         let messages = vec![
-            Message::assistant(vec![ContentBlock::ToolUse {
-                id: "t1".into(),
-                name: "bash".into(),
-                input: serde_json::json!({}),
-            }]),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "t1",
+                "bash",
+                serde_json::json!({}),
+            )]),
             Message::user("first gap"),
-            Message::assistant(vec![ContentBlock::ToolUse {
-                id: "t2".into(),
-                name: "bash".into(),
-                input: serde_json::json!({}),
-            }]),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "t2",
+                "bash",
+                serde_json::json!({}),
+            )]),
             Message::user("second gap"),
         ];
         let repaired = repair_orphaned_tool_use(&messages);
@@ -489,16 +528,8 @@ mod tests {
         // message (every dialect requires all of one turn's results together, not split across two).
         let messages = vec![
             Message::assistant(vec![
-                ContentBlock::ToolUse {
-                    id: "answered".into(),
-                    name: "bash".into(),
-                    input: serde_json::json!({}),
-                },
-                ContentBlock::ToolUse {
-                    id: "orphan".into(),
-                    name: "bash".into(),
-                    input: serde_json::json!({}),
-                },
+                ContentBlock::tool_use("answered", "bash", serde_json::json!({})),
+                ContentBlock::tool_use("orphan", "bash", serde_json::json!({})),
             ]),
             Message::tool_results(vec![ContentBlock::ToolResult {
                 tool_use_id: "answered".into(),

@@ -70,6 +70,39 @@ fn default_system_prompt(
             &mut seen,
         );
     }
+    // pi's own per-tool `promptGuidelines` (`read.ts`/`edit.ts`/`write.ts`) — declared on the tool
+    // definition itself and collected from whatever's actually registered. Adapted, not ported
+    // verbatim: pi's edit tool takes an `edits[].oldText`/`newText` array, ours takes `edits[].old_string`/
+    // `new_string` (see `tools/edit.rs`'s own schema) — porting pi's exact field names would tell the
+    // model to look for parameters that don't exist on our tool. `bash`/`grep`/`find`/`ls` carry no
+    // `promptGuidelines` on pi's side, so there's nothing to port for those.
+    if has("read") {
+        add(
+            "Use read to examine files instead of cat or sed.".to_string(),
+            &mut guidelines,
+            &mut seen,
+        );
+    }
+    if has("edit") {
+        for g in [
+            "Use edit for precise changes (edits[].old_string must match exactly)",
+            "When changing multiple separate locations in one file, use one edit call with multiple \
+             entries in edits[] instead of multiple edit calls",
+            "Each edits[].old_string is matched against the original file, not after earlier edits are \
+             applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
+            "Keep edits[].old_string as small as possible while still being unique in the file. Do not \
+             pad with large unchanged regions.",
+        ] {
+            add(g.to_string(), &mut guidelines, &mut seen);
+        }
+    }
+    if has("write") {
+        add(
+            "Use write only for new files or complete rewrites.".to_string(),
+            &mut guidelines,
+            &mut seen,
+        );
+    }
     for g in extra_guidelines {
         let g = g.trim();
         if !g.is_empty() {
@@ -139,6 +172,22 @@ enum Command {
         /// Max loop iterations before bailing.
         #[arg(long, default_value_t = agent_core::agent::DEFAULT_MAX_STEPS)]
         max_steps: u32,
+        /// Use the 1-hour prompt-cache TTL (vs 5 minutes); helps when turns are spaced out. `serve`'s
+        /// identical flag; `run`'s one-shot single-turn case rarely benefits, but a multi-message
+        /// invocation (several `tasks` sent as sequential turns) can.
+        #[arg(long, default_value_t = false)]
+        cache_long: bool,
+        /// Enable extended thinking with this token budget (must be below the per-turn max tokens).
+        /// `serve`'s identical flag; unlike `serve`, `run` has no thinking-level cycling, so this is
+        /// applied as-is with no per-model default derivation when omitted.
+        #[arg(long)]
+        thinking: Option<u32>,
+        /// Reasoning effort for models driven by an effort level rather than a token budget (OpenAI
+        /// reasoning models via `reasoning_effort`; Anthropic adaptive-thinking models via
+        /// `output_config.effort`). One of minimal/low/medium/high/xhigh. Ignored by models that take
+        /// neither shape. `serve`'s identical flag.
+        #[arg(long, value_parser = parse_reasoning_effort)]
+        reasoning_effort: Option<agent_core::ReasoningEffort>,
         /// Trust `cwd` for this run only, so a project-local `.claude/SYSTEM.md` is honored even if
         /// `cwd` isn't in the persisted allowlist (`agent trust <path>`). A session-scoped override,
         /// not a permanent grant — see `agent trust` to record one.
@@ -150,6 +199,30 @@ enum Command {
         /// somehow given.
         #[arg(long, default_value_t = false)]
         force_untrusted: bool,
+        /// Compaction headroom (tokens) reserved below the context window before it fires. Defaults to
+        /// `CompactionConfig::default()`'s 24,000. `serve`'s identical flag.
+        #[arg(long, env = "AI_AGENT_COMPACTION_RESERVE_TOKENS")]
+        compaction_reserve_tokens: Option<u32>,
+        /// Roughly how many tokens of recent conversation compaction keeps verbatim. Defaults to
+        /// `CompactionConfig::default()`'s 40,000. `serve`'s identical flag.
+        #[arg(long, env = "AI_AGENT_COMPACTION_KEEP_RECENT_TOKENS")]
+        compaction_keep_recent_tokens: Option<u32>,
+        /// How many times to retry a gateway request that fails before the first response byte
+        /// arrives. Defaults to 3. `serve`'s identical flag.
+        #[arg(long, env = "AI_AGENT_RETRY_MAX_RETRIES")]
+        retry_max_retries: Option<u32>,
+        /// Base of the exponential backoff between those retries, in milliseconds. Defaults to 250.
+        /// `serve`'s identical flag.
+        #[arg(long, env = "AI_AGENT_RETRY_BASE_DELAY_MS")]
+        retry_base_delay_ms: Option<u64>,
+        /// Default `bash` command timeout (ms) when the model omits `timeout_ms`. Defaults to 1,800,000
+        /// (30 minutes). `serve`'s identical flag.
+        #[arg(long, env = "AI_AGENT_BASH_TIMEOUT_MS")]
+        bash_timeout_ms: Option<u64>,
+        /// Run `bash` commands through this shell instead of the auto-resolved one (`/bin/bash`, else
+        /// `bash` on `$PATH`, else `sh`). Matches pi's own `shellPath` setting. `serve`'s identical flag.
+        #[arg(long, env = "AI_AGENT_BASH_SHELL_PATH")]
+        bash_shell_path: Option<String>,
         /// Restrict the tool set to exactly these names (comma-separated), dropping everything else.
         /// Combine with `--exclude-tools` to carve one back out of the allow-list.
         #[arg(long, value_delimiter = ',')]
@@ -161,14 +234,20 @@ enum Command {
         /// Register no tools at all — a pure-conversation run. Wins over `--tools`/`--exclude-tools`.
         #[arg(long, default_value_t = false)]
         no_tools: bool,
-        /// Disable skills discovery/loading — no `<available_skills>` listing in the system prompt, and
-        /// a `/skill:name` invocation in the task message is sent through unexpanded. Matches pi's own
-        /// `--no-skills`. A one-shot `run` has no `reload` to re-enable it mid-process, unlike `serve`.
+        /// Disable *standard-root* skills discovery/loading (`~/.claude/skills`, `<cwd>/.claude/skills`)
+        /// — no `<available_skills>` listing in the system prompt from either, and a `/skill:name`
+        /// invocation in the task message is sent through unexpanded unless it resolves against a
+        /// `--skill` path instead. An explicit `--skill <path>` is still honored even so — pi's own
+        /// `--no-skills` does the same (a documented, tested combination: it's a way to say "nothing
+        /// auto-discovered, only what I explicitly listed", not "no skills at all"). A one-shot `run`
+        /// has no `reload` to re-enable it mid-process, unlike `serve`.
         #[arg(long, default_value_t = false)]
         no_skills: bool,
-        /// Disable prompt-template discovery/loading — a `/name` invocation in the task message is sent
-        /// through unexpanded instead of being resolved against `.claude/prompts/*.md`. Matches pi's own
-        /// `--no-prompt-templates`.
+        /// Disable *standard-root* prompt-template discovery/loading (`~/.claude/prompts`,
+        /// `<cwd>/.claude/prompts`) — a `/name` invocation in the task message is sent through
+        /// unexpanded unless it resolves against a `--prompt-template` path instead. An explicit
+        /// `--prompt-template <path>` is still honored even so, matching `--no-skills`'s identical
+        /// carve-out and pi's own `--no-prompt-templates`.
         #[arg(long, default_value_t = false)]
         no_prompt_templates: bool,
         /// Do not discover/inject AGENTS.md / CLAUDE.md project-instruction files. Matches `serve`'s
@@ -186,10 +265,11 @@ enum Command {
         #[arg(long = "prompt-template", value_name = "PATH")]
         extra_prompt_template_paths: Vec<String>,
         /// Set this run's session name up front, before the first turn even starts — a whitespace-only
-        /// value is rejected rather than silently producing a blank/meaningless name. Matches pi's own
-        /// `--name`; the RPC `set_session_name` command (`serve` only) covers renaming an already-running
-        /// session, this covers naming one from the very start.
-        #[arg(long)]
+        /// value is rejected rather than silently producing a blank/meaningless name, matching pi's own
+        /// `--name` validation. Unlike pi (renames unconditionally on every invocation), only takes
+        /// effect on a genuinely fresh session — see the fresh-only check in `serve`, a deliberate
+        /// deviation. The RPC `set_session_name` command covers renaming an already-running session.
+        #[arg(short = 'n', long)]
         name: Option<String>,
         /// An extra guideline bullet appended to the default system prompt's `Guidelines:` section
         /// (repeatable) — pi's own `promptGuidelines`. Deduplicated and trimmed against the built-in
@@ -335,15 +415,19 @@ enum Command {
         /// list instead.
         #[arg(long, env = "AI_AGENT_MODELS", value_delimiter = ',')]
         models: Option<Vec<String>>,
-        /// Disable skills discovery/loading — no `<available_skills>` listing in the system prompt, and
-        /// a `/skill:name` invocation (however it reaches the session — `prompt`, `steer`, `follow_up`)
-        /// is sent through unexpanded. Matches pi's own `--no-skills` and `run`'s identical flag; applies
+        /// Disable *standard-root* skills discovery/loading (`~/.claude/skills`, `<cwd>/.claude/skills`)
+        /// — no `<available_skills>` listing in the system prompt from either, and a `/skill:name`
+        /// invocation (however it reaches the session — `prompt`, `steer`, `follow_up`) is sent through
+        /// unexpanded unless it resolves against a `--skill` path instead. An explicit `--skill <path>`
+        /// is still honored even so, matching `run`'s identical flag and pi's own `--no-skills`. Applies
         /// on every `reload` too.
         #[arg(long, default_value_t = false)]
         no_skills: bool,
-        /// Disable prompt-template discovery/loading — a `/name` invocation is sent through unexpanded
-        /// instead of being resolved against `.claude/prompts/*.md`. Matches pi's own
-        /// `--no-prompt-templates` and `run`'s identical flag; applies on every `reload` too.
+        /// Disable *standard-root* prompt-template discovery/loading (`~/.claude/prompts`,
+        /// `<cwd>/.claude/prompts`) — a `/name` invocation is sent through unexpanded unless it resolves
+        /// against a `--prompt-template` path instead. An explicit `--prompt-template <path>` is still
+        /// honored even so, matching `run`'s identical flag and pi's own `--no-prompt-templates`. Applies
+        /// on every `reload` too.
         #[arg(long, default_value_t = false)]
         no_prompt_templates: bool,
         /// Discover skills from this directory too, in addition to the two standard roots (repeatable).
@@ -356,9 +440,11 @@ enum Command {
         #[arg(long = "prompt-template", value_name = "PATH")]
         extra_prompt_template_paths: Vec<String>,
         /// Set the initial session's name up front, before the first turn even starts — a whitespace-only
-        /// value is rejected. Matches pi's own `--name`; the RPC `set_session_name` command covers
-        /// renaming afterward.
-        #[arg(long)]
+        /// value is rejected, matching pi's own `--name`. Unlike pi (which renames unconditionally on
+        /// every invocation, last-write-wins), this only ever takes effect on a genuinely fresh session
+        /// — see the fresh-only check in `run_task`/`serve` for why: a deliberate deviation, not an
+        /// oversight. The RPC `set_session_name` command covers renaming an existing session afterward.
+        #[arg(short = 'n', long)]
         name: Option<String>,
         /// An extra guideline bullet appended to the default system prompt's `Guidelines:` section
         /// (repeatable) — pi's own `promptGuidelines`; `run`'s identical flag. Has no effect when
@@ -427,8 +513,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             gateway_url,
             key,
             max_steps,
+            cache_long,
+            thinking,
+            reasoning_effort,
             trust_project,
             force_untrusted,
+            compaction_reserve_tokens,
+            compaction_keep_recent_tokens,
+            retry_max_retries,
+            retry_base_delay_ms,
+            bash_timeout_ms,
+            bash_shell_path,
             tools,
             exclude_tools,
             no_tools,
@@ -451,8 +546,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 gateway_url,
                 key,
                 max_steps,
+                cache_long,
+                thinking,
+                reasoning_effort,
                 trust_project,
                 force_untrusted,
+                compaction_reserve_tokens,
+                compaction_keep_recent_tokens,
+                retry_max_retries,
+                retry_base_delay_ms,
+                bash_timeout_ms,
+                bash_shell_path,
                 tools,
                 exclude_tools,
                 no_tools,
@@ -703,6 +807,10 @@ async fn run_turn(
                     "\n[transient error, retrying {attempt}/{}: {e}]",
                     beyond_ai_agent::retry::MAX_RUN_RETRIES
                 );
+                // The failed attempt's closing error record must not survive into the retry — see
+                // `Session::pop_error_record`'s doc comment (this is the same run resuming from
+                // scratch, not a fresh prompt).
+                session.pop_error_record();
                 tokio::time::sleep(delay).await;
             }
             _ => return result,
@@ -820,6 +928,27 @@ fn expand_message(
     beyond_ai_agent::prompts::expand_if_slash(&message, prompt_templates)
 }
 
+/// Whether `id` is safe to embed directly in a filename component — alphanumeric, optionally with
+/// `.`/`_`/`-` in the middle, starting and ending with a letter or digit. Matches pi's
+/// `assertValidSessionId` (`^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$`); rejects anything that could
+/// resolve to a path outside the sessions directory (a leading `/` or `..`, an embedded `/`, etc.) or
+/// be empty.
+fn is_valid_session_id(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    let is_alnum = |b: u8| b.is_ascii_alphanumeric();
+    match bytes {
+        [] => false,
+        [only] => is_alnum(*only),
+        [first, .., last] => {
+            is_alnum(*first)
+                && is_alnum(*last)
+                && bytes
+                    .iter()
+                    .all(|&b| is_alnum(b) || b == b'.' || b == b'_' || b == b'-')
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_task(
     tasks: Vec<String>,
@@ -827,8 +956,17 @@ async fn run_task(
     gateway_url: Option<String>,
     key: Option<String>,
     max_steps: u32,
+    cache_long: bool,
+    thinking: Option<u32>,
+    reasoning_effort: Option<agent_core::ReasoningEffort>,
     trust_project: bool,
     force_untrusted: bool,
+    compaction_reserve_tokens: Option<u32>,
+    compaction_keep_recent_tokens: Option<u32>,
+    retry_max_retries: Option<u32>,
+    retry_base_delay_ms: Option<u64>,
+    bash_timeout_ms: Option<u64>,
+    bash_shell_path: Option<String>,
     tools_allow: Option<Vec<String>>,
     tools_exclude: Option<Vec<String>>,
     no_tools: bool,
@@ -852,6 +990,19 @@ async fn run_task(
     if let Some(n) = &name {
         if n.trim().is_empty() {
             return Err("--name requires a non-empty value".into());
+        }
+    }
+    // `--session-id` is embedded directly into a filename (`SessionMeta::with_id` →
+    // `SessionRepo::path_for`'s `{created_at}_{id}.jsonl`) with no other sanitization — an id like
+    // `../../../tmp/pwned/evil` would write (and `mkdir -p`, since `SessionStore::create` does that
+    // too) outside the intended sessions directory. Matches pi's own `assertValidSessionId`.
+    if let Some(id) = &session_id {
+        if !is_valid_session_id(id) {
+            return Err(format!(
+                "--session-id {id:?} is invalid: must contain only letters, digits, '.', '_', '-', \
+                 and start/end with a letter or digit — it becomes part of a filesystem path"
+            )
+            .into());
         }
     }
     let mut timing = beyond_ai_agent::timing::StartupTiming::new();
@@ -881,6 +1032,12 @@ async fn run_task(
     timing.mark("compose initial message");
 
     let gateway = gateway_url.unwrap_or_else(|| DEFAULT_GATEWAY.to_string());
+    // Whether the operator explicitly passed `--model`, as opposed to `run` silently falling back to
+    // `DEFAULT_MODEL` — the distinction a reopened `--session`/`--continue` needs below to know whether
+    // to keep going on the model the session was actually last driven on instead of quietly switching
+    // it, the same bug class `switch_session` had (see `Persistence::model_and_level_at_active` in
+    // `serve.rs`).
+    let model_explicit = model.is_some();
     let model = model.unwrap_or_else(|| DEFAULT_MODEL.to_string());
     let key =
         key.ok_or("no gateway key: pass --key or set AI_AGENT_KEY (a bai_v1… virtual key)")?;
@@ -892,21 +1049,24 @@ async fn run_task(
     // `serve`. `/skill:name` and `/name` prompt-template invocations are expanded here exactly like
     // `serve`'s own "prompt" handler does — this was previously silently skipped in `run`, so a message
     // starting with either was sent to the model as a literal, unexpanded string instead.
-    // `--no-skills`/`--no-prompt-templates` skip discovery outright rather than discovering and then
-    // discarding — matching pi's own flags, and avoiding a needless filesystem walk when the operator
-    // has already said neither is wanted.
+    // `--no-skills`/`--no-prompt-templates` skip *standard-root* discovery outright rather than
+    // discovering and then discarding — matching pi's own flags, and avoiding a needless filesystem walk
+    // when the operator has already said neither standard root is wanted. An explicit `--skill`/
+    // `--prompt-template` extra path is still honored even so — pi's own `noSkills`/`noPromptTemplates`
+    // do the same (a documented, tested combination; see `skills::discover_extra_only`'s doc comment —
+    // pi-parity fix, M2), so `--no-skills --skill ./foo` isn't a self-contradicting no-op.
     let skills = if no_skills {
-        Vec::new()
+        beyond_ai_agent::skills::discover_extra_only(&extra_skill_paths).0
     } else {
         beyond_ai_agent::skills::discover(&cwd, project_trusted, &extra_skill_paths)
     };
     let prompt_templates = if no_prompt_templates {
-        Vec::new()
+        beyond_ai_agent::prompts::discover_extra_only(&extra_prompt_template_paths).0
     } else {
         beyond_ai_agent::prompts::discover(&cwd, project_trusted, &extra_prompt_template_paths)
     };
     timing.mark("discover skills/prompt templates");
-    let mut registry = tools::default_registry();
+    let mut registry = tools::default_registry_with(bash_timeout_ms, bash_shell_path.as_deref());
     tools::apply_filter(
         &mut registry,
         tools_allow.as_deref(),
@@ -933,9 +1093,10 @@ async fn run_task(
     // reopening an existing `--session <path>` or resuming via `--continue` already has a fixed id from
     // disk. Matches pi's own `--session-id`: a known, predictable id for a script/test harness to
     // correlate against, instead of parsing it back out of the run's own output.
-    // `--name`, like `--session-id`, only ever applies where a *new* `SessionMeta` is minted — reopening
-    // an existing session shouldn't get silently renamed just because the flag happened to be passed
-    // again on a later invocation.
+    // `--name`: seeded here for the in-memory-only case (no store at all, so the post-hoc check below
+    // never runs) and for a brand-new `--session <path>` file (already fresh, so that check is a
+    // harmless no-op there). The `--continue` and reopened-`--session` cases are handled uniformly by
+    // that check instead, since they don't go through this closure — see its comment below.
     let fresh_meta = || {
         let mut meta = match &session_id {
             Some(id) => SessionMeta::with_id(id.clone(), &cwd_str, &model),
@@ -944,7 +1105,7 @@ async fn run_task(
         meta.title = name.clone();
         meta
     };
-    let (store, mut session) = match session_path {
+    let (mut store, mut session) = match session_path {
         Some(path) => {
             let path = PathBuf::from(path);
             // A zero-byte file at `path` (e.g. `touch`'d ahead of time, or left over from a crash
@@ -952,7 +1113,30 @@ async fn run_task(
             // now initializes an empty file in place rather than failing (see its own doc comment).
             let has_content = path.metadata().is_ok_and(|m| m.len() > 0);
             if has_content {
-                let (store, session) = SessionStore::open(path)?;
+                // pi-parity fix (C-M6): bare `?` here propagated the raw `std::io::Error` straight to
+                // `main`'s `Result`, which Rust's default `Termination` impl prints via `{:?}` — a
+                // Debug dump of the error's internal shape (`Custom { kind: InvalidData, error: "..." }`)
+                // with no file path at all, matching neither pi's own clear
+                // `"Error: Session file is not a valid pi session: <path>"` nor this project's own
+                // no-leaked-internals bar for user-facing errors. Wrapping in a plain `String` message
+                // (still `Error: "..."` once printed, but a human-readable sentence, not an internal
+                // struct shape) and naming `path` fixes both: the operator now sees *which* file and
+                // *why*, instead of guessing.
+                // pi-parity fix (C-M6): bare `?` here propagated the raw `std::io::Error` straight to
+                // `main`'s `Result`, which Rust's default `Termination` impl prints via `{:?}` — a
+                // Debug dump of the error's internal shape (`Custom { kind: InvalidData, error: "..." }`)
+                // with no file path at all, matching neither pi's own clear
+                // `"Error: Session file is not a valid pi session: <path>"` nor this project's own
+                // no-leaked-internals bar for user-facing errors. Wrapping in a plain `String` message
+                // (still `Error: "..."` once printed, but a human-readable sentence, not an internal
+                // struct shape) and naming `path` fixes both: the operator now sees *which* file and
+                // *why*, instead of guessing.
+                let (store, session) = SessionStore::open(path.clone()).map_err(|e| {
+                    format!(
+                        "session file is not a valid session: {}: {e}",
+                        path.display()
+                    )
+                })?;
                 (Some(store), session)
             } else {
                 let store = SessionStore::create(path, fresh_meta())?;
@@ -966,14 +1150,60 @@ async fn run_task(
         }
         None => (None, Session::new()),
     };
+    // `--name`, applied uniformly across every path above (mirrors `serve`'s own startup check) —
+    // only for a genuinely fresh session (no messages, no title yet). `--continue`'s `resume_or_create`
+    // branch above mints its own fresh `SessionMeta` internally when no cwd match exists, bypassing the
+    // `fresh_meta` closure other branches use, so this was previously the one path `--name` silently
+    // never reached even when it *did* open a brand-new session.
+    if let Some(name) = &name {
+        if session.messages.is_empty() {
+            if let Some(store) = &mut store {
+                if store.meta().title.is_none() {
+                    store.set_title(name)?;
+                }
+            }
+        }
+    }
     let meta = store
         .as_ref()
         .map(|s| s.meta().clone())
         .unwrap_or_else(fresh_meta);
+    // Prefer the session's own persisted model over the CLI-resolved default when reopening an
+    // existing `--session`/`--continue` session and the operator didn't explicitly pass `--model` —
+    // the same bug class `switch_session` had in `serve.rs` (see `Persistence::model_and_level_at_active`
+    // there): without this, reattaching to a session last driven on `gpt-5` without re-passing `--model`
+    // silently continued it on whatever `DEFAULT_MODEL` resolves to instead, no warning. For a
+    // genuinely fresh session `meta.model` already equals `model` (`fresh_meta` seeds it from the same
+    // value), so this is a no-op there.
+    let model = if model_explicit {
+        model
+    } else {
+        meta.model.clone()
+    };
+    // A genuinely fresh session's `cwd` always equals the current one (just stamped by `fresh_meta`),
+    // so this only fires for a reopened `--session`/`--continue` session — the recorded directory was
+    // moved/deleted, or this process simply isn't running where the session was created (e.g. a
+    // `--session-dir` shared across projects). `serve` already surfaces the identical check as
+    // `cwd_stale` on its RPC responses; `run` had no equivalent at all, matching pi's
+    // `MissingSessionCwdError` guard. Informational, not fatal — the tools underneath will surface
+    // their own, more specific errors if this actually matters for the task at hand.
+    if serve::cwd_is_stale(&meta.cwd, &cwd) {
+        eprintln!(
+            "warning: this session's recorded working directory ({}) does not match the current one \
+             ({}); tools will operate against the current directory",
+            meta.cwd,
+            cwd.display()
+        );
+    }
     timing.mark("open session");
     timing.print();
 
-    let client = GatewayClient::new(gateway, key)?;
+    let client = GatewayClient::new(gateway, key)?.with_retry(
+        retry_max_retries.unwrap_or(agent_core::client::MAX_RETRIES),
+        retry_base_delay_ms
+            .map(std::time::Duration::from_millis)
+            .unwrap_or(agent_core::client::BASE_BACKOFF),
+    );
     // Shared with `DirectCheckpoint` below (built before `agent`, so the hook can be installed at
     // construction) so a long multi-step turn (many tool round-trips) is persisted incrementally —
     // the same guarantee `serve` gives every session. Without this, only the *end* of each whole
@@ -981,11 +1211,34 @@ async fn run_task(
     // crash mid-turn — after several tool round-trips already ran real commands/edited real files —
     // lost all record of them with no session trace at all.
     let store = Arc::new(std::sync::Mutex::new(store));
-    let agent = Agent::new(Arc::new(client), model.clone())
+    // Matches `serve`'s own `build_agent`: defaults to the model's own capability-table context
+    // window when `--context-window` isn't given (`run` has no such flag to override it with, unlike
+    // `serve` — not part of this port's scope), then applies the reserve/keep-recent overrides.
+    let mut compaction = agent_core::CompactionConfig {
+        context_window: agent_core::capabilities(&model).context_window,
+        ..agent_core::CompactionConfig::default()
+    };
+    if let Some(reserve) = compaction_reserve_tokens {
+        compaction.reserve_tokens = reserve;
+    }
+    if let Some(keep_recent) = compaction_keep_recent_tokens {
+        compaction.keep_recent_tokens = keep_recent;
+    }
+    let mut agent = Agent::new(Arc::new(client), model.clone())
         .with_tools(registry)
         .with_system(system)
         .with_max_steps(max_steps)
+        .with_compaction(compaction)
+        .with_cache_long(cache_long)
         .with_checkpoint_hook(Arc::new(DirectCheckpoint(store.clone())));
+    // Unlike `serve`, `run` has no thinking-level cycling — these are applied as-is, with no per-model
+    // default derivation when omitted (matching `run`'s prior behavior of not setting either at all).
+    if let Some(budget) = thinking {
+        agent = agent.with_thinking(budget);
+    }
+    if let Some(effort) = reasoning_effort {
+        agent = agent.with_reasoning_effort(effort);
+    }
 
     if json {
         // A leading header line so a `--json` consumer can identify the session before any event
@@ -1050,6 +1303,32 @@ mod tests {
     use agent_core::Error;
     use agent_core::mock::{MockTransport, turn};
 
+    #[test]
+    fn is_valid_session_id_accepts_ordinary_ids() {
+        assert!(is_valid_session_id("abc123"));
+        assert!(is_valid_session_id("a"));
+        assert!(is_valid_session_id("my-session_id.v2"));
+        assert!(is_valid_session_id("18be91b27c544ffa-19b6811ee53adb5c-0"));
+    }
+
+    #[test]
+    fn is_valid_session_id_rejects_path_traversal_and_separators() {
+        // pi-parity fix: this id is embedded directly into a filename component with no other
+        // sanitization — must reject anything that could resolve outside the sessions directory.
+        assert!(!is_valid_session_id("../../../tmp/pwned/evil"));
+        assert!(!is_valid_session_id("/etc/passwd"));
+        assert!(!is_valid_session_id("foo/bar"));
+        assert!(!is_valid_session_id("foo\\bar"));
+    }
+
+    #[test]
+    fn is_valid_session_id_rejects_empty_and_edge_punctuation() {
+        assert!(!is_valid_session_id(""));
+        assert!(!is_valid_session_id(".hidden"));
+        assert!(!is_valid_session_id("trailing-"));
+        assert!(!is_valid_session_id("-leading"));
+    }
+
     #[tokio::test]
     async fn direct_checkpoint_persists_incrementally_during_a_multi_tool_round_trip_run() {
         // Two tool round-trips, then a final text turn. `DirectCheckpoint` must have already written
@@ -1090,6 +1369,213 @@ mod tests {
             "checkpoints during the run must have persisted the tool round-trips that already \
              happened, not just whatever `persist_run_tail` would add after the fact: {:?}",
             disk_session.messages
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_real_write_call_mid_flight_still_serializes_a_second_real_write_behind_it()
+     {
+        // pi: file-mutation-queue.test.ts, "keeps write queue locked while an aborted write is still
+        // in flight" — the exact end-to-end scenario: while a write is cancelled but still conceptually
+        // "in flight", a second write to the *same path*, dispatched concurrently on a completely
+        // separate `Agent`/session, must not even *start* until the first's lock is genuinely released
+        // — and must end up as the file's final content (no interleaving/corruption). `write_lock.rs`'s
+        // own unit tests already prove the registry's `Drop`-tied release in isolation, with a synthetic
+        // critical section (`aborting_a_lock_holder_mid_critical_section_releases_the_lock_only_at_that_
+        // point`); this drives the same guarantee through the *real* `write` tool
+        // (`beyond_ai_agent::tools::write::Write`) and the real `agent_core::Agent`
+        // dispatch/`write_target`-grouping path (`agent.rs`'s `group_runs`), across two independent,
+        // genuinely concurrent `Agent::run` calls sharing one `WriteLockRegistry` — the same
+        // two-runs-sharing-a-registry shape `same_write_target_serializes_across_two_agent_runs_sharing_
+        // a_registry` (agent-core's own test module) uses for the non-cancellation version of this,
+        // with cancellation of the first layered in.
+        //
+        // Both runs (plus a third "controller" branch) are driven concurrently via one `tokio::join!`
+        // — `run_events_cancellable`'s sink is a boxed `dyn FnMut`, so the resulting future isn't
+        // `Send` and can't be `tokio::spawn`ed directly; `join!` polls all three cooperatively on this
+        // task instead, which is all genuine interleaving needs here. The controller branch is what
+        // makes this a real concurrency proof rather than two runs that merely happen to execute in a
+        // safe order: it waits until A has demonstrably started (and so acquired the lock), asserts B's
+        // own `run` has *not* started within a generous window while A is still holding the lock and
+        // uncancelled, and only then triggers cancellation. (An earlier, sequential-only version of
+        // this test — run A to completion, then run B — passed even with the cross-run lock acquisition
+        // deleted outright, since nothing was left to race by the time B started; this shape doesn't:
+        // deleting the lock acquisition makes the "B must still be blocked" assertion below fail.)
+        //
+        // Real `Write::run` has no internal `.await` at all (`write_atomic` is synchronous fs I/O — see
+        // its doc comment): so, unlike pi's Node `fs.writeFile`, a task cancellation can never land
+        // *mid*-write for this tool; it only ever lands strictly before the mutation starts or strictly
+        // after it's already committed (a *stronger* guarantee than pi's own — a cancelled write here
+        // can never leave a half-written file, full stop). `GatedWrite` below simulates the "genuinely
+        // still in flight" window pi's async write creates by delegating `write_target` to the real tool
+        // (so grouping/locking uses the real path-normalization logic) but gating entry to the real
+        // mutation behind a signal the tool itself never releases — cancellation is therefore the *only*
+        // way that call ever ends.
+        use agent_core::{CancellationToken, Error, ToolOutput, ToolRegistry, WriteLockRegistry};
+        use async_trait::async_trait;
+        use std::time::Duration;
+
+        /// Delegates schema/`write_target` to the real `write` tool, but signals `started` (via a
+        /// `watch` — not `Notify`, since two independent branches below each need to observe this same
+        /// transition) and then blocks forever instead of ever performing the real mutation —
+        /// cancellation is the only way this call ends, so its lock is held for as long as the run is
+        /// willing to wait.
+        struct GatedWrite {
+            started: tokio::sync::watch::Sender<bool>,
+        }
+        #[async_trait]
+        impl agent_core::tool::Tool for GatedWrite {
+            fn name(&self) -> &str {
+                "write"
+            }
+            fn description(&self) -> &str {
+                "gated write (test double delegating to the real `write` tool's schema/write_target)"
+            }
+            fn input_schema(&self) -> serde_json::Value {
+                tools::write::Write.input_schema()
+            }
+            fn write_target(&self, input: &serde_json::Value) -> Option<String> {
+                tools::write::Write.write_target(input)
+            }
+            async fn run(
+                &self,
+                _input: serde_json::Value,
+            ) -> std::result::Result<ToolOutput, agent_core::ToolError> {
+                let _ = self.started.send(true);
+                futures::future::pending::<()>().await;
+                unreachable!(
+                    "cancellation must have ended this call before the pending future ever resolves"
+                )
+            }
+        }
+
+        /// The real `write` tool, plus a `started` signal fired the instant its `run` actually begins
+        /// — i.e. the instant it has already acquired the write lock — so the test can tell "blocked,
+        /// still waiting on the lock" apart from "running".
+        struct ObservedWrite {
+            started: Arc<tokio::sync::Notify>,
+        }
+        #[async_trait]
+        impl agent_core::tool::Tool for ObservedWrite {
+            fn name(&self) -> &str {
+                "write"
+            }
+            fn description(&self) -> &str {
+                tools::write::Write.description()
+            }
+            fn input_schema(&self) -> serde_json::Value {
+                tools::write::Write.input_schema()
+            }
+            fn write_target(&self, input: &serde_json::Value) -> Option<String> {
+                tools::write::Write.write_target(input)
+            }
+            async fn run(
+                &self,
+                input: serde_json::Value,
+            ) -> std::result::Result<ToolOutput, agent_core::ToolError> {
+                self.started.notify_one();
+                tools::write::Write.run(input).await
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("shared.txt");
+        let registry = Arc::new(WriteLockRegistry::new());
+
+        // Run A: the gated write. Its guard is held until cancellation, and only ever fires
+        // `a_started` from inside `Tool::run` — i.e. strictly *after* the group has already acquired
+        // `target`'s write lock (see `agent.rs`'s `group_runs`).
+        let (a_started_tx, a_started_rx) = tokio::sync::watch::channel(false);
+        let mut tools_a = ToolRegistry::new();
+        tools_a.register(Arc::new(GatedWrite {
+            started: a_started_tx,
+        }));
+        let write_args_a =
+            serde_json::json!({ "path": target.to_str().unwrap(), "content": "first\n" })
+                .to_string();
+        let mock_a = Arc::new(MockTransport::new(vec![
+            turn::tool_call("1", "write", &write_args_a),
+            turn::text("done"),
+        ]));
+        let agent_a = Agent::new(mock_a, "claude-test")
+            .with_tools(tools_a)
+            .with_write_locks(registry.clone());
+        let cancel = CancellationToken::new();
+        let cancel_for_a = cancel.clone();
+        let a_run = async move {
+            let mut session_a = Session::new();
+            session_a.user("write the first file");
+            agent_a
+                .run_events_cancellable(&mut session_a, |_| {}, cancel_for_a)
+                .await
+        };
+
+        // Run B: the real `write` tool, targeting the *same* path, on a completely separate `Agent`,
+        // sharing the same registry — but its dispatch doesn't even begin until `a_started` fires, so
+        // it can only ever race the lock *after* A has demonstrably already acquired it (never before).
+        let b_started = Arc::new(tokio::sync::Notify::new());
+        let mut tools_b = ToolRegistry::new();
+        tools_b.register(Arc::new(ObservedWrite {
+            started: b_started.clone(),
+        }));
+        let write_args_b =
+            serde_json::json!({ "path": target.to_str().unwrap(), "content": "second\n" })
+                .to_string();
+        let mock_b = Arc::new(MockTransport::new(vec![
+            turn::tool_call("2", "write", &write_args_b),
+            turn::text("done"),
+        ]));
+        let agent_b = Agent::new(mock_b, "claude-test")
+            .with_tools(tools_b)
+            .with_write_locks(registry.clone());
+        let mut a_started_rx_for_b = a_started_rx.clone();
+        let b_run = async move {
+            let _ = a_started_rx_for_b.changed().await;
+            let mut session_b = Session::new();
+            session_b.user("write the second file");
+            agent_b.run(&mut session_b, |_| {}).await
+        };
+
+        // The controller: the crux of the test. Once A has genuinely started (and so holds the lock),
+        // confirm B has *not* — a generous window, well past anything scheduling jitter could explain
+        // — then only trigger cancellation once that's confirmed.
+        let mut a_started_rx_for_controller = a_started_rx;
+        let target_for_controller = target.clone();
+        let controller = async move {
+            let _ = a_started_rx_for_controller.changed().await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), b_started.notified())
+                    .await
+                    .is_err(),
+                "the second write must not start while the first call's lock is still held and \
+                 uncancelled"
+            );
+            assert!(
+                !target_for_controller.exists(),
+                "neither write has actually run yet — the file must not exist"
+            );
+            cancel.cancel();
+        };
+
+        let (result_a, result_b, ()) = tokio::time::timeout(
+            Duration::from_secs(5),
+            futures::future::join3(a_run, b_run, controller),
+        )
+        .await
+        .expect("the whole scenario must not deadlock");
+
+        assert!(
+            matches!(result_a, Err(Error::Cancelled)),
+            "got: {result_a:?}"
+        );
+        // B must have completed cleanly once A's (now-released) lock let it proceed.
+        result_b.expect("run B's own result must be Ok");
+
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "second\n",
+            "the second, real write must be the file's final content — no interleaving/corruption \
+             from the cancelled first call"
         );
     }
 
@@ -1200,6 +1686,43 @@ mod tests {
         let full = tools::default_registry();
         let prompt = default_system_prompt(&full, &[]);
         assert!(!prompt.contains("Use bash for file operations like ls, rg, find"));
+    }
+
+    #[test]
+    fn default_system_prompt_includes_pis_per_tool_guidelines_for_read_edit_write() {
+        // pi-parity fix: pi declares real default guidance on its read/edit/write tool definitions
+        // (`promptGuidelines`), collected automatically whenever the tool is registered — we ported
+        // only the operator-typed `--prompt-guideline` mechanism, not this content, so a model never
+        // got told (for example) edit's exact-match/non-overlapping-edit semantics unless an operator
+        // happened to type the same guidance in by hand.
+        let registry = tools::default_registry();
+        let prompt = default_system_prompt(&registry, &[]);
+        assert!(
+            prompt.contains("Use read to examine files instead of cat or sed."),
+            "got: {prompt}"
+        );
+        assert!(
+            prompt.contains("Use edit for precise changes (edits[].old_string must match exactly)"),
+            "got: {prompt}"
+        );
+        assert!(
+            prompt.contains("Keep edits[].old_string as small as possible"),
+            "got: {prompt}"
+        );
+        assert!(
+            prompt.contains("Use write only for new files or complete rewrites."),
+            "got: {prompt}"
+        );
+    }
+
+    #[test]
+    fn default_system_prompt_omits_a_tools_guidelines_when_the_tool_is_not_registered() {
+        let mut only_bash = agent_core::tool::ToolRegistry::new();
+        only_bash.register(std::sync::Arc::new(tools::bash::Bash::real()));
+        let prompt = default_system_prompt(&only_bash, &[]);
+        assert!(!prompt.contains("Use read to examine files"));
+        assert!(!prompt.contains("Use edit for precise changes"));
+        assert!(!prompt.contains("Use write only for new files"));
     }
 
     #[test]

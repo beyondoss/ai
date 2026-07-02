@@ -150,19 +150,47 @@ impl Tool for Read {
         // saved under a missing or wrong extension (an extensionless clipboard/screenshot temp file, a
         // `.dat`) is still detected correctly, not silently UTF-8-decoded into garbage text. The
         // extension only matters as a fallback when sniffing can't identify a format at all (a
-        // truncated/corrupt file whose header doesn't parse) — the file *shouldn't* also fail the read
-        // below, so may as well route it through the clearer "image, but unreadable" error instead of a
-        // confusing UTF-8-decode one. `read_image` re-sniffs internally too (for the *reported* format,
-        // once it has the full file, not just this prefix).
-        if let Some(format) = sniff_image_format(&path).or_else(|| extension_image_format(&path)) {
+        // truncated/corrupt file whose header doesn't parse). `read_image` re-sniffs internally too
+        // (for the *reported* format, once it has the full file, not just this prefix).
+        //
+        // An *animated* PNG is deliberately excluded from image handling entirely, extension fallback
+        // included — see `Sniff::AnimatedPng`'s doc comment — so it falls all the way through to the
+        // ordinary text path below, the same route a corrupt/non-image file named `.png` takes.
+        let sniff = sniff_image_format(&path);
+        let sniffed_format = match sniff {
+            Sniff::Format(format) => Some(format),
+            Sniff::AnimatedPng | Sniff::Unknown => None,
+        };
+        // An animated PNG must never reach image handling at all — not even via the extension
+        // fallback below, which exists only for the genuinely *ambiguous* "sniffing found nothing"
+        // case (`Sniff::Unknown`), not for "sniffing positively identified this as unservable".
+        let format = match sniff {
+            Sniff::AnimatedPng => None,
+            _ => sniffed_format.or_else(|| extension_image_format(&path)),
+        };
+        if let Some(format) = format {
             // Decode/resize/re-encode is CPU-bound and can run for a while on a large image — matching
             // pi's `resizeImageInProcess`, which runs its WASM decode/resize/encode in a worker thread
             // specifically so it doesn't stall the event loop, keep it off this async runtime's worker
             // threads too (same pattern as `grep`/`find`'s own blocking walks).
-            let path = path.clone();
-            return tokio::task::spawn_blocking(move || read_image(&path, format))
+            let path_for_task = path.clone();
+            let result = tokio::task::spawn_blocking(move || read_image(&path_for_task, format))
                 .await
                 .map_err(|e| ToolError::Execution(format!("image read task failed: {e}")))?;
+            match result {
+                Ok(out) => return Ok(out),
+                // A real magic-byte match (`sniffed_format` is `Some`) that still fails to decode is a
+                // genuinely corrupt/truncated image — surface that as a hard error, matching the
+                // existing `a_small_file_with_valid_magic_bytes_but_no_real_image_body_is_rejected`
+                // behavior.
+                Err(err) if sniffed_format.is_some() => return Err(err),
+                // Extension-only guess (no real magic-byte match at all) that failed to decode: this
+                // "looks like an image by name only" — a Git LFS pointer file saved as `.png`, a
+                // corrupted download, or any plain-text file someone named `.jpg`. Matching pi's `read`
+                // tool (`tools.test.ts`, "should treat files with image extension but non-image content
+                // as text"), fall through to the ordinary text read below instead of erroring.
+                Err(_) => {}
+            }
         }
 
         let offset = input
@@ -274,32 +302,107 @@ impl Tool for Read {
     }
 }
 
-/// How many leading bytes are enough for `image::guess_format` to recognize any of our five supported
-/// formats: PNG's signature is 8 bytes, JPEG's SOI+marker is 2-3, GIF's is 6, BMP's is 2, and WebP's
-/// `RIFF....WEBP` header is 12 — 32 is comfortably past all of them with room to spare.
-const SNIFF_LEN: usize = 32;
+/// How many leading bytes are read once for magic-byte sniffing and, for a PNG specifically, an
+/// animated-PNG check. Bumped from a plain-magic-bytes-only 32 to pi's own `IMAGE_TYPE_SNIFF_BYTES`
+/// (`mime.ts`) 4100: PNG's signature is 8 bytes, JPEG's SOI+marker is 2-3, GIF's is 6, BMP's is 2, and
+/// WebP's `RIFF....WEBP` header is 12 (32 was already comfortably past all of those), but an animated
+/// PNG's `acTL` chunk — which, per the APNG spec, always precedes the first `IDAT` — can sit behind
+/// other ancillary chunks (`iCCP`, `sRGB`, `pHYs`, …) placed between `IHDR` and `IDAT`; 4100 bytes gives
+/// [`is_animated_png`] enough room to actually reach it in practice, matching pi's own budget exactly.
+const SNIFF_LEN: usize = 4100;
+
+/// The result of sniffing a file's leading bytes.
+enum Sniff {
+    /// A recognized, servable image format.
+    Format(image::ImageFormat),
+    /// An *animated* PNG (an `acTL` chunk precedes the first `IDAT` — see [`is_animated_png`]).
+    /// Deliberately its own variant, not folded into `Unknown`: sending a single static frame of an
+    /// animated image to a vision model as if it were the whole picture is misleading (matching pi's
+    /// `detectSupportedImageMimeType`, which returns `null` for an animated PNG so `read.ts` never
+    /// attempts to decode/serve it as an image at all — it goes straight to the ordinary text path,
+    /// the raw PNG bytes included, same as any other non-image file would). The `image` crate *can*
+    /// decode an APNG's default/first frame as an ordinary static PNG, so without this distinction the
+    /// extension-based fallback (see `Read::run`) would silently ship that one frame as if it were the
+    /// complete image — this variant exists specifically so the caller can refuse that fallback too,
+    /// not just skip the sniffed-format fast path.
+    AnimatedPng,
+    /// No recognized image signature (or the file couldn't be opened/read at all).
+    Unknown,
+}
 
 /// Peek the first [`SNIFF_LEN`] bytes of `path` and identify a real image by its magic bytes,
 /// regardless of what extension (if any) the file has — matching pi's `detectImageMimeType`, which
 /// always probes unconditionally rather than gating on the extension first. Only ever reports one of
 /// the five formats this tool actually knows how to encode/re-encode; any other format `guess_format`
 /// might recognize (TIFF, ICO, …) is treated the same as "not an image" here, since there's no
-/// supported path to serve it as an attachment. `None` on any read/probe failure (missing file, a
-/// directory, too few bytes, no recognizable header) — the caller falls back to the extension gate, or
-/// ultimately the ordinary text path.
-fn sniff_image_format(path: &str) -> Option<image::ImageFormat> {
+/// supported path to serve it as an attachment. A PNG whose chunk stream is animated (see
+/// [`is_animated_png`]) reports [`Sniff::AnimatedPng`] instead of [`Sniff::Format`], regardless of how
+/// confidently `guess_format` would otherwise call it a plain PNG. [`Sniff::Unknown`] on any read/probe
+/// failure (missing file, a directory, too few bytes, no recognizable header) — the caller falls back
+/// to the extension gate, or ultimately the ordinary text path.
+fn sniff_image_format(path: &str) -> Sniff {
     use std::io::Read as _;
     let mut buf = [0u8; SNIFF_LEN];
-    let mut f = std::fs::File::open(path).ok()?;
-    let n = f.read(&mut buf).ok()?;
-    match image::guess_format(&buf[..n]).ok()? {
-        format @ (image::ImageFormat::Png
-        | image::ImageFormat::Jpeg
-        | image::ImageFormat::Gif
-        | image::ImageFormat::WebP
-        | image::ImageFormat::Bmp) => Some(format),
-        _ => None,
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return Sniff::Unknown;
+    };
+    let Ok(n) = f.read(&mut buf) else {
+        return Sniff::Unknown;
+    };
+    let buf = &buf[..n];
+    match image::guess_format(buf) {
+        Ok(image::ImageFormat::Png) if is_animated_png(buf) => Sniff::AnimatedPng,
+        Ok(
+            format @ (image::ImageFormat::Png
+            | image::ImageFormat::Jpeg
+            | image::ImageFormat::Gif
+            | image::ImageFormat::WebP
+            | image::ImageFormat::Bmp),
+        ) => Sniff::Format(format),
+        _ => Sniff::Unknown,
     }
+}
+
+/// Whether `buf` (a PNG's leading bytes, signature included) is an *animated* PNG: an `acTL`
+/// (animation control) chunk appears before the first `IDAT` (image data) chunk — the APNG spec's own
+/// definition of "animated", and the exact check pi's `isAnimatedPng` (`mime.ts`) makes. A static PNG
+/// carrying unrelated ancillary chunks (`tEXt`, `iCCP`, …) between `IHDR` and `IDAT` correctly returns
+/// `false`; only `acTL`'s presence — always required to appear before `IDAT` per the spec — signals
+/// real animation. Returns `false` (not animated) on any malformed/truncated/oversized-beyond-`buf`
+/// chunk stream, the same conservative default pi's version uses: a corrupt file falls through to the
+/// ordinary sniff-failed/decode-failed handling instead of being silently misclassified as animated.
+fn is_animated_png(buf: &[u8]) -> bool {
+    const PNG_SIGNATURE_LEN: usize = 8;
+    let mut offset = PNG_SIGNATURE_LEN;
+    // Each chunk is a 4-byte big-endian length, a 4-byte ASCII type, `length` bytes of data, and a
+    // trailing 4-byte CRC — walk the stream one chunk at a time without copying any of it.
+    while offset + 8 <= buf.len() {
+        let chunk_len = u32::from_be_bytes([
+            buf[offset],
+            buf[offset + 1],
+            buf[offset + 2],
+            buf[offset + 3],
+        ]) as usize;
+        let chunk_type = &buf[offset + 4..offset + 8];
+        if chunk_type == b"acTL" {
+            return true;
+        }
+        if chunk_type == b"IDAT" {
+            return false; // acTL must precede the first IDAT per the APNG spec — none seen means static.
+        }
+        // `saturating_add`, not plain `+`: `chunk_len` comes straight off untrusted file bytes and this
+        // crate runs with `overflow-checks = true` in release — an adversarial/corrupt length must
+        // degrade to "not animated" below, never panic.
+        let next_offset = offset
+            .saturating_add(8)
+            .saturating_add(chunk_len)
+            .saturating_add(4);
+        if next_offset <= offset || next_offset > buf.len() {
+            return false; // malformed/truncated chunk, or acTL simply isn't within our sniff window
+        }
+        offset = next_offset;
+    }
+    false
 }
 
 /// The image format implied by a path's extension, or `None` if it isn't a recognized one. Used only
@@ -867,6 +970,140 @@ mod tests {
         assert!(
             matches!(err, ToolError::InvalidInput(_)),
             "a non-decodable image must be a clear tool error, not silently forwarded: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_falls_back_to_text_when_extension_implies_image_but_content_is_not_image_bytes() {
+        // pi: tools.test.ts, "should treat files with image extension but non-image content as text".
+        // No magic-byte match at all here (unlike the sniffed-but-corrupt case above) — the extension
+        // is the *only* signal this might be an image, so a failed decode should fall back to a plain
+        // text read (e.g. a Git LFS pointer file saved as `.png`) rather than a hard error.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-an-image.png");
+        std::fs::write(&path, "definitely not a png").unwrap();
+
+        let out = Read
+            .run(json!({ "path": path.to_str().unwrap() }))
+            .await
+            .unwrap();
+        assert!(
+            out.text.contains("definitely not a png"),
+            "got: {}",
+            out.text
+        );
+        assert!(
+            out.images.is_empty(),
+            "must not be treated as an image attachment"
+        );
+    }
+
+    /// The 8-byte PNG magic signature every PNG (animated or not) starts with.
+    fn png_signature() -> Vec<u8> {
+        vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]
+    }
+
+    /// Build one PNG chunk: 4-byte big-endian length, 4-byte ASCII type, `data` verbatim, and a
+    /// (deliberately bogus, never checked by `is_animated_png` or `image::guess_format`) 4-byte CRC.
+    fn png_chunk(chunk_type: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut c = Vec::new();
+        c.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        c.extend_from_slice(chunk_type);
+        c.extend_from_slice(data);
+        c.extend_from_slice(&[0, 0, 0, 0]);
+        c
+    }
+
+    /// Splice a synthetic, minimal `acTL` (animation control) chunk right after a real PNG's `IHDR`
+    /// chunk — the same relative position a real APNG encoder places it (`acTL` always precedes the
+    /// first `IDAT` per the APNG spec). Its data doesn't need to be semantically meaningful
+    /// (`num_frames`/`num_plays`) for detection purposes; only the chunk's presence, type, and correct
+    /// length prefix matter to `is_animated_png`'s chunk walk — this is deliberately the *minimal*
+    /// fixture that makes a file "an animated PNG" by the same definition `is_animated_png` itself uses.
+    fn splice_actl_after_ihdr(png_bytes: &[u8]) -> Vec<u8> {
+        let ihdr_len = u32::from_be_bytes(png_bytes[8..12].try_into().unwrap()) as usize;
+        let ihdr_end = 8 + 8 + ihdr_len + 4; // signature + (len+type) + data + crc
+        let mut out = png_bytes[..ihdr_end].to_vec();
+        out.extend(png_chunk(b"acTL", &[0u8; 8])); // num_frames=0, num_plays=0 — content unchecked
+        out.extend_from_slice(&png_bytes[ihdr_end..]);
+        out
+    }
+
+    #[test]
+    fn is_animated_png_detects_an_actl_chunk_before_the_first_idat() {
+        let mut buf = png_signature();
+        buf.extend(png_chunk(b"IHDR", &[0u8; 13]));
+        buf.extend(png_chunk(b"acTL", &[0u8; 8]));
+        buf.extend(png_chunk(b"IDAT", &[0u8; 4]));
+        assert!(is_animated_png(&buf));
+    }
+
+    #[test]
+    fn is_animated_png_is_false_for_a_static_png_with_ancillary_chunks_before_idat() {
+        // A real-world static PNG routinely carries chunks (`tEXt`, `iCCP`, `pHYs`, …) between `IHDR`
+        // and `IDAT` — only `acTL`'s actual presence signals animation, not "something sits before
+        // IDAT".
+        let mut buf = png_signature();
+        buf.extend(png_chunk(b"IHDR", &[0u8; 13]));
+        buf.extend(png_chunk(b"tEXt", b"comment"));
+        buf.extend(png_chunk(b"IDAT", &[0u8; 4]));
+        assert!(!is_animated_png(&buf));
+    }
+
+    #[test]
+    fn is_animated_png_is_false_when_idat_arrives_with_no_actl_at_all() {
+        let mut buf = png_signature();
+        buf.extend(png_chunk(b"IHDR", &[0u8; 13]));
+        buf.extend(png_chunk(b"IDAT", &[0u8; 4]));
+        assert!(!is_animated_png(&buf));
+    }
+
+    #[test]
+    fn is_animated_png_is_false_on_a_truncated_chunk_stream() {
+        // A chunk header claiming more data than the buffer actually holds (or a stream cut off
+        // mid-chunk) must degrade to "not animated", not panic or loop — the same conservative default
+        // pi's `isAnimatedPng` uses on malformed input.
+        let mut buf = png_signature();
+        buf.extend(png_chunk(b"IHDR", &[0u8; 13]));
+        buf.truncate(buf.len() - 2); // cut mid-chunk, past the length+type but short on data/CRC
+        assert!(!is_animated_png(&buf));
+    }
+
+    #[tokio::test]
+    async fn an_animated_png_falls_back_to_text_instead_of_being_sent_as_a_single_static_frame() {
+        // pi: `detectSupportedImageMimeType` (`mime.ts`) returns `null` for an animated PNG
+        // (`isAnimatedPng`), so `read.ts` never even attempts to decode/serve it as an image at all —
+        // sending a vision model one static frame of an animation, unlabeled as such, would misrepresent
+        // what the file actually contains. We port the same detect-and-exclude behavior
+        // (`Sniff::AnimatedPng`) rather than silently shipping the `image` crate's default/first-frame
+        // decode as if it were the complete picture — deliberately *not* treated as "just decode the
+        // first frame and go", the way plain APNG-as-first-frame would read.
+        let img = image::RgbImage::from_pixel(4, 4, image::Rgb([10, 20, 30]));
+        let mut png_bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut png_bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        let apng_bytes = splice_actl_after_ihdr(&png_bytes);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("animated.png");
+        std::fs::write(&path, &apng_bytes).unwrap();
+
+        let out = Read
+            .run(json!({ "path": path.to_str().unwrap() }))
+            .await
+            .unwrap();
+        assert!(
+            out.images.is_empty(),
+            "an animated PNG must not be sent as a single-frame image attachment"
+        );
+        assert!(
+            !out.text.contains("Read image"),
+            "must not be reported as an image read at all: {}",
+            out.text
         );
     }
 

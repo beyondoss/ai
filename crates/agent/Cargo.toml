@@ -48,6 +48,11 @@ regex = "1"
 # full-width/ligature chars) still lands against the on-disk bytes.
 unicode-normalization = "0.1"
 
+# Every filesystem tool's `path` normalization: decoding a `file://` URL argument (`tools::normalize_path`)
+# needs the same percent-decoding `fileURLToPath` does. Already present transitively (`reqwest`/`url`);
+# depended on directly since we call its API, not just link it incidentally.
+percent-encoding = "2"
+
 # `read` base64-encodes image files so the multimodal model can see them (e.g. a screenshot).
 base64 = "0.22"
 # `read`'s image pipeline: magic-byte format sniffing (`guess_format`) and Lanczos3 downscaling for an

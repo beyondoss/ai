@@ -594,6 +594,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_syntactically_invalid_edits_json_string_falls_through_to_requiring_top_level_fields()
+    {
+        // pi: edit-tool-legacy-input.test.ts, "leaves edits alone when the string is not valid JSON" —
+        // pi's `prepareArguments` passes a non-JSON `edits` string through unchanged, letting the
+        // ordinary schema validation reject it downstream. Ours parses inline (`parse_edits`): the
+        // `serde_json::from_str::<Value>(s).ok()` on a malformed string yields `None`, so `edits_value`
+        // is `None` too — the `arr` branch is skipped entirely, and (with no top-level `old_string`/
+        // `new_string` given either) this must fall through to the same generic "provide `edits`, or
+        // `old_string` and `new_string`" error as an outright missing `edits`, not a JSON-parse-error
+        // message that would leak `serde_json`'s own wording to the model.
+        let f = write_tmp("foo and bar");
+        let p = f.path().to_str().unwrap();
+        let err = Edit
+            .run(json!({ "path": p, "edits": "not json" }))
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::InvalidInput(msg) => assert!(
+                msg.contains("provide `edits`, or `old_string` and `new_string`"),
+                "got: {msg}"
+            ),
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+        // The file must be untouched — this must fail before ever attempting to read/write it.
+        assert_eq!(std::fs::read_to_string(p).unwrap(), "foo and bar");
+    }
+
+    #[tokio::test]
     async fn matches_independent_of_application_order() {
         // edit1's output ("bar") must not be matched by a later edit; matching against the original
         // keeps this deterministic.

@@ -301,6 +301,45 @@ enum Entry {
         parent_id: Option<String>,
         title: String,
     },
+    /// A user-defined bookmark/marker set on another entry — pi's own `LabelEntry`
+    /// (`session-manager/labels.test.ts`). `target_id` names the labeled entry; `label: None` clears
+    /// whatever label `target_id` currently carries; the most recent `Entry::Label` for a given
+    /// `target_id` wins (last-write-wins), matching pi's own `appendLabelChange`.
+    ///
+    /// Unlike pi — where a label is a full tree node other entries can become a child of, requiring a
+    /// "rewire the children of a dropped label" step when forking past one — this is a pure anchored
+    /// side-channel record, the same shape as `ModelChange`/`ThinkingLevelChange`/`TitleChange`: an
+    /// O(1) append, `id`/`parent_id` chained purely for on-disk provenance/ordering, never redirecting
+    /// `self.active` and never itself a parent any other entry chains onto. A label therefore never
+    /// occupies a slot in the message chain to begin with, so there is no rewiring problem to solve —
+    /// see [`SessionStore::set_label`]/[`SessionStore::get_label`] and
+    /// [`SessionRepo::fork_at_entry`]'s label carry-over.
+    Label {
+        id: String,
+        parent_id: Option<String>,
+        target_id: String,
+        #[serde(default)]
+        label: Option<String>,
+    },
+    /// An opaque, caller-defined entry — pi's own `CustomEntry`
+    /// (`session-manager/save-entry.test.ts`), for an extension/tool to attach app-defined data at a
+    /// specific point in the tree (`kind` identifies the shape of `data` to whatever produced it; this
+    /// module never interprets either). Unlike `Label`/`ModelChange`/`ThinkingLevelChange`/`TitleChange`
+    /// (anchored side-channel records that never occupy a chain slot), this IS a real tree node: it
+    /// becomes the new active tip when appended (see [`SessionStore::append_custom`]), and a later
+    /// message's `parent_id` can point at it — but it contributes nothing when the active path is
+    /// materialized into `Session.messages`/LLM context (see [`Node::as_message`]), matching pi's own
+    /// `buildSessionContext` skipping `"custom"`-typed entries. Still reported by [`SessionStore::tree`]
+    /// for full-tree traversal, so a client can see it happened even though the model never does.
+    Custom {
+        id: String,
+        parent_id: Option<String>,
+        #[serde(default)]
+        timestamp: u64,
+        kind: String,
+        #[serde(default)]
+        data: Value,
+    },
 }
 
 /// File-tracking details persisted alongside an [`Entry::BranchSummary`] — the branch-summary analog
@@ -326,6 +365,25 @@ pub struct CompactionMeta {
     pub tokens_before: u32,
 }
 
+/// What [`SessionRepo::fork_at_entry_prefix`] computes before anything is written — the would-be
+/// child's metadata, its message prefix, and enough of the source's own bookkeeping
+/// ([`original_ids`](Self::original_ids), [`labels`](Self::labels)) for [`SessionRepo::fork_at_entry`]
+/// to carry labels forward once [`SessionStore::rewrite`] mints the copy's real ids.
+struct ForkPrefix {
+    meta: SessionMeta,
+    messages: Vec<Message>,
+    /// The source session's own ids for `messages`, in the same order — i.e. before `rewrite` replaces
+    /// them with a fresh chain. `rewrite` cannot preserve ids in general (a compaction's summary
+    /// message has no 1:1 original to key off of), but a *fork*'s prefix genuinely is an unmodified
+    /// copy, assigned fresh ids in the same order it was read — so zipping this against the new store's
+    /// `active_ids()` after `rewrite` recovers the old-id → new-id mapping without `rewrite` itself
+    /// needing to know or preserve anything.
+    original_ids: Vec<String>,
+    /// Labels recorded in the source session against any id in `original_ids`, as `(target_id, label)`
+    /// pairs — see [`SessionStore::labels_within`].
+    labels: Vec<(String, String)>,
+}
+
 /// One branch in the session's tree, as reported by [`SessionStore::list_branches`] — a leaf (a node
 /// with no children) plus enough to render a picker: whether it's the currently active one, how deep
 /// its path from the root runs, and a preview of its first user text.
@@ -342,20 +400,44 @@ pub struct BranchInfo {
     pub preview: Option<String>,
 }
 
-/// One node in the in-memory tree index: a message's parent link and its content. Spans the *whole*
+/// A [`Node`]'s content — either a real conversation message, or an opaque caller-defined entry (see
+/// [`Entry::Custom`]) that occupies a slot in the tree but contributes nothing when the active path is
+/// materialized into `Session.messages`/LLM context.
+#[derive(Clone)]
+enum NodeContent {
+    Message(Message),
+    Custom { kind: String, data: Value },
+}
+
+/// One node in the in-memory tree index: an entry's parent link and its content. Spans the *whole*
 /// file (every branch), not just the active path — built once on [`SessionStore::open`]/`create` and
 /// kept in sync by every mutating method, so a branch can be materialized without re-reading the file.
 #[derive(Clone)]
 struct Node {
     parent_id: Option<String>,
-    message: Message,
-    /// Unix seconds this message was actually appended, from [`Entry::Message`]'s own `timestamp`
-    /// field — `0` for a node with no recorded timestamp (a legacy file written before this field
-    /// existed, or a branch-summary-materialized node, which doesn't carry one). See
+    content: NodeContent,
+    /// Unix seconds this entry was actually appended, from [`Entry::Message`]/[`Entry::Custom`]'s own
+    /// `timestamp` field — `0` for a node with no recorded timestamp (a legacy file written before this
+    /// field existed, or a branch-summary-materialized node, which doesn't carry one). See
     /// [`read_listing`]'s `updated_at` computation for why this exists: a content-derived signal,
     /// preferred over the file's OS mtime, which a copy/restore/sync that doesn't preserve it exactly
     /// can leave stale or wrong.
     timestamp: u64,
+}
+
+impl Node {
+    /// This node's message content, or `None` for a non-message node (currently only
+    /// [`NodeContent::Custom`]) — what every "materialize the active path/a branch into messages" call
+    /// site filters through, so a custom entry contributes nothing to `Session.messages`/LLM context
+    /// while still being a real, positioned node for tree traversal (`SessionStore::tree`) — matching
+    /// pi's own `buildSessionContext` skipping `"custom"`-typed entries. See [`Entry::Custom`]'s doc
+    /// comment.
+    fn as_message(&self) -> Option<&Message> {
+        match &self.content {
+            NodeContent::Message(m) => Some(m),
+            NodeContent::Custom { .. } => None,
+        }
+    }
 }
 
 /// One node in the session's tree, as reported by [`SessionStore::tree`] — every message (not just the
@@ -366,10 +448,15 @@ pub struct TreeNode {
     pub id: String,
     /// `None` at the tree's root.
     pub parent_id: Option<String>,
-    pub role: Role,
+    /// `None` for a non-message node ([`Entry::Custom`] — see [`Node::as_message`]), which has no role
+    /// of its own.
+    pub role: Option<Role>,
     /// A preview of this message's own text content, or `None` for a pure tool-use/tool-result/
-    /// thinking/image turn with no plain-text block.
+    /// thinking/image turn with no plain-text block. For a custom entry, `Some("[custom: {kind}]")`.
     pub preview: Option<String>,
+    /// The label currently set on this node, if any — see [`SessionStore::set_label`]. Pi's own
+    /// `SessionTreeNode.label`.
+    pub label: Option<String>,
 }
 
 /// Turn a persisted branch summary's text into the message that materializes at the tip of the branch
@@ -448,6 +535,10 @@ pub struct SessionStore {
     /// Same idea as `model_changes`, for the portable thinking level (see [`Entry::ThinkingLevelChange`]/
     /// [`Self::record_thinking_level_change`]/[`Self::thinking_level_at`]).
     level_changes: HashMap<Option<String>, String>,
+    /// The label currently set on each target id, by that id — the last (by file order)
+    /// [`Entry::Label`] seen for it, with a `label: None` entry removing it from this map entirely
+    /// (last-write-wins). See [`Self::set_label`]/[`Self::get_label`].
+    labels: HashMap<String, String>,
 }
 
 impl SessionStore {
@@ -505,6 +596,7 @@ impl SessionStore {
             branch_summary_details: HashMap::new(),
             model_changes: HashMap::new(),
             level_changes: HashMap::new(),
+            labels: HashMap::new(),
         })
     }
 
@@ -525,6 +617,7 @@ impl SessionStore {
         let mut branch_summary_details: HashMap<String, BranchSummaryDetails> = HashMap::new();
         let mut model_changes: HashMap<Option<String>, String> = HashMap::new();
         let mut level_changes: HashMap<Option<String>, String> = HashMap::new();
+        let mut labels: HashMap<String, String> = HashMap::new();
 
         let mut reader = BufReader::new(file);
         let mut raw = Vec::new();
@@ -582,7 +675,7 @@ impl SessionStore {
                         id.clone(),
                         Node {
                             parent_id,
-                            message,
+                            content: NodeContent::Message(message),
                             timestamp,
                         },
                     );
@@ -603,7 +696,7 @@ impl SessionStore {
                         id.clone(),
                         Node {
                             parent_id,
-                            message: branch_summary_message(&summary),
+                            content: NodeContent::Message(branch_summary_message(&summary)),
                             // `Entry::BranchSummary` carries no timestamp of its own (out of scope for
                             // now — see `Node::timestamp`'s doc comment); `read_listing`'s `updated_at`
                             // computation treats this as "no signal" and falls through to whatever else
@@ -612,6 +705,25 @@ impl SessionStore {
                         },
                     );
                     branch_summary_details.insert(id.clone(), details);
+                    tip = Some(id);
+                }
+                // Becomes the new tip just like a `Message` (a real, positioned tree node — see
+                // `Entry::Custom`'s doc comment) — a later message's `parent_id` can point at it.
+                Ok(Entry::Custom {
+                    id,
+                    parent_id,
+                    timestamp,
+                    kind,
+                    data,
+                }) => {
+                    nodes.insert(
+                        id.clone(),
+                        Node {
+                            parent_id,
+                            content: NodeContent::Custom { kind, data },
+                            timestamp,
+                        },
+                    );
                     tip = Some(id);
                 }
                 // Purely a provenance record (see `Entry::Compaction`'s doc comment) — the very next
@@ -638,6 +750,20 @@ impl SessionStore {
                         m.title = title_or_clear(title);
                     }
                 }
+                // Never redirects `tip` — a pure lookup record keyed directly by `target_id` (unlike
+                // `model_changes`/`level_changes`, which are keyed by *anchor* and apply to descendants;
+                // a label applies only to the exact entry named). Last-write-wins per `target_id`,
+                // matching pi's own `appendLabelChange`.
+                Ok(Entry::Label {
+                    target_id, label, ..
+                }) => match label {
+                    Some(l) => {
+                        labels.insert(target_id, l);
+                    }
+                    None => {
+                        labels.remove(&target_id);
+                    }
+                },
                 // A line that read fully (valid UTF-8, under the size cap) but failed to deserialize as
                 // an `Entry` — a bad line *other* than a torn final write (disk bit rot, a manual edit,
                 // a future `Entry` variant an older binary doesn't know about yet). Unlike the
@@ -659,10 +785,31 @@ impl SessionStore {
         let meta = migrate(meta, &path)?;
 
         let active = path_from_root(&nodes, tip.as_deref());
-        let messages: Vec<Message> = active.iter().map(|id| nodes[id].message.clone()).collect();
+        // A custom entry (`NodeContent::Custom`) contributes nothing here — it's a real, positioned
+        // node in `active`'s chain (see `Entry::Custom`'s doc comment), but not a message, so
+        // `as_message` filters it out of the materialized `Session.messages`/LLM context.
+        let messages: Vec<Message> = active
+            .iter()
+            .filter_map(|id| nodes[id].as_message().cloned())
+            .collect();
         let persisted = messages.len();
         let mut session = Session::new();
         session.messages = Arc::new(messages);
+        // Restore a proactive-compaction trigger signal for a resumed session. Usage isn't persisted
+        // per-message anywhere in this format (only ever lived on the in-memory `Session`), so a
+        // freshly-opened session's `last_input_tokens` defaults to 0 — and `should_compact`/
+        // `is_hard_overflow` both require it to be positive to fire at all. Left unset, a resumed
+        // session already well over the compaction threshold wouldn't proactively compact until a
+        // *new* turn produced fresh real usage — one whole turn later than it should (pi's own
+        // regression test: `pre-prompt-compaction-no-continue`). Estimate it the same way
+        // `compaction::trailing_tokens` already estimates *any* span of messages it has no exact
+        // provider-reported figure for (the char/4 heuristic) — good enough for a trigger check, which
+        // only needs the right ballpark — treating the whole persisted transcript as "trailing" (by
+        // calling `trailing_tokens` while `last_usage_message_count` is still its default 0) and then
+        // marking every persisted message as already accounted for, so the very next real
+        // `trailing_tokens` call doesn't double-count it.
+        session.last_input_tokens = agent_core::compaction::trailing_tokens(&session);
+        session.last_usage_message_count = session.messages.len();
         Ok((
             Self {
                 path,
@@ -673,6 +820,7 @@ impl SessionStore {
                 branch_summary_details,
                 model_changes,
                 level_changes,
+                labels,
             },
             session,
         ))
@@ -734,7 +882,7 @@ impl SessionStore {
                 id.clone(),
                 Node {
                     parent_id: parent.clone(),
-                    message: msg.clone(),
+                    content: NodeContent::Message(msg.clone()),
                     timestamp,
                 },
             ));
@@ -753,6 +901,49 @@ impl SessionStore {
         }
         self.persisted = messages.len();
         Ok(())
+    }
+
+    /// Append an opaque, caller-defined entry as a child of the current active tip, then advance the
+    /// tip to it — pi's own `appendCustomEntry` (`session-manager/save-entry.test.ts`). Returns the new
+    /// entry's id. `kind` identifies the shape of `data` to whatever produced it; this module never
+    /// interprets either.
+    ///
+    /// Unlike [`append_new`](Self::append_new) (which only ever adds real conversation messages), this
+    /// grows `self.active` by one — the entry genuinely occupies a slot in the chain, so a later
+    /// `append_new`'s next message correctly parents onto it — but contributes nothing when the active
+    /// path is materialized into `Session.messages`: `self.persisted` (a *message* count) is
+    /// deliberately left untouched here, so it stays exactly what `append_new`'s own `messages[self
+    /// .persisted..]` diffing needs regardless of how many custom entries have been interspersed. See
+    /// [`Entry::Custom`]'s doc comment for why this can safely be a real tree node without disturbing
+    /// compaction's own message-counting (`rewrite_compacted`'s `folded_ids` walk already accounts for
+    /// this).
+    pub fn append_custom(
+        &mut self,
+        kind: impl Into<String>,
+        data: serde_json::Value,
+    ) -> std::io::Result<String> {
+        let kind = kind.into();
+        let id = new_id();
+        let timestamp = now_secs();
+        let parent_id = self.active.last().cloned();
+        let entry = Entry::Custom {
+            id: id.clone(),
+            parent_id: parent_id.clone(),
+            timestamp,
+            kind: kind.clone(),
+            data: data.clone(),
+        };
+        append_line(&self.path, &entry)?;
+        self.nodes.insert(
+            id.clone(),
+            Node {
+                parent_id,
+                content: NodeContent::Custom { kind, data },
+                timestamp,
+            },
+        );
+        self.active.push(id.clone());
+        Ok(id)
     }
 
     /// Rewrite the whole file atomically (header + every message). Used when the message list was
@@ -792,7 +983,7 @@ impl SessionStore {
                 id.clone(),
                 Node {
                     parent_id: parent.clone(),
-                    message: m.clone(),
+                    content: NodeContent::Message(m.clone()),
                     timestamp: now_secs(),
                 },
             ));
@@ -828,19 +1019,37 @@ impl SessionStore {
 
         write_line(&mut f, &Entry::Session(self.meta.clone()))?;
         for (id, node) in preserved.iter().chain(new_nodes.iter()) {
-            write_line(
-                &mut f,
-                &Entry::Message {
-                    id: Some(id.clone()),
-                    parent_id: node.parent_id.clone(),
-                    // Preserved nodes write back their own original timestamp — they're being
-                    // physically relocated during the rewrite, not newly created, so re-stamping
-                    // `now_secs()` here would make old content look freshly updated. Freshly
-                    // constructed `new_nodes` above already carry their own real `now_secs()`.
-                    timestamp: node.timestamp,
-                    message: node.message.clone(),
-                },
-            )?;
+            // `preserved` (off-active nodes carried through unchanged) can be either shape — a real
+            // message or a custom entry (Track C-M2) that happened to live on some other branch;
+            // `new_nodes` (the freshly compacted/forked active path) is always real messages, since
+            // `messages: &[Message]` admits nothing else. Round-tripping each back through its own
+            // original `Entry` variant, not unconditionally `Entry::Message`, is what keeps a preserved
+            // custom entry from being silently corrupted into an empty/default message by a rewrite.
+            match &node.content {
+                NodeContent::Message(m) => write_line(
+                    &mut f,
+                    &Entry::Message {
+                        id: Some(id.clone()),
+                        parent_id: node.parent_id.clone(),
+                        // Preserved nodes write back their own original timestamp — they're being
+                        // physically relocated during the rewrite, not newly created, so re-stamping
+                        // `now_secs()` here would make old content look freshly updated. Freshly
+                        // constructed `new_nodes` above already carry their own real `now_secs()`.
+                        timestamp: node.timestamp,
+                        message: m.clone(),
+                    },
+                )?,
+                NodeContent::Custom { kind, data } => write_line(
+                    &mut f,
+                    &Entry::Custom {
+                        id: id.clone(),
+                        parent_id: node.parent_id.clone(),
+                        timestamp: node.timestamp,
+                        kind: kind.clone(),
+                        data: data.clone(),
+                    },
+                )?,
+            }
         }
         // Sync the temp file's contents, then rename (atomic), then fsync the parent directory so the
         // rename itself is durable: without the dir fsync a crash could surface the old file — or, in the
@@ -902,8 +1111,32 @@ impl SessionStore {
         self.meta.compactions = self.meta.compactions.saturating_add(1);
         self.meta.dropped_messages = self.meta.dropped_messages.saturating_add(dropped as u64);
 
-        let folded_count = dropped.saturating_add(1).min(self.active.len());
-        let folded_ids: Vec<String> = self.active[..folded_count].to_vec();
+        // Walk from the front of `self.active` counting only *message*-bearing ids (a custom entry —
+        // Track C-M2 — can sit interspersed on the active path without contributing to `self.persisted`,
+        // so a plain positional slice by count would misalign once one exists); any custom id
+        // encountered along the way is folded together with the messages around it, since it sat
+        // structurally within the region compaction just summarized away. `target` message ids is
+        // `dropped + 1` (one summary message replaces every folded message — see this method's doc
+        // comment on why `+ 1`), capped so a pathological `dropped` can't run past the end of `active`.
+        // Walk from the front of `self.active` counting only *message*-bearing ids (a custom entry —
+        // Track C-M2 — can sit interspersed on the active path without contributing to `self.persisted`,
+        // so a plain positional slice by count would misalign once one exists); any custom id
+        // encountered along the way is folded together with the messages around it, since it sat
+        // structurally within the region compaction just summarized away. `target` message ids is
+        // `dropped + 1` (one summary message replaces every folded message — see this method's doc
+        // comment on why `+ 1`), capped so a pathological `dropped` can't run past the end of `active`.
+        let target = dropped.saturating_add(1);
+        let mut folded_ids: Vec<String> = Vec::new();
+        let mut folded_messages = 0usize;
+        for id in &self.active {
+            if folded_messages >= target {
+                break;
+            }
+            folded_ids.push(id.clone());
+            if self.nodes[id].as_message().is_some() {
+                folded_messages += 1;
+            }
+        }
 
         let mut new_nodes: Vec<(String, Node)> = Vec::with_capacity(messages.len());
         // The new active path starts a fresh, detached chain (`parent: None`), exactly like a plain
@@ -920,7 +1153,7 @@ impl SessionStore {
                 id.clone(),
                 Node {
                     parent_id: parent.clone(),
-                    message: m.clone(),
+                    content: NodeContent::Message(m.clone()),
                     timestamp: now_secs(),
                 },
             ));
@@ -960,7 +1193,14 @@ impl SessionStore {
                     id: Some(id.clone()),
                     parent_id: node.parent_id.clone(),
                     timestamp: node.timestamp,
-                    message: node.message.clone(),
+                    // `new_nodes` is built just above from `messages: &[Message]` alone, so every entry
+                    // here is always `NodeContent::Message` — never a custom entry.
+                    message: match node.as_message() {
+                        Some(m) => m.clone(),
+                        None => unreachable!(
+                            "rewrite_compacted's own new_nodes only ever holds NodeContent::Message"
+                        ),
+                    },
                 },
             )?;
         }
@@ -1007,9 +1247,11 @@ impl SessionStore {
             .iter()
             .rposition(|id| target_ancestors.contains(id.as_str()));
         let from = common_idx.map_or(0, |i| i + 1);
+        // A custom entry (Track C-M2) among the abandoned range has no message content to summarize —
+        // skip it, same as everywhere else a `Vec<Message>` is materialized from the tree.
         self.active[from..]
             .iter()
-            .map(|id| (id.clone(), self.nodes[id].message.clone()))
+            .filter_map(|id| self.nodes[id].as_message().map(|m| (id.clone(), m.clone())))
             .collect()
     }
 
@@ -1072,7 +1314,7 @@ impl SessionStore {
                 let preview = path
                     .iter()
                     .rev()
-                    .find_map(|mid| first_user_text(&self.nodes[mid].message))
+                    .find_map(|mid| self.nodes[mid].as_message().and_then(first_user_text))
                     .map(preview_of);
                 BranchInfo {
                     leaf_id: id.to_string(),
@@ -1113,14 +1355,19 @@ impl SessionStore {
             .into_iter()
             .map(|id| {
                 let path = path_from_root(&self.nodes, Some(id));
+                // `shared` must be a valid message-count index into the *filtered* `messages` below
+                // (and into the caller's own filtered active-path messages, which it's compared
+                // against) — so a custom entry (Track C-M2) anywhere in the common prefix must not
+                // inflate this count, exactly as it contributes nothing to either message list.
                 let shared = path
                     .iter()
                     .zip(self.active.iter())
                     .take_while(|(a, b)| a == b)
+                    .filter(|(mid, _)| self.nodes[mid.as_str()].as_message().is_some())
                     .count();
-                let messages = path
+                let messages: Vec<Message> = path
                     .iter()
-                    .map(|mid| self.nodes[mid].message.clone())
+                    .filter_map(|mid| self.nodes[mid].as_message().cloned())
                     .collect();
                 (shared, messages)
             })
@@ -1135,11 +1382,18 @@ impl SessionStore {
         let mut nodes: Vec<TreeNode> = self
             .nodes
             .iter()
-            .map(|(id, node)| TreeNode {
-                id: id.clone(),
-                parent_id: node.parent_id.clone(),
-                role: node.message.role,
-                preview: message_text_preview(&node.message),
+            .map(|(id, node)| {
+                let (role, preview) = match &node.content {
+                    NodeContent::Message(m) => (Some(m.role), message_text_preview(m)),
+                    NodeContent::Custom { kind, .. } => (None, Some(format!("[custom: {kind}]"))),
+                };
+                TreeNode {
+                    id: id.clone(),
+                    parent_id: node.parent_id.clone(),
+                    role,
+                    preview,
+                    label: self.labels.get(id).cloned(),
+                }
             })
             .collect();
         nodes.sort_by(|a, b| a.id.cmp(&b.id));
@@ -1152,7 +1406,19 @@ impl SessionStore {
     /// installs them as the live `Session.messages`. A later `append_new` against that returned slice
     /// naturally forks off `target_id` — it chains new messages off `self.active.last()`, which this
     /// sets to `target_id`. Errors (`NotFound`) if `target_id` names no known message.
+    ///
+    /// A no-op — no `Leaf` entry appended, nothing re-read — when `target_id` already *is* the active
+    /// tip (pi-parity fix B-L2, `agent-session-tree-navigation.test.ts`'s "should handle navigation to
+    /// same position (no-op)"): navigating to where the session already is shouldn't grow the file with
+    /// a redundant marker every time a client re-confirms the current position.
     pub fn switch_active(&mut self, target_id: &str) -> std::io::Result<Vec<Message>> {
+        if self.active.last().is_some_and(|id| id == target_id) {
+            return Ok(self
+                .active
+                .iter()
+                .filter_map(|id| self.nodes[id].as_message().cloned())
+                .collect());
+        }
         if !self.nodes.contains_key(target_id) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -1174,7 +1440,7 @@ impl SessionStore {
         let active = path_from_root(&self.nodes, Some(target_id));
         let messages: Vec<Message> = active
             .iter()
-            .map(|id| self.nodes[id].message.clone())
+            .filter_map(|id| self.nodes[id].as_message().cloned())
             .collect();
         self.persisted = messages.len();
         self.active = active;
@@ -1251,7 +1517,7 @@ impl SessionStore {
             entry_id.clone(),
             Node {
                 parent_id: Some(target_id.to_string()),
-                message: branch_summary_message(&summary),
+                content: NodeContent::Message(branch_summary_message(&summary)),
                 // No content-derived timestamp for a materialized branch summary — same scope
                 // boundary as the `Entry::BranchSummary` arm in `open()`.
                 timestamp: 0,
@@ -1263,7 +1529,7 @@ impl SessionStore {
         let messages: Vec<Message> = self
             .active
             .iter()
-            .map(|id| self.nodes[id].message.clone())
+            .filter_map(|id| self.nodes[id].as_message().cloned())
             .collect();
         self.persisted = messages.len();
         Ok(messages)
@@ -1332,6 +1598,53 @@ impl SessionStore {
         append_line(&self.path, &entry)?;
         self.meta.title = title_or_clear(title);
         Ok(())
+    }
+
+    /// The label currently set on `target_id`, if any — the most recent [`Entry::Label`] recorded
+    /// against it (last-write-wins), or `None` if it was never labeled or was last cleared. Pi's own
+    /// `SessionManager.getLabel`.
+    pub fn get_label(&self, target_id: &str) -> Option<&str> {
+        self.labels.get(target_id).map(String::as_str)
+    }
+
+    /// Set (`label: Some`) or clear (`label: None`) a user-defined bookmark/marker on `target_id` — an
+    /// O(1) [`Entry::Label`] append, pi's own `appendLabelChange` (`session-manager/labels.test.ts`).
+    /// Errors (`NotFound`) if `target_id` names no known entry in this session, matching pi's own
+    /// `Entry {id} not found`. See [`Entry::Label`]'s doc comment for why this never needs to rewire
+    /// any other entry's `parent_id`, unlike pi's own version.
+    pub fn set_label(&mut self, target_id: &str, label: Option<&str>) -> std::io::Result<()> {
+        if !self.nodes.contains_key(target_id) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no entry with id {target_id} in this session"),
+            ));
+        }
+        let entry = Entry::Label {
+            id: new_id(),
+            parent_id: self.active.last().cloned(),
+            target_id: target_id.to_string(),
+            label: label.map(str::to_string),
+        };
+        append_line(&self.path, &entry)?;
+        match label {
+            Some(l) => {
+                self.labels.insert(target_id.to_string(), l.to_string());
+            }
+            None => {
+                self.labels.remove(target_id);
+            }
+        }
+        Ok(())
+    }
+
+    /// Every recorded label whose target id appears in `ids`, as `(target_id, label)` pairs — the
+    /// label analogue of [`Self::branch_summary_details_within`], used by
+    /// [`SessionRepo::fork_at_entry`] to carry labels forward when their labeled entry survives into
+    /// the forked prefix.
+    fn labels_within(&self, ids: &[String]) -> Vec<(String, String)> {
+        ids.iter()
+            .filter_map(|id| self.labels.get(id).map(|l| (id.clone(), l.clone())))
+            .collect()
     }
 }
 
@@ -1555,30 +1868,66 @@ impl SessionRepo {
     /// excludes `entry_id` itself from the forked prefix — forking right before a message the caller
     /// wants to redo, rather than keep; `false` (pi's `"at"`, the default) includes it. Errors
     /// (`NotFound`) if `entry_id` names no known message in `id`'s tree.
+    ///
+    /// Labels carry forward (pi-parity C-M1, `session-manager/labels.test.ts`'s "labels are preserved
+    /// in createBranchedSession"): any label recorded in the source session against a message that
+    /// survives into the forked prefix is re-applied in the new store, against that message's *new* id
+    /// — [`rewrite`](Self::rewrite) mints fresh ids for a forked copy (it has to: see its own doc
+    /// comment on why a rewrite can't in general reuse originals), so `fork_at_entry_prefix`'s
+    /// `original_ids` (positionally parallel to the prefix `rewrite` just wrote) is what maps each old
+    /// id to its replacement. A label whose target fell *outside* the forked prefix (off `entry_id`'s
+    /// path, or past it when `before` excludes it) has no surviving id to re-attach to and is simply
+    /// dropped, matching pi's "labels not on path are not preserved."
+    ///
+    /// Custom entries (Track C-M2, [`Entry::Custom`]) on the forked path are **not** carried into the
+    /// new session — the copied prefix is a plain `Vec<Message>` fed through the ordinary
+    /// [`rewrite`](Self::rewrite), which only ever produces message nodes; a custom entry's opaque
+    /// `data` has no message representation to carry forward. This matches this method's existing
+    /// precedent for every *other* side-channel entry type (`ModelChange`/`ThinkingLevelChange`/
+    /// `BranchSummary` provenance): forking already only ever preserves the message content itself,
+    /// never the surrounding bookkeeping — labels are carried forward as a deliberate, narrower
+    /// exception (see above), not a general rule this extends.
     pub fn fork_at_entry(
         &self,
         id: &str,
         entry_id: &str,
         before: bool,
     ) -> std::io::Result<(SessionStore, Session)> {
-        let (meta, prefix) = self.fork_at_entry_prefix(id, entry_id, before)?;
-        let mut store = self.create(meta)?;
-        store.rewrite(&prefix)?;
+        let prefix = self.fork_at_entry_prefix(id, entry_id, before)?;
+        let mut store = self.create(prefix.meta)?;
+        store.rewrite(&prefix.messages)?;
+        if !prefix.labels.is_empty() {
+            let new_ids: Vec<String> = store.active_ids().to_vec();
+            debug_assert_eq!(new_ids.len(), prefix.original_ids.len());
+            let old_to_new: HashMap<&str, &str> = prefix
+                .original_ids
+                .iter()
+                .map(String::as_str)
+                .zip(new_ids.iter().map(String::as_str))
+                .collect();
+            for (target_id, label) in &prefix.labels {
+                if let Some(&new_id) = old_to_new.get(target_id.as_str()) {
+                    store.set_label(new_id, Some(label))?;
+                }
+            }
+        }
         let mut session = Session::new();
-        session.messages = Arc::new(prefix);
+        session.messages = Arc::new(prefix.messages);
         Ok((store, session))
     }
 
     /// Compute what [`fork_at_entry`](Self::fork_at_entry) would write, without writing it: the
-    /// would-be child's metadata and message prefix. Pure/in-memory beyond the initial `open_id` read —
-    /// no file is created. Used both by `fork_at_entry` itself (to avoid duplicating the prefix logic)
-    /// and by [`fork_at_entry_messages`](Self::fork_at_entry_messages) for side-effect-free previews.
+    /// would-be child's metadata, message prefix, the source's own ids for that prefix (positionally
+    /// parallel — see [`ForkPrefix::original_ids`]), and any labels found within it. Pure/in-memory
+    /// beyond the initial `open_id` read — no file is created. Used both by `fork_at_entry` itself (to
+    /// avoid duplicating the prefix logic) and by [`fork_at_entry_messages`](Self::fork_at_entry_messages)
+    /// for side-effect-free previews.
     fn fork_at_entry_prefix(
         &self,
         id: &str,
         entry_id: &str,
         before: bool,
-    ) -> std::io::Result<(SessionMeta, Vec<Message>)> {
+    ) -> std::io::Result<ForkPrefix> {
         let (src, _src_session) = self.open_id(id)?;
         if !src.nodes.contains_key(entry_id) {
             return Err(std::io::Error::new(
@@ -1594,11 +1943,29 @@ impl SessionRepo {
         if before {
             path.pop();
         }
-        let prefix: Vec<Message> = path
-            .iter()
-            .map(|id| src.nodes[id].message.clone())
-            .collect();
-        Ok((meta, prefix))
+        // Labels are looked up against the *full* path (including any custom entry's id) — a label
+        // whose target is a custom entry that then gets filtered out below simply won't be found in
+        // `fork_at_entry`'s old-id → new-id map, and is correctly dropped the same way an
+        // off-path label already is. `original_ids`/`messages` below, by contrast, must stay message-
+        // only and positionally parallel to each other: `rewrite` (called next, on `messages`) only
+        // ever produces message nodes, so a custom entry has no counterpart id in the destination
+        // store to carry a label forward to anyway (Track C-M2 forks don't carry custom entries
+        // themselves — see `SessionRepo::fork_at_entry`'s doc comment).
+        let labels = src.labels_within(&path);
+        let mut original_ids = Vec::with_capacity(path.len());
+        let mut messages = Vec::with_capacity(path.len());
+        for id in &path {
+            if let Some(m) = src.nodes[id].as_message() {
+                original_ids.push(id.clone());
+                messages.push(m.clone());
+            }
+        }
+        Ok(ForkPrefix {
+            meta,
+            messages,
+            original_ids,
+            labels,
+        })
     }
 
     /// Preview what [`fork_at_entry`](Self::fork_at_entry) would produce — the exact message prefix —
@@ -1610,8 +1977,7 @@ impl SessionRepo {
         entry_id: &str,
         before: bool,
     ) -> std::io::Result<Vec<Message>> {
-        let (_meta, prefix) = self.fork_at_entry_prefix(id, entry_id, before)?;
-        Ok(prefix)
+        Ok(self.fork_at_entry_prefix(id, entry_id, before)?.messages)
     }
 
     fn find_path(&self, id: &str) -> Option<PathBuf> {
@@ -1750,6 +2116,8 @@ fn read_listing(path: &Path) -> Option<SessionMeta> {
         Entry::Compaction { .. } => return None,
         Entry::ModelChange { .. } | Entry::ThinkingLevelChange { .. } => return None,
         Entry::TitleChange { .. } => return None,
+        Entry::Label { .. } => return None,
+        Entry::Custom { .. } => return None,
     };
 
     // A streaming line count, not a tree walk: it counts every `Message` line in the file, which for a
@@ -1817,13 +2185,17 @@ fn read_listing(path: &Path) -> Option<SessionMeta> {
                 }
             }
             // A stray header mid-file (or a branch-navigation/summary/compaction-provenance/model-or-
-            // thinking-level-change marker) is ignored.
+            // thinking-level-change/label/custom marker) is ignored — a custom entry contributes no
+            // message text of its own, matching `message_count`'s "real conversation messages only"
+            // semantics.
             Ok(Entry::Session(_))
             | Ok(Entry::Leaf { .. })
             | Ok(Entry::BranchSummary { .. })
             | Ok(Entry::Compaction { .. })
             | Ok(Entry::ModelChange { .. })
-            | Ok(Entry::ThinkingLevelChange { .. }) => {}
+            | Ok(Entry::ThinkingLevelChange { .. })
+            | Ok(Entry::Label { .. })
+            | Ok(Entry::Custom { .. }) => {}
             // Whole-session-scoped: the most recent one anywhere in the file wins.
             Ok(Entry::TitleChange { title, .. }) => {
                 meta.title = title_or_clear(title);
@@ -2195,6 +2567,50 @@ mod tests {
     }
 
     #[test]
+    fn create_fork_and_fork_at_entry_all_write_their_file_immediately_even_for_a_single_message() {
+        // pi-parity (C-M4), pinning current behavior: pi's `createBranchedSession` defers the actual
+        // file write until an assistant message lands (`session-manager/tree-traversal.test.ts:464-532`),
+        // specifically to avoid littering the session directory with a fork abandoned after one user
+        // message. This module deliberately does NOT port that deferral — see the "Tree-shaped history"
+        // section of ARCHITECTURE.md for the full reasoning (short version: `rewrite` already writes the
+        // whole prefix atomically in one temp-file-then-rename call, so there's no truncated-file risk
+        // to guard against, and threading a "created but not yet flushed" state through `SessionStore`
+        // isn't worth it for a cosmetic directory-listing concern). This test pins that decision: a
+        // fresh `create`, and a `fork`/`fork_at_entry` of a single-user-message prefix, must all have a
+        // real file on disk immediately, before any assistant message ever exists.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+
+        let store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        assert!(
+            store.path().exists() && std::fs::metadata(store.path()).unwrap().len() > 0,
+            "create must write a real header immediately"
+        );
+
+        let mut src = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let src_id = src.meta().id.clone();
+        let mut session = Session::new();
+        session.user("only a user message, no assistant reply yet");
+        src.append_new(&session.messages).unwrap();
+        let user_id = src.active_ids()[0].clone();
+
+        let (forked, fsession) = repo.fork(&src_id, usize::MAX).unwrap();
+        assert_eq!(fsession.messages.len(), 1);
+        assert!(
+            forked.path().exists() && std::fs::metadata(forked.path()).unwrap().len() > 0,
+            "fork of a single-user-message (no assistant reply) prefix must still write immediately"
+        );
+
+        let (forked_at_entry, fsession2) = repo.fork_at_entry(&src_id, &user_id, false).unwrap();
+        assert_eq!(fsession2.messages.len(), 1);
+        assert!(
+            forked_at_entry.path().exists()
+                && std::fs::metadata(forked_at_entry.path()).unwrap().len() > 0,
+            "fork_at_entry of a single-user-message prefix must still write immediately"
+        );
+    }
+
+    #[test]
     fn append_new_batches_many_new_messages_in_one_call() {
         // Regression guard for the buffered-write fix: a multi-message batch (not the usual
         // one-or-two-at-a-time turn) must still land every line, in order, with the cursor advanced
@@ -2407,6 +2823,53 @@ mod tests {
     }
 
     #[test]
+    fn read_listing_survives_an_oversized_invalid_utf8_and_corrupt_line_all_mid_file() {
+        // pi-parity gap (fixed, L4): `read_listing` shares `SessionStore::open`'s exact skip-and-
+        // continue recovery logic (same `read_capped_line` primitive, same three corruption cases),
+        // but only `open`'s recovery had a dedicated test — this one drives all three corruption
+        // shapes through the *listing* scan specifically, proving `message_count`/`preview`/
+        // `search_text` all still reflect every good entry, not just the ones before the first bad
+        // line.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo
+            .create(SessionMeta::new("/work", "claude-test"))
+            .unwrap();
+        let id = store.meta().id.clone();
+        let mut session = Session::new();
+        session.user("first good message");
+        store.append_new(&session.messages).unwrap();
+
+        let path = repo.find_path(&id).unwrap();
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        // Oversized line.
+        write!(f, "\"").unwrap();
+        for _ in 0..(MAX_LINE_BYTES / 1024 + 10) {
+            write!(f, "{}", "x".repeat(1024)).unwrap();
+        }
+        writeln!(f, "\"").unwrap();
+        // Invalid UTF-8 line.
+        f.write_all(b"\xff\xfe not valid utf-8\n").unwrap();
+        // Well-formed JSON that isn't a valid `Entry`.
+        writeln!(f, r#"{{"not":"a valid entry"}}"#).unwrap();
+        drop(f);
+
+        session.user("second good message");
+        store.append_new(&session.messages).unwrap();
+
+        let listed = read_listing(&path).unwrap();
+        assert_eq!(
+            listed.message_count, 2,
+            "both good messages must be counted, not just the one before the corruption"
+        );
+        assert!(
+            listed.search_text.contains("second good message"),
+            "the message appended after the corrupted lines must still reach the search corpus: {}",
+            listed.search_text
+        );
+    }
+
+    #[test]
     fn rewrite_replaces_whole_transcript() {
         let dir = tmpdir();
         let repo = SessionRepo::open(dir.path()).unwrap();
@@ -2607,6 +3070,158 @@ mod tests {
         assert!(
             after.len() > before.len(),
             "new content must have been appended"
+        );
+    }
+
+    #[test]
+    fn rewrite_compacted_handles_two_sequential_compactions_back_to_back() {
+        // B-L6 pi-parity test gap (fixed): every existing test exercised a single `rewrite_compacted`
+        // call in isolation — matches pi's "should handle multiple compactions (only latest matters)"
+        // (`compaction.test.ts:377-398`). A second compaction, appended right after the first with no
+        // reopen in between, must independently record its own provenance (not overwrite or merge
+        // with the first), and the materialized session must reflect only the *latest* cut.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        for text in ["one", "two", "three", "four", "five"] {
+            session.user(text);
+        }
+        store.append_new(&session.messages).unwrap();
+        let round1_ids = store.active_ids().to_vec();
+        assert_eq!(round1_ids.len(), 5);
+
+        // Round 1: fold "one","two","three" down to [summary1, four, five] — dropped = 2.
+        let round1_messages = vec![
+            Message::user(format!(
+                "{}\n\nfirst summary",
+                agent_core::compaction::SUMMARY_MARKER
+            )),
+            session.messages[3].clone(), // "four"
+            session.messages[4].clone(), // "five"
+        ];
+        store
+            .rewrite_compacted(&round1_messages, CompactionMeta { tokens_before: 100 })
+            .unwrap();
+        assert_eq!(store.meta().compactions, 1);
+        assert_eq!(store.meta().dropped_messages, 2);
+        assert_eq!(store.active_ids().len(), 3);
+
+        // Continue past round 1 with two more ordinary messages — no reopen in between, exercising
+        // the in-process (not just persisted-and-reopened) state right after a compaction.
+        let mut continued = Session::new();
+        continued.messages = Arc::new(round1_messages.clone());
+        continued.user("six");
+        continued.user("seven");
+        store.append_new(&continued.messages).unwrap();
+        assert_eq!(store.active_ids().len(), 5);
+
+        // Round 2: fold everything except the very last message ("seven") — dropped = 3.
+        let round2_messages = vec![
+            Message::user(format!(
+                "{}\n\nsecond summary",
+                agent_core::compaction::SUMMARY_MARKER
+            )),
+            continued.messages[4].clone(), // "seven"
+        ];
+        store
+            .rewrite_compacted(&round2_messages, CompactionMeta { tokens_before: 200 })
+            .unwrap();
+
+        // Both rounds' provenance accumulate independently — not overwritten.
+        assert_eq!(store.meta().compactions, 2);
+        assert_eq!(store.meta().dropped_messages, 5); // 2 + 3
+        assert_eq!(store.active_ids().len(), 2);
+
+        // The materialized session (after a reopen) reflects only the *latest* cut.
+        let (reopened, restored) = repo.open_id(&store.meta().id.clone()).unwrap();
+        assert_eq!(restored.messages.len(), 2);
+        assert!(
+            matches!(&restored.messages[0].content[0], ContentBlock::Text { text, .. }
+                if text.contains("second summary")),
+            "the active path must show the second (latest) summary, not the first: {:?}",
+            restored.messages[0].content
+        );
+
+        // Exactly two `Entry::Compaction` provenance records — one per round, independently readable.
+        let raw = fs::read_to_string(&reopened.path).unwrap();
+        let lines: Vec<Value> = raw
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let compaction_entries: Vec<&Value> = lines
+            .iter()
+            .filter(|v| v["type"] == json!("compaction"))
+            .collect();
+        assert_eq!(
+            compaction_entries.len(),
+            2,
+            "expected one entry per round: {raw}"
+        );
+        assert_eq!(compaction_entries[0]["summary"], json!("first summary"));
+        assert_eq!(compaction_entries[1]["summary"], json!("second summary"));
+
+        // Round 1's folded originals ("one","two","three") are still physically present, untouched
+        // by round 2.
+        for (id, text) in round1_ids[..3].iter().zip(["one", "two", "three"]) {
+            let found = lines.iter().find(|v| v["id"] == json!(id));
+            assert!(
+                found.is_some(),
+                "round 1's folded message {id} ({text}) missing: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_compacted_falls_back_to_a_plain_rewrite_when_nothing_was_folded() {
+        // B-L6 pi-parity test gap (fixed): a degenerate "compaction" that doesn't actually shrink the
+        // active path (e.g. new message count matching the old one) has no folded prefix worth
+        // recording — `rewrite_compacted` must fall back to a plain `rewrite`, not write a
+        // meaningless `Entry::Compaction` record naming zero folded messages.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("one");
+        session.user("two");
+        store.append_new(&session.messages).unwrap();
+
+        // Same length in as out — nothing folded.
+        let same_length = vec![
+            Message::user("one (rewritten)"),
+            Message::user("two (rewritten)"),
+        ];
+        store
+            .rewrite_compacted(&same_length, CompactionMeta { tokens_before: 1 })
+            .unwrap();
+
+        assert_eq!(
+            store.meta().compactions,
+            0,
+            "nothing was folded; must not count as a compaction"
+        );
+        assert_eq!(store.meta().dropped_messages, 0);
+        assert_eq!(store.active_ids().len(), 2);
+
+        let (reopened, restored) = repo.open_id(&store.meta().id.clone()).unwrap();
+        assert_eq!(restored.messages.len(), 2);
+        let ContentBlock::Text { text, .. } = &restored.messages[0].content[0] else {
+            panic!("expected text");
+        };
+        assert_eq!(text, "one (rewritten)");
+
+        // No `Entry::Compaction` record at all.
+        let raw = fs::read_to_string(&reopened.path).unwrap();
+        let compaction_entries = raw
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| v["type"] == json!("compaction"))
+            .count();
+        assert_eq!(
+            compaction_entries, 0,
+            "a no-op fold must not write a meaningless compaction provenance record: {raw}"
         );
     }
 
@@ -3439,6 +4054,43 @@ mod tests {
     }
 
     #[test]
+    fn open_restores_a_proactive_compaction_signal_from_the_persisted_transcript() {
+        // B-M14 pi-parity gap (fixed): `SessionStore::open` never restored `last_input_tokens` from
+        // the persisted history — a freshly-built `Session` defaults it to 0, and `should_compact`/
+        // `is_hard_overflow` both require it to be positive to fire at all. A resumed large session
+        // wouldn't proactively compact until a *new* turn produced fresh real usage, a whole turn
+        // later than it should (pi's own `pre-prompt-compaction-no-continue` regression test covers
+        // the same gap). Usage isn't persisted per-message anywhere in this format, so the estimate
+        // must come from the same char/4 heuristic `compaction::trailing_tokens` already uses
+        // elsewhere for spans with no exact provider-reported figure.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let id = store.meta().id.clone();
+        let mut session = Session::new();
+        // Real, non-trivial text so the char/4 estimate is comfortably nonzero and easy to bound.
+        session.user("a".repeat(400)); // ~100 estimated tokens
+        session.push(Message::assistant(vec![ContentBlock::text(
+            "b".repeat(400),
+        )])); // ~100 more
+        store.append_new(&session.messages).unwrap();
+
+        let (_reopened, restored) = repo.open_id(&id).unwrap();
+        assert!(
+            restored.last_input_tokens > 0,
+            "a resumed session must have a nonzero live-context estimate, not the zero default"
+        );
+        assert!(
+            restored.last_input_tokens >= 190,
+            "expected roughly 200 estimated tokens across both messages, got {}",
+            restored.last_input_tokens
+        );
+        // Every persisted message must be marked as already accounted for, so a subsequent
+        // `trailing_tokens` call (after a fresh turn) doesn't double-count this estimate.
+        assert_eq!(restored.last_usage_message_count, restored.messages.len());
+    }
+
+    #[test]
     fn compaction_records_provenance() {
         let dir = tmpdir();
         let repo = SessionRepo::open(dir.path()).unwrap();
@@ -3581,6 +4233,195 @@ mod tests {
     }
 
     #[test]
+    fn set_label_sets_and_gets() {
+        // pi: session-manager/labels.test.ts, "sets and gets labels".
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("hello");
+        store.append_new(&session.messages).unwrap();
+        let msg_id = store.active_ids()[0].clone();
+
+        assert_eq!(store.get_label(&msg_id), None, "no label initially");
+        store.set_label(&msg_id, Some("checkpoint")).unwrap();
+        assert_eq!(store.get_label(&msg_id), Some("checkpoint"));
+
+        // The label is visible via `tree()` too, attached to the labeled node.
+        let node = store.tree().into_iter().find(|n| n.id == msg_id).unwrap();
+        assert_eq!(node.label.as_deref(), Some("checkpoint"));
+    }
+
+    #[test]
+    fn set_label_clears_with_none() {
+        // pi: session-manager/labels.test.ts, "clears labels with undefined".
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("hello");
+        store.append_new(&session.messages).unwrap();
+        let msg_id = store.active_ids()[0].clone();
+
+        store.set_label(&msg_id, Some("checkpoint")).unwrap();
+        assert_eq!(store.get_label(&msg_id), Some("checkpoint"));
+        store.set_label(&msg_id, None).unwrap();
+        assert_eq!(store.get_label(&msg_id), None);
+    }
+
+    #[test]
+    fn set_label_last_write_wins() {
+        // pi: session-manager/labels.test.ts, "last label wins".
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("hello");
+        store.append_new(&session.messages).unwrap();
+        let msg_id = store.active_ids()[0].clone();
+
+        store.set_label(&msg_id, Some("first")).unwrap();
+        store.set_label(&msg_id, Some("second")).unwrap();
+        store.set_label(&msg_id, Some("third")).unwrap();
+        assert_eq!(store.get_label(&msg_id), Some("third"));
+
+        // Survives reopen from disk too, not just in-memory state.
+        let (reopened, _) = repo.open_id(&store.meta().id.clone()).unwrap();
+        assert_eq!(reopened.get_label(&msg_id), Some("third"));
+    }
+
+    #[test]
+    fn set_label_rejects_unknown_target_id() {
+        // pi: session-manager/labels.test.ts, "throws when labeling non-existent entry".
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let err = store.set_label("non-existent", Some("label")).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn labels_are_excluded_from_the_active_session_messages() {
+        // pi: session-manager/labels.test.ts, "labels are not included in buildSessionContext". In this
+        // module labels never occupy a slot in the message chain at all (see `Entry::Label`'s doc
+        // comment), so this holds trivially — proven here so a future refactor can't silently regress
+        // it by folding labels into `nodes`/`active`.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("hello");
+        store.append_new(&session.messages).unwrap();
+        let msg_id = store.active_ids()[0].clone();
+        store.set_label(&msg_id, Some("checkpoint")).unwrap();
+
+        assert_eq!(store.active_ids().len(), 1);
+        let (_, restored) = repo.open_id(&store.meta().id.clone()).unwrap();
+        assert_eq!(restored.messages.len(), 1);
+    }
+
+    #[test]
+    fn labels_are_preserved_across_fork_at_entry_and_dropped_when_off_path() {
+        // pi: session-manager/labels.test.ts, "labels are preserved in createBranchedSession" and
+        // "labels not on path are not preserved" — combined into one scenario: msg1/msg2 are labeled
+        // and both end up on the forked path; msg3 is labeled but forked *before* (excluded), so its
+        // label has nothing to carry forward to.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("first");
+        session.push(Message::assistant(vec![ContentBlock::text("hi")]));
+        session.user("followup");
+        store.append_new(&session.messages).unwrap();
+        let ids = store.active_ids().to_vec(); // [msg1, msg2, msg3]
+
+        store.set_label(&ids[0], Some("first")).unwrap();
+        store.set_label(&ids[1], Some("second")).unwrap();
+        store.set_label(&ids[2], Some("third")).unwrap();
+
+        let session_id = store.meta().id.clone();
+        // Fork "before" msg3 — keeps msg1/msg2, excludes msg3.
+        let (forked, fsession) = repo.fork_at_entry(&session_id, &ids[2], true).unwrap();
+        assert_eq!(fsession.messages.len(), 2);
+        let new_ids = forked.active_ids().to_vec();
+        assert_eq!(new_ids.len(), 2);
+
+        assert_eq!(
+            forked.get_label(&new_ids[0]),
+            Some("first"),
+            "msg1's label must carry forward under msg1's new id in the forked session"
+        );
+        assert_eq!(
+            forked.get_label(&new_ids[1]),
+            Some("second"),
+            "msg2's label must carry forward under msg2's new id in the forked session"
+        );
+
+        // msg3's label had nothing on the forked path to attach to — it must not silently reappear
+        // under some other id, and the forked session must not carry any *extra* stray label.
+        assert!(
+            !forked
+                .tree()
+                .iter()
+                .any(|n| n.label.as_deref() == Some("third")),
+            "a label whose target fell off the forked path must not be preserved"
+        );
+
+        // The original session is completely unaffected by the fork.
+        assert_eq!(store.get_label(&ids[0]), Some("first"));
+        assert_eq!(store.get_label(&ids[1]), Some("second"));
+        assert_eq!(store.get_label(&ids[2]), Some("third"));
+
+        // Reopening the forked session from disk must agree (labels actually persisted, not just held
+        // in memory on the freshly-created store).
+        let (reforked, _) = repo.open_id(&forked.meta().id.clone()).unwrap();
+        assert_eq!(reforked.get_label(&new_ids[0]), Some("first"));
+        assert_eq!(reforked.get_label(&new_ids[1]), Some("second"));
+    }
+
+    #[test]
+    fn forking_a_session_with_labels_produces_an_unbroken_parent_chain() {
+        // pi: session-manager/labels.test.ts, "rewires children of removed labels when forking" — pi
+        // needs an explicit rewiring step there because a label is a real tree node other entries chain
+        // off of, so dropping one during a fork would otherwise orphan its children. This module's
+        // labels never occupy a chain slot to begin with (see `Entry::Label`'s doc comment), so there is
+        // no rewiring problem to solve; this proves the structural guarantee that replaces it: after
+        // forking a session with labels interspersed, the new session's parent chain is a single
+        // unbroken line from root to tip with no gaps.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("first");
+        store.append_new(&session.messages).unwrap();
+        let msg1_id = store.active_ids()[0].clone();
+        store.set_label(&msg1_id, Some("checkpoint")).unwrap();
+        store.record_model_change("model-b").unwrap();
+        session.user("followup");
+        store.append_new(&session.messages).unwrap();
+        let msg2_id = store.active_ids()[1].clone();
+
+        let session_id = store.meta().id.clone();
+        let (forked, fsession) = repo.fork_at_entry(&session_id, &msg2_id, false).unwrap();
+        assert_eq!(fsession.messages.len(), 2);
+
+        let new_ids = forked.active_ids().to_vec();
+        assert_eq!(new_ids.len(), 2);
+        assert_eq!(
+            forked
+                .tree()
+                .iter()
+                .find(|n| n.id == new_ids[1])
+                .unwrap()
+                .parent_id
+                .as_deref(),
+            Some(new_ids[0].as_str()),
+            "the second message's parent must be the first message directly, with no gap"
+        );
+    }
+
+    #[test]
     fn model_and_thinking_level_changes_are_branch_scoped() {
         // A model/thinking-level change recorded on one branch must not leak onto a sibling branch that
         // never passed through the message it was anchored to — the whole point of H6. A change
@@ -3650,6 +4491,47 @@ mod tests {
         let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
         let err = store.switch_active("does-not-exist").unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn switch_active_to_the_already_active_leaf_is_a_no_op() {
+        // pi-parity fix (B-L2): `agent-session-tree-navigation.test.ts`'s "should handle navigation to
+        // same position (no-op)" — navigating to wherever the session already is must not append a
+        // redundant `Leaf` entry (or any entry at all): the entry count on disk must not grow, and the
+        // in-memory active path must be unchanged.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("a");
+        session.user("b");
+        store.append_new(&session.messages).unwrap();
+        let ids = store.active_ids().to_vec();
+        let tip = ids.last().cloned().unwrap();
+
+        let before = std::fs::read_to_string(store.path()).unwrap();
+        let messages = store.switch_active(&tip).unwrap();
+
+        assert_eq!(
+            messages.len(),
+            2,
+            "the no-op switch must still return the current branch's materialized messages"
+        );
+        assert_eq!(
+            store.active_ids(),
+            ids.as_slice(),
+            "the active path must be unchanged by a no-op switch"
+        );
+        let after = std::fs::read_to_string(store.path()).unwrap();
+        assert_eq!(
+            before, after,
+            "navigating to the already-active leaf must not write anything to disk"
+        );
+
+        // Reopening must agree: no phantom `Leaf` entry was ever persisted.
+        let (reopened, restored) = repo.open_id(&store.meta().id.clone()).unwrap();
+        assert_eq!(restored.messages.len(), 2);
+        assert_eq!(reopened.active_ids(), ids.as_slice());
     }
 
     #[test]
@@ -3841,6 +4723,193 @@ mod tests {
             reopened.active_ids(),
             &[root_id],
             "the tip must have moved to include the summary message, not stayed at the root"
+        );
+    }
+
+    #[test]
+    fn switch_active_with_summary_attaches_to_a_root_target_and_becomes_the_new_leaf() {
+        // B-M6 pi-parity test gap (fixed): the exact tree shape a branch summary produces was never
+        // asserted, only that *some* summary got applied. This is pi's "summary attached to root
+        // node" scenario (`agent-session-tree-navigation.test.ts:78-106`) — this codebase's uniform
+        // contract (no editor-rewind distinction between user/assistant targets, unlike pi) is: the
+        // summary always attaches as a *child of the target itself*, regardless of shape, and always
+        // becomes the new leaf.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("first message"); // u1 — the root, no parent
+        session.push(Message::assistant(vec![ContentBlock::text("a1")]));
+        session.user("second message");
+        session.push(Message::assistant(vec![ContentBlock::text("a2")]));
+        store.append_new(&session.messages).unwrap();
+        let ids = store.active_ids().to_vec();
+        let u1 = ids[0].clone();
+        let a1 = ids[1].clone();
+
+        store
+            .switch_active_with_summary(&u1, "root recap", &ids[3], BranchSummaryDetails::default())
+            .unwrap();
+
+        // u1 itself is confirmed root (no parent) — the scenario this test is actually exercising.
+        let tree = store.tree();
+        let u1_node = tree.iter().find(|n| n.id == u1).unwrap();
+        assert!(u1_node.parent_id.is_none(), "u1 must be the tree's root");
+
+        let summary_id = store.active_ids().last().unwrap().clone();
+        let summary_node = tree.iter().find(|n| n.id == summary_id).unwrap();
+        assert_eq!(
+            summary_node.parent_id.as_deref(),
+            Some(u1.as_str()),
+            "the summary must attach as a child of the target itself"
+        );
+
+        // u1 now has two children: its original next message (a1) and the new summary.
+        let children: Vec<&str> = tree
+            .iter()
+            .filter(|n| n.parent_id.as_deref() == Some(u1.as_str()))
+            .map(|n| n.id.as_str())
+            .collect();
+        assert_eq!(
+            children.len(),
+            2,
+            "expected two children of u1: {children:?}"
+        );
+        assert!(children.contains(&a1.as_str()));
+        assert!(children.contains(&summary_id.as_str()));
+
+        assert_eq!(
+            store.active_ids().last(),
+            Some(&summary_id),
+            "the summary must become the new leaf"
+        );
+    }
+
+    #[test]
+    fn switch_active_with_summary_attaches_to_a_nested_user_target_and_becomes_the_new_leaf() {
+        // B-M6 pi-parity test gap (fixed): pi's "attach summary to correct parent when navigating to
+        // nested user message" scenario (`agent-session-tree-navigation.test.ts:108-145`) — there, pi
+        // attaches to the target's *parent* (an editor-rewind semantic this codebase has no
+        // equivalent of). Here the contract is uniform: the summary attaches as a child of the
+        // nested user target itself, alongside its existing child, and becomes the new leaf.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("message one");
+        session.push(Message::assistant(vec![ContentBlock::text("a1")]));
+        session.user("message two"); // u2 — nested (not root), the target
+        session.push(Message::assistant(vec![ContentBlock::text("a2")]));
+        session.user("message three");
+        session.push(Message::assistant(vec![ContentBlock::text("a3")]));
+        store.append_new(&session.messages).unwrap();
+        let ids = store.active_ids().to_vec();
+        let u2 = ids[2].clone();
+        let a1 = ids[1].clone();
+        let a2 = ids[3].clone();
+
+        // u2's parent is confirmed a1 — the "nested, not root" shape this test exercises.
+        let tree_before = store.tree();
+        assert_eq!(
+            tree_before
+                .iter()
+                .find(|n| n.id == u2)
+                .unwrap()
+                .parent_id
+                .as_deref(),
+            Some(a1.as_str())
+        );
+
+        store
+            .switch_active_with_summary(
+                &u2,
+                "nested recap",
+                &ids[5],
+                BranchSummaryDetails::default(),
+            )
+            .unwrap();
+
+        let tree = store.tree();
+        let summary_id = store.active_ids().last().unwrap().clone();
+        let summary_node = tree.iter().find(|n| n.id == summary_id).unwrap();
+        assert_eq!(
+            summary_node.parent_id.as_deref(),
+            Some(u2.as_str()),
+            "the summary must attach as a child of u2 itself, not u2's parent"
+        );
+
+        // u2 now has two children: its original next message (a2) and the new summary.
+        let children: Vec<&str> = tree
+            .iter()
+            .filter(|n| n.parent_id.as_deref() == Some(u2.as_str()))
+            .map(|n| n.id.as_str())
+            .collect();
+        assert_eq!(
+            children.len(),
+            2,
+            "expected two children of u2: {children:?}"
+        );
+        assert!(children.contains(&a2.as_str()));
+        assert!(children.contains(&summary_id.as_str()));
+
+        assert_eq!(store.active_ids().last(), Some(&summary_id));
+    }
+
+    #[test]
+    fn switch_active_with_summary_attaches_to_an_assistant_target_and_becomes_the_new_leaf() {
+        // B-M6 pi-parity test gap (fixed): pi's "attach summary to selected node when navigating to
+        // assistant message" scenario (`agent-session-tree-navigation.test.ts:147-173`) — pi attaches
+        // to the assistant target itself (no rewind semantic for a non-user target), matching this
+        // codebase's uniform contract exactly.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("hello");
+        session.push(Message::assistant(vec![ContentBlock::text("a1")])); // the target
+        session.user("goodbye");
+        session.push(Message::assistant(vec![ContentBlock::text("a2")]));
+        store.append_new(&session.messages).unwrap();
+        let ids = store.active_ids().to_vec();
+        let a1 = ids[1].clone();
+        let u2 = ids[2].clone();
+
+        store
+            .switch_active_with_summary(
+                &a1,
+                "assistant recap",
+                &ids[3],
+                BranchSummaryDetails::default(),
+            )
+            .unwrap();
+
+        let tree = store.tree();
+        let summary_id = store.active_ids().last().unwrap().clone();
+        let summary_node = tree.iter().find(|n| n.id == summary_id).unwrap();
+        assert_eq!(
+            summary_node.parent_id.as_deref(),
+            Some(a1.as_str()),
+            "the summary must attach as a child of the selected assistant node"
+        );
+
+        // a1 now has two children: its original next message (u2) and the new summary.
+        let children: Vec<&str> = tree
+            .iter()
+            .filter(|n| n.parent_id.as_deref() == Some(a1.as_str()))
+            .map(|n| n.id.as_str())
+            .collect();
+        assert_eq!(
+            children.len(),
+            2,
+            "expected two children of a1: {children:?}"
+        );
+        assert!(children.contains(&u2.as_str()));
+        assert!(children.contains(&summary_id.as_str()));
+
+        assert_eq!(
+            store.active_ids().last(),
+            Some(&summary_id),
+            "the summary must become the new leaf"
         );
     }
 
@@ -4230,5 +5299,233 @@ mod tests {
         // same cyclic structure from different entry points.
         let _ = store.list_branches();
         let _ = store.abandoned_by_switch("m1");
+    }
+
+    #[test]
+    fn append_custom_participates_in_tree_traversal_but_is_skipped_from_active_messages() {
+        // pi: session-manager/save-entry.test.ts, "saves custom entries and includes them in tree
+        // traversal" — a custom entry chains into the tree like any other entry (a later message's
+        // parent is the custom entry's id, not skipped over it), is reported by full-tree traversal,
+        // but contributes nothing to the materialized `Session.messages`/LLM context.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("hello");
+        store.append_new(&session.messages).unwrap();
+        let msg1_id = store.active_ids()[0].clone();
+
+        let custom_id = store
+            .append_custom("my_data", json!({"foo": "bar"}))
+            .unwrap();
+
+        session.push(Message::assistant(vec![ContentBlock::text("hi")]));
+        store.append_new(&session.messages).unwrap();
+        let msg2_id = store.active_ids().last().unwrap().clone();
+
+        // The custom entry sits between msg1 and msg2 in the chain.
+        assert_eq!(
+            msg2_id,
+            store.active_ids()[2],
+            "path must be [msg1, custom, msg2]"
+        );
+        assert_eq!(store.active_ids()[1], custom_id);
+
+        let tree = store.tree();
+        let custom_node = tree.iter().find(|n| n.id == custom_id).unwrap();
+        assert_eq!(custom_node.parent_id.as_deref(), Some(msg1_id.as_str()));
+        assert_eq!(custom_node.role, None, "a custom entry has no message role");
+        let msg2_node = tree.iter().find(|n| n.id == msg2_id).unwrap();
+        assert_eq!(
+            msg2_node.parent_id.as_deref(),
+            Some(custom_id.as_str()),
+            "the message appended after a custom entry must chain directly off it"
+        );
+
+        // buildSessionContext-equivalent: only the two real messages, not the custom entry.
+        assert_eq!(store.active_ids().len(), 3);
+        let (_, restored) = repo.open_id(&store.meta().id.clone()).unwrap();
+        assert_eq!(
+            restored.messages.len(),
+            2,
+            "a custom entry must be skipped when materializing Session.messages"
+        );
+    }
+
+    #[test]
+    fn custom_entries_survive_reopen_and_a_compaction_of_an_unrelated_later_range() {
+        // A custom entry appended mid-session must round-trip through a reopen with its content intact,
+        // and must not confuse `rewrite_compacted`'s folded-message counting when a *later* compaction
+        // folds messages that came after it — the whole point of the message-counting walk (as opposed
+        // to a raw positional slice) in `rewrite_compacted`.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("a");
+        store.append_new(&session.messages).unwrap();
+        let custom_id = store
+            .append_custom("preset-state", json!({"name": "plan"}))
+            .unwrap();
+        session.push(Message::assistant(vec![ContentBlock::text("b")]));
+        session.user("c");
+        store.append_new(&session.messages).unwrap();
+
+        let (reopened, restored) = repo.open_id(&store.meta().id.clone()).unwrap();
+        assert_eq!(restored.messages.len(), 3);
+        let custom_node = reopened
+            .tree()
+            .into_iter()
+            .find(|n| n.id == custom_id)
+            .unwrap();
+        assert_eq!(
+            custom_node.preview.as_deref(),
+            Some("[custom: preset-state]")
+        );
+
+        // Compact away everything: a summary replacing all 3 messages down to 1.
+        let mut summary_session = Session::new();
+        summary_session.push(Message::user(format!(
+            "{}\n\nsummary text",
+            agent_core::compaction::SUMMARY_MARKER
+        )));
+        store
+            .rewrite_compacted(
+                &summary_session.messages,
+                CompactionMeta { tokens_before: 100 },
+            )
+            .unwrap();
+
+        // The custom entry (off the new active path, part of the folded-away region) must still be
+        // readable on disk — compaction preserves folded content, it doesn't delete it (see
+        // `rewrite_compacted`'s own doc comment) — and the new active path must be exactly the summary.
+        let (_, after) = repo.open_id(&store.meta().id.clone()).unwrap();
+        assert_eq!(after.messages.len(), 1);
+        let tree_after = store.tree();
+        assert!(
+            tree_after.iter().any(|n| n.id == custom_id),
+            "the custom entry must still be present in the tree after compaction folded past it"
+        );
+    }
+
+    #[test]
+    fn fork_at_entry_drops_custom_entries_but_keeps_the_surrounding_messages() {
+        // Track C-M2: a custom entry on the forked path has no message representation to carry into the
+        // new session (see `fork_at_entry`'s doc comment) — it must be silently dropped, while the real
+        // messages before and after it fork normally with an unbroken parent chain.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("a");
+        store.append_new(&session.messages).unwrap();
+        store.append_custom("marker", json!({"k": "v"})).unwrap();
+        session.push(Message::assistant(vec![ContentBlock::text("b")]));
+        store.append_new(&session.messages).unwrap();
+        let msg2_id = store.active_ids().last().unwrap().clone();
+
+        let session_id = store.meta().id.clone();
+        let (forked, fsession) = repo.fork_at_entry(&session_id, &msg2_id, false).unwrap();
+        assert_eq!(
+            fsession.messages.len(),
+            2,
+            "both real messages must survive the fork"
+        );
+        let dump = serde_json::to_string(fsession.messages.as_ref()).unwrap();
+        assert!(dump.contains("\"a\"") && dump.contains("\"b\""));
+
+        let new_ids = forked.active_ids().to_vec();
+        assert_eq!(
+            new_ids.len(),
+            2,
+            "the custom entry must not occupy a slot in the forked chain"
+        );
+        assert_eq!(
+            forked
+                .tree()
+                .iter()
+                .find(|n| n.id == new_ids[1])
+                .unwrap()
+                .parent_id
+                .as_deref(),
+            Some(new_ids[0].as_str()),
+            "the second message's parent must be the first message directly, not the dropped custom entry"
+        );
+    }
+
+    #[test]
+    fn rewrite_compacted_folded_ids_are_correct_when_a_custom_entry_sits_inside_the_folded_range() {
+        // Regression guard for the `rewrite_compacted` fix that came with Track C-M2: a plain
+        // `self.active[..folded_count]` positional slice (the original implementation) would
+        // misalign the moment a custom entry occupies a slot in `self.active` without contributing to
+        // `self.persisted` — a custom entry inside the folded region would silently eat one of the
+        // slots meant for a real folded message, leaving the true last folded message unlisted in the
+        // `Entry::Compaction` provenance record. This drives that exact shape: [msg1, custom, msg2,
+        // msg3] compacted down to a 1-message summary (folding all 3 real messages away) must list
+        // all 3 real ids (and the custom id, since it structurally sits within the folded region) in
+        // `folded_ids` — not silently drop msg3.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("one");
+        store.append_new(&session.messages).unwrap();
+        let msg1_id = store.active_ids()[0].clone();
+        let custom_id = store.append_custom("marker", json!({"k": "v"})).unwrap();
+        session.user("two");
+        session.user("three");
+        store.append_new(&session.messages).unwrap();
+        let all_ids = store.active_ids().to_vec();
+        assert_eq!(
+            all_ids,
+            vec![
+                msg1_id.clone(),
+                custom_id.clone(),
+                all_ids[2].clone(),
+                all_ids[3].clone()
+            ]
+        );
+        let msg2_id = all_ids[2].clone();
+        let msg3_id = all_ids[3].clone();
+
+        let compacted_messages = vec![Message::user(format!(
+            "{}\n\nrecap",
+            agent_core::compaction::SUMMARY_MARKER
+        ))];
+        store
+            .rewrite_compacted(&compacted_messages, CompactionMeta { tokens_before: 999 })
+            .unwrap();
+        assert_eq!(store.active_ids().len(), 1);
+
+        let raw = fs::read_to_string(&store.path).unwrap();
+        let lines: Vec<Value> = raw
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let compaction_entry = lines
+            .iter()
+            .find(|v| v["type"] == json!("compaction"))
+            .expect("exactly one compaction entry");
+        let folded_ids: Vec<String> = compaction_entry["folded_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+
+        assert!(
+            folded_ids.contains(&msg1_id),
+            "folded_ids must list the first folded message: {folded_ids:?}"
+        );
+        assert!(
+            folded_ids.contains(&msg2_id),
+            "folded_ids must list the second folded message: {folded_ids:?}"
+        );
+        assert!(
+            folded_ids.contains(&msg3_id),
+            "folded_ids must list the third (last) folded message — this is exactly what a naive \
+             positional slice would drop once a custom entry occupies a slot: {folded_ids:?}"
+        );
     }
 }

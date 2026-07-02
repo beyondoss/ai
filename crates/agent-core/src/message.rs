@@ -54,6 +54,17 @@ pub enum ContentBlock {
         id: String,
         name: String,
         input: Value,
+        /// Gemini-style opaque reasoning-continuity data tied to this specific call (OpenRouter/Gemini
+        /// via the OpenAI Chat Completions fallback dialect: wire field `reasoning_details`, one array
+        /// entry per tool call, matched back to it by the entry's own `id`). A single serialized JSON
+        /// object — this block owns at most the one entry matched to its `id`, not the whole array —
+        /// opaque and replayed verbatim under the assistant message's `reasoning_details` array on a
+        /// later tool turn, the same "don't interpret it, just echo it back" contract as
+        /// `Thinking.signature`. `None` for every dialect but OpenAI Chat Completions (the only one
+        /// that parses this field today — see `dialect::openai::Decoder`'s `reasoning_details`
+        /// handling) and for a call whose provider never sent one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
     },
     /// The result of running a tool, fed back to the model. Carried on a `User` message (Anthropic
     /// convention). `is_error` lets the model see a failure as a value rather than a dead turn.
@@ -80,6 +91,17 @@ impl ContentBlock {
             text: text.into(),
             id: None,
             phase: None,
+        }
+    }
+
+    /// A tool-call block with no reasoning-continuity data — the common case for every dialect but
+    /// OpenAI Chat Completions (see `ToolUse`'s doc comment).
+    pub fn tool_use(id: impl Into<String>, name: impl Into<String>, input: Value) -> Self {
+        ContentBlock::ToolUse {
+            id: id.into(),
+            name: name.into(),
+            input,
+            thought_signature: None,
         }
     }
 }
@@ -120,6 +142,28 @@ pub struct Message {
     /// [`Session::scrub_cross_model_state`](crate::session::Session::scrub_cross_model_state).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
+    /// Set on a synthetic assistant turn created by [`Message::error`] — a whole run that ended in
+    /// `Err` (a transport failure that exhausted every retry layer, or a compaction/overflow recovery
+    /// that itself failed) with no real model response to persist. `None` on every ordinary message.
+    /// Matches pi's `errorMessage` field on an `AssistantMessage` with `stopReason: "error"`
+    /// (`agent.ts`'s `handleRunFailure`) — without a persisted record here, the session's last message
+    /// stays the user's own un-answered prompt, and a client's retry would append a second consecutive
+    /// `user` turn no dialect's wire format allows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    /// Set on an assistant turn whose model stream was cancelled mid-flight (`StopReason::Aborted`) —
+    /// distinct from [`error_message`](Self::error_message): this is a user-initiated stop with
+    /// whatever partial content had already streamed, not a fault with no response at all. Matches
+    /// pi's `AssistantMessage.stopReason === "aborted"` (`agent.ts`'s `handleRunFailure`,
+    /// `packages/ai/test/abort.test.ts`) — without persisting the partial turn, a cancelled run leaves
+    /// no trace in the transcript and, like an unpersisted error, risks a later retry stacking a second
+    /// consecutive `user` turn.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub aborted: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl Message {
@@ -129,6 +173,8 @@ impl Message {
             role: Role::User,
             content: vec![ContentBlock::text(text)],
             model_id: None,
+            error_message: None,
+            aborted: false,
         }
     }
 
@@ -138,6 +184,24 @@ impl Message {
             role: Role::Assistant,
             content,
             model_id: None,
+            error_message: None,
+            aborted: false,
+        }
+    }
+
+    /// A synthetic assistant turn closing out a run that ended in `Err` with no real model response —
+    /// see the [`error_message`](Self::error_message) field doc for why this must be persisted rather
+    /// than leaving the user's prompt as the session's dangling last message. An empty text block
+    /// (mirroring pi's own `content: [{type:"text", text:""}]` shape) rather than no content at all,
+    /// since an assistant turn with a genuinely empty content array is a shape no wire dialect accepts
+    /// on a future replay.
+    pub fn error(message: impl Into<String>) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: vec![ContentBlock::text(String::new())],
+            model_id: None,
+            error_message: Some(message.into()),
+            aborted: false,
         }
     }
 
@@ -156,6 +220,8 @@ impl Message {
             role: Role::User,
             content,
             model_id: None,
+            error_message: None,
+            aborted: false,
         }
     }
 
@@ -174,6 +240,8 @@ impl Message {
                 images: Vec::new(),
             }],
             model_id: None,
+            error_message: None,
+            aborted: false,
         }
     }
 
@@ -186,6 +254,8 @@ impl Message {
             role: Role::User,
             content: blocks,
             model_id: None,
+            error_message: None,
+            aborted: false,
         }
     }
 
@@ -196,10 +266,18 @@ impl Message {
         self
     }
 
+    /// Mark this assistant turn as cancelled mid-stream — see the [`aborted`](Self::aborted) field doc.
+    pub fn with_aborted(mut self) -> Self {
+        self.aborted = true;
+        self
+    }
+
     /// The `ToolUse` blocks in this message, if any (what the loop dispatches each step).
     pub fn tool_uses(&self) -> impl Iterator<Item = (&str, &str, &Value)> {
         self.content.iter().filter_map(|b| match b {
-            ContentBlock::ToolUse { id, name, input } => Some((id.as_str(), name.as_str(), input)),
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => Some((id.as_str(), name.as_str(), input)),
             _ => None,
         })
     }
@@ -230,6 +308,10 @@ pub enum StopReason {
     /// The model declined to respond (Anthropic `refusal`). A distinct terminal state so a caller can
     /// tell a refusal apart from a normal end-of-turn rather than reading it as success.
     Refusal,
+    /// A client cancelled the run mid-stream — never sent by a provider, only synthesized locally by
+    /// `Agent::run_turn_once` when `cancel` trips after some content has already streamed. Distinct
+    /// from a fault: matches pi's own `stopReason: "aborted"` (see `Message::aborted`'s doc comment).
+    Aborted,
     /// Anything else / dialect-specific.
     Other,
 }
@@ -336,15 +418,35 @@ mod tests {
 
     #[test]
     fn content_block_tool_use_round_trips() {
-        let block = ContentBlock::ToolUse {
-            id: "tu_1".into(),
-            name: "read".into(),
-            input: json!({ "path": "README.md" }),
-        };
+        let block = ContentBlock::tool_use("tu_1", "read", json!({ "path": "README.md" }));
         let wire = serde_json::to_value(&block).unwrap();
         // Internally-tagged on `type`, snake_case — the shape the dialect adapters key on.
         assert_eq!(wire["type"], "tool_use");
         assert_eq!(wire["name"], "read");
+        // No reasoning-continuity data on the common path — the field is skipped entirely, not
+        // serialized as `null`, so an existing on-disk session round-trips unchanged.
+        assert!(wire.get("thought_signature").is_none());
+        let back: ContentBlock = serde_json::from_value(wire).unwrap();
+        assert_eq!(back, block);
+    }
+
+    #[test]
+    fn content_block_tool_use_thought_signature_round_trips() {
+        // OpenAI Chat Completions' Gemini/OpenRouter `reasoning_details` replay path (see
+        // `dialect::openai::Decoder`) — opaque, just needs to survive a wire round-trip verbatim.
+        let block = ContentBlock::ToolUse {
+            id: "tu_1".into(),
+            name: "read".into(),
+            input: json!({ "path": "README.md" }),
+            thought_signature: Some(
+                r#"{"type":"reasoning.encrypted","id":"tu_1","data":"enc"}"#.into(),
+            ),
+        };
+        let wire = serde_json::to_value(&block).unwrap();
+        assert_eq!(
+            wire["thought_signature"],
+            r#"{"type":"reasoning.encrypted","id":"tu_1","data":"enc"}"#
+        );
         let back: ContentBlock = serde_json::from_value(wire).unwrap();
         assert_eq!(back, block);
     }
@@ -368,16 +470,8 @@ mod tests {
     fn tool_uses_extracts_only_tool_calls() {
         let msg = Message::assistant(vec![
             ContentBlock::text("let me look"),
-            ContentBlock::ToolUse {
-                id: "a".into(),
-                name: "read".into(),
-                input: json!({}),
-            },
-            ContentBlock::ToolUse {
-                id: "b".into(),
-                name: "bash".into(),
-                input: json!({}),
-            },
+            ContentBlock::tool_use("a", "read", json!({})),
+            ContentBlock::tool_use("b", "bash", json!({})),
         ]);
         let calls: Vec<_> = msg.tool_uses().map(|(id, name, _)| (id, name)).collect();
         assert_eq!(calls, vec![("a", "read"), ("b", "bash")]);

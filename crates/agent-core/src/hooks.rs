@@ -5,6 +5,25 @@
 //! no-ops, so an agent without hooks behaves exactly as before. This is the minimal version of pi's
 //! richer hook surface — the pieces a headless, gateway-fronted server actually needs.
 //!
+//! **Deliberately narrower than pi's `agent-loop.ts` config in two specific ways**, both confirmed —
+//! not just assumed — during a pi-parity test-coverage pass:
+//! - pi's `beforeToolCall` can *mutate* `args` in place before dispatch (`agent-loop.test.ts`,
+//!   "should execute mutated beforeToolCall args without revalidation"). [`before_tool_call`] here is
+//!   allow/deny-only, `&Value` not `&mut Value` — no caller in this codebase (a gateway-fronted
+//!   headless server, not an embeddable SDK with third-party tool-authoring) has ever needed a hook to
+//!   rewrite a model's own tool-call arguments; a permission gate only ever needs to see them.
+//! - pi separately lets a *tool itself* define `prepareArguments` (a per-tool legacy-shape normalizer,
+//!   `agent-loop.test.ts`'s "should prepare tool arguments for validation"), and lets `afterToolCall`
+//!   force a whole batch to terminate the run (`agent-loop.test.ts`'s "should allow afterToolCall to
+//!   mark a tool batch as terminating"). Neither is a global-hook concern here: this codebase's tools
+//!   already do their own legacy-input normalization internally (see `crates/agent/src/tools/edit.rs`'s
+//!   `parse_edits` folding a legacy `old_string`/`new_string` pair into its `edits` array — the same
+//!   shape-normalization job pi's `prepareArguments` does, just localized to the one tool that needs it
+//!   instead of exposed as a cross-cutting seam), and run-termination is a *tool's own result*
+//!   ([`crate::tool::ToolOutput::terminate`]) reduced across a batch by the loop itself
+//!   (`Agent::run_events_steered`'s `terminate &= wants_terminate`), not a separate hook layer bolted
+//!   on afterward.
+//!
 //! [`before_tool_call`]: AgentHooks::before_tool_call
 //! [`after_tool_call`]: AgentHooks::after_tool_call
 

@@ -116,14 +116,19 @@ impl ModelTransport for GatewayClient {
         let base_backoff = self.base_backoff;
 
         let is_anthropic = dialect == Dialect::Anthropic;
-        // OpenAI's Responses API uses this for connection-level session-affinity routing, distinct
+        // Both OpenAI wire dialects use this for connection-level session-affinity routing, distinct
         // from `prompt_cache_key`'s cache-node affinity in the body — matches pi's
-        // `openai-responses.ts` (`headers["x-client-request-id"] = sessionId`), reusing the same
+        // `openai-responses.ts` (`headers["x-client-request-id"] = sessionId`) and
+        // `openai-completions.ts` (`compat.sendSessionAffinityHeaders`), reusing the same
         // per-conversation `cache_key` value pi's own `sessionId` carries.
-        let session_affinity_header = (dialect == Dialect::OpenAiResponses)
+        let session_affinity_header = matches!(dialect, Dialect::OpenAiResponses | Dialect::OpenAi)
             .then_some(req.cache_key.as_deref())
             .flatten()
             .map(str::to_string);
+        // pi's Chat Completions dialect additionally sends `x-session-affinity` alongside `session_id`
+        // and `x-client-request-id` (`openai-completions.ts`'s `compat.sendSessionAffinityHeaders`
+        // branch); the Responses dialect never sends it.
+        let send_x_session_affinity = dialect == Dialect::OpenAi;
         // Interleaved thinking lets the model weave thinking between tool calls across a turn — but
         // it's only meaningful for the `Budget` shape; `Adaptive` models interleave by default, and
         // sending the beta opt-in for them is a harmless no-op at best, so skip it to keep the header
@@ -147,6 +152,7 @@ impl ModelTransport for GatewayClient {
                 needs_interleaved_beta,
                 needs_fine_grained_tool_streaming_beta,
                 session_affinity_header.as_deref(),
+                send_x_session_affinity,
                 max_retries,
                 base_backoff,
             )
@@ -299,6 +305,7 @@ async fn send_with_retry(
     needs_interleaved_beta: bool,
     needs_fine_grained_tool_streaming_beta: bool,
     session_affinity_header: Option<&str>,
+    send_x_session_affinity: bool,
     max_retries: u32,
     base_backoff: Duration,
 ) -> Result<reqwest::Response> {
@@ -306,13 +313,17 @@ async fn send_with_retry(
     loop {
         let mut builder = http.post(url).bearer_auth(api_key).json(body);
         if let Some(session_id) = session_affinity_header {
-            // pi sends both: `session_id` (`compat.sendSessionIdHeader`, true by default for native
-            // OpenAI — the only provider this header condition ever fires for) and
-            // `x-client-request-id`, both carrying the same value. Missing `session_id` risked
-            // cache/session-affinity routing landing on a different backend node per turn even though
-            // `x-client-request-id` was already correct.
+            // pi sends `session_id` (`compat.sendSessionIdHeader`, true by default for native OpenAI)
+            // and `x-client-request-id` for both OpenAI dialects, both carrying the same value. Missing
+            // `session_id` risked cache/session-affinity routing landing on a different backend node
+            // per turn even though `x-client-request-id` was already correct.
             builder = builder.header("session_id", session_id);
             builder = builder.header("x-client-request-id", session_id);
+            // Chat Completions also gets `x-session-affinity` (`openai-completions.ts`'s
+            // `compat.sendSessionAffinityHeaders` branch) — the Responses dialect never sends it.
+            if send_x_session_affinity {
+                builder = builder.header("x-session-affinity", session_id);
+            }
         }
         if is_anthropic {
             builder = builder.header("anthropic-version", ANTHROPIC_VERSION);
@@ -396,8 +407,12 @@ const QUOTA_EXHAUSTED_PATTERNS: &[&str] = &[
 ];
 
 /// Whether a 429 response body indicates quota/billing exhaustion (fail fast) rather than ordinary
-/// rate limiting (worth retrying).
-fn is_quota_exhausted(body: &str) -> bool {
+/// rate limiting (worth retrying). `pub`: `agent::retry::is_retryable_whole_run` (the `agent` crate)
+/// reuses this same heuristic for its own raw-status-digit fallback, rather than duplicating the phrase
+/// list — a quota-exhausted 429's message text (`"gateway returned 429 …: <body>"`) still contains
+/// whichever [`QUOTA_EXHAUSTED_PATTERNS`] phrase the body did, so passing the whole message through
+/// works the same as passing just the body does here.
+pub fn is_quota_exhausted(body: &str) -> bool {
     let m = body.to_ascii_lowercase();
     QUOTA_EXHAUSTED_PATTERNS.iter().any(|p| m.contains(p))
 }
@@ -651,6 +666,59 @@ mod tests {
         );
     }
 
+    /// A real TCP peer that answers with valid SSE headers plus one partial event, then closes the
+    /// connection *cleanly* — `Connection: close`, no `Content-Length` mismatch, so EOF is the defined
+    /// end of a close-delimited body, not a framing violation (contrast the sibling test above). This is
+    /// the wire-level analog of pi's mocked wrapper stream that simply stops yielding events with no
+    /// error (`packages/ai/test/openai-responses-terminal-event.test.ts:167-186`, "emits an error final
+    /// result when the wrapper stream ends before a terminal response event"). Proves the decoder's own
+    /// "ended before…" rejection reaches the caller through the *full* client pipeline — not just the
+    /// buffered-decoder unit tests (`dialect::anthropic`'s own `finish()` tests) — and that a clean
+    /// close is never mistaken for (or tagged as) a [`MID_STREAM_NETWORK_ERROR`], since nothing about
+    /// this shutdown was actually a transport fault.
+    #[tokio::test]
+    async fn a_clean_early_close_before_the_terminal_event_is_not_tagged_as_a_network_error() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
+                      data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n",
+                )
+                .unwrap();
+            stream.flush().unwrap();
+            // A graceful shutdown — no `message_stop`, but nothing about the close itself is abnormal.
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        });
+
+        let client = GatewayClient::new(format!("http://{addr}"), "test-key").unwrap();
+        let req = ModelRequest::new("claude-test", Vec::new(), 100);
+        let mut events = client.stream(req).await.unwrap(); // the request itself succeeds
+        let mut last_err = None;
+        while let Some(ev) = events.next().await {
+            if let Err(Error::Transport(msg)) = ev {
+                last_err = Some(msg);
+                break;
+            }
+        }
+        server.join().unwrap();
+        let msg = last_err.expect("a clean early close must still surface a transport error");
+        assert!(
+            msg.contains("Anthropic stream ended before message_stop"),
+            "expected the decoder's own terminal-event rejection, got: {msg}"
+        );
+        assert!(
+            !msg.contains(MID_STREAM_NETWORK_ERROR),
+            "a clean, close-delimited EOF is not a network fault and must not carry the \
+             MID_STREAM_NETWORK_ERROR tag: {msg}"
+        );
+    }
+
     /// A real TCP peer that always answers 429 with a quota-exhaustion body — proves the client fails
     /// fast (one request, no retry) instead of burning its retry budget on a rejection retrying can
     /// never fix.
@@ -746,6 +814,57 @@ mod tests {
             request_count.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "an ordinary rate-limit 429 must still be retried"
+        );
+    }
+
+    /// A real TCP peer captures the raw request bytes so the test can inspect headers directly — proves
+    /// pi's session-affinity headers (`session_id`/`x-client-request-id`/`x-session-affinity`) go out on
+    /// a Chat Completions dialect request too, not just OpenAI Responses. Matches
+    /// `openai-completions.ts`'s `compat.sendSessionAffinityHeaders` branch, exercised by
+    /// `packages/ai/test/openai-completions-prompt-cache.test.ts`'s "sends known session-affinity
+    /// headers when compat.sendSessionAffinityHeaders is enabled" case.
+    #[tokio::test]
+    async fn session_affinity_headers_are_sent_for_chat_completions_dialect_too() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let captured_clone = captured.clone();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap();
+            *captured_clone.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let sse = "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                sse.len(),
+                sse
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        });
+
+        let client = GatewayClient::new(format!("http://{addr}"), "test-key").unwrap();
+        // `llama-3.1-70b` resolves to `Dialect::OpenAi` (Chat Completions) — a third-party
+        // OpenAI-compatible provider, not native OpenAI Responses.
+        let req = ModelRequest::new("llama-3.1-70b", Vec::new(), 100)
+            .with_cache_key("session-affinity-test");
+        let mut events = client.stream(req).await.unwrap();
+        let _ = events.next().await;
+        server.join().unwrap();
+
+        let request = captured.lock().unwrap().clone();
+        assert!(
+            request.contains("session_id: session-affinity-test"),
+            "expected a `session_id` header on a Chat Completions request, got:\n{request}"
+        );
+        assert!(
+            request.contains("x-client-request-id: session-affinity-test"),
+            "expected an `x-client-request-id` header on a Chat Completions request, got:\n{request}"
+        );
+        assert!(
+            request.contains("x-session-affinity: session-affinity-test"),
+            "expected an `x-session-affinity` header on a Chat Completions request, got:\n{request}"
         );
     }
 }

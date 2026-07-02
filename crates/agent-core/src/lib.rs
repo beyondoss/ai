@@ -32,6 +32,7 @@ pub mod session;
 pub mod steering;
 pub mod tool;
 pub mod transport;
+pub mod validation;
 pub mod write_lock;
 
 pub use agent::{Agent, AgentEvent};

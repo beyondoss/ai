@@ -838,6 +838,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_timed_out_command_with_truncated_output_still_reports_the_full_output_path() {
+        // pi: tools.test.ts, "should include full output path for truncated timeout and abort errors"
+        // — iterates the timeout and aborted cases against 3000 lines of output. `truncation` and
+        // `timeout` each have their own dedicated test above, but neither proves they compose: a
+        // command that was both chatty *and* killed for running too long must still carry the
+        // `[Showing lines …]`/`Full output: <path>` markers on its timeout error, with the complete
+        // (untruncated) output actually readable from that path — not just an empty "timed out" message
+        // that quietly drops everything the command had already printed.
+        let body = (1..=3000)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let runner = recording(ExecResult {
+            stdout: body.clone(),
+            timed_out: true,
+            ..Default::default()
+        });
+        let err = Bash::with_runner(runner)
+            .run(json!({ "command": "chatty-and-slow", "timeout_ms": 5000 }))
+            .await
+            .unwrap_err();
+        let ToolError::Execution(msg) = err else {
+            panic!("expected Execution error")
+        };
+
+        assert!(
+            msg.contains("Command timed out after 5 seconds"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains("[Showing lines"),
+            "range marker missing: {msg}"
+        );
+        assert!(msg.contains("2999"), "tail must be kept: {msg}");
+        assert!(
+            !msg.contains("1\n2\n3\n4"),
+            "head must be dropped (tail truncation, not head+tail): {msg}"
+        );
+
+        let path = msg
+            .split("Full output: ")
+            .nth(1)
+            .and_then(|s| s.split(']').next())
+            .expect("must carry a full-output path");
+        assert!(
+            std::path::Path::new(path).exists(),
+            "full-output file must actually exist: {path}"
+        );
+        let full = std::fs::read_to_string(path).unwrap();
+        assert_eq!(
+            full, body,
+            "the complete, untruncated output must be recoverable from the full-output file even \
+             though the command timed out"
+        );
+    }
+
+    #[tokio::test]
     async fn nonexistent_cwd_is_a_clear_invalid_input_error_not_a_raw_spawn_failure() {
         let runner = recording(ExecResult {
             code: Some(0),

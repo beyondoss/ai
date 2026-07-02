@@ -88,6 +88,17 @@ pub enum AgentEvent {
     /// ceiling). A terminal marker on the event stream so a streaming client sees *why* a run stopped
     /// rather than the stream just going silent; `run_events` still returns the same `Err`.
     Error { message: String },
+    /// An automatic compaction attempt (proactive threshold or hard-overflow backstop) failed —
+    /// non-terminal, unlike `Error`. The run continues into the turn that was about to be sent
+    /// unsummarized; a client tracking `isCompacting` should clear it on this event exactly like on
+    /// `Compacted`. Matches pi's `compaction_end { errorMessage }` on the same failure path: a
+    /// transient summarization-call failure (network blip, provider hiccup) must not make an
+    /// otherwise-servable turn unreachable, since `should_compact` would otherwise re-trigger and
+    /// re-fail before every future turn, permanently blocking the session.
+    CompactionFailed {
+        reason: CompactionReason,
+        message: String,
+    },
 }
 
 /// Default per-turn output token ceiling.
@@ -438,16 +449,11 @@ impl Agent {
             }
 
             // Proactive compaction: once the live prompt crosses the threshold, summarize the prefix
-            // before building the next request so the run never walks into the context wall.
+            // before building the next request so the run never walks into the context wall. A
+            // failure here is reported, not propagated — see `compact_or_report`'s doc comment.
             if self.compaction.enabled && compaction::should_compact(session, &self.compaction) {
-                self.compact(
-                    session,
-                    CompactionReason::Threshold,
-                    &cancel,
-                    &mut sink,
-                    None,
-                )
-                .await?;
+                self.compact_or_report(session, CompactionReason::Threshold, &cancel, &mut sink)
+                    .await?;
             } else if !self.compaction.enabled
                 && compaction::is_hard_overflow(
                     session,
@@ -462,14 +468,8 @@ impl Agent {
                 // requests that are already guaranteed to overflow. See `is_hard_overflow`'s doc
                 // comment for why this bypasses the `enabled` gate but the threshold check above
                 // doesn't.
-                self.compact(
-                    session,
-                    CompactionReason::Overflow,
-                    &cancel,
-                    &mut sink,
-                    None,
-                )
-                .await?;
+                self.compact_or_report(session, CompactionReason::Overflow, &cancel, &mut sink)
+                    .await?;
             }
 
             sink(AgentEvent::TurnStart {
@@ -509,7 +509,7 @@ impl Agent {
                 // The provider rejected the request for exceeding its context window. Compact once and
                 // retry the same turn; if it still overflows (or there's nothing to compact), give up.
                 Err(e) if is_context_overflow(&e) && !overflow_recovered => {
-                    if self
+                    match self
                         .compact(
                             session,
                             CompactionReason::Overflow,
@@ -517,20 +517,62 @@ impl Agent {
                             &mut sink,
                             None,
                         )
-                        .await?
+                        .await
                     {
-                        overflow_recovered = true;
-                        continue;
+                        Ok(true) => {
+                            overflow_recovered = true;
+                            continue;
+                        }
+                        Ok(false) => {
+                            sink(AgentEvent::Error {
+                                message: e.to_string(),
+                            });
+                            session.push(Message::error(e.to_string()));
+                            return Err(e);
+                        }
+                        // The recovery compaction itself failed (e.g. the summarization call errored)
+                        // — surface a curated message, not the raw underlying failure, matching pi's
+                        // own `_runAutoCompaction` catch block ("Context overflow recovery failed:
+                        // {error}"). A cancellation is left exactly as-is: the user asked to stop,
+                        // that's not a compaction failure to explain.
+                        Err(compact_err) => {
+                            let message = if matches!(compact_err, Error::Cancelled) {
+                                compact_err.to_string()
+                            } else {
+                                format!("Context overflow recovery failed: {compact_err}")
+                            };
+                            sink(AgentEvent::Error {
+                                message: message.clone(),
+                            });
+                            session.push(Message::error(message));
+                            return Err(compact_err);
+                        }
                     }
+                }
+                // A second context-overflow on the very turn a compaction just tried to recover from
+                // — recompacting again within this same call would either find nothing new to fold or
+                // just repeat the same failure, so this never loops back into the arm above a second
+                // time. Curated, matching pi's own guard against retrying overflow recovery more than
+                // once per call (`_checkCompaction`'s `_overflowRecoveryAttempted` check).
+                Err(e) if is_context_overflow(&e) && overflow_recovered => {
+                    let message = "Context overflow recovery failed after one compact-and-retry \
+                        attempt. Try reducing context or switching to a larger-context model."
+                        .to_string();
                     sink(AgentEvent::Error {
-                        message: e.to_string(),
+                        message: message.clone(),
                     });
+                    session.push(Message::error(message));
                     return Err(e);
                 }
                 Err(e) => {
                     sink(AgentEvent::Error {
                         message: e.to_string(),
                     });
+                    // Persist a closing assistant record — pi's `handleRunFailure` (`agent.ts`) does
+                    // the same — so the session's last message is never the user's own un-answered
+                    // prompt. Without this, a client's retry after a transient failure would append a
+                    // second consecutive `user` turn, a shape no wire dialect accepts.
+                    session.push(Message::error(e.to_string()));
                     return Err(e);
                 }
             };
@@ -538,14 +580,44 @@ impl Agent {
             last_stop_reason = turn.stop_reason;
             let malformed: HashMap<String, String> =
                 std::mem::take(&mut turn.malformed).into_iter().collect();
-            session.push(Message::assistant(turn.blocks).with_model_id(&self.model));
+            // Snapshot usage *before* appending this turn's own assistant message: `record_usage`
+            // captures `messages.len()` as the boundary `trailing_tokens` estimates forward from, and
+            // `turn.usage.input_tokens` describes the prompt that was sent *without* this response —
+            // recording it after the push would make the boundary include a message the snapshot
+            // itself doesn't account for, undercounting the live context by this turn's own output
+            // until the next real usage snapshot arrives.
             session.record_usage(turn.usage);
+            let mut blocks = turn.blocks;
+            if turn.stop_reason == StopReason::Aborted && blocks.is_empty() {
+                // Cancelled before any content had streamed at all (e.g. mid-`MessageStart`, no delta
+                // yet) — pi's own contract tolerates a genuinely empty `content: []` here (see
+                // `abort.test.ts`'s `testImmediateAbort`), but an empty content array is a shape at
+                // least one dialect's replay validation rejects outright. One empty text block instead
+                // — same wire-safety tradeoff `Message::error` already makes for the analogous case.
+                blocks.push(ContentBlock::text(String::new()));
+            }
+            let mut assistant_message = Message::assistant(blocks).with_model_id(&self.model);
+            if turn.stop_reason == StopReason::Aborted {
+                assistant_message = assistant_message.with_aborted();
+            }
+            session.push(assistant_message);
             session.steps += 1;
             steps_this_call += 1;
             sink(AgentEvent::TurnEnd {
                 stop_reason: turn.stop_reason,
                 step: session.steps,
             });
+
+            // A cancelled-mid-stream turn: the partial content is committed above (matching pi's
+            // `abort.test.ts` contract), but this is still a client-requested stop, not an ordinary
+            // one — re-raise `Error::Cancelled` exactly as every *other* cancellation path in this
+            // loop already does (the top-of-loop check above, `run_turn`'s own pre-connect-cancel
+            // branch), so callers that key behavior off "did this run end in `Err(Cancelled)`" (whole-
+            // run retry exclusion, `serve.rs`'s `abort` RPC response shape) stay correct. No `AgentEnd`
+            // here, matching those same sibling paths — one is only ever emitted on an `Ok(())` return.
+            if turn.stop_reason == StopReason::Aborted {
+                return Err(Error::Cancelled);
+            }
 
             // Collect the tool calls the assistant just made.
             let calls: Vec<(String, String, Value)> = session
@@ -717,7 +789,22 @@ impl Agent {
                                 let (text, images, is_error, terminate) =
                                     match this.tools.get(name) {
                                         Some(tool) => {
-                                            match tool.run_streaming(input.clone(), &progress).await {
+                                            // Best-effort pi-parity coercion (`validation.rs`, matches
+                                            // pi's AJV-backed `validateToolArguments`): a provider that
+                                            // stringified a primitive the model emitted as genuinely
+                                            // typed (`{"count":"42"}` instead of `{"count":42}`) would
+                                            // otherwise fail the tool's own `as_i64()`/`as_bool()`
+                                            // extraction with a confusing "missing field" error. Falls
+                                            // back to the raw input unchanged on any coercion failure —
+                                            // a genuinely malformed call still surfaces through the
+                                            // tool's own existing, clearer validation error rather than
+                                            // a new failure path.
+                                            let coerced = crate::validation::coerce_tool_arguments(
+                                                &tool.input_schema(),
+                                                input.clone(),
+                                            )
+                                            .unwrap_or_else(|_| input.clone());
+                                            match tool.run_streaming(coerced, &progress).await {
                                                 Ok(o) => (o.text, o.images, false, o.terminate),
                                                 Err(e) => (e.to_string(), Vec::new(), true, false),
                                             }
@@ -941,6 +1028,9 @@ impl Agent {
             futures::pin_mut!(stream_fut);
             match select(stream_fut, cancelled.as_mut()).await {
                 Either::Left((res, _)) => res?,
+                // Cancelled before the request even connected — nothing was ever sent to the model,
+                // so there's no partial content worth persisting (unlike the mid-stream case below).
+                // A genuine `Err` here, not a synthetic `Aborted` turn.
                 Either::Right(((), _)) => return Err(Error::Cancelled),
             }
         };
@@ -957,10 +1047,47 @@ impl Agent {
                     emit(ev);
                 }
                 Either::Left((None, _)) => break,
-                Either::Right(((), _)) => return Err(Error::Cancelled),
+                // Cancelled after some content had already streamed — `finish()` flushes whatever's
+                // still open in `acc` (pi-parity: matches `abort.test.ts`'s "aborted mid-stream keeps
+                // partial content" contract). Returned as `Ok` with a synthetic `Aborted` stop reason,
+                // not `Err`, so `run_events_steered` still gets to persist it exactly like any other
+                // turn before that caller re-raises the cancellation — see its `StopReason::Aborted`
+                // arm for why the external `Err(Error::Cancelled)` contract is preserved either way.
+                Either::Right(((), _)) => {
+                    let mut turn = acc.finish();
+                    turn.stop_reason = StopReason::Aborted;
+                    return Ok(turn);
+                }
             }
         }
         Ok(acc.finish())
+    }
+
+    /// [`run_turn`](Self::run_turn), for a one-off "utility" model call (compaction/branch-summary)
+    /// that isn't the main conversational loop — every caller of `run_turn` in this file *except*
+    /// `run_events_steered` should go through this instead of calling `run_turn` directly.
+    ///
+    /// The distinction matters because of `run_turn`'s own cancellation contract: a mid-stream cancel
+    /// returns `Ok(Turn { stop_reason: Aborted, .. })`, not `Err(Error::Cancelled)` — deliberately, so
+    /// `run_events_steered` can persist whatever partial content streamed before persisting nothing at
+    /// all (see that `Aborted` arm's own doc comment). A utility call has no such persistence story —
+    /// `compact`/`summarize_branch` only care about the finished summary text, and their own callers
+    /// (`serve.rs`'s `switch_branch`, matching pi's `abortBranchSummary`) expect a genuine cancellation
+    /// to surface as a hard stop with *nothing* recorded, not silently succeed with whatever fragment
+    /// of prose had streamed before the abort landed. Without this, a cancelled compaction/branch-
+    /// summary call would be indistinguishable from "the model summarized to an empty string" — the
+    /// caller falls through to "nothing worth recording" and proceeds as if cancellation never
+    /// happened, instead of the caller's own cancellation-handling arm ever running.
+    async fn run_utility_turn(
+        &self,
+        req: ModelRequest,
+        cancel: &CancellationToken,
+    ) -> Result<Turn> {
+        let turn = self.run_turn(req, &mut |_| {}, cancel).await?;
+        if turn.stop_reason == StopReason::Aborted {
+            return Err(Error::Cancelled);
+        }
+        Ok(turn)
     }
 
     /// Summarize the conversation prefix in place, keeping the recent turns verbatim. Makes one
@@ -974,6 +1101,27 @@ impl Agent {
     /// [`compaction::summary_request`]'s doc comment) — a manual compaction's client-supplied focus.
     /// An automatic trigger ([`CompactionReason::Threshold`]/[`CompactionReason::Overflow`]) has no
     /// client in the loop to ask, so it always passes `None`.
+    /// Apply this agent's configured reasoning (extended-thinking budget / reasoning-effort level) to
+    /// `req`, the same way the main turn loop does for every live-conversation request (see
+    /// `run_events_steered`'s own `with_thinking`/`with_reasoning_effort` calls). Shared by
+    /// [`Self::compact`] and [`Self::summarize_branch`]'s summarization requests: without this, a
+    /// summarization call always ran at the model's bare default reasoning level regardless of what
+    /// the live session was actually configured to use, since `compaction::summary_request`/
+    /// `branch_summary::branch_summary_request` build a plain `ModelRequest` with no reasoning
+    /// knowledge of their own — this crate's config lives only on `Agent`. Forwards the *same* level
+    /// the live conversation uses (not a fixed lower one) — both fields are already model-appropriate
+    /// by construction (only ever set via `with_thinking`/`with_reasoning_effort` for a model that
+    /// actually supports them), and the summarization call always targets that same model.
+    fn with_reasoning(&self, mut req: ModelRequest) -> ModelRequest {
+        if let Some(budget) = self.thinking {
+            req = req.with_thinking(budget);
+        }
+        if let Some(effort) = self.reasoning_effort {
+            req = req.with_reasoning_effort(effort);
+        }
+        req
+    }
+
     pub async fn compact(
         &self,
         session: &mut Session,
@@ -987,6 +1135,21 @@ impl Agent {
         else {
             return Ok(false);
         };
+        // Nothing new to fold in since the last compaction: on a clean boundary, `first_kept == 1`
+        // means the only thing before the cut is the previous round's own summary message
+        // (`apply_summary` always splices it in at index 0) — no new activity happened after it. This
+        // is the clean-boundary analog of the `turn_start == 1` reuse a few lines below for the
+        // split-turn case: re-summarizing here would spend a whole model call restating the same
+        // summary with an empty `<new-activity>` section, a real but narrow waste (repeated manual
+        // `compact` calls with nothing new in between are the main way this is reachable — an
+        // *automatic* trigger can't, since `apply_summary` also resets `last_input_tokens` to 0 and
+        // `should_compact` requires it to be positive to fire at all).
+        if cut.turn_start.is_none()
+            && cut.first_kept == 1
+            && compaction::previous_summary(&session.messages[..1]).is_some()
+        {
+            return Ok(false);
+        }
         sink(AgentEvent::CompactionStart { reason });
         let first_kept = cut.first_kept;
         let before = session.messages.len();
@@ -997,14 +1160,14 @@ impl Agent {
         let summary = match cut.turn_start {
             None => {
                 // Clean boundary: unchanged, single-call path.
-                let req = compaction::summary_request(
+                let req = self.with_reasoning(compaction::summary_request(
                     &self.model,
                     &prefix,
                     self.compaction.summary_max_tokens,
                     &file_ops,
                     custom_instructions,
-                );
-                turn_text(&self.run_turn(req, &mut |_| {}, cancel).await?)
+                ));
+                turn_text(&self.run_utility_turn(req, cancel).await?)
             }
             Some(turn_start) => {
                 // Split turn: summarize the closed-off history and the in-progress turn's own prefix
@@ -1036,28 +1199,28 @@ impl Agent {
                             return Ok(prev.to_string());
                         }
                     }
-                    let req = compaction::summary_request(
+                    let req = self.with_reasoning(compaction::summary_request(
                         &self.model,
                         &session.messages[..turn_start],
                         self.compaction.summary_max_tokens,
                         &file_ops,
                         custom_instructions,
-                    );
-                    Ok::<_, Error>(turn_text(&self.run_turn(req, &mut |_| {}, cancel).await?))
+                    ));
+                    Ok::<_, Error>(turn_text(&self.run_utility_turn(req, cancel).await?))
                 };
                 // Unlike `history` above, the turn-prefix call never takes `custom_instructions` — it
                 // summarizes the SPLIT_TURN_INSTRUCTION template's "context for the retained suffix,"
                 // not the closed-off conversation `custom_instructions` is meant to steer. Matches pi's
                 // `generateTurnPrefixSummary`, whose signature doesn't accept custom instructions at all.
                 let turn_prefix = async {
-                    let req = compaction::summary_request(
+                    let req = self.with_reasoning(compaction::summary_request(
                         &self.model,
                         &session.messages[turn_start..first_kept],
                         turn_prefix_max_tokens,
                         &file_ops,
                         None,
-                    );
-                    Ok::<_, Error>(turn_text(&self.run_turn(req, &mut |_| {}, cancel).await?))
+                    ));
+                    Ok::<_, Error>(turn_text(&self.run_utility_turn(req, cancel).await?))
                 };
                 let history = history.await?;
                 let turn_prefix = turn_prefix.await?;
@@ -1067,6 +1230,12 @@ impl Agent {
         if summary.trim().is_empty() {
             return Ok(false);
         }
+        // Append the file list deterministically rather than trusting the summarizing model to have
+        // mentioned exact paths in its own prose — see `format_file_operations`'s doc comment.
+        let summary = format!(
+            "{summary}{}",
+            compaction::format_file_operations(&file_ops.read_files, &file_ops.modified_files)
+        );
         compaction::apply_summary(session, first_kept, &summary);
         session.compaction = file_ops;
         sink(AgentEvent::Compacted {
@@ -1078,6 +1247,42 @@ impl Agent {
         Ok(true)
     }
 
+    /// Runs an *automatic* (proactive-threshold or hard-overflow) compaction and swallows a failure
+    /// rather than propagating it — mirrors pi's `_runAutoCompaction`, which wraps the equivalent call
+    /// in `try/catch` and emits `compaction_end { errorMessage }` on failure instead of letting it
+    /// abort the run. Without this, a single transient summarization-call failure (network blip,
+    /// provider hiccup) would end the whole run via the `?` in the caller — and since `should_compact`
+    /// re-fires on every subsequent turn until it succeeds, a persistently failing summarizer would
+    /// make the session permanently unusable, blocking the user's *own* prompt from ever reaching the
+    /// model. A manually invoked `compact()` (the `compact` RPC command) is unaffected — that caller
+    /// still sees the real error and can decide what to do.
+    ///
+    /// A genuine `Error::Cancelled` is re-raised rather than swallowed — a cancellation is the user
+    /// asking the whole run to stop, not a compaction-specific fault, so it must still unwind the loop
+    /// the normal way instead of falling through to send the very turn the user just cancelled.
+    async fn compact_or_report<F>(
+        &self,
+        session: &mut Session,
+        reason: CompactionReason,
+        cancel: &CancellationToken,
+        sink: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(AgentEvent),
+    {
+        match self.compact(session, reason, cancel, sink, None).await {
+            Ok(_) => Ok(()),
+            Err(Error::Cancelled) => Err(Error::Cancelled),
+            Err(e) => {
+                sink(AgentEvent::CompactionFailed {
+                    reason,
+                    message: e.to_string(),
+                });
+                Ok(())
+            }
+        }
+    }
+
     /// Summarize an abandoned tree branch's messages (Track L2/L3: a headless server calls this from
     /// its branch-navigation command, on messages its session store's `abandoned_by_switch` returned,
     /// *before* actually switching branches). The network-calling half of branch summarization; the
@@ -1085,10 +1290,16 @@ impl Agent {
     /// persisting the result is the caller's job — this only returns the summary text, mirroring
     /// [`Self::compact`]'s network/storage split but without touching `session` (a branch summary
     /// doesn't rewrite the *active* conversation the way a compaction summary does).
+    ///
+    /// `custom_instructions`, when given, steers *what* the branch recap emphasizes — the same
+    /// "Additional focus: {custom_instructions}" framing [`compaction::summary_request`] uses for a
+    /// manual compaction (see [`crate::branch_summary::branch_summary_request`]'s doc comment) — a
+    /// client-supplied focus threaded down from the `switch_branch` RPC command's own optional field.
     pub async fn summarize_branch(
         &self,
         messages: &[Message],
         cancel: &CancellationToken,
+        custom_instructions: Option<&str>,
     ) -> Result<String> {
         // Same input budget compaction sizes its own summarization calls against — the model's context
         // window minus its reserved headroom — so an abandoned branch's rendered transcript can't
@@ -1097,27 +1308,40 @@ impl Agent {
             .compaction
             .context_window
             .saturating_sub(self.compaction.reserve_tokens);
-        let req = crate::branch_summary::branch_summary_request(
+        let req = self.with_reasoning(crate::branch_summary::branch_summary_request(
             &self.model,
             messages,
             self.compaction.summary_max_tokens,
             input_token_budget,
-        );
-        let turn = self.run_turn(req, &mut |_| {}, cancel).await?;
-        Ok(turn
+            custom_instructions,
+        ));
+        let turn = self.run_utility_turn(req, cancel).await?;
+        let summary: String = turn
             .blocks
             .iter()
             .filter_map(|b| match b {
                 ContentBlock::Text { text, .. } => Some(text.as_str()),
                 _ => None,
             })
-            .collect())
+            .collect();
+        // Same deterministic append `compact` does — see `format_file_operations`'s doc comment. Files
+        // are re-extracted from the same `messages` `branch_summary_request` itself already scanned
+        // (cheap: `extract_file_ops` doesn't touch tool-result bodies, just tool-call names/inputs),
+        // since that request's own file lists aren't otherwise surfaced back to this caller.
+        let (read, modified) = compaction::extract_file_ops(messages);
+        Ok(format!(
+            "{summary}{}",
+            compaction::format_file_operations(&read, &modified)
+        ))
     }
 }
 
 /// The concatenated text blocks of a summarization turn — a summary is always plain prose, so anything
 /// else the model emitted (there shouldn't be any; the summarization system prompt asks for none) is
 /// simply not text and is dropped here rather than erroring.
+///
+/// `turn.stop_reason == StopReason::Aborted` never reaches here — see [`Agent::run_utility_turn`],
+/// every caller's actual entry point.
 fn turn_text(turn: &Turn) -> String {
     turn.blocks
         .iter()
@@ -1165,6 +1389,17 @@ fn emit_tool_update(sink: &mut dyn FnMut(AgentEvent), update: crate::tool::ToolU
 /// Resolve a per-call dispatch result, synthesizing an error placeholder for a call whose group never
 /// got to run — only reachable via [`repair_cancelled_dispatch`], when cancellation aborts the batch
 /// before every group's future resolved.
+///
+/// Confirmed intentional (not a gap): pi's own `bash.ts` finalizes its output accumulator on abort and
+/// returns `"<partial output>\n\nCommand aborted"`, so a cancelled `bash` call specifically keeps
+/// whatever had streamed so far. Cancellation here works at the *dispatch* layer instead — the loop
+/// drops the whole group's future (`select(drain, cancelled)` in the caller), which is what actually
+/// kills a `bash` subprocess via its `kill_on_drop`/process-group guard — so by the time this generic
+/// placeholder runs, the tool's own in-flight state (any partial output it may have captured) is
+/// already gone with the dropped future; there's nothing tool-specific left to recover here. This
+/// applies uniformly to every tool, not just `bash`, which is the point: one dispatch-layer mechanism
+/// handles cancellation safely for all current and future tools, rather than requiring each one to
+/// cooperatively watch a cancellation signal and preserve its own partial state.
 fn resolve_tool_result(result: Option<ToolCallResult>) -> ToolCallResult {
     result.unwrap_or_else(|| {
         (
@@ -1241,9 +1476,12 @@ const OVERFLOW_PATTERNS: &[&str] = &[
     "is longer than the model's context length",
     // Mistral
     "too large for model with",
-    // Cerebras
+    // Cerebras — pi matches both with one regex (`^4(?:00|13)\s*(?:status code)?\s*\(no body\)`);
+    // this table is substring-only, so both phrasings are listed explicitly instead.
     "400 (no body)",
     "413 (no body)",
+    "400 status code (no body)",
+    "413 status code (no body)",
     // GitHub Copilot
     "exceeds the limit of",
     // llama.cpp server
@@ -1254,6 +1492,9 @@ const OVERFLOW_PATTERNS: &[&str] = &[
     "context window exceeds limit",
     // Kimi For Coding
     "exceeded model token limit",
+    // DS4 server — "Prompt has 256,468 tokens, but the configured context size is 256,000 tokens";
+    // matched on the invariant phrase between the two (comma-formatted) token counts.
+    "but the configured context size is",
     // z.ai — normally a silent overflow caught by `compaction::is_hard_overflow` instead (usage vs
     // window, no error raised at all), but its non-standard `finish_reason` can also surface as text.
     "model_context_window_exceeded",
@@ -1331,8 +1572,23 @@ const MID_STREAM_RETRYABLE_FREE_TEXT_PATTERNS: &[&str] = &[
     "service unavailable",
     "provider returned error",
     "network error",
+    // OpenAI's own literal `finish_reason` spelling (underscore, not a space) — see
+    // `dialect::openai::Decoder::finish`, which raises this exact message when a stream's
+    // `finish_reason` is `"network_error"`. Kept as a separate entry from `"network error"` above
+    // rather than relying on some fuzzier match, since the two are genuinely different literal strings.
+    "network_error",
     "connection error",
+    // pi's own regression case (earendil-works/pi#3317): a provider-reported "Network connection
+    // lost." is a distinct phrasing from both "network error" and "connection error" above — none of
+    // the existing entries substring-match it, so this exact transient-disconnect message fell through
+    // to a hard failure instead of pi's silent retry-and-recover.
+    "connection lost",
+    // pi matches these as two separate patterns (`/timed? out/i`, `/timeout/i`) — "timed out" alone
+    // missed both "time out" (no `d`) and the bare single-word "timeout" a provider or proxy error
+    // wrapper commonly uses (e.g. "ETIMEDOUT", "upstream request timeout").
     "timed out",
+    "time out",
+    "timeout",
     "ended without",
 ];
 
@@ -1376,6 +1632,16 @@ pub fn is_retryable_mid_stream(e: &Error) -> bool {
     if is_context_overflow(e) {
         return false;
     }
+    // A quota/billing-exhausted 429 must not be retried even when its own message also happens to
+    // contain a broader retryable-looking phrase — a quota rejection's HTTP status line is routinely
+    // the exact same "429 Too Many Requests" wording as an ordinary, transient rate limit, so the
+    // `"too many requests"` free-text pattern below would otherwise call it retryable purely from that
+    // shared status text, ignoring the body's own `error.type` telling us retrying can never succeed.
+    // Checked ahead of every pattern below, the same way `is_context_overflow` already is — both are
+    // "this specific failure class always wins over broader ambient wording" exclusions.
+    if crate::client::is_quota_exhausted(msg) {
+        return false;
+    }
     let m = msg.to_ascii_lowercase();
     m.contains("stream ended before")
         || m.contains("overloaded")
@@ -1409,7 +1675,12 @@ fn mid_stream_backoff(attempt: u32) -> Duration {
 /// escapes) passes through unchanged. Not a full JSON5-style parser: it can't repair a buffer that's
 /// merely incomplete (cut off mid-stream with an unclosed brace) — that class falls through to
 /// [`close_incomplete_json`] instead, tried next in [`Accumulator::flush_block`]'s fallback chain.
-fn repair_json(s: &str) -> String {
+///
+/// `pub(crate)`: also reused by [`crate::dialect::push_sse_line`] to repair a malformed *outer*
+/// Anthropic SSE event body before its first parse attempt — the same fixture shapes pi's
+/// `parseJsonWithRepair` (`packages/ai/src/utils/json-parse.ts`) repairs there, just applied one
+/// layer up the stack (a full event body rather than an accumulated `partial_json` string).
+pub(crate) fn repair_json(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut in_string = false;
     let mut chars = s.chars().peekable();
@@ -1535,8 +1806,12 @@ enum OpenBlock {
     Text(String, Option<String>, Option<String>),
     /// (text, signature) of an open thinking block.
     Thinking(String, String),
-    /// (id, name, json-arg buffer) of an open tool call.
-    Tool(String, String, String),
+    /// (id, name, json-arg buffer, reasoning-continuity data) of an open tool call. The last field is
+    /// OpenAI Chat Completions' `reasoning_details` replay data (see `ContentBlock::ToolUse`'s doc
+    /// comment) — populated by the same `SignatureDelta` event `Thinking` uses, since both are just an
+    /// opaque string attached to whatever block is open at that index; `None` for every dialect that
+    /// never emits it for a tool-call index.
+    Tool(String, String, String, Option<String>),
 }
 
 /// Folds a `StreamEvent` sequence into content blocks. Every block-scoped event carries an `index`,
@@ -1611,12 +1886,24 @@ impl Accumulator {
             }
             StreamEvent::SignatureDelta { index, signature } => {
                 self.declare(*index);
-                if let OpenBlock::Thinking(_, sig) = self
+                // Shared by two unrelated meanings, disambiguated by whichever block is already open
+                // at this index: Anthropic-style thinking signatures (the common case — appended, since
+                // a real cryptographic signature can arrive fragmented) and OpenAI Chat Completions'
+                // `reasoning_details` tool-call replay data (always sent as one complete chunk, but
+                // `push_str` is still correct — and harmless if the provider ever did fragment it).
+                // Defaults to opening a new `Thinking` block, matching the pre-existing behavior, when
+                // nothing is open yet at this index — a dialect only ever emits this for a tool call
+                // index *after* that call's `ToolUseStart`, never before.
+                match self
                     .open
                     .entry(*index)
                     .or_insert_with(|| OpenBlock::Thinking(String::new(), String::new()))
                 {
-                    sig.push_str(signature);
+                    OpenBlock::Thinking(_, sig) => sig.push_str(signature),
+                    OpenBlock::Tool(_, _, _, thought_signature) => thought_signature
+                        .get_or_insert_with(String::new)
+                        .push_str(signature),
+                    OpenBlock::Text(..) => {}
                 }
             }
             StreamEvent::RedactedThinking { index, data } => {
@@ -1633,19 +1920,19 @@ impl Accumulator {
                 self.declare(*index);
                 self.open.insert(
                     *index,
-                    OpenBlock::Tool(id.clone(), name.clone(), String::new()),
+                    OpenBlock::Tool(id.clone(), name.clone(), String::new(), None),
                 );
             }
             StreamEvent::InputJsonDelta {
                 index,
                 partial_json,
             } => {
-                if let Some(OpenBlock::Tool(_, _, buf)) = self.open.get_mut(index) {
+                if let Some(OpenBlock::Tool(_, _, buf, _)) = self.open.get_mut(index) {
                     buf.push_str(partial_json);
                 }
             }
             StreamEvent::InputJsonFinal { index, full_json } => {
-                if let Some(OpenBlock::Tool(_, _, buf)) = self.open.get_mut(index) {
+                if let Some(OpenBlock::Tool(_, _, buf, _)) = self.open.get_mut(index) {
                     buf.clone_from(full_json);
                 }
             }
@@ -1677,7 +1964,7 @@ impl Accumulator {
             return;
         };
         let block = match open_block {
-            OpenBlock::Tool(id, name, args) => {
+            OpenBlock::Tool(id, name, args, thought_signature) => {
                 let input = if args.trim().is_empty() {
                     json!({})
                 } else {
@@ -1700,7 +1987,12 @@ impl Accumulator {
                         }
                     }
                 };
-                Some(ContentBlock::ToolUse { id, name, input })
+                Some(ContentBlock::ToolUse {
+                    id,
+                    name,
+                    input,
+                    thought_signature,
+                })
             }
             OpenBlock::Thinking(text, signature) => {
                 Some(ContentBlock::Thinking { text, signature })
@@ -1792,6 +2084,49 @@ mod tests {
         (agent, mock)
     }
 
+    #[test]
+    fn accumulator_attaches_a_signature_delta_to_an_open_tool_call_not_only_to_thinking() {
+        // [A-M5] `SignatureDelta` is shared by two unrelated meanings, disambiguated by whichever
+        // block is already open at its index (see `apply`'s doc comment): the common case, an
+        // Anthropic-style thinking-block signature, and OpenAI Chat Completions' Gemini/OpenRouter
+        // `reasoning_details` tool-call replay data (`dialect::openai::Decoder`). Before this fix
+        // `OpenBlock::Tool` had no field to hold it at all, and the handler unconditionally matched
+        // `OpenBlock::Thinking`, so a `SignatureDelta` arriving for an open *tool-call* index was
+        // silently dropped (and would even have clobbered a `Thinking` block accidentally
+        // re-materialized at that index). This pins the correct behavior end to end through the
+        // `Accumulator`, independent of any one dialect's own wire parsing.
+        let mut acc = Accumulator::default();
+        acc.apply(&StreamEvent::ToolUseStart {
+            index: 0,
+            id: "call_1".into(),
+            name: "read".into(),
+        });
+        acc.apply(&StreamEvent::SignatureDelta {
+            index: 0,
+            signature: r#"{"type":"reasoning.encrypted","id":"call_1","data":"enc"}"#.into(),
+        });
+        acc.apply(&StreamEvent::InputJsonDelta {
+            index: 0,
+            partial_json: r#"{"path":"README.md"}"#.into(),
+        });
+        acc.apply(&StreamEvent::ContentBlockStop { index: 0 });
+        acc.apply(&StreamEvent::MessageStop {
+            stop_reason: StopReason::ToolUse,
+        });
+        let turn = acc.finish();
+        assert_eq!(
+            turn.blocks,
+            vec![ContentBlock::ToolUse {
+                id: "call_1".into(),
+                name: "read".into(),
+                input: json!({ "path": "README.md" }),
+                thought_signature: Some(
+                    r#"{"type":"reasoning.encrypted","id":"call_1","data":"enc"}"#.into()
+                ),
+            }]
+        );
+    }
+
     #[tokio::test]
     async fn single_text_turn_completes() {
         let (agent, mock) = agent_with(vec![turn::text("hello world")], ToolRegistry::new());
@@ -1806,6 +2141,34 @@ mod tests {
         assert_eq!(
             session.messages[1].content,
             vec![ContentBlock::text("hello world")]
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_snapshot_is_taken_before_the_turns_own_message_is_appended() {
+        // pi-parity fix: `record_usage` used to run *after* `session.push`, so
+        // `last_usage_message_count` (the boundary `compaction::trailing_tokens` estimates forward
+        // from) included the very assistant message that usage snapshot came from — that turn's own
+        // output was invisible to the compaction trigger until the *next* real usage snapshot caught
+        // up, undercounting the live context by roughly one turn's worth every single loop iteration.
+        let (agent, _mock) = agent_with(
+            vec![turn::text(
+                "a reasonably long response so its estimated token count is unambiguously non-zero",
+            )],
+            ToolRegistry::new(),
+        );
+        let mut session = Session::new();
+        session.user("hi");
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        // The turn just completed; its own assistant message must already be visible to
+        // `trailing_tokens`, not swallowed into the usage-snapshot boundary that was just recorded.
+        assert!(
+            compaction::trailing_tokens(&session) > 0,
+            "expected the just-appended assistant message to count as trailing context, got 0 \
+             (last_usage_message_count={}, messages.len()={})",
+            session.last_usage_message_count,
+            session.messages.len()
         );
     }
 
@@ -1927,11 +2290,11 @@ mod tests {
         assert_eq!(session.messages.len(), 4); // user, assistant(tool_use), user(tool_result), assistant(text)
         assert_eq!(
             session.messages[1].content,
-            vec![ContentBlock::ToolUse {
-                id: "tu_1".into(),
-                name: "echo".into(),
-                input: json!({ "text": "pong" }),
-            }]
+            vec![ContentBlock::tool_use(
+                "tu_1",
+                "echo",
+                json!({ "text": "pong" }),
+            )]
         );
         // The tool actually ran against the retry's complete, valid arguments — not an error result
         // from attempt 1's truncated `{"tex` fragment.
@@ -1998,6 +2361,72 @@ mod tests {
         let err = agent.run(&mut session, |_| {}).await.unwrap_err();
         assert!(matches!(err, Error::Transport(msg) if msg.contains("400")));
         assert_eq!(mock.calls(), 1, "a non-retryable error must not retry");
+    }
+
+    #[tokio::test]
+    async fn a_run_ending_in_error_persists_a_closing_assistant_record() {
+        // pi-parity fix (`packages/agent/test/agent.test.ts:126-155`, "emits full lifecycle events for
+        // thrown run failures"): pi's `handleRunFailure` always appends a synthetic assistant message
+        // (`stopReason:"error"`, `errorMessage:<text>`) so the session's last message is never the
+        // user's own un-answered prompt. Previously this loop's `Err(e) => { sink(...); return Err(e) }`
+        // returned without ever touching `session.messages`, leaving [user] as the entire transcript.
+        let mock = Arc::new(MockTransport::scripted(vec![vec![
+            Ok(StreamEvent::MessageStart),
+            Err(Error::Transport(
+                "gateway returned 400: invalid request".into(),
+            )),
+        ]]));
+        let agent = Agent::new(mock, "claude-opus-4-8").with_max_steps(8);
+        let mut session = Session::new();
+        session.user("hi");
+        let err = agent.run(&mut session, |_| {}).await.unwrap_err();
+        assert!(matches!(err, Error::Transport(_)));
+
+        assert_eq!(
+            session.messages.len(),
+            2,
+            "expected [user, assistant(error)]"
+        );
+        let closing = &session.messages[1];
+        assert_eq!(closing.role, Role::Assistant);
+        assert_eq!(
+            closing.error_message.as_deref(),
+            Some("transport error: gateway returned 400: invalid request")
+        );
+        assert_eq!(closing.content, vec![ContentBlock::text("")]);
+    }
+
+    #[tokio::test]
+    async fn a_prompt_after_a_failed_run_does_not_double_push_a_user_turn() {
+        // The other half of the fix above: once the failure closes the turn with a real assistant
+        // record, a client retrying with a fresh `session.user(...)` must restore valid role
+        // alternation — not append a second consecutive `user` message, a shape no wire dialect
+        // accepts. Mirrors pi's own harness-level proof
+        // (`packages/agent/test/harness/agent-harness.test.ts:262-291`,
+        // `await expect(harness.prompt("after failure")).resolves.toMatchObject({ role: "assistant" })`).
+        let mock = Arc::new(MockTransport::scripted(vec![
+            vec![
+                Ok(StreamEvent::MessageStart),
+                Err(Error::Transport(
+                    "gateway returned 400: invalid request".into(),
+                )),
+            ],
+            turn::text("recovered").into_iter().map(Ok).collect(),
+        ]));
+        let agent = Agent::new(mock, "claude-opus-4-8").with_max_steps(8);
+        let mut session = Session::new();
+        session.user("hi");
+        agent.run(&mut session, |_| {}).await.unwrap_err();
+
+        // Role alternation holds: [user, assistant(error), user] — this new prompt lands right after
+        // the closing error record, not stacked on a dangling unanswered `user` turn.
+        assert_eq!(session.messages[1].role, Role::Assistant);
+        session.user("after failure");
+        assert_eq!(session.messages[2].role, Role::User);
+        agent.run(&mut session, |_| {}).await.unwrap();
+        let last = session.messages.last().unwrap();
+        assert_eq!(last.role, Role::Assistant);
+        assert!(!last.content.is_empty());
     }
 
     #[tokio::test]
@@ -2080,6 +2509,28 @@ mod tests {
         assert!(is_context_overflow(&Error::Transport(
             "413 (no body)".into()
         )));
+        // The "status code" variant pi's single regex also matches — a plain "400 (no body)"
+        // substring check misses this because of the extra words in between.
+        assert!(is_context_overflow(&Error::Transport(
+            "400 status code (no body)".into()
+        )));
+        assert!(is_context_overflow(&Error::Transport(
+            "413 status code (no body)".into()
+        )));
+    }
+
+    #[test]
+    fn is_context_overflow_detects_ds4() {
+        // pi-parity gap (fixed): DS4's phrasing wasn't in the table at all, and its numbers-in-the-
+        // middle shape doesn't match the generic `context`+`{long,exceed,maximum,window}` catch-all
+        // either — ported straight from pi's own test fixture (`overflow.test.ts`, commit `21cb380`),
+        // comma-formatted variant included.
+        assert!(is_context_overflow(&Error::Transport(
+            "400 Prompt has 256468 tokens, but the configured context size is 256000 tokens".into()
+        )));
+        assert!(is_context_overflow(&Error::Transport(
+            "Prompt has 5,958,968 tokens, but the configured context size is 256,000 tokens".into()
+        )));
     }
 
     #[test]
@@ -2153,6 +2604,190 @@ mod tests {
     }
 
     #[test]
+    fn is_context_overflow_negative_cases_ported_from_pi() {
+        // A-L7 pi-parity test gap (fixed): pi's `overflow.test.ts` pins 5 distinct "must NOT be
+        // classified as overflow" scenarios; the prior test above only exercised 2 combined-pattern
+        // variants of its own. Ported verbatim, one assertion per pi case.
+        for (msg, why) in [
+            (
+                "500 `model runner crashed unexpectedly`",
+                "a generic Ollama crash, not a context-window rejection",
+            ),
+            (
+                "Throttling error: Too many tokens, please wait before trying again.",
+                "Bedrock throttling (HTTP 429), not overflow, despite the 'too many tokens' wording",
+            ),
+            (
+                "Service unavailable: The service is temporarily unavailable.",
+                "Bedrock service unavailable, a transient outage not a context-size rejection",
+            ),
+            (
+                "Rate limit exceeded, please retry after 30 seconds.",
+                "a generic rate limit, not overflow",
+            ),
+            (
+                "Too many requests. Please slow down.",
+                "a generic HTTP 429 style error, not overflow",
+            ),
+        ] {
+            assert!(
+                !is_context_overflow(&Error::Transport(msg.into())),
+                "expected NOT overflow ({why}): {msg}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn overflow_recovery_compaction_failure_surfaces_a_curated_message() {
+        // B-M12 pi-parity gap (fixed): when the overflow-recovery compact-and-retry's own
+        // summarization call fails (a distinct failure from the overflow it was trying to recover
+        // from), the raw underlying transport error used to surface verbatim, both on the emitted
+        // `AgentEvent::Error` and the session's closing error record. Matches pi's own
+        // `_runAutoCompaction` catch block ("Context overflow recovery failed: {error}") — untested
+        // before this fix.
+        let session_messages = vec![
+            Message::user(
+                "first request, long enough that its token estimate is comfortably nonzero",
+            ),
+            Message::assistant(vec![ContentBlock::text(
+                "first done, a fairly long response so the estimate is nontrivial too",
+            )]),
+            Message::user(
+                "second request, also long enough for a nonzero token estimate here as well",
+            ),
+            Message::assistant(vec![ContentBlock::text(
+                "second done, another long enough response for the estimate to register",
+            )]),
+        ];
+        let mut session = Session::new();
+        session.messages = Arc::new(session_messages);
+
+        let mock = Arc::new(MockTransport::scripted(vec![
+            // The live turn: the provider rejects it for exceeding the context window.
+            vec![Err(Error::Transport(
+                "prompt is too long: 300000 tokens > 200000 maximum".into(),
+            ))],
+            // The recovery compaction's own (single, clean-boundary) summarization call fails
+            // outright — a distinct, unrelated failure from the overflow above.
+            vec![Err(Error::Transport("mock summarizer down".into()))],
+        ]));
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8").with_compaction(CompactionConfig {
+            keep_recent_tokens: 1,
+            ..CompactionConfig::default()
+        });
+
+        let mut error_messages = Vec::new();
+        let result = agent
+            .run_events(&mut session, |ev| {
+                if let AgentEvent::Error { message } = ev {
+                    error_messages.push(message);
+                }
+            })
+            .await;
+
+        assert!(
+            result.is_err(),
+            "the turn genuinely cannot proceed; the run must still fail"
+        );
+        assert_eq!(
+            mock.calls(),
+            2,
+            "the overflowing turn plus the one failed recovery summarization call"
+        );
+        assert_eq!(error_messages.len(), 1);
+        assert!(
+            error_messages[0].contains("Context overflow recovery failed:")
+                && error_messages[0].contains("mock summarizer down"),
+            "expected a curated message wrapping the underlying failure, got: {:?}",
+            error_messages[0]
+        );
+        assert_eq!(
+            session
+                .messages
+                .last()
+                .and_then(|m| m.error_message.as_deref()),
+            Some(error_messages[0].as_str()),
+            "the curated message must also be the session's closing error record, not the raw one"
+        );
+    }
+
+    #[tokio::test]
+    async fn second_overflow_after_recovery_already_attempted_surfaces_a_curated_message() {
+        // B-M12 pi-parity gap (fixed): once a compaction has already run once to recover from an
+        // overflow this call (`overflow_recovered`), a *second* overflow on the retried turn used to
+        // fall through to the generic error path and surface the raw provider "prompt too long"
+        // message. Matches pi's own guard against retrying overflow recovery more than once per call
+        // (`_checkCompaction`'s `_overflowRecoveryAttempted`), including its exact curated string.
+        let session_messages = vec![
+            Message::user(
+                "first request, long enough that its token estimate is comfortably nonzero",
+            ),
+            Message::assistant(vec![ContentBlock::text(
+                "first done, a fairly long response so the estimate is nontrivial too",
+            )]),
+            Message::user(
+                "second request, also long enough for a nonzero token estimate here as well",
+            ),
+            Message::assistant(vec![ContentBlock::text(
+                "second done, another long enough response for the estimate to register",
+            )]),
+        ];
+        let mut session = Session::new();
+        session.messages = Arc::new(session_messages);
+
+        let mock = Arc::new(MockTransport::scripted(vec![
+            // The live turn overflows.
+            vec![Err(Error::Transport(
+                "prompt is too long: 300000 tokens > 200000 maximum".into(),
+            ))],
+            // The recovery compaction itself succeeds this time...
+            turn::text("## Goal\nsummary of earlier work")
+                .into_iter()
+                .map(Ok)
+                .collect(),
+            // ...but the retried turn overflows again anyway (still too large even compacted).
+            vec![Err(Error::Transport(
+                "prompt is too long: 300000 tokens > 200000 maximum".into(),
+            ))],
+        ]));
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8").with_compaction(CompactionConfig {
+            keep_recent_tokens: 1,
+            ..CompactionConfig::default()
+        });
+
+        let mut error_messages = Vec::new();
+        let mut compacted = false;
+        let result = agent
+            .run_events(&mut session, |ev| match ev {
+                AgentEvent::Error { message } => error_messages.push(message),
+                AgentEvent::Compacted { .. } => compacted = true,
+                _ => {}
+            })
+            .await;
+
+        assert!(result.is_err(), "a second overflow must still fail the run");
+        assert!(
+            compacted,
+            "the first (successful) recovery must still have run"
+        );
+        assert_eq!(mock.calls(), 3);
+        assert_eq!(error_messages.len(), 1);
+        assert_eq!(
+            error_messages[0],
+            "Context overflow recovery failed after one compact-and-retry attempt. Try reducing \
+             context or switching to a larger-context model.",
+            "must match pi's own curated string exactly"
+        );
+        assert_eq!(
+            session
+                .messages
+                .last()
+                .and_then(|m| m.error_message.as_deref()),
+            Some(error_messages[0].as_str())
+        );
+    }
+
+    #[test]
     fn is_retryable_mid_stream_matches_both_dialects_truncation_and_overload() {
         assert!(is_retryable_mid_stream(&Error::Transport(
             "Anthropic stream ended before message_stop".into()
@@ -2182,6 +2817,22 @@ mod tests {
             "gateway returned 401: unauthorized".into()
         )));
         assert!(!is_retryable_mid_stream(&Error::Cancelled));
+    }
+
+    #[test]
+    fn is_retryable_mid_stream_matches_pis_broader_timeout_patterns() {
+        // pi-parity fix (L1): pi matches timeout phrasing as two separate patterns
+        // (`/timed? out/i`, `/timeout/i`) — "timed out" alone missed both "time out" (no `d`) and the
+        // bare single-word "timeout" a provider/proxy error wrapper commonly uses.
+        assert!(is_retryable_mid_stream(&Error::Transport(
+            "the operation time out".into()
+        )));
+        assert!(is_retryable_mid_stream(&Error::Transport(
+            "upstream request timeout".into()
+        )));
+        assert!(is_retryable_mid_stream(&Error::Transport(
+            "504 Gateway Timeout".into()
+        )));
     }
 
     #[test]
@@ -2235,6 +2886,18 @@ mod tests {
     }
 
     #[test]
+    fn is_retryable_mid_stream_recognizes_network_connection_lost() {
+        // pi-parity fix (earendil-works/pi#3317, `regressions/3317-network-connection-lost-retry.test.ts`):
+        // this exact provider-reported phrasing is distinct from both "network error" and "connection
+        // error" above and previously fell through every pattern to a hard, non-retried failure.
+        assert!(is_retryable_mid_stream(&Error::Transport(
+            "Network connection lost.".into()
+        )));
+        // is_retryable_whole_run is a strict superset (see retry.rs), so this must hold there too —
+        // that's the layer pi's own test actually observes (`auto_retry_start`/`auto_retry_end`).
+    }
+
+    #[test]
     fn is_retryable_mid_stream_recognizes_explicit_retry_guidance_phrases() {
         for msg in [
             "provider stream error: server_error: you can retry your request.",
@@ -2263,6 +2926,25 @@ mod tests {
                 "expected NOT retryable: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn is_retryable_mid_stream_excludes_a_quota_exhausted_429_even_when_it_also_says_too_many_requests()
+     {
+        // Real bug found wiring up A-M8's whole-run quota exclusion: a quota-exhausted 429's HTTP
+        // status line is routinely the exact same "429 Too Many Requests" wording an ordinary,
+        // transient rate limit uses — `MID_STREAM_RETRYABLE_FREE_TEXT_PATTERNS`'s bare "too many
+        // requests" phrase matched on that shared status text alone, so this message was retryable
+        // here even though `is_retryable_mid_stream_still_excludes_permanent_failures` already proved
+        // a quota body *without* that status-line wording correctly wasn't. Since
+        // `is_retryable_whole_run` (`crates/agent/src/retry.rs`) OR-composes with this function first,
+        // the whole-run layer's own quota exclusion could never even be reached — this function's
+        // "yes" always won.
+        assert!(!is_retryable_mid_stream(&Error::Transport(
+            "gateway returned 429 Too Many Requests: {\"error\":{\"type\":\"insufficient_quota\",\
+             \"message\":\"You exceeded your current quota\"}}"
+                .into()
+        )));
     }
 
     #[test]
@@ -2310,6 +2992,99 @@ mod tests {
             session.messages.last().map(|m| m.content.first()),
             Some(Some(ContentBlock::ToolResult { .. }))
         ));
+    }
+
+    #[tokio::test]
+    async fn a_terminate_request_only_wins_when_every_call_in_the_batch_agrees() {
+        // pi-parity coverage (`packages/agent/test/agent-loop.test.ts`, "should continue after
+        // parallel tool calls when not all tool results terminate"): a single tool asking to end the
+        // run must not cut off a sibling call the model dispatched in the same batch — only honored
+        // when *every* result in the group agrees. `agent.rs`'s own `terminate &= wants_terminate`
+        // fold implements this; this pins the actual end-to-end behavior, not just the fold in
+        // isolation.
+        struct ConditionalExitTool;
+        #[async_trait]
+        impl Tool for ConditionalExitTool {
+            fn name(&self) -> &str {
+                "echo"
+            }
+            fn description(&self) -> &str {
+                "echo the value arg; terminates the run only when value is \"first\""
+            }
+            fn input_schema(&self) -> Value {
+                json!({ "type": "object", "properties": { "value": { "type": "string" } }, "required": ["value"] })
+            }
+            async fn run(
+                &self,
+                input: Value,
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+                let value = input
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| crate::error::ToolError::InvalidInput("missing value".into()))?;
+                Ok(crate::tool::ToolOutput::text(format!("echoed: {value}"))
+                    .with_terminate(value == "first"))
+            }
+        }
+
+        let parallel_calls = vec![
+            StreamEvent::MessageStart,
+            StreamEvent::ToolUseStart {
+                index: 0,
+                id: "tool-1".into(),
+                name: "echo".into(),
+            },
+            StreamEvent::InputJsonDelta {
+                index: 0,
+                partial_json: r#"{"value":"first"}"#.into(),
+            },
+            StreamEvent::ContentBlockStop { index: 0 },
+            StreamEvent::ToolUseStart {
+                index: 1,
+                id: "tool-2".into(),
+                name: "echo".into(),
+            },
+            StreamEvent::InputJsonDelta {
+                index: 1,
+                partial_json: r#"{"value":"second"}"#.into(),
+            },
+            StreamEvent::ContentBlockStop { index: 1 },
+            StreamEvent::MessageStop {
+                stop_reason: StopReason::ToolUse,
+            },
+        ];
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(ConditionalExitTool));
+        let (agent, mock) = agent_with(vec![parallel_calls, turn::text("done")], tools);
+        let mut session = Session::new();
+        session.user("echo both");
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        // Both tool results are recorded, and the run continued into a real second turn instead of
+        // stopping just because "first"'s result asked to terminate.
+        assert_eq!(mock.calls(), 2, "the batch must not terminate early");
+        assert_eq!(
+            session.messages.iter().map(|m| m.role).collect::<Vec<_>>(),
+            vec![Role::User, Role::Assistant, Role::User, Role::Assistant],
+        );
+        assert_eq!(
+            session.messages[2].content,
+            vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "tool-1".into(),
+                    content: "echoed: first".into(),
+                    is_error: false,
+                    images: Vec::new(),
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: "tool-2".into(),
+                    content: "echoed: second".into(),
+                    is_error: false,
+                    images: Vec::new(),
+                },
+            ]
+        );
     }
 
     #[tokio::test]
@@ -2597,6 +3372,236 @@ mod tests {
             end_order,
             vec!["f".to_string(), "s".to_string()],
             "ToolEnd must stream in actual finish order (fast, then slow), not call order: {end_order:?}"
+        );
+    }
+
+    /// A normalized event "kind" for ordering assertions — mirrors pi's own `normalizeEventOrder`
+    /// (`agent-session-retry-events.test.ts`), which also collapses consecutive fine-grained deltas
+    /// into a single logical step. `Stream(...)` wraps many more sub-events on our side (per-token
+    /// deltas) than pi's coarser `message_update`, so consecutive `Stream` events collapse to one
+    /// `"stream"` marker here — the same normalization idea, adapted to this crate's own event shape
+    /// rather than pi's exact variant names.
+    fn normalized_event_kinds(events: &[AgentEvent]) -> Vec<&'static str> {
+        fn kind(ev: &AgentEvent) -> &'static str {
+            match ev {
+                AgentEvent::AgentStart => "agent_start",
+                AgentEvent::TurnStart { .. } => "turn_start",
+                AgentEvent::Stream(_) => "stream",
+                AgentEvent::ToolStart { .. } => "tool_start",
+                AgentEvent::ToolProgress { .. } => "tool_progress",
+                AgentEvent::ToolEnd { .. } => "tool_end",
+                AgentEvent::TurnEnd { .. } => "turn_end",
+                AgentEvent::Steered { .. } => "steered",
+                AgentEvent::AgentEnd { .. } => "agent_end",
+                AgentEvent::CompactionStart { .. } => "compaction_start",
+                AgentEvent::Compacted { .. } => "compacted",
+                AgentEvent::CompactionFailed { .. } => "compaction_failed",
+                AgentEvent::Error { .. } => "error",
+            }
+        }
+        let mut out: Vec<&'static str> = Vec::new();
+        for ev in events {
+            let k = kind(ev);
+            if k == "stream" && out.last() == Some(&"stream") {
+                continue;
+            }
+            out.push(k);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn emits_the_expected_event_order_for_a_single_prompt() {
+        // pi-parity coverage (`agent-session-retry-events.test.ts`, "emits the expected event order
+        // for a single prompt"): only pairwise/relative orderings were tested before this — pins the
+        // complete sequence for the simplest possible run.
+        let (agent, _mock) = agent_with(vec![turn::text("hello")], ToolRegistry::new());
+        let mut session = Session::new();
+        session.user("hi");
+        let mut events = Vec::new();
+        agent
+            .run_events(&mut session, |ev| events.push(ev))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            normalized_event_kinds(&events),
+            vec![
+                "agent_start",
+                "turn_start",
+                "stream",
+                "turn_end",
+                "agent_end"
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn emits_the_expected_event_order_for_a_tool_call_turn() {
+        // pi-parity coverage (`agent-session-retry-events.test.ts`, "emits the expected event order
+        // for a tool call turn"): the full sequence across a tool-dispatch turn followed by the
+        // model's final text turn — turn_start/turn_end appears twice, agent_start/agent_end once each.
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        let (agent, _mock) = agent_with(
+            vec![
+                turn::tool_call("tu_1", "echo", r#"{"text":"hello"}"#),
+                turn::text("done"),
+            ],
+            tools,
+        );
+        let mut session = Session::new();
+        session.user("hi");
+        let mut events = Vec::new();
+        agent
+            .run_events(&mut session, |ev| events.push(ev))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            normalized_event_kinds(&events),
+            vec![
+                "agent_start",
+                "turn_start",
+                "stream",
+                "turn_end",
+                "tool_start",
+                "tool_end",
+                "turn_start",
+                "stream",
+                "turn_end",
+                "agent_end",
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn a_late_tool_progress_emit_after_the_run_settles_is_silently_dropped_not_a_panic() {
+        // pi-parity coverage (`packages/agent/test/agent.test.ts`, "should ignore tool updates after
+        // the tool execution settles"): `ToolProgress::emit`'s own doc comment already promises this
+        // ("best-effort... dropped rather than erroring") — the channel receiver really is gone once
+        // the tool group task exits — but nothing end-to-end proved a tool holding onto its handle past
+        // settlement (a fire-and-forget background task, say) can't panic the process or corrupt a
+        // later, unrelated run.
+        let captured: Arc<std::sync::Mutex<Option<crate::tool::ToolProgress>>> =
+            Arc::new(std::sync::Mutex::new(None));
+
+        struct CapturesProgressTool(Arc<std::sync::Mutex<Option<crate::tool::ToolProgress>>>);
+        #[async_trait]
+        impl Tool for CapturesProgressTool {
+            fn name(&self) -> &str {
+                "captures_progress"
+            }
+            fn description(&self) -> &str {
+                "stashes its progress handle for the caller to use after settlement"
+            }
+            fn input_schema(&self) -> Value {
+                json!({ "type": "object" })
+            }
+            async fn run(
+                &self,
+                _input: Value,
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+                unreachable!("run_streaming is always preferred when overridden")
+            }
+            async fn run_streaming(
+                &self,
+                _input: Value,
+                progress: &crate::tool::ToolProgress,
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+                progress.emit("running", None);
+                *self.0.lock().unwrap() = Some(progress.clone());
+                Ok(crate::tool::ToolOutput::text("done").with_terminate(true))
+            }
+        }
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(CapturesProgressTool(captured.clone())));
+        let (agent, _mock) = agent_with(
+            vec![turn::tool_call("tu_1", "captures_progress", "{}")],
+            tools,
+        );
+        let mut session = Session::new();
+        session.user("go");
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        // The run has fully settled — its channel's receiving end is gone. Emitting on the stashed
+        // handle now must not panic (a real bug here would abort this whole test process, not just
+        // fail an assertion) and must be a true no-op.
+        let handle = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("tool ran and stashed its handle");
+        handle.emit("late, after settlement", Some(json!({ "status": "late" })));
+
+        // The channel being silently defunct doesn't leak into a completely unrelated later run.
+        let mut tools2 = ToolRegistry::new();
+        tools2.register(Arc::new(EchoTool));
+        let (agent2, _mock2) = agent_with(vec![turn::text("still fine")], tools2);
+        let mut session2 = Session::new();
+        session2.user("go again");
+        agent2.run(&mut session2, |_| {}).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_stringified_primitive_tool_argument_is_coerced_before_dispatch() {
+        // pi-parity coverage (`packages/ai/test/validation.test.ts`): a provider (or an
+        // OpenAI-compatible proxy in between) can stringify a primitive the model emitted as
+        // genuinely typed — `{"count":"42"}` instead of `{"count":42}`. Without coercion this tool's
+        // own `as_i64()` extraction would see `None` and fail with a confusing "missing/wrong-type
+        // field" error instead of running normally.
+        struct NeedsIntegerTool;
+        #[async_trait]
+        impl Tool for NeedsIntegerTool {
+            fn name(&self) -> &str {
+                "double"
+            }
+            fn description(&self) -> &str {
+                "doubles an integer count"
+            }
+            fn input_schema(&self) -> Value {
+                json!({
+                    "type": "object",
+                    "properties": { "count": { "type": "integer" } },
+                    "required": ["count"],
+                })
+            }
+            async fn run(
+                &self,
+                input: Value,
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+                let count = input.get("count").and_then(Value::as_i64).ok_or_else(|| {
+                    crate::error::ToolError::InvalidInput("count must be an integer".into())
+                })?;
+                Ok((count * 2).to_string().into())
+            }
+        }
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(NeedsIntegerTool));
+        // The model streamed the argument as a JSON *string* ("21"), not a number — exactly the shape
+        // coercion exists to normalize before the tool ever sees it.
+        let (agent, _mock) = agent_with(
+            vec![
+                turn::tool_call("tu_1", "double", r#"{"count":"21"}"#),
+                turn::text("done"),
+            ],
+            tools,
+        );
+        let mut session = Session::new();
+        session.user("double 21");
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        assert_eq!(
+            session.messages[2].content,
+            vec![ContentBlock::ToolResult {
+                tool_use_id: "tu_1".into(),
+                content: "42".into(),
+                is_error: false,
+                images: Vec::new(),
+            }],
+            "the stringified \"21\" must coerce to the integer 21 before the tool runs, not error"
         );
     }
 
@@ -3579,6 +4584,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_automatic_compaction_is_reported_not_propagated() {
+        // pi-parity gap (fixed): a transient failure in the summarization call used to unwind the
+        // whole run via `?` — and since `should_compact` re-fires on every subsequent turn until it
+        // succeeds, a persistently failing summarizer made the session permanently unusable, blocking
+        // the user's own prompt from ever reaching the model. It must instead report `CompactionFailed`
+        // and let the turn that was about to be sent proceed unsummarized, matching pi's
+        // `_runAutoCompaction`'s `try/catch` + `compaction_end { errorMessage }`.
+        fn big_tool_turn(id: &str) -> Vec<StreamEvent> {
+            vec![
+                StreamEvent::MessageStart,
+                StreamEvent::ToolUseStart {
+                    index: 0,
+                    id: id.into(),
+                    name: "echo".into(),
+                },
+                StreamEvent::InputJsonDelta {
+                    index: 0,
+                    partial_json: r#"{"text":"a"}"#.into(),
+                },
+                StreamEvent::ContentBlockStop { index: 0 },
+                StreamEvent::Usage(TokenUsage {
+                    input_tokens: 95,
+                    output_tokens: 5,
+                    ..Default::default()
+                }),
+                StreamEvent::MessageStop {
+                    stop_reason: StopReason::ToolUse,
+                },
+            ]
+        }
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        let mock = Arc::new(MockTransport::scripted(vec![
+            // Turns 1 and 2 both cross the usage threshold, but the first compaction attempt is a
+            // silent `find_split_cut` no-op (not enough history yet for a worthwhile cut) — mirrors
+            // `compaction_start_fires_with_the_right_reason_before_compacted` above, which needs the
+            // same two turns before a real summarization call happens.
+            big_tool_turn("t1").into_iter().map(Ok).collect(),
+            big_tool_turn("t2").into_iter().map(Ok).collect(),
+            // The compaction round's own summarization call — fails outright, not with a
+            // mid-stream-retryable shape (this is a hard failure, not a transient blip to retry away).
+            vec![Err(Error::Transport(
+                "mock summarizer permanently unavailable".into(),
+            ))],
+            // Turn 3 still gets sent, unsummarized, and completes the run normally.
+            turn::text("done despite the failed compaction")
+                .into_iter()
+                .map(Ok)
+                .collect(),
+        ]));
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8")
+            .with_tools(tools)
+            .with_max_steps(6)
+            .with_compaction(CompactionConfig {
+                context_window: 100,
+                reserve_tokens: 10,
+                keep_recent_tokens: 1,
+                summary_max_tokens: 256,
+                enabled: true,
+            });
+        let mut session = Session::new();
+        session.user("seed task with enough text to fill several estimated tokens here please");
+
+        let mut kinds = Vec::new();
+        let result = agent
+            .run_events(&mut session, |ev| {
+                if matches!(
+                    ev,
+                    AgentEvent::CompactionStart { .. }
+                        | AgentEvent::Compacted { .. }
+                        | AgentEvent::CompactionFailed { .. }
+                        | AgentEvent::Error { .. }
+                ) {
+                    kinds.push(ev);
+                }
+            })
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "a failed automatic compaction must not abort the run: {result:?}"
+        );
+        assert_eq!(
+            kinds.len(),
+            2,
+            "expected exactly CompactionStart then CompactionFailed, got: {kinds:#?}"
+        );
+        assert!(
+            matches!(
+                &kinds[0],
+                AgentEvent::CompactionStart {
+                    reason: CompactionReason::Threshold
+                }
+            ),
+            "got: {:#?}",
+            kinds[0]
+        );
+        match &kinds[1] {
+            AgentEvent::CompactionFailed { reason, message } => {
+                assert_eq!(*reason, CompactionReason::Threshold);
+                assert!(
+                    message.contains("mock summarizer permanently unavailable"),
+                    "got: {message}"
+                );
+            }
+            other => panic!("expected CompactionFailed, got: {other:#?}"),
+        }
+        assert_eq!(
+            mock.calls(),
+            4,
+            "the failed compaction attempt must not have blocked the real next turn from still being sent"
+        );
+        assert!(
+            matches!(
+                session.messages.last().map(|m| m.content.first()),
+                Some(Some(ContentBlock::Text { text, .. })) if text == "done despite the failed compaction"
+            ),
+            "the run must reach the real turn, not just swallow the failure and stop: {:#?}",
+            session.messages.last()
+        );
+    }
+
+    #[tokio::test]
     async fn hard_overflow_forces_compaction_even_when_auto_compaction_is_disabled() {
         // Auto-compaction is off, so the normal threshold check (`should_compact`, gated on `enabled`)
         // never fires. But the tool-call turn's own reported usage already meets the raw context
@@ -3747,17 +4875,17 @@ mod tests {
             Message::user("first request"),
             Message::assistant(vec![ContentBlock::text("first done")]),
             Message::user("second request"),
-            Message::assistant(vec![ContentBlock::ToolUse {
-                id: "1".into(),
-                name: "read".into(),
-                input: json!({ "path": "a.rs" }),
-            }]),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "1",
+                "read",
+                json!({ "path": "a.rs" }),
+            )]),
             Message::tool_result("1", "contents of a.rs", false),
-            Message::assistant(vec![ContentBlock::ToolUse {
-                id: "2".into(),
-                name: "edit".into(),
-                input: json!({ "path": "a.rs" }),
-            }]),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "2",
+                "edit",
+                json!({ "path": "a.rs" }),
+            )]),
             Message::tool_result("2", "edited", false),
         ];
         let mut session = Session::new();
@@ -3799,6 +4927,185 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compact_appends_file_operations_to_the_applied_summary_text() {
+        // pi-parity fix: `<read-files>`/`<modified-files>` were fed into the summarization *prompt*
+        // but never appended to its *output* — the file list only reached the live conversation if the
+        // summarizing model happened to mention exact paths in its own prose. `session.compaction`
+        // already tracked the files structurally (a separate mechanism, unaffected by this bug); this
+        // is about the actual text a later turn's request would include.
+        let session_messages = vec![
+            Message::user("look at this"),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "1",
+                "read",
+                json!({ "path": "src/lib.rs" }),
+            )]),
+            Message::tool_result("1", "contents", false),
+            Message::user("ok now something else"),
+            Message::assistant(vec![ContentBlock::text("done")]),
+        ];
+        let mut session = Session::new();
+        session.messages = Arc::new(session_messages);
+
+        let mock = Arc::new(MockTransport::new(vec![turn::text(
+            "A prose summary that never mentions any file paths.",
+        )]));
+        let agent = Agent::new(mock, "claude-opus-4-8").with_compaction(CompactionConfig {
+            keep_recent_tokens: 1,
+            ..CompactionConfig::default()
+        });
+        let cancel = CancellationToken::new();
+        let compacted = agent
+            .compact(
+                &mut session,
+                CompactionReason::Manual,
+                &cancel,
+                &mut |_| {},
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(compacted);
+
+        let ContentBlock::Text { text, .. } = &session.messages[0].content[0] else {
+            panic!("expected the spliced summary message to be text");
+        };
+        assert!(text.contains("<read-files>"), "got: {text}");
+        assert!(text.contains("src/lib.rs"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn summarize_branch_appends_file_operations_to_the_returned_text() {
+        // Same fix, the branch-summarization path.
+        let branch = vec![
+            Message::user("try approach X"),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "1",
+                "edit",
+                json!({ "path": "src/x.rs" }),
+            )]),
+            Message::tool_result("1", "edited", false),
+            Message::assistant(vec![ContentBlock::text("didn't pan out")]),
+        ];
+        let mock = Arc::new(MockTransport::new(vec![turn::text(
+            "A prose summary that never mentions any file paths.",
+        )]));
+        let agent = Agent::new(mock, "claude-opus-4-8");
+        let cancel = CancellationToken::new();
+        let summary = agent
+            .summarize_branch(&branch, &cancel, None)
+            .await
+            .unwrap();
+        assert!(summary.contains("<modified-files>"), "got: {summary}");
+        assert!(summary.contains("src/x.rs"), "got: {summary}");
+    }
+
+    #[tokio::test]
+    async fn summarize_branch_threads_custom_instructions_into_the_summarization_request() {
+        // B-M8 pi-parity gap (fixed): unlike `Agent::compact`, `summarize_branch` had no
+        // `custom_instructions` parameter at all — a client navigating away from a branch had no way
+        // to steer what the recap emphasizes, unlike a manual compaction. The custom instruction must
+        // actually reach the request the mock transport receives.
+        let branch = vec![
+            Message::user("try approach X"),
+            Message::assistant(vec![ContentBlock::text("didn't pan out")]),
+        ];
+        let mock = Arc::new(MockTransport::new(vec![turn::text("a recap")]));
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8");
+        let cancel = CancellationToken::new();
+        agent
+            .summarize_branch(
+                &branch,
+                &cancel,
+                Some("keep every detail about the auth refactor"),
+            )
+            .await
+            .unwrap();
+
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 1);
+        let ContentBlock::Text { text, .. } = &requests[0].messages[0].content[0] else {
+            panic!("expected text");
+        };
+        assert!(
+            text.contains("Additional focus: keep every detail about the auth refactor"),
+            "got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn summarize_branch_forwards_the_agents_configured_reasoning_to_the_summarization_request()
+     {
+        // B-M13 pi-parity gap (fixed): a summarization call (branch or compaction) always ran at the
+        // model's bare default reasoning level, ignoring whatever the live session was configured to
+        // use. `summarize_branch` must forward the same level, matching pi's `generateSummary` (which
+        // only omits `reasoning` when thinking is off, and otherwise passes the live level straight
+        // through).
+        let branch = vec![
+            Message::user("try approach X"),
+            Message::assistant(vec![ContentBlock::text("didn't pan out")]),
+        ];
+        let mock = Arc::new(MockTransport::new(vec![turn::text("a recap")]));
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8")
+            .with_reasoning_effort(ReasoningEffort::High);
+        let cancel = CancellationToken::new();
+        agent
+            .summarize_branch(&branch, &cancel, None)
+            .await
+            .unwrap();
+
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].reasoning_effort, Some(ReasoningEffort::High));
+    }
+
+    #[tokio::test]
+    async fn summarize_branch_reports_cancellation_as_an_error_not_an_empty_success() {
+        // Real interaction bug found while integrating concurrent work: `run_turn`'s mid-stream cancel
+        // path was changed (`StopReason::Aborted`) to return `Ok(Turn{blocks:[..], ..})` instead of
+        // `Err(Error::Cancelled)`, specifically so `run_events_steered` can persist partial content —
+        // see that change's own doc comment. But `summarize_branch` (and `compact`) call `run_turn`
+        // directly for a one-off utility call with no such persistence story; naively inheriting that
+        // same `Ok(Aborted)` return would make a cancelled call indistinguishable from "the model
+        // summarized to an empty string" — the caller (`serve.rs`'s `switch_branch`) falls through to
+        // "nothing worth recording" and reports a normal success, exactly the bug this pins: `abort`
+        // during branch summarization must still surface as `Err(Error::Cancelled)` so the caller's own
+        // cancellation-handling arm (which leaves the session completely untouched, matching pi's
+        // `abortBranchSummary`) actually runs. See `Agent::run_utility_turn`, which every summarization
+        // call site now goes through instead of calling `run_turn` directly.
+        struct StalledTransport;
+        #[async_trait]
+        impl ModelTransport for StalledTransport {
+            async fn stream(&self, _req: ModelRequest) -> Result<crate::transport::EventStream> {
+                let s = futures::stream::once(async { Ok(StreamEvent::MessageStart) })
+                    .chain(futures::stream::pending());
+                Ok(Box::pin(s))
+            }
+        }
+        let branch = vec![
+            Message::user("try approach X"),
+            Message::assistant(vec![ContentBlock::text("didn't pan out")]),
+        ];
+        let agent = Agent::new(Arc::new(StalledTransport), "claude-opus-4-8");
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            trigger.cancel();
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            agent.summarize_branch(&branch, &cancel, None),
+        )
+        .await
+        .expect("cancellation must interrupt the stalled summarization call");
+        assert!(
+            matches!(result, Err(Error::Cancelled)),
+            "expected Err(Cancelled), got {result:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn compact_runs_the_two_split_turn_summary_calls_sequentially_not_concurrently() {
         // Regression for the exact bug pi fixed 13 commits after the last audit ("serialize split-turn
         // compaction summaries... so single-concurrency local providers do not fail with 429 errors"):
@@ -3836,17 +5143,17 @@ mod tests {
             Message::user("first request"),
             Message::assistant(vec![ContentBlock::text("first done")]),
             Message::user("second request"),
-            Message::assistant(vec![ContentBlock::ToolUse {
-                id: "1".into(),
-                name: "read".into(),
-                input: json!({ "path": "a.rs" }),
-            }]),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "1",
+                "read",
+                json!({ "path": "a.rs" }),
+            )]),
             Message::tool_result("1", "contents of a.rs", false),
-            Message::assistant(vec![ContentBlock::ToolUse {
-                id: "2".into(),
-                name: "edit".into(),
-                input: json!({ "path": "a.rs" }),
-            }]),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "2",
+                "edit",
+                json!({ "path": "a.rs" }),
+            )]),
             Message::tool_result("2", "edited", false),
         ];
         let mut session = Session::new();
@@ -3892,17 +5199,17 @@ mod tests {
             Message::user("first request"),
             Message::assistant(vec![ContentBlock::text("first done")]),
             Message::user("second request"),
-            Message::assistant(vec![ContentBlock::ToolUse {
-                id: "1".into(),
-                name: "read".into(),
-                input: json!({ "path": "a.rs" }),
-            }]),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "1",
+                "read",
+                json!({ "path": "a.rs" }),
+            )]),
             Message::tool_result("1", "contents of a.rs", false),
-            Message::assistant(vec![ContentBlock::ToolUse {
-                id: "2".into(),
-                name: "edit".into(),
-                input: json!({ "path": "a.rs" }),
-            }]),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "2",
+                "edit",
+                json!({ "path": "a.rs" }),
+            )]),
             Message::tool_result("2", "edited", false),
         ];
         let mut session = Session::new();
@@ -3954,17 +5261,17 @@ mod tests {
                 "{}\n\nprior summary body",
                 compaction::SUMMARY_MARKER
             )),
-            Message::assistant(vec![ContentBlock::ToolUse {
-                id: "1".into(),
-                name: "read".into(),
-                input: json!({ "path": "a.rs" }),
-            }]),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "1",
+                "read",
+                json!({ "path": "a.rs" }),
+            )]),
             Message::tool_result("1", "contents of a.rs", false),
-            Message::assistant(vec![ContentBlock::ToolUse {
-                id: "2".into(),
-                name: "edit".into(),
-                input: json!({ "path": "a.rs" }),
-            }]),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "2",
+                "edit",
+                json!({ "path": "a.rs" }),
+            )]),
             Message::tool_result("2", "edited", false),
         ];
         let mut session = Session::new();
@@ -4004,6 +5311,54 @@ mod tests {
                     && text.contains("turn prefix summary text")),
             "expected the prior summary folded forward verbatim, got: {:?}",
             session.messages[0].content
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_is_a_no_op_on_a_clean_boundary_when_nothing_new_followed_the_prior_summary() {
+        // pi-parity gap (fixed): the clean-boundary path had no "nothing new to fold since the last
+        // compaction" reuse guard the split-turn path already has (see the test above). A prior
+        // compaction's summary always sits at `session.messages[0]`; when every message since it is
+        // still a closed, ordinary conversation (no split-turn mid-dispatch shape), `find_split_cut`
+        // can land `first_kept == 1` — the cut boundary right after the summary itself, meaning there
+        // is no new activity to fold in at all. Calling compact() again here (e.g. a client issuing a
+        // second manual `compact` with nothing new typed in between) must be a genuine no-op: zero
+        // model calls, the session left completely unchanged — not a wasted call that just restates
+        // the same summary with an empty `<new-activity>` section.
+        let session_messages = vec![
+            Message::user(format!(
+                "{}\n\nprior summary body",
+                compaction::SUMMARY_MARKER
+            )),
+            Message::assistant(vec![ContentBlock::text("first reply")]),
+            Message::user("second question"),
+            Message::assistant(vec![ContentBlock::text("second reply")]),
+        ];
+        let mut session = Session::new();
+        session.messages = Arc::new(session_messages.clone());
+
+        // No turns scripted at all: any model call at all would panic/error the mock, failing the
+        // test loudly rather than silently passing.
+        let mock = Arc::new(MockTransport::new(vec![]));
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8"); // default keep_recent_tokens (40k)
+        let cancel = CancellationToken::new();
+        let compacted = agent
+            .compact(
+                &mut session,
+                CompactionReason::Manual,
+                &cancel,
+                &mut |_| {},
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(!compacted, "must report a no-op, not a real compaction");
+        assert_eq!(mock.calls(), 0, "must not make any model call at all");
+        assert_eq!(
+            session.messages.as_ref(),
+            &session_messages,
+            "the session must be left completely unchanged"
         );
     }
 
@@ -4845,5 +6200,146 @@ mod tests {
         .await
         .expect("cancellation must interrupt the stalled stream");
         assert!(matches!(result, Err(Error::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn cancellation_mid_stream_persists_partial_content_as_an_aborted_turn() {
+        use std::time::Duration;
+
+        // pi-parity fix (`packages/ai/test/abort.test.ts`'s `testAbortSignal`,
+        // `packages/coding-agent/test/suite/agent-session-retry-events.test.ts:334-359` "emits
+        // agent_end for aborted runs and persists the aborted assistant message"): a stream cancelled
+        // after real content has already arrived must not discard it — pi persists a
+        // `stopReason:"aborted"` message with the partial text, and a follow-up prompt still works.
+        // A transport that streams two text deltas, then goes silent forever — cancellation must land
+        // while genuine partial content is already accumulated, not race a stream that would complete
+        // or error out on its own.
+        struct PartialThenStalledTransport;
+        #[async_trait]
+        impl ModelTransport for PartialThenStalledTransport {
+            async fn stream(&self, _req: ModelRequest) -> Result<crate::transport::EventStream> {
+                let s = futures::stream::iter(vec![
+                    Ok(StreamEvent::MessageStart),
+                    Ok(StreamEvent::TextDelta {
+                        index: 0,
+                        text: "partial an".into(),
+                    }),
+                    Ok(StreamEvent::TextDelta {
+                        index: 0,
+                        text: "swer".into(),
+                    }),
+                ])
+                .chain(futures::stream::pending());
+                Ok(Box::pin(s))
+            }
+        }
+
+        let agent = Agent::new(Arc::new(PartialThenStalledTransport), "claude-opus-4-8");
+        let mut session = Session::new();
+        session.user("go");
+
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            trigger.cancel();
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            agent.run_events_cancellable(&mut session, |_| {}, cancel),
+        )
+        .await
+        .expect("cancellation must interrupt the stalled stream");
+        // The external contract is unchanged: the run still ends in `Err(Error::Cancelled)` — whole-
+        // run retry exclusion, `serve.rs`'s `abort` RPC handling, and every other caller keying off
+        // this still work exactly as before.
+        assert!(matches!(result, Err(Error::Cancelled)));
+
+        assert_eq!(
+            session.messages.len(),
+            2,
+            "expected [user, assistant(aborted, partial)]"
+        );
+        let closing = &session.messages[1];
+        assert_eq!(closing.role, Role::Assistant);
+        assert!(
+            closing.aborted,
+            "the persisted message must be flagged aborted"
+        );
+        assert!(
+            closing.error_message.is_none(),
+            "aborted is a distinct condition from error — must not also set error_message"
+        );
+        assert_eq!(
+            closing.content,
+            vec![ContentBlock::text("partial answer")],
+            "the partial text that had already streamed must survive, not be discarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prompt_after_a_mid_stream_abort_does_not_double_push_a_user_turn() {
+        use std::time::Duration;
+
+        // The other half of the fix: once the aborted turn closes with a real assistant record, a
+        // fresh `session.user(...)` must restore valid role alternation and a normal run must succeed
+        // — mirroring pi's `testAbortSignal`, which sends a real follow-up after the abort and asserts
+        // it completes normally.
+        struct StallsOnFirstCallOnly {
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait]
+        impl ModelTransport for StallsOnFirstCallOnly {
+            async fn stream(&self, _req: ModelRequest) -> Result<crate::transport::EventStream> {
+                if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    let s = futures::stream::iter(vec![
+                        Ok(StreamEvent::MessageStart),
+                        Ok(StreamEvent::TextDelta {
+                            index: 0,
+                            text: "partial".into(),
+                        }),
+                    ])
+                    .chain(futures::stream::pending());
+                    Ok(Box::pin(s))
+                } else {
+                    Ok(Box::pin(futures::stream::iter(
+                        turn::text("recovered").into_iter().map(Ok),
+                    )))
+                }
+            }
+        }
+
+        let agent = Agent::new(
+            Arc::new(StallsOnFirstCallOnly {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            "claude-opus-4-8",
+        );
+        let mut session = Session::new();
+        session.user("go");
+
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            trigger.cancel();
+        });
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            agent.run_events_cancellable(&mut session, |_| {}, cancel),
+        )
+        .await
+        .expect("cancellation must interrupt the stalled stream")
+        .expect_err("aborted run must still return Err(Cancelled)");
+
+        assert_eq!(session.messages[1].role, Role::Assistant);
+        session.user("after abort");
+        assert_eq!(session.messages[2].role, Role::User);
+        agent.run(&mut session, |_| {}).await.unwrap();
+        let last = session.messages.last().unwrap();
+        assert_eq!(last.role, Role::Assistant);
+        assert!(!last.aborted);
+        assert!(!last.content.is_empty());
     }
 }

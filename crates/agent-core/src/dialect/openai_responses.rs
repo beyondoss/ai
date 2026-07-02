@@ -65,12 +65,44 @@ fn text_of(blocks: &[ContentBlock]) -> String {
 /// intended shifts the split point). Escaping each half first (`\` → `\\`, `|` → `\|`) makes the join
 /// round-trip correctly regardless of what either id contains; the common case, where neither needs
 /// escaping, costs nothing beyond the two no-op `contains` checks.
+///
+/// `item_id` gets one more check before escaping: a same-dialect backend's own item id is always
+/// short (OpenAI's own are `fc_`-prefixed and well under [`MAX_ITEM_ID_LEN`]), but nothing guarantees
+/// that of a non-standard OpenAI-Responses-compatible provider sitting behind the same dialect — e.g.
+/// GitHub Copilot's own tool-call ids are shaped `call_id|<450+ char opaque blob>`. Replaying a foreign
+/// id like that is exactly what [`escape_tool_id_part`] used to do unconditionally: pass it through
+/// mostly as-is, which risks handing a *different* backend an oversized or oddly-charset'd id it
+/// rejects outright. Mirroring pi's `buildForeignResponsesItemId`, an oversized `item_id` is replaced
+/// with a short, deterministic, one-way digest (`fc_<hash>`) instead: the original is unrecoverable
+/// from the digest (same tradeoff as pi's `shortHash`), but the mapping is stable, so a `ToolResult`
+/// elsewhere in the session that still references the original combined id keeps pairing correctly.
 fn combine_tool_id(call_id: &str, item_id: &str) -> String {
-    format!(
-        "{}|{}",
-        escape_tool_id_part(call_id),
+    let item_id = if item_id.len() > MAX_ITEM_ID_LEN {
+        std::borrow::Cow::Owned(format!("fc_{}", short_hash(item_id)))
+    } else {
         escape_tool_id_part(item_id)
-    )
+    };
+    format!("{}|{}", escape_tool_id_part(call_id), item_id)
+}
+
+/// OpenAI's documented cap on a `function_call` item id (mirrors pi's `normalizeIdPart`/
+/// `buildForeignResponsesItemId`, both bounded to 64) — also the threshold past which
+/// [`combine_tool_id`] treats an `item_id` as foreign/non-standard rather than carrying it through
+/// verbatim.
+const MAX_ITEM_ID_LEN: usize = 64;
+
+/// Fast, deterministic, one-way digest for bounding an oversized tool-call item id down to a short,
+/// `[0-9a-f]`-only token — mirrors pi's `shortHash` (`packages/ai/src/utils/hash.ts`). Not reversible:
+/// nothing recovers `s` from the output, only a stable `s -> digest` mapping, which is all replay
+/// pairing needs (the same foreign `item_id` always collapses to the same digest). `DefaultHasher` is
+/// keyed with fixed (not per-process-random) state, so this is deterministic across calls and process
+/// restarts alike — required here since the digest, once computed, is persisted as part of the
+/// session's `ToolUse.id`/`ToolResult.tool_use_id` pairing rather than recomputed later.
+fn short_hash(s: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 fn escape_tool_id_part(s: &str) -> std::borrow::Cow<'_, str> {
@@ -118,7 +150,9 @@ fn split_on_unescaped_separator(s: &str) -> Option<(&str, &str)> {
 
 /// Split a combined id back into `(call_id, item_id)`, unescaping each half. No unescaped `|` (a plain
 /// id from another dialect, or a call whose item id we chose not to capture) means there's no item id
-/// to replay.
+/// to replay. An `item_id` that [`combine_tool_id`] replaced with a digest round-trips like any other
+/// opaque string here — the digest is plain `[0-9a-f]`, so there's nothing to unescape, and (being
+/// one-way) the original foreign id it stood in for is simply not recoverable.
 fn split_tool_id(id: &str) -> (std::borrow::Cow<'_, str>, Option<std::borrow::Cow<'_, str>>) {
     match split_on_unescaped_separator(id) {
         Some((call_id, item_id)) => (
@@ -155,26 +189,43 @@ const USER_IMAGE_PLACEHOLDER: &str = "(image omitted: model does not support ima
 /// Same idea, for a tool result's image output specifically.
 const TOOL_IMAGE_PLACEHOLDER: &str = "(tool image omitted: model does not support images)";
 
+/// pi-parity fix: collapse only a consecutive *run* of non-vision images into one placeholder, not
+/// every image anywhere in the turn via a single turn-wide boolean gate — mirrors the Anthropic
+/// dialect's per-run state machine (`dialect::anthropic`'s image-collapse pass, `anthropic.rs:282-301`).
+/// A single `had_image` flag checked once at the end loses both the position (the placeholder always
+/// landed last, even if the image was first) and the grouping (two runs of images separated by text
+/// wrongly collapsed into one placeholder instead of two). `pending_placeholder` tracks whether the run
+/// currently being scanned still needs its placeholder flushed; it flushes right before any block that
+/// isn't part of that run (and once more after the loop, for a run that was still open at the end).
 fn push_user_content(input: &mut Vec<Value>, blocks: &[ContentBlock], supports_vision: bool) {
     let mut parts: Vec<Value> = Vec::new();
-    let mut had_image = false;
+    let mut pending_placeholder = false;
     for b in blocks {
+        if matches!(b, ContentBlock::Image { .. }) && !supports_vision {
+            // Still inside a run of non-vision images — extend it rather than flushing yet.
+            pending_placeholder = true;
+            continue;
+        }
+        if pending_placeholder {
+            parts.push(json!({ "type": "input_text", "text": USER_IMAGE_PLACEHOLDER }));
+            pending_placeholder = false;
+        }
         match b {
             ContentBlock::Text { text, .. } if !text.is_empty() => {
                 parts.push(json!({ "type": "input_text", "text": text }));
             }
-            ContentBlock::Image { source } if supports_vision => {
+            // supports_vision is always true here — the false case was already handled above.
+            ContentBlock::Image { source } => {
                 parts.push(json!({
                     "type": "input_image",
                     "detail": "auto",
                     "image_url": format!("data:{};base64,{}", source.media_type, source.data),
                 }));
             }
-            ContentBlock::Image { .. } => had_image = true,
             _ => {}
         }
     }
-    if had_image {
+    if pending_placeholder {
         parts.push(json!({ "type": "input_text", "text": USER_IMAGE_PLACEHOLDER }));
     }
     if !parts.is_empty() {
@@ -308,6 +359,10 @@ fn push_assistant_content(input: &mut Vec<Value>, blocks: &[ContentBlock], msg_i
                 id,
                 name,
                 input: args,
+                // Only the OpenAI Chat Completions dialect ever populates this (Gemini-style
+                // `reasoning_details` continuity — see `ContentBlock::ToolUse`'s doc comment); no
+                // Responses wire slot exists for it, so it's always `None` here and ignored.
+                thought_signature: _,
             } => {
                 let (call_id, item_id) = split_tool_id(id);
                 let mut obj = Map::new();
@@ -571,6 +626,21 @@ impl Decoder {
 
     fn finalize(&mut self, data: &Value, out: &mut Vec<StreamEvent>) {
         self.saw_terminal = true;
+        // Defensive: a `response.completed`/`response.incomplete` event's own embedded
+        // `response.status` can in principle also read `"failed"`/`"cancelled"` (pi's
+        // `mapStopReason` guards this exhaustively) rather than the failure only ever arriving via
+        // the dedicated `response.failed` event — treated identically either way: no events emitted
+        // here, `self.failed` set so `finish()` surfaces it as a hard `Err` instead of the generic
+        // warn-and-treat-as-`Other` fallback below, which would otherwise report a genuine failure as
+        // if the turn had ended cleanly.
+        let status = data
+            .get("response")
+            .and_then(|r| r.get("status"))
+            .and_then(Value::as_str);
+        if matches!(status, Some("failed") | Some("cancelled")) {
+            self.failed = Some(failure_message(data));
+            return;
+        }
         // Defensive: normally every item is closed via its own `output_item.done` before the terminal
         // event arrives — but a malformed/truncated stream must not silently drop whatever's still
         // open, at any index.
@@ -598,12 +668,10 @@ impl Decoder {
             "reasoning_tokens",
         );
 
-        let status = response
-            .and_then(|r| r.get("status"))
-            .and_then(Value::as_str);
         let mut stop_reason = match status {
             Some("completed") => StopReason::EndTurn,
             Some("incomplete") => StopReason::MaxTokens,
+            // `"failed"`/`"cancelled"` already returned early above.
             Some(other) => {
                 tracing::warn!(
                     status = other,
@@ -809,6 +877,10 @@ impl StreamDecoder for Decoder {
         }
         Ok(Vec::new())
     }
+
+    fn is_terminal(&self) -> bool {
+        self.saw_terminal
+    }
 }
 
 #[cfg(test)]
@@ -829,6 +901,7 @@ mod tests {
                         id: "call_1|fc_1".into(),
                         name: "get_weather".into(),
                         input: json!({ "city": "SF" }),
+                        thought_signature: None,
                     },
                 ]),
                 Message::tool_result("call_1|fc_1", "72F", false),
@@ -880,6 +953,41 @@ mod tests {
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["name"], "get_weather");
         assert!(body["tools"][0].get("function").is_none());
+    }
+
+    #[test]
+    fn fallback_message_id_is_unique_across_multiple_text_blocks_in_one_turn() {
+        // pi-parity coverage gap (A-M6): mirrors pi's `packages/ai/test/openai-responses-message-id
+        // .test.ts:17-47` ("generates unique fallback message IDs for multiple text blocks in one
+        // assistant turn"). `fallback_message_id`'s `msg_{msg_index}` / `msg_{msg_index}_{n}` scheme
+        // was implemented but had no test proving 2+ text-producing blocks in a single turn (a model
+        // rarely, but not never, emits more than one — see `push_assistant_content`'s doc comment)
+        // actually get distinct, correctly-incrementing ids rather than colliding on the same one.
+        let req = ModelRequest::new(
+            "gpt-4o",
+            vec![
+                Message::user("hello"),
+                Message::assistant(vec![
+                    ContentBlock::text("first answer"),
+                    ContentBlock::text("second answer"),
+                ]),
+            ],
+            64,
+        );
+        let body = build_body(&req);
+
+        // messages[1] is the assistant turn, so msg_index == 1: "msg_1" for the first text block,
+        // "msg_1_1" for the second — never the same id reused for both.
+        assert_eq!(body["input"][1]["type"], "message");
+        assert_eq!(body["input"][1]["content"][0]["text"], "first answer");
+        assert_eq!(body["input"][1]["id"], "msg_1");
+        assert_eq!(body["input"][2]["type"], "message");
+        assert_eq!(body["input"][2]["content"][0]["text"], "second answer");
+        assert_eq!(body["input"][2]["id"], "msg_1_1");
+        assert_ne!(
+            body["input"][1]["id"], body["input"][2]["id"],
+            "each text block's fallback id must be distinct"
+        );
     }
 
     #[test]
@@ -1140,6 +1248,43 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
         assert_eq!(body["input"][0]["call_id"], "call_1");
         assert_eq!(body["input"][0]["output"][0]["text"], "screenshot attached");
         assert_eq!(body["input"][0]["output"][1]["type"], "input_image");
+        // pi-parity strengthening (A-L3): the content-block TYPE alone doesn't prove the image data
+        // actually made it onto the wire — assert the `image_url` value itself is the expected
+        // data URI, prefixed with the source's real media type and carrying its base64 payload
+        // verbatim, not just "some string is present at this key".
+        assert_eq!(
+            body["input"][0]["output"][1]["image_url"],
+            "data:image/png;base64,AAAA"
+        );
+        assert!(
+            body["input"][0]["output"][1]["image_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,"),
+            "image_url must carry the base64 data URI prefix, not just resemble one"
+        );
+    }
+
+    #[test]
+    fn a_tool_result_with_only_an_image_and_no_text_omits_the_empty_text_output_part() {
+        // A-L8 pi-parity test gap (fixed, `packages/ai/test/image-tool-result.test.ts`): a tool that
+        // returns only an image (no text) must not pad `output` with a spurious empty text part ahead
+        // of the real image.
+        let req = ModelRequest::new(
+            "gpt-4o",
+            vec![Message::tool_results(vec![ContentBlock::ToolResult {
+                tool_use_id: "call_1".into(),
+                content: String::new(),
+                is_error: false,
+                images: vec![ImageSource::base64("image/png", "AAAA")],
+            }])],
+            256,
+        );
+        let body = build_body(&req);
+        let output = body["input"][0]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1, "expected only the image part: {output:#?}");
+        assert_eq!(output[0]["type"], "input_image");
+        assert_eq!(output[0]["image_url"], "data:image/png;base64,AAAA");
     }
 
     #[test]
@@ -1192,6 +1337,66 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
         );
         let body = build_body(&req);
         assert_eq!(body["input"][0]["content"][1]["type"], "input_image");
+    }
+
+    #[test]
+    fn non_vision_model_collapses_only_consecutive_image_runs_not_the_whole_turn() {
+        // pi-parity fix (A-M11): a single turn-wide `had_image` boolean used to collapse *every*
+        // image in the turn into one placeholder appended at the very end, regardless of where the
+        // images actually sat relative to text. That both loses position and wrongly merges two
+        // distinct runs into one. Mirrors `dialect::anthropic`'s per-run state machine
+        // (`anthropic.rs:282-301`): text - image - image - text - image - text should produce one
+        // placeholder per *run* of images, each positioned right after the text that preceded it, not
+        // a single placeholder tacked on at the end.
+        let req = ModelRequest::new(
+            "o3-mini", // the one o-series id that isn't vision-capable.
+            vec![Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::text("first"),
+                    ContentBlock::Image {
+                        source: ImageSource::base64("image/png", "AAAA"),
+                    },
+                    ContentBlock::Image {
+                        source: ImageSource::base64("image/png", "BBBB"),
+                    },
+                    ContentBlock::text("middle"),
+                    ContentBlock::Image {
+                        source: ImageSource::base64("image/png", "CCCC"),
+                    },
+                    ContentBlock::text("last"),
+                ],
+                model_id: None,
+                error_message: None,
+                aborted: false,
+            }],
+            64,
+        );
+        let body = build_body(&req);
+        let content = body["input"][0]["content"].as_array().unwrap();
+
+        let placeholder = json!({
+            "type": "input_text",
+            "text": "(image omitted: model does not support images)"
+        });
+        assert_eq!(
+            content,
+            &vec![
+                json!({ "type": "input_text", "text": "first" }),
+                placeholder.clone(),
+                json!({ "type": "input_text", "text": "middle" }),
+                placeholder,
+                json!({ "type": "input_text", "text": "last" }),
+            ],
+            "two images then text then one image must produce two placeholders in their own \
+             positions — one per consecutive run — not a single placeholder for the whole turn"
+        );
+        // No `input_image` part should appear at all — every image in this turn is behind the
+        // non-vision gate.
+        assert!(
+            content.iter().all(|p| p["type"] != "input_image"),
+            "a non-vision model must never receive a real input_image part"
+        );
     }
 
     #[test]
@@ -1353,6 +1558,10 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
 
     #[test]
     fn incomplete_status_maps_to_max_tokens() {
+        // Usage values mirror pi's own incomplete-path fixture
+        // (`openai-responses-terminal-event.test.ts:127-141`'s `createIncompleteEvents`: input_tokens
+        // 30, output_tokens 12, cached_tokens 5) so the expected numbers below are directly
+        // comparable to pi's `toMatchObject({ input: 25, output: 12, cacheRead: 5, cacheWrite: 0, … })`.
         const SSE: &str = r#"
 data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1"}}
 
@@ -1360,7 +1569,7 @@ data: {"type":"response.output_text.delta","output_index":0,"delta":"cut off"}
 
 data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1"}}
 
-data: {"type":"response.incomplete","response":{"status":"incomplete","usage":{"input_tokens":5,"output_tokens":5}}}
+data: {"type":"response.incomplete","response":{"status":"incomplete","usage":{"input_tokens":30,"output_tokens":12,"input_tokens_details":{"cached_tokens":5}}}}
 "#;
         let mut dec = Decoder::default();
         let events = decode_sse(&mut dec, SSE).unwrap();
@@ -1370,6 +1579,27 @@ data: {"type":"response.incomplete","response":{"status":"incomplete","usage":{"
                 stop_reason: StopReason::MaxTokens
             })
         );
+        // pi-parity strengthening (A-L2): pi's equivalent (`openai-responses-terminal-event
+        // .test.ts:206-222`, "finalizes incomplete terminal events as length stops") asserts the full
+        // `responseId`/`stopReason`/usage tuple on this exact incomplete path — a truncated turn must
+        // still report accurate, billable usage, not just the right stop reason. `responseId` has no
+        // equivalent to assert here: this dialect's decoder is deliberately stateless (see the module
+        // doc comment — every turn resends full history rather than referencing a server-side
+        // `previous_response_id`), so there's no persisted response-id field anywhere in
+        // `StreamEvent`/`TokenUsage`, on *any* path, completed or incomplete — N/A by design, not an
+        // oversight.
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::Usage(u) => Some(*u),
+                _ => None,
+            })
+            .expect("a usage event");
+        assert_eq!(usage.input_tokens, 25); // 30 - 5 cached, same "bill the uncached remainder" rule
+        // `separates_cached_from_uncached_input` already exercises on the completed path.
+        assert_eq!(usage.output_tokens, 12);
+        assert_eq!(usage.cache_read_tokens, 5);
+        assert_eq!(usage.cache_write_tokens, 0);
     }
 
     #[test]
@@ -1378,6 +1608,91 @@ data: {"type":"response.incomplete","response":{"status":"incomplete","usage":{"
 data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1"}}
 
 data: {"type":"response.failed","response":{"error":{"code":"server_error","message":"boom"}}}
+"#;
+        let mut dec = Decoder::default();
+        let err = decode_sse(&mut dec, SSE).unwrap_err();
+        assert!(matches!(err, Error::Transport(_)));
+        // pi-parity strengthening (A-M7): pi's equivalent (`openai-responses-terminal-event
+        // .test.ts:224-232`) asserts `.rejects.toThrow("server_error: boom")` — the provider's own
+        // error `code` and `message` both showing up in the final error text, not just "some
+        // transport error happened." `matches!` alone would still pass if `failure_message` silently
+        // dropped the code, dropped the message, or swapped in a generic string — assert on the
+        // actual text `failure_message` (this dialect's `code: message` construction) produces.
+        let text = err.to_string();
+        assert!(
+            text.contains("server_error: boom"),
+            "error message must carry both the provider's error code and its message text \
+             verbatim, got: {text}"
+        );
+    }
+
+    #[test]
+    fn an_embedded_failed_status_on_response_completed_is_rejected_like_response_failed() {
+        // pi-parity fix (L2): pi's `mapStopReason` exhaustively guards `response.status` reading
+        // `"failed"`/`"cancelled"` even on a `response.completed`/`response.incomplete` event, not
+        // only via the dedicated `response.failed` event — our `finalize()` used to only check the
+        // event *type*, silently treating this embedded case as a successful (if unrecognized-status)
+        // turn instead of a genuine failure.
+        const SSE: &str = r#"
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1"}}
+
+data: {"type":"response.completed","response":{"status":"failed","error":{"code":"server_error","message":"boom"}}}
+"#;
+        let mut dec = Decoder::default();
+        let err = decode_sse(&mut dec, SSE).unwrap_err();
+        assert!(matches!(err, Error::Transport(_)));
+        let text = err.to_string();
+        assert!(text.contains("server_error: boom"), "got: {text}");
+    }
+
+    #[test]
+    fn an_embedded_cancelled_status_on_response_incomplete_is_rejected() {
+        const SSE: &str = r#"
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1"}}
+
+data: {"type":"response.incomplete","response":{"status":"cancelled"}}
+"#;
+        let mut dec = Decoder::default();
+        let err = decode_sse(&mut dec, SSE).unwrap_err();
+        assert!(matches!(err, Error::Transport(_)));
+    }
+
+    #[test]
+    fn a_non_json_trailer_after_response_completed_is_ignored_not_a_transport_error() {
+        // pi-parity fix: `is_terminal()` (used to gate this exact tolerance — see
+        // `dialect::push_sse_line`) was only ever overridden on the Anthropic decoder, even though this
+        // one already tracks the same `saw_terminal` state — a trailing keepalive/stats line from a
+        // gateway/proxy after the real `response.completed` arrived used to hard-error an otherwise-
+        // successful turn, unlike the Anthropic path.
+        const SSE: &str = r#"
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1"}}
+
+data: {"type":"response.output_text.delta","output_index":0,"delta":"hi"}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1"}}
+
+data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}
+
+data: not-json-at-all
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, SSE).unwrap();
+        assert_eq!(
+            events.last(),
+            Some(&StreamEvent::MessageStop {
+                stop_reason: StopReason::EndTurn
+            })
+        );
+    }
+
+    #[test]
+    fn a_non_json_data_line_before_response_completed_is_still_a_hard_error() {
+        // The flip side of the test above: garbage arriving *before* a terminal response event is a
+        // genuine corrupted/tampered stream, not trailing proxy noise — must still fail loudly.
+        const SSE: &str = r#"
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1"}}
+
+data: not-json-at-all
 "#;
         let mut dec = Decoder::default();
         let err = decode_sse(&mut dec, SSE).unwrap_err();
@@ -1744,5 +2059,77 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
         let (call_id, item_id) = split_tool_id("call_1");
         assert_eq!(call_id, "call_1");
         assert_eq!(item_id, None);
+    }
+
+    // Regression test mirroring pi's
+    // `packages/ai/test/openai-responses-foreign-toolcall-id.test.ts:19-65` — a foreign backend's own
+    // combined tool-call id (GitHub Copilot's, in pi's fixture) is far longer than any OpenAI-Responses
+    // item id and packs a `/`, `+`, `=` charset from its own opaque encoding. pi's fix hashes the
+    // foreign item-id half into a bounded, `fc_`-prefixed, alphanumeric id (`fc_${shortHash(itemId)}`,
+    // ≤ 64 chars) rather than replaying it mostly as-is; our `combine_tool_id` does the same at the
+    // point it first packs a wire-native id into `ToolUse.id`, using our own digest (not pi's
+    // `shortHash` — the two don't need to agree bit-for-bit, only the *shape* of the contract does:
+    // bounded, charset-safe, deterministic, one-way).
+    const COPILOT_RAW_TOOL_CALL_ID: &str = "call_4VnzVawQXPB9MgYib7CiQFEY|I9b95oN1wD/cHXKTw3PpRkL6KkCtzTJhUxMouMWYwHeTo2j3htzfSk7YPx2vifiIM4g3A8XXyOj8q4Bt6SLUG7gqY1E3ELkrkVQNHglRfUmWj84lqxJY+Puieb3VKyX0FB+83TUzn91cDMF/4gzt990IzqVrc+nIb9RRscRD070Du16q1glydVjWR0SBJsE6TbY/esOjFpqplogQqrajm1eI++f3eLi73R6q7hVusY0QbeFySVxABCjhN0lXB04caBe1rzHjYzul6MAXj7uq+0r17VLq+yrtyYhN12wkmFqHeqTyEei6EFPbMy24Nc+IbJlkP0OCg02W+gOnyBFcbi2ctvJFSOhSjt1CqBdqCnnhwUqXjbWiT0wh3DmLScRgTHmGkaI+oAcQQjfic65nxj+TnEkReA==";
+
+    #[test]
+    fn combine_tool_id_hashes_a_foreign_oversized_item_id_into_a_bounded_fc_shape() {
+        let (call_id, item_id) = COPILOT_RAW_TOOL_CALL_ID.split_once('|').unwrap();
+        assert!(
+            item_id.len() > MAX_ITEM_ID_LEN,
+            "fixture must exercise the oversized path"
+        );
+
+        let combined = combine_tool_id(call_id, item_id);
+        let (split_call_id, split_item_id) = split_tool_id(&combined);
+
+        // `call_id` is untouched — only `item_id` is foreign/oversized here.
+        assert_eq!(split_call_id, call_id);
+
+        let hashed = split_item_id.expect("oversized item id must still produce an item id");
+        assert!(
+            hashed.len() <= 64,
+            "hashed item id must respect OpenAI's own cap: {hashed}"
+        );
+        assert!(
+            hashed.starts_with("fc_"),
+            "OpenAI Responses requires the item id to start with \"fc\": {hashed}"
+        );
+        assert!(
+            hashed[3..].chars().all(|c| c.is_ascii_alphanumeric()),
+            "hashed item id must be charset-safe: {hashed}"
+        );
+        // One-way: the digest never contains (and can't be turned back into) the original blob.
+        assert_ne!(hashed.as_ref(), item_id);
+    }
+
+    #[test]
+    fn combine_tool_id_hash_is_deterministic_across_calls() {
+        // Not reversible, but stable: the same foreign item id must always collapse to the same
+        // digest, or a `ToolResult` elsewhere in the session (which independently references the
+        // original combined id) would stop pairing with its `ToolUse` after a second encode pass.
+        let (call_id, item_id) = COPILOT_RAW_TOOL_CALL_ID.split_once('|').unwrap();
+        let first = combine_tool_id(call_id, item_id);
+        let second = combine_tool_id(call_id, item_id);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn combine_tool_id_leaves_an_item_id_at_exactly_the_length_cap_unhashed() {
+        let item_id = "x".repeat(MAX_ITEM_ID_LEN);
+        let combined = combine_tool_id("call_1", &item_id);
+        let (_call_id, split_item_id) = split_tool_id(&combined);
+        assert_eq!(split_item_id.as_deref(), Some(item_id.as_str()));
+    }
+
+    #[test]
+    fn combine_tool_id_hashes_an_item_id_one_over_the_length_cap() {
+        let item_id = "x".repeat(MAX_ITEM_ID_LEN + 1);
+        let combined = combine_tool_id("call_1", &item_id);
+        let (_call_id, split_item_id) = split_tool_id(&combined);
+        let hashed = split_item_id.unwrap();
+        assert_ne!(hashed.as_ref(), item_id);
+        assert!(hashed.starts_with("fc_"));
+        assert!(hashed.len() <= MAX_ITEM_ID_LEN);
     }
 }

@@ -4,6 +4,7 @@
 //! counters. It's `serde`-serializable so a headless run (`serve`) can persist it and a client can
 //! reattach to a running session later — the foundation for the attach-later remote-control model.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -56,6 +57,16 @@ pub struct Session {
     /// compaction trigger isn't comparing the window against a stale, undercounted size.
     #[serde(default)]
     pub last_usage_message_count: usize,
+    /// Output tokens the provider reported for the turn `last_usage_message_count` was snapshotted at
+    /// — i.e. the exact size of `messages[last_usage_message_count]` (that turn's own assistant
+    /// message), once appended. `compaction::trailing_tokens` uses this in place of its usual char/4
+    /// estimate for that one message specifically: it's the one message in the trailing window whose
+    /// real size is already known exactly, from the provider's own usage report, rather than needing
+    /// the heuristic every other trailing message must fall back on. Without this, the just-completed
+    /// turn's own output was still *counted* (the heuristic estimates it too, just less precisely) —
+    /// this is a precision fix for the proactive trigger's timing, not a data-loss one.
+    #[serde(default)]
+    pub last_output_tokens: u32,
     /// What compaction has recorded about this session so far — folded forward across every round
     /// (see [`CompactionProvenance`]), since `apply_summary` physically replaces the summarized
     /// messages and anything not captured here is lost with them. Default (all-empty, `compactions:
@@ -100,6 +111,26 @@ impl Session {
         self
     }
 
+    /// Remove the trailing message if (and only if) it's a synthetic [`Message::error`] record —
+    /// called by a whole-run auto-retry layer right before re-invoking the same run on the same
+    /// session. `run_events_steered` persists this record on every `Err`-ending run (so a client's own
+    /// retry via a fresh `prompt` never stacks a second consecutive `user` turn on a truly abandoned
+    /// run), but an *automatic* retry re-runs the exact same attempt from scratch — it must be
+    /// genuinely invisible in the session's history, "no trace of the failed attempt in loop-visible
+    /// state" (mirroring how `agent_core`'s own mid-stream retry layer, one level down, never persists
+    /// anything for a failed attempt in the first place). Leaving the record in place here would let
+    /// the retry's own real response land right after it, producing two consecutive assistant turns —
+    /// or, on final exhaustion, a spurious extra history entry no client asked for.
+    pub fn pop_error_record(&mut self) {
+        if self
+            .messages
+            .last()
+            .is_some_and(|m| m.error_message.is_some())
+        {
+            Arc::make_mut(&mut self.messages).pop();
+        }
+    }
+
     /// Scrub state that doesn't survive a model switch, ahead of resuming the conversation on
     /// `new_model`. Two things are per-producing-model, not portable:
     ///
@@ -113,7 +144,9 @@ impl Session {
     ///   not downgraded into a useless empty `Text` block.
     /// - Combined OpenAI-Responses tool-call ids (`"call_id|item_id"`) — the `item_id` half only pairs
     ///   with a `reasoning` item on the *same* model/dialect; replayed to a foreign model it's at best
-    ///   dead weight, at worst rejected.
+    ///   dead weight, at worst rejected. Truncating a `ToolUse.id` this way would silently break its
+    ///   pairing with the matching `ToolResult.tool_use_id` — possibly in a later message — so every
+    ///   rewrite is recorded and replayed onto the paired `ToolResult` in a second pass below.
     ///
     /// Applied per-message, gated on `Message::model_id`: a message stamped with `new_model` itself is
     /// untouched (still valid to replay), everything else — including any message with `model_id: None`
@@ -122,6 +155,10 @@ impl Session {
     /// ids (never contain `|`), so this is safe to run unconditionally regardless of dialect.
     pub fn scrub_cross_model_state(&mut self, new_model: &str) {
         let messages = Arc::make_mut(&mut self.messages);
+
+        // First pass: downgrade/drop thinking blocks and truncate foreign-model tool-call ids,
+        // recording old -> new id for every `ToolUse` rewrite.
+        let mut id_remap: HashMap<String, String> = HashMap::new();
         for message in messages.iter_mut() {
             if message.model_id.as_deref() == Some(new_model) {
                 continue;
@@ -134,11 +171,31 @@ impl Session {
                 }
                 ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => false,
                 ContentBlock::ToolUse { id, .. } => {
-                    *id = crate::dialect::openai_responses::call_id_only(id);
+                    let new_id = crate::dialect::openai_responses::call_id_only(id);
+                    if new_id != *id {
+                        id_remap.insert(std::mem::replace(id, new_id.clone()), new_id);
+                    }
                     true
                 }
                 _ => true,
             });
+        }
+
+        // Second pass: replay each rewrite onto its paired `ToolResult` — which may live in a later
+        // message, so it's out of scope in the loop above. `ToolResult` blocks live on `User`
+        // messages, which never carry a `model_id` (see `Message::model_id`), so there's no
+        // same-model shortcut to take here: any match against the remap is by definition a pairing
+        // that must follow its `ToolUse` to stay intact, regardless of which message it's on.
+        if !id_remap.is_empty() {
+            for message in messages.iter_mut() {
+                for block in &mut message.content {
+                    if let ContentBlock::ToolResult { tool_use_id, .. } = block {
+                        if let Some(new_id) = id_remap.get(tool_use_id) {
+                            new_id.clone_into(tool_use_id);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -156,11 +213,25 @@ impl Session {
         // not `+`: these three fields come straight from parsed model-API usage data with no
         // upper-bound validation (a non-standard proxy could report anomalously large values), and
         // `overflow-checks = true` in the release profile turns a raw `u32` overflow into a panic.
-        self.last_input_tokens = usage
+        let live_input = usage
             .input_tokens
             .saturating_add(usage.cache_read_tokens)
             .saturating_add(usage.cache_write_tokens);
-        self.last_usage_message_count = self.messages.len();
+        // A genuinely all-zero report means no real `Usage` event ever arrived this turn (the loop's
+        // `Aborted`-turn path calls this unconditionally, before checking `stop_reason`, and a stream
+        // cancelled before its `Usage` event carries `TokenUsage::default()`) — not a provider telling
+        // us the live context just became empty. Holding the last real snapshot instead of zeroing it
+        // out keeps `get_state`'s `context_usage` (and the compaction trigger) reporting the session's
+        // actual last-known size through an aborted turn, rather than spuriously reporting "no context
+        // at all" the instant a client cancels mid-stream. A message pushed since the last real
+        // snapshot (including the very turn this call is for) is still accounted for — just via
+        // `compaction::trailing_tokens`'s char/4 estimate instead of this exact figure, the same
+        // fallback every message ahead of `last_usage_message_count` already uses.
+        if live_input > 0 {
+            self.last_input_tokens = live_input;
+            self.last_usage_message_count = self.messages.len();
+            self.last_output_tokens = usage.output_tokens;
+        }
     }
 }
 
@@ -254,11 +325,11 @@ mod tests {
     fn scrub_cross_model_state_truncates_combined_tool_call_ids_from_a_foreign_model() {
         let mut s = Session::new();
         s.push(
-            Message::assistant(vec![ContentBlock::ToolUse {
-                id: "call_1|fc_1".into(),
-                name: "read".into(),
-                input: serde_json::json!({}),
-            }])
+            Message::assistant(vec![ContentBlock::tool_use(
+                "call_1|fc_1",
+                "read",
+                serde_json::json!({}),
+            )])
             .with_model_id("gpt-5"),
         );
         s.scrub_cross_model_state("claude-opus-4-8");
@@ -266,6 +337,48 @@ mod tests {
             panic!("expected a ToolUse block");
         };
         assert_eq!(id, "call_1");
+    }
+
+    #[test]
+    fn scrub_cross_model_state_keeps_a_tool_use_and_its_later_tool_result_paired() {
+        // Realistic multi-message shape: the ToolUse lives on the assistant turn that requested it,
+        // its ToolResult on a later user turn (with unrelated turns in between) — truncating the
+        // combined id on one side without the other would leave the pairing broken.
+        let mut s = Session::new();
+        s.push(
+            Message::assistant(vec![ContentBlock::tool_use(
+                "call_1|fc_1",
+                "read",
+                serde_json::json!({}),
+            )])
+            .with_model_id("gpt-5"),
+        );
+        s.push(
+            Message::assistant(vec![ContentBlock::text("still working...")]).with_model_id("gpt-5"),
+        );
+        s.push(Message::tool_result("call_1|fc_1", "file contents", false));
+
+        s.scrub_cross_model_state("claude-opus-4-8");
+
+        let ContentBlock::ToolUse {
+            id: tool_use_id, ..
+        } = &s.messages[0].content[0]
+        else {
+            panic!("expected a ToolUse block");
+        };
+        let ContentBlock::ToolResult {
+            tool_use_id: result_id,
+            ..
+        } = &s.messages[2].content[0]
+        else {
+            panic!("expected a ToolResult block");
+        };
+        assert_eq!(tool_use_id, "call_1");
+        assert_eq!(result_id, "call_1");
+        assert_eq!(
+            tool_use_id, result_id,
+            "ToolUse/ToolResult pairing must survive the scrub"
+        );
     }
 
     #[test]
@@ -298,6 +411,9 @@ mod tests {
         assert_eq!(back.reasoning_tokens, 4);
         // Live context size = last turn's input + cache read + cache write (3 + 200 + 0).
         assert_eq!(back.last_input_tokens, 203);
+        // The second (most recent) call's own reported output size, for `trailing_tokens` to use in
+        // place of a rough estimate for that turn's assistant message.
+        assert_eq!(back.last_output_tokens, 7);
     }
 
     #[test]
@@ -313,5 +429,35 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(s.last_input_tokens, u32::MAX);
+    }
+
+    #[test]
+    fn record_usage_holds_the_last_real_snapshot_through_a_genuinely_zero_usage_turn() {
+        // pi-parity fix: a stream cancelled before its `Usage` event ever arrives (`Agent`'s `Aborted`
+        // turn path) calls `record_usage(TokenUsage::default())` unconditionally — previously this
+        // zeroed `last_input_tokens`, making `get_state`'s `context_usage` (and the compaction trigger)
+        // report "no context at all" the instant a client cancelled mid-stream, even with a real,
+        // sizable prior conversation still live in the session.
+        let mut s = Session::new();
+        s.record_usage(TokenUsage {
+            input_tokens: 5_000,
+            cache_read_tokens: 200,
+            ..Default::default()
+        });
+        assert_eq!(s.last_input_tokens, 5_200);
+        let count_before = s.last_usage_message_count;
+
+        s.push(Message::assistant(vec![ContentBlock::text("")]));
+        s.record_usage(TokenUsage::default());
+
+        assert_eq!(
+            s.last_input_tokens, 5_200,
+            "a zero-usage report must not overwrite the last real live-context snapshot"
+        );
+        assert_eq!(
+            s.last_usage_message_count, count_before,
+            "the snapshot's message-count boundary must also hold, not silently advance past the \
+             unaccounted-for message that triggered this call"
+        );
     }
 }

@@ -55,12 +55,16 @@ pub fn search(job: &FindJob) -> (Vec<PathBuf>, bool) {
     // `hidden(false)` includes dotfiles (like ripgrep --hidden); .gitignore is respected by default.
     // `require_git(false)` keeps that respect even outside an actual git repository (e.g. a plain
     // checkout with no `.git`, or a tree copied without its VCS metadata) — the ignore crate's default
-    // otherwise silently stops honoring `.gitignore` the moment there's no repo to find.
-    for entry in WalkBuilder::new(&job.root)
-        .hidden(false)
-        .require_git(false)
-        .build()
-    {
+    // otherwise silently stops honoring `.gitignore` the moment there's no repo to find. Only applied
+    // outside a real repo, though — matching pi's own `fd` invocation (`--no-require-git` only when the
+    // root isn't inside a git repo): inside one, the default git-aware walk keeps a nested repo's own
+    // `.gitignore` from leaking parent rules across its boundary.
+    let mut builder = WalkBuilder::new(&job.root);
+    builder.hidden(false);
+    if !super::root_is_inside_git_repo(&job.root) {
+        builder.require_git(false);
+    }
+    for entry in builder.build() {
         if paths.len() >= HARD_CAP {
             break;
         }
@@ -331,6 +335,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gitignore_is_still_honored_inside_a_real_git_repository() {
+        // pi-parity fix (L7): `require_git(false)` is now conditional on the search root *not* being
+        // inside a real git repo (matching pi's own `fd --no-require-git` scoping) — this guards
+        // against the conditional accidentally breaking the far more common case, a search root that
+        // *is* inside a real repo, which must still honor `.gitignore` exactly as before.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "ignored.rs\n").unwrap();
+        std::fs::write(dir.path().join("ignored.rs"), "").unwrap();
+        std::fs::write(dir.path().join("kept.rs"), "").unwrap();
+        let out = Find
+            .run(json!({ "pattern": "*.rs", "path": dir.path().to_str().unwrap() }))
+            .await
+            .unwrap()
+            .text;
+        assert!(out.contains("kept.rs"), "got: {out}");
+        assert!(
+            !out.contains("ignored.rs"),
+            ".gitignore must still be honored inside a real git repository: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dotfiles_are_included_by_default() {
+        // pi: tools.test.ts, "should include hidden files that are not gitignored". `hidden(false)`
+        // (see `search`'s doc comment, just above) is the only thing standing between this and a
+        // dotfile silently vanishing from every `find` result by default, the way it would under
+        // `ignore`'s (and ripgrep's) own default — pin it with a real dotfile, not just the doc comment.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".secret")).unwrap();
+        std::fs::write(dir.path().join(".secret/hidden.txt"), "hidden").unwrap();
+        std::fs::write(dir.path().join("visible.txt"), "visible").unwrap();
+
+        let out = Find
+            .run(json!({ "pattern": "**/*.txt", "path": dir.path().to_str().unwrap() }))
+            .await
+            .unwrap()
+            .text;
+        let lines: Vec<&str> = out
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert!(lines.contains(&"visible.txt"), "got: {out}");
+        assert!(lines.contains(&".secret/hidden.txt"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn regression_3303_a_nested_gitignore_only_scopes_its_own_subtree_flat_siblings() {
+        // Regression for pi's #3303: the prior fd-backed implementation collected every `.gitignore`
+        // under the search path and passed them to fd via a single `--ignore-file` list, which fd
+        // treats as one *global* ignore source — so `a/.gitignore`'s rules leaked into sibling `b/`.
+        // Ours never collected `.gitignore` files by hand at all (`WalkBuilder` walks and applies each
+        // one in its own scope natively, see `search`'s doc comment on `require_git(false)`), so this
+        // is expected to already hold; proving it, not fixing a suspected bug here.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::create_dir_all(dir.path().join("b")).unwrap();
+        std::fs::write(dir.path().join("a/.gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(dir.path().join("a/ignored.txt"), "").unwrap();
+        std::fs::write(dir.path().join("a/kept.txt"), "").unwrap();
+        std::fs::write(dir.path().join("b/ignored.txt"), "").unwrap();
+        std::fs::write(dir.path().join("b/kept.txt"), "").unwrap();
+        std::fs::write(dir.path().join("root.txt"), "").unwrap();
+
+        let out = Find
+            .run(json!({ "pattern": "**/*.txt", "path": dir.path().to_str().unwrap() }))
+            .await
+            .unwrap()
+            .text;
+        let mut lines: Vec<&str> = out
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        lines.sort_unstable();
+        assert_eq!(
+            lines,
+            vec!["a/kept.txt", "b/ignored.txt", "b/kept.txt", "root.txt"],
+            "got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn regression_3303_each_nested_gitignore_scopes_only_its_own_subtree() {
+        // The deeper case from the same pi regression: `a/.gitignore` ignores `ignored.txt` within
+        // both `a/` and `a/deep/` (rules apply to the whole subtree rooted where the file lives), while
+        // `a/deep/.gitignore`'s *additional* `secret.txt` rule applies only within `a/deep/` — and `b/`
+        // is untouched by either.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a/deep")).unwrap();
+        std::fs::create_dir_all(dir.path().join("b")).unwrap();
+        std::fs::write(dir.path().join("a/.gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(dir.path().join("a/deep/.gitignore"), "secret.txt\n").unwrap();
+        std::fs::write(dir.path().join("a/ignored.txt"), "").unwrap();
+        std::fs::write(dir.path().join("a/kept.txt"), "").unwrap();
+        std::fs::write(dir.path().join("a/deep/ignored.txt"), "").unwrap();
+        std::fs::write(dir.path().join("a/deep/secret.txt"), "").unwrap();
+        std::fs::write(dir.path().join("a/deep/kept.txt"), "").unwrap();
+        std::fs::write(dir.path().join("b/ignored.txt"), "").unwrap();
+        std::fs::write(dir.path().join("b/kept.txt"), "").unwrap();
+        std::fs::write(dir.path().join("root.txt"), "").unwrap();
+
+        let out = Find
+            .run(json!({ "pattern": "**/*.txt", "path": dir.path().to_str().unwrap() }))
+            .await
+            .unwrap()
+            .text;
+        let mut lines: Vec<&str> = out
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        lines.sort_unstable();
+        assert_eq!(
+            lines,
+            vec![
+                "a/deep/kept.txt",
+                "a/kept.txt",
+                "b/ignored.txt",
+                "b/kept.txt",
+                "root.txt"
+            ],
+            "got: {out}"
+        );
+    }
+
+    #[tokio::test]
     async fn output_byte_cap_truncates_even_under_the_result_limit() {
         // 300 long-named matches: well under the 1000-result default `limit` (so the result-count
         // marker never fires), but the aggregate listing of paths still blows past the 50KB output
@@ -359,6 +491,76 @@ mod tests {
             !out.contains("result limit"),
             "result-count marker must not co-fire when count never exceeded the limit"
         );
+    }
+
+    /// The tree pi's own regression fixture (`3302-find-path-glob.test.ts`) builds: a `some/parent/
+    /// child/` subtree with two files, and a separate `src/foo/bar/` subtree with one `.spec.ts` file.
+    fn regression_3302_tree() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("some/parent/child")).unwrap();
+        std::fs::create_dir_all(dir.path().join("src/foo/bar")).unwrap();
+        std::fs::write(dir.path().join("some/parent/child/file.ext"), "").unwrap();
+        std::fs::write(dir.path().join("some/parent/child/test.spec.ts"), "").unwrap();
+        std::fs::write(dir.path().join("src/foo/bar/example.spec.ts"), "").unwrap();
+        dir
+    }
+
+    // pi issue #3302: `find` advertises path-glob patterns like `src/**/*.spec.ts`, but the original
+    // fd-backed implementation matched only against the basename whenever the pattern contained a `/`,
+    // so every one of the four scenarios below silently returned no matches. Ours never shelled out to
+    // fd (see the module doc comment), but the same anchoring bug class — a `/`-containing pattern not
+    // actually being matched against the full path — is exactly what `basename_only`/the `**/` prefix
+    // in `Find::run` (just above `search`) exists to avoid; this pins pi's own regression cases against
+    // it directly, not just against the general "matches nested paths" happy path already covered above.
+
+    #[tokio::test]
+    async fn regression_3302_basename_pattern_still_matches() {
+        // "regression-safe": a `/`-free pattern must keep matching by basename exactly as before, even
+        // once path-glob support (below) is layered on top of it.
+        let dir = regression_3302_tree();
+        let out = Find
+            .run(json!({ "pattern": "*.spec.ts", "path": dir.path().to_str().unwrap() }))
+            .await
+            .unwrap()
+            .text;
+        assert!(out.contains("some/parent/child/test.spec.ts"), "got: {out}");
+        assert!(out.contains("src/foo/bar/example.spec.ts"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn regression_3302_directory_prefixed_pattern_with_trailing_double_star_matches_the_subtree()
+     {
+        let dir = regression_3302_tree();
+        let out = Find
+            .run(json!({ "pattern": "some/parent/child/**", "path": dir.path().to_str().unwrap() }))
+            .await
+            .unwrap()
+            .text;
+        assert!(out.contains("some/parent/child/file.ext"), "got: {out}");
+        assert!(out.contains("some/parent/child/test.spec.ts"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn regression_3302_leading_double_star_wildcard_with_path_segments_matches() {
+        let dir = regression_3302_tree();
+        let out = Find
+            .run(json!({ "pattern": "**/parent/child/*", "path": dir.path().to_str().unwrap() }))
+            .await
+            .unwrap()
+            .text;
+        assert!(out.contains("some/parent/child/file.ext"), "got: {out}");
+        assert!(out.contains("some/parent/child/test.spec.ts"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn regression_3302_nested_src_glob_matches_the_nested_spec_file() {
+        let dir = regression_3302_tree();
+        let out = Find
+            .run(json!({ "pattern": "src/**/*.spec.ts", "path": dir.path().to_str().unwrap() }))
+            .await
+            .unwrap()
+            .text;
+        assert_eq!(out.trim_end(), "src/foo/bar/example.spec.ts", "got: {out}");
     }
 
     #[tokio::test]
