@@ -456,8 +456,10 @@ fn convert_to_png(bytes: &[u8], format: image::ImageFormat) -> Option<Vec<u8>> {
 /// the multimodal model can actually see it. `ext_format` is only the fallback used when magic-byte
 /// sniffing can't identify the real format (a truncated or corrupt header); the sniffed format is
 /// preferred whenever it succeeds. An image that already fits [`MAX_IMAGE_BASE64_BYTES`] is sent as its
-/// original bytes, unmodified; an oversized one is downscaled/re-encoded by [`resize_image`], and only
-/// refused outright if even that can't fit the budget.
+/// original bytes, unmodified; an oversized one is downscaled/re-encoded by [`resize_image`]. If even
+/// that can't fit the budget, or a BMP fails to convert to a supported format, this returns `Ok` with a
+/// text-only "[Image omitted: …]" result rather than an `Err` — matching pi's `processImage`, which
+/// treats both as a normal (if disappointing) outcome for the model to see, not a failed tool call.
 fn read_image(path: &str, ext_format: image::ImageFormat) -> Result<ToolOutput, ToolError> {
     let bytes =
         std::fs::read(path).map_err(|e| ToolError::Execution(format!("read {path}: {e}")))?;
@@ -471,7 +473,16 @@ fn read_image(path: &str, ext_format: image::ImageFormat) -> Result<ToolOutput, 
     let (bytes, format) = if format == image::ImageFormat::Bmp {
         match convert_to_png(&bytes, format) {
             Some(png) => (png, image::ImageFormat::Png),
-            None => (bytes, format),
+            // pi: `image-process.ts`'s `processImage`, when `normalizeImage` fails — a text-only,
+            // *successful* result (`ok: false` with a message, not a thrown/rejected error), so the
+            // model sees an explanation rather than the tool call itself reading as failed. `read.ts`
+            // wraps that into a plain `tool_result` text block, no error, no image; mirrored here by
+            // returning `Ok` instead of `Err`.
+            None => {
+                return Ok(ToolOutput::text(
+                    "[Image omitted: could not be converted to a supported inline image format.]",
+                ));
+            }
         }
     } else {
         (bytes, format)
@@ -537,10 +548,13 @@ fn read_image(path: &str, ext_format: image::ImageFormat) -> Result<ToolOutput, 
                 ImageSource::base64(resized_media_type, resized.base64_data),
             ))
         }
-        None => Err(ToolError::InvalidInput(format!(
-            "image {path} is {} bytes and could not be downscaled to fit the inline size budget",
-            bytes.len()
-        ))),
+        // pi: `image-process.ts`'s `processImage`, when `resizeImage` returns `null` — same graceful,
+        // *successful* text-only result as the BMP-conversion-failure case above (`ok: false` with a
+        // message, not a thrown error): the model needs to know the image couldn't be inlined, but the
+        // tool call itself didn't fail.
+        None => Ok(ToolOutput::text(
+            "[Image omitted: could not be resized below the inline image size limit.]",
+        )),
     }
 }
 
@@ -1613,5 +1627,74 @@ mod tests {
         let resized = resize_image(&bytes, image::ImageFormat::Png, 300, 300, budget, 80)
             .expect("JPEG must still fit even where lossless PNG does not");
         assert_eq!(resized.media_type, "image/jpeg");
+    }
+
+    #[tokio::test]
+    async fn read_returns_a_graceful_text_result_not_an_error_when_resize_image_cannot_fit_it() {
+        // pi: `image-process.ts`'s `processImage`, when `resizeImage` returns `null` — a *successful*,
+        // text-only result (`ok: false` with a message, not a thrown error), tested explicitly at
+        // `image-resize-callers.test.ts:32-52` (asserts `result.content` is text-only, contains "Image
+        // omitted", and the call resolves rather than rejecting/erroring). `resize_image_returns_none_
+        // when_the_budget_is_unreachable` above only pins the low-level helper directly with an injected
+        // 1-byte budget; this goes one level up and exercises the real path a model actually calls
+        // (`Read::run` -> `read_image` -> `resize_image`, with the tool's real, un-injectable budget and
+        // dimension constants), asserting `Ok`, not `Err`.
+        //
+        // The production budget (4.5MB base64) can never be genuinely unreachable for a *real* photo —
+        // even worst-case incompressible noise shrinks to a few KB at the retry loop's 64x64 floor — so
+        // there's no way to construct a real image too big to ever fit. Instead this forces the same
+        // `None` outcome `resize_image` returns for *any* internal failure, budget or otherwise: a file
+        // comfortably past the byte-size gate (so `read_image`'s small-file fast-path validation, which
+        // returns a different, legitimate hard `Err` — see `a_small_file_with_valid_magic_bytes_but_no_
+        // real_image_body_is_rejected` above — never runs) carrying a valid PNG signature but a chunk
+        // stream that can't actually decode. That reaches the exact `None` branch inside `read_image`
+        // this test pins, indistinguishable from the caller's side from a real too-big-to-shrink image.
+        let mut bytes = png_signature();
+        // Comfortably past MAX_IMAGE_BASE64_BYTES once base64-encoded, so the small-file fast path is
+        // skipped and this falls through to `resize_image` unvalidated.
+        bytes.extend(vec![0u8; 4 * 1024 * 1024]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized_corrupt.png");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let out = Read
+            .run(json!({ "path": path.to_str().unwrap() }))
+            .await
+            .expect("resize_image returning None must not surface as a tool Err");
+        assert!(
+            out.images.is_empty(),
+            "no image attachment when it could not be resized to fit"
+        );
+        assert_eq!(
+            out.text,
+            "[Image omitted: could not be resized below the inline image size limit.]"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_returns_a_graceful_text_result_not_an_error_when_bmp_conversion_fails() {
+        // Same graceful-outcome pattern as the resize-failure case above, for the other `read_image`
+        // failure mode pi handles identically: BMP-to-PNG normalization failing. pi's `image-process.ts`
+        // returns `{ ok: false, message: "[Image omitted: could not be converted to a supported inline
+        // image format.]" }` rather than throwing; mirrored here as `Ok` text, not `Err`.
+        //
+        // BMP's magic signature is just the 2 ASCII bytes "BM" (`image::guess_format`'s own MAGIC_BYTES
+        // table has an empty mask for it), so a file starting with "BM" but with no valid BMP header
+        // after it sniffs as BMP — routing into image handling — while still failing to actually decode.
+        let mut bytes = b"BM".to_vec();
+        bytes.extend(vec![0u8; 16]); // nowhere near a real 14+40-byte BMP file+DIB header
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt.bmp");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let out = Read
+            .run(json!({ "path": path.to_str().unwrap() }))
+            .await
+            .expect("a BMP that fails to convert to PNG must not surface as a tool Err");
+        assert!(out.images.is_empty());
+        assert_eq!(
+            out.text,
+            "[Image omitted: could not be converted to a supported inline image format.]"
+        );
     }
 }

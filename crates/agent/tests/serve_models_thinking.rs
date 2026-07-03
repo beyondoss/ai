@@ -455,16 +455,18 @@ fn serve_cycle_thinking_level_advances_through_the_ladder_and_wraps() {
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
-    // Starting Off, each cycle advances one rung on the portable Off/Minimal/Low/Medium/High/XHigh
-    // ladder, wrapping back to Off. `claude-test` (this test's model) resolves to `ThinkingShape::Budget`
-    // with a 32_000 max_output, so `reasoning_effort` stays null throughout (that dialect arm never
-    // reads it) and `thinking` is the level's derived, clamped budget.
+    // Starting Off, each cycle advances one rung on the portable Off/Minimal/Low/Medium/High ladder,
+    // wrapping back to Off. `claude-test` (this test's model) resolves to `ThinkingShape::Budget` with
+    // a 32_000 max_output, so `reasoning_effort` stays null throughout (that dialect arm never reads
+    // it) and `thinking` is the level's derived, clamped budget. No `XHigh` rung: pi's
+    // `thinkingLevelMap` only offers `xhigh` on the four gen6+ Adaptive-shape model ids, not the
+    // generic Budget-shape branch `claude-test` falls into (see `models.rs`'s
+    // `supports_xhigh_reasoning`).
     let expected = [
         ("minimal", json!(1024)),
         ("low", json!(2048)),
         ("medium", json!(8192)),
         ("high", json!(24000)),
-        ("xhigh", json!(31999)),
         ("off", Value::Null),
     ];
     for (level, thinking) in expected {
@@ -506,12 +508,13 @@ fn serve_set_reasoning_effort_sets_the_portable_level_directly() {
     assert_eq!(data["level"], "high");
     assert_eq!(data["thinking"], 24000);
 
-    // A subsequent cycle starts from "high", advancing to "xhigh" — proving `set_reasoning_effort`
-    // really did move `current_level`, not just a one-off override.
+    // A subsequent cycle starts from "high" — the top rung `claude-test` (Budget-shape) supports, no
+    // `xhigh` — wrapping back to "off", proving `set_reasoning_effort` really did move
+    // `current_level`, not just a one-off override.
     writeln!(stdin, "{}", json!({ "type": "cycle_thinking_level" })).unwrap();
     stdin.flush().unwrap();
     let frames = read_until_response(&mut stdout, "cycle_thinking_level");
-    assert_eq!(frames.last().unwrap()["data"]["level"], "xhigh");
+    assert_eq!(frames.last().unwrap()["data"]["level"], "off");
 
     // `null` clears it back to off.
     writeln!(

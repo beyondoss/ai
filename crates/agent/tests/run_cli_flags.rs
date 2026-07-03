@@ -118,6 +118,38 @@ fn run_binary_help_flag_prints_usage_to_stdout_with_empty_stderr() {
 }
 
 #[test]
+fn run_binary_json_help_flag_routes_usage_to_stderr_with_empty_stdout() {
+    // F-L3 (pi: stdout-cleanliness.test.ts "keeps stdout empty for --mode json --help ..." / "keeps
+    // stdout empty for -p --help ..."): unlike plain `run --help` above, `--json` marks `run`'s stdout
+    // as the NDJSON `AgentEvent` stream (see `main.rs`'s `run_turn_once`) — the same one-frame-per-line
+    // invariant `serve`'s NDJSON protocol depends on. clap's own `--help` short-circuit runs before any
+    // application code, so it can't consult that fact on its own; `main.rs`'s `cli()` helper scans argv
+    // for `run` + `--json` + a help flag and redirects clap's rendered help to stderr instead of
+    // stdout when it does. No `--gateway-url`/`--key` needed: clap's help short-circuit fires before
+    // any of that is ever read.
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args(["run", "--json", "--help"])
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        b"",
+        "stdout must stay empty when --json --help combine: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Usage:"), "stderr: {stderr}");
+}
+
+#[test]
 fn export_subcommand_renders_an_existing_session_file_with_no_gateway_or_key() {
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl");

@@ -107,6 +107,14 @@ impl ModelTransport for GatewayClient {
         {
             req.messages = repaired.into();
         }
+        // Every dialect rejects a message with empty/whitespace-only content and no tool calls —
+        // reachable via `Message::error()`'s closing record, an immediate-abort turn, or cross-model
+        // scrubbing. Fix the wire shape, not the persisted session (see the doc comment).
+        if let std::borrow::Cow::Owned(fixed) =
+            crate::dialect::ensure_non_empty_content(&req.messages)
+        {
+            req.messages = fixed.into();
+        }
         let dialect = Dialect::for_model(&req.model);
         let url = format!("{}{}", self.base_url, dialect.endpoint_path());
         let body = dialect.build_body(&req);

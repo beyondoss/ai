@@ -1137,8 +1137,39 @@ impl SessionStore {
                 folded_messages += 1;
             }
         }
+        // Everything on the active path past the fold point: the real kept messages (verbatim in
+        // `messages[1..]`) and any custom entry (Track C-M2) interleaved among them. The fold loop
+        // above only ever walks up to the fold boundary, so a custom entry positioned here was
+        // previously neither recorded as folded provenance nor carried into the new chain below — it
+        // just silently vanished. Carried forward instead, in its original relative position.
+        let kept_suffix_ids: Vec<String> = self.active[folded_ids.len()..].to_vec();
 
-        let mut new_nodes: Vec<(String, Node)> = Vec::with_capacity(messages.len());
+        // Resolve the model/thinking-level effective at the old tip being folded away, before it's
+        // gone. A change anchored exactly at the tip takes effect for whatever comes *next* (see
+        // `record_model_change`'s anchor semantics), so check that anchor first, then fall back to
+        // `change_at`'s ancestor walk (which deliberately excludes the query id's own anchor — the
+        // opposite of what's wanted here). The new active path built below starts a fresh, detached
+        // chain, so `path_from_root` from any of its ids can never reach back into `model_changes`/
+        // `level_changes` entries anchored on the now-folded chain — without re-anchoring the
+        // already-resolved value onto the new chain's `None` baseline (the same mechanism a change
+        // recorded before the session's very first message already uses), a model/thinking-level
+        // switch made before this compaction becomes permanently unrecoverable.
+        let old_tip = self.active.last().cloned();
+        let effective_model = old_tip.as_deref().and_then(|tip| {
+            self.model_changes
+                .get(&Some(tip.to_string()))
+                .cloned()
+                .or_else(|| change_at(&self.nodes, &self.model_changes, tip).map(str::to_string))
+        });
+        let effective_level = old_tip.as_deref().and_then(|tip| {
+            self.level_changes
+                .get(&Some(tip.to_string()))
+                .cloned()
+                .or_else(|| change_at(&self.nodes, &self.level_changes, tip).map(str::to_string))
+        });
+
+        let mut new_nodes: Vec<(String, Node)> =
+            Vec::with_capacity(messages.len() + kept_suffix_ids.len());
         // The new active path starts a fresh, detached chain (`parent: None`), exactly like a plain
         // `rewrite` — *not* chained onto the last folded message. `path_from_root` walks a tip's whole
         // parent chain to build the live session, so linking back into the folded prefix would just
@@ -1147,17 +1178,46 @@ impl SessionStore {
         // self-contained sub-chain, reachable by id and named in `folded_ids` below, structurally off
         // to the side, the same way an abandoned branch already is.
         let mut parent: Option<String> = None;
-        for m in messages {
+        let mut rest = messages.iter();
+        // First node: the summary itself — synthesized fresh by compaction, with no counterpart on
+        // `self.active` (it replaces the whole folded prefix, not any single node within it).
+        if let Some(summary) = rest.next() {
             let id = new_id();
             new_nodes.push((
                 id.clone(),
                 Node {
                     parent_id: parent.clone(),
-                    content: NodeContent::Message(m.clone()),
+                    content: NodeContent::Message(summary.clone()),
                     timestamp: now_secs(),
                 },
             ));
             parent = Some(id);
+        }
+        // The kept suffix: walk `self.active`'s own surviving ids in order, rather than `messages[1..]`
+        // alone, so a custom entry among them rides along in its original relative position instead of
+        // being silently dropped. A message-bearing id pulls the next verbatim `Message` (the two are
+        // in lockstep by construction — see this method's doc comment); a custom id clones its content
+        // unchanged.
+        for id in &kept_suffix_ids {
+            let content = match &self.nodes[id].content {
+                NodeContent::Message(_) => match rest.next() {
+                    Some(m) => NodeContent::Message(m.clone()),
+                    None => unreachable!(
+                        "kept_suffix_ids and messages[1..] must have the same message count"
+                    ),
+                },
+                custom @ NodeContent::Custom { .. } => custom.clone(),
+            };
+            let new_node_id = new_id();
+            new_nodes.push((
+                new_node_id.clone(),
+                Node {
+                    parent_id: parent.clone(),
+                    content,
+                    timestamp: now_secs(),
+                },
+            ));
+            parent = Some(new_node_id);
         }
         let new_active: Vec<String> = new_nodes.iter().map(|(id, _)| id.clone()).collect();
 
@@ -1186,23 +1246,57 @@ impl SessionStore {
         let mut buf = Vec::new();
         write_line(&mut buf, &Entry::Session(self.meta.clone()))?;
         write_line(&mut buf, &compaction_entry)?;
-        for (id, node) in &new_nodes {
+        // Re-anchor the resolved pre-compaction model/thinking-level onto the new chain's `None`
+        // baseline — see the resolution comment above. Only written when something was actually
+        // recorded on the folded chain (`record_model_change`'s own "call only when it actually
+        // changed" discipline), so a session that never changed either stays exactly as terse as
+        // before.
+        if let Some(model) = &effective_model {
             write_line(
                 &mut buf,
-                &Entry::Message {
-                    id: Some(id.clone()),
-                    parent_id: node.parent_id.clone(),
-                    timestamp: node.timestamp,
-                    // `new_nodes` is built just above from `messages: &[Message]` alone, so every entry
-                    // here is always `NodeContent::Message` — never a custom entry.
-                    message: match node.as_message() {
-                        Some(m) => m.clone(),
-                        None => unreachable!(
-                            "rewrite_compacted's own new_nodes only ever holds NodeContent::Message"
-                        ),
-                    },
+                &Entry::ModelChange {
+                    id: new_id(),
+                    parent_id: None,
+                    model: model.clone(),
                 },
             )?;
+        }
+        if let Some(level) = &effective_level {
+            write_line(
+                &mut buf,
+                &Entry::ThinkingLevelChange {
+                    id: new_id(),
+                    parent_id: None,
+                    level: level.clone(),
+                },
+            )?;
+        }
+        for (id, node) in &new_nodes {
+            // `new_nodes` can now hold either shape: a real message, or a custom entry (Track C-M2)
+            // carried forward from the kept suffix — round-tripped through its own original `Entry`
+            // variant, not unconditionally `Entry::Message`, mirroring `rewrite`'s own preserved-node
+            // handling.
+            match &node.content {
+                NodeContent::Message(m) => write_line(
+                    &mut buf,
+                    &Entry::Message {
+                        id: Some(id.clone()),
+                        parent_id: node.parent_id.clone(),
+                        timestamp: node.timestamp,
+                        message: m.clone(),
+                    },
+                )?,
+                NodeContent::Custom { kind, data } => write_line(
+                    &mut buf,
+                    &Entry::Custom {
+                        id: id.clone(),
+                        parent_id: node.parent_id.clone(),
+                        timestamp: node.timestamp,
+                        kind: kind.clone(),
+                        data: data.clone(),
+                    },
+                )?,
+            }
         }
         let mut f = OpenOptions::new().append(true).open(&self.path)?;
         f.write_all(&buf)?;
@@ -1214,6 +1308,12 @@ impl SessionStore {
         self.nodes.extend(new_nodes);
         self.active = new_active;
         self.persisted = messages.len();
+        if let Some(model) = effective_model {
+            self.model_changes.insert(None, model);
+        }
+        if let Some(level) = effective_level {
+            self.level_changes.insert(None, level);
+        }
         Ok(())
     }
 
@@ -5526,6 +5626,133 @@ mod tests {
             folded_ids.contains(&msg3_id),
             "folded_ids must list the third (last) folded message — this is exactly what a naive \
              positional slice would drop once a custom entry occupies a slot: {folded_ids:?}"
+        );
+    }
+
+    #[test]
+    fn rewrite_compacted_preserves_the_model_and_thinking_level_active_at_the_old_tip() {
+        // pi-parity gap (fixed): `rewrite_compacted`'s new active chain starts fully detached
+        // (`parent: None`), so `change_at`'s ancestor walk from any new-chain id could never reach a
+        // `model_changes`/`level_changes` entry anchored on the now-folded chain — a model/thinking-
+        // level switch made before a compaction became permanently unrecoverable. Fixed by resolving
+        // the effective value at the old tip and re-anchoring it onto the new chain's `None` baseline.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let id = store.meta().id.clone();
+        let mut session = Session::new();
+        session.user("one");
+        store.append_new(&session.messages).unwrap();
+        store.record_model_change("gpt-5").unwrap();
+        store.record_thinking_level_change("high").unwrap();
+        session.user("two");
+        session.user("three");
+        store.append_new(&session.messages).unwrap();
+
+        let old_tip = store.active_ids().last().unwrap().clone();
+        assert_eq!(store.model_at(&old_tip), Some("gpt-5"));
+        assert_eq!(store.thinking_level_at(&old_tip), Some("high"));
+
+        let compacted_messages = vec![Message::user(format!(
+            "{}\n\nrecap",
+            agent_core::compaction::SUMMARY_MARKER
+        ))];
+        store
+            .rewrite_compacted(&compacted_messages, CompactionMeta { tokens_before: 999 })
+            .unwrap();
+
+        let new_tip = store.active_ids().last().unwrap().clone();
+        assert_eq!(
+            store.model_at(&new_tip),
+            Some("gpt-5"),
+            "the model switch must survive the compaction, not vanish"
+        );
+        assert_eq!(
+            store.thinking_level_at(&new_tip),
+            Some("high"),
+            "the thinking-level switch must survive the compaction, not vanish"
+        );
+
+        // Must survive a reopen too — persisted to disk, not just patched into the live in-memory maps.
+        drop(store);
+        let (reopened, _restored) = repo.open_id(&id).unwrap();
+        let reopened_tip = reopened.active_ids().last().unwrap().clone();
+        assert_eq!(reopened.model_at(&reopened_tip), Some("gpt-5"));
+        assert_eq!(reopened.thinking_level_at(&reopened_tip), Some("high"));
+    }
+
+    #[test]
+    fn rewrite_compacted_carries_a_custom_entry_forward_when_it_sits_in_the_kept_suffix() {
+        // pi-parity gap (fixed): a *partial* compaction only folds the front of `self.active`; a
+        // custom entry (Track C-M2) sitting in the surviving *kept* suffix was previously neither
+        // recorded as folded provenance nor carried into the new chain (`new_nodes` was built solely
+        // from `messages: &[Message]`, which has no representation for a custom entry) — it just
+        // silently disappeared. This drives that exact shape: [msg1, msg2, custom, msg3, msg4]
+        // partially compacted (fold msg1+msg2 only) must keep the custom entry, in position, on the
+        // new active path.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("one");
+        session.user("two");
+        store.append_new(&session.messages).unwrap();
+        store.append_custom("marker", json!({"k": "v"})).unwrap();
+        session.user("three");
+        session.user("four");
+        store.append_new(&session.messages).unwrap();
+        assert_eq!(
+            store.active_ids().len(),
+            5,
+            "msg1, msg2, custom, msg3, msg4"
+        );
+
+        // Fold only msg1+msg2 away — msg3/msg4 (and the custom entry between them and the fold
+        // boundary) are the kept suffix.
+        let compacted_messages = vec![
+            Message::user(format!(
+                "{}\n\nrecap",
+                agent_core::compaction::SUMMARY_MARKER
+            )),
+            Message::user("three"),
+            Message::user("four"),
+        ];
+        store
+            .rewrite_compacted(&compacted_messages, CompactionMeta { tokens_before: 999 })
+            .unwrap();
+
+        let active_ids = store.active_ids().to_vec();
+        assert_eq!(
+            active_ids.len(),
+            4,
+            "summary, custom, msg3, msg4 — the custom entry must not vanish: {active_ids:?}"
+        );
+        let active: std::collections::HashSet<&str> =
+            active_ids.iter().map(String::as_str).collect();
+        let custom_survivors: Vec<TreeNode> = store
+            .tree()
+            .into_iter()
+            .filter(|n| active.contains(n.id.as_str()) && n.role.is_none())
+            .collect();
+        assert_eq!(
+            custom_survivors.len(),
+            1,
+            "exactly one custom node must be on the new active path: {active_ids:?}"
+        );
+        assert_eq!(
+            custom_survivors[0].preview.as_deref(),
+            Some("[custom: marker]")
+        );
+
+        // The materialized message content is unaffected (custom entries contribute nothing to
+        // `Session.messages`) — still exactly [summary, "three", "four"].
+        let (_repo2, session) = SessionStore::open(store.path.clone()).unwrap();
+        assert_eq!(session.messages.len(), 3);
+        assert!(
+            matches!(&session.messages[1].content[0], ContentBlock::Text { text, .. } if text == "three")
+        );
+        assert!(
+            matches!(&session.messages[2].content[0], ContentBlock::Text { text, .. } if text == "four")
         );
     }
 }

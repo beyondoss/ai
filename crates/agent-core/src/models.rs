@@ -257,9 +257,16 @@ pub fn capabilities(model: &str) -> ModelCaps {
             supports_eager_tool_streaming: true,
             api: ApiKind::ChatCompletions,
             // Budget-shape thinking sends a numeric `budget_tokens`, never a named effort string, so
-            // neither field below is ever read for this shape — left at their harmless defaults.
+            // `min_reasoning_effort`/`adaptive_xhigh_effort_wire` are never read for this shape — left
+            // at their harmless defaults. `supports_xhigh_reasoning` is *not* one of those unread
+            // fields, despite the shape never putting a named effort string on the wire: it's read
+            // shape-agnostically by `available_thinking_levels`/`clamp_reasoning_effort` to decide
+            // whether to offer/accept the `xhigh` *portable* thinking-level rung at all (which then
+            // maps to a numeric budget via `budget_for_effort`). pi's `thinkingLevelMap.xhigh` is only
+            // defined for the four gen6+ Adaptive-shape ids — none of these classic Budget-shape models
+            // (sonnet-4-5, opus-4-5, sonnet-3-7, haiku-4-5, opus-4-0/4-1, etc.) offer it.
             min_reasoning_effort: crate::transport::ReasoningEffort::Minimal,
-            supports_xhigh_reasoning: true,
+            supports_xhigh_reasoning: false,
             adaptive_xhigh_effort_wire: "xhigh",
         };
     }
@@ -1409,6 +1416,54 @@ mod tests {
         assert_eq!(
             available_thinking_levels(&capabilities("gpt-4o")),
             vec![ThinkingLevel::Off]
+        );
+    }
+
+    #[test]
+    fn budget_shape_models_do_not_offer_xhigh_but_adaptive_shape_gen6_plus_does() {
+        // Regression for the pi-parity gap: pi's `thinkingLevelMap.xhigh` is only defined for the four
+        // gen6+ Adaptive-shape ids — classic Budget-shape Claude models (sonnet-4-5, opus-4-5,
+        // sonnet-3-7, haiku-4-5, opus-4-0/4-1, etc.) must not advertise or accept the `xhigh` rung, even
+        // though `thinking_for_level`/`budget_for_effort` would happily turn it into a plain numeric
+        // `budget_tokens` value the Anthropic wire accepts fine — the bug is purely that we shouldn't
+        // *offer* it for these models in the first place.
+        for id in [
+            "claude-sonnet-4-5",
+            "claude-opus-4-5",
+            "claude-3-7-sonnet-20250219",
+            "claude-haiku-4-5",
+        ] {
+            let caps = capabilities(id);
+            assert_eq!(
+                caps.thinking,
+                ThinkingShape::Budget,
+                "{id} should be Budget-shape"
+            );
+            assert!(
+                !caps.supports_xhigh_reasoning,
+                "{id}: Budget-shape models must not support xhigh"
+            );
+            assert!(
+                !available_thinking_levels(&caps).contains(&ThinkingLevel::XHigh),
+                "{id}: xhigh must not be an available thinking level"
+            );
+            assert_eq!(
+                clamp_thinking_level(&caps, ThinkingLevel::XHigh),
+                ThinkingLevel::High,
+                "{id}: requesting xhigh must clamp down to high"
+            );
+        }
+
+        // Adaptive-shape gen6+ models are unaffected: xhigh is still offered where pi's catalogue
+        // actually maps it (opus-4-6/4-7/4-8, fable-5 — sonnet-4-6/sonnet-5 are the two adaptive
+        // exceptions covered by other tests in this module).
+        let caps = capabilities("claude-opus-4-8");
+        assert_eq!(caps.thinking, ThinkingShape::Adaptive);
+        assert!(caps.supports_xhigh_reasoning);
+        assert!(available_thinking_levels(&caps).contains(&ThinkingLevel::XHigh));
+        assert_eq!(
+            clamp_thinking_level(&caps, ThinkingLevel::XHigh),
+            ThinkingLevel::XHigh
         );
     }
 

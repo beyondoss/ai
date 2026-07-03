@@ -101,11 +101,16 @@ fn discover_with_diagnostics_impl(
         let expanded = crate::tools::expand_tilde(extra, home.as_deref().and_then(|p| p.to_str()));
         let root = PathBuf::from(expanded);
         if root.is_dir() {
-            extra_root_skills.push(discover_in(&root));
+            let (skills, diagnostics) = discover_in_with_diagnostics(&root);
+            collisions.extend(diagnostics);
+            extra_root_skills.push(skills);
         } else if root.extension().and_then(|e| e.to_str()) == Some("md") {
             // pi's other `--skill` shape: a single standalone `.md` file, one skill, no directory of
             // its own resources — `skills.ts`'s `stats.isFile() && resolvedPath.endsWith(".md")`.
-            match parse_skill(&root) {
+            // A discarded diagnostics sink: this call site already reports a `None` with its own,
+            // more specific "--skill file" framing below, so `parse_skill`'s own diagnostic (which
+            // would otherwise duplicate it) is intentionally not folded into `collisions`.
+            match parse_skill(&root, &mut Vec::new()) {
                 Some(skill) => extra_root_skills.push(vec![skill]),
                 None => {
                     let message = format!(
@@ -126,7 +131,9 @@ fn discover_with_diagnostics_impl(
     }
 
     for root in standard_roots {
-        for skill in discover_in(&root) {
+        let (skills, diagnostics) = discover_in_with_diagnostics(&root);
+        collisions.extend(diagnostics);
+        for skill in skills {
             // Later standard roots (project) win over earlier (user) on name collisions.
             if let Some(existing) = found.iter_mut().find(|s| s.name == skill.name) {
                 let message = format!(
@@ -190,13 +197,27 @@ fn discover_with_diagnostics_impl(
 /// shape, for something too small to need its own directory). Once a directory yields its `SKILL.md` we
 /// stop descending into it — the manifest defines that skill's root, and anything nested is that
 /// skill's own resources.
+///
+/// `#[cfg(test)]`: every non-test caller needs this root's diagnostics too (an unreadable manifest, a
+/// missing `description`, …), so production code goes through [`discover_in_with_diagnostics`] directly;
+/// this diagnostics-discarding convenience wrapper only still exists for tests that don't care about them.
+#[cfg(test)]
 fn discover_in(root: &Path) -> Vec<Skill> {
+    discover_in_with_diagnostics(root).0
+}
+
+/// Like [`discover_in`], but also returns any diagnostics collected while parsing this root's own
+/// manifests — an unreadable `SKILL.md`/loose-`.md` file, or one missing a usable `description` — so
+/// `discover_with_diagnostics_impl` can fold them into the diagnostics it already returns to a caller,
+/// rather than [`parse_skill`]'s failures being visible only via `tracing::warn!`.
+fn discover_in_with_diagnostics(root: &Path) -> (Vec<Skill>, Vec<String>) {
     let mut out = Vec::new();
-    walk(root, &mut out);
-    for skill in loose_root_skills(root) {
+    let mut diagnostics = Vec::new();
+    walk(root, &mut out, &mut diagnostics);
+    for skill in loose_root_skills(root, &mut diagnostics) {
         out.push(skill);
     }
-    out
+    (out, diagnostics)
 }
 
 /// Walk `root` for `SKILL.md` manifests, gitignore-aware — reuses the same `ignore` crate `grep`/`find`
@@ -211,7 +232,7 @@ fn discover_in(root: &Path) -> Vec<Skill> {
 /// can't trap the walk. `.gitignore`/`.ignore` are already honored by `WalkBuilder`'s own defaults;
 /// `.fdignore` is registered explicitly (`add_custom_ignore_filename`) to match pi's own
 /// `skills.ts::IGNORE_FILE_NAMES`, which lists all three.
-fn walk(root: &Path, out: &mut Vec<Skill>) {
+fn walk(root: &Path, out: &mut Vec<Skill>, diagnostics: &mut Vec<String>) {
     let mut candidates: Vec<PathBuf> = ignore::WalkBuilder::new(root)
         .max_depth(Some(MAX_DEPTH))
         .follow_links(true)
@@ -251,7 +272,7 @@ fn walk(root: &Path, out: &mut Vec<Skill>) {
         if accepted_dirs.iter().any(|a| dir.starts_with(a)) {
             continue;
         }
-        if let Some(skill) = parse_skill(&manifest) {
+        if let Some(skill) = parse_skill(&manifest, diagnostics) {
             out.push(skill);
         }
         accepted_dirs.push(dir.to_path_buf());
@@ -261,7 +282,7 @@ fn walk(root: &Path, out: &mut Vec<Skill>) {
 /// Loose `*.md` files directly under `root` (not `SKILL.md`, which [`walk`] already handles, and not
 /// nested in a subdirectory — only the root's immediate children) — pi's second skill shape, for one
 /// small enough not to need its own directory and resources.
-fn loose_root_skills(root: &Path) -> Vec<Skill> {
+fn loose_root_skills(root: &Path, diagnostics: &mut Vec<String>) -> Vec<Skill> {
     let Ok(entries) = fs::read_dir(root) else {
         return Vec::new();
     };
@@ -274,7 +295,7 @@ fn loose_root_skills(root: &Path) -> Vec<Skill> {
         if path.file_name().and_then(|n| n.to_str()) == Some("SKILL.md") {
             continue; // a bare root-level SKILL.md is `walk`'s concern, not a loose skill file
         }
-        if let Some(skill) = parse_skill(&path) {
+        if let Some(skill) = parse_skill(&path, diagnostics) {
             out.push(skill);
         }
     }
@@ -283,13 +304,38 @@ fn loose_root_skills(root: &Path) -> Vec<Skill> {
 
 /// Parse a `SKILL.md`'s frontmatter into a [`Skill`]. Requires a non-empty `description`; falls back to
 /// the directory name for `name` if the frontmatter omits it.
-fn parse_skill(manifest: &Path) -> Option<Skill> {
-    let text = fs::read_to_string(manifest).ok()?;
+///
+/// Both silent-drop paths — an unreadable manifest, and a missing/empty `description` — are reported
+/// through `diagnostics` (the same `Vec<String>` `discover_with_diagnostics` surfaces to a caller) and
+/// `tracing::warn!`-logged at the point of detection, matching every other malformed-skill case in this
+/// file: `validate_skill_name`/`validate_skill_description`'s issues below `warn!` even when the skill is
+/// still allowed to load, so a skill that fails to load at all must not produce *less* signal than one.
+fn parse_skill(manifest: &Path, diagnostics: &mut Vec<String>) -> Option<Skill> {
+    let text = match fs::read_to_string(manifest) {
+        Ok(text) => text,
+        Err(err) => {
+            let message = format!(
+                "failed to read skill manifest {}: {err}",
+                manifest.display()
+            );
+            tracing::warn!("{message}");
+            diagnostics.push(message);
+            return None;
+        }
+    };
     let (fm, _body) = parse_frontmatter(&text);
-    let description = fm
-        .get("description")
-        .filter(|d| !d.trim().is_empty())?
-        .clone();
+    let description = match fm.get("description") {
+        Some(d) if !d.trim().is_empty() => d.clone(),
+        _ => {
+            let message = format!(
+                "skill manifest {} has no usable frontmatter (needs a non-empty description)",
+                manifest.display()
+            );
+            tracing::warn!("{message}");
+            diagnostics.push(message);
+            return None;
+        }
+    };
     let name = fm.get("name").cloned().or_else(|| {
         manifest
             .parent()?
@@ -1034,6 +1080,78 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_skill(tmp.path(), "broken", "---\nname: broken\n---\n");
         assert!(discover_in(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn missing_description_is_diagnosed_not_silently_dropped() {
+        // Previously `fm.get("description").filter(...)?` returned `None` via the `?` operator with
+        // zero diagnostic signal — unlike every other malformed-skill case in this file (e.g.
+        // `validate_skill_name`'s issues, which `warn!` even when the skill is still allowed to load).
+        // A missing `description:` must now surface through both the `tracing::warn!` channel and the
+        // diagnostics `Vec<String>` `discover_with_diagnostics` returns to a caller.
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(tmp.path(), "broken", "---\nname: broken\n---\n");
+        let mut skills = Vec::new();
+        let mut diagnostics = Vec::new();
+        let capture = crate::tracing_test::capture(|| {
+            let (s, d) = discover_in_with_diagnostics(tmp.path());
+            skills = s;
+            diagnostics = d;
+        });
+        assert!(skills.is_empty(), "got: {skills:?}");
+        assert!(
+            diagnostics.iter().any(|d| d.contains("description")),
+            "got: {diagnostics:?}"
+        );
+        let messages = capture.messages();
+        assert!(
+            messages.iter().any(|m| m.contains("description")),
+            "got: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn empty_description_is_diagnosed_not_silently_dropped() {
+        // Same silent-drop path as `missing_description_is_diagnosed_not_silently_dropped`, but for a
+        // `description:` field present yet whitespace-only — the `.filter(|d| !d.trim().is_empty())`
+        // half of the same `?`-chain.
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(
+            tmp.path(),
+            "broken",
+            "---\nname: broken\ndescription: \"   \"\n---\n",
+        );
+        let (skills, diagnostics) = discover_in_with_diagnostics(tmp.path());
+        assert!(skills.is_empty(), "got: {skills:?}");
+        assert!(
+            diagnostics.iter().any(|d| d.contains("description")),
+            "got: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn unreadable_manifest_is_diagnosed_not_silently_dropped() {
+        // Previously `fs::read_to_string(manifest).ok()?` dropped a read failure (permissions, etc)
+        // the same silent way. `fs::read_to_string` fails identically for a permissions error and for
+        // a path that turns out to be a directory — exercising the latter keeps this test portable (no
+        // chmod/platform-specific permission dance) while still hitting the exact `Err` branch a real
+        // unreadable file would.
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("SKILL.md");
+        fs::create_dir_all(&manifest).unwrap();
+        let mut diagnostics = Vec::new();
+        let capture = crate::tracing_test::capture(|| {
+            assert!(parse_skill(&manifest, &mut diagnostics).is_none());
+        });
+        assert!(
+            diagnostics.iter().any(|d| d.contains("failed to read")),
+            "got: {diagnostics:?}"
+        );
+        let messages = capture.messages();
+        assert!(
+            messages.iter().any(|m| m.contains("failed to read")),
+            "got: {messages:?}"
+        );
     }
 
     #[test]

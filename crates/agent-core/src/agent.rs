@@ -1135,20 +1135,31 @@ impl Agent {
         else {
             return Ok(false);
         };
-        // Nothing new to fold in since the last compaction: on a clean boundary, `first_kept == 1`
-        // means the only thing before the cut is the previous round's own summary message
-        // (`apply_summary` always splices it in at index 0) — no new activity happened after it. This
-        // is the clean-boundary analog of the `turn_start == 1` reuse a few lines below for the
-        // split-turn case: re-summarizing here would spend a whole model call restating the same
-        // summary with an empty `<new-activity>` section, a real but narrow waste (repeated manual
-        // `compact` calls with nothing new in between are the main way this is reachable — an
+        // Nothing new worth folding in since the last compaction: on a clean boundary, once a prior
+        // summary occupies `messages[0]` (`apply_summary` always splices it in there), `find_cut`'s
+        // backward token walk over `messages[1..]` only ever lands on a real cut by hitting the
+        // `keep_recent_tokens` budget early; if that walk instead exhausts the whole suffix without
+        // ever reaching budget, everything since the last summary already fits under the recent-token
+        // window on its own — there's no old-enough content yet to be worth a fresh summarization
+        // call. This is the clean-boundary analog of the `turn_start == 1` reuse a few lines below for
+        // the split-turn case. Matches pi's own `prepareCompaction` skip condition ("should skip
+        // repeated compactions when kept messages still fit") — broader than just `first_kept == 1`
+        // (literally zero new messages): e.g. `[summary, user, assistant, user, assistant]` under the
+        // real default `keep_recent_tokens` lands `first_kept == 2`, which a narrower `== 1` check
+        // would miss even though nothing here is large enough to justify re-summarizing yet (repeated
+        // manual `compact` calls with little new in between are the main way this is reachable — an
         // *automatic* trigger can't, since `apply_summary` also resets `last_input_tokens` to 0 and
         // `should_compact` requires it to be positive to fire at all).
         if cut.turn_start.is_none()
-            && cut.first_kept == 1
             && compaction::previous_summary(&session.messages[..1]).is_some()
         {
-            return Ok(false);
+            let since_last_summary: u32 = session.messages[1..]
+                .iter()
+                .map(compaction::estimate_message_tokens)
+                .fold(0u32, |acc, n| acc.saturating_add(n));
+            if since_last_summary < self.compaction.keep_recent_tokens {
+                return Ok(false);
+            }
         }
         sink(AgentEvent::CompactionStart { reason });
         let first_kept = cut.first_kept;
@@ -5360,6 +5371,93 @@ mod tests {
             &session_messages,
             "the session must be left completely unchanged"
         );
+    }
+
+    #[tokio::test]
+    async fn compact_is_a_no_op_when_new_content_since_the_prior_summary_still_fits_the_budget() {
+        // Broader than the `first_kept == 1` test above (pi-parity gap, second pass): with the real
+        // default `keep_recent_tokens` (40k), `[summary, user, assistant, user, assistant]` lands
+        // `find_split_cut`'s `first_kept` at 2, not 1 — the old narrower guard only checked for
+        // exactly 1 and would have re-summarized here even though none of the new content is remotely
+        // close to the recent-token budget. Verified empirically before the fix: this exact fixture
+        // produced `first_kept == 2` and slipped past the guard.
+        let session_messages = vec![
+            Message::user(format!(
+                "{}\n\nprior summary body",
+                compaction::SUMMARY_MARKER
+            )),
+            Message::user("first question"),
+            Message::assistant(vec![ContentBlock::text("first reply")]),
+            Message::user("second question"),
+            Message::assistant(vec![ContentBlock::text("second reply")]),
+        ];
+        let mut session = Session::new();
+        session.messages = Arc::new(session_messages.clone());
+
+        // No turns scripted: any model call at all fails the test loudly.
+        let mock = Arc::new(MockTransport::new(vec![]));
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8"); // default keep_recent_tokens (40k)
+        let cancel = CancellationToken::new();
+        let compacted = agent
+            .compact(
+                &mut session,
+                CompactionReason::Manual,
+                &cancel,
+                &mut |_| {},
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(!compacted, "must report a no-op, not a real compaction");
+        assert_eq!(mock.calls(), 0, "must not make any model call at all");
+        assert_eq!(
+            session.messages.as_ref(),
+            &session_messages,
+            "the session must be left completely unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_still_fires_on_a_clean_boundary_once_new_content_exceeds_the_budget() {
+        // The other half of the fix: the broadened guard must not become a blanket "never
+        // re-compact" — once genuinely new, budget-sized content has accumulated since the prior
+        // summary, a fresh compaction must still proceed normally.
+        let session_messages = vec![
+            Message::user(format!(
+                "{}\n\nprior summary body",
+                compaction::SUMMARY_MARKER
+            )),
+            Message::user("a".repeat(400_000)), // ~100k estimated tokens, well over any tiny budget
+            Message::assistant(vec![ContentBlock::text("interim reply")]),
+            Message::user("second question"),
+            Message::assistant(vec![ContentBlock::text("reply")]),
+        ];
+        let mut session = Session::new();
+        session.messages = Arc::new(session_messages);
+
+        let mock = Arc::new(MockTransport::new(vec![turn::text("new summary")]));
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8").with_compaction(CompactionConfig {
+            keep_recent_tokens: 1,
+            ..CompactionConfig::default()
+        });
+        let cancel = CancellationToken::new();
+        let compacted = agent
+            .compact(
+                &mut session,
+                CompactionReason::Manual,
+                &cancel,
+                &mut |_| {},
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            compacted,
+            "genuinely new large content must still trigger compaction"
+        );
+        assert_eq!(mock.calls(), 1);
     }
 
     #[test]

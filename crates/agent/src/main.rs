@@ -494,6 +494,50 @@ enum Command {
     },
 }
 
+/// [`Cli::parse`], except a `--help`/`-h` triggered while `run --json` is also present renders to
+/// stderr and exits 0 instead of clap's own default of stdout — matching pi's own `--mode json
+/// --help`/`-p --help` behavior (`stdout-cleanliness.test.ts`). Plain `run --help` (no `--json`) and
+/// top-level `--help`/`--version` are untouched: clap's stdout default is correct there (nothing is
+/// consuming stdout as a data stream), and `run_binary_help_flag_prints_usage_to_stdout_with_empty_stderr`/
+/// `run_binary_version_flag_prints_only_the_version_to_stdout` already pin that down. `--json` marks
+/// `run`'s stdout as the NDJSON `AgentEvent` stream (see `run_turn_once`) — the same invariant
+/// `serve`'s `#![deny(clippy::print_stdout)]` protects for its own protocol — but clap's `--help`
+/// short-circuit fires from inside `Cli::parse()`, before any application code (and thus before that
+/// lint's module boundary) ever runs, so it can't be caught statically; this is the runtime backstop.
+///
+/// `Cli::parse()` can't tell us this itself: on `--help`, clap returns an error *before* the `run`
+/// subcommand's fields (including `json`) are ever populated, so there's no parsed `Cli::Run { json,
+/// .. }` to inspect. Scanning the raw argv instead — subcommand `run` at position 1, `--json` and a
+/// help flag present anywhere else — sidesteps that: it doesn't need parsing to have succeeded, and a
+/// `--json`/`--help`/`-h` substring can only appear as those literal flags here, never as a task
+/// message (an argument starting with `-` is consumed as a flag by clap, not a positional, unless
+/// explicitly escaped with `--`).
+fn cli() -> Cli {
+    match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            let args: Vec<String> = std::env::args().collect();
+            let run_json_help = args.get(1).map(String::as_str) == Some("run")
+                && args.iter().any(|a| a == "--json")
+                && args.iter().any(|a| a == "--help" || a == "-h");
+            if run_json_help
+                && matches!(
+                    e.kind(),
+                    clap::error::ErrorKind::DisplayHelp
+                        | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                )
+            {
+                eprint!("{}", e.render());
+                std::process::exit(0);
+            }
+            // Every other case (a real usage error, `--version`, bare `--help`) keeps clap's own
+            // default stream/exit-code behavior — see the doc comment above for why only the
+            // `run --json --help` combination needs overriding.
+            e.exit();
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Always stderr, never stdout: `serve`'s NDJSON control protocol and `run`'s streamed output both
@@ -506,7 +550,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
 
-    match Cli::parse().command {
+    match cli().command {
         Command::Run {
             tasks,
             model,

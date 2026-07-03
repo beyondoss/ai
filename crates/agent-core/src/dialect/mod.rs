@@ -215,6 +215,71 @@ fn answered(messages: &[Message], i: usize, tool_use_id: &str) -> bool {
     })
 }
 
+/// Ensure every message reaches the wire with at least one non-empty content block. Filters out
+/// whitespace-only `Text` blocks — matching pi's `convertMessages` (`anthropic-messages.ts`) and
+/// `openai-completions.ts:1007-1018` ("Some providers require 'either content or tool_calls, but not
+/// none'"). Anthropic 400s on an empty `text` content block (see `anthropic::downgrade_unsigned_
+/// thinking`'s doc comment); an OpenAI-shaped `{content: null}` with no `tool_calls` hits the same
+/// rejection class. Reachable today via `Message::error()`'s empty closing record (a whole-run
+/// failure with no partial response), the immediate-abort turn (`Agent::run_events_steered`), and
+/// `Session::scrub_cross_model_state` leaving `content: []` behind after dropping a foreign model's
+/// empty thinking block (`scrub_cross_model_state_drops_an_empty_thinking_block_instead_of_
+/// downgrading_it`) — none of these were filtered before reaching a request.
+///
+/// Unlike pi, a message left with zero content after filtering is NOT dropped from the list: this
+/// codebase relies on that record staying present to keep role alternation valid for whatever prompt
+/// follows it (see `a_prompt_after_a_failed_run_does_not_double_push_a_user_turn` — dropping
+/// `assistant(error)` from `[user, assistant(error), user]` would leave two consecutive `user` turns,
+/// a shape no dialect accepts either). Instead, an otherwise-empty message is padded with a single
+/// placeholder text block. Session storage is untouched — this only shapes the wire copy, mirroring
+/// `strip_model_id`/`downgrade_unsigned_thinking`. Called once, generically, right before any
+/// dialect's `build_body`, alongside `repair_orphaned_tool_use`.
+///
+/// Cheap when nothing needs fixing (the overwhelmingly common case): a first read-only pass decides
+/// whether any repair is needed at all before ever allocating.
+pub(crate) fn ensure_non_empty_content(messages: &[Message]) -> std::borrow::Cow<'_, [Message]> {
+    if !messages.iter().any(needs_content_fixup) {
+        return std::borrow::Cow::Borrowed(messages);
+    }
+    std::borrow::Cow::Owned(
+        messages
+            .iter()
+            .map(|m| {
+                if !needs_content_fixup(m) {
+                    return m.clone();
+                }
+                let mut content: Vec<ContentBlock> = m
+                    .content
+                    .iter()
+                    .filter(|b| !is_empty_text(b))
+                    .cloned()
+                    .collect();
+                if content.is_empty() {
+                    content.push(ContentBlock::text(EMPTY_MESSAGE_PLACEHOLDER));
+                }
+                Message {
+                    content,
+                    ..m.clone()
+                }
+            })
+            .collect(),
+    )
+}
+
+/// Whether `message` has any whitespace-only `Text` block, or has no content at all — either case
+/// needs [`ensure_non_empty_content`]'s fixup.
+fn needs_content_fixup(message: &Message) -> bool {
+    message.content.is_empty() || message.content.iter().any(is_empty_text)
+}
+
+fn is_empty_text(block: &ContentBlock) -> bool {
+    matches!(block, ContentBlock::Text { text, .. } if text.trim().is_empty())
+}
+
+/// Placeholder substituted for a message that would otherwise reach the wire with zero content — see
+/// [`ensure_non_empty_content`].
+const EMPTY_MESSAGE_PLACEHOLDER: &str = "(no content)";
+
 /// A stateful decoder turning a provider's SSE `data:` payloads into [`StreamEvent`]s. One per
 /// request (it carries cross-event state: token counts, the open content block, the stop reason).
 pub trait StreamDecoder: Send {
@@ -559,5 +624,92 @@ mod tests {
             }
             other => panic!("expected exactly two ToolResult blocks merged, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn ensure_non_empty_content_leaves_a_well_formed_list_untouched() {
+        // Proven via `Cow::Borrowed` (no allocation), not just value equality — the common case.
+        let messages = vec![
+            Message::user("hi"),
+            Message::assistant(vec![ContentBlock::text("hello")]),
+        ];
+        assert!(matches!(
+            ensure_non_empty_content(&messages),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn ensure_non_empty_content_pads_message_error_s_empty_closing_record() {
+        // The confirmed-reachable case: a whole-run failure with no partial response persists
+        // `Message::error(...)` — a single whitespace-only `Text` block, `error_message: Some(_)`,
+        // otherwise a completely ordinary assistant turn that must still occupy its slot in the
+        // alternation (see the doc comment on `ensure_non_empty_content`).
+        let messages = vec![
+            Message::user("hi"),
+            Message::error("transport error: gateway returned 400"),
+        ];
+        let fixed = ensure_non_empty_content(&messages);
+        assert!(matches!(fixed, std::borrow::Cow::Owned(_)));
+        assert_eq!(fixed.len(), 2, "the record must not be dropped: {fixed:?}");
+        assert_eq!(fixed[1].role, Role::Assistant);
+        assert_eq!(
+            fixed[1].content,
+            vec![ContentBlock::text(EMPTY_MESSAGE_PLACEHOLDER)]
+        );
+        // Session-persistence-relevant fields must survive the wire-only fixup untouched.
+        assert_eq!(
+            fixed[1].error_message.as_deref(),
+            Some("transport error: gateway returned 400")
+        );
+    }
+
+    #[test]
+    fn ensure_non_empty_content_pads_a_message_left_with_zero_blocks_after_scrubbing() {
+        // Mirrors `session::tests::scrub_cross_model_state_drops_an_empty_thinking_block_instead_of_
+        // downgrading_it` — a foreign model's empty thinking block is dropped entirely, leaving
+        // `content: []` with no thinking, no text, nothing. That message must still reach the wire
+        // with something, not an empty content array (Anthropic 400s on that shape too).
+        let messages = vec![Message::user("hi"), Message::assistant(vec![])];
+        let fixed = ensure_non_empty_content(&messages);
+        assert!(matches!(fixed, std::borrow::Cow::Owned(_)));
+        assert_eq!(
+            fixed[1].content,
+            vec![ContentBlock::text(EMPTY_MESSAGE_PLACEHOLDER)]
+        );
+    }
+
+    #[test]
+    fn ensure_non_empty_content_filters_a_stray_empty_text_block_but_keeps_real_content() {
+        // A whitespace-only text block alongside real content (a tool call, an image) is dropped —
+        // matching pi's per-block filtering — without disturbing the rest of the message or padding
+        // anything (there's already real content left).
+        let messages = vec![Message::assistant(vec![
+            ContentBlock::text("   \n\t  "),
+            ContentBlock::tool_use("t1", "bash", serde_json::json!({})),
+        ])];
+        let fixed = ensure_non_empty_content(&messages);
+        assert!(matches!(fixed, std::borrow::Cow::Owned(_)));
+        assert_eq!(fixed[0].content.len(), 1, "got: {:?}", fixed[0].content);
+        assert!(matches!(fixed[0].content[0], ContentBlock::ToolUse { .. }));
+    }
+
+    #[test]
+    fn ensure_non_empty_content_preserves_alternation_after_a_failed_run_and_a_retry_prompt() {
+        // The scenario `agent::tests::a_prompt_after_a_failed_run_does_not_double_push_a_user_turn`
+        // guards at the session level: `[user, assistant(error), user]` must stay 3 messages on the
+        // wire too — padding, not dropping, is what keeps role alternation valid here.
+        let messages = vec![
+            Message::user("hi"),
+            Message::error("boom"),
+            Message::user("after failure"),
+        ];
+        let fixed = ensure_non_empty_content(&messages);
+        assert_eq!(fixed.len(), 3, "got: {fixed:?}");
+        assert_eq!(
+            fixed.iter().map(|m| m.role).collect::<Vec<_>>(),
+            vec![Role::User, Role::Assistant, Role::User],
+            "must not collapse into two consecutive user turns"
+        );
     }
 }
