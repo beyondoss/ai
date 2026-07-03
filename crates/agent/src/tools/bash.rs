@@ -225,11 +225,15 @@ impl Bash {
         // emit a throttled snapshot as it grows. Always via the streaming path so the temp-file spill
         // sees the *complete* output; a non-streaming runner (test double) delivers no chunks and is
         // handled by the fallback below.
-        let result = {
+        //
+        // `sink` is declared at this scope (not nested in its own block) because `run_fut` borrows it
+        // and, unlike before this fix, is no longer awaited to completion in the same expression that
+        // constructs it — a cancellation races it instead (see below), so `sink` must outlive that race.
+        let sink = {
             let acc = acc.clone();
             let streamed = streamed.clone();
             let last_emit = last_emit.clone();
-            let sink = move |bytes: &[u8]| {
+            move |bytes: &[u8]| {
                 streamed.store(true, Ordering::Relaxed);
                 let mut a = lock(&acc);
                 a.append(bytes);
@@ -242,13 +246,52 @@ impl Bash {
                         emit_update(p, &snap);
                     }
                 }
+            }
+        };
+        let sink: ChunkSink<'_> = &sink;
+        let run_fut = self
+            .runner
+            .run_streaming(self.shell(), &args, cwd, dur, sink);
+
+        // Races the runner against this call's own cancellation — the same token a caller trips via
+        // `abort_bash`/SIGTERM/etc (e.g. `serve`'s host `bash` RPC) — rather than being cancellable only
+        // by an external `Drop` of this whole future with no chance to finalize. `acc` is always current
+        // regardless of the throttled snapshots above (every chunk is appended unconditionally, matching
+        // pi's own accumulator), so on cancellation we flush exactly what's in it and return that, tagged
+        // "Command cancelled", instead of discarding it. Without `progress` there's no token to race
+        // against, so this just awaits the runner directly, unchanged from before.
+        let result = match progress {
+            Some(p) => {
+                tokio::pin!(run_fut);
+                tokio::select! {
+                    r = &mut run_fut => Some(r),
+                    () = p.cancelled() => None,
+                }
+            }
+            None => Some(run_fut.await),
+        };
+        let Some(result) = result
+            .transpose()
+            .map_err(|e: std::io::Error| ToolError::Execution(format!("spawn failed: {e}")))?
+        else {
+            // Cancelled mid-stream: dropping the pinned `run_fut` above (implicit at the end of the
+            // `Some(p)` match arm) kills the subprocess via its `kill_on_drop`/process-group guard, the
+            // same way an external `Drop` of this whole call already did before this fix — the only
+            // change is that we get a chance to flush `acc` first instead of losing it.
+            let snap = {
+                let mut a = lock(&acc);
+                a.finish();
+                a.snapshot(true)
             };
-            let sink: ChunkSink<'_> = &sink;
-            self.runner
-                .run_streaming(self.shell(), &args, cwd, dur, sink)
-                .await
-        }
-        .map_err(|e| ToolError::Execution(format!("spawn failed: {e}")))?;
+            if let Some(p) = progress {
+                emit_update(p, &snap);
+            }
+            let text = clean(format_output(&snap, ""));
+            return Err(ToolError::Execution(append_status(
+                &text,
+                "Command cancelled",
+            )));
+        };
 
         // Fallback for a non-streaming runner (test double): feed its final captured output.
         if !streamed.load(Ordering::Relaxed) {
@@ -380,7 +423,8 @@ fn truncation_details(snap: &OutputSnapshot) -> Option<Value> {
     })
 }
 
-/// Append a status line (`exit code` / `timed out`) after the output, pi-style (`text\n\n<status>`).
+/// Append a status line (`exit code` / `timed out` / `cancelled`) after the output, pi-style
+/// (`text\n\n<status>`).
 fn append_status(text: &str, status: &str) -> String {
     if text.is_empty() {
         status.to_string()
@@ -390,12 +434,25 @@ fn append_status(text: &str, status: &str) -> String {
 }
 
 /// ANSI escape + OSC sequences a terminal emits but the model can't use: CSI/SGR colour and cursor
-/// moves (`ESC [ … final`) plus OSC strings (`ESC ] … BEL`). Built once; the pattern is a static
-/// literal, so a build failure is impossible — we model it as `None` instead of unwrapping.
+/// moves (`ESC [ … final`, or the 8-bit C1 CSI introducer `\x9b`) plus OSC strings (`ESC ] … `,
+/// terminated by BEL, ST (`ESC \`), or the 8-bit C1 ST `\x9c`). A direct port of pi's own
+/// `ansi.ts::ansiRegex` (itself derived from the `ansi-regex`/`strip-ansi` npm packages — see that
+/// file's license header) rather than a from-scratch pattern, so it inherits the exact same coverage:
+/// the prior version only recognized a BEL-terminated OSC (missing an OSC-8 hyperlink or any other
+/// modern tool that ST-terminates instead) and excluded `:` from CSI parameters (missing 24-bit
+/// truecolor SGR, e.g. `\x1b[38:2:255:0:0m`, which uses colon-separated sub-parameters) — both leaked
+/// raw escape-sequence noise into the model's context instead of being stripped. Built once; the
+/// pattern is a static literal, so a build failure is impossible — we model it as `None` instead of
+/// unwrapping.
 fn ansi_re() -> Option<&'static Regex> {
     static RE: OnceLock<Option<Regex>> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07").ok())
-        .as_ref()
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?:\x1b\][\s\S]*?(?:\x07|\x1b\x5c|\x9c))|[\x1b\x9b][\[\]()#;?]*(?:\d{1,4}(?:[;:]\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]",
+        )
+        .ok()
+    })
+    .as_ref()
 }
 
 /// Whitespace the model actually needs (`\t`, `\n`, `\r`) survives; every other C0 control byte (NUL,
@@ -780,6 +837,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn strips_an_st_terminated_osc_sequence_not_just_bel_terminated() {
+        // Pi-parity audit M9: the prior regex only recognized `ESC ] … BEL` — an OSC-8 hyperlink (or
+        // any modern tool) terminated with ST (`ESC \`) instead leaked raw escape-sequence noise into
+        // the model's context. Matches pi's own `ansi.ts`, which accepts either terminator.
+        let runner = recording(ExecResult {
+            code: Some(0),
+            stdout: "\x1b]8;;http://example.com\x1b\\link text\x1b]8;;\x1b\\ done".into(),
+            ..Default::default()
+        });
+        let out = Bash::with_runner(runner)
+            .run(json!({ "command": "x" }))
+            .await
+            .unwrap()
+            .text;
+        assert_eq!(out, "link text done");
+    }
+
+    #[tokio::test]
+    async fn strips_a_colon_separated_truecolor_sgr_sequence() {
+        // Pi-parity audit M9: the prior regex excluded `:` from CSI parameters entirely, so a 24-bit
+        // truecolor SGR sequence (`\x1b[38:2:255:0:0m`, colon-separated sub-parameters) wasn't
+        // recognized at all and leaked through verbatim. Matches pi's own `ansi.ts`.
+        let runner = recording(ExecResult {
+            code: Some(0),
+            stdout: "\x1b[38:2:255:0:0mRED\x1b[0m done".into(),
+            ..Default::default()
+        });
+        let out = Bash::with_runner(runner)
+            .run(json!({ "command": "x" }))
+            .await
+            .unwrap()
+            .text;
+        assert_eq!(out, "RED done");
+    }
+
+    #[tokio::test]
     async fn sanitizes_control_characters() {
         let runner = recording(ExecResult {
             code: Some(0),
@@ -981,6 +1074,47 @@ mod tests {
             count < 100,
             "expected a throttled handful of updates for 5000 rapid chunks, got {count}"
         );
+    }
+
+    #[tokio::test]
+    async fn cancelling_mid_stream_returns_the_output_already_captured_instead_of_discarding_it() {
+        // Pi-parity: pi's `bash-executor.ts` returns whatever output already streamed when a command is
+        // cancelled (`BashResult { output, cancelled: true }`), not a bare placeholder. Previously this
+        // tool's `exec` had no cancellation awareness of its own — a caller could only cancel by
+        // dropping the whole future, which discarded everything captured so far, accumulator included.
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        let cancel = agent_core::CancellationToken::new();
+        let progress = ToolProgress::new(tx, "id".into(), "bash".into(), cancel.clone());
+
+        let bash = Bash::real();
+        let run = bash.run_streaming(
+            json!({ "command": "printf 'partial-output\\n'; sleep 30" }),
+            &progress,
+        );
+        tokio::pin!(run);
+        // Give the `printf` time to actually run and land in the accumulator before cancelling — the
+        // command then goes silent for 30s, so nothing further would ever stream via `ToolProgress`
+        // (throttled snapshots only fire on new chunk arrival): this is exactly the case an
+        // external-drop-only cancellation would have lost entirely.
+        tokio::select! {
+            _ = &mut run => panic!("must not complete on its own within this window"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(300)) => {}
+        }
+        cancel.cancel();
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .expect("cancellation must resolve promptly, not wait out the sleep")
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("partial-output"),
+            "cancellation must preserve output already captured: {msg:?}"
+        );
+        assert!(
+            msg.to_lowercase().contains("cancel"),
+            "cancellation result should say so: {msg:?}"
+        );
+        drop(rx);
     }
 
     #[tokio::test]

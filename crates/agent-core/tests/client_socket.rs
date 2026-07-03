@@ -169,6 +169,45 @@ async fn gateway_client_surfaces_http_error() {
     assert!(first.is_err(), "a 403 must surface as a stream error");
 }
 
+#[tokio::test]
+async fn gateway_client_gives_actionable_guidance_on_a_401() {
+    // Pi-parity fix: a live 401 (the gateway itself rejecting the key) used to surface as a bare
+    // "gateway returned 401: <body>" — identical formatting to any other 4xx, with no hint at what to
+    // actually do about it. Unlike a 403 (still just a generic error, see the test above), 401
+    // specifically must name the actual cause and point at the fix.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"error\":{\"type\":\"authentication_error\"}}",
+            );
+        }
+    });
+    let client = GatewayClient::new(format!("http://{addr}"), "bai_v1.test").expect("client");
+    let mut stream = client
+        .stream(ModelRequest::new(
+            "claude-opus-4-8",
+            vec![Message::user("hi")],
+            64,
+        ))
+        .await
+        .expect("stream");
+    let first = stream.next().await.expect("an item");
+    let err = first.expect_err("a 401 must surface as a stream error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("API key") && (msg.contains("invalid") || msg.contains("expired")),
+        "expected actionable 401 guidance naming the key, got: {msg}"
+    );
+    assert!(
+        msg.contains("authentication_error"),
+        "the upstream detail must still be included, not just the new guidance: {msg}"
+    );
+}
+
 /// Capture the raw bytes of the first request a one-shot server receives, then answer with a minimal
 /// empty-body SSE response. Returns the shared buffer the caller reads after driving the request.
 fn spawn_request_capturing_server() -> (String, std::sync::Arc<std::sync::Mutex<String>>) {

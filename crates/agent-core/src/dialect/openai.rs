@@ -332,6 +332,11 @@ pub fn build_body(req: &ModelRequest) -> Value {
     map.insert("stream".into(), json!(true));
     // Ask for a trailing usage chunk so token accounting works on the streaming path.
     map.insert("stream_options".into(), json!({ "include_usage": true }));
+    // Sent unconditionally when set — matches pi's own unconditional `openai-completions.ts` (a
+    // reasoning model that rejects a custom temperature is a caller error, same as pi's).
+    if let Some(temperature) = req.temperature {
+        map.insert("temperature".into(), json!(temperature));
+    }
     // Prompt-cache affinity: OpenAI routes automatic prefix-cache hits by `prompt_cache_key`, so a
     // stable per-conversation key keeps a session pinned to a warm cache node. (OpenAI caches prefixes
     // automatically — there are no explicit breakpoints to set, only this routing hint.) The key has a
@@ -875,6 +880,18 @@ mod tests {
     use super::*;
     use crate::dialect::decode_sse;
     use crate::message::{Message, ToolDef};
+
+    #[test]
+    fn build_body_sends_temperature_when_set() {
+        let req = ModelRequest::new("gpt-4o", vec![Message::user("hi")], 256).with_temperature(0.4);
+        assert_eq!(build_body(&req)["temperature"], 0.4);
+    }
+
+    #[test]
+    fn build_body_omits_temperature_when_unset() {
+        let req = ModelRequest::new("gpt-4o", vec![Message::user("hi")], 256);
+        assert!(build_body(&req).get("temperature").is_none());
+    }
 
     #[test]
     fn build_body_maps_system_tool_calls_and_results() {

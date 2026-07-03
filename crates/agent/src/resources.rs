@@ -4,10 +4,12 @@
 //! the project's own `AGENTS.md`/`CLAUDE.md` files, any discovered skills, and the current date/cwd —
 //! the context a coding agent needs to behave like it belongs in *this* repo.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::path_utils::resolved_path;
 use crate::skills::{self, Skill};
 
 /// Options controlling how the system prompt is assembled.
@@ -163,11 +165,26 @@ fn discover_claude_file(cwd: &Path, project_trusted: bool, filename: &str) -> Op
 /// At most one file is taken per directory: when both `AGENTS.md` and `CLAUDE.md` are present,
 /// `AGENTS.md` wins (matching pi's resource-loader). Filename matching is case-insensitive.
 pub fn load_context_files(cwd: &Path) -> Vec<(String, String)> {
+    load_context_files_with_home(cwd, std::env::var_os("HOME").map(PathBuf::from).as_deref())
+}
+
+/// [`load_context_files`], with the global home directory injected rather than read from `$HOME` —
+/// lets a test exercise the `cwd`-is-under-`~/.claude` dedup case deterministically, without racing
+/// real env-var state across parallel test threads.
+///
+/// `home`'s `.claude` subdirectory is deduped against the ancestor walk below by canonical path
+/// (`path_utils::resolved_path`), not skipped by construction: when `cwd` is `~/.claude` itself or a
+/// descendant of it, the ancestor walk would otherwise revisit the exact same directory the global
+/// lookup already read, injecting its contents into the system prompt twice.
+fn load_context_files_with_home(cwd: &Path, home: Option<&Path>) -> Vec<(String, String)> {
     let mut out = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
 
     // Global instruction file (one, AGENTS-wins).
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        if let Some(file) = load_context_file_from_dir(&home.join(".claude")) {
+    if let Some(home) = home {
+        let global_dir = home.join(".claude");
+        seen.insert(resolved_path(&global_dir));
+        if let Some(file) = load_context_file_from_dir(&global_dir) {
             out.push(file);
         }
     }
@@ -176,6 +193,9 @@ pub fn load_context_files(cwd: &Path) -> Vec<(String, String)> {
     let mut ancestors: Vec<&Path> = cwd.ancestors().collect();
     ancestors.reverse(); // root-most first
     for dir in ancestors {
+        if !seen.insert(resolved_path(dir)) {
+            continue;
+        }
         if let Some(file) = load_context_file_from_dir(dir) {
             out.push(file);
         }
@@ -183,9 +203,31 @@ pub fn load_context_files(cwd: &Path) -> Vec<(String, String)> {
     out
 }
 
-/// Pick this directory's single context file: `AGENTS.md` if present, else `CLAUDE.md`, matched
-/// case-insensitively. Returns `(path, body)` only when the chosen file exists and is non-empty —
-/// preserving the empty-file skip. A directory we can't read just yields nothing.
+/// Pick this directory's context file: `AGENTS.md` if it reads cleanly and is non-empty, else
+/// `CLAUDE.md` under the same conditions (matched case-insensitively). A directory we can't even list
+/// yields nothing.
+///
+/// Matches pi's own `loadContextFileFromDir`: a read failure on the first candidate (permission
+/// denied, a dangling symlink) logs a warning and falls through to the next one, rather than
+/// abandoning the whole directory — the prior version committed to `AGENTS.md` the moment it was
+/// *seen*, so `fs::read_to_string` failing on it returned `None` outright and a perfectly good sibling
+/// `CLAUDE.md` was silently never tried. An empty `AGENTS.md` falls through the same way (Beyond
+/// deliberately treats an empty file as no file at all, unlike pi, which stops there and includes the
+/// empty content as-is — a real, intentional divergence, not a gap to close), so this also fixes the
+/// same class of bug for that trigger: "absent" must mean "try the next candidate," not "give up on
+/// the directory."
+///
+/// **Deliberate divergence, awareness-only: filename matching here is genuinely case-insensitive
+/// (`to_ascii_lowercase() == "agents.md"`), not just tolerant of a few specific spellings.** pi's own
+/// `resource-loader.ts` checks an exact 4-candidate list — `["AGENTS.md", "AGENTS.MD", "CLAUDE.md",
+/// "CLAUDE.MD"]` via `existsSync` — which is really a filesystem-case-sensitivity accident, not a
+/// deliberate case-insensitive spec: on a case-insensitive filesystem (macOS/Windows default) any of
+/// those 4 literal strings resolves to the same file regardless of its actual on-disk casing, so the
+/// list works there for any casing at all; on a case-sensitive one (most Linux setups, this codebase's
+/// primary target), a real `agents.md` or `Agents.MD` matches none of the 4 and is silently invisible to
+/// pi. Beyond's lowercase-compare is a strict superset of pi's 4-string list on every filesystem, so
+/// this isn't something to narrow down to match — it can only recognize a project-instruction file pi
+/// would miss, never the reverse.
 fn load_context_file_from_dir(dir: &Path) -> Option<(String, String)> {
     let mut agents: Option<PathBuf> = None;
     let mut claude: Option<PathBuf> = None;
@@ -197,12 +239,22 @@ fn load_context_file_from_dir(dir: &Path) -> Option<(String, String)> {
             claude = Some(entry.path());
         }
     }
-    let chosen = agents.or(claude)?;
-    let body = fs::read_to_string(&chosen).ok()?;
-    if body.trim().is_empty() {
-        return None;
+    for candidate in [agents, claude].into_iter().flatten() {
+        match fs::read_to_string(&candidate) {
+            Ok(body) if !body.trim().is_empty() => {
+                return Some((candidate.display().to_string(), body));
+            }
+            Ok(_) => {} // empty file: treated as absent, try the next candidate
+            Err(e) => {
+                tracing::warn!(
+                    path = %candidate.display(),
+                    error = %e,
+                    "could not read project-instruction file, trying the next candidate"
+                );
+            }
+        }
     }
-    Some((chosen.display().to_string(), body))
+    None
 }
 
 /// Today's date as `YYYY-MM-DD` in the host's local timezone, without pulling in a date crate. Local
@@ -397,6 +449,30 @@ mod tests {
     }
 
     #[test]
+    fn dedupes_the_global_home_claude_file_when_cwd_is_under_it() {
+        // Pi-parity fix: when `cwd` is `~/.claude` itself or a descendant of it, the ancestor walk
+        // would revisit the exact same directory the global `~/.claude` lookup already read — the same
+        // file's content injected into the system prompt twice.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let claude_dir = home.join(".claude");
+        let nested = claude_dir.join("some-project");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(claude_dir.join("AGENTS.md"), "global-instructions-marker").unwrap();
+
+        let files = load_context_files_with_home(&nested, Some(home));
+        let occurrences = files
+            .iter()
+            .filter(|(_, body)| body.contains("global-instructions-marker"))
+            .count();
+        assert_eq!(
+            occurrences, 1,
+            "the global ~/.claude file must appear exactly once, not once per ancestor-walk revisit: \
+             {files:#?}"
+        );
+    }
+
+    #[test]
     fn one_file_per_dir_prefers_agents() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("proj");
@@ -413,6 +489,82 @@ mod tests {
         assert!(
             !joined.contains("claude-loses"),
             "CLAUDE.md must be skipped when AGENTS.md is present"
+        );
+    }
+
+    #[test]
+    fn an_empty_agents_md_falls_back_to_a_readable_claude_md() {
+        // Pi-parity audit H67: the prior version resolved `chosen = agents.or(claude)` and read
+        // *that one name only* — an empty `AGENTS.md` returned `None` for the whole directory,
+        // discarding a perfectly good sibling `CLAUDE.md` instead of trying it.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("AGENTS.md"), "   \n\n").unwrap();
+        fs::write(dir.join("CLAUDE.md"), "claude-still-wins").unwrap();
+
+        let joined: String = load_context_files(&dir)
+            .iter()
+            .map(|(_, b)| b.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("claude-still-wins"),
+            "an empty AGENTS.md must fall back to a readable CLAUDE.md: {joined:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_agents_md_falls_back_to_a_readable_claude_md() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        fs::create_dir_all(&dir).unwrap();
+        let agents_path = dir.join("AGENTS.md");
+        fs::write(&agents_path, "unreadable").unwrap();
+        fs::set_permissions(&agents_path, fs::Permissions::from_mode(0o000)).unwrap();
+        // Some environments (root, certain sandboxes) don't actually enforce permission bits — skip
+        // rather than assert a false failure if the mode change didn't block the read at all.
+        let mode_actually_blocks_reads = fs::read_to_string(&agents_path).is_err();
+        fs::write(dir.join("CLAUDE.md"), "claude-still-wins").unwrap();
+
+        let result = load_context_files(&dir);
+        // Restore permissions before any assertion can panic, so the tempdir cleans up.
+        let _ = fs::set_permissions(&agents_path, fs::Permissions::from_mode(0o644));
+
+        if !mode_actually_blocks_reads {
+            return;
+        }
+        let joined: String = result
+            .iter()
+            .map(|(_, b)| b.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("claude-still-wins"),
+            "an unreadable AGENTS.md must fall back to a readable CLAUDE.md: {joined:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_broken_symlink_named_agents_md_falls_back_to_a_readable_claude_md() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(dir.join("does-not-exist"), dir.join("AGENTS.md")).unwrap();
+        fs::write(dir.join("CLAUDE.md"), "claude-still-wins").unwrap();
+
+        let joined: String = load_context_files(&dir)
+            .iter()
+            .map(|(_, b)| b.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("claude-still-wins"),
+            "a broken symlink named AGENTS.md must fall back to a readable CLAUDE.md: {joined:?}"
         );
     }
 

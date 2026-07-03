@@ -19,14 +19,22 @@ use crate::compaction::{
 use crate::message::{ContentBlock, Message};
 use crate::transport::ModelRequest;
 
-/// The instruction appended after the rendered branch transcript. Adapted from pi's
-/// `BRANCH_SUMMARY_PROMPT` to this project's existing Markdown-heading convention (matching
-/// [`crate::compaction::SUMMARY_INSTRUCTION`]'s structure), so a downstream reader sees a consistent
-/// shape whether a section came from compaction or branch summarization.
-pub const BRANCH_SUMMARY_INSTRUCTION: &str = "The user explored a different conversation branch \
-before returning here. Summarize that branch into this exact Markdown structure, keeping concrete \
-identifiers (file paths, function names, commands) verbatim and omitting pleasantries:\n\n## Goal\n\
-## Constraints\n## Progress\n### Done\n### In Progress\n### Blocked\n## Key Decisions\n## Next Steps";
+/// The instruction appended after the rendered branch transcript. Matches pi's own
+/// `BRANCH_SUMMARY_PROMPT` structurally — the same bracketed-exemplar/"(none)"-fallback/checkbox/
+/// numbered-list granularity [`crate::compaction::SUMMARY_INSTRUCTION`]'s doc comment describes — so a
+/// downstream reader sees a consistent shape whether a section came from compaction or branch
+/// summarization. Deliberately has no `## Critical Context` section (pi's own `BRANCH_SUMMARY_PROMPT`
+/// doesn't either) — an abandoned branch's recap is read once on return, not carried forward turn after
+/// turn the way a live compaction summary is, so it doesn't need the same "what would a fresh context
+/// need to keep working" section.
+pub const BRANCH_SUMMARY_INSTRUCTION: &str = "Create a structured summary of this conversation branch \
+for context when returning later.\n\nUse this EXACT format:\n\n## Goal\n[What was the user trying to \
+accomplish in this branch?]\n\n## Constraints & Preferences\n- [Any constraints, preferences, or \
+requirements mentioned]\n- [Or \"(none)\" if none were mentioned]\n\n## Progress\n### Done\n- [x] \
+[Completed tasks/changes]\n\n### In Progress\n- [ ] [Work that was started but not finished]\n\n### \
+Blocked\n- [Issues preventing progress, if any]\n\n## Key Decisions\n- **[Decision]**: [Brief \
+rationale]\n\n## Next Steps\n1. [What should happen next to continue this work]\n\nKeep each section \
+concise. Preserve exact file paths, function names, and error messages.";
 
 /// Prefix marking a message as a branch summary, mirroring [`crate::compaction::SUMMARY_MARKER`] — an
 /// explicit signal (for a human or a later, nested summarization) that this text recaps an abandoned
@@ -157,6 +165,29 @@ mod tests {
     }
 
     #[test]
+    fn branch_summary_instruction_gives_pi_parity_structural_guidance() {
+        // Same pi-parity gap as `crate::compaction::SUMMARY_INSTRUCTION` — matches pi's own
+        // `BRANCH_SUMMARY_PROMPT` (`branch-summarization.ts`) structurally.
+        assert!(
+            BRANCH_SUMMARY_INSTRUCTION.contains("- [x]")
+                && BRANCH_SUMMARY_INSTRUCTION.contains("- [ ]"),
+            "must use checkbox conventions for Done/In Progress: {BRANCH_SUMMARY_INSTRUCTION}"
+        );
+        assert!(
+            BRANCH_SUMMARY_INSTRUCTION.contains("\"(none)\""),
+            "must give an explicit \"(none)\" fallback: {BRANCH_SUMMARY_INSTRUCTION}"
+        );
+        assert!(
+            BRANCH_SUMMARY_INSTRUCTION.contains("1. ["),
+            "Next Steps must be a numbered (not bulleted) list: {BRANCH_SUMMARY_INSTRUCTION}"
+        );
+        assert!(
+            BRANCH_SUMMARY_INSTRUCTION.contains("## Goal\n["),
+            "must give a bracketed exemplar right after the Goal heading: {BRANCH_SUMMARY_INSTRUCTION}"
+        );
+    }
+
+    #[test]
     fn branch_summary_request_renders_transcript_and_tags_files() {
         let req = branch_summary_request("claude-test", &branch(), 512, 100_000, None);
         let ContentBlock::Text { text, .. } = &req.messages[0].content[0] else {
@@ -167,7 +198,7 @@ mod tests {
         assert!(text.contains("src/x.rs"));
         assert!(text.contains("<modified-files>"));
         assert!(text.contains("## Goal"));
-        assert!(text.contains("different conversation branch"));
+        assert!(text.contains("conversation branch for context when returning later"));
         assert_eq!(req.system.as_deref(), Some(SUMMARY_SYSTEM));
         assert_eq!(req.model, "claude-test");
         assert_eq!(req.max_tokens, 512);
@@ -312,7 +343,7 @@ mod tests {
             panic!("expected text");
         };
         assert!(
-            text.contains("different conversation branch"),
+            text.contains("conversation branch for context when returning later"),
             "the structured template survives: {text}"
         );
         assert!(

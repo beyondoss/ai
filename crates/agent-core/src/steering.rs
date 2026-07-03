@@ -99,6 +99,24 @@ pub enum QueueMode {
     All,
 }
 
+/// A requested mid-run model switch (and, optionally, a new thinking budget) — see
+/// [`Steering::request_model_switch`]. Mirrors pi's `prepareNextTurn`/`nextTurnSnapshot`: a host can
+/// downgrade to a cheaper model once a run turns out not to need much firepower, or raise the model or
+/// thinking budget once it turns out to need more, all without stopping and restarting the whole call.
+///
+/// Deliberately narrower than pi's snapshot, which can also swap the whole `context`/reasoning-effort:
+/// this only ever changes what the *main conversational turns* target. Compaction/branch-summary calls
+/// still use the `Agent`'s original, as-configured model — pi's own harness doesn't thread
+/// `prepareNextTurn`'s override into those either (they run through a separate summarization path with
+/// no `nextTurnSnapshot` awareness).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelSwitch {
+    pub model: String,
+    /// `None` leaves the thinking budget as currently configured on the `Agent`; `Some(budget)` sets a
+    /// new one for every subsequent turn of this run.
+    pub thinking: Option<u32>,
+}
+
 /// A cloneable handle to the shared steering queues. Clones share the same two lanes (and the stop
 /// flag).
 #[derive(Clone, Default)]
@@ -115,6 +133,9 @@ pub struct Steering {
     /// How much of the follow-up (plus any stranded steer) lane [`drain_at_stop`](Self::drain_at_stop)
     /// consumes per call — independent of `steer_mode`, matching pi's separate `followUpMode`.
     follow_up_mode: Arc<Mutex<QueueMode>>,
+    /// Set by [`request_model_switch`](Self::request_model_switch); consumed by the loop at the next
+    /// turn boundary (the same point `stop_requested` is checked).
+    model_switch: Arc<Mutex<Option<ModelSwitch>>>,
 }
 
 impl Steering {
@@ -219,6 +240,7 @@ impl Steering {
         lock(&self.steer).clear();
         lock(&self.follow_up).clear();
         self.stop_requested.store(false, Ordering::Relaxed);
+        *lock_switch(&self.model_switch) = None;
     }
 
     /// Request that the run stop gracefully at the next turn boundary — after the current turn's tool
@@ -232,6 +254,22 @@ impl Steering {
     pub(crate) fn take_stop_requested(&self) -> bool {
         self.stop_requested.swap(false, Ordering::Relaxed)
     }
+
+    /// Request that every subsequent turn of this run target `model` (and, if `thinking` is `Some`, a
+    /// new thinking budget) — applied at the next turn boundary, the same point a graceful stop is
+    /// checked. A second call before the first is observed replaces it outright (only the most recent
+    /// request matters — there's no queue of switches to apply in sequence).
+    pub fn request_model_switch(&self, model: impl Into<String>, thinking: Option<u32>) {
+        *lock_switch(&self.model_switch) = Some(ModelSwitch {
+            model: model.into(),
+            thinking,
+        });
+    }
+
+    /// Consume and return the pending model switch, if any. Each request is observed at most once.
+    pub(crate) fn take_model_switch(&self) -> Option<ModelSwitch> {
+        lock_switch(&self.model_switch).take()
+    }
 }
 
 /// Recover the data on a poisoned lock rather than propagating a panic into the loop.
@@ -241,6 +279,13 @@ fn lock(q: &Queue) -> std::sync::MutexGuard<'_, VecDeque<SteeringMessage>> {
 
 /// Same recovery posture as [`lock`], for the [`QueueMode`] setting.
 fn lock_mode(m: &Arc<Mutex<QueueMode>>) -> std::sync::MutexGuard<'_, QueueMode> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Same recovery posture as [`lock`], for the pending [`ModelSwitch`].
+fn lock_switch(
+    m: &Arc<Mutex<Option<ModelSwitch>>>,
+) -> std::sync::MutexGuard<'_, Option<ModelSwitch>> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -449,6 +494,64 @@ mod tests {
         assert!(
             !s.take_stop_requested(),
             "clear must not leave a stop request that could cut short a different session's run"
+        );
+    }
+
+    #[test]
+    fn model_switch_is_taken_at_most_once() {
+        let s = Steering::new();
+        assert!(s.take_model_switch().is_none(), "nothing queued yet");
+        s.request_model_switch("claude-cheap", Some(512));
+        assert_eq!(
+            s.take_model_switch(),
+            Some(ModelSwitch {
+                model: "claude-cheap".to_string(),
+                thinking: Some(512),
+            })
+        );
+        assert!(
+            s.take_model_switch().is_none(),
+            "a switch must be observed at most once, like the stop flag"
+        );
+    }
+
+    #[test]
+    fn a_second_model_switch_before_the_first_is_observed_replaces_it() {
+        let s = Steering::new();
+        s.request_model_switch("claude-cheap", None);
+        s.request_model_switch("claude-expensive", Some(1024));
+        assert_eq!(
+            s.take_model_switch(),
+            Some(ModelSwitch {
+                model: "claude-expensive".to_string(),
+                thinking: Some(1024),
+            }),
+            "only the most recent request should apply — no queue of switches"
+        );
+    }
+
+    #[test]
+    fn clear_also_drops_a_pending_model_switch() {
+        let s = Steering::new();
+        s.request_model_switch("claude-cheap", None);
+        s.clear();
+        assert!(
+            s.take_model_switch().is_none(),
+            "clear must not leave a switch that could apply to a different session's run"
+        );
+    }
+
+    #[test]
+    fn model_switch_is_shared_across_clones() {
+        let a = Steering::new();
+        let b = a.clone();
+        a.request_model_switch("claude-cheap", Some(256));
+        assert_eq!(
+            b.take_model_switch(),
+            Some(ModelSwitch {
+                model: "claude-cheap".to_string(),
+                thinking: Some(256),
+            })
         );
     }
 

@@ -74,7 +74,7 @@ fn grep_engine(bencher: Bencher, threads: usize) {
     let root = tree();
     let job = grep::GrepJob::new(NEEDLE, false, false, None, root.clone(), 100).unwrap();
     bencher.bench_local(|| {
-        let (m, _) = grep::search(&job, threads);
+        let (m, _, _) = grep::search(&job, threads);
         black_box(m.len());
     });
 }
@@ -105,7 +105,7 @@ fn grep_dense(bencher: Bencher) {
     let root = tree();
     let job = grep::GrepJob::new("ordinary", false, false, None, root.clone(), 100).unwrap();
     bencher.bench_local(|| {
-        let (m, _) = grep::search(&job, 1);
+        let (m, _, _) = grep::search(&job, 1);
         black_box(m.len());
     });
 }
@@ -210,7 +210,7 @@ fn find_walk(bencher: Bencher) {
         1000,
     );
     bencher.bench_local(|| {
-        let (p, _) = find::search(&job);
+        let (p, _, _) = find::search(&job);
         black_box(p.len());
     });
 }

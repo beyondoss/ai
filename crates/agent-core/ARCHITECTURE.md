@@ -46,19 +46,59 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   with images becomes a real `Message::user_with_images` turn instead of a plain-text one; a mid-run
   steer's images are appended as `ContentBlock::Image` blocks after its text block, onto the same
   tool-results turn its text rides on.
-- **Graceful stop** — `Steering::request_stop` (pi's `shouldStopAfterTurn` equivalent) sets a flag
-  checked at every turn boundary, *after* that turn's tool calls (if any) have already run and their
-  results are committed to the session, but before the next model call would start. It wins over both
-  continuing a tool-call turn and draining queued follow-up/steer messages (mirroring the refusal case,
-  those are left queued, not dropped). Unlike `cancel`, it never drops an in-flight future or leaves an
-  orphaned `tool_use` — the difference between a graceful stop and a hard abort. Whatever a run does with
-  a pending request, `run_events_steered` always clears it before returning (a `Drop` guard, so an early
-  `?`/error/cancellation return can't skip it), so a request can never bind to a later, unrelated call
-  that reuses the same `Steering` handle.
-- **Hooks** — `AgentHooks` (`with_hooks`) gates (`before_tool_call` → block reason) and rewrites
-  (`after_tool_call`) tool calls; the permission/redaction seam. Both methods also receive the run's
-  `&CancellationToken`, so a hook can observe (or react to) an in-flight cancellation. Defaults to
-  `NoHooks`.
+- **Mid-run model switching** — `Steering::request_model_switch(model, thinking?)` (pi's
+  `prepareNextTurn`/`nextTurnSnapshot` equivalent) retargets every subsequent turn of a run already in
+  flight, applied at the same turn boundary a graceful stop is checked — never mid-turn, so the request
+  already in flight when a switch is requested is unaffected. A `ModelSwitched` event fires when it's
+  applied. Deliberately narrower than pi's full snapshot: only the main conversational turns' own model/
+  thinking budget are affected — `compact`/`compact_or_report`/`summarize_branch` keep using the `Agent`'s
+  original, as-configured model, matching pi's own summarization path (no `nextTurnSnapshot` awareness
+  there either). `serve`'s `switch_model` RPC command is the concrete surface for this; `set_model`/
+  `set_thinking` are a separate, idle-only mechanism that only takes effect on the *next* `prompt`.
+- **Graceful stop** — two independent, OR-combined ways to end a run at a turn boundary rather than a
+  hard abort: `Steering::request_stop` — an external flag a host sets from outside the loop (`serve`'s
+  `stop_after_turn` RPC command) — and `AgentHooks::should_stop_after_turn` — an in-process,
+  content-aware hook the loop itself calls with the turn's own assistant message and tool results, pi's
+  actual `shouldStopAfterTurn` equivalent (the external flag has no such content access; see the `Hooks`
+  bullet below for why this needed its own seam). Either wanting to stop ends the run. Checked at every
+  turn boundary, *after* that turn's tool calls (if any) have already run and their results are committed
+  to the session, but before the next model call would start. Wins over both continuing a tool-call turn
+  and draining queued follow-up/steer messages (mirroring the refusal case, those are left queued, not
+  dropped). Unlike `cancel`, neither drops an in-flight future or leaves an orphaned `tool_use` — the
+  difference between a graceful stop and a hard abort. Whatever a run does with a pending `request_stop`,
+  `run_events_steered` always clears it before returning (a `Drop` guard, so an early `?`/error/
+  cancellation return can't skip it), so a request can never bind to a later, unrelated call that reuses
+  the same `Steering` handle.
+- **Hooks** — `AgentHooks` (`with_hooks`) gates (`before_tool_call` → block reason), rewrites
+  (`after_tool_call`), can end a run early (`should_stop_after_turn`, see the `Graceful stop` bullet
+  above), and can rewrite the model's own generated content (`on_assistant_message`) — the permission/
+  redaction/stop-decision seam. `after_tool_call` sees (and can rewrite) a tool's `images: Vec<ImageSource>`
+  alongside its text — not just the text, which used to be all a redaction hook could see or touch, so an
+  image a tool returned (a screenshot `read` pulled off disk, say) passed through completely invisibly to
+  any hook wanting to redact/replace it. Kept as parallel `(text, images)` fields rather than pi's own
+  unified `content: (TextContent | ImageContent)[]` array — a bigger structural change to `ToolOutput`'s
+  public shape this fix didn't need, since every existing hook only cares about 2-3 of the (still
+  positionally clear) 8 parameters anyway. Every method also receives `&Session` (the live conversation as of the
+  call — the requesting/just-completed assistant turn is already `session.messages.last()` or one before
+  it, since the pre-dispatch checkpoint below establishes that invariant before any hook ever runs) and
+  the run's `&CancellationToken`, so a hook can condition its decision on the surrounding conversation —
+  not just the one call's own name/args — and observe (or react to) an in-flight cancellation.
+  `on_assistant_message` fires once per turn, right after the assistant message is finalized (the
+  `Aborted` marker, if any, already applied) but before it's pushed to `session.messages`, checkpointed,
+  or surfaced in `AgentEvent::TurnEnd` — pi's `message_end` extension event, narrowed to the
+  assistant-authored case (`before_tool_call`/`after_tool_call` cover the analogous tool-call/tool-result
+  seams already). `should_stop_after_turn`/`on_assistant_message` both fail *open* on a panic (don't stop
+  / keep the original message) — unlike `before_tool_call`'s fail-*closed* (blocks the call): neither is a
+  security boundary, and losing content or halting an otherwise-healthy run over a buggy hook would be
+  more disruptive than just continuing it; `on_assistant_message` additionally discards a replacement
+  whose role isn't `Role::Assistant` (a caller bug), for the same reason. Defaults to `NoHooks`.
+  `crates/agent`'s own `ToolPolicy` (`--deny-tool`/`--deny-bash-pattern`) is the concrete implementation
+  this workspace actually installs; see its `ARCHITECTURE.md`.
+- **Panic isolation** — every `before_tool_call`/`Tool::run_streaming`/`after_tool_call` invocation runs
+  behind a `catch_unwind` boundary (`catch_tool_panic`): a panic in any of them degrades to one failed
+  tool call (an error `tool_result`, or a fail-closed block for `before_tool_call`) instead of unwinding
+  the whole run. Neither trait returns a `Result` a panic could be redirected through instead, so this is
+  the one place that actually needs to catch the unwind.
 - **Compaction** — when the live prompt crosses `context_window − reserve` (or the provider rejects an
   overflow), [`compaction`](src/compaction.rs) summarizes the prefix via one model call and splices a
   summary in, keeping recent turns verbatim (`Agent::compact`, auto-trigger, compact-and-retry).
@@ -96,7 +136,14 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   `context_window` (minus a margin absorbing estimation slop) — so a long-running session doesn't keep
   sending its static output ceiling on every turn regardless of how much of the window the prompt has
   already consumed, paying for a wasted round-trip each time before the reactive path above ever gets a
-  chance to compact. Anthropic writes `max_tokens`, OpenAI Chat Completions writes `max_tokens`/
+  chance to compact. A third call site, distinct from the two above (which both run at the *top* of the
+  loop, before a request is built): a turn that already completed successfully but got cut off by
+  `max_tokens` alone, with no tool calls — a silent truncation, not an error — is checked against
+  `is_hard_overflow` too, right before the run would otherwise end and hand back the hard-truncated
+  non-answer. If compacting frees real room, the truncated response is discarded (never shown to the
+  user) and the same turn is retried fresh; if there's nothing left to compact, the truncated answer is
+  reported as-is, unchanged from prior behavior. Anthropic writes `max_tokens`, OpenAI Chat Completions
+  writes `max_tokens`/
   `max_completion_tokens` (per `ModelCaps::max_tokens_field`), and OpenAI Responses writes
   `max_output_tokens` — all three funnel through the one shared clamp rather than each reimplementing
   it (a HIGH pi-parity gap, fixed: the clamp originally existed only on the Anthropic dialect, so the
@@ -143,7 +190,13 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   chunk as `AgentEvent::ToolProgress` the instant it arrives (not batched after the group joins), and
   `AgentEvent::ToolEnd` fires per call the moment its own result is known — a client watching the event
   stream sees completions in actual finish order, not batched after the slowest call in the group.
-  Default `run_streaming` delegates to `run`, so non-streaming tools are untouched.
+  Default `run_streaming` delegates to `run`, so non-streaming tools are untouched. `ToolProgress` also
+  carries the run's `CancellationToken`: `is_cancelled()` for a poll check, `cancelled()` for a future a
+  tool's own execution loop can race against (`tokio::select!`) so it notices a cancellation promptly and
+  gets a chance to flush partial state itself, rather than relying solely on the dispatch dropping its
+  whole future out from under it with no chance to finalize — `tools::bash::Bash::exec` is the first real
+  user, racing its subprocess runner against this to return already-captured output on cancellation
+  instead of discarding it.
 - **Cross-run file-mutation exclusivity** — `Agent::with_write_locks` shares a `WriteLockRegistry`
   (`write_lock.rs`) across every `Agent` rebuild for a process's lifetime (not just one turn's grouping):
   a tool's `write_target(input)` path acquires the registry's per-path async lock for the tool's whole
@@ -212,6 +265,13 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   call — a caller tracking "is a compaction currently in flight" (pi's `isCompacting`, surfaced by
   `crates/agent`'s `serve.rs`) sets a flag here and clears it on `Compacted`, since `compact`'s own
   summarization call passes a discarding inner sink and so nothing else can arrive in between.
+  `Compacted` also carries `summary` (the generated text actually spliced in, file-operations list
+  already appended — pi's own `CompactionResult.summary`) and `tokens_after` (an estimate of the whole
+  post-compaction message list via `compaction::estimate_messages_tokens`, pi's own
+  `estimatedTokensAfter` — deliberately *not* `trailing_tokens`, whose since-last-usage-snapshot delta
+  `apply_summary` resets to point past the rebuilt list's end, so it would report 0 immediately after a
+  compaction); `crates/agent`'s `serve.rs` threads both straight into the `compact` RPC's own response,
+  which previously exposed neither.
 
 ## What this crate is not
 
@@ -315,7 +375,7 @@ longer has to *assume* strict sequential delivery to stay correct if that ever c
 | `ModelTransport`                 | The loop's only network seam; turns a `ModelRequest` into an `EventStream`                                                                | Not the gateway client specifically — `MockTransport` is the other implementor                                                   |
 | `Session`                        | One run's message history + step/token counters, Arc-shared, serde round-trips                                                            | Not multi-session storage — one `Session` is one conversation                                                                    |
 | `ToolRegistry`                   | Name → `Arc<dyn Tool>` lookup the loop dispatches against                                                                                 | Not a permission system itself — gating is the `AgentHooks::before_tool_call` seam                                               |
-| `AgentHooks`                     | Interception around each tool call: `before_tool_call` (block) / `after_tool_call` (rewrite)                                              | Not a sandbox — it decides per call; defaults to `NoHooks`                                                                       |
+| `AgentHooks`                     | Interception around each tool call and turn: `before_tool_call` (block) / `after_tool_call` (rewrite) / `on_assistant_message` (rewrite the model's own generated content)                | Not a sandbox — it decides per call; defaults to `NoHooks`                                                                       |
 | `ToolError`                      | A tool's own failure → an error `tool_result` fed back to the model                                                                       | Not a loop-aborting error — the run continues                                                                                    |
 | `ToolOutput`                     | A tool's success value: `text` + `images` (multimodal) + a `terminate` hint                                                               | Not just a string — `String`/`&str` convert in, and `terminate` ends the run only when every call in the batch agrees            |
 | `ModelCaps`                      | Per-model wire knobs from `capabilities(model)`: max-tokens field, long-cache, vision, thinking shape, reasoning-effort, context window   | Not a model catalog or pricing/routing table — the gateway routes and meters; this is the smallest table the wire decisions need |
@@ -376,7 +436,12 @@ two guards, so concurrency never costs correctness:
   many subprocesses / parallel walks at once (`grep` itself fans out over CPU cores, which would
   compound). `buffer_unordered` is safe despite its name: each group yields results tagged with their
   original call index `i`, scattered into a pre-sized `results[i]` — cross-group completion order never
-  reaches the transcript.
+  reaches the transcript. A single `conservative_exclusive` call anywhere in the turn (`bash`'s own
+  override — its mutation scope can't be named by `write_target`) forces the whole turn's concurrency to
+  1 regardless of the cap; `Agent::with_sequential_tools(true)` forces that same concurrency-1 dispatch
+  unconditionally, host-selected rather than inferred from the calls themselves (a deterministic-repro
+  debugging session, or a host policy that never wants two tool calls actually overlapping) — matching
+  pi's own `AgentOptions.toolExecution: "sequential" | "parallel"`.
 
 The transcript stays deterministic regardless of which tool finishes first: every `ToolStart` is sunk
 _before_ dispatch (in call order), and every `ToolEnd` + `ToolResult` block is rebuilt in call order
@@ -451,13 +516,13 @@ in `benches/decode.rs` (framing is ~4× faster on coalesced chunks: ~2 allocatio
 | ----------------- | --------------------------------------------- | --------------------- | ------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | (loop top)        | iteration begins                              | Err(MaxSteps)         | `steps >= max_steps`                                                                 | No request sent; session unchanged                                                                                                                                               |
 | (loop top)        | iteration begins                              | request built         | `steps < max_steps`                                                                  | `ModelRequest` cloned (Arc pointers) from session + cached tool defs                                                                                                             |
-| request built     | `transport.stream()` / stream item            | Err(Transport)        | network/HTTP/decode err (after retries), mid-stream `event: error`, truncated stream | Turn discarded; an `Error` event is sunk; error returned from `run`/`run_events`                                                                                                 |
+| request built     | `transport.stream()` / stream item            | Err(Transport)        | network/HTTP/decode err (after retries), mid-stream `event: error`, truncated stream | An `Error` event is sunk; if real content had already streamed before the failure, it's kept — pushed as an assistant turn tagged `error_message` (not discarded) — otherwise a bare closing record; error returned from `run`/`run_events`                                    |
 | request built     | stream exhausts                               | turn assembled        | always                                                                               | `Accumulator::finish()` returns `Turn`; malformed tool args become recoverable error `tool_result`s                                                                              |
-| any await point   | `cancel` tripped                              | Err(Cancelled)        | client abort                                                                         | Stream/tool futures dropped (HTTP + subprocess killed); no `Error` event (not a fault)                                                                                           |
+| any await point   | `cancel` tripped                              | Err(Cancelled)        | client abort                                                                         | Stream/tool futures dropped (HTTP + subprocess killed); no `Error` event (not a fault). If nothing had streamed yet (pre-connect, or the top-of-loop check), the pending `user` turn is still closed out with an aborted assistant record — not left dangling — so a later prompt can't stack a second consecutive `user` message |
 | turn assembled    | —                                             | turn pushed           | —                                                                                    | `session.push(assistant)`, `record_usage`, `steps += 1`, `TurnEnd` sunk                                                                                                          |
 | turn pushed       | no tool_use blocks / `stop_reason != ToolUse` | done (`Ok`)           | —                                                                                    | Returns to caller; session ends on the assistant turn                                                                                                                            |
-| turn pushed       | `tool_use` blocks present, `ToolUse`          | dispatching tools     | —                                                                                    | `ToolStart` sunk per call, in call order                                                                                                                                         |
-| dispatching tools | all groups resolve (`buffer_unordered`)       | (loop top, next iter) | —                                                                                    | `ToolEnd` sunk + one `tool_results` user message pushed, in call order (carrying any tool images + mid-run steer text); ends the run early instead if every call set `terminate` |
+| turn pushed       | `tool_use` blocks present, `ToolUse`          | dispatching tools     | —                                                                                    | `ToolStart` sunk per call, in call order; the `tool_use` turn is checkpointed here too — *before* any tool runs — so a crash mid-dispatch never loses the record of which calls the model asked for |
+| dispatching tools | all groups resolve (`buffer_unordered`)       | (loop top, next iter) | —                                                                                    | `ToolEnd` sunk + one `tool_results` user message pushed, in call order (carrying any tool images + mid-run steer text); checkpointed again here; ends the run early instead if every call set `terminate` |
 
 ### Per-block accumulation (`Accumulator`)
 
@@ -626,11 +691,11 @@ both fields `None` and never reads them.
 | File                          | What It Does                                                                                                                                                                                                                                                                                                                                                                               |
 | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `lib.rs`                      | Crate root: module list, public re-exports, and the crate-wide `#![cfg_attr(test, allow(...))]` panic-free gate                                                                                                                                                                                                                                                                            |
-| `agent.rs`                    | `Agent` config + `run`/`run_events`/`run_events_cancellable`/`run_events_steered` loop, `Accumulator`, concurrent tool dispatch (threading text/images/`terminate`), tool-driven termination, mid-run + stop-boundary steering, `with_reasoning_effort`, model-aware `new` defaults, hooks, auto-compaction + overflow retry                                                               |
+| `agent.rs`                    | `Agent` config + `run`/`run_cancellable`/`run_events`/`run_events_cancellable`/`run_events_steered` loop, `Accumulator`, concurrent tool dispatch (threading text/images/`terminate`), tool-driven termination, mid-run + stop-boundary steering, `with_reasoning_effort`, model-aware `new` defaults, hooks, auto-compaction + overflow retry                                                               |
 | `message.rs`                  | `Role`/`ContentBlock`(+ `Thinking`/`RedactedThinking`/`Image`; `ToolResult` carries optional `images`; `Text` carries optional `id`/`phase`, OpenAI Responses' replay metadata)/`Message`/`ToolDef`/`StopReason`(+ `Refusal`)/`StreamEvent`/`TokenUsage`(+ `reasoning_tokens`) — the internal model                                                                                                                                                                 |
 | `compaction.rs`               | Context compaction: trigger, cut-point search, summary-prompt build (`summary_request` takes an optional `custom_instructions`, appended as "Additional focus: …" — a manual compaction's client-supplied steering, matching pi's `generateSummary`; never applied to the split-turn prefix call, matching pi's `generateTurnPrefixSummary` not accepting one at all), file-op extraction, and incremental update (`previous_summary`/`SUMMARY_MARKER` fold-forward) — the network-free half of `Agent::compact`                                                                                                                                                                             |
 | `models.rs`                   | `capabilities(model) -> ModelCaps`: minimal per-model wire table (max-tokens field, long-cache, vision, thinking shape, reasoning-effort, context window), matched by id prefix; consumed by the dialects and `Agent::new`                                                                                                                                                                 |
-| `hooks.rs`                    | `AgentHooks` interception trait (`before_tool_call`/`after_tool_call`, both cancellation-aware) + `NoHooks` default                                                                                                                                                                                                                                                                        |
+| `hooks.rs`                    | `AgentHooks` interception trait (`before_tool_call`/`after_tool_call`/`should_stop_after_turn`/`on_assistant_message`, all cancellation-aware) + `NoHooks` default                                                                                                                                                                                                                                                                        |
 | `steering.rs`                 | `Steering` — two shared queues of `SteeringMessage` (text + optional images): `push_steer` (mid-run, folded onto the tool-results turn) and `push`/follow-up (injected at would-stop boundaries), each with its own independent `QueueMode` (`set_steering_mode`/`set_follow_up_mode`); `pending_count` peeks the combined depth of both lanes without draining; plus `request_stop`/`take_stop_requested`, a graceful-stop flag checked at turn boundaries; `clear()` drops both lanes and the stop flag without returning them, for a caller about to swap in a different session's conversation     |
 | `write_lock.rs`               | `WriteLockRegistry` — a process-scoped, path-keyed async-mutex map (`Agent::with_write_locks`) extending same-path write exclusivity across `Agent` rebuilds (a `set_model`/`set_thinking` rebuild, or multiple sessions sharing one registry), layered on top of the per-turn write-target grouping below                                                                                |
 | `tool.rs`                     | `Tool` trait (`run -> ToolOutput`, optional streaming `run_streaming` + `ToolProgress` sink) + `ToolOutput { text, images, terminate }` + `ToolRegistry` (name-keyed `Arc<dyn Tool>` map, last-registration-wins, name-sorted `definitions`)                                                                                                                                               |
@@ -662,7 +727,7 @@ both fields `None` and never reads them.
 | Failure                                                            | What Actually Happens                                                                                            | Recovery                                                                        |
 | ------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
 | `session.steps` reaches `max_steps`                                | `run_events` returns `Error::MaxSteps(n)` before another request is sent; session retains every completed turn   | Caller persists/inspects `Session`; can raise `max_steps` and resume            |
-| Gateway returns non-2xx                                            | Body read as text; `Error::Transport("gateway returned {status}: {detail}")` returned from `stream()`            | First `run`/`run_events` call errors; session has no partial turn               |
+| Gateway returns non-2xx                                            | Body read as text; `Error::Transport("gateway returned {status}: {detail}")` returned from `stream()` — a 401 specifically gets a pointed, actionable message naming the API key as the likely cause instead of a bare status code (pi-parity fix: neither this crate nor pi itself used to say anything more specific than the raw upstream body for a live auth rejection) | First `run`/`run_events` call errors; session has no partial turn               |
 | SSE chunk splits a multi-byte UTF-8 char                           | Raw bytes buffered across chunks; decoding waits for the newline, so the split is invisible                      | Transparent — no error (regression-tested over a real socket)                   |
 | SSE-framed line isn't valid UTF-8                                  | `Error::Transport("invalid UTF-8 in SSE stream: …")` from inside the event stream                                | Stream item `Err`; in-progress turn discarded, error returned                   |
 | SSE `data:` payload isn't valid JSON                               | `Error::Transport("malformed SSE json: …")`                                                                      | Same as above                                                                   |

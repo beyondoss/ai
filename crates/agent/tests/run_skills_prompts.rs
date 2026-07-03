@@ -483,3 +483,94 @@ fn run_binary_prompt_guideline_flag_reaches_the_system_prompt() {
         bodies[0]
     );
 }
+
+#[test]
+fn run_binary_system_prompt_flag_replaces_the_base_prompt() {
+    // Pi-parity audit H58: `run` had no way to override the agent's identity at all — `serve` already
+    // had `--system-prompt`, but a one-shot invocation (e.g. a specialized reviewer/persona for
+    // automation) had no equivalent.
+    let dir = tempfile::tempdir().unwrap();
+    let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "hi",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--system-prompt",
+            "CUSTOM-PERSONA-MARKER: you are a terse code reviewer.",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[0].contains("CUSTOM-PERSONA-MARKER"),
+        "--system-prompt must replace the system prompt sent on the wire: {}",
+        bodies[0]
+    );
+    assert!(
+        !bodies[0].contains("You are the Beyond coding agent"),
+        "the built-in base prompt must be replaced entirely, not merely appended to: {}",
+        bodies[0]
+    );
+}
+
+#[test]
+fn run_binary_append_system_prompt_flag_appends_after_the_base_prompt() {
+    // Pi-parity audit M60: `run` had `--system-prompt` (replace) but no way to layer *extra*
+    // instructions on top of the built-in base without discarding it entirely.
+    let dir = tempfile::tempdir().unwrap();
+    let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "hi",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--append-system-prompt",
+            "APPENDED-INSTRUCTION-MARKER: always cite line numbers.",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[0].contains("APPENDED-INSTRUCTION-MARKER"),
+        "--append-system-prompt must reach the wire system prompt: {}",
+        bodies[0]
+    );
+    assert!(
+        bodies[0].contains("You are the Beyond coding agent"),
+        "the built-in base prompt must still be present, not replaced: {}",
+        bodies[0]
+    );
+}

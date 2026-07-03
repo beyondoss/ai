@@ -128,11 +128,15 @@ impl ModelTransport for GatewayClient {
         // from `prompt_cache_key`'s cache-node affinity in the body — matches pi's
         // `openai-responses.ts` (`headers["x-client-request-id"] = sessionId`) and
         // `openai-completions.ts` (`compat.sendSessionAffinityHeaders`), reusing the same
-        // per-conversation `cache_key` value pi's own `sessionId` carries.
-        let session_affinity_header = matches!(dialect, Dialect::OpenAiResponses | Dialect::OpenAi)
-            .then_some(req.cache_key.as_deref())
-            .flatten()
-            .map(str::to_string);
+        // per-conversation `cache_key` value pi's own `sessionId` carries. Suppressed when the request
+        // opted out of caching (`no_cache`): pinning a one-off request to a specific gateway/cache node
+        // makes no sense when it's explicitly not trying to read a cache back, and pi's own dialects
+        // gate this the same way `no_cache` gates the body's own `prompt_cache_key`/`cache_control`.
+        let session_affinity_header =
+            (matches!(dialect, Dialect::OpenAiResponses | Dialect::OpenAi) && !req.no_cache)
+                .then_some(req.cache_key.as_deref())
+                .flatten()
+                .map(str::to_string);
         // pi's Chat Completions dialect additionally sends `x-session-affinity` alongside `session_id`
         // and `x-client-request-id` (`openai-completions.ts`'s `compat.sendSessionAffinityHeaders`
         // branch); the Responses dialect never sends it.
@@ -375,6 +379,22 @@ async fn send_with_retry(
                 // since an upstream can return an arbitrarily large error page (an HTML error document
                 // from a misconfigured proxy, say) and this ends up in logs and `AgentEvent::Error`.
                 let detail = resp.text().await.unwrap_or_default();
+                // A live 401 (the gateway itself rejected the key, as opposed to `run`/`serve`'s own
+                // preflight "no key given at all" check, which this can't be — a request only reaches
+                // here with *some* key attached) gets a pointed, actionable message naming the actual
+                // cause instead of a bare status code: this crate has no CLI-flag names of its own to
+                // reference (agent-core is layered under any consumer's own `--key`/`AI_AGENT_KEY`-style
+                // flag), so this stays in terms of "the API key" generically, distinct from — and more
+                // specific than — the upstream body alone, which for a 401 is often just `{"error":
+                // {"type":"authentication_error"}}` with no hint at what to actually do about it.
+                if status.as_u16() == 401 {
+                    return Err(Error::Transport(format!(
+                        "gateway rejected the request as unauthorized (401) — the API key being used \
+                         is missing, invalid, expired, or lacks permission for this model; check the \
+                         key and try again. Upstream detail: {}",
+                        truncate_error_body(detail.trim())
+                    )));
+                }
                 return Err(Error::Transport(format!(
                     "gateway returned {status}: {}",
                     truncate_error_body(detail.trim())
@@ -884,6 +904,119 @@ mod tests {
         assert!(
             request.contains("x-session-affinity: session-affinity-test"),
             "expected an `x-session-affinity` header on a Chat Completions request, got:\n{request}"
+        );
+    }
+
+    /// Pi-parity audit task #40: `no_cache` must suppress the session-affinity headers too, not just
+    /// the cache-control blocks — otherwise a request that explicitly opted out of prompt caching still
+    /// pins itself to a specific backend session, defeating the purpose of the opt-out. Matches pi's
+    /// `compat.sendSessionAffinityHeaders` gating, which never fires when caching is disabled for the
+    /// request.
+    #[tokio::test]
+    async fn session_affinity_headers_are_suppressed_when_no_cache_is_set() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let captured_clone = captured.clone();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap();
+            *captured_clone.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let sse = "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                sse.len(),
+                sse
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        });
+
+        let client = GatewayClient::new(format!("http://{addr}"), "test-key").unwrap();
+        let req = ModelRequest::new("llama-3.1-70b", Vec::new(), 100)
+            .with_cache_key("session-affinity-test")
+            .with_no_cache(true);
+        let mut events = client.stream(req).await.unwrap();
+        let _ = events.next().await;
+        server.join().unwrap();
+
+        let request = captured.lock().unwrap().clone();
+        assert!(
+            !request.contains("session_id:"),
+            "expected no `session_id` header when no_cache is set, got:\n{request}"
+        );
+        assert!(
+            !request.contains("x-client-request-id:"),
+            "expected no `x-client-request-id` header when no_cache is set, got:\n{request}"
+        );
+        assert!(
+            !request.contains("x-session-affinity:"),
+            "expected no `x-session-affinity` header when no_cache is set, got:\n{request}"
+        );
+    }
+
+    /// Pi-parity audit "cluster deep-dive" pass flagged: cancelling a turn while a `tool_use`'s
+    /// arguments are still mid-stream leaves that call orphaned (no matching `tool_result`) in the
+    /// persisted session, and — since `repair_cancelled_dispatch` only runs when dispatch itself starts
+    /// — the audit's claim was "no repair happens here at all". That claim missed that
+    /// `repair_orphaned_tool_use` runs generically on *every* real request through `GatewayClient`,
+    /// regardless of how the orphan was produced (see its doc comment: "this covers every other way one
+    /// can reach a request"). Proves that end-to-end over the real wire path, not just the isolated
+    /// `dialect::tests` unit coverage of `repair_orphaned_tool_use` itself: a session whose last message
+    /// is exactly the shape `Accumulator::finish` produces for a tool call cut off mid-argument-stream
+    /// (a `ToolUse` block with a best-effort/possibly-empty `input`, no following `tool_result`) must
+    /// never reach the wire with that call still unanswered.
+    #[tokio::test]
+    async fn an_orphaned_tool_use_from_a_cancelled_mid_argument_stream_never_reaches_the_wire() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let captured_clone = captured.clone();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap();
+            *captured_clone.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let sse = "data: {\"type\":\"message_stop\"}\n\n";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                sse.len(),
+                sse
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        });
+
+        let client = GatewayClient::new(format!("http://{addr}"), "test-key").unwrap();
+        let messages = vec![
+            crate::message::Message::user("edit the file"),
+            // Exactly what a cancelled-mid-argument-stream tool call leaves behind: a `ToolUse` block
+            // (empty `input`, matching `Accumulator::finish`'s fallback for unparseable/truncated
+            // streamed JSON) with no following `tool_result` — the run was aborted before dispatch.
+            crate::message::Message::assistant(vec![crate::message::ContentBlock::tool_use(
+                "orphan-1",
+                "edit",
+                serde_json::json!({}),
+            )]),
+        ];
+        let req = ModelRequest::new("claude-opus-4-8", messages, 100);
+        let mut events = client.stream(req).await.unwrap();
+        let _ = events.next().await;
+        server.join().unwrap();
+
+        let request = captured.lock().unwrap().clone();
+        let body_start = request.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+        let body = &request[body_start..];
+        assert!(
+            body.contains("orphan-1") && body.contains("tool_result"),
+            "expected a synthetic tool_result for the orphaned tool_use `orphan-1`, got body:\n{body}"
+        );
+        // The very shape that 400s if unrepaired: a `tool_use` with no immediately-following
+        // `tool_result` anywhere in the outgoing body.
+        assert!(
+            !body.contains("\"content\":[]"),
+            "no message should reach the wire with empty content either, got body:\n{body}"
         );
     }
 }

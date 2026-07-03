@@ -116,10 +116,24 @@ fn serve_compact_forwards_custom_instructions_to_the_summarization_call() {
     stdin.flush().unwrap();
     let frames = read_until_response(&mut stdout, "compact");
     assert_eq!(frames.last().unwrap()["success"], true, "{frames:#?}");
-    assert_eq!(
-        frames.last().unwrap()["data"]["compacted"],
-        true,
-        "{frames:#?}"
+    let data = &frames.last().unwrap()["data"];
+    assert_eq!(data["compacted"], true, "{frames:#?}");
+    // Pi-parity fix: the response previously carried only `compacted: bool` — pi's own `compact`
+    // returns the generated summary text and a post-compaction token estimate too.
+    let summary = data["summary"]
+        .as_str()
+        .expect("a real compaction must carry its generated summary text");
+    assert!(
+        !summary.is_empty(),
+        "summary must not be empty: {frames:#?}"
+    );
+    assert!(
+        data["tokens_before"].as_u64().is_some(),
+        "tokens_before must be populated on a real compaction: {frames:#?}"
+    );
+    assert!(
+        data["tokens_after"].as_u64().is_some(),
+        "tokens_after must be populated on a real compaction: {frames:#?}"
     );
 
     drop(stdin);

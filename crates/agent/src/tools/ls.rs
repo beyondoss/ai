@@ -4,6 +4,12 @@
 //! hidden by default (`all: true` opts back in — cuts real noise like `.git`/editor swapfiles without
 //! losing access), and directories are always sorted before files (a stable UX improvement independent
 //! of parity with anything else).
+//!
+//! Matches the reference agent on: a missing path or a path that isn't a directory gets a clean, specific
+//! error (`Path not found: {path}` / `Not a directory: {path}`) rather than a raw OS errno string; each
+//! entry's directory-ness is decided by following symlinks (`std::fs::metadata`, not the lstat-like
+//! `DirEntry::file_type`), so a symlink to a directory gets the `/` suffix; and an entry that can't be
+//! stat'd at all (permission race, dangling symlink) is silently skipped rather than guessed at.
 
 use agent_core::tool::Tool;
 use agent_core::{ToolError, ToolOutput};
@@ -52,6 +58,23 @@ impl Tool for Ls {
         // "src-old": '-' sorts below '/' byte-wise, so "src-old/" would sort before "src/"). The
         // display suffix is appended only after sorting, matching the reference agent's own two-step
         // sort-then-suffix order.
+        // Pi-parity fix: distinguish "doesn't exist" from "not a directory" with clean, specific
+        // messages (matching pi's own `Path not found: {path}`/`Not a directory: {path}`) before ever
+        // calling `read_dir` — rather than a raw OS errno string covering both. `metadata` (not
+        // `symlink_metadata`) follows a symlink to check the *target*, matching pi's own `ops.stat`
+        // (Node's `fs.stat` follows symlinks) and ordinary `ls`'s own expectation that listing a
+        // symlink-to-a-directory lists the target's contents.
+        match std::fs::metadata(path) {
+            Ok(meta) => {
+                if !meta.is_dir() {
+                    return Err(ToolError::Execution(format!("Not a directory: {path}")));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ToolError::Execution(format!("Path not found: {path}")));
+            }
+            Err(e) => return Err(ToolError::Execution(format!("ls {path}: {e}"))),
+        }
         let mut entries: Vec<(String, bool)> = Vec::new();
         let dir =
             std::fs::read_dir(path).map_err(|e| ToolError::Execution(format!("ls {path}: {e}")))?;
@@ -62,8 +85,17 @@ impl Tool for Ls {
             if !all && name.starts_with('.') {
                 continue;
             }
-            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            entries.push((name.into_owned(), is_dir));
+            // Pi-parity fix: `DirEntry::file_type` is lstat-like — it reports a symlink's own type, not
+            // its target's, so a symlink pointing at a directory was mislabeled as a plain file (no
+            // trailing `/`). pi's own `ls.ts` stats each entry with `fs.stat` (follows symlinks), so use
+            // `std::fs::metadata` on the full entry path here to match. This also subsumes the
+            // unstattable-entry case: a vanished-between-readdir-and-here entry or a dangling symlink
+            // both fail `metadata` and are skipped (hidden), matching pi's own catch-and-skip behavior,
+            // instead of silently guessing `is_dir = false` for something we couldn't actually confirm.
+            let Ok(meta) = std::fs::metadata(entry.path()) else {
+                continue;
+            };
+            entries.push((name.into_owned(), meta.is_dir()));
         }
         // Directories first, then case-insensitive alphabetical by bare name — matches pi's
         // `a.toLowerCase().localeCompare(b.toLowerCase())`, not a byte-order compare (which would sort
@@ -145,6 +177,87 @@ mod tests {
             .unwrap()
             .text;
         assert!(all.contains(".hidden"));
+    }
+
+    #[tokio::test]
+    async fn reports_a_clean_not_found_message_for_a_missing_path() {
+        // Pi-parity fix: a raw OS errno string ("No such file or directory (os error 2)") covered both
+        // "doesn't exist" and "not a directory" alike — pi's own `ls.ts` distinguishes them with clean,
+        // specific messages.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let err = Ls
+            .run(json!({ "path": missing.to_str().unwrap() }))
+            .await
+            .unwrap_err();
+        let ToolError::Execution(msg) = err else {
+            panic!("expected Execution, got {err:?}");
+        };
+        assert!(
+            msg.contains(&format!("Path not found: {}", missing.to_str().unwrap())),
+            "got: {msg}"
+        );
+        assert!(
+            !msg.contains("os error"),
+            "must not leak raw OS errno text: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reports_a_clean_not_a_directory_message_for_a_plain_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("plain.txt");
+        std::fs::write(&file, "x").unwrap();
+        let err = Ls
+            .run(json!({ "path": file.to_str().unwrap() }))
+            .await
+            .unwrap_err();
+        let ToolError::Execution(msg) = err else {
+            panic!("expected Execution, got {err:?}");
+        };
+        assert_eq!(msg, format!("Not a directory: {}", file.to_str().unwrap()));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_symlink_to_a_directory_is_shown_with_the_directory_suffix() {
+        // Pi-parity fix: `DirEntry::file_type()` is lstat-like and reported the symlink's own type
+        // (never a directory), not the target's — pi's `ls.ts` follows symlinks via `fs.stat` when
+        // deciding the `/` suffix.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real_dir");
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("link_to_dir")).unwrap();
+        let out = Ls
+            .run(json!({ "path": dir.path().to_str().unwrap() }))
+            .await
+            .unwrap()
+            .text;
+        assert!(
+            out.contains("link_to_dir/"),
+            "a symlink to a directory must be shown with a trailing slash: {out}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_dangling_symlink_is_listed_as_a_plain_entry_not_mislabeled_a_directory() {
+        // Related regression guard for the same fix: an entry whose type this process can't fully
+        // confirm (here, a symlink target that doesn't exist) must never be mislabeled as a directory —
+        // it should either be skipped (unstattable) or shown as a plain, unsuffixed entry, but never
+        // get a `/` it hasn't earned.
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), dir.path().join("dangling"))
+            .unwrap();
+        let out = Ls
+            .run(json!({ "path": dir.path().to_str().unwrap() }))
+            .await
+            .unwrap()
+            .text;
+        assert!(
+            !out.contains("dangling/"),
+            "a dangling symlink must never be shown as a directory: {out}"
+        );
     }
 
     #[tokio::test]

@@ -19,8 +19,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agent_core::{Agent, GatewayClient, Session, StreamEvent};
+use beyond_ai_agent::policy::ToolPolicy;
 use beyond_ai_agent::session_store::{
-    SessionMeta, SessionRepo, SessionStore, canonical_cwd, default_session_dir,
+    SessionMeta, SessionRepo, SessionStore, canonical_cwd, default_session_dir, fork_by_arg,
+    sessions_root,
 };
 use beyond_ai_agent::{serve, tools};
 use clap::{Parser, Subcommand};
@@ -172,6 +174,10 @@ enum Command {
         /// Max loop iterations before bailing.
         #[arg(long, default_value_t = agent_core::agent::DEFAULT_MAX_STEPS)]
         max_steps: u32,
+        /// Per-turn output token ceiling. `serve`'s identical flag; defaults to the model's own
+        /// capability-table `max_output` (see `agent_core::models::capabilities`) when omitted.
+        #[arg(long, env = "AI_AGENT_MAX_TOKENS")]
+        max_tokens: Option<u32>,
         /// Use the 1-hour prompt-cache TTL (vs 5 minutes); helps when turns are spaced out. `serve`'s
         /// identical flag; `run`'s one-shot single-turn case rarely benefits, but a multi-message
         /// invocation (several `tasks` sent as sequential turns) can.
@@ -188,6 +194,20 @@ enum Command {
         /// neither shape. `serve`'s identical flag.
         #[arg(long, value_parser = parse_reasoning_effort)]
         reasoning_effort: Option<agent_core::ReasoningEffort>,
+        /// Sampling temperature. Omitted (leaving the provider default) unless set. Silently ignored by
+        /// Anthropic while `--thinking` is set (Anthropic forbids the two together). `serve`'s identical
+        /// flag.
+        #[arg(long)]
+        temperature: Option<f64>,
+        /// Replace the built-in base system prompt entirely. `serve`'s identical flag — e.g. a
+        /// specialized reviewer/persona invocation for automation that needs a wholly different agent
+        /// identity, not just extra instructions layered on top (see `--append-system-prompt`).
+        #[arg(long, env = "AI_AGENT_SYSTEM_PROMPT")]
+        system_prompt: Option<String>,
+        /// Append extra instructions after the base system prompt (built-in, or `--system-prompt` if
+        /// also given). `serve`'s identical flag.
+        #[arg(long, env = "AI_AGENT_APPEND_SYSTEM_PROMPT")]
+        append_system_prompt: Option<String>,
         /// Trust `cwd` for this run only, so a project-local `.claude/SYSTEM.md` is honored even if
         /// `cwd` isn't in the persisted allowlist (`agent trust <path>`). A session-scoped override,
         /// not a permanent grant — see `agent trust` to record one.
@@ -199,6 +219,12 @@ enum Command {
         /// somehow given.
         #[arg(long, default_value_t = false)]
         force_untrusted: bool,
+        /// Model context window (tokens); the loop summarizes older turns to stay below it. Defaults
+        /// to the model's own capability-table window (see `agent_core::models::capabilities`) — only
+        /// pass this to pin a fixed budget regardless of which model ends up used. `serve`'s identical
+        /// flag.
+        #[arg(long, env = "AI_AGENT_CONTEXT_WINDOW")]
+        context_window: Option<u32>,
         /// Compaction headroom (tokens) reserved below the context window before it fires. Defaults to
         /// `CompactionConfig::default()`'s 24,000. `serve`'s identical flag.
         #[arg(long, env = "AI_AGENT_COMPACTION_RESERVE_TOKENS")]
@@ -223,17 +249,44 @@ enum Command {
         /// `bash` on `$PATH`, else `sh`). Matches pi's own `shellPath` setting. `serve`'s identical flag.
         #[arg(long, env = "AI_AGENT_BASH_SHELL_PATH")]
         bash_shell_path: Option<String>,
+        /// Prepend this line to every `bash` command, in the same shell invocation (e.g. sourcing a
+        /// project's env setup, activating a venv). Matches pi's own `shellCommandPrefix` setting.
+        /// `serve`'s identical flag.
+        #[arg(long, env = "AI_AGENT_BASH_COMMAND_PREFIX")]
+        bash_command_prefix: Option<String>,
         /// Restrict the tool set to exactly these names (comma-separated), dropping everything else.
-        /// Combine with `--exclude-tools` to carve one back out of the allow-list.
-        #[arg(long, value_delimiter = ',')]
+        /// Combine with `--exclude-tools` to carve one back out of the allow-list. `serve`'s identical
+        /// flag/env var — a deployment convention setting this env var to sandbox an agent must apply
+        /// here too, not just to `serve`.
+        #[arg(long, env = "AI_AGENT_TOOLS", value_delimiter = ',')]
         tools: Option<Vec<String>>,
         /// Drop these tools (comma-separated) from the default set — e.g. `--exclude-tools bash,write`
-        /// for a read-only reviewer that can't run shell commands or mutate files.
-        #[arg(long, value_delimiter = ',')]
+        /// for a read-only reviewer that can't run shell commands or mutate files. `serve`'s identical
+        /// flag/env var.
+        #[arg(long, env = "AI_AGENT_EXCLUDE_TOOLS", value_delimiter = ',')]
         exclude_tools: Option<Vec<String>>,
         /// Register no tools at all — a pure-conversation run. Wins over `--tools`/`--exclude-tools`.
         #[arg(long, default_value_t = false)]
         no_tools: bool,
+        /// Force every batch of tool calls in a turn to run one at a time instead of the default
+        /// bounded-concurrent dispatch (`agent_core::Agent::with_sequential_tools`) — e.g. for a
+        /// deterministic repro, or a host policy that never wants two tool calls actually overlapping.
+        /// `serve`'s identical flag.
+        #[arg(long, default_value_t = false)]
+        sequential_tools: bool,
+        /// Block every call to this tool (comma-separated, repeatable), even though it stays visible
+        /// and registered — unlike `--exclude-tools` (the model never sees an excluded tool exists at
+        /// all), a denied call still surfaces to the model as a normal error `tool_result` explaining
+        /// it was blocked by policy. Installs an `agent_core::AgentHooks` permission gate
+        /// (`policy::ToolPolicy`) on the agent; a no-op (no hook installed at all) when combined with
+        /// `--deny-bash-pattern` leaves the list empty.
+        #[arg(long, value_delimiter = ',')]
+        deny_tool: Vec<String>,
+        /// Block a `bash` call whenever its command contains this substring, case-insensitively
+        /// (comma-separated, repeatable) — e.g. `--deny-bash-pattern "rm -rf"`. Combines with
+        /// `--deny-tool` under the same policy hook.
+        #[arg(long, value_delimiter = ',')]
+        deny_bash_pattern: Vec<String>,
         /// Disable *standard-root* skills discovery/loading (`~/.claude/skills`, `<cwd>/.claude/skills`)
         /// — no `<available_skills>` listing in the system prompt from either, and a `/skill:name`
         /// invocation in the task message is sent through unexpanded unless it resolves against a
@@ -276,6 +329,16 @@ enum Command {
         /// guidelines.
         #[arg(long = "prompt-guideline", value_name = "TEXT")]
         prompt_guidelines: Vec<String>,
+        /// Fork an existing session into a brand-new one and continue from there, rather than reopening
+        /// it in place — by id (searched in this project first, then every other project's own session
+        /// directory under `~/.claude/sessions/`) or by a direct path to its `.jsonl` file (any
+        /// project). Matches pi's own cross-project `--fork <path|id>`; the forked copy's `cwd` is the
+        /// *current* directory, not wherever the source session was originally recorded against. Wins
+        /// over `--session`/`--continue` if more than one is given — a fork always starts a fresh child,
+        /// never reopens one in place. Forks the whole active transcript; `serve`'s `fork`/`fork_at_entry`
+        /// RPC commands cover forking at an earlier point once a session is running.
+        #[arg(long, value_name = "PATH_OR_ID")]
+        fork: Option<String>,
         /// Persist this run to a specific session file, creating it if missing or continuing it if it
         /// already exists — so a later `run --session <path>` picks up where this one left off. Wins
         /// over `--continue` if both are given.
@@ -295,6 +358,16 @@ enum Command {
         /// first run here. Ignored if `--session` is also given.
         #[arg(long, short = 'c', default_value_t = false)]
         r#continue: bool,
+        /// Use this directory as the session repo instead of the default `~/.claude/sessions/
+        /// <encoded-cwd>/` — matches `serve`'s own `--session-dir`/`AI_AGENT_SESSION_DIR` (same flag,
+        /// same meaning: the directory itself becomes the repo root, not a further per-cwd subdirectory
+        /// under it). Affects `--continue` and `--fork <id>`'s target project and cross-project search
+        /// root (that search then spans this directory's own siblings, matching how `serve`'s
+        /// `list_all_sessions` scopes its cross-project scan off `--session-dir`'s parent). Has no
+        /// effect on `--session <path>` (already names an exact file directly) or a plain no-flag run
+        /// (never persisted at all, so there is no repo to redirect).
+        #[arg(long, env = "AI_AGENT_SESSION_DIR")]
+        session_dir: Option<String>,
         /// After the run completes, export the transcript as a self-contained HTML file at this path
         /// (parent directories are created as needed) — the same rendering `serve`'s `export_html` RPC
         /// command produces, for a one-shot run with no server involved.
@@ -324,6 +397,16 @@ enum Command {
         /// Persist many sessions under this directory (enables list/switch/fork/name commands).
         #[arg(long, env = "AI_AGENT_SESSION_DIR")]
         session_dir: Option<String>,
+        /// Use this exact session id instead of a freshly generated one — a caller (a script, a test
+        /// harness) that wants a known, predictable id to correlate against rather than parsing it back
+        /// out of `get_state`/the startup `{"kind":"session", id, …}` banner. Applies only when a *new*
+        /// `SessionMeta` is actually minted: a brand-new `--session-file` (one that doesn't already
+        /// exist), `--no-session-persistence`, or the default/`--session-dir` repo mode when no existing
+        /// session matches this `cwd` yet; ignored when reattaching to an existing one (already has a
+        /// fixed id from disk) — matches `run`'s identical flag/contract exactly (`main.rs::Run::
+        /// session_id`).
+        #[arg(long)]
+        session_id: Option<String>,
         /// Skip persistence entirely, even without `--session-file`/`--session-dir`. Without this,
         /// `serve` defaults to `~/.claude/sessions/<encoded-cwd>/` rather than silently running
         /// in-memory-only — pass this for the rare case that's genuinely what you want (e.g. a
@@ -347,6 +430,11 @@ enum Command {
         /// pass this to pin a fixed budget that survives a `set_model` switch to a different model.
         #[arg(long, env = "AI_AGENT_CONTEXT_WINDOW")]
         context_window: Option<u32>,
+        /// Per-turn output token ceiling. Defaults to the model's own capability-table `max_output`
+        /// (see `agent_core::models::capabilities`), floored at a sane minimum — only pass this to
+        /// override that, e.g. capping generation length or lifting it past the model-derived default.
+        #[arg(long, env = "AI_AGENT_MAX_TOKENS")]
+        max_tokens: Option<u32>,
         /// Use the 1-hour prompt-cache TTL (vs 5 minutes); helps when turns are spaced out.
         #[arg(long, default_value_t = false)]
         cache_long: bool,
@@ -359,6 +447,11 @@ enum Command {
         /// neither shape.
         #[arg(long, value_parser = parse_reasoning_effort)]
         reasoning_effort: Option<agent_core::ReasoningEffort>,
+        /// Sampling temperature. Omitted (leaving the provider default) unless set. Silently ignored by
+        /// Anthropic while `--thinking` is set (Anthropic forbids the two together). `run`'s identical
+        /// flag.
+        #[arg(long)]
+        temperature: Option<f64>,
         /// Trust `cwd` for this run only, so a project-local `.claude/SYSTEM.md` is honored even if
         /// `cwd` isn't in the persisted allowlist (`agent trust <path>`). A session-scoped override,
         /// not a permanent grant — see `agent trust` to record one.
@@ -398,6 +491,11 @@ enum Command {
         /// confusing spawn error on the first `bash` call.
         #[arg(long, env = "AI_AGENT_BASH_SHELL_PATH")]
         bash_shell_path: Option<String>,
+        /// Prepend this line to every `bash` command, in the same shell invocation (e.g. sourcing a
+        /// project's env setup, activating a venv). Matches pi's own `shellCommandPrefix` setting.
+        /// Fixed for the process, like `--bash-shell-path`; survives `set_model`/`set_thinking` rebuilds.
+        #[arg(long, env = "AI_AGENT_BASH_COMMAND_PREFIX")]
+        bash_command_prefix: Option<String>,
         /// Restrict the tool set to exactly these names (comma-separated), dropping everything else.
         /// Fixed for the process, like `--system-prompt`; survives `set_model`/`set_thinking` rebuilds.
         #[arg(long, env = "AI_AGENT_TOOLS", value_delimiter = ',')]
@@ -409,6 +507,21 @@ enum Command {
         /// Register no tools at all — a pure-conversation session. Wins over `--tools`/`--exclude-tools`.
         #[arg(long, default_value_t = false)]
         no_tools: bool,
+        /// Force every batch of tool calls in a turn to run one at a time instead of the default
+        /// bounded-concurrent dispatch (`agent_core::Agent::with_sequential_tools`). `run`'s identical
+        /// flag.
+        #[arg(long, default_value_t = false)]
+        sequential_tools: bool,
+        /// Block every call to this tool (comma-separated, repeatable), even though it stays visible
+        /// and registered — unlike `--exclude-tools`, a denied call still surfaces to the model as a
+        /// normal error `tool_result` explaining it was blocked by policy, rather than the tool being
+        /// invisible outright. `run`'s identical flag.
+        #[arg(long, env = "AI_AGENT_DENY_TOOL", value_delimiter = ',')]
+        deny_tool: Vec<String>,
+        /// Block a `bash` call whenever its command contains this substring, case-insensitively
+        /// (comma-separated, repeatable). `run`'s identical flag.
+        #[arg(long, env = "AI_AGENT_DENY_BASH_PATTERN", value_delimiter = ',')]
+        deny_bash_pattern: Vec<String>,
         /// Restrict `cycle_model`'s candidate list to exactly these ids, in this order
         /// (comma-separated) — e.g. `--models claude-opus-4-8,claude-sonnet-4-5,gpt-5`.
         /// `set_model`/`get_available_models` are unaffected; empty/absent cycles the full known-model
@@ -480,6 +593,41 @@ enum Command {
     ClearTrust {
         /// The project directory to clear. Defaults to the current directory.
         path: Option<String>,
+    },
+    /// Report `path`'s (default: the current directory) tri-state trust decision — `trusted`,
+    /// `untrusted`, or `unknown` — walking up through its ancestors for the first explicit entry
+    /// (`TrustStore::lookup`), the same resolution `trust`/`untrust`/`clear-trust` use internally but
+    /// previously had no read-only way to actually query.
+    TrustStatus {
+        /// The project directory to query. Defaults to the current directory.
+        path: Option<String>,
+    },
+    /// View or update persisted defaults for `run`/`serve` flags — model, gateway URL, session
+    /// directory — stored at `~/.claude/settings.json` (see `settings::SettingsStore`) and consulted as
+    /// the last fallback after an explicit `--flag`/environment variable, before this crate's own
+    /// built-in default. With no flags, prints the currently stored values. Mirrors `agent trust`/
+    /// `agent untrust` managing the trust store the same out-of-band way.
+    Settings {
+        /// Set the stored default model (used when neither `--model` nor `AI_AGENT_MODEL` is given).
+        #[arg(long)]
+        model: Option<String>,
+        /// Clear the stored default model.
+        #[arg(long, default_value_t = false)]
+        clear_model: bool,
+        /// Set the stored default gateway URL (used when neither `--gateway-url` nor `AI_GATEWAY_URL`
+        /// is given).
+        #[arg(long)]
+        gateway_url: Option<String>,
+        /// Clear the stored default gateway URL.
+        #[arg(long, default_value_t = false)]
+        clear_gateway_url: bool,
+        /// Set the stored default session directory (used when neither `--session-dir` nor
+        /// `AI_AGENT_SESSION_DIR` is given).
+        #[arg(long)]
+        session_dir: Option<String>,
+        /// Clear the stored default session directory.
+        #[arg(long, default_value_t = false)]
+        clear_session_dir: bool,
     },
     /// Render an existing session's `.jsonl` file as a self-contained HTML transcript and exit — pure
     /// offline rendering of what's already on disk, no gateway/key/model involved at all (unlike `run
@@ -557,20 +705,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             gateway_url,
             key,
             max_steps,
+            max_tokens,
             cache_long,
             thinking,
             reasoning_effort,
+            temperature,
+            system_prompt,
+            append_system_prompt,
             trust_project,
             force_untrusted,
+            context_window,
             compaction_reserve_tokens,
             compaction_keep_recent_tokens,
             retry_max_retries,
             retry_base_delay_ms,
             bash_timeout_ms,
             bash_shell_path,
+            bash_command_prefix,
             tools,
             exclude_tools,
             no_tools,
+            sequential_tools,
+            deny_tool,
+            deny_bash_pattern,
             no_skills,
             no_prompt_templates,
             no_context_files,
@@ -578,9 +735,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             extra_prompt_template_paths,
             name,
             prompt_guidelines,
+            fork,
             session,
             session_id,
             r#continue,
+            session_dir,
             export,
             json,
         } => {
@@ -590,20 +749,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 gateway_url,
                 key,
                 max_steps,
+                max_tokens,
                 cache_long,
                 thinking,
                 reasoning_effort,
+                temperature,
+                system_prompt,
+                append_system_prompt,
                 trust_project,
                 force_untrusted,
+                context_window,
                 compaction_reserve_tokens,
                 compaction_keep_recent_tokens,
                 retry_max_retries,
                 retry_base_delay_ms,
                 bash_timeout_ms,
                 bash_shell_path,
+                bash_command_prefix,
                 tools,
                 exclude_tools,
                 no_tools,
+                sequential_tools,
+                deny_tool,
+                deny_bash_pattern,
                 no_skills,
                 no_prompt_templates,
                 no_context_files,
@@ -611,9 +779,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 extra_prompt_template_paths,
                 name,
                 prompt_guidelines,
+                fork,
                 session,
                 session_id,
                 r#continue,
+                session_dir,
                 export,
                 json,
             )
@@ -625,8 +795,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             key,
             session_file,
             session_dir,
+            session_id,
             no_session_persistence,
             max_steps,
+            max_tokens,
             system_prompt,
             append_system_prompt,
             no_context_files,
@@ -634,6 +806,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cache_long,
             thinking,
             reasoning_effort,
+            temperature,
             trust_project,
             force_untrusted,
             compaction_reserve_tokens,
@@ -642,9 +815,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             retry_base_delay_ms,
             bash_timeout_ms,
             bash_shell_path,
+            bash_command_prefix,
             tools,
             exclude_tools,
             no_tools,
+            sequential_tools,
+            deny_tool,
+            deny_bash_pattern,
             models,
             no_skills,
             no_prompt_templates,
@@ -667,6 +844,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return Err("--name requires a non-empty value".into());
                 }
             }
+            // Same filesystem-path-injection concern as `run`'s identical check (`--session-id` becomes
+            // part of a persisted session's filename) — see `is_valid_session_id`'s doc comment.
+            if let Some(id) = &session_id {
+                if !is_valid_session_id(id) {
+                    return Err(format!(
+                        "--session-id {id:?} is invalid: must contain only letters, digits, '.', '_', \
+                         '-', and start/end with a letter or digit — it becomes part of a filesystem path"
+                    )
+                    .into());
+                }
+            }
             let system = system_prompt.unwrap_or_else(|| {
                 // Shell-path override doesn't affect this registry's use (listing tool
                 // names/descriptions for the default system prompt) — `describe()` doesn't mention it.
@@ -679,21 +867,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 default_system_prompt(&reg, &prompt_guidelines)
             });
+            // A stored `agent settings` default sits between an explicit flag/env var and this crate's
+            // own built-in default — same convention `run_task` applies (see its identical comment).
+            let stored_settings = beyond_ai_agent::settings::SettingsStore::open_default();
+            let resolved_session_dir = session_dir.or_else(|| {
+                // Only synthesize a stored default when *neither* explicit flag was given —
+                // `Persistence::open` checks `session_dir` before `session_file`, so filling in a
+                // stored session-dir default even when the operator explicitly chose `--session-file`
+                // would silently switch them into repo mode instead of the file mode they asked for.
+                if session_file.is_none() {
+                    stored_settings.get().default_session_dir.clone()
+                } else {
+                    None
+                }
+            });
             serve::serve(serve::ServeConfig {
-                gateway: gateway_url.unwrap_or_else(|| DEFAULT_GATEWAY.to_string()),
+                gateway: gateway_url
+                    .or_else(|| stored_settings.get().default_gateway_url.clone())
+                    .unwrap_or_else(|| DEFAULT_GATEWAY.to_string()),
                 key,
-                model: model.unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+                model: model
+                    .or_else(|| stored_settings.get().default_model.clone())
+                    .unwrap_or_else(|| DEFAULT_MODEL.to_string()),
                 max_steps,
+                max_tokens,
                 system,
                 append_system: append_system_prompt,
                 context_files: !no_context_files,
                 session_file,
-                session_dir,
+                session_dir: resolved_session_dir,
+                session_id,
                 no_session_persistence,
                 context_window,
                 cache_long,
                 thinking,
                 reasoning_effort,
+                temperature,
                 trust_project,
                 force_untrusted,
                 compaction_reserve_tokens,
@@ -702,9 +911,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 retry_base_delay_ms: retry_base_delay_ms.map(std::time::Duration::from_millis),
                 bash_timeout_ms,
                 bash_shell_path,
+                bash_command_prefix,
                 tools,
                 exclude_tools,
                 no_tools,
+                sequential_tools,
+                deny_tool,
+                deny_bash_pattern,
                 models: models.unwrap_or_default(),
                 no_skills,
                 no_prompt_templates,
@@ -730,8 +943,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string_pretty(&reg.definitions())?);
         }
         Command::ListModels => {
+            // Pi-parity fix: previously a bare list of ids — pi's own `--list-models` prints a table
+            // (provider/model/context/max-out/thinking/images) built from data its model catalogue
+            // already carries. Beyond has no separate provider field (a model id is forwarded verbatim;
+            // see `agent_core::models`'s own module doc comment), so this mirrors the rest of pi's
+            // columns from `agent_core::capabilities`, which already computes every one of them for
+            // wire-shaping — nothing new is invented here, just surfaced.
+            println!(
+                "{:<22} {:>10} {:>9} {:<8} {:<6}",
+                "model", "context", "max-out", "thinking", "vision"
+            );
             for model in serve::available_models() {
-                println!("{model}");
+                let caps = agent_core::capabilities(model);
+                let thinking = caps.reasoning_effort
+                    || caps.thinking != agent_core::models::ThinkingShape::None;
+                println!(
+                    "{:<22} {:>10} {:>9} {:<8} {:<6}",
+                    model,
+                    caps.context_window,
+                    caps.max_output,
+                    if thinking { "yes" } else { "no" },
+                    if caps.supports_vision { "yes" } else { "no" },
+                );
             }
         }
         Command::Trust { path } => {
@@ -760,6 +993,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut store = beyond_ai_agent::trust_store::TrustStore::open_default();
             store.clear(&dir)?;
             println!("cleared: {}", dir.display());
+        }
+        Command::TrustStatus { path } => {
+            let dir = match path {
+                Some(p) => PathBuf::from(p),
+                None => std::env::current_dir()?,
+            };
+            let store = beyond_ai_agent::trust_store::TrustStore::open_default();
+            let status = match store.lookup(&dir) {
+                beyond_ai_agent::trust_store::Trust::Trusted => "trusted",
+                beyond_ai_agent::trust_store::Trust::Untrusted => "untrusted",
+                beyond_ai_agent::trust_store::Trust::Unknown => "unknown",
+            };
+            println!("{status}: {}", dir.display());
+        }
+        Command::Settings {
+            model,
+            clear_model,
+            gateway_url,
+            clear_gateway_url,
+            session_dir,
+            clear_session_dir,
+        } => {
+            let mut store = beyond_ai_agent::settings::SettingsStore::open_default();
+            let any_write = model.is_some()
+                || clear_model
+                || gateway_url.is_some()
+                || clear_gateway_url
+                || session_dir.is_some()
+                || clear_session_dir;
+            if model.is_some() || clear_model {
+                store.set_default_model(model)?;
+            }
+            if gateway_url.is_some() || clear_gateway_url {
+                store.set_default_gateway_url(gateway_url)?;
+            }
+            if session_dir.is_some() || clear_session_dir {
+                store.set_default_session_dir(session_dir)?;
+            }
+            if any_write {
+                println!("updated settings:");
+            }
+            let s = store.get();
+            println!(
+                "default_model: {}",
+                s.default_model.as_deref().unwrap_or("(not set)")
+            );
+            println!(
+                "default_gateway_url: {}",
+                s.default_gateway_url.as_deref().unwrap_or("(not set)")
+            );
+            println!(
+                "default_session_dir: {}",
+                s.default_session_dir.as_deref().unwrap_or("(not set)")
+            );
         }
         Command::Export { session, output } => {
             let (store, sess) =
@@ -832,14 +1119,34 @@ fn read_stdin_if_piped() -> Option<String> {
 /// have quietly recovered from. A retried attempt's own streamed output (text/JSON events) follows
 /// directly after a `[retrying...]` stderr notice — nothing is erased, matching how `serve` demarcates
 /// attempts with an `auto_retry` frame rather than hiding the failed one.
+/// A cancelled turn (SIGTERM/SIGINT — see the `ShutdownSignal` wiring in `run_task`, or a future
+/// `--timeout` equivalent) is an expected, clean stop, not a crash: printing it through `main`'s
+/// default `Result` `Termination` would dump `Error: Cancelled` (the bare enum variant, via `Debug`)
+/// with no context a script/CI caller could act on. Matches the `[refused]`/exit(1) precedent just
+/// below in `run_task` — a clear bracketed status line on stderr, then a distinct process exit
+/// instead of unwinding further. Any other error still propagates normally via `?`.
+fn unwrap_turn_result(
+    result: agent_core::Result<agent_core::StopReason>,
+) -> Result<agent_core::StopReason, Box<dyn std::error::Error>> {
+    match result {
+        Ok(reason) => Ok(reason),
+        Err(agent_core::Error::Cancelled) => {
+            eprintln!("[cancelled]");
+            std::process::exit(1);
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 async fn run_turn(
     agent: &Agent,
     session: &mut Session,
     json: bool,
+    cancel: &agent_core::CancellationToken,
 ) -> agent_core::Result<agent_core::StopReason> {
     let mut attempt = 0u32;
     loop {
-        let result = run_turn_once(agent, session, json).await;
+        let result = run_turn_once(agent, session, json, cancel).await;
         match &result {
             Err(e)
                 if attempt < beyond_ai_agent::retry::MAX_RUN_RETRIES
@@ -875,44 +1182,54 @@ async fn run_turn_once(
     agent: &Agent,
     session: &mut Session,
     json: bool,
+    cancel: &agent_core::CancellationToken,
 ) -> agent_core::Result<agent_core::StopReason> {
     let mut stop_reason = agent_core::StopReason::default();
     if json {
         agent
-            .run_events(session, |ev| {
-                if let agent_core::AgentEvent::TurnEnd { stop_reason: r, .. } = &ev {
-                    stop_reason = *r;
-                }
-                if let Ok(line) = serde_json::to_string(&ev) {
-                    println!("{line}");
-                    let _ = std::io::stdout().flush();
-                }
-            })
+            .run_events_cancellable(
+                session,
+                |ev| {
+                    if let agent_core::AgentEvent::TurnEnd { stop_reason: r, .. } = &ev {
+                        stop_reason = *r;
+                    }
+                    if let Ok(line) = serde_json::to_string(&ev) {
+                        println!("{line}");
+                        let _ = std::io::stdout().flush();
+                    }
+                },
+                cancel.clone(),
+            )
             .await?;
         return Ok(stop_reason);
     }
     agent
-        .run(session, |ev| match ev {
-            StreamEvent::TextDelta { text, .. } => {
-                print!("{text}");
-                let _ = std::io::stdout().flush();
-            }
-            StreamEvent::ToolUseStart { name, .. } => {
-                // No trailing newline: `InputJsonDelta` fragments print immediately after, live, on
-                // this same line — a growing preview of the call's arguments as they stream in,
-                // rather than the model appearing to hang until the whole call (and its result) land.
-                print!("\n[tool: {name}] ");
-                let _ = std::io::stdout().flush();
-            }
-            StreamEvent::InputJsonDelta { partial_json, .. } => {
-                print!("{partial_json}");
-                let _ = std::io::stdout().flush();
-            }
-            StreamEvent::MessageStop { stop_reason: r } => {
-                stop_reason = *r;
-            }
-            _ => {}
-        })
+        .run_cancellable(
+            session,
+            |ev| match ev {
+                StreamEvent::TextDelta { text, .. } => {
+                    print!("{text}");
+                    let _ = std::io::stdout().flush();
+                }
+                StreamEvent::ToolUseStart { name, .. } => {
+                    // No trailing newline: `InputJsonDelta` fragments print immediately after, live,
+                    // on this same line — a growing preview of the call's arguments as they stream in,
+                    // rather than the model appearing to hang until the whole call (and its result)
+                    // land.
+                    print!("\n[tool: {name}] ");
+                    let _ = std::io::stdout().flush();
+                }
+                StreamEvent::InputJsonDelta { partial_json, .. } => {
+                    print!("{partial_json}");
+                    let _ = std::io::stdout().flush();
+                }
+                StreamEvent::MessageStop { stop_reason: r } => {
+                    stop_reason = *r;
+                }
+                _ => {}
+            },
+            cancel.clone(),
+        )
         .await?;
     println!();
     Ok(stop_reason)
@@ -1000,20 +1317,29 @@ async fn run_task(
     gateway_url: Option<String>,
     key: Option<String>,
     max_steps: u32,
+    max_tokens: Option<u32>,
     cache_long: bool,
     thinking: Option<u32>,
     reasoning_effort: Option<agent_core::ReasoningEffort>,
+    temperature: Option<f64>,
+    system_prompt: Option<String>,
+    append_system_prompt: Option<String>,
     trust_project: bool,
     force_untrusted: bool,
+    context_window: Option<u32>,
     compaction_reserve_tokens: Option<u32>,
     compaction_keep_recent_tokens: Option<u32>,
     retry_max_retries: Option<u32>,
     retry_base_delay_ms: Option<u64>,
     bash_timeout_ms: Option<u64>,
     bash_shell_path: Option<String>,
+    bash_command_prefix: Option<String>,
     tools_allow: Option<Vec<String>>,
     tools_exclude: Option<Vec<String>>,
     no_tools: bool,
+    sequential_tools: bool,
+    deny_tool: Vec<String>,
+    deny_bash_pattern: Vec<String>,
     no_skills: bool,
     no_prompt_templates: bool,
     no_context_files: bool,
@@ -1021,9 +1347,11 @@ async fn run_task(
     extra_prompt_template_paths: Vec<String>,
     name: Option<String>,
     prompt_guidelines: Vec<String>,
+    fork: Option<String>,
     session_path: Option<String>,
     session_id: Option<String>,
     continue_session: bool,
+    session_dir: Option<String>,
     export: Option<String>,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1075,20 +1403,31 @@ async fn run_task(
     let initial_message = parts.join("");
     timing.mark("compose initial message");
 
-    let gateway = gateway_url.unwrap_or_else(|| DEFAULT_GATEWAY.to_string());
-    // Whether the operator explicitly passed `--model`, as opposed to `run` silently falling back to
-    // `DEFAULT_MODEL` — the distinction a reopened `--session`/`--continue` needs below to know whether
-    // to keep going on the model the session was actually last driven on instead of quietly switching
-    // it, the same bug class `switch_session` had (see `Persistence::model_and_level_at_active` in
-    // `serve.rs`).
+    // A stored `agent settings` default sits between an explicit flag/env var and this crate's own
+    // built-in default — checked here, once, rather than threading `SettingsStore` through every
+    // individual flag's own resolution site.
+    let stored_settings = beyond_ai_agent::settings::SettingsStore::open_default();
+    let gateway = gateway_url
+        .or_else(|| stored_settings.get().default_gateway_url.clone())
+        .unwrap_or_else(|| DEFAULT_GATEWAY.to_string());
+    // Whether the operator explicitly passed `--model`, as opposed to `run` falling back to a stored
+    // default or `DEFAULT_MODEL` — the distinction a reopened `--session`/`--continue` needs below to
+    // know whether to keep going on the model the session was actually last driven on instead of
+    // quietly switching it, the same bug class `switch_session` had (see
+    // `Persistence::model_and_level_at_active` in `serve.rs`). A merely-stored default counts as *not*
+    // explicit here — same as an unset flag — since the operator didn't ask for this specific
+    // invocation to use it.
     let model_explicit = model.is_some();
-    let model = model.unwrap_or_else(|| DEFAULT_MODEL.to_string());
+    let model = model
+        .or_else(|| stored_settings.get().default_model.clone())
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
     let key =
         key.ok_or("no gateway key: pass --key or set AI_AGENT_KEY (a bai_v1… virtual key)")?;
 
     let project_trusted = !force_untrusted
         && (trust_project
-            || beyond_ai_agent::trust_store::TrustStore::open_default().is_trusted(&cwd));
+            || beyond_ai_agent::trust_store::TrustStore::open_default().is_trusted(&cwd)
+            || !beyond_ai_agent::trust_store::has_trust_gated_resources(&cwd));
     // Discovered once, up front: a one-shot `run` has no `reload` to re-discover mid-process, unlike
     // `serve`. `/skill:name` and `/name` prompt-template invocations are expanded here exactly like
     // `serve`'s own "prompt" handler does — this was previously silently skipped in `run`, so a message
@@ -1110,18 +1449,26 @@ async fn run_task(
         beyond_ai_agent::prompts::discover(&cwd, project_trusted, &extra_prompt_template_paths)
     };
     timing.mark("discover skills/prompt templates");
-    let mut registry = tools::default_registry_with(bash_timeout_ms, bash_shell_path.as_deref());
+    let mut registry = tools::default_registry_with_prefix(
+        bash_timeout_ms,
+        bash_shell_path.as_deref(),
+        bash_command_prefix.as_deref(),
+    );
     tools::apply_filter(
         &mut registry,
         tools_allow.as_deref(),
         tools_exclude.as_deref(),
         no_tools,
     );
-    let base = default_system_prompt(&registry, &prompt_guidelines);
+    // `--system-prompt` replaces the built-in base entirely — matches `serve`'s identical flag, and
+    // the same on-disk `SYSTEM.md` override still applies on top inside `build_system_prompt` either
+    // way (an explicit CLI flag doesn't disable that; a project's own `SYSTEM.md` still wins).
+    let base =
+        system_prompt.unwrap_or_else(|| default_system_prompt(&registry, &prompt_guidelines));
     let system = beyond_ai_agent::resources::build_system_prompt(
         &beyond_ai_agent::resources::PromptOptions {
             base: &base,
-            append: None,
+            append: append_system_prompt.as_deref(),
             cwd: &cwd,
             include_context_files: !no_context_files,
             skills: &skills,
@@ -1149,50 +1496,79 @@ async fn run_task(
         meta.title = name.clone();
         meta
     };
-    let (mut store, mut session) = match session_path {
-        Some(path) => {
-            let path = PathBuf::from(path);
-            // A zero-byte file at `path` (e.g. `touch`'d ahead of time, or left over from a crash
-            // before the header write landed) has nothing to open — route it through `create`, which
-            // now initializes an empty file in place rather than failing (see its own doc comment).
-            let has_content = path.metadata().is_ok_and(|m| m.len() > 0);
-            if has_content {
-                // pi-parity fix (C-M6): bare `?` here propagated the raw `std::io::Error` straight to
-                // `main`'s `Result`, which Rust's default `Termination` impl prints via `{:?}` — a
-                // Debug dump of the error's internal shape (`Custom { kind: InvalidData, error: "..." }`)
-                // with no file path at all, matching neither pi's own clear
-                // `"Error: Session file is not a valid pi session: <path>"` nor this project's own
-                // no-leaked-internals bar for user-facing errors. Wrapping in a plain `String` message
-                // (still `Error: "..."` once printed, but a human-readable sentence, not an internal
-                // struct shape) and naming `path` fixes both: the operator now sees *which* file and
-                // *why*, instead of guessing.
-                // pi-parity fix (C-M6): bare `?` here propagated the raw `std::io::Error` straight to
-                // `main`'s `Result`, which Rust's default `Termination` impl prints via `{:?}` — a
-                // Debug dump of the error's internal shape (`Custom { kind: InvalidData, error: "..." }`)
-                // with no file path at all, matching neither pi's own clear
-                // `"Error: Session file is not a valid pi session: <path>"` nor this project's own
-                // no-leaked-internals bar for user-facing errors. Wrapping in a plain `String` message
-                // (still `Error: "..."` once printed, but a human-readable sentence, not an internal
-                // struct shape) and naming `path` fixes both: the operator now sees *which* file and
-                // *why*, instead of guessing.
-                let (store, session) = SessionStore::open(path.clone()).map_err(|e| {
-                    format!(
-                        "session file is not a valid session: {}: {e}",
-                        path.display()
-                    )
-                })?;
-                (Some(store), session)
-            } else {
-                let store = SessionStore::create(path, fresh_meta())?;
-                (Some(store), Session::new())
+    // `--session-dir` (matching `serve`'s own flag/env var exactly) redirects the repo root that
+    // `--continue` and `--fork` both use, in place of the default `~/.claude/sessions/<encoded-cwd>/`.
+    // Its parent becomes `--fork`'s cross-project search root too — the same convention `serve`'s own
+    // `list_all_sessions` already applies (`Persistence::list_all_with_progress`'s `repo.dir().parent()`)
+    // when `--session-dir` is set there, so both binaries scope a cross-project scan identically.
+    let (repo_dir, fork_search_root): (PathBuf, PathBuf) =
+        match session_dir.or_else(|| stored_settings.get().default_session_dir.clone()) {
+            Some(dir) => {
+                let dir = PathBuf::from(dir);
+                let search_root = dir
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| dir.clone());
+                (dir, search_root)
             }
+            None => (default_session_dir(&cwd_str), sessions_root()),
+        };
+    let (mut store, mut session) = if let Some(arg) = &fork {
+        // `--fork` wins over `--session`/`--continue`: a fork always starts a fresh child session,
+        // never reopens one in place, so there is no meaningful way to combine it with either.
+        let target = SessionRepo::open(&repo_dir)?;
+        let (store, session) = fork_by_arg(arg, &target, &cwd_str, &fork_search_root, usize::MAX)
+            .map_err(|e| format!("--fork {arg:?}: {e}"))?;
+        (Some(store), session)
+    } else {
+        match session_path {
+            Some(path) => {
+                let path = PathBuf::from(path);
+                // A zero-byte file at `path` (e.g. `touch`'d ahead of time, or left over from a crash
+                // before the header write landed) has nothing to open — route it through `create`, which
+                // now initializes an empty file in place rather than failing (see its own doc comment).
+                let has_content = path.metadata().is_ok_and(|m| m.len() > 0);
+                if has_content {
+                    // pi-parity fix (C-M6): bare `?` here propagated the raw `std::io::Error` straight to
+                    // `main`'s `Result`, which Rust's default `Termination` impl prints via `{:?}` — a
+                    // Debug dump of the error's internal shape (`Custom { kind: InvalidData, error: "..." }`)
+                    // with no file path at all, matching neither pi's own clear
+                    // `"Error: Session file is not a valid pi session: <path>"` nor this project's own
+                    // no-leaked-internals bar for user-facing errors. Wrapping in a plain `String` message
+                    // (still `Error: "..."` once printed, but a human-readable sentence, not an internal
+                    // struct shape) and naming `path` fixes both: the operator now sees *which* file and
+                    // *why*, instead of guessing.
+                    // pi-parity fix (C-M6): bare `?` here propagated the raw `std::io::Error` straight to
+                    // `main`'s `Result`, which Rust's default `Termination` impl prints via `{:?}` — a
+                    // Debug dump of the error's internal shape (`Custom { kind: InvalidData, error: "..." }`)
+                    // with no file path at all, matching neither pi's own clear
+                    // `"Error: Session file is not a valid pi session: <path>"` nor this project's own
+                    // no-leaked-internals bar for user-facing errors. Wrapping in a plain `String` message
+                    // (still `Error: "..."` once printed, but a human-readable sentence, not an internal
+                    // struct shape) and naming `path` fixes both: the operator now sees *which* file and
+                    // *why*, instead of guessing.
+                    let (store, session) = SessionStore::open(path.clone()).map_err(|e| {
+                        format!(
+                            "session file is not a valid session: {}: {e}",
+                            path.display()
+                        )
+                    })?;
+                    (Some(store), session)
+                } else {
+                    let store = SessionStore::create(path, fresh_meta())?;
+                    (Some(store), Session::new())
+                }
+            }
+            None if continue_session => {
+                let repo = SessionRepo::open(&repo_dir)?;
+                // `None` here, not `session_id` — see `resume_or_create`'s doc comment: `--session-id`
+                // is documented (and tested, above) to apply only to a genuinely fresh `--session <path>`
+                // or a plain ephemeral run, never `--continue`.
+                let (store, session) = repo.resume_or_create(&cwd_str, &model, None)?;
+                (Some(store), session)
+            }
+            None => (None, Session::new()),
         }
-        None if continue_session => {
-            let repo = SessionRepo::open(default_session_dir(&cwd_str))?;
-            let (store, session) = repo.resume_or_create(&cwd_str, &model)?;
-            (Some(store), session)
-        }
-        None => (None, Session::new()),
     };
     // `--name`, applied uniformly across every path above (mirrors `serve`'s own startup check) —
     // only for a genuinely fresh session (no messages, no title yet). `--continue`'s `resume_or_create`
@@ -1256,10 +1632,10 @@ async fn run_task(
     // lost all record of them with no session trace at all.
     let store = Arc::new(std::sync::Mutex::new(store));
     // Matches `serve`'s own `build_agent`: defaults to the model's own capability-table context
-    // window when `--context-window` isn't given (`run` has no such flag to override it with, unlike
-    // `serve` — not part of this port's scope), then applies the reserve/keep-recent overrides.
+    // window when `--context-window` isn't given, then applies the reserve/keep-recent overrides.
     let mut compaction = agent_core::CompactionConfig {
-        context_window: agent_core::capabilities(&model).context_window,
+        context_window: context_window
+            .unwrap_or_else(|| agent_core::capabilities(&model).context_window),
         ..agent_core::CompactionConfig::default()
     };
     if let Some(reserve) = compaction_reserve_tokens {
@@ -1274,6 +1650,8 @@ async fn run_task(
         .with_max_steps(max_steps)
         .with_compaction(compaction)
         .with_cache_long(cache_long)
+        .with_sequential_tools(sequential_tools)
+        .with_cache_key(meta.id.clone())
         .with_checkpoint_hook(Arc::new(DirectCheckpoint(store.clone())));
     // Unlike `serve`, `run` has no thinking-level cycling — these are applied as-is, with no per-model
     // default derivation when omitted (matching `run`'s prior behavior of not setting either at all).
@@ -1282,6 +1660,16 @@ async fn run_task(
     }
     if let Some(effort) = reasoning_effort {
         agent = agent.with_reasoning_effort(effort);
+    }
+    if let Some(temperature) = temperature {
+        agent = agent.with_temperature(temperature);
+    }
+    if let Some(max_tokens) = max_tokens {
+        agent = agent.with_max_tokens(max_tokens);
+    }
+    let policy = ToolPolicy::from_lists(&deny_tool, &deny_bash_pattern);
+    if !policy.is_empty() {
+        agent = agent.with_hooks(Arc::new(policy));
     }
 
     if json {
@@ -1296,13 +1684,39 @@ async fn run_task(
         let _ = std::io::stdout().flush();
     }
 
+    // `run` previously registered no signal handler at all — Rust's default SIGTERM/SIGINT
+    // disposition terminates the process immediately, running no destructors, so a bash tool's
+    // `GroupKillGuard` (which only reaps on `Drop`) never gets to kill a still-running child's
+    // process group, and any not-yet-persisted checkpoint from the current turn is lost outright.
+    // Reusing `serve`'s own `ShutdownSignal` (rather than a second, subtly different
+    // implementation) ties a shutdown request to the *same* `CancellationToken` plumbing
+    // `run_events_cancellable` already drops tool futures through on an explicit `abort` — so a
+    // `Ctrl-C`/`systemctl stop`/pod eviction now takes the identical clean-cancellation path
+    // instead of a raw kill.
+    let cancel = agent_core::CancellationToken::new();
+    let shutdown_cancel = cancel.clone();
+    tokio::spawn(async move {
+        if let Ok(mut shutdown) = serve::ShutdownSignal::new() {
+            shutdown.wait().await;
+            shutdown_cancel.cancel();
+        }
+    });
+
     session.user(expand_message(&initial_message, &skills, &prompt_templates));
-    let mut stop_reason = run_turn(&agent, &mut session, json).await?;
+    let turn_result = run_turn(&agent, &mut session, json, &cancel).await;
+    // Persist whatever's in `session` regardless of outcome: `run_events_cancellable` mutates
+    // `session` in place as it streams, so a cancelled turn still leaves behind whatever
+    // assistant/tool content had already landed — the same partial-content guarantee `serve` gives
+    // every session, not just the happy path. `DirectCheckpoint` already covers most of this
+    // incrementally, but the turn's own tail (its final, possibly-partial assistant message) is
+    // only ever captured here.
     persist_run_tail(&store, &session)?;
+    let mut stop_reason = unwrap_turn_result(turn_result)?;
     for message in messages {
         session.user(expand_message(&message, &skills, &prompt_templates));
-        stop_reason = run_turn(&agent, &mut session, json).await?;
+        let turn_result = run_turn(&agent, &mut session, json, &cancel).await;
         persist_run_tail(&store, &session)?;
+        stop_reason = unwrap_turn_result(turn_result)?;
     }
 
     if let Some(export) = export {
@@ -1330,15 +1744,44 @@ async fn run_task(
     // Text mode has no other failure signal a script/CI caller could key off of — a refusal would
     // otherwise still exit 0, indistinguishable from a normal completion, unless the last turn's
     // stop reason is checked explicitly here. JSON mode already carries `stop_reason` on every
-    // `TurnEnd` event in its own output stream, so it's unaffected either way — that exit code stays
-    // reserved for a genuine process failure. Matches pi's own print-mode, which treats a refusal
-    // (folded into its generic "error" stop reason there, unlike this crate's distinct `Refusal`
-    // variant) the same way, in text mode only.
-    if !json && stop_reason == agent_core::StopReason::Refusal {
-        eprintln!("[refused]");
+    // `TurnEnd` event in its own output stream, so it's unaffected either way — see
+    // `text_mode_failure_message`'s own doc comment for the exact contract (including why `Aborted` is
+    // checked too, defensively, even though it's currently unreachable here).
+    if let Some(message) = text_mode_failure_message(json, stop_reason) {
+        eprintln!("{message}");
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// The diagnostic to print and exit(1) on for a finished run's final stop reason, or `None` to exit
+/// 0 normally. `None` unconditionally in JSON mode: `stop_reason` is already on every `TurnEnd` event
+/// in that mode's own output stream, so its exit code stays reserved for a genuine process failure.
+///
+/// In text mode, a refusal would otherwise still exit 0, indistinguishable from a normal completion —
+/// matches pi's own print-mode, which treats a refusal (folded into its generic "error" stop reason
+/// there, unlike this crate's distinct `Refusal` variant) the same way. `Aborted` is checked
+/// defensively alongside it: `unwrap_turn_result` already exits(1) on every currently-reachable
+/// cancellation path (`Err(Error::Cancelled)`, e.g. `ShutdownSignal`-triggered SIGTERM/SIGHUP/Ctrl-C —
+/// see `agent_core::Agent::run_events_cancellable`'s doc comment, which guarantees cancellation always
+/// surfaces that way, never as an `Ok(..)` carrying `Aborted`), so this arm is currently unreachable
+/// from `run_task` — but a mid-stream cancellation genuinely can produce `Ok(Turn { stop_reason:
+/// Aborted, .. })` at lower layers (see `Agent::run_turn_once`'s own doc comment), just not through
+/// any path this binary's own `run_turn_once` currently reaches. Handling it here too costs nothing
+/// and closes the gap outright if that internal contract ever changes, rather than silently exiting 0
+/// on what would still be an interrupted, incomplete run.
+fn text_mode_failure_message(
+    json: bool,
+    stop_reason: agent_core::StopReason,
+) -> Option<&'static str> {
+    if json {
+        return None;
+    }
+    match stop_reason {
+        agent_core::StopReason::Refusal => Some("[refused]"),
+        agent_core::StopReason::Aborted => Some("[cancelled]"),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1373,6 +1816,45 @@ mod tests {
         assert!(!is_valid_session_id("-leading"));
     }
 
+    #[test]
+    fn text_mode_failure_message_flags_a_refusal_and_an_aborted_stop_reason_as_failures() {
+        // pi-parity fix: `Aborted` previously wasn't checked at all alongside the existing `Refusal`
+        // check — defensive, since `unwrap_turn_result` already exits(1) on every currently-reachable
+        // cancellation path, but this closes the gap outright if that internal contract ever changes.
+        assert_eq!(
+            text_mode_failure_message(false, agent_core::StopReason::Refusal),
+            Some("[refused]")
+        );
+        assert_eq!(
+            text_mode_failure_message(false, agent_core::StopReason::Aborted),
+            Some("[cancelled]")
+        );
+    }
+
+    #[test]
+    fn text_mode_failure_message_is_none_for_a_normal_end_of_turn() {
+        assert_eq!(
+            text_mode_failure_message(false, agent_core::StopReason::EndTurn),
+            None
+        );
+        assert_eq!(
+            text_mode_failure_message(false, agent_core::StopReason::ToolUse),
+            None
+        );
+    }
+
+    #[test]
+    fn text_mode_failure_message_is_always_none_in_json_mode() {
+        assert_eq!(
+            text_mode_failure_message(true, agent_core::StopReason::Refusal),
+            None
+        );
+        assert_eq!(
+            text_mode_failure_message(true, agent_core::StopReason::Aborted),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn direct_checkpoint_persists_incrementally_during_a_multi_tool_round_trip_run() {
         // Two tool round-trips, then a final text turn. `DirectCheckpoint` must have already written
@@ -1403,7 +1885,14 @@ mod tests {
 
         let mut session = Session::new();
         session.user("read the file twice");
-        run_turn(&agent, &mut session, false).await.unwrap();
+        run_turn(
+            &agent,
+            &mut session,
+            false,
+            &agent_core::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
 
         // Read independently of `store` (which the test itself still holds a live handle to) —
         // exactly what a process restarting after a crash would do.
@@ -1645,9 +2134,14 @@ mod tests {
         let mut session = Session::new();
         session.user("hi");
 
-        run_turn(&agent, &mut session, false)
-            .await
-            .expect("the whole-run retry must recover once a real turn is finally scripted");
+        run_turn(
+            &agent,
+            &mut session,
+            false,
+            &agent_core::CancellationToken::new(),
+        )
+        .await
+        .expect("the whole-run retry must recover once a real turn is finally scripted");
 
         // agent_core's own internal retry consumed the 4 failing turns; ours consumed the 5th
         // (successful) one on its first — and only necessary — retry.
@@ -1674,9 +2168,14 @@ mod tests {
         let mut session = Session::new();
         session.user("hi");
 
-        let err = run_turn(&agent, &mut session, false)
-            .await
-            .expect_err("must eventually give up, not retry forever");
+        let err = run_turn(
+            &agent,
+            &mut session,
+            false,
+            &agent_core::CancellationToken::new(),
+        )
+        .await
+        .expect_err("must eventually give up, not retry forever");
         assert!(matches!(err, Error::Transport(_)));
         assert_eq!(transport.calls(), total_attempts);
     }

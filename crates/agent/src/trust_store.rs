@@ -23,6 +23,28 @@ use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
+use crate::path_utils::resolved_path as resolved_key_path;
+
+/// Whether `cwd` has anything project trust actually gates: a `SYSTEM.md`/`APPEND_SYSTEM.md`
+/// override, project-local skills (`.claude/skills`, or an `.agents/skills` at any ancestor level up
+/// to the enclosing git-repo root), or project-local prompt templates (`.claude/prompts`) — see
+/// `resources.rs`/`skills.rs`/`prompts.rs` for where each of these is actually read. When none exist,
+/// there's nothing an untrusted checkout could do differently by being trusted, so a caller can treat
+/// the directory as trusted without ever consulting the allowlist — matching pi's own
+/// `hasTrustRequiringProjectResources`/`resolveProjectTrusted` fast path (`trust-manager.ts`), which
+/// skips the trust store (and its own interactive prompt) entirely for the same reason. Nothing here
+/// is cached or sticky: a directory that gains one of these later (e.g. a fresh `git init` adding
+/// `.claude/skills`) simply starts requiring trust from that point on, the next time this is checked.
+pub fn has_trust_gated_resources(cwd: &Path) -> bool {
+    cwd.join(".claude/SYSTEM.md").is_file()
+        || cwd.join(".claude/APPEND_SYSTEM.md").is_file()
+        || cwd.join(".claude/skills").is_dir()
+        || cwd.join(".claude/prompts").is_dir()
+        || crate::skills::collect_ancestor_agents_skill_dirs(cwd)
+            .iter()
+            .any(|dir| dir.is_dir())
+}
+
 /// The trust decision for a directory, after walking up to the nearest ancestor with an explicit
 /// entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,7 +95,7 @@ impl TrustStore {
     /// first explicit entry found (checking `untrusted` before `trusted` at each level, so a
     /// same-level conflict favors denying). No entry anywhere in the chain means [`Trust::Unknown`].
     pub fn lookup(&self, dir: &Path) -> Trust {
-        let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        let canonical = resolved_key_path(dir);
         for ancestor in canonical.ancestors() {
             let key = ancestor.display().to_string();
             if self.untrusted.contains(&key) {
@@ -161,19 +183,38 @@ impl TrustStore {
 /// Read and parse the store file at `path`, tolerating a missing/unparsable file (empty allowlist) and
 /// the legacy bare `Vec<String>` shape (trusted-only) — shared by [`TrustStore::open`] and
 /// [`TrustStore::mutate_locked`], which both need "current on-disk state, gracefully defaulted."
+///
+/// A missing file is the ordinary, silent case (nothing has ever been trusted yet). Anything else that
+/// falls back to an empty allowlist — an existing-but-unreadable file (permission denied, a directory
+/// where a file was expected) or one that parses as neither the current tri-state shape nor the legacy
+/// bare-array shape (corrupted/hand-edited JSON) — `warn!`s instead of silently discarding every
+/// persisted trust/untrust decision, matching `session_store.rs`'s own "skip and warn, don't silently
+/// lose data" precedent for a corrupt entry.
 fn read_store_file(path: &Path) -> (BTreeSet<String>, BTreeSet<String>) {
-    let contents = fs::read_to_string(path).ok();
-    contents
-        .as_deref()
-        .and_then(|s| serde_json::from_str::<StoreFile>(s).ok())
-        .map(|f| (f.trusted, f.untrusted))
-        .or_else(|| {
-            contents
-                .as_deref()
-                .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
-                .map(|v| (v.into_iter().collect(), BTreeSet::new()))
-        })
-        .unwrap_or_default()
+    let contents = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Default::default(),
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "could not read trust store file, treating it as an empty allowlist"
+            );
+            return Default::default();
+        }
+    };
+    if let Ok(f) = serde_json::from_str::<StoreFile>(&contents) {
+        return (f.trusted, f.untrusted);
+    }
+    if let Ok(v) = serde_json::from_str::<Vec<String>>(&contents) {
+        return (v.into_iter().collect(), BTreeSet::new());
+    }
+    tracing::warn!(
+        path = %path.display(),
+        "trust store file is not valid JSON in either the current or legacy shape, treating it as an \
+         empty allowlist"
+    );
+    Default::default()
 }
 
 fn write_store_file(
@@ -281,10 +322,7 @@ fn lock_path_for(store_path: &Path) -> PathBuf {
 /// exist yet or can't be resolved (canonicalization needs the path to exist; a project directory
 /// always does by the time trust is checked, but degrading gracefully here is cheap insurance).
 fn canonical_key(path: &Path) -> String {
-    path.canonicalize()
-        .unwrap_or_else(|_| path.to_path_buf())
-        .display()
-        .to_string()
+    resolved_key_path(path).display().to_string()
 }
 
 fn default_path() -> PathBuf {
@@ -297,6 +335,94 @@ fn default_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn has_trust_gated_resources_is_false_for_a_bare_directory() {
+        // Pi-parity fix: a directory with nothing project trust actually gates has no functional
+        // difference between trusted and untrusted — matching pi's own
+        // `hasTrustRequiringProjectResources` fast path.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!has_trust_gated_resources(dir.path()));
+    }
+
+    #[test]
+    fn has_trust_gated_resources_is_true_for_a_project_system_md() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        fs::write(dir.path().join(".claude/SYSTEM.md"), "custom identity").unwrap();
+        assert!(has_trust_gated_resources(dir.path()));
+    }
+
+    #[test]
+    fn has_trust_gated_resources_is_true_for_a_project_append_system_md() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        fs::write(dir.path().join(".claude/APPEND_SYSTEM.md"), "extra rules").unwrap();
+        assert!(has_trust_gated_resources(dir.path()));
+    }
+
+    #[test]
+    fn has_trust_gated_resources_is_true_for_a_project_skills_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".claude/skills")).unwrap();
+        assert!(has_trust_gated_resources(dir.path()));
+    }
+
+    #[test]
+    fn has_trust_gated_resources_is_true_for_a_project_prompts_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".claude/prompts")).unwrap();
+        assert!(has_trust_gated_resources(dir.path()));
+    }
+
+    #[test]
+    fn has_trust_gated_resources_is_true_for_an_ancestor_agents_skills_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("a/b/c");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(dir.path().join("a/.agents/skills")).unwrap();
+        assert!(
+            has_trust_gated_resources(&nested),
+            "an ancestor's .agents/skills must count, not just cwd's own"
+        );
+    }
+
+    #[test]
+    fn pre_trusting_a_not_yet_created_directory_via_a_noisy_path_takes_effect_once_it_exists() {
+        // Pi-parity audit H68: the old `canonical_key`/`lookup` called `path.canonicalize()` with no
+        // absolutize-and-normalize step first — for a directory that doesn't exist yet, `canonicalize`
+        // fails outright (`ENOENT`), and the fallback was the literal path as given. A trailing slash
+        // or a redundant `./` component then landed in the stored key verbatim, which could never
+        // match the fully-canonical absolute path a later `lookup()` (once the directory actually
+        // exists) compares against — `agent trust newproj/`, run before `newproj` exists, silently
+        // never took effect.
+        let store_dir = tempfile::tempdir().unwrap();
+        let mut trust_store = TrustStore::open(store_dir.path().join("trusted-projects.json"));
+
+        let parent = tempfile::tempdir().unwrap();
+        let not_yet_created = parent.path().join("newproj");
+        // Trailing slash and a redundant `./` component — realistic shapes a hand-typed path or shell
+        // completion could produce, and exactly the noise `canonicalize()` itself would collapse if
+        // the directory existed (it doesn't yet).
+        let noisy_path = parent.path().join("./newproj/");
+
+        trust_store.trust(&noisy_path).unwrap();
+
+        // The directory now actually gets created — the workflow this store's own module doc comment
+        // says it must support: pre-authorizing a project out-of-band, ahead of its first real
+        // `run`/`serve` invocation.
+        fs::create_dir_all(&not_yet_created).unwrap();
+
+        // The real runtime lookup always uses a canonicalized, absolute path (see `canonical_cwd` in
+        // `session_store.rs`) — reproduced directly here rather than via `set_current_dir`.
+        let real_lookup_path = not_yet_created.canonicalize().unwrap();
+        assert_eq!(
+            trust_store.lookup(&real_lookup_path),
+            Trust::Trusted,
+            "a directory pre-trusted via a noisy (trailing-slash/`./`) path, before it existed, must \
+             still be recognized as trusted once it exists and is looked up via its canonical form"
+        );
+    }
 
     #[test]
     fn untrusted_directory_is_not_trusted() {
@@ -405,6 +531,72 @@ mod tests {
 
         let store = TrustStore::open(store_path);
         assert!(store.is_trusted(&project));
+    }
+
+    #[test]
+    fn a_missing_store_file_is_silent_and_treated_as_an_empty_allowlist() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("does-not-exist.json");
+
+        let capture = crate::tracing_test::capture(|| {
+            let store = TrustStore::open(store_path);
+            assert!(matches!(store.lookup(dir.path()), Trust::Unknown));
+        });
+        assert!(
+            capture.messages().is_empty(),
+            "a missing file is the ordinary case, not worth warning about: {:?}",
+            capture.messages()
+        );
+    }
+
+    #[test]
+    fn a_corrupt_store_file_warns_and_is_treated_as_an_empty_allowlist() {
+        // Pi-parity fix: a corrupted/unreadable store file previously fell back to an empty allowlist
+        // exactly like a missing one — silently discarding every persisted trust/untrust decision with
+        // no signal at all that anything was wrong.
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("trusted-projects.json");
+        fs::write(&store_path, "not valid json at all { [ }").unwrap();
+
+        let capture = crate::tracing_test::capture(|| {
+            let store = TrustStore::open(store_path.clone());
+            assert!(matches!(store.lookup(dir.path()), Trust::Unknown));
+        });
+        let messages = capture.messages();
+        assert!(
+            messages.iter().any(|m| m.contains("trust store")),
+            "a corrupt store file must be logged, not silently swallowed: {messages:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_store_file_warns_and_is_treated_as_an_empty_allowlist() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("trusted-projects.json");
+        fs::write(&store_path, "{}").unwrap();
+        fs::set_permissions(&store_path, fs::Permissions::from_mode(0o000)).unwrap();
+        // Some environments (root, certain sandboxes) don't actually enforce permission bits — skip
+        // rather than assert a false failure if the mode change didn't block the read at all.
+        let mode_actually_blocks_reads = fs::read_to_string(&store_path).is_err();
+
+        let capture = crate::tracing_test::capture(|| {
+            let store = TrustStore::open(store_path.clone());
+            assert!(matches!(store.lookup(dir.path()), Trust::Unknown));
+        });
+        let _ = fs::set_permissions(&store_path, fs::Permissions::from_mode(0o644));
+
+        if !mode_actually_blocks_reads {
+            eprintln!("skipping: this environment doesn't enforce file permission bits");
+            return;
+        }
+        let messages = capture.messages();
+        assert!(
+            messages.iter().any(|m| m.contains("trust store")),
+            "an unreadable store file must be logged, not silently swallowed: {messages:?}"
+        );
     }
 
     #[test]

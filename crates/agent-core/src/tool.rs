@@ -100,6 +100,14 @@ impl ToolProgress {
     pub fn is_cancelled(&self) -> bool {
         self.cancel.is_cancelled()
     }
+
+    /// A future that resolves the moment this call's run is cancelled — for a tool to race against its
+    /// own work (e.g. in a `tokio::select!` alongside a subprocess read loop) so it notices cancellation
+    /// promptly and can flush partial state itself, rather than only ever being cut off by an external
+    /// `Drop` of its whole future with no chance to finalize.
+    pub fn cancelled(&self) -> impl std::future::Future<Output = ()> + '_ {
+        self.cancel.cancelled()
+    }
 }
 
 /// A tool's successful output: text for the model, plus any images it produced (a screenshot, a

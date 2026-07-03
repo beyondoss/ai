@@ -241,6 +241,19 @@ pub fn default_registry_with(
     bash_timeout_ms: Option<u64>,
     bash_shell_path: Option<&str>,
 ) -> ToolRegistry {
+    default_registry_with_prefix(bash_timeout_ms, bash_shell_path, None)
+}
+
+/// Like [`default_registry_with`], plus an optional line prepended to every `bash` command in the same
+/// shell invocation (`--bash-command-prefix`/`AI_AGENT_BASH_COMMAND_PREFIX`, matching pi's own
+/// `shellCommandPrefix` setting) — split out as its own function rather than a third parameter on the
+/// widely-called `default_registry_with` so every existing two-argument call site (tests included) stays
+/// unchanged.
+pub fn default_registry_with_prefix(
+    bash_timeout_ms: Option<u64>,
+    bash_shell_path: Option<&str>,
+    bash_command_prefix: Option<&str>,
+) -> ToolRegistry {
     let mut reg = ToolRegistry::new();
     reg.register(Arc::new(read::Read));
     reg.register(Arc::new(write::Write));
@@ -254,6 +267,9 @@ pub fn default_registry_with(
     };
     if let Some(path) = bash_shell_path {
         bash = bash.with_shell_path(path);
+    }
+    if let Some(prefix) = bash_command_prefix {
+        bash = bash.with_command_prefix(prefix);
     }
     reg.register(Arc::new(bash));
     reg.register(Arc::new(beyond::Fork::real()));

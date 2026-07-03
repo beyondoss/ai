@@ -725,3 +725,469 @@ fn run_session_flag_warns_when_the_sessions_recorded_cwd_no_longer_matches() {
         "stderr: {stderr}"
     );
 }
+
+/// Reads a session `.jsonl` file's header line and returns its `id` field.
+fn session_id_of(path: &std::path::Path) -> String {
+    let content = std::fs::read_to_string(path).unwrap();
+    let header: serde_json::Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+    header["id"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn run_fork_by_path_copies_a_session_file_into_a_new_session_and_continues_from_it() {
+    // Pi-parity fix: `--fork <path>` (pi's own cross-project `--fork`) previously didn't exist at all —
+    // `run` had no fork surface of any kind. A direct path to a `.jsonl` file must resolve regardless of
+    // which project it belongs to, copy its transcript into a brand-new session under the *current*
+    // project, and continue the run from there — leaving the original source file untouched.
+    let source_dir = tempfile::tempdir().unwrap();
+    let source_path = source_dir.path().join("source.jsonl");
+
+    let (base1, _bodies1) = spawn_model_server(vec![turn_text("first answer")]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output1 = run_cmd(bin)
+        .args([
+            "run",
+            "remember the marker: fork-by-path-99",
+            "--gateway-url",
+            &base1,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--session",
+            source_path.to_str().unwrap(),
+        ])
+        .current_dir(source_dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+    assert!(
+        output1.status.success(),
+        "source run failed.\nstderr: {}",
+        String::from_utf8_lossy(&output1.stderr)
+    );
+    let source_content_before = std::fs::read_to_string(&source_path).unwrap();
+
+    let target_home = tempfile::tempdir().unwrap();
+    let target_project = tempfile::tempdir().unwrap();
+    let (base2, bodies2) = spawn_model_server(vec![turn_text("second answer")]);
+    let output2 = Command::new(bin)
+        .env("HOME", target_home.path())
+        .args([
+            "run",
+            "what was the marker?",
+            "--gateway-url",
+            &base2,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--fork",
+            source_path.to_str().unwrap(),
+        ])
+        .current_dir(target_project.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+    assert!(
+        output2.status.success(),
+        "forked run failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output2.stdout),
+        String::from_utf8_lossy(&output2.stderr)
+    );
+
+    let bodies2 = bodies2.lock().unwrap();
+    assert!(
+        bodies2[0].contains("fork-by-path-99"),
+        "the forked run must see the source session's history: {}",
+        bodies2[0]
+    );
+
+    // The fork lands under the *current* project's own session directory, not the source's.
+    let project_subdir = std::fs::read_dir(target_home.path().join(".claude/sessions"))
+        .expect("sessions root must exist")
+        .next()
+        .expect("one project subdirectory")
+        .unwrap()
+        .path();
+    let forked_path = std::fs::read_dir(&project_subdir)
+        .expect("project subdirectory must exist")
+        .next()
+        .expect("one forked session file")
+        .unwrap()
+        .path();
+    let forked_content: String = std::fs::read_to_string(&forked_path).unwrap();
+    let header: serde_json::Value =
+        serde_json::from_str(forked_content.lines().next().unwrap()).unwrap();
+    assert_eq!(
+        header["parent"].as_str().unwrap(),
+        session_id_of(&source_path),
+        "the forked session must record the source session as its parent"
+    );
+    assert_eq!(
+        header["cwd"].as_str().unwrap(),
+        target_project
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "the forked session's cwd must be the current project, not the source's"
+    );
+
+    // The original source file is untouched — forking copies, it doesn't move or mutate.
+    assert_eq!(
+        std::fs::read_to_string(&source_path).unwrap(),
+        source_content_before,
+        "the source session must be left exactly as it was"
+    );
+}
+
+#[test]
+fn run_fork_by_id_finds_a_session_in_a_different_projects_own_directory() {
+    // The cross-project half of `--fork <path|id>`: an id not found in the current project's own
+    // session directory must fall back to searching every other project's directory under
+    // `~/.claude/sessions/` — matching pi's own `SessionManager.listAll`/`resolveSessionPath` fallback.
+    let home_dir = tempfile::tempdir().unwrap();
+    let project_a = tempfile::tempdir().unwrap();
+    let project_b = tempfile::tempdir().unwrap();
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+
+    let (base1, _bodies1) = spawn_model_server(vec![turn_text("first answer")]);
+    let output1 = Command::new(bin)
+        .env("HOME", home_dir.path())
+        .args([
+            "run",
+            "remember the marker: cross-project-77",
+            "--gateway-url",
+            &base1,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--continue",
+        ])
+        .current_dir(project_a.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+    assert!(
+        output1.status.success(),
+        "project A run failed.\nstderr: {}",
+        String::from_utf8_lossy(&output1.stderr)
+    );
+
+    let project_a_subdir = std::fs::read_dir(home_dir.path().join(".claude/sessions"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let source_path = std::fs::read_dir(&project_a_subdir)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let source_id = session_id_of(&source_path);
+
+    let (base2, bodies2) = spawn_model_server(vec![turn_text("second answer")]);
+    let output2 = Command::new(bin)
+        .env("HOME", home_dir.path())
+        .args([
+            "run",
+            "what was the marker?",
+            "--gateway-url",
+            &base2,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--fork",
+            &source_id,
+        ])
+        .current_dir(project_b.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+    assert!(
+        output2.status.success(),
+        "forked run in project B failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output2.stdout),
+        String::from_utf8_lossy(&output2.stderr)
+    );
+
+    let bodies2 = bodies2.lock().unwrap();
+    assert!(
+        bodies2[0].contains("cross-project-77"),
+        "forking by id across projects must carry the source transcript over: {}",
+        bodies2[0]
+    );
+
+    // The fork must land under project B's own subdirectory, distinct from project A's.
+    let sessions_root = home_dir.path().join(".claude/sessions");
+    let subdirs: Vec<_> = std::fs::read_dir(&sessions_root)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(
+        subdirs.len(),
+        2,
+        "expected one subdirectory per project, got: {subdirs:?}"
+    );
+    let project_b_subdir = subdirs
+        .iter()
+        .find(|p| p != &&project_a_subdir)
+        .expect("a second, distinct project subdirectory for project B");
+    let forked_path = std::fs::read_dir(project_b_subdir)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let header: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(&forked_path)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(header["parent"].as_str().unwrap(), source_id);
+}
+
+#[test]
+fn run_fork_with_an_unknown_id_fails_clearly_instead_of_silently_starting_fresh() {
+    let home_dir = tempfile::tempdir().unwrap();
+    let project_dir = tempfile::tempdir().unwrap();
+    let (base, _bodies) = spawn_model_server(vec![]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+
+    let output = Command::new(bin)
+        .env("HOME", home_dir.path())
+        .args([
+            "run",
+            "hi",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--fork",
+            "no-such-session-id-anywhere",
+        ])
+        .current_dir(project_dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        !output.status.success(),
+        "forking an unknown id must fail the run"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--fork") && stderr.contains("no-such-session-id-anywhere"),
+        "stderr must name the flag and the id, not a leaked internal error shape: {stderr}"
+    );
+}
+
+#[test]
+fn run_binary_session_dir_flag_redirects_the_continue_repo() {
+    // Pi-parity fix: `run` had no `--session-dir` equivalent at all — `--continue` was pinned to the
+    // hardcoded default `~/.claude/sessions/<encoded-cwd>/` with no override, unlike `serve`'s own
+    // `--session-dir`. The given directory must become the repo root directly (matching `serve`'s own
+    // semantics), not a further per-cwd subdirectory nested under it.
+    let repo_dir = tempfile::tempdir().unwrap();
+    let project_dir = tempfile::tempdir().unwrap();
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+
+    let (base1, _bodies1) = spawn_model_server(vec![turn_text("first answer")]);
+    let output1 = run_cmd(bin)
+        .args([
+            "run",
+            "remember the marker: session-dir-55",
+            "--gateway-url",
+            &base1,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--continue",
+            "--session-dir",
+            repo_dir.path().to_str().unwrap(),
+        ])
+        .current_dir(project_dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+    assert!(
+        output1.status.success(),
+        "first run failed.\nstderr: {}",
+        String::from_utf8_lossy(&output1.stderr)
+    );
+
+    // The session file must land directly inside `repo_dir` — not `repo_dir/.claude/sessions/...`.
+    let entries: Vec<_> = std::fs::read_dir(repo_dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+        .collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "the session file must be created directly under --session-dir: {entries:?}"
+    );
+
+    // A second `--continue --session-dir` run must reopen the same session (proving `resume_or_create`
+    // actually used the overridden directory, not the default one).
+    let (base2, bodies2) = spawn_model_server(vec![turn_text("second answer")]);
+    let output2 = run_cmd(bin)
+        .args([
+            "run",
+            "what was the marker?",
+            "--gateway-url",
+            &base2,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--continue",
+            "--session-dir",
+            repo_dir.path().to_str().unwrap(),
+        ])
+        .current_dir(project_dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+    assert!(
+        output2.status.success(),
+        "second run failed.\nstderr: {}",
+        String::from_utf8_lossy(&output2.stderr)
+    );
+    let bodies2 = bodies2.lock().unwrap();
+    assert!(
+        bodies2[0].contains("session-dir-55"),
+        "the second run must see the first run's history: {}",
+        bodies2[0]
+    );
+}
+
+#[test]
+fn run_binary_ai_agent_session_dir_env_var_redirects_the_continue_repo() {
+    let repo_dir = tempfile::tempdir().unwrap();
+    let (base, _bodies) = spawn_model_server(vec![turn_text("ok")]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+
+    let output = run_cmd(bin)
+        .env("AI_AGENT_SESSION_DIR", repo_dir.path())
+        .args([
+            "run",
+            "hi",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--continue",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let entries: Vec<_> = std::fs::read_dir(repo_dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+        .collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "AI_AGENT_SESSION_DIR must redirect the repo the same way --session-dir does: {entries:?}"
+    );
+}
+
+#[test]
+fn run_binary_fork_with_session_dir_scopes_cross_project_search_to_its_parent() {
+    // `--session-dir`'s cross-project search root (for `--fork <id>` when the id isn't in the current
+    // repo) is that directory's own *parent* — matching how `serve`'s `list_all_sessions` scopes its
+    // cross-project scan off `--session-dir`'s parent, so both binaries agree on what "every project"
+    // means once a custom root is in play.
+    let shared_root = tempfile::tempdir().unwrap();
+    let repo_a = shared_root.path().join("repo-a");
+    let repo_b = shared_root.path().join("repo-b");
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+
+    let (base1, _bodies1) = spawn_model_server(vec![turn_text("first answer")]);
+    let output1 = run_cmd(bin)
+        .args([
+            "run",
+            "remember the marker: cross-repo-88",
+            "--gateway-url",
+            &base1,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--continue",
+            "--session-dir",
+            repo_a.to_str().unwrap(),
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+    assert!(
+        output1.status.success(),
+        "seeding run into repo-a failed.\nstderr: {}",
+        String::from_utf8_lossy(&output1.stderr)
+    );
+    let source_path = std::fs::read_dir(&repo_a)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let source_id = session_id_of(&source_path);
+
+    // `--fork <id> --session-dir repo-b` must find the session seeded into the *sibling* repo-a via
+    // repo-b's parent (the shared root), not fail with "no session matching".
+    let (base2, bodies2) = spawn_model_server(vec![turn_text("second answer")]);
+    let output2 = run_cmd(bin)
+        .args([
+            "run",
+            "what was the marker?",
+            "--gateway-url",
+            &base2,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--fork",
+            &source_id,
+            "--session-dir",
+            repo_b.to_str().unwrap(),
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+    assert!(
+        output2.status.success(),
+        "forking across --session-dir siblings failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output2.stdout),
+        String::from_utf8_lossy(&output2.stderr)
+    );
+    let bodies2 = bodies2.lock().unwrap();
+    assert!(
+        bodies2[0].contains("cross-repo-88"),
+        "the forked run must carry over repo-a's history: {}",
+        bodies2[0]
+    );
+}

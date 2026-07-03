@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use agent_core::tool::Tool;
 use agent_core::{ToolError, ToolOutput};
 use async_trait::async_trait;
-use globset::{Glob, GlobMatcher};
+use globset::{GlobBuilder, GlobMatcher};
 use ignore::WalkBuilder;
 use serde_json::{Value, json};
 
@@ -48,10 +48,14 @@ impl FindJob {
     }
 }
 
-/// Walk the tree and collect matching paths, sorted lexicographically. Returns the paths and whether
-/// the result was truncated (by `limit` or the hard cap).
-pub fn search(job: &FindJob) -> (Vec<PathBuf>, bool) {
+/// Walk the tree and collect matching paths, sorted lexicographically. Returns the paths, whether the
+/// result was truncated (by `limit` or the hard cap), and, when the walk hit at least one unreadable
+/// path (permission denied, a broken symlink, …), the first such error's message — matching real `fd`,
+/// which exits non-zero and reports the real error text the moment it can't read *any* path in the
+/// tree, rather than silently treating it as "not found here."
+pub fn search(job: &FindJob) -> (Vec<PathBuf>, bool, Option<String>) {
     let mut paths: Vec<PathBuf> = Vec::new();
+    let mut first_error: Option<String> = None;
     // `hidden(false)` includes dotfiles (like ripgrep --hidden); .gitignore is respected by default.
     // `require_git(false)` keeps that respect even outside an actual git repository (e.g. a plain
     // checkout with no `.git`, or a tree copied without its VCS metadata) — the ignore crate's default
@@ -68,7 +72,15 @@ pub fn search(job: &FindJob) -> (Vec<PathBuf>, bool) {
         if paths.len() >= HARD_CAP {
             break;
         }
-        let Ok(entry) = entry else { continue };
+        let entry = match entry {
+            Ok(entry) => entry,
+            // Recorded (not just skipped, the prior behavior), so an otherwise-empty result can say
+            // "couldn't fully search" instead of a confidently wrong "no files matching".
+            Err(e) => {
+                first_error.get_or_insert_with(|| e.to_string());
+                continue;
+            }
+        };
         let path = entry.path();
         // Skip the search root itself, but match both files *and* directories — `find "node_modules"`
         // or any directory-name pattern would otherwise return nothing.
@@ -90,7 +102,7 @@ pub fn search(job: &FindJob) -> (Vec<PathBuf>, bool) {
     paths.sort();
     let truncated = paths.len() > job.limit || paths.len() >= HARD_CAP;
     paths.truncate(job.limit);
-    (paths, truncated)
+    (paths, truncated, first_error)
 }
 
 #[async_trait]
@@ -136,7 +148,15 @@ impl Tool for Find {
         } else {
             format!("**/{pattern}")
         };
-        let matcher = Glob::new(&glob_src)
+        // Smart-case, matching pi's own `find` (which never passes `--ignore-case`/`-s`, so `fd`'s own
+        // smart-case default applies): a pattern with no uppercase letter matches case-insensitively
+        // (an everyday `*.md` still finds `README.MD`), one with any uppercase letter matches exactly
+        // as typed. Without this, `find` was always case-sensitive outright — `*.rs` never matched
+        // `File.RS` — silently missing files pi's own `find` would return.
+        let case_insensitive = !pattern.chars().any(|c| c.is_uppercase());
+        let matcher = GlobBuilder::new(&glob_src)
+            .case_insensitive(case_insensitive)
+            .build()
             .map_err(|e| ToolError::InvalidInput(format!("bad glob: {e}")))?
             .compile_matcher();
 
@@ -144,11 +164,21 @@ impl Tool for Find {
         let root = PathBuf::from(root);
         let job = FindJob::new(matcher, basename_only, root.clone(), limit);
         // The walk blocks (synchronous directory reads); keep it off the async runtime.
-        let (paths, truncated) = tokio::task::spawn_blocking(move || search(&job))
+        let (paths, truncated, walk_error) = tokio::task::spawn_blocking(move || search(&job))
             .await
             .map_err(|e| ToolError::Execution(format!("find task failed: {e}")))?;
 
         if paths.is_empty() {
+            // A genuine zero-match walk and a walk that hit an unreadable path along the way both
+            // land here with an empty result — but they aren't the same thing, and reporting them
+            // identically ("no files matching") tells the model a confident falsehood in the second
+            // case. Matches real `fd`, which exits non-zero and reports the real error the moment it
+            // can't read *any* path in the tree.
+            if let Some(err) = walk_error {
+                return Err(ToolError::Execution(format!(
+                    "search was incomplete, so \"no files matching\" may not be accurate: {err}"
+                )));
+            }
             return Ok(no_match.into());
         }
         // Write straight into `out` instead of allocating a `format!` temp String per path — same fix
@@ -163,14 +193,22 @@ impl Tool for Find {
         // otherwise fire — see `cap_listing_bytes`'s doc comment.
         let byte_capped =
             super::output::cap_listing_bytes(&mut out, "narrow the pattern or path to see more");
-        if !byte_capped && truncated {
-            let _ = writeln!(
-                out,
-                "{}",
-                super::output::marker(format_args!(
+        if !byte_capped {
+            let mut notices = Vec::new();
+            if truncated {
+                notices.push(format!(
                     "result limit {limit} reached; raise `limit` for more"
-                ))
-            );
+                ));
+            }
+            if let Some(err) = walk_error {
+                notices.push(format!(
+                    "search was incomplete — some paths couldn't be read, so there may be more \
+                     matches than shown: {err}"
+                ));
+            }
+            if !notices.is_empty() {
+                let _ = writeln!(out, "{}", super::output::marker(notices.join(". ")));
+            }
         }
         Ok(out.into())
     }
@@ -196,6 +234,47 @@ mod tests {
         assert!(out.contains("main.rs"));
         assert!(out.contains("lib.rs"));
         assert!(!out.contains("README.md"));
+    }
+
+    #[tokio::test]
+    async fn a_lowercase_pattern_matches_case_insensitively_smart_case() {
+        // Pi-parity audit H70: pi's own `find` never passes `--ignore-case`/`-s`, so `fd`'s own
+        // smart-case default applies (verified against real `fd`: `--glob '*.rs'` matches `File.RS`).
+        // This crate's `find` was always case-sensitive outright — an everyday lowercase pattern like
+        // `*.md` silently missed mixed/upper-case-named files pi's own `find` would return.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("File.RS"), "").unwrap();
+        std::fs::write(dir.path().join("lower.rs"), "").unwrap();
+        std::fs::write(dir.path().join("Mixed.Rs"), "").unwrap();
+
+        let out = Find
+            .run(json!({ "pattern": "*.rs", "path": dir.path().to_str().unwrap() }))
+            .await
+            .unwrap()
+            .text;
+        assert!(out.contains("File.RS"), "got: {out}");
+        assert!(out.contains("lower.rs"), "got: {out}");
+        assert!(out.contains("Mixed.Rs"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn a_pattern_containing_an_uppercase_letter_matches_case_sensitively() {
+        // Smart-case's other half: the moment a pattern has *any* uppercase letter, it must match
+        // exactly as typed — verified against real `fd`: `--glob '*.RS'` does not match `lower.rs`.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("File.RS"), "").unwrap();
+        std::fs::write(dir.path().join("lower.rs"), "").unwrap();
+
+        let out = Find
+            .run(json!({ "pattern": "*.RS", "path": dir.path().to_str().unwrap() }))
+            .await
+            .unwrap()
+            .text;
+        assert!(out.contains("File.RS"), "got: {out}");
+        assert!(
+            !out.contains("lower.rs"),
+            "an uppercase-containing pattern must not match a lowercase file: {out}"
+        );
     }
 
     #[tokio::test]
@@ -276,6 +355,80 @@ mod tests {
             .unwrap()
             .text;
         assert!(out.contains("no files matching"));
+    }
+
+    /// Skip a permission-bit test under a runtime that doesn't actually enforce them (root, some
+    /// sandboxes) — matches the same guard `grep.rs`'s identical tests use.
+    #[cfg(unix)]
+    fn mode_actually_blocks_reads(path: &std::path::Path) -> bool {
+        std::fs::read_dir(path).is_err()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_search_root_reports_an_error_not_a_false_no_matches() {
+        // Pi-parity audit H69: real `fd` exits non-zero the moment it can't read a path in the tree,
+        // root included — this crate's own walk previously swallowed that into a skipped entry, so an
+        // unreadable root silently reported "no files matching" instead of surfacing the real problem.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "").unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let blocks = mode_actually_blocks_reads(dir.path());
+
+        let result = Find
+            .run(json!({ "pattern": "*.txt", "path": dir.path().to_str().unwrap() }))
+            .await;
+        let _ = std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755));
+
+        if !blocks {
+            return;
+        }
+        let err =
+            result.expect_err("an unreadable root must surface as an error, not empty output");
+        let ToolError::Execution(msg) = err else {
+            panic!("expected Execution error, got {err:?}")
+        };
+        assert!(
+            msg.contains("incomplete") && msg.contains("Permission denied"),
+            "must surface the real reason, not a bare confident-empty result: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_subdirectory_alongside_real_matches_still_returns_them_with_a_notice() {
+        // A real match elsewhere in the tree must not be discarded just because some other, unrelated
+        // path couldn't be read — matches `grep.rs`'s identical, deliberate divergence from pi's own
+        // all-or-nothing behavior.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("readable.rs"), "").unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("secret.rs"), "").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let blocks = mode_actually_blocks_reads(&locked);
+
+        let result = Find
+            .run(json!({ "pattern": "*.rs", "path": dir.path().to_str().unwrap() }))
+            .await;
+        let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
+
+        if !blocks {
+            return;
+        }
+        let out = result.unwrap().text;
+        assert!(
+            out.contains("readable.rs"),
+            "a real match elsewhere must still be reported: {out}"
+        );
+        assert!(
+            out.contains("incomplete"),
+            "the result must note it may be incomplete: {out}"
+        );
     }
 
     #[tokio::test]

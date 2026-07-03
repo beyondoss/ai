@@ -2,12 +2,18 @@
 //!
 //! A skill is a directory containing a `SKILL.md` whose YAML frontmatter declares a `name` and
 //! `description`. We discover them under `~/.claude/skills` (user) and `<cwd>/.claude/skills`
-//! (project), and inject only their name/description/location into the system prompt — the body is
-//! read on demand (by the `read` tool) when a task matches, so skills cost almost no context until used.
+//! (project), plus the vendor-neutral `~/.agents/skills` (user, always) and `.agents/skills` (project,
+//! trust-gated — checked at *every* directory level between `cwd` and the enclosing git-repo root, not
+//! just `cwd` itself, matching pi's `collectAncestorAgentsSkillDirs`; `.agents/skills` never recognizes
+//! the loose-single-`.md`-file shape `.claude/skills` does — only `SKILL.md`-per-directory counts), and
+//! inject only their name/description/location into the system prompt — the body is read on demand (by
+//! the `read` tool) when a task matches, so skills cost almost no context until used.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use crate::path_utils::push_unique_root;
 
 /// A discovered skill: enough to advertise it; the body stays on disk until needed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,33 +32,36 @@ pub struct Skill {
 /// bound keeps a pathological/symlinked layout from turning discovery into an unbounded walk.
 const MAX_DEPTH: usize = 8;
 
-/// Discover skills under the user (`~/.claude/skills`) root, plus the project (`<cwd>/.claude/skills`)
-/// root when `project_trusted`. Project skills shadow user skills of the same name. Returns them sorted
-/// by name (stable output).
+/// Discover skills under the user (`~/.claude/skills`, `~/.agents/skills`) roots, plus the project
+/// (`<cwd>/.claude/skills`, and every `.agents/skills` between `cwd` and the enclosing git-repo root)
+/// roots when `project_trusted`. A more specific root shadows a less specific one of the same name —
+/// project over user, `.claude/skills` over the vendor-neutral `.agents/skills`, and (among multiple
+/// `.agents/skills` levels) the one closest to `cwd` over one further up. Returns them sorted by name
+/// (stable output).
 ///
-/// The user root is **never** gated on `project_trusted`: it's the operator's own machine-wide
-/// directory, not something the current (possibly untrusted) project checkout controls, so an untrusted
-/// project must not blank it out along with its own — see [`discover_with_diagnostics`].
+/// The user roots are **never** gated on `project_trusted`: they're the operator's own machine-wide
+/// directories, not something the current (possibly untrusted) project checkout controls, so an
+/// untrusted project must not blank them out along with its own — see [`discover_with_diagnostics`].
 pub fn discover(cwd: &Path, project_trusted: bool, extra_roots: &[String]) -> Vec<Skill> {
     discover_with_diagnostics(cwd, project_trusted, extra_roots).0
 }
 
 /// Like [`discover`], but also reports name collisions — the same skill `name` declared by more than
-/// one `SKILL.md`/loose-`.md` file, silently shadowed by `discover` (the later standard root wins) — as
-/// human-readable strings naming both paths, for `get_commands` to surface as a diagnostic rather than a
-/// client having no way to notice a skill was shadowed.
+/// one `SKILL.md`/loose-`.md` file, silently shadowed by `discover` (the more specific standard root
+/// wins) — as human-readable strings naming both paths, for `get_commands` to surface as a diagnostic
+/// rather than a client having no way to notice a skill was shadowed.
 ///
-/// `extra_roots` are additional, ad-hoc discovery roots beyond the two standard ones — pi's own
+/// `extra_roots` are additional, ad-hoc discovery roots beyond the standard ones — pi's own
 /// `--skill <path>` (repeatable), which accepts either a directory (walked like a standard root) or a
 /// single standalone `.md` file (one skill, no directory of its own resources — pi's other skill shape).
-/// Unlike the two standard roots (routinely absent — that's normal, not worth a diagnostic), an
+/// Unlike the standard roots (routinely absent — that's normal, not worth a diagnostic), an
 /// operator-supplied extra root that doesn't exist (or isn't a directory or `.md` file) is a likely
 /// typo/mistake, so it's reported through the same diagnostics channel `discover_with_diagnostics`
 /// already has, rather than silently contributing nothing. On a name collision, a **standard** root always wins over an
 /// extra one — matching pi (`resource-loader.ts` appends `--skill` paths after project/user skills, and
 /// `addSkills`' collision resolution keeps whichever was seen *first*, making the CLI paths lowest
 /// priority) — so `--skill` fills gaps rather than silently overriding a project's own skill of the same
-/// name. Extra roots collide among *themselves* on later-wins, same as the two standard roots do.
+/// name. Extra roots collide among *themselves* on later-wins, same as the standard roots do.
 pub fn discover_with_diagnostics(
     cwd: &Path,
     project_trusted: bool,
@@ -61,14 +70,15 @@ pub fn discover_with_diagnostics(
     discover_with_diagnostics_impl(cwd, project_trusted, extra_roots, true)
 }
 
-/// Like [`discover_with_diagnostics`], but skips *both* standard roots (`~/.claude/skills` and
-/// `<cwd>/.claude/skills`) entirely, keeping only `extra_roots` — what `--no-skills` needs, since pi's
-/// own `noSkills` still honors an explicit `--skill` path passed alongside it (a documented, tested
-/// combination: `resource-loader.test.ts`, "should still load additional skill paths when noSkills is
-/// true" — pi-parity fix, M2). `discover_with_diagnostics(cwd, false, extra_roots)` can't express this on
-/// its own: the user standard root is never gated on `project_trusted` (see [`discover`]'s doc comment),
-/// so there's no way to suppress *both* standard roots through its existing parameters — this needs an
-/// actual "skip standard roots" switch.
+/// Like [`discover_with_diagnostics`], but skips every standard root (`~/.claude/skills`,
+/// `<cwd>/.claude/skills`, `~/.agents/skills`, and the `.agents/skills` ancestor walk) entirely, keeping
+/// only `extra_roots` — what `--no-skills` needs, since pi's own `noSkills` still honors an explicit
+/// `--skill` path passed alongside it (a documented, tested combination: `resource-loader.test.ts`,
+/// "should still load additional skill paths when noSkills is true" — pi-parity fix, M2).
+/// `discover_with_diagnostics(cwd, false, extra_roots)` can't express this on its own: the user standard
+/// roots are never gated on `project_trusted` (see [`discover`]'s doc comment), so there's no way to
+/// suppress every standard root through its existing parameters — this needs an actual "skip standard
+/// roots" switch.
 pub fn discover_extra_only(extra_roots: &[String]) -> (Vec<Skill>, Vec<String>) {
     discover_with_diagnostics_impl(Path::new(""), false, extra_roots, false)
 }
@@ -81,13 +91,48 @@ fn discover_with_diagnostics_impl(
 ) -> (Vec<Skill>, Vec<String>) {
     let mut found: Vec<Skill> = Vec::new();
     let mut collisions: Vec<String> = Vec::new();
+    // `.agents/skills` roots first, so `.claude/skills` — the tool-specific customization a project
+    // maintainer wrote deliberately for this agent — wins on a same-named collision against the
+    // vendor-neutral fallback convention (this crate's own `standard_roots` fold below keeps whichever
+    // root is processed *later*; see the loop's own comment).
+    let mut agents_roots: Vec<PathBuf> = Vec::new();
     let mut standard_roots: Vec<PathBuf> = Vec::new();
+    // Canonical form of every root added so far, across `agents_roots`/`standard_roots`/the extra-root
+    // loop below (see `push_unique_root`'s own doc comment).
+    let mut seen_roots: HashSet<PathBuf> = HashSet::new();
     if include_standard_roots {
-        if let Some(home) = home_dir() {
-            standard_roots.push(home.join(".claude/skills"));
+        let user_agents_skills = home_dir().map(|h| h.join(".agents/skills"));
+        if let Some(dir) = &user_agents_skills {
+            push_unique_root(&mut agents_roots, &mut seen_roots, dir.clone());
         }
         if project_trusted {
-            standard_roots.push(cwd.join(".claude/skills"));
+            // Furthest (enclosing git-repo root, or filesystem root if none) to nearest (`cwd`), so the
+            // fold below lets the directory *closest to cwd* win — a subdirectory's own `.agents/skills`
+            // shadows one declared further up a monorepo, the same "more specific wins" precedent
+            // `.claude/skills` already has between user and project. Deduped against the user root
+            // above (pi's own `collectAncestorAgentsSkillDirs(...).filter(dir => dir !== userAgentsSkillsDir)`)
+            // so a `cwd` under `$HOME` itself (no enclosing git repo) doesn't double-count it.
+            let mut ancestors = collect_ancestor_agents_skill_dirs(cwd);
+            ancestors.reverse();
+            for dir in ancestors {
+                if user_agents_skills.as_deref() != Some(dir.as_path()) {
+                    push_unique_root(&mut agents_roots, &mut seen_roots, dir);
+                }
+            }
+        }
+        if let Some(home) = home_dir() {
+            push_unique_root(
+                &mut standard_roots,
+                &mut seen_roots,
+                home.join(".claude/skills"),
+            );
+        }
+        if project_trusted {
+            push_unique_root(
+                &mut standard_roots,
+                &mut seen_roots,
+                cwd.join(".claude/skills"),
+            );
         }
     }
     // Each extra root's own skills, kept as separate groups (rather than one flat Vec) so root order
@@ -101,10 +146,20 @@ fn discover_with_diagnostics_impl(
         let expanded = crate::tools::expand_tilde(extra, home.as_deref().and_then(|p| p.to_str()));
         let root = PathBuf::from(expanded);
         if root.is_dir() {
+            // Already scanned via a standard/`.agents` root, or an earlier `--skill`, under a
+            // different (possibly symlinked or relative) path — walking it again would double-count
+            // its skills and self-collide every name in it against a phantom duplicate.
+            if !seen_roots.insert(crate::path_utils::resolved_path(&root)) {
+                continue;
+            }
             let (skills, diagnostics) = discover_in_with_diagnostics(&root);
             collisions.extend(diagnostics);
             extra_root_skills.push(skills);
         } else if root.extension().and_then(|e| e.to_str()) == Some("md") {
+            // Same reasoning as the directory case above, for a standalone `.md` file.
+            if !seen_roots.insert(crate::path_utils::resolved_path(&root)) {
+                continue;
+            }
             // pi's other `--skill` shape: a single standalone `.md` file, one skill, no directory of
             // its own resources — `skills.ts`'s `stats.isFile() && resolvedPath.endsWith(".md")`.
             // A discarded diagnostics sink: this call site already reports a `None` with its own,
@@ -130,25 +185,18 @@ fn discover_with_diagnostics_impl(
         }
     }
 
+    // `.agents/skills` roots first (see the comment where `agents_roots` was built above), then the
+    // two `.claude/skills` roots — each fold keeps whichever definition of a same-named skill is
+    // processed *later*, so `.claude/skills` ends up winning over `.agents/skills` overall.
+    for root in agents_roots {
+        let (skills, diagnostics) = discover_in_with_diagnostics_skill_md_only(&root);
+        collisions.extend(diagnostics);
+        fold_skills_later_wins(&mut found, skills, &mut collisions);
+    }
     for root in standard_roots {
         let (skills, diagnostics) = discover_in_with_diagnostics(&root);
         collisions.extend(diagnostics);
-        for skill in skills {
-            // Later standard roots (project) win over earlier (user) on name collisions.
-            if let Some(existing) = found.iter_mut().find(|s| s.name == skill.name) {
-                let message = format!(
-                    "skill \"{}\" defined at both {} and {} — the latter wins",
-                    skill.name,
-                    existing.path.display(),
-                    skill.path.display()
-                );
-                tracing::warn!("{message}");
-                collisions.push(message);
-                *existing = skill;
-            } else {
-                found.push(skill);
-            }
-        }
+        fold_skills_later_wins(&mut found, skills, &mut collisions);
     }
     // Names claimed by a standard root — snapshotted *before* extra roots are processed, so a
     // standard-root skill always wins over an extra one, but two extra roots can still shadow each
@@ -173,19 +221,7 @@ fn discover_with_diagnostics_impl(
                 collisions.push(message);
                 continue;
             }
-            if let Some(existing) = found.iter_mut().find(|s| s.name == skill.name) {
-                let message = format!(
-                    "skill \"{}\" defined at both {} and {} — the latter wins",
-                    skill.name,
-                    existing.path.display(),
-                    skill.path.display()
-                );
-                tracing::warn!("{message}");
-                collisions.push(message);
-                *existing = skill;
-            } else {
-                found.push(skill);
-            }
+            fold_skills_later_wins(&mut found, vec![skill], &mut collisions);
         }
     }
     found.sort_by(|a, b| a.name.cmp(&b.name));
@@ -220,6 +256,86 @@ fn discover_in_with_diagnostics(root: &Path) -> (Vec<Skill>, Vec<String>) {
     (out, diagnostics)
 }
 
+/// Like [`discover_in_with_diagnostics`], but skips the loose-root-`.md`-file skill shape entirely —
+/// the `.agents/skills` vendor-neutral convention (unlike `.claude/skills`) never recognizes it: pi's
+/// own `package-manager.ts::collectSkillEntries` gates that branch on `mode === "pi"` specifically, so
+/// a standalone `quick.md` directly under an `.agents/skills` root stays invisible there, matching pi
+/// exactly rather than silently accepting a shape the convention doesn't define.
+fn discover_in_with_diagnostics_skill_md_only(root: &Path) -> (Vec<Skill>, Vec<String>) {
+    let mut out = Vec::new();
+    let mut diagnostics = Vec::new();
+    walk(root, &mut out, &mut diagnostics);
+    (out, diagnostics)
+}
+
+/// Fold each of `skills` into `found`, keeping whichever definition of a same-named skill is folded in
+/// *later* — the shared "later root wins" tie-break every root group (`.agents/skills`, `.claude/skills`,
+/// and an extra `--skill` root once it's cleared the standard-root check) applies on a name collision.
+fn fold_skills_later_wins(
+    found: &mut Vec<Skill>,
+    skills: Vec<Skill>,
+    collisions: &mut Vec<String>,
+) {
+    for skill in skills {
+        if let Some(existing) = found.iter_mut().find(|s| s.name == skill.name) {
+            let message = format!(
+                "skill \"{}\" defined at both {} and {} — the latter wins",
+                skill.name,
+                existing.path.display(),
+                skill.path.display()
+            );
+            tracing::warn!("{message}");
+            collisions.push(message);
+            *existing = skill;
+        } else {
+            found.push(skill);
+        }
+    }
+}
+
+/// The nearest ancestor of `start` (inclusive) containing a `.git` entry (a directory for a normal
+/// repository, or a file for a worktree/submodule — `Path::exists` doesn't distinguish, matching pi's
+/// own `existsSync` check) — the enclosing git repository root. `None` if `start` isn't inside one at
+/// all, walking all the way to the filesystem root before giving up.
+fn find_git_repo_root(start: &Path) -> Option<PathBuf> {
+    let mut dir = start.to_path_buf();
+    loop {
+        if dir.join(".git").exists() {
+            return Some(dir);
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent.to_path_buf(),
+            None => return None,
+        }
+    }
+}
+
+/// Every `.agents/skills` candidate directory between `start` (inclusive) and the enclosing git
+/// repository root (inclusive), or all the way to the filesystem root if `start` isn't inside a git
+/// repository at all — nearest (`start`) first, furthest last. Matches pi's own
+/// `collectAncestorAgentsSkillDirs`: unlike `.claude/skills` (checked only at `cwd`), the vendor-neutral
+/// `.agents/skills` convention is checked at *every* directory level, so a skill declared at a
+/// monorepo's root is visible from any subdirectory within it. No depth cap here (matching pi
+/// exactly) — this walks parent directories, not a filesystem subtree, so it can't runaway the way an
+/// uncapped recursive descent could; [`MAX_DEPTH`] still bounds how far `walk` descends into whichever
+/// `.agents/skills` directory this discovers.
+pub(crate) fn collect_ancestor_agents_skill_dirs(start: &Path) -> Vec<PathBuf> {
+    let git_repo_root = find_git_repo_root(start);
+    let mut dirs = Vec::new();
+    let mut dir = start.to_path_buf();
+    loop {
+        dirs.push(dir.join(".agents/skills"));
+        if git_repo_root.as_deref() == Some(dir.as_path()) {
+            break;
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent.to_path_buf(),
+            None => break,
+        }
+    }
+    dirs
+}
+
 /// Walk `root` for `SKILL.md` manifests, gitignore-aware — reuses the same `ignore` crate `grep`/`find`
 /// already depend on, rather than hand-rolling `.gitignore`/`.ignore` parsing, so a vendored or fixture
 /// directory carrying its own ignore file doesn't leak a stray `SKILL.md` into the prompt.
@@ -231,7 +347,13 @@ fn discover_in_with_diagnostics(root: &Path) -> (Vec<Skill>, Vec<String>) {
 /// already discards `Err` entries as the normal "missing/unreadable" case, so a cyclic symlink still
 /// can't trap the walk. `.gitignore`/`.ignore` are already honored by `WalkBuilder`'s own defaults;
 /// `.fdignore` is registered explicitly (`add_custom_ignore_filename`) to match pi's own
-/// `skills.ts::IGNORE_FILE_NAMES`, which lists all three.
+/// `skills.ts::IGNORE_FILE_NAMES`, which lists all three — and *only* those three: pi never consults a
+/// global excludes file or `.git/info/exclude`, so `git_global`/`git_exclude` are disabled here to match
+/// that narrower per-directory-only scope. Without this, a developer who manages `~/.claude` as a git
+/// repo (dotfiles-as-git) or has a `core.excludesFile`/`~/.config/git/ignore` entry matching a skill's
+/// path gets a legitimate `SKILL.md` silently dropped by this walk while pi still finds it — both
+/// defaults are otherwise `true` regardless of `require_git`, which only gates whether git-related
+/// rules apply *at all* outside a repo, not which categories of git-related rule are in scope.
 fn walk(root: &Path, out: &mut Vec<Skill>, diagnostics: &mut Vec<String>) {
     let mut candidates: Vec<PathBuf> = ignore::WalkBuilder::new(root)
         .max_depth(Some(MAX_DEPTH))
@@ -242,6 +364,8 @@ fn walk(root: &Path, out: &mut Vec<Skill>, diagnostics: &mut Vec<String>) {
         // placed within it should still be honored either way, not only when `require_git`'s default
         // finds an enclosing `.git`.
         .require_git(false)
+        .git_global(false)
+        .git_exclude(false)
         // LOW pi-parity gap (fixed): pi's `skills.ts` hardcodes skipping `node_modules` unconditionally
         // ("avoid scanning dependencies"), not just relying on a `.gitignore` mentioning it. Ignore-file
         // coverage alone doesn't reach here reliably: `follow_links(true)` above exists specifically so
@@ -724,6 +848,204 @@ mod tests {
     }
 
     #[test]
+    fn find_git_repo_root_finds_the_nearest_enclosing_git_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let deep = repo.join("a/b/c");
+        fs::create_dir_all(&deep).unwrap();
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        assert_eq!(find_git_repo_root(&deep), Some(repo));
+    }
+
+    #[test]
+    fn find_git_repo_root_recognizes_a_dot_git_file_not_just_a_directory() {
+        // A worktree/submodule's `.git` is a *file* (pointing at the real gitdir elsewhere), not a
+        // directory — matches pi's own bare `existsSync` check, which doesn't distinguish either.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join(".git"), "gitdir: /elsewhere\n").unwrap();
+        assert_eq!(find_git_repo_root(&repo), Some(repo));
+    }
+
+    #[test]
+    fn find_git_repo_root_returns_none_when_no_git_repo_encloses_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let deep = tmp.path().join("a/b/c");
+        fs::create_dir_all(&deep).unwrap();
+        assert_eq!(find_git_repo_root(&deep), None);
+    }
+
+    #[test]
+    fn collect_ancestor_agents_skill_dirs_stops_at_the_git_repo_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let start = repo.join("a/b");
+        fs::create_dir_all(&start).unwrap();
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let dirs = collect_ancestor_agents_skill_dirs(&start);
+        assert_eq!(
+            dirs,
+            vec![
+                repo.join("a/b/.agents/skills"),
+                repo.join("a/.agents/skills"),
+                repo.join(".agents/skills"),
+            ],
+            "must stop at the repo root — the tempdir's own parent must never be included"
+        );
+    }
+
+    #[test]
+    fn collect_ancestor_agents_skill_dirs_walks_to_the_filesystem_root_when_no_git_repo_encloses_it()
+     {
+        let tmp = tempfile::tempdir().unwrap();
+        let start = tmp.path().join("a/b");
+        fs::create_dir_all(&start).unwrap();
+        let dirs = collect_ancestor_agents_skill_dirs(&start);
+        assert_eq!(
+            dirs.last(),
+            Some(&PathBuf::from("/.agents/skills")),
+            "with no enclosing git repo, the walk must reach the filesystem root, matching pi's \
+             own collectAncestorAgentsSkillDirs: {dirs:?}"
+        );
+    }
+
+    #[test]
+    fn discover_finds_a_project_skill_under_agents_skills_at_cwd_when_trusted() {
+        // Pi-parity audit H7: `.agents/skills` (the vendor-neutral convention) was entirely missing.
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(
+            &tmp.path().join(".agents/skills"),
+            "vendor-neutral",
+            "---\nname: vendor-neutral\ndescription: found via .agents/skills\n---\n",
+        );
+        let found = discover(tmp.path(), true, &[]);
+        assert!(
+            found.iter().any(|s| s.name == "vendor-neutral"),
+            "got: {found:?}"
+        );
+    }
+
+    #[test]
+    fn discover_agents_skills_project_root_is_trust_gated_like_dot_claude_skills() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(
+            &tmp.path().join(".agents/skills"),
+            "untrusted-project",
+            "---\nname: untrusted-project\ndescription: should not load\n---\n",
+        );
+        let found = discover(tmp.path(), false, &[]);
+        assert!(
+            !found.iter().any(|s| s.name == "untrusted-project"),
+            "an untrusted project's own .agents/skills must not load, same as .claude/skills: {found:?}"
+        );
+    }
+
+    #[test]
+    fn discover_agents_skills_ancestor_walk_finds_a_skill_declared_above_cwd_in_the_same_repo() {
+        // The core gap H7 flagged: pi checks *every* directory level between cwd and the enclosing
+        // git-repo root, not just cwd itself — a skill declared at a monorepo's root must still be
+        // visible from a deeply nested subdirectory.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        write_skill(
+            &repo.join(".agents/skills"),
+            "monorepo-wide",
+            "---\nname: monorepo-wide\ndescription: declared at the repo root\n---\n",
+        );
+        let deep_cwd = repo.join("packages/service/src");
+        fs::create_dir_all(&deep_cwd).unwrap();
+        let found = discover(&deep_cwd, true, &[]);
+        assert!(
+            found.iter().any(|s| s.name == "monorepo-wide"),
+            "a repo-root .agents/skills must be visible from a deep subdirectory: {found:?}"
+        );
+    }
+
+    #[test]
+    fn discover_agents_skills_nearest_ancestor_wins_over_a_further_one_on_name_collision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        write_skill(
+            &repo.join(".agents/skills"),
+            "x",
+            "---\nname: dup\ndescription: outer\n---\n",
+        );
+        let sub = repo.join("sub");
+        write_skill(
+            &sub.join(".agents/skills"),
+            "x",
+            "---\nname: dup\ndescription: inner\n---\n",
+        );
+        let found = discover(&sub, true, &[]);
+        let dup = found.iter().find(|s| s.name == "dup").expect("must load");
+        assert_eq!(
+            dup.description, "inner",
+            "the .agents/skills level closest to cwd must win: {found:?}"
+        );
+    }
+
+    #[test]
+    fn discover_dot_claude_skills_wins_over_agents_skills_on_name_collision() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(
+            &tmp.path().join(".agents/skills"),
+            "one",
+            "---\nname: dup\ndescription: vendor-neutral\n---\n",
+        );
+        write_skill(
+            &tmp.path().join(".claude/skills"),
+            "two",
+            "---\nname: dup\ndescription: tool-specific\n---\n",
+        );
+        let found = discover(tmp.path(), true, &[]);
+        let dup = found.iter().find(|s| s.name == "dup").expect("must load");
+        assert_eq!(
+            dup.description, "tool-specific",
+            ".claude/skills must win over the vendor-neutral .agents/skills: {found:?}"
+        );
+    }
+
+    #[test]
+    fn discover_agents_skills_does_not_recognize_a_loose_root_md_file() {
+        // The convention-specific gotcha the task explicitly warns about: unlike `.claude/skills`,
+        // `.agents/skills` never recognizes a standalone `.md` file directly at its root — only a
+        // `SKILL.md`-per-directory counts. Matches pi's `mode === "pi"`-gated branch.
+        let tmp = tempfile::tempdir().unwrap();
+        let agents_skills = tmp.path().join(".agents/skills");
+        fs::create_dir_all(&agents_skills).unwrap();
+        fs::write(
+            agents_skills.join("quick.md"),
+            "---\nname: quick\ndescription: a loose file\n---\n",
+        )
+        .unwrap();
+        let found = discover(tmp.path(), true, &[]);
+        assert!(
+            !found.iter().any(|s| s.name == "quick"),
+            "a loose .md file under .agents/skills must stay invisible: {found:?}"
+        );
+    }
+
+    #[test]
+    fn discover_extra_only_skips_agents_skills_too() {
+        // `--no-skills` must skip *every* standard root, not just `.claude/skills` — `.agents/skills`
+        // is a standard root now too.
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(
+            &tmp.path().join(".agents/skills"),
+            "should-not-load",
+            "---\nname: should-not-load\ndescription: skipped by --no-skills\n---\n",
+        );
+        let (found, _) = discover_extra_only(&[]);
+        assert!(
+            !found.iter().any(|s| s.name == "should-not-load"),
+            "got: {found:?}"
+        );
+    }
+
+    #[test]
     fn discover_with_diagnostics_loads_from_an_explicit_extra_root() {
         // pi: coding-agent/skills.test.ts — "should load from explicit skillPaths".
         let tmp = tempfile::tempdir().unwrap();
@@ -739,6 +1061,33 @@ mod tests {
         let (found, _) =
             discover_with_diagnostics(&cwd, true, &[extra_root.to_string_lossy().into_owned()]);
         assert!(found.iter().any(|s| s.name == "shared"), "got: {found:?}");
+    }
+
+    #[test]
+    fn discover_with_diagnostics_dedupes_an_extra_root_that_is_actually_a_standard_root() {
+        // Pi-parity fix (#45/#73): the same real directory reached via two different paths (here, the
+        // project's own `.claude/skills` standard root and an identically-pathed `--skill` extra root)
+        // must be walked only once — not double-counted into a phantom "defined at both X and Y"
+        // collision for every skill inside it.
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("project");
+        let standard_root = cwd.join(".claude/skills");
+        write_skill(
+            &standard_root,
+            "shared",
+            "---\nname: shared\ndescription: only actually defined once\n---\n",
+        );
+        let (found, collisions) =
+            discover_with_diagnostics(&cwd, true, &[standard_root.to_string_lossy().into_owned()]);
+        assert_eq!(
+            found.iter().filter(|s| s.name == "shared").count(),
+            1,
+            "the same directory scanned via two paths must not double-count its skills: {found:?}"
+        );
+        assert!(
+            !collisions.iter().any(|c| c.contains("shared")),
+            "must not report a phantom self-collision: {collisions:?}"
+        );
     }
 
     #[test]
@@ -1293,6 +1642,35 @@ mod tests {
             .map(|s| s.name)
             .collect();
         assert_eq!(names, vec!["real".to_string()]);
+    }
+
+    #[test]
+    fn a_git_info_exclude_entry_does_not_hide_a_real_skill() {
+        // Pi-parity audit H65: pi's `skills.ts::IGNORE_FILE_NAMES` only ever reads `.gitignore`/
+        // `.ignore`/`.fdignore` per-directory — never `.git/info/exclude` or a global excludes file.
+        // `WalkBuilder`'s `git_exclude`/`git_global` default `true` regardless of `require_git`, so
+        // without explicitly disabling them, a developer with a matching `.git/info/exclude` entry (or
+        // a `~/.claude` managed as its own git repo) would have a legitimate `SKILL.md` silently
+        // dropped here while pi still finds it. This test exercises the `.git/info/exclude` half
+        // hermetically (no `$HOME`/`$XDG_CONFIG_HOME` override needed, unlike the global-excludes half,
+        // which the doc comment above covers by inspection instead).
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join(".git/info")).unwrap();
+        fs::write(tmp.path().join(".git/info/exclude"), "real/\n").unwrap();
+        write_skill(
+            tmp.path(),
+            "real",
+            "---\nname: real\ndescription: a real skill\n---\n",
+        );
+        let names: Vec<String> = discover_in(tmp.path())
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["real".to_string()],
+            "a .git/info/exclude entry must not hide a real skill — pi never consults it"
+        );
     }
 
     #[test]

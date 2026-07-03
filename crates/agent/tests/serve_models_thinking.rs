@@ -6,7 +6,9 @@ mod common;
 use std::io::{BufReader, Write};
 use std::process::{Command, Stdio};
 
-use common::{ISOLATED_HOME, read_until_response, serve_cmd, spawn_model_server};
+use common::{
+    ISOLATED_HOME, read_until_response, serve_cmd, spawn_model_server, turn_text, turn_tool_use,
+};
 use serde_json::{Value, json};
 
 /// Like `serve_cmd`, but with an explicit `--model` instead of the hardcoded `"claude-test"` — for
@@ -180,6 +182,56 @@ fn serve_cycle_model_advances_and_wraps() {
         last["data"]["scoped"], false,
         "no --models flag was given, so cycling the full list must report scoped: false"
     );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_set_model_and_cycle_model_responses_carry_capability_info() {
+    // Pi-parity fix: `set_model`/`cycle_model` only ever echoed back `model`/`reasoning_effort` (plus
+    // `scoped` for `cycle_model`) — a client had to make a *separate* `get_available_models` round trip
+    // just to learn the new model's context window/max output/reasoning/vision support, even though
+    // `model_info` already computes all of it. Both responses must now carry the same capability shape
+    // `get_available_models`' own entries do.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_model", "model": "claude-opus-4-8" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "set_model");
+    let data = &frames.last().unwrap()["data"];
+    assert_eq!(data["model"], "claude-opus-4-8");
+    assert_eq!(data["provider"], "anthropic");
+    assert!(
+        data["context_window"].as_u64().unwrap() > 0,
+        "got: {data:#?}"
+    );
+    assert!(data["max_output"].as_u64().unwrap() > 0, "got: {data:#?}");
+    assert_eq!(data["reasoning"], true);
+    assert_eq!(data["supports_vision"], true);
+
+    writeln!(stdin, "{}", json!({ "type": "cycle_model" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "cycle_model");
+    let data = &frames.last().unwrap()["data"];
+    assert!(
+        data["context_window"].as_u64().unwrap() > 0,
+        "cycle_model must carry the same capability info: {data:#?}"
+    );
+    assert!(data["max_output"].as_u64().unwrap() > 0, "got: {data:#?}");
+    assert!(data.get("provider").is_some(), "got: {data:#?}");
 
     drop(stdin);
     child.wait().unwrap();
@@ -689,4 +741,166 @@ fn serve_cycle_thinking_level_never_gets_stuck_for_a_model_without_xhigh_or_off(
 
     drop(stdin);
     child.wait().unwrap();
+}
+
+#[test]
+fn serve_switch_model_retargets_the_next_turn_of_an_in_flight_prompt() {
+    // Pi-parity gap (pi's `prepareNextTurn`): unlike `set_model` (only takes effect on the *next*
+    // `prompt`), `switch_model` retargets a run already in flight. turn 1 runs a real 1s sleep (keeps
+    // the run in flight long enough to send the switch); turn 2 (built after the switch is applied)
+    // must target the new model — turn 1's own already-in-flight request must not be affected.
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+
+    let turn1 = turn_tool_use(
+        "toolu_s",
+        "bash",
+        &json!({ "command": "sleep 1" }).to_string(),
+    );
+    let (base, bodies) = spawn_model_server(vec![turn1, turn_text("done")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "start" })).unwrap();
+    stdin.flush().unwrap();
+    // Send the switch while turn 1's sleep is still running.
+    std::thread::sleep(Duration::from_millis(300));
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "switch_model", "id": "sw1", "model": "claude-cheap", "thinking": 256 })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+
+    let frames = read_until_response(&mut stdout, "prompt");
+    assert!(
+        frames
+            .iter()
+            .any(|f| f["command"] == "switch_model" && f["success"] == true),
+        "switch_model should be acknowledged: {frames:#?}"
+    );
+    assert!(
+        frames
+            .iter()
+            .any(|f| f["type"] == "event" && f["event"]["kind"] == "model_switched"),
+        "a model_switched event should fire: {frames:#?}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 2);
+    assert!(
+        bodies[0].contains(r#""model":"claude-test""#),
+        "turn 1 (already in flight when the switch arrived) must be unaffected: {}",
+        bodies[0]
+    );
+    assert!(
+        bodies[1].contains(r#""model":"claude-cheap""#),
+        "turn 2 must target the switched-to model: {}",
+        bodies[1]
+    );
+    assert!(
+        bodies[1].contains(r#""budget_tokens":256"#),
+        "turn 2 must also carry the switched-to thinking budget: {}",
+        bodies[1]
+    );
+}
+
+#[test]
+fn serve_switch_model_while_idle_is_a_no_op_pointing_at_set_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, bodies) = spawn_model_server(vec![]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "switch_model", "model": "claude-cheap" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "switch_model");
+    assert_eq!(frames.last().unwrap()["success"], true, "{frames:#?}");
+
+    drop(stdin);
+    child.wait().unwrap();
+    assert_eq!(
+        bodies.lock().unwrap().len(),
+        0,
+        "no model call should ever fire"
+    );
+}
+
+#[test]
+fn serve_max_tokens_flag_reaches_the_wire_request_and_survives_a_model_switch() {
+    // Pi-parity audit: `Agent::with_max_tokens` existed but had no CLI/RPC override anywhere — every
+    // `serve` process was locked to the model-derived default, and (per `ServeConfig::max_tokens`'s own
+    // doc comment) it must survive a `set_model` rebuild rather than resetting to the new model's own
+    // default.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, bodies) = spawn_model_server(vec![turn_text("first"), turn_text("second")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file)
+        .args(["--max-tokens", "777"])
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    // A different (still Anthropic-dialect — any `claude*` id) model, so the mock server's
+    // Anthropic-shaped `turn_text` SSE body decodes cleanly for both turns; crossing dialects
+    // (e.g. into an OpenAI Responses model) isn't this test's concern and would need a
+    // dialect-matched mock response instead.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_model", "model": "claude-cheap" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "set_model");
+    assert_eq!(frames.last().unwrap()["success"], true, "{frames:#?}");
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "second" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    drop(stdin);
+    child.wait().unwrap();
+
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[0].contains(r#""max_tokens":777"#),
+        "--max-tokens must set the wire request's max_tokens: {}",
+        bodies[0]
+    );
+    assert!(
+        bodies[1].contains(r#""max_tokens":777"#),
+        "--max-tokens must survive a set_model rebuild, not reset to the new model's own default: {}",
+        bodies[1]
+    );
 }

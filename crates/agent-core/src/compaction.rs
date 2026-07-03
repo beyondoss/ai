@@ -124,22 +124,43 @@ pub const SUMMARY_SYSTEM: &str = "You compact a long agent transcript so the age
 with far fewer tokens but no loss of essential context. Be precise, concrete, and information-dense; \
 preserve file paths, identifiers, commands, and decisions exactly.";
 
-/// The instruction appended after the rendered transcript in the summarization call.
-pub const SUMMARY_INSTRUCTION: &str = "Summarize the conversation above into this exact Markdown \
-structure, keeping concrete identifiers (file paths, function names, commands) verbatim and omitting \
-pleasantries:\n\n## Goal\n## Constraints\n## Progress\n### Done\n### In Progress\n### Blocked\n## Key \
-Decisions\n## Next Steps\n## Critical Context";
+/// The instruction appended after the rendered transcript in the summarization call. Matches pi's own
+/// `SUMMARIZATION_PROMPT` (`compaction.ts`) structurally: a bracketed exemplar per section (telling the
+/// model *what kind of content* goes there, not just a bare heading), an explicit "(none)" fallback for
+/// the two sections that can legitimately be empty, checkbox conventions for Done/In Progress
+/// (`- [x]`/`- [ ]`) matching a to-do-list shape the model has abundant training signal for, and a
+/// numbered (not bulleted) Next Steps list, since order matters there and nowhere else in the template.
+pub const SUMMARY_INSTRUCTION: &str = "The messages above are a conversation to summarize. Create a \
+structured context checkpoint summary that another LLM will use to continue the work.\n\nUse this EXACT \
+format:\n\n## Goal\n[What is the user trying to accomplish? Can be multiple items if the session covers \
+different tasks.]\n\n## Constraints & Preferences\n- [Any constraints, preferences, or requirements \
+mentioned by user]\n- [Or \"(none)\" if none were mentioned]\n\n## Progress\n### Done\n- [x] [Completed \
+tasks/changes]\n\n### In Progress\n- [ ] [Current work]\n\n### Blocked\n- [Issues preventing progress, \
+if any]\n\n## Key Decisions\n- **[Decision]**: [Brief rationale]\n\n## Next Steps\n1. [Ordered list of \
+what should happen next]\n\n## Critical Context\n- [Any data, examples, or references needed to \
+continue]\n- [Or \"(none)\" if not applicable]\n\nKeep each section concise. Preserve exact file paths, \
+function names, and error messages.";
 
 /// The instruction used when a *previous* summary already exists — an incremental update rather than a
 /// from-scratch re-summarization. Without this, each compaction re-summarizes the prior summary as raw
-/// transcript, compounding information loss and re-billing those tokens every cycle.
-pub const UPDATE_INSTRUCTION: &str = "Above is the PREVIOUS summary followed by NEW activity since it \
-was written. Produce a single UPDATED summary that folds the new activity into the previous one, in \
-this exact Markdown structure, keeping concrete identifiers (file paths, function names, commands) \
-verbatim and omitting pleasantries. Preserve still-relevant facts from the previous summary; do not \
-drop earlier decisions or context just because they are not repeated in the new activity:\n\n## Goal\n\
-## Constraints\n## Progress\n### Done\n### In Progress\n### Blocked\n## Key Decisions\n## Next Steps\n\
-## Critical Context";
+/// transcript, compounding information loss and re-billing those tokens every cycle. Matches pi's own
+/// `UPDATE_SUMMARIZATION_PROMPT`: explicit per-field update rules (move Done↔In-Progress items, drop
+/// resolved Blocked entries, append rather than replace Key Decisions) rather than just "keep it
+/// current" — the same granularity gap [`SUMMARY_INSTRUCTION`]'s doc comment describes.
+pub const UPDATE_INSTRUCTION: &str = "The messages above are NEW conversation messages to incorporate \
+into the existing summary provided in <previous-summary> tags.\n\nUpdate the existing structured \
+summary with new information. RULES:\n- PRESERVE all existing information from the previous summary\n- \
+ADD new progress, decisions, and context from the new messages\n- UPDATE the Progress section: move \
+items from \"In Progress\" to \"Done\" when completed\n- UPDATE \"Next Steps\" based on what was \
+accomplished\n- PRESERVE exact file paths, function names, and error messages\n- If something is no \
+longer relevant, you may remove it\n\nUse this EXACT format:\n\n## Goal\n[Preserve existing goals, add \
+new ones if the task expanded]\n\n## Constraints & Preferences\n- [Preserve existing, add new ones \
+discovered]\n\n## Progress\n### Done\n- [x] [Include previously done items AND newly completed \
+items]\n\n### In Progress\n- [ ] [Current work - update based on progress]\n\n### Blocked\n- [Current \
+blockers - remove if resolved]\n\n## Key Decisions\n- **[Decision]**: [Brief rationale] (preserve all \
+previous, add new)\n\n## Next Steps\n1. [Update based on current state]\n\n## Critical Context\n- \
+[Preserve important context, add new if needed]\n\nKeep each section concise. Preserve exact file \
+paths, function names, and error messages.";
 
 /// The instruction used when the cut point falls *inside* an in-progress turn (see [`is_split_turn`]):
 /// the prefix being summarized ends mid-tool-dispatch, so its concluding response — and the context
@@ -199,6 +220,19 @@ pub(crate) fn estimate_message_tokens(m: &Message) -> u32 {
             ContentBlock::Image { .. } => 1_200,
         })
         .sum()
+}
+
+/// Total estimated tokens across every message in `messages` — pi's own `estimateMessagesTokens`,
+/// summing [`estimate_message_tokens`] per message. Unlike [`trailing_tokens`] (a *delta* since the last
+/// real usage snapshot), this estimates the whole list from scratch — used right after
+/// [`apply_summary`] rebuilds the message list for a post-compaction estimate, a moment at which
+/// `trailing_tokens` would just report 0 (`apply_summary` resets its snapshot to point past the
+/// freshly-shrunk list's end, so there's no "since last snapshot" delta to speak of yet).
+pub(crate) fn estimate_messages_tokens(messages: &[Message]) -> u32 {
+    messages
+        .iter()
+        .map(estimate_message_tokens)
+        .fold(0u32, |acc, n| acc.saturating_add(n))
 }
 
 /// Estimated tokens in every message appended since [`Session::last_input_tokens`] was last set — the
@@ -681,6 +715,40 @@ mod tests {
             Message::tool_result("2", "edited", false),
             Message::assistant(vec![ContentBlock::text("done")]),
         ]
+    }
+
+    #[test]
+    fn summary_instruction_templates_give_pi_parity_structural_guidance() {
+        // pi-parity gap: the templates used to be bare heading names with one line of framing — no
+        // bracketed exemplars (what kind of content goes in each section), no "(none)" fallback for
+        // sections that can legitimately be empty, no checkbox/numbering conventions. Matches pi's own
+        // `SUMMARIZATION_PROMPT`/`UPDATE_SUMMARIZATION_PROMPT` (`compaction.ts`) structurally.
+        for (name, template) in [
+            ("SUMMARY_INSTRUCTION", SUMMARY_INSTRUCTION),
+            ("UPDATE_INSTRUCTION", UPDATE_INSTRUCTION),
+        ] {
+            assert!(
+                template.contains("- [x]") && template.contains("- [ ]"),
+                "{name} must use checkbox conventions for Done/In Progress: {template}"
+            );
+            assert!(
+                template.contains("1. ["),
+                "{name}'s Next Steps must be a numbered (not bulleted) list: {template}"
+            );
+            assert!(
+                template.contains("## Goal\n["),
+                "{name} must give a bracketed exemplar right after the Goal heading, not a bare \
+                 heading: {template}"
+            );
+        }
+        // Only the from-scratch template has optional sections that can legitimately be empty (the
+        // update template's rules are phrased as edits to what's already there, so it has no
+        // equivalent "or (none)" fallback — matching pi's own asymmetry between the two prompts).
+        assert!(
+            SUMMARY_INSTRUCTION.contains("\"(none)\""),
+            "SUMMARY_INSTRUCTION must give an explicit \"(none)\" fallback for optional sections: \
+             {SUMMARY_INSTRUCTION}"
+        );
     }
 
     #[test]
@@ -1201,7 +1269,7 @@ mod tests {
         assert!(text.contains("<previous-summary>"));
         assert!(text.contains("Previous summary body about task X"));
         assert!(text.contains("<new-activity>"));
-        assert!(text.contains("PREVIOUS summary followed by NEW activity"));
+        assert!(text.contains("NEW conversation messages to incorporate"));
         // The marker line itself isn't fed back into the transcript as raw text.
         assert!(!text.contains(SUMMARY_MARKER));
     }

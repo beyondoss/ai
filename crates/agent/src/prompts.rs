@@ -4,9 +4,11 @@
 //! (project). When a prompt message begins with `/name ...`, the matching template's body is expanded
 //! with bash-style argument substitution and sent to the model in place of the slash line.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use crate::path_utils::push_unique_root;
 
 /// A discovered prompt template.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,12 +76,26 @@ fn discover_with_diagnostics_impl(
     let mut origins: HashMap<String, PathBuf> = HashMap::new();
     let mut collisions: Vec<String> = Vec::new();
     let mut standard_roots: Vec<PathBuf> = Vec::new();
+    // Canonical form of every root added so far, across `standard_roots` and the extra-root loop
+    // below — a root reached by two different paths (a symlink, a relative-vs-absolute spelling, `cwd`
+    // itself equaling `~/.claude/prompts` in some deployment) must only be walked once, or its
+    // templates would double-count and self-collide against a phantom duplicate rather than a genuine
+    // collision. See `push_unique_root`'s own doc comment.
+    let mut seen_roots: HashSet<PathBuf> = HashSet::new();
     if include_standard_roots {
         if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-            standard_roots.push(home.join(".claude/prompts"));
+            push_unique_root(
+                &mut standard_roots,
+                &mut seen_roots,
+                home.join(".claude/prompts"),
+            );
         }
         if project_trusted {
-            standard_roots.push(cwd.join(".claude/prompts"));
+            push_unique_root(
+                &mut standard_roots,
+                &mut seen_roots,
+                cwd.join(".claude/prompts"),
+            );
         }
     }
 
@@ -99,13 +115,31 @@ fn discover_with_diagnostics_impl(
         ))
     }
 
+    // Gitignore-aware, matching `skills.rs::walk` — pi's own `collectAutoPromptEntries` applies its
+    // `IGNORE_FILE_NAMES` (`.gitignore`/`.ignore`/`.fdignore`) here too via `addIgnoreRules`; this had
+    // no `ignore`-crate usage at all before, so a `.claude/prompts/.gitignore` entry that pi would skip
+    // (e.g. `draft-*.md` hiding a work-in-progress template) was silently still loaded and exposed as
+    // `/name` here. `max_depth(Some(1))` keeps this the same single-directory scan pi's own
+    // `readdirSync` does (prompt templates, unlike skills, are never nested in a subdirectory of their
+    // own) — only `root`'s immediate children are considered, not an arbitrary-depth walk.
+    // `git_global`/`git_exclude` are disabled for the same reason `skills.rs` disables them: pi never
+    // consults a global excludes file or `.git/info/exclude`, only the three per-directory ignore files.
     fn load_dir(root: &Path) -> Vec<(String, PathBuf, PromptTemplate)> {
         let mut out = Vec::new();
-        let Ok(entries) = fs::read_dir(root) else {
-            return out;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
+        let paths: Vec<PathBuf> = ignore::WalkBuilder::new(root)
+            .max_depth(Some(1))
+            .follow_links(true)
+            .add_custom_ignore_filename(".fdignore")
+            .require_git(false)
+            .git_global(false)
+            .git_exclude(false)
+            .filter_entry(|entry| entry.file_name() != "node_modules")
+            .build()
+            .flatten() // missing/unreadable/inaccessible entries are the normal case, not an error
+            .filter(|entry| entry.depth() > 0 && entry.file_type().is_some_and(|t| t.is_file()))
+            .map(ignore::DirEntry::into_path)
+            .collect();
+        for path in paths {
             if path.extension().and_then(|e| e.to_str()) != Some("md") {
                 continue;
             }
@@ -127,8 +161,18 @@ fn discover_with_diagnostics_impl(
         let expanded = crate::tools::expand_tilde(extra, home.as_deref().and_then(|p| p.to_str()));
         let root = PathBuf::from(expanded);
         if root.is_dir() {
+            // Already scanned via a standard root, or an earlier `--prompt-template`, under a
+            // different (possibly symlinked or relative) path — walking it again would double-count
+            // its templates and self-collide every name in it against a phantom duplicate.
+            if !seen_roots.insert(crate::path_utils::resolved_path(&root)) {
+                continue;
+            }
             extra_entries.push(load_dir(&root));
         } else if root.extension().and_then(|e| e.to_str()) == Some("md") {
+            // Same reasoning as the directory case above, for a standalone `.md` file.
+            if !seen_roots.insert(crate::path_utils::resolved_path(&root)) {
+                continue;
+            }
             // pi-parity fix (M3): pi's other `--prompt-template` shape — a single standalone `.md`
             // file, one template, no directory of its own resources.
             match load_file(&root) {
@@ -514,6 +558,90 @@ mod tests {
     }
 
     #[test]
+    fn a_dotfile_template_is_not_discovered() {
+        // Regression guard: `load_dir`'s `WalkBuilder` never sets `.hidden(...)` at all, relying on
+        // the crate's own default (`hidden: true`, which — despite the confusing name — means dotfiles
+        // *are* skipped), matching pi's own `collectAutoPromptEntries`'s explicit
+        // `if (entry.name.startsWith(".")) continue;`. A deliberately-dotted `.draft.md` (a real
+        // "hide this WIP template" convention) must not leak into discovery.
+        let tmp = tempfile::tempdir().unwrap();
+        let pdir = tmp.path().join(".claude/prompts");
+        fs::create_dir_all(&pdir).unwrap();
+        fs::write(pdir.join(".draft.md"), "a work-in-progress template").unwrap();
+
+        let templates = discover(tmp.path(), true, &[]);
+        assert!(
+            !templates
+                .iter()
+                .any(|t| t.name == ".draft" || t.name == "draft"),
+            "a dotfile template must not be discovered: {templates:?}"
+        );
+    }
+
+    #[test]
+    fn a_gitignore_entry_hides_a_matching_prompt_template() {
+        // Pi-parity audit H66: `load_dir` did a plain `fs::read_dir` with no ignore-crate usage at
+        // all, unlike `skills.rs`'s sibling `walk` — a `.claude/prompts/.gitignore` entry (e.g.
+        // `draft-*.md` hiding a work-in-progress template) that pi would honor was silently ignored
+        // here, exposing a `/name` command pi itself would never expose.
+        let tmp = tempfile::tempdir().unwrap();
+        let pdir = tmp.path().join(".claude/prompts");
+        fs::create_dir_all(&pdir).unwrap();
+        fs::write(pdir.join(".gitignore"), "draft-*.md\n").unwrap();
+        fs::write(pdir.join("draft-outline.md"), "should not surface").unwrap();
+        fs::write(pdir.join("real.md"), "a real template").unwrap();
+
+        let templates = discover(tmp.path(), true, &[]);
+        assert!(
+            !templates.iter().any(|t| t.name == "draft-outline"),
+            "a gitignored template must not be discovered: {templates:?}"
+        );
+        assert!(
+            templates.iter().any(|t| t.name == "real"),
+            "a non-ignored template in the same directory must still be discovered: {templates:?}"
+        );
+    }
+
+    #[test]
+    fn a_git_info_exclude_entry_does_not_hide_a_real_prompt_template() {
+        // Matches `skills.rs`'s identical H65 test: pi's own `IGNORE_FILE_NAMES` never includes
+        // `.git/info/exclude` or a global excludes file, so those must not hide a template either.
+        let tmp = tempfile::tempdir().unwrap();
+        let pdir = tmp.path().join(".claude/prompts");
+        fs::create_dir_all(&pdir).unwrap();
+        fs::create_dir_all(tmp.path().join(".git/info")).unwrap();
+        fs::write(tmp.path().join(".git/info/exclude"), "real.md\n").unwrap();
+        fs::write(pdir.join("real.md"), "a real template").unwrap();
+
+        let templates = discover(tmp.path(), true, &[]);
+        assert!(
+            templates.iter().any(|t| t.name == "real"),
+            "a .git/info/exclude entry must not hide a real prompt template: {templates:?}"
+        );
+    }
+
+    #[test]
+    fn a_template_in_a_nested_subdirectory_is_not_discovered() {
+        // Non-recursive, matching pi's own `readdirSync` (no subdirectory descent) — prompt templates,
+        // unlike skills, are never nested in a subdirectory of their own.
+        let tmp = tempfile::tempdir().unwrap();
+        let pdir = tmp.path().join(".claude/prompts");
+        fs::create_dir_all(pdir.join("nested")).unwrap();
+        fs::write(pdir.join("nested/deep.md"), "should not surface").unwrap();
+        fs::write(pdir.join("top.md"), "a top-level template").unwrap();
+
+        let templates = discover(tmp.path(), true, &[]);
+        assert!(
+            !templates.iter().any(|t| t.name == "deep"),
+            "a template nested in a subdirectory must not be discovered: {templates:?}"
+        );
+        assert!(
+            templates.iter().any(|t| t.name == "top"),
+            "a top-level template must still be discovered: {templates:?}"
+        );
+    }
+
+    #[test]
     fn discover_with_diagnostics_is_empty_when_no_names_collide() {
         let tmp = tempfile::tempdir().unwrap();
         let pdir = tmp.path().join(".claude/prompts");
@@ -531,6 +659,40 @@ mod tests {
     }
 
     #[test]
+    fn discover_with_diagnostics_alphabetizes_the_final_list_regardless_of_registration_order() {
+        // Pi-parity awareness note: pi's own `prompt-templates.ts` never sorts at all (no `.sort(` call
+        // anywhere in it) — its listing order is whatever order roots were registered/walked in.
+        // Beyond always alphabetizes by name (`found.sort_by`), a deliberate divergence — this pins that
+        // down against the one scenario where the two orders would visibly differ: a project-root
+        // template ("zebra", registered first) vs. an extra-root template ("apple", registered after)
+        // must still come out apple-before-zebra, not in registration order.
+        let tmp = tempfile::tempdir().unwrap();
+        let pdir = tmp.path().join(".claude/prompts");
+        fs::create_dir_all(&pdir).unwrap();
+        fs::write(pdir.join("zebra.md"), "Zebra body.").unwrap();
+
+        let extra_root = tmp.path().join("shared-prompts");
+        fs::create_dir_all(&extra_root).unwrap();
+        fs::write(extra_root.join("apple.md"), "Apple body.").unwrap();
+
+        let (templates, _) = discover_with_diagnostics(
+            tmp.path(),
+            true,
+            &[extra_root.to_string_lossy().into_owned()],
+        );
+        let names: Vec<&str> = templates
+            .iter()
+            .filter(|t| t.name == "apple" || t.name == "zebra")
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["apple", "zebra"],
+            "must be alphabetized, not registration order (project root before extra root): {names:?}"
+        );
+    }
+
+    #[test]
     fn discover_with_diagnostics_loads_from_an_explicit_extra_root() {
         let tmp = tempfile::tempdir().unwrap();
         let extra_root = tmp.path().join("shared-prompts");
@@ -541,6 +703,34 @@ mod tests {
         let (found, _) =
             discover_with_diagnostics(&cwd, true, &[extra_root.to_string_lossy().into_owned()]);
         assert!(found.iter().any(|t| t.name == "deploy"), "got: {found:?}");
+    }
+
+    #[test]
+    fn discover_with_diagnostics_dedupes_an_extra_root_that_is_actually_a_standard_root() {
+        // Pi-parity fix (#45/#73): the same real directory reached via two different paths (here, the
+        // project's own `.claude/prompts` standard root and an identically-pathed
+        // `--prompt-template` extra root) must be walked only once — not double-counted into a phantom
+        // "defined at both X and Y" collision for every template inside it.
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("project");
+        let standard_root = cwd.join(".claude/prompts");
+        fs::create_dir_all(&standard_root).unwrap();
+        fs::write(
+            standard_root.join("deploy.md"),
+            "Deploy the thing, only actually defined once.",
+        )
+        .unwrap();
+        let (found, collisions) =
+            discover_with_diagnostics(&cwd, true, &[standard_root.to_string_lossy().into_owned()]);
+        assert_eq!(
+            found.iter().filter(|t| t.name == "deploy").count(),
+            1,
+            "the same directory scanned via two paths must not double-count its templates: {found:?}"
+        );
+        assert!(
+            !collisions.iter().any(|c| c.contains("deploy")),
+            "must not report a phantom self-collision: {collisions:?}"
+        );
     }
 
     #[test]

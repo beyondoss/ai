@@ -21,7 +21,7 @@ use crate::compaction::{self, CompactionConfig, CompactionReason};
 use crate::error::{Error, MID_STREAM_NETWORK_ERROR, Result};
 use crate::hooks::{AgentHooks, CheckpointHook, NoCheckpoint, NoHooks};
 use crate::message::{
-    ContentBlock, ImageSource, Message, StopReason, StreamEvent, TokenUsage, ToolDef,
+    ContentBlock, ImageSource, Message, Role, StopReason, StreamEvent, TokenUsage, ToolDef,
 };
 use crate::session::Session;
 use crate::steering::Steering;
@@ -83,6 +83,17 @@ pub enum AgentEvent {
         reason: CompactionReason,
         /// Estimated input tokens at the moment this compaction fired (before the reset).
         tokens_before: u32,
+        /// The generated summary text actually spliced into the session (with the deterministic
+        /// file-operations list already appended — see `compaction::format_file_operations`) — pi's own
+        /// `CompactionResult.summary`. A caller (the `compact` RPC, a `run --json` client) that wants to
+        /// show the operator what got summarized would otherwise have no way to see it at all.
+        summary: String,
+        /// Estimated total tokens across the post-compaction message list (summary + kept suffix) — pi's
+        /// own `CompactionResult.estimatedTokensAfter`, computed the same way (`estimate_messages_tokens`
+        /// summed over every message), not `trailing_tokens`'s since-last-snapshot delta, which is
+        /// always 0 immediately after `apply_summary` resets that snapshot to point past the rebuilt
+        /// list's end.
+        tokens_after: u32,
     },
     /// The run is ending abnormally (transport failure after retries, malformed SSE, or the step
     /// ceiling). A terminal marker on the event stream so a streaming client sees *why* a run stopped
@@ -98,6 +109,16 @@ pub enum AgentEvent {
     CompactionFailed {
         reason: CompactionReason,
         message: String,
+    },
+    /// A pending [`crate::steering::ModelSwitch`] (see [`Steering::request_model_switch`]) was applied
+    /// at a turn boundary — every subsequent turn of this run now targets `model`, with `thinking` set
+    /// if the switch requested a new budget. Mirrors pi's `prepareNextTurn`: a host can downgrade to a
+    /// cheaper model once a run turns out not to need much firepower, or raise it (or the thinking
+    /// budget) once it turns out to need more, without stopping and restarting the whole call.
+    ModelSwitched {
+        model: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thinking: Option<u32>,
     },
 }
 
@@ -156,6 +177,9 @@ pub struct Agent {
     /// Reasoning effort level (OpenAI reasoning models; Anthropic adaptive thinking). Applied to every
     /// turn's request when set.
     reasoning_effort: Option<ReasoningEffort>,
+    /// Sampling temperature. `None` leaves the provider default. Applied to every turn's request when
+    /// set — see [`ModelRequest::temperature`]'s doc comment for per-dialect gating.
+    temperature: Option<f64>,
     /// Context-compaction policy: when to summarize the prefix to stay under the context window.
     compaction: CompactionConfig,
     /// Whether [`Self::run_turn`] retries a mid-stream transport failure (see
@@ -163,6 +187,12 @@ pub struct Agent {
     /// operator debugging a flaky network hop can disable it via `with_auto_retry(false)` to see the
     /// raw failure on the very first hiccup rather than after `MAX_MID_STREAM_RETRIES` silent attempts.
     auto_retry: bool,
+    /// Force every tool-call group in a turn to run one at a time, regardless of
+    /// [`MAX_CONCURRENT_TOOL_GROUPS`] — the same effect `exclusive_turn` already has for a single
+    /// `bash`-like call, but host-selectable for a whole run. Defaults to `false` (concurrent, bounded).
+    /// Matches pi's own `AgentOptions.toolExecution: "sequential" | "parallel"` — see
+    /// [`Self::with_sequential_tools`].
+    sequential_tools: bool,
     /// Interception hooks around tool calls (gate/rewrite). Defaults to no-ops.
     hooks: Arc<dyn AgentHooks>,
     /// Stable prompt-cache affinity key for this run (OpenAI `prompt_cache_key`).
@@ -210,12 +240,14 @@ impl Agent {
             max_steps: DEFAULT_MAX_STEPS,
             thinking: None,
             reasoning_effort: None,
+            temperature: None,
             compaction: CompactionConfig {
                 context_window: caps.context_window,
                 summary_max_tokens,
                 ..CompactionConfig::default()
             },
             auto_retry: true,
+            sequential_tools: false,
             hooks: Arc::new(NoHooks),
             cache_key: None,
             cache_long: false,
@@ -271,6 +303,13 @@ impl Agent {
         self
     }
 
+    /// Set the sampling temperature applied to every turn. See [`ModelRequest::temperature`]'s doc
+    /// comment for per-dialect gating (Anthropic omits it while thinking is enabled).
+    pub fn with_temperature(mut self, temperature: f64) -> Self {
+        self.temperature = Some(temperature);
+        self
+    }
+
     /// Set the compaction policy (context window, reserve, keep-recent, enabled).
     pub fn with_compaction(mut self, mut compaction: CompactionConfig) -> Self {
         // A caller replacing the whole config wholesale — the common pattern for overriding just
@@ -301,6 +340,13 @@ impl Agent {
     /// Enable or disable mid-stream retry (default: enabled) — see the `auto_retry` field's doc comment.
     pub fn with_auto_retry(mut self, enabled: bool) -> Self {
         self.auto_retry = enabled;
+        self
+    }
+
+    /// Force fully-sequential tool dispatch (default: `false`, bounded-concurrent) — see the
+    /// `sequential_tools` field's doc comment.
+    pub fn with_sequential_tools(mut self, enabled: bool) -> Self {
+        self.sequential_tools = enabled;
         self
     }
 
@@ -354,6 +400,30 @@ impl Agent {
                 on_event(s);
             }
         })
+        .await
+    }
+
+    /// Like [`run`](Self::run), but a `cancel` token lets a caller interrupt the run — see
+    /// [`run_events_cancellable`](Self::run_events_cancellable) for the exact semantics. Returns
+    /// [`Error::Cancelled`] once cancelled.
+    pub async fn run_cancellable<F>(
+        &self,
+        session: &mut Session,
+        mut on_event: F,
+        cancel: CancellationToken,
+    ) -> Result<()>
+    where
+        F: FnMut(&StreamEvent),
+    {
+        self.run_events_cancellable(
+            session,
+            move |ev| {
+                if let AgentEvent::Stream(s) = &ev {
+                    on_event(s);
+                }
+            },
+            cancel,
+        )
         .await
     }
 
@@ -436,9 +506,41 @@ impl Agent {
         // The previous turn's stop reason, read by `is_hard_overflow`'s `MaxTokens` check — `EndTurn`
         // (a value that check never matches) until the first turn actually completes.
         let mut last_stop_reason = StopReason::EndTurn;
+        // Mutable, per-call shadows of the `Agent`'s own model/thinking/reasoning-effort — `self` is
+        // borrowed immutably for the whole call, so a mid-run switch (see below) can't touch `self`
+        // directly; every read of "what model/thinking is this run using right now" goes through these
+        // instead of `self.model`/`self.thinking`/`self.reasoning_effort` for the rest of this function.
+        // Deliberately NOT threaded into `compact`/`compact_or_report`/`is_hard_overflow`: those still
+        // use the `Agent`'s original, as-configured model — pi's own harness doesn't thread
+        // `prepareNextTurn`'s override into its summarization path either (a separate call with no
+        // `nextTurnSnapshot` awareness).
+        let mut current_model = self.model.clone();
+        let mut current_thinking = self.thinking;
+        // Not mutated by a mid-run switch — `ModelSwitch` only ever carries a model/thinking override
+        // (see its own doc comment on why this is deliberately narrower than pi's full snapshot); a
+        // plain `let` still reads uniformly alongside the two shadows above that *do* change.
+        let current_reasoning_effort = self.reasoning_effort;
         loop {
             if cancel.is_cancelled() {
+                close_out_pending_cancellation(session, &current_model);
+                // Matches pi's `agent-harness.ts` `abort()`: a message queued via `push`/`push_steer`
+                // shortly before (or during) cancellation must not silently ride into whatever
+                // unrelated run reuses this same `Steering` handle next.
+                steering.clear();
                 return Err(Error::Cancelled);
+            }
+            // A pending mid-run model switch (`Steering::request_model_switch`, pi's `prepareNextTurn`
+            // equivalent) is applied at the same turn boundary a graceful stop is checked — before the
+            // next request is built, never mid-turn.
+            if let Some(switch) = steering.take_model_switch() {
+                current_model = switch.model.clone();
+                if let Some(budget) = switch.thinking {
+                    current_thinking = Some(budget);
+                }
+                sink(AgentEvent::ModelSwitched {
+                    model: switch.model,
+                    thinking: switch.thinking,
+                });
             }
             if steps_this_call >= self.max_steps {
                 let err = Error::MaxSteps(self.max_steps);
@@ -477,7 +579,7 @@ impl Agent {
             });
 
             let mut req = ModelRequest::new(
-                self.model.clone(),
+                current_model.clone(),
                 session.messages.clone(),
                 self.max_tokens,
             )
@@ -486,11 +588,14 @@ impl Agent {
             if let Some(system) = &self.system {
                 req = req.with_system(system.clone());
             }
-            if let Some(budget) = self.thinking {
+            if let Some(budget) = current_thinking {
                 req = req.with_thinking(budget);
             }
-            if let Some(effort) = self.reasoning_effort {
+            if let Some(effort) = current_reasoning_effort {
                 req = req.with_reasoning_effort(effort);
+            }
+            if let Some(temperature) = self.temperature {
+                req = req.with_temperature(temperature);
             }
             if let Some(key) = &self.cache_key {
                 req = req.with_cache_key(key.clone());
@@ -498,14 +603,24 @@ impl Agent {
 
             // `emit` borrows `sink` for the turn; bind the result, then drop the borrow before handling
             // an error so the terminal `Error` event can go out through `sink`.
+            let mut partial_turn: Option<Turn> = None;
             let turn_result = {
                 let mut emit = |ev: StreamEvent| sink(AgentEvent::Stream(ev));
-                self.run_turn(req, &mut emit, &cancel).await
+                self.run_turn(req, &mut emit, &cancel, &mut partial_turn)
+                    .await
             };
             let mut turn = match turn_result {
                 Ok(turn) => turn,
                 // A cancellation is a user request, not a fault — return it without an `Error` event.
-                Err(Error::Cancelled) => return Err(Error::Cancelled),
+                // Reachable here only pre-connect (no byte ever streamed back — a mid-stream abort
+                // resolves to `Ok(Turn { stop_reason: Aborted, .. })` instead, handled by the ordinary
+                // turn-commit path below), so the session needs the same closing-out `run_turn`'s
+                // sibling paths give a mid-stream abort.
+                Err(Error::Cancelled) => {
+                    close_out_pending_cancellation(session, &current_model);
+                    steering.clear();
+                    return Err(Error::Cancelled);
+                }
                 // The provider rejected the request for exceeding its context window. Compact once and
                 // retry the same turn; if it still overflows (or there's nothing to compact), give up.
                 Err(e) if is_context_overflow(&e) && !overflow_recovered => {
@@ -572,7 +687,20 @@ impl Agent {
                     // the same — so the session's last message is never the user's own un-answered
                     // prompt. Without this, a client's retry after a transient failure would append a
                     // second consecutive `user` turn, a shape no wire dialect accepts.
-                    session.push(Message::error(e.to_string()));
+                    //
+                    // If real content had already streamed before this failure struck (`partial_turn`,
+                    // set by `run_turn_once`), keep it rather than closing out with a bare empty
+                    // record — pi's own dialects keep whatever streamed before a mid-stream failure,
+                    // just like they do for a mid-stream cancellation (see the `StopReason::Aborted`
+                    // arm below). A pre-connect failure (nothing ever streamed) leaves `partial_turn`
+                    // `None`, falling back to the original bare closing record.
+                    let closing = match partial_turn.take() {
+                        Some(turn) if !turn.blocks.is_empty() => Message::assistant(turn.blocks)
+                            .with_model_id(&current_model)
+                            .with_error(e.to_string()),
+                        _ => Message::error(e.to_string()),
+                    };
+                    session.push(closing);
                     return Err(e);
                 }
             };
@@ -596,10 +724,27 @@ impl Agent {
                 // — same wire-safety tradeoff `Message::error` already makes for the analogous case.
                 blocks.push(ContentBlock::text(String::new()));
             }
-            let mut assistant_message = Message::assistant(blocks).with_model_id(&self.model);
+            let mut assistant_message = Message::assistant(blocks).with_model_id(&current_model);
             if turn.stop_reason == StopReason::Aborted {
                 assistant_message = assistant_message.with_aborted();
             }
+            // Let a hook redact/rewrite the model's own generated content — e.g. scrubbing a secret it
+            // echoed back — before it's committed to `session`, checkpointed, or handed to the caller in
+            // `AgentEvent::TurnEnd` below. A panicking hook, or one that returns a message with the
+            // wrong role, falls back to the original rather than risk losing this turn's content or
+            // splicing a wrong-role message into the transcript — see `on_assistant_message`'s own doc
+            // comment for why both are "fail open, keep the original," matching
+            // `should_stop_after_turn`'s identical convention just below.
+            let original_role = assistant_message.role;
+            assistant_message = catch_tool_panic(self.hooks.on_assistant_message(
+                assistant_message.clone(),
+                session,
+                &cancel,
+            ))
+            .await
+            .ok()
+            .filter(|rewritten| rewritten.role == original_role)
+            .unwrap_or(assistant_message);
             session.push(assistant_message);
             session.steps += 1;
             steps_this_call += 1;
@@ -616,6 +761,7 @@ impl Agent {
             // run retry exclusion, `serve.rs`'s `abort` RPC response shape) stay correct. No `AgentEnd`
             // here, matching those same sibling paths — one is only ever emitted on an `Ok(())` return.
             if turn.stop_reason == StopReason::Aborted {
+                steering.clear();
                 return Err(Error::Cancelled);
             }
 
@@ -631,6 +777,66 @@ impl Agent {
                 .unwrap_or_default();
 
             if calls.is_empty() || turn.stop_reason != StopReason::ToolUse {
+                // Silent truncation: the provider replied successfully, but the response was cut off by
+                // `max_tokens` alone (no tool calls, so this isn't a "the model needs another turn to
+                // keep working" shape) — the model didn't get to finish because there wasn't room left,
+                // not because it was done. Left as-is, the run would end here and hand the user a
+                // hard-truncated non-answer with no indication anything went wrong. If auto-compaction is
+                // enabled and the live prompt has genuinely reached (or this `MaxTokens` stop implies
+                // it's about to reach) the raw context window, compact and retry this same turn instead —
+                // pi's own `_checkCompaction`+silent-overflow handling does the same. Guarded by the same
+                // `overflow_recovered` flag the error-based overflow-retry arm uses (reset at the top of
+                // every turn), so a second silent truncation right after this recovery doesn't loop
+                // forever; a genuine improvement should always show up as *some* progress within one
+                // retry, same rationale as the error-based path.
+                if calls.is_empty()
+                    && turn.stop_reason == StopReason::MaxTokens
+                    && !overflow_recovered
+                    && self.compaction.enabled
+                    && compaction::is_hard_overflow(
+                        session,
+                        &self.compaction,
+                        turn.stop_reason,
+                        self.max_tokens,
+                    )
+                {
+                    match self
+                        .compact(
+                            session,
+                            CompactionReason::Overflow,
+                            &cancel,
+                            &mut sink,
+                            None,
+                        )
+                        .await
+                    {
+                        Ok(true) => {
+                            // Compaction freed real room — discard the truncated response and retry the
+                            // same turn fresh; keeping both would leave two consecutive assistant turns
+                            // once the retry's real response lands, a shape no dialect accepts.
+                            Arc::make_mut(&mut session.messages).pop();
+                            session.steps -= 1;
+                            steps_this_call -= 1;
+                            overflow_recovered = true;
+                            continue;
+                        }
+                        Ok(false) => {
+                            // Nothing worth compacting (already at a clean, minimal boundary) — the
+                            // truncated response is the best available answer; fall through and report
+                            // it normally rather than silently discarding it with nothing to replace it.
+                        }
+                        Err(e) => {
+                            // The recovery attempt itself failed (e.g. the summarization call errored) —
+                            // non-fatal here, unlike the error-based overflow-retry arm: a real (if
+                            // truncated) answer already exists, so report it rather than failing the
+                            // whole run over a failed *recovery* attempt.
+                            sink(AgentEvent::CompactionFailed {
+                                reason: CompactionReason::Overflow,
+                                message: e.to_string(),
+                            });
+                        }
+                    }
+                }
                 // A refusal is a distinct terminal condition, not an ordinary stop: draining queued
                 // steer/follow-up messages here would inject a new user turn right after the model
                 // just declined to engage with the current one, which the model would likely refuse
@@ -645,8 +851,21 @@ impl Agent {
                 }
                 // A pending graceful-stop request wins over draining follow-up/steer messages, exactly
                 // as it wins over continuing tool-call turns below — the queue is left untouched (same
-                // rationale as the refusal case above) so nothing queued for "next time" is lost.
-                if steering.take_stop_requested() {
+                // rationale as the refusal case above) so nothing queued for "next time" is lost. A
+                // content-aware `should_stop_after_turn` hook can request the same stop — see its own
+                // doc comment; a panicking hook fails open (doesn't stop) rather than crashing the run.
+                let hook_wants_stop = match session.messages.last() {
+                    Some(assistant_msg) => catch_tool_panic(self.hooks.should_stop_after_turn(
+                        assistant_msg,
+                        &[],
+                        session,
+                        &cancel,
+                    ))
+                    .await
+                    .unwrap_or(false),
+                    None => false,
+                };
+                if steering.take_stop_requested() || hook_wants_stop {
                     sink(AgentEvent::AgentEnd {
                         steps: session.steps,
                     });
@@ -679,6 +898,16 @@ impl Agent {
                 self.checkpoint.checkpoint(session).await;
                 continue;
             }
+
+            // The assistant's own turn — including the `tool_use` blocks collected into `calls` above —
+            // is durable now, *before* any of those tools ever run. Matches pi's `agent-harness.ts`
+            // (persists every message the instant it's produced, tool_use turn included). Without this,
+            // a crash mid-tool-execution (e.g. mid-`bash`) loses the record that the model asked for
+            // these specific calls even though a tool that already ran (an `edit`, a `write`) already
+            // took effect on disk — the persisted transcript and physical reality silently diverge on
+            // resume. Only reachable here (past the `calls.is_empty()` branch above), so a plain text
+            // turn with no tool calls doesn't pay for a redundant checkpoint before its own `AgentEnd`.
+            self.checkpoint.checkpoint(session).await;
 
             // Run the tools and feed results back as a single user turn. A tool's own failure becomes
             // an error `tool_result`, not an aborted run — the model can react to it next turn.
@@ -734,6 +963,15 @@ impl Agent {
             }
             let this = self;
             let malformed = &malformed;
+            // Read-only reborrow, shared across every concurrently-dispatched call's hook invocations:
+            // by this point the requesting assistant turn (this batch's own `tool_use` blocks) is
+            // already `session.messages.last()` (the pre-dispatch checkpoint above established that
+            // same invariant), so a hook can see the call it's gating in its full conversational
+            // context — pi's `BeforeToolCallContext`/`AfterToolCallContext` carry the same
+            // (`assistantMessage`/`context`). `session` itself isn't mutated again until every call in
+            // this batch has finished (`session.push(Message::tool_results(..))` below), so this shared
+            // borrow's lifetime never actually overlaps a mutation.
+            let session_ref: &Session = session;
             // Per-turn progress channel: every call gets a `ToolProgress` cloning `prog_tx`; the drain
             // loop below forwards each update to `sink` as it arrives. `futures`' mpsc keeps this
             // executor-agnostic (no tokio in the library).
@@ -773,9 +1011,16 @@ impl Agent {
                                     true,
                                     false,
                                 )
-                            } else if let Some(reason) =
-                                this.hooks.before_tool_call(name, input, &cancel).await
+                            } else if let Some(reason) = match catch_tool_panic(
+                                this.hooks.before_tool_call(name, input, session_ref, &cancel),
+                            )
+                            .await
                             {
+                                // A panicking permission hook fails closed: better to block the call
+                                // than to silently treat a crashed check as "allowed".
+                                Ok(reason) => reason,
+                                Err(panic_msg) => Some(panic_msg),
+                            } {
                                 // A hook blocked the call (e.g. a permission policy). Feed the reason
                                 // back as an error result instead of running the tool.
                                 (format!("tool call blocked: {reason}"), Vec::new(), true, false)
@@ -804,21 +1049,45 @@ impl Agent {
                                                 input.clone(),
                                             )
                                             .unwrap_or_else(|_| input.clone());
-                                            match tool.run_streaming(coerced, &progress).await {
-                                                Ok(o) => (o.text, o.images, false, o.terminate),
-                                                Err(e) => (e.to_string(), Vec::new(), true, false),
+                                            match catch_tool_panic(
+                                                tool.run_streaming(coerced, &progress),
+                                            )
+                                            .await
+                                            {
+                                                Ok(Ok(o)) => (o.text, o.images, false, o.terminate),
+                                                Ok(Err(e)) => {
+                                                    (e.to_string(), Vec::new(), true, false)
+                                                }
+                                                Err(panic_msg) => {
+                                                    (panic_msg, Vec::new(), true, false)
+                                                }
                                             }
                                         }
                                         None => {
                                             (format!("unknown tool: {name}"), Vec::new(), true, false)
                                         }
                                     };
-                                // Let a hook rewrite the result text (redact, cap, reclassify) before
-                                // it's fed back to the model.
-                                let (text, is_error) = this
-                                    .hooks
-                                    .after_tool_call(name, input, text, is_error, &cancel)
-                                    .await;
+                                // Let a hook rewrite the result text/images (redact, cap, reclassify)
+                                // before it's fed back to the model. A panicking hook here just keeps
+                                // the tool's own original (text, images, is_error) — losing a real,
+                                // already-obtained result to a broken *rewrite* attempt would be
+                                // strictly worse than ignoring the rewrite.
+                                let (text, images, is_error) = match catch_tool_panic(
+                                    this.hooks.after_tool_call(
+                                        name,
+                                        input,
+                                        text.clone(),
+                                        images.clone(),
+                                        is_error,
+                                        session_ref,
+                                        &cancel,
+                                    ),
+                                )
+                                .await
+                                {
+                                    Ok(rewritten) => rewritten,
+                                    Err(_) => (text, images, is_error),
+                                };
                                 (text, images, is_error, terminate)
                             };
                         // Sent the instant this call's own result is known — not batched until every
@@ -848,7 +1117,9 @@ impl Agent {
             // caps this at 1 instead — with only ever one group in flight, a `bash` call (or anything
             // else `conservative_exclusive`) can't race a same-turn `edit`/`write` group it has no path
             // to be grouped against; which group runs first still doesn't matter for the transcript,
-            // same as the concurrent case.
+            // same as the concurrent case. `self.sequential_tools` caps it at 1 too, host-selected
+            // rather than inferred from the calls themselves — e.g. a deterministic-repro debugging
+            // session, or a host policy that never wants two tool calls actually overlapping.
             //
             // Race the whole dispatch against cancellation: a tripped token drops `drain`, which drops
             // every in-flight tool future — aborting a hung `bash` (its `kill_on_drop` child dies) and
@@ -858,7 +1129,7 @@ impl Agent {
             // fully released (repairing the transcript needs to move `results` out).
             let mut cancelled_mid_dispatch = false;
             {
-                let concurrency = if exclusive_turn {
+                let concurrency = if self.sequential_tools || exclusive_turn {
                     1
                 } else {
                     MAX_CONCURRENT_TOOL_GROUPS
@@ -906,6 +1177,7 @@ impl Agent {
                 // both Anthropic and OpenAI reject on resume. Repair it before propagating the
                 // cancellation.
                 repair_cancelled_dispatch(session, &calls, results);
+                steering.clear();
                 return Err(Error::Cancelled);
             }
             // `ToolEnd` for each call was already emitted live, from within `group_runs`, the instant
@@ -962,8 +1234,32 @@ impl Agent {
             // A graceful-stop request is honored here too, after this turn's tool results (and any
             // folded-in steer text) are already committed — the same turn-boundary contract as the
             // tool-less branch above. Checked *after* the `Steered` event so a client sees its steer
-            // message land in the transcript even if the run stops right after.
-            if steering.take_stop_requested() {
+            // message land in the transcript even if the run stops right after. A content-aware
+            // `should_stop_after_turn` hook can request the same stop, now with the actual assistant
+            // turn and its tool results available — pi's `shouldStopAfterTurn` receives exactly this
+            // pair, at exactly this point in the loop.
+            let hook_wants_stop = {
+                let messages = &session.messages;
+                let assistant_and_results = messages
+                    .len()
+                    .checked_sub(2)
+                    .and_then(|i| messages.get(i))
+                    .zip(messages.last());
+                match assistant_and_results {
+                    Some((assistant_msg, tool_results_msg)) => {
+                        catch_tool_panic(self.hooks.should_stop_after_turn(
+                            assistant_msg,
+                            &tool_results_msg.content,
+                            session,
+                            &cancel,
+                        ))
+                        .await
+                        .unwrap_or(false)
+                    }
+                    None => false,
+                }
+            };
+            if steering.take_stop_requested() || hook_wants_stop {
                 sink(AgentEvent::AgentEnd {
                     steps: session.steps,
                 });
@@ -978,15 +1274,25 @@ impl Agent {
     /// dead attempt's partial blocks, so the `Turn` this returns can't blend a half-formed tool call
     /// from a failed connection into what actually gets applied to the session. A cancellation always
     /// propagates immediately; only the mid-stream-failure class is retried.
+    /// `partial_out` is overwritten by every attempt (successful or not): `None` unless the *last*
+    /// attempt made before this call returns failed after real content had already streamed, in which
+    /// case it holds that content — see [`run_turn_once`]'s doc comment. A retried attempt always
+    /// starts `run_turn_once` fresh, so a dead attempt's partial blocks never leak into a *later*,
+    /// successful attempt's slot; only a final, non-retried (or retries-exhausted) failure leaves this
+    /// set when this function returns.
     async fn run_turn(
         &self,
         req: ModelRequest,
         emit: &mut dyn FnMut(StreamEvent),
         cancel: &CancellationToken,
+        partial_out: &mut Option<Turn>,
     ) -> Result<Turn> {
         let mut attempt = 0u32;
         loop {
-            match self.run_turn_once(req.clone(), emit, cancel).await {
+            match self
+                .run_turn_once(req.clone(), emit, cancel, partial_out)
+                .await
+            {
                 Ok(turn) => return Ok(turn),
                 Err(e)
                     if self.auto_retry
@@ -1015,12 +1321,23 @@ impl Agent {
     /// read would otherwise hang for the full idle timeout) or a slow-to-connect gateway; dropping
     /// `stream` (or the connect future, before it resolves) on cancel aborts the underlying HTTP
     /// request rather than waiting it out.
+    ///
+    /// `partial_out` is reset to `None` up front, then set once — right before returning `Err` — iff a
+    /// mid-stream failure struck *after* real content had already accumulated: pi's
+    /// `anthropic-messages.ts`/`openai-completions.ts` keep whatever streamed before a failure, tagging
+    /// the turn with the error rather than silently discarding it (the same treatment a mid-stream
+    /// *cancellation* already gets a few lines below, via the synthetic `Aborted` turn). Without this, a
+    /// network blip or in-band provider error partway through a long response loses everything streamed
+    /// so far once retries are exhausted — real, already-generated prose or a half-finished edit,
+    /// gone — leaving only an empty placeholder in history.
     async fn run_turn_once(
         &self,
         req: ModelRequest,
         emit: &mut dyn FnMut(StreamEvent),
         cancel: &CancellationToken,
+        partial_out: &mut Option<Turn>,
     ) -> Result<Turn> {
+        *partial_out = None;
         let cancelled = cancel.cancelled();
         futures::pin_mut!(cancelled);
         let mut stream = {
@@ -1039,8 +1356,16 @@ impl Agent {
             let next = stream.next();
             futures::pin_mut!(next);
             match select(next, cancelled.as_mut()).await {
-                Either::Left((Some(ev), _)) => {
-                    let ev = ev?;
+                Either::Left((Some(Err(e)), _)) => {
+                    // A mid-stream transport/decode failure — unlike cancellation just below, this
+                    // isn't a synthetic `Ok(Turn)` (the retry-classification functions need the real
+                    // `Err` to decide whether `run_turn` retries), but whatever content had already
+                    // accumulated is still worth keeping for the caller to attach to the eventual
+                    // terminal record instead of losing it outright.
+                    *partial_out = Some(acc.finish());
+                    return Err(e);
+                }
+                Either::Left((Some(Ok(ev)), _)) => {
                     // `apply` only borrows, so `ev` is still ours to move into `emit` afterward — no
                     // clone needed on this per-delta hot path (see `Accumulator::apply`'s doc comment).
                     acc.apply(&ev);
@@ -1083,7 +1408,14 @@ impl Agent {
         req: ModelRequest,
         cancel: &CancellationToken,
     ) -> Result<Turn> {
-        let turn = self.run_turn(req, &mut |_| {}, cancel).await?;
+        // A utility call (compaction/branch-summary) has no session to attach partial content to on
+        // failure — only the finished summary text ever matters to its caller — so the partial turn a
+        // mid-stream failure might leave behind is simply discarded here, unlike the main conversational
+        // loop's own call to `run_turn`.
+        let mut discarded_partial = None;
+        let turn = self
+            .run_turn(req, &mut |_| {}, cancel, &mut discarded_partial)
+            .await?;
         if turn.stop_reason == StopReason::Aborted {
             return Err(Error::Cancelled);
         }
@@ -1249,11 +1581,26 @@ impl Agent {
         );
         compaction::apply_summary(session, first_kept, &summary);
         session.compaction = file_ops;
+        // Computed from the freshly-rebuilt list (summary + kept suffix), not `trailing_tokens` — that
+        // one measures a delta since the last real usage snapshot, which `apply_summary` just reset to
+        // point past this very list's end, so it would report a meaningless 0 here.
+        let tokens_after = compaction::estimate_messages_tokens(&session.messages);
+        // The rewrite just replaced (typically most of) the session's history with the new summary —
+        // this already spent one or two real, paid-for model calls to produce. Checkpoint immediately:
+        // without this, a crash between the rewrite landing here and the next natural checkpoint (which
+        // may be turns away, or may never come if the run ends on a tool-less reply) loses the rewrite
+        // entirely — on resume the persisted session still holds the old, oversized history, so the
+        // very next turn immediately re-triggers the identical (already-paid-for) compaction again, and
+        // if this was overflow-recovery, the resumed session lands right back in the same
+        // context-overflow condition it just paid to escape.
+        self.checkpoint.checkpoint(session).await;
         sink(AgentEvent::Compacted {
             messages_before: before,
             messages_after: session.messages.len(),
             reason,
             tokens_before,
+            summary,
+            tokens_after,
         });
         Ok(true)
     }
@@ -1397,6 +1744,42 @@ fn emit_tool_update(sink: &mut dyn FnMut(AgentEvent), update: crate::tool::ToolU
     }
 }
 
+/// Run `fut` with a panic boundary: a panic inside it (a hook's own bug, or a tool implementation's
+/// stray `.unwrap()`/index-out-of-bounds/debug-mode overflow) is caught and turned into an `Err`
+/// message instead of unwinding through the whole tool-dispatch future — and, since dispatch is only
+/// ever awaited from inside `run_events_steered`'s own future, through the entire in-flight run.
+///
+/// Pi-parity gap: pi's `agent-loop.ts` wraps every user-extensible call (`beforeToolCall`, a tool's own
+/// `execute`, `afterToolCall`) in try/catch, degrading a buggy hook/tool to one failed call instead of
+/// killing the run. Neither `AgentHooks`'s trait methods nor `Tool::run_streaming` return a `Result` a
+/// panic could be redirected through instead — a caller can't opt out of this by returning an error, so
+/// this is the one place that needs to actually catch the unwind.
+///
+/// `AssertUnwindSafe`: the futures here borrow `&self`/`&CancellationToken`/`&Value`/`&str` — all
+/// either `Copy`, plain data, or (for a caller's own hook/tool trait object) opaque behind `&dyn Trait`,
+/// none of which this crate can prove `UnwindSafe` through a generic bound, but a torn-mid-panic
+/// *read-only* borrow of them is exactly the case `UnwindSafe`'s conservative default is overly cautious
+/// about (see the `std::panic` module docs on "exception safety") — there is no interior mutability this
+/// crate's own state relies on being consistent across the unwind (a hook/tool with its own is the
+/// author's responsibility, same as it would be for any other panic in their code).
+async fn catch_tool_panic<F, T>(fut: F) -> std::result::Result<T, String>
+where
+    F: std::future::Future<Output = T>,
+{
+    use futures::FutureExt;
+    std::panic::AssertUnwindSafe(fut)
+        .catch_unwind()
+        .await
+        .map_err(|payload| {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "panicked with a non-string payload".to_string());
+            format!("panicked: {msg}")
+        })
+}
+
 /// Resolve a per-call dispatch result, synthesizing an error placeholder for a call whose group never
 /// got to run — only reachable via [`repair_cancelled_dispatch`], when cancellation aborts the batch
 /// before every group's future resolved.
@@ -1420,6 +1803,34 @@ fn resolve_tool_result(result: Option<ToolCallResult>) -> ToolCallResult {
             false,
         )
     })
+}
+
+/// A cancellation that pre-empted the turn before the model produced anything — the top-of-loop check
+/// in [`Agent::run_events_steered`], or `run_turn`'s own `Err(Cancelled)` (reachable before a single
+/// byte streams back, unlike a mid-stream abort, which resolves to `Ok(Turn { stop_reason: Aborted,
+/// .. })` instead and is handled by the ordinary turn-commit path) — leaves `session`'s last message as
+/// the caller's own unanswered `user` turn. Every path that loops back to the top of that loop does so
+/// with a `user`-role message last (the initial prompt, a tool-results turn, or a drained follow-up),
+/// so this is reachable on the very first turn of a call and on a later one alike.
+///
+/// Left as-is, a later `prompt` on the same session would push a *second* consecutive `user` message —
+/// a shape no dialect accepts. Close it out with the same aborted, empty-content assistant record the
+/// mid-stream cancellation path already produces: pi's own `StreamFn` contract requires even a
+/// never-streamed request to resolve to a final `stopReason: "aborted"` message for exactly this reason
+/// (`abort.test.ts`'s `testImmediateAbort`). A no-op if the last message is somehow already
+/// assistant-role (defensive; not reachable through the current loop structure, but cheap to guard).
+fn close_out_pending_cancellation(session: &mut Session, model: &str) {
+    if session
+        .messages
+        .last()
+        .is_some_and(|m| m.role == Role::User)
+    {
+        session.push(
+            Message::assistant(vec![ContentBlock::text(String::new())])
+                .with_model_id(model)
+                .with_aborted(),
+        );
+    }
 }
 
 /// Synthesize an error `tool_result` for every call whose group never finished (dispatch was
@@ -3408,6 +3819,7 @@ mod tests {
                 AgentEvent::Compacted { .. } => "compacted",
                 AgentEvent::CompactionFailed { .. } => "compaction_failed",
                 AgentEvent::Error { .. } => "error",
+                AgentEvent::ModelSwitched { .. } => "model_switched",
             }
         }
         let mut out: Vec<&'static str> = Vec::new();
@@ -4110,6 +4522,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn with_sequential_tools_forces_one_group_in_flight_at_a_time() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        // Same shape as `tool_group_concurrency_is_capped`, but with `with_sequential_tools(true)` set
+        // — a batch of calls that would otherwise overlap up to `MAX_CONCURRENT_TOOL_GROUPS` at once
+        // must now never observe more than 1 in flight, proving the host-level toggle actually
+        // overrides the default bounded-concurrent dispatch rather than just existing unused.
+        struct CountingTool {
+            in_flight: Arc<AtomicUsize>,
+            max_seen: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl Tool for CountingTool {
+            fn name(&self) -> &str {
+                "count"
+            }
+            fn description(&self) -> &str {
+                "tracks concurrent in-flight calls"
+            }
+            fn input_schema(&self) -> Value {
+                json!({ "type": "object" })
+            }
+            async fn run(
+                &self,
+                _input: Value,
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+                let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_seen.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                Ok(crate::tool::ToolOutput::default())
+            }
+        }
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(CountingTool {
+            in_flight: in_flight.clone(),
+            max_seen: max_seen.clone(),
+        }));
+
+        const N: usize = 20;
+        let mut many_calls = vec![StreamEvent::MessageStart];
+        for i in 0..N {
+            many_calls.push(StreamEvent::ToolUseStart {
+                index: 0,
+                id: format!("c{i}"),
+                name: "count".into(),
+            });
+            many_calls.push(StreamEvent::ContentBlockStop { index: 0 });
+        }
+        many_calls.push(StreamEvent::MessageStop {
+            stop_reason: StopReason::ToolUse,
+        });
+
+        let (agent, _mock) = agent_with(vec![many_calls, turn::text("done")], tools);
+        let agent = agent.with_sequential_tools(true);
+        let mut session = Session::new();
+        session.user("go");
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        assert_eq!(session.messages[2].content.len(), N);
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            1,
+            "sequential_tools must force exactly one group in flight at a time"
+        );
+    }
+
+    #[tokio::test]
     async fn unknown_tool_yields_error_result() {
         let (agent, _mock) = agent_with(
             vec![
@@ -4789,6 +5273,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_silently_truncated_turn_compacts_and_retries_instead_of_returning_a_cut_off_answer()
+    {
+        // pi-parity gap: a turn that completes successfully (no transport error) but gets cut off by
+        // `max_tokens` alone, with no tool calls, used to fall straight through to "the model ended its
+        // turn" — handing the user a hard-truncated non-answer with no recovery, even with
+        // auto-compaction enabled. `find_cut` declines short conversations (needs at least 4 messages),
+        // so a throwaway first tool round-trip pads the history before the real, truncated turn.
+        fn max_tokens_turn(input_tokens: u32) -> Vec<StreamEvent> {
+            vec![
+                StreamEvent::MessageStart,
+                StreamEvent::TextDelta {
+                    index: 0,
+                    text: "this got cut off partway through and must not survive the retry".into(),
+                },
+                StreamEvent::Usage(TokenUsage {
+                    input_tokens,
+                    output_tokens: 100,
+                    ..Default::default()
+                }),
+                StreamEvent::MessageStop {
+                    stop_reason: StopReason::MaxTokens,
+                },
+            ]
+        }
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        let mock = Arc::new(MockTransport::new(vec![
+            turn::tool_call("t1", "echo", r#"{"text":"pad"}"#),
+            max_tokens_turn(150),
+            turn::text("## Goal\nsummary of earlier work"),
+            turn::text("here is the real, complete answer"),
+        ]));
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8")
+            .with_tools(tools)
+            .with_compaction(CompactionConfig {
+                context_window: 100,
+                reserve_tokens: 10,
+                keep_recent_tokens: 1,
+                summary_max_tokens: 256,
+                enabled: true,
+            });
+        let mut session = Session::new();
+        session.user("seed task");
+
+        let mut reason_seen = None;
+        agent
+            .run_events(&mut session, |ev| {
+                if let AgentEvent::Compacted { reason, .. } = ev {
+                    reason_seen = Some(reason);
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            reason_seen,
+            Some(CompactionReason::Overflow),
+            "the silent truncation must trigger a compaction with reason Overflow"
+        );
+        // 4 model calls: the padding tool turn, the truncated attempt, the forced summarization call,
+        // and the real retried turn.
+        assert_eq!(mock.calls(), 4);
+        let dump = format!("{:?}", session.messages);
+        assert!(
+            !dump.contains("cut off partway through"),
+            "the discarded truncated response must not survive in the session: {dump}"
+        );
+        assert!(
+            dump.contains("real, complete answer"),
+            "the retried turn's real answer must be what's left: {dump}"
+        );
+    }
+
+    #[tokio::test]
     async fn auto_compaction_records_provenance_on_the_session() {
         // A registered tool named "read" (not "echo") so `extract_file_ops` — keyed on tool name —
         // actually picks up a file reference from the compacted turns.
@@ -4983,6 +5542,92 @@ mod tests {
         };
         assert!(text.contains("<read-files>"), "got: {text}");
         assert!(text.contains("src/lib.rs"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn compacted_event_carries_the_summary_text_and_a_post_compaction_token_estimate() {
+        // Pi-parity fix: `AgentEvent::Compacted` used to carry only `messages_before`/`messages_after`/
+        // `reason`/`tokens_before` — a caller (the `compact` RPC's response, a `run --json` client) had
+        // no way to see the summary text that was actually spliced in, nor any estimate of how much the
+        // compaction actually shrank the prompt by.
+        let session_messages = vec![
+            Message::user("look at this"),
+            Message::assistant(vec![ContentBlock::text("ok, looking")]),
+            Message::user("now something else"),
+            Message::assistant(vec![ContentBlock::text("done")]),
+        ];
+        let mut session = Session::new();
+        session.messages = Arc::new(session_messages);
+        session.last_input_tokens = 12345;
+
+        let mock = Arc::new(MockTransport::new(vec![turn::text(
+            "SUMMARY-TEXT-MARKER-771",
+        )]));
+        let agent = Agent::new(mock, "claude-opus-4-8").with_compaction(CompactionConfig {
+            keep_recent_tokens: 1,
+            ..CompactionConfig::default()
+        });
+        let cancel = CancellationToken::new();
+        let mut event_summary = None;
+        let mut event_tokens_before = None;
+        let mut event_tokens_after = None;
+        let compacted = agent
+            .compact(
+                &mut session,
+                CompactionReason::Manual,
+                &cancel,
+                &mut |ev| {
+                    if let AgentEvent::Compacted {
+                        summary,
+                        tokens_before,
+                        tokens_after,
+                        ..
+                    } = ev
+                    {
+                        event_summary = Some(summary);
+                        event_tokens_before = Some(tokens_before);
+                        event_tokens_after = Some(tokens_after);
+                    }
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(compacted);
+
+        let summary = event_summary.expect("Compacted event must carry a summary");
+        assert!(
+            summary.contains("SUMMARY-TEXT-MARKER-771"),
+            "the event's summary must be the actual generated text: {summary}"
+        );
+        // Matches what was actually spliced into the session (modulo `apply_summary`'s own
+        // `SUMMARY_MARKER` prefix, which wraps the summary text but isn't part of it).
+        let ContentBlock::Text { text: spliced, .. } = &session.messages[0].content[0] else {
+            panic!("expected the spliced summary message to be text");
+        };
+        assert_eq!(
+            spliced,
+            &format!("{}\n\n{summary}", compaction::SUMMARY_MARKER)
+        );
+
+        assert_eq!(
+            event_tokens_before,
+            Some(12345),
+            "tokens_before must reflect the session's own pre-compaction usage snapshot"
+        );
+        let tokens_after = event_tokens_after.expect("Compacted event must carry tokens_after");
+        assert!(
+            tokens_after > 0,
+            "a non-empty post-compaction session must estimate a positive token count, got {tokens_after}"
+        );
+        // A real, whole-list estimate, not `trailing_tokens`'s since-last-snapshot delta — which
+        // `apply_summary` resets to point past the rebuilt list's end, so it would report 0 here.
+        assert_eq!(
+            compaction::trailing_tokens(&session),
+            0,
+            "sanity: trailing_tokens is 0 immediately after apply_summary, confirming tokens_after \
+             can't have come from it"
+        );
     }
 
     #[tokio::test]
@@ -5571,6 +6216,7 @@ mod tests {
                 &self,
                 _name: &str,
                 _input: &Value,
+                _session: &Session,
                 _cancel: &CancellationToken,
             ) -> Option<String> {
                 Some("denied by test policy".into())
@@ -6014,11 +6660,12 @@ mod tests {
 
     #[tokio::test]
     async fn checkpoint_fires_after_each_tool_round_trip_not_just_at_the_end() {
-        // Two tool round-trips followed by a final text turn: the checkpoint must fire twice — once
-        // per tool_results commit — each time with every message durable up to that point (never
-        // mid-way through an assistant message's tool_use with no matching tool_result yet), and it
-        // must NOT double-fire or fire again for the final text-only turn's own `AgentEnd` (that path
-        // is already covered by a caller's own post-run persist).
+        // Two tool round-trips followed by a final text turn: the checkpoint must fire *twice per
+        // round-trip* — once the instant the assistant's own `tool_use` turn is committed (before those
+        // tools ever run — a crash mid-execution must not lose the record that the model asked for
+        // them), and again once the matching `tool_results` land — and it must NOT fire for the final
+        // text-only turn's own `AgentEnd` (that path is already covered by a caller's own post-run
+        // persist).
         let mut tools = ToolRegistry::new();
         tools.register(Arc::new(EchoTool));
         let mock = Arc::new(MockTransport::new(vec![
@@ -6038,17 +6685,129 @@ mod tests {
         agent.run(&mut session, |_| {}).await.unwrap();
 
         let lens = checkpoint.lens.lock().unwrap().clone();
-        // user, assistant(tool_use), tool_results = 3 after the first round-trip; +2 more after the
-        // second = 5. The final text turn ends the run via `AgentEnd`, not a checkpoint.
+        // user, assistant(tool_use) = 2 (pre-dispatch checkpoint) then +tool_results = 3
+        // (post-dispatch checkpoint); +assistant(tool_use) = 4, +tool_results = 5 for the second
+        // round-trip. The final text turn ends the run via `AgentEnd`, not a checkpoint.
         assert_eq!(
             lens,
-            vec![3, 5],
-            "checkpoint must fire exactly once per tool round-trip, with the session already durable"
+            vec![2, 3, 4, 5],
+            "checkpoint must fire both before dispatch (right after the tool_use turn commits) and \
+             after (once tool_results land), for each round-trip"
         );
         assert_eq!(
             session.messages.len(),
             6,
             "sanity: final count after the text turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_fires_before_tool_dispatch_even_if_the_tool_never_returns() {
+        // The exact crash-recovery scenario the pre-dispatch checkpoint exists for: the assistant's
+        // `tool_use` turn must be durable *before* a slow/hung tool ever resolves — a host checkpointing
+        // incrementally must be able to see "the model asked for this call" without waiting for the
+        // call itself to finish.
+        struct HangTool;
+        #[async_trait]
+        impl Tool for HangTool {
+            fn name(&self) -> &str {
+                "hang"
+            }
+            fn description(&self) -> &str {
+                "never returns"
+            }
+            fn input_schema(&self) -> Value {
+                json!({ "type": "object" })
+            }
+            async fn run(
+                &self,
+                _: Value,
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+                futures::future::pending().await
+            }
+        }
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(HangTool));
+        let mock = Arc::new(MockTransport::new(vec![turn::tool_call(
+            "tu_1", "hang", "{}",
+        )]));
+        let checkpoint = Arc::new(RecordingCheckpoint {
+            lens: std::sync::Mutex::new(Vec::new()),
+        });
+        let agent = Agent::new(mock, "claude-opus-4-8")
+            .with_tools(tools)
+            .with_max_steps(8)
+            .with_checkpoint_hook(checkpoint.clone());
+        let mut session = Session::new();
+        session.user("go");
+
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            trigger.cancel();
+        });
+        let result = agent
+            .run_events_cancellable(&mut session, |_| {}, cancel)
+            .await;
+        assert!(matches!(result, Err(Error::Cancelled)));
+
+        let lens = checkpoint.lens.lock().unwrap().clone();
+        assert_eq!(
+            lens,
+            vec![2],
+            "the tool_use turn must already be checkpointed even though the tool it called never \
+             returned and the run was cancelled mid-dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_fires_right_after_a_compaction_rewrite_lands() {
+        // pi-parity gap: `apply_summary` physically rewrites `session.messages` in place — spending one
+        // or two real, paid-for model calls to produce it — but nothing checkpointed that rewrite. A
+        // crash between the rewrite landing and the next natural checkpoint (which could be a whole
+        // tool round-trip away, or never come at all if the run ends on a tool-less reply) lost it
+        // entirely: on resume the persisted session still held the old, oversized history, so the very
+        // next turn re-triggered the identical (already-paid-for) compaction again.
+        let session_messages = vec![
+            Message::user("look at this"),
+            Message::assistant(vec![ContentBlock::text("ok")]),
+            Message::user("and this"),
+            Message::assistant(vec![ContentBlock::text("done")]),
+        ];
+        let mut session = Session::new();
+        session.messages = Arc::new(session_messages);
+
+        let mock = Arc::new(MockTransport::new(vec![turn::text("## Goal\na summary")]));
+        let checkpoint = Arc::new(RecordingCheckpoint {
+            lens: std::sync::Mutex::new(Vec::new()),
+        });
+        let agent = Agent::new(mock, "claude-opus-4-8")
+            .with_compaction(CompactionConfig {
+                keep_recent_tokens: 1,
+                ..CompactionConfig::default()
+            })
+            .with_checkpoint_hook(checkpoint.clone());
+        let cancel = CancellationToken::new();
+        let compacted = agent
+            .compact(
+                &mut session,
+                CompactionReason::Manual,
+                &cancel,
+                &mut |_| {},
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(compacted);
+
+        let lens = checkpoint.lens.lock().unwrap().clone();
+        assert_eq!(
+            lens,
+            vec![session.messages.len()],
+            "the checkpoint must fire exactly once, right after the rewritten (post-compaction) \
+             history is in place — got: {lens:?}, session now has {} messages",
+            session.messages.len()
         );
     }
 
@@ -6439,5 +7198,748 @@ mod tests {
         assert_eq!(last.role, Role::Assistant);
         assert!(!last.aborted);
         assert!(!last.content.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pre_connect_cancellation_closes_out_the_pending_user_turn() {
+        // pi-parity gap (H5): a token already cancelled *before* the model ever connects (the top-of-
+        // loop check, or `run_turn`'s own pre-connect race) used to return `Err(Cancelled)` with no
+        // session mutation at all — unlike a mid-stream abort, which always closes the turn out with an
+        // aborted assistant record (see the sibling tests above). Left as the caller's own unanswered
+        // `user` turn, a follow-up prompt would push a *second* consecutive `user` message, which no
+        // dialect accepts. pi's own `StreamFn` contract requires even a never-streamed request to
+        // resolve to a final `stopReason: "aborted"` message for exactly this reason.
+        let agent = Agent::new(Arc::new(MockTransport::new(vec![])), "claude-opus-4-8");
+        let mut session = Session::new();
+        session.user("go");
+
+        // Already cancelled — the top-of-loop check trips before a request is ever built, so the
+        // transport (empty turn list; a real call would panic on it) is never actually invoked.
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = agent
+            .run_events_cancellable(&mut session, |_| {}, cancel)
+            .await;
+        assert!(matches!(result, Err(Error::Cancelled)));
+
+        assert_eq!(
+            session.messages.len(),
+            2,
+            "the pending user turn must be closed out with an aborted assistant record, not left \
+             dangling: {:?}",
+            session.messages
+        );
+        let last = &session.messages[1];
+        assert_eq!(last.role, Role::Assistant);
+        assert!(last.aborted, "closing record must be flagged aborted");
+    }
+
+    #[tokio::test]
+    async fn cancellation_clears_queued_steer_and_follow_up_messages() {
+        // pi-parity gap: pi's `agent-harness.ts` `abort()` unconditionally clears both queues so a
+        // message queued right before (or during) cancellation doesn't silently ride into whatever
+        // unrelated run reuses the same `Steering` handle next. `Steering::clear()` existed already but
+        // `agent.rs` never called it on any of its cancellation exit paths.
+        let agent = Agent::new(Arc::new(MockTransport::new(vec![])), "claude-opus-4-8");
+        let mut session = Session::new();
+        session.user("go");
+        let steering = Steering::new();
+        steering.push("a follow-up queued before cancelling");
+        steering.push_steer("a steer queued before cancelling");
+        assert_eq!(steering.pending_count(), 2);
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = agent
+            .run_events_steered(&mut session, |_| {}, cancel, steering.clone())
+            .await;
+        assert!(matches!(result, Err(Error::Cancelled)));
+
+        assert_eq!(
+            steering.pending_count(),
+            0,
+            "both lanes must be cleared once a run ends via cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prompt_after_a_pre_connect_cancellation_does_not_double_push_a_user_turn() {
+        // The other half of H5's fix: once the pre-connect-cancelled turn closes with a real assistant
+        // record, a fresh `session.user(...)` must restore valid role alternation and a normal run must
+        // succeed — mirroring the equivalent mid-stream-abort recovery test above.
+        let agent = Agent::new(Arc::new(MockTransport::new(vec![])), "claude-opus-4-8");
+        let mut session = Session::new();
+        session.user("go");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        agent
+            .run_events_cancellable(&mut session, |_| {}, cancel)
+            .await
+            .expect_err("pre-connect cancellation must still return Err(Cancelled)");
+
+        assert_eq!(session.messages[1].role, Role::Assistant);
+        session.user("after abort");
+        assert_eq!(session.messages[2].role, Role::User);
+
+        // A fresh, non-cancelled run against a transport that actually answers must now succeed —
+        // proving role alternation is valid (no two consecutive `user` messages to 400 on).
+        let agent = Agent::new(
+            Arc::new(MockTransport::new(vec![turn::text("recovered")])),
+            "claude-opus-4-8",
+        );
+        agent.run(&mut session, |_| {}).await.unwrap();
+        let last = session.messages.last().unwrap();
+        assert_eq!(last.role, Role::Assistant);
+        assert!(!last.aborted);
+        assert!(!last.content.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_non_retryable_mid_stream_failure_keeps_whatever_content_had_already_streamed() {
+        // pi-parity gap: a mid-stream transport/decode failure used to discard the whole `Accumulator`
+        // via `?` without ever calling `finish()` — losing real, already-generated prose (or a
+        // half-formed edit) the instant a network blip or in-band provider error struck partway through
+        // a long response. pi's own dialects keep whatever streamed before *either* an abort or an
+        // error; only a pre-connect failure (nothing ever streamed) should still close out empty.
+        let mock = Arc::new(MockTransport::scripted(vec![vec![
+            Ok(StreamEvent::MessageStart),
+            Ok(StreamEvent::TextDelta {
+                index: 0,
+                text: "here is the start of a real answer".into(),
+            }),
+            // A permission error is explicitly non-retryable (see
+            // `is_retryable_mid_stream_still_excludes_permanent_failures`) — this must reach the
+            // terminal `Err` arm on the very first attempt, no retry involved.
+            Err(Error::Transport(
+                "provider stream error: permission_error: not allowed".into(),
+            )),
+        ]]));
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8");
+        let mut session = Session::new();
+        session.user("go");
+
+        let result = agent.run(&mut session, |_| {}).await;
+        assert!(matches!(result, Err(Error::Transport(_))));
+        assert_eq!(mock.calls(), 1, "a non-retryable failure must not retry");
+
+        assert_eq!(session.messages.len(), 2);
+        let last = &session.messages[1];
+        assert_eq!(last.role, Role::Assistant);
+        assert_eq!(
+            last.content,
+            vec![ContentBlock::text("here is the start of a real answer")],
+            "the partial text that streamed before the failure must be kept, not discarded"
+        );
+        assert!(
+            last.error_message.is_some(),
+            "still tagged as an error record, not silently treated as a clean success"
+        );
+        assert!(!last.aborted, "a transport failure is not a cancellation");
+    }
+
+    #[tokio::test]
+    async fn a_pre_connect_transport_failure_still_closes_out_empty() {
+        // The other half of the fix: when the failure strikes *before* the model ever streams anything
+        // back (a connect-level rejection), there's no partial content to keep — the original bare
+        // closing record is still correct here, not every transport error should suddenly grow content.
+        struct RejectsBeforeConnecting;
+        #[async_trait]
+        impl ModelTransport for RejectsBeforeConnecting {
+            async fn stream(&self, _req: ModelRequest) -> Result<crate::transport::EventStream> {
+                Err(Error::Transport(
+                    "provider stream error: permission_error: not allowed".into(),
+                ))
+            }
+        }
+        let agent = Agent::new(Arc::new(RejectsBeforeConnecting), "claude-opus-4-8");
+        let mut session = Session::new();
+        session.user("go");
+
+        let result = agent.run(&mut session, |_| {}).await;
+        assert!(matches!(result, Err(Error::Transport(_))));
+
+        assert_eq!(session.messages.len(), 2);
+        let last = &session.messages[1];
+        assert_eq!(last.content, vec![ContentBlock::text(String::new())]);
+        assert!(last.error_message.is_some());
+    }
+
+    struct PanicTool;
+    #[async_trait]
+    impl Tool for PanicTool {
+        fn name(&self) -> &str {
+            "panic_tool"
+        }
+        fn description(&self) -> &str {
+            "always panics"
+        }
+        fn input_schema(&self) -> Value {
+            json!({ "type": "object" })
+        }
+        async fn run(
+            &self,
+            _: Value,
+        ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+            panic!("boom: this tool always panics");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicking_tool_becomes_an_error_tool_result_not_a_dead_run() {
+        // pi-parity gap: a panic inside a tool's own `run` (a stray `.unwrap()`, an index-out-of-bounds)
+        // used to unwind straight through the whole `run_events_steered` call — no `Result` a tool
+        // could return instead, so the only way to guard against it is a panic boundary in the loop
+        // itself. pi's `agent-loop.ts` degrades this to one failed tool call; the run must too.
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(PanicTool));
+        let mock = Arc::new(MockTransport::new(vec![
+            turn::tool_call("tu_1", "panic_tool", "{}"),
+            turn::text("recovered"),
+        ]));
+        let agent = Agent::new(mock, "claude-opus-4-8")
+            .with_tools(tools)
+            .with_max_steps(8);
+        let mut session = Session::new();
+        session.user("go");
+
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        let tool_result = &session.messages[2];
+        assert_eq!(tool_result.role, Role::User);
+        let ContentBlock::ToolResult {
+            content, is_error, ..
+        } = &tool_result.content[0]
+        else {
+            panic!("expected a ToolResult block, got {:?}", tool_result.content);
+        };
+        assert!(*is_error);
+        assert!(
+            content.contains("panicked"),
+            "the tool_result must explain the call panicked, got: {content}"
+        );
+        // The run itself must have completed normally afterward — proof the panic didn't unwind past
+        // the dispatch boundary.
+        assert_eq!(session.messages.last().unwrap().role, Role::Assistant);
+        assert!(!session.messages.last().unwrap().content.is_empty());
+    }
+
+    struct PanicsOnDeny;
+    #[async_trait]
+    impl AgentHooks for PanicsOnDeny {
+        async fn before_tool_call(
+            &self,
+            name: &str,
+            _input: &Value,
+            _session: &Session,
+            _cancel: &CancellationToken,
+        ) -> Option<String> {
+            if name == "echo" {
+                panic!("boom: before_tool_call always panics");
+            }
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicking_before_tool_call_hook_fails_closed_instead_of_killing_the_run() {
+        // A permission hook is exactly the code most likely to have a bug (it's the newest, most
+        // custom code in the loop) — its panic must block the one call, fail-closed, not crash the run.
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        let mock = Arc::new(MockTransport::new(vec![
+            turn::tool_call("tu_1", "echo", r#"{"text":"hi"}"#),
+            turn::text("recovered"),
+        ]));
+        let agent = Agent::new(mock, "claude-opus-4-8")
+            .with_tools(tools)
+            .with_max_steps(8)
+            .with_hooks(Arc::new(PanicsOnDeny));
+        let mut session = Session::new();
+        session.user("go");
+
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        let tool_result = &session.messages[2];
+        let ContentBlock::ToolResult {
+            content, is_error, ..
+        } = &tool_result.content[0]
+        else {
+            panic!("expected a ToolResult block, got {:?}", tool_result.content);
+        };
+        assert!(*is_error, "a panicking permission hook must fail closed");
+        assert!(content.contains("panicked"), "got: {content}");
+    }
+
+    struct ScreenshotTool;
+    #[async_trait]
+    impl Tool for ScreenshotTool {
+        fn name(&self) -> &str {
+            "screenshot"
+        }
+        fn description(&self) -> &str {
+            "returns a fake screenshot image"
+        }
+        fn input_schema(&self) -> Value {
+            json!({ "type": "object" })
+        }
+        async fn run(
+            &self,
+            _input: Value,
+        ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+            Ok(crate::tool::ToolOutput::image(
+                "here's the screenshot",
+                ImageSource {
+                    kind: "base64".into(),
+                    media_type: "image/png".into(),
+                    data: "fake-sensitive-pixels".into(),
+                },
+            ))
+        }
+    }
+
+    struct StripsImages;
+    #[async_trait]
+    impl AgentHooks for StripsImages {
+        async fn after_tool_call(
+            &self,
+            _name: &str,
+            _input: &Value,
+            output: String,
+            _images: Vec<ImageSource>,
+            is_error: bool,
+            _session: &Session,
+            _cancel: &CancellationToken,
+        ) -> (String, Vec<ImageSource>, bool) {
+            // Redact the image entirely, same shape a real hook (screenshot-blocking policy, a
+            // secrets-in-images scanner) would use — proves images actually reach the hook now,
+            // instead of being structurally invisible to it.
+            (
+                format!("{output} [image redacted by policy]"),
+                Vec::new(),
+                is_error,
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn after_tool_call_hook_can_redact_an_image_the_tool_returned() {
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(ScreenshotTool));
+        let mock = Arc::new(MockTransport::new(vec![
+            turn::tool_call("tu_1", "screenshot", "{}"),
+            turn::text("done"),
+        ]));
+        let agent = Agent::new(mock, "claude-opus-4-8")
+            .with_tools(tools)
+            .with_max_steps(8)
+            .with_hooks(Arc::new(StripsImages));
+        let mut session = Session::new();
+        session.user("take a screenshot");
+
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        let tool_result = &session.messages[2];
+        let ContentBlock::ToolResult {
+            content, images, ..
+        } = &tool_result.content[0]
+        else {
+            panic!("expected a ToolResult block, got {:?}", tool_result.content);
+        };
+        assert!(
+            content.contains("[image redacted by policy]"),
+            "got: {content}"
+        );
+        assert!(
+            images.is_empty(),
+            "the hook's redacted (empty) images must be what's actually committed: {images:?}"
+        );
+    }
+
+    struct PanicsOnRewrite;
+    #[async_trait]
+    impl AgentHooks for PanicsOnRewrite {
+        async fn after_tool_call(
+            &self,
+            _name: &str,
+            _input: &Value,
+            _output: String,
+            _images: Vec<ImageSource>,
+            _is_error: bool,
+            _session: &Session,
+            _cancel: &CancellationToken,
+        ) -> (String, Vec<ImageSource>, bool) {
+            panic!("boom: after_tool_call always panics");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicking_after_tool_call_hook_keeps_the_tools_own_result() {
+        // Losing a real, already-obtained tool result to a broken *rewrite* attempt would be strictly
+        // worse than just ignoring the rewrite — the tool's own (text, is_error) must survive.
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        let mock = Arc::new(MockTransport::new(vec![
+            turn::tool_call("tu_1", "echo", r#"{"text":"hi"}"#),
+            turn::text("recovered"),
+        ]));
+        let agent = Agent::new(mock, "claude-opus-4-8")
+            .with_tools(tools)
+            .with_max_steps(8)
+            .with_hooks(Arc::new(PanicsOnRewrite));
+        let mut session = Session::new();
+        session.user("go");
+
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        let tool_result = &session.messages[2];
+        let ContentBlock::ToolResult {
+            content, is_error, ..
+        } = &tool_result.content[0]
+        else {
+            panic!("expected a ToolResult block, got {:?}", tool_result.content);
+        };
+        assert!(
+            !*is_error,
+            "the tool's own success must survive the panicking rewrite hook"
+        );
+        assert_eq!(content, "hi", "got: {content}");
+    }
+
+    #[tokio::test]
+    async fn a_mid_run_model_switch_applies_to_the_next_turn_not_the_current_one() {
+        use std::time::Duration;
+
+        // pi-parity gap: pi's `prepareNextTurn` lets a host swap the model/thinking level mid-run,
+        // without stopping and restarting the whole call. `Steering::request_model_switch` is this
+        // crate's equivalent — requested *during* the first tool call (concurrently, via a genuinely
+        // separate task, not pre-queued before the run even starts), it must not affect the request
+        // already in flight, only the next turn's.
+        struct SleepyTool;
+        #[async_trait]
+        impl Tool for SleepyTool {
+            fn name(&self) -> &str {
+                "sleepy"
+            }
+            fn description(&self) -> &str {
+                "sleeps briefly"
+            }
+            fn input_schema(&self) -> Value {
+                json!({ "type": "object" })
+            }
+            async fn run(
+                &self,
+                _: Value,
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                Ok("slept".into())
+            }
+        }
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(SleepyTool));
+        let mock = Arc::new(MockTransport::new(vec![
+            turn::tool_call("t1", "sleepy", "{}"),
+            turn::text("done"),
+        ]));
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8")
+            .with_tools(tools)
+            .with_max_steps(8);
+        let mut session = Session::new();
+        session.user("go");
+        let steering = Steering::new();
+
+        let switch_steering = steering.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            switch_steering.request_model_switch("claude-cheap", Some(256));
+        });
+
+        let mut events = Vec::new();
+        agent
+            .run_events_steered(
+                &mut session,
+                |ev| events.push(ev),
+                CancellationToken::new(),
+                steering,
+            )
+            .await
+            .unwrap();
+
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].model, "claude-opus-4-8",
+            "the turn already in flight when the switch was requested must be unaffected"
+        );
+        assert_eq!(
+            requests[1].model, "claude-cheap",
+            "the next turn must target the switched-to model"
+        );
+        assert_eq!(
+            requests[1].thinking.map(|t| t.budget_tokens),
+            Some(256),
+            "the next turn must also carry the switched-to thinking budget"
+        );
+        assert!(
+            events.iter().any(|ev| matches!(
+                ev,
+                AgentEvent::ModelSwitched { model, thinking }
+                    if model == "claude-cheap" && *thinking == Some(256)
+            )),
+            "a ModelSwitched event must fire so a client can observe the change: {events:#?}"
+        );
+    }
+
+    struct StopOnMarkerText(&'static str);
+    #[async_trait]
+    impl AgentHooks for StopOnMarkerText {
+        async fn should_stop_after_turn(
+            &self,
+            message: &Message,
+            _tool_results: &[ContentBlock],
+            _session: &Session,
+            _cancel: &CancellationToken,
+        ) -> bool {
+            message
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { text, .. } if text.contains(self.0)))
+        }
+    }
+
+    #[tokio::test]
+    async fn should_stop_after_turn_hook_ends_a_tool_less_run_early() {
+        // pi-parity gap: `Steering::request_stop` is a bare external flag with no access to what the
+        // turn actually said — a host wanting a content-aware stop decision had no seam. Scripts two
+        // text-only turns; a hook that stops the moment it sees a marker in the *first* must prevent
+        // the second from ever being requested.
+        let (agent, mock) = agent_with(
+            vec![
+                turn::text("here is the STOP-MARKER in my answer"),
+                turn::text("this second turn must never be requested"),
+            ],
+            ToolRegistry::new(),
+        );
+        let agent = agent.with_hooks(Arc::new(StopOnMarkerText("STOP-MARKER")));
+        let mut session = Session::new();
+        session.user("go");
+
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        assert_eq!(
+            mock.calls(),
+            1,
+            "the hook must end the run after the first turn, before a second is ever requested"
+        );
+    }
+
+    struct StopOnSuccessfulToolResult {
+        saw_result: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait]
+    impl AgentHooks for StopOnSuccessfulToolResult {
+        async fn should_stop_after_turn(
+            &self,
+            _message: &Message,
+            tool_results: &[ContentBlock],
+            _session: &Session,
+            _cancel: &CancellationToken,
+        ) -> bool {
+            let saw_it = tool_results.iter().any(
+                |b| matches!(b, ContentBlock::ToolResult { content, is_error, .. } if content == "pong" && !is_error),
+            );
+            if saw_it {
+                self.saw_result
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            saw_it
+        }
+    }
+
+    #[tokio::test]
+    async fn should_stop_after_turn_hook_sees_the_actual_tool_result_content() {
+        // The other reachable turn boundary (after a tool round-trip, not just a tool-less turn) — pi's
+        // `shouldStopAfterTurn` receives the same `toolResults` at exactly this point in its own loop.
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        let mock = Arc::new(MockTransport::new(vec![
+            turn::tool_call("tu_1", "echo", r#"{"text":"pong"}"#),
+            turn::text("this second turn must never be requested"),
+        ]));
+        let hooks = Arc::new(StopOnSuccessfulToolResult {
+            saw_result: std::sync::atomic::AtomicBool::new(false),
+        });
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8")
+            .with_tools(tools)
+            .with_max_steps(8)
+            .with_hooks(hooks.clone());
+        let mut session = Session::new();
+        session.user("go");
+
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        assert!(
+            hooks.saw_result.load(std::sync::atomic::Ordering::SeqCst),
+            "the hook must have observed the real tool_result content"
+        );
+        assert_eq!(
+            mock.calls(),
+            1,
+            "the hook must end the run right after the tool round-trip, before a second turn"
+        );
+    }
+
+    struct PanicsOnStopDecision;
+    #[async_trait]
+    impl AgentHooks for PanicsOnStopDecision {
+        async fn should_stop_after_turn(
+            &self,
+            _message: &Message,
+            _tool_results: &[ContentBlock],
+            _session: &Session,
+            _cancel: &CancellationToken,
+        ) -> bool {
+            panic!("boom: should_stop_after_turn always panics");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicking_should_stop_after_turn_hook_fails_open_instead_of_killing_the_run() {
+        // Unlike a panicking permission hook (fails closed — blocks the call), a panicking *stop*
+        // decision fails open: this isn't a security boundary, and halting an otherwise-healthy run
+        // because of a buggy hook would be more disruptive than just continuing it. A tool-calling first
+        // turn (unlike a tool-less one) only continues to a second turn if nothing requested a stop —
+        // proving the panic neither crashed the run nor was misread as "yes, stop".
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        let mock = Arc::new(MockTransport::new(vec![
+            turn::tool_call("tu_1", "echo", r#"{"text":"hi"}"#),
+            turn::text("second turn must still be reached"),
+        ]));
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8")
+            .with_tools(tools)
+            .with_max_steps(8)
+            .with_hooks(Arc::new(PanicsOnStopDecision));
+        let mut session = Session::new();
+        session.user("go");
+
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        assert_eq!(
+            mock.calls(),
+            2,
+            "the panic must fail open — the run must continue to the second turn, not crash or stop"
+        );
+    }
+
+    struct RedactSecretsFromAssistant;
+    #[async_trait]
+    impl AgentHooks for RedactSecretsFromAssistant {
+        async fn on_assistant_message(
+            &self,
+            mut message: Message,
+            _session: &Session,
+            _cancel: &CancellationToken,
+        ) -> Message {
+            for block in &mut message.content {
+                if let ContentBlock::Text { text, .. } = block {
+                    *text = text.replace("secret-token-123", "[REDACTED]");
+                }
+            }
+            message
+        }
+    }
+
+    #[tokio::test]
+    async fn on_assistant_message_hook_rewrites_what_actually_gets_committed_to_the_session() {
+        // Pi-parity fix: no hook fired with the model's own generated content before it was committed —
+        // only `before_tool_call`/`after_tool_call` existed. Confirms the rewritten text (not the raw
+        // model output) is what actually lands in `session.messages`, which is what a checkpoint would
+        // persist and what a later turn's prompt would include.
+        let mock = Arc::new(MockTransport::new(vec![turn::text(
+            "here is the secret-token-123 you asked about",
+        )]));
+        let agent =
+            Agent::new(mock, "claude-opus-4-8").with_hooks(Arc::new(RedactSecretsFromAssistant));
+        let mut session = Session::new();
+        session.user("go");
+
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        let ContentBlock::Text { text, .. } = &session.messages.last().unwrap().content[0] else {
+            panic!("expected a text block");
+        };
+        assert_eq!(text, "here is the [REDACTED] you asked about");
+        assert!(
+            !text.contains("secret-token-123"),
+            "the raw secret must not survive into the committed session: {text}"
+        );
+    }
+
+    struct PanicsOnAssistantMessage;
+    #[async_trait]
+    impl AgentHooks for PanicsOnAssistantMessage {
+        async fn on_assistant_message(
+            &self,
+            _message: Message,
+            _session: &Session,
+            _cancel: &CancellationToken,
+        ) -> Message {
+            panic!("boom: on_assistant_message always panics");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicking_on_assistant_message_hook_keeps_the_original_message_not_a_crashed_run() {
+        let mock = Arc::new(MockTransport::new(vec![turn::text("the real answer")]));
+        let agent =
+            Agent::new(mock, "claude-opus-4-8").with_hooks(Arc::new(PanicsOnAssistantMessage));
+        let mut session = Session::new();
+        session.user("go");
+
+        agent
+            .run(&mut session, |_| {})
+            .await
+            .expect("a panicking redaction hook must not crash the run");
+
+        let ContentBlock::Text { text, .. } = &session.messages.last().unwrap().content[0] else {
+            panic!("expected a text block");
+        };
+        assert_eq!(
+            text, "the real answer",
+            "a panicking hook must fail open to the original, unredacted content"
+        );
+    }
+
+    struct ReturnsWrongRole;
+    #[async_trait]
+    impl AgentHooks for ReturnsWrongRole {
+        async fn on_assistant_message(
+            &self,
+            _message: Message,
+            _session: &Session,
+            _cancel: &CancellationToken,
+        ) -> Message {
+            // A misbehaving hook — returns a `User`-role message instead of preserving `Assistant`.
+            Message::user("a hook bug should never let this land in the transcript")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_role_mismatched_on_assistant_message_replacement_is_discarded() {
+        // Matches pi's own "the replacement must keep the original message role" contract: a
+        // misbehaving hook can't splice a wrong-role message into the transcript.
+        let mock = Arc::new(MockTransport::new(vec![turn::text("the real answer")]));
+        let agent = Agent::new(mock, "claude-opus-4-8").with_hooks(Arc::new(ReturnsWrongRole));
+        let mut session = Session::new();
+        session.user("go");
+
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        let last = session.messages.last().unwrap();
+        assert_eq!(last.role, Role::Assistant);
+        let ContentBlock::Text { text, .. } = &last.content[0] else {
+            panic!("expected a text block");
+        };
+        assert_eq!(text, "the real answer");
     }
 }

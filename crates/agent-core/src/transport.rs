@@ -175,6 +175,14 @@ pub struct ModelRequest {
     /// Queueing/latency class for the request (OpenAI Responses only; ignored by every other
     /// dialect). `None` omits the field, leaving OpenAI's own default tier.
     pub service_tier: Option<ServiceTier>,
+    /// Sampling temperature. `None` leaves the provider default. On the Anthropic dialect this is
+    /// silently omitted whenever `thinking` is set — Anthropic's API requires `temperature: 1` (or the
+    /// field entirely absent) while extended thinking is enabled, matching pi's own
+    /// `!options?.thinkingEnabled` gate (`anthropic-messages.ts`). Both OpenAI-shaped dialects send it
+    /// unconditionally when set, matching pi's own unconditional `openai-completions.ts`/
+    /// `openai-responses.ts` — a caller asking for a fixed temperature on a reasoning model that
+    /// rejects it is a caller error, same as pi's.
+    pub temperature: Option<f64>,
 }
 
 impl ModelRequest {
@@ -199,6 +207,7 @@ impl ModelRequest {
             user_id: None,
             reasoning_summary: None,
             service_tier: None,
+            temperature: None,
         }
     }
 
@@ -269,6 +278,13 @@ impl ModelRequest {
     /// Builder-style: set the request's queueing/latency tier (OpenAI Responses only).
     pub fn with_service_tier(mut self, tier: ServiceTier) -> Self {
         self.service_tier = Some(tier);
+        self
+    }
+
+    /// Builder-style: set the sampling temperature. See the field's own doc comment for per-dialect
+    /// gating (Anthropic omits it while thinking is enabled).
+    pub fn with_temperature(mut self, temperature: f64) -> Self {
+        self.temperature = Some(temperature);
         self
     }
 }

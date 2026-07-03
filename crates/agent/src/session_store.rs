@@ -198,6 +198,60 @@ impl SessionMeta {
     }
 }
 
+/// One session's best match against a lowercased, already-trimmed `query`, for ranking search results —
+/// `(field_priority, byte_offset)`, ascending order is "more relevant" (a match in a higher-priority
+/// field beats any match in a lower one; within the same field, an earlier match beats a later one).
+/// Checked in priority order — `title`, `id`, `preview`, `cwd`, then the full `search_text` — and stops
+/// at the first field that matches, so a title hit is never outranked by a coincidental `search_text`
+/// hit elsewhere. `None` when `query` doesn't appear in any field at all (the session doesn't match).
+///
+/// Deliberately simpler than pi's own TUI session-picker scorer (`fuzzyMatch` in
+/// `packages/tui/src/fuzzy.ts`): that one is a fuzzy subsequence matcher with a hand-tuned heuristic
+/// (consecutive-run bonus, word-boundary bonus, gap penalty) built for a human eyeballing highlighted
+/// matches as they type. A scripting RPC/CLI caller — the only consumer here, since Beyond has no
+/// interactive TUI of its own — wants predictable "does this text contain the query" filtering instead
+/// of typo-tolerant fuzzy scoring, so this is a plain case-insensitive substring search.
+fn search_rank(meta: &SessionMeta, query_lower: &str) -> Option<(usize, usize)> {
+    let fields: [&str; 5] = [
+        meta.title.as_deref().unwrap_or(""),
+        &meta.id,
+        meta.preview.as_deref().unwrap_or(""),
+        &meta.cwd,
+        &meta.search_text,
+    ];
+    fields.iter().enumerate().find_map(|(priority, field)| {
+        field
+            .to_lowercase()
+            .find(query_lower)
+            .map(|offset| (priority, offset))
+    })
+}
+
+/// Filter `sessions` to those matching `query` (case-insensitive substring against `title`/`id`/
+/// `preview`/`cwd`/`search_text` — see [`search_rank`]), sorted best-match-first with a most-recently-
+/// active tiebreak. `query: None` (or empty/whitespace-only) returns `sessions` unchanged, in whatever
+/// order the caller already sorted them (recency, from [`SessionRepo::list`]/[`SessionRepo::list_all`]) —
+/// so an absent query is a true no-op, not just "matches everything."
+pub fn search_sessions(sessions: Vec<SessionMeta>, query: Option<&str>) -> Vec<SessionMeta> {
+    let Some(query) = query.map(str::trim).filter(|q| !q.is_empty()) else {
+        return sessions;
+    };
+    let query_lower = query.to_lowercase();
+    let mut ranked: Vec<(SessionMeta, (usize, usize))> = sessions
+        .into_iter()
+        .filter_map(|m| {
+            let rank = search_rank(&m, &query_lower)?;
+            Some((m, rank))
+        })
+        .collect();
+    ranked.sort_by(|(a_meta, a_rank), (b_meta, b_rank)| {
+        a_rank
+            .cmp(b_rank)
+            .then_with(|| b_meta.updated_at.cmp(&a_meta.updated_at))
+    });
+    ranked.into_iter().map(|(m, _)| m).collect()
+}
+
 /// One persisted line. Internally tagged on `type`. A `Message` entry flattens the wrapped
 /// `agent_core::Message` (`{role, content}`) alongside its tree fields, so the wire shape is
 /// `{"type":"message", id, parent_id, role, content}` — `agent_core::Message` itself carries no tree
@@ -227,11 +281,14 @@ enum Entry {
     },
     /// A branch-navigation marker: the active tip moved to `target_id`. `id`/`parent_id` chain leaf
     /// markers the same way message entries chain messages (so the most recent one is unambiguous even
-    /// if several land in one file); `target_id` is the payload — the message id now at the tip.
+    /// if several land in one file); `target_id` is the payload — the message id now at the tip, or
+    /// `None` for the tree's own root (before any message) — see [`SessionStore::switch_active_to_root`],
+    /// which lets a client redo the very first message in place. A legacy file's own `target_id` was
+    /// always a bare, non-null string, which deserializes as `Some(..)` here with no migration needed.
     Leaf {
         id: String,
         parent_id: Option<String>,
-        target_id: String,
+        target_id: Option<String>,
     },
     /// An LLM-generated recap of an abandoned branch (Track L2), persisted when navigating away from
     /// it — see [`SessionStore::switch_active_with_summary`]. `from_id` is the abandoned branch's old
@@ -398,6 +455,10 @@ pub struct BranchInfo {
     /// The first user message's text on this branch's path, truncated like a session listing's
     /// preview. `None` if the branch has no user text at all.
     pub preview: Option<String>,
+    /// Unix seconds the tip message was appended — `0` if not recorded (see [`Node::timestamp`]). Lets
+    /// a client reconstruct which of several branches forking from the same point came first, matching
+    /// pi's own `SessionTreeNode.entry.timestamp`.
+    pub timestamp: u64,
 }
 
 /// A [`Node`]'s content — either a real conversation message, or an opaque caller-defined entry (see
@@ -457,6 +518,10 @@ pub struct TreeNode {
     /// The label currently set on this node, if any — see [`SessionStore::set_label`]. Pi's own
     /// `SessionTreeNode.label`.
     pub label: Option<String>,
+    /// Unix seconds this entry was appended — `0` if not recorded (see [`Node::timestamp`]). Lets a
+    /// client reconstruct sibling/branch order chronologically, matching pi's own
+    /// `SessionTreeNode.entry.timestamp` (which pi sorts each node's children by when rendering a tree).
+    pub timestamp: u64,
 }
 
 /// Turn a persisted branch summary's text into the message that materializes at the tip of the branch
@@ -681,7 +746,7 @@ impl SessionStore {
                     );
                     tip = Some(id);
                 }
-                Ok(Entry::Leaf { target_id, .. }) => tip = Some(target_id),
+                Ok(Entry::Leaf { target_id, .. }) => tip = target_id,
                 // A branch summary *does* become the new tip — it's a child of the branch point being
                 // returned to (see `switch_active_with_summary`), materialized into a real message so
                 // the recap actually reaches the model on the next turn, not just sitting on disk.
@@ -1388,9 +1453,9 @@ impl SessionStore {
     /// a child (the abandoned continuation) — and it must still be reported: it's where the session
     /// currently *is*, which is exactly the thing a branch listing needs to show regardless of whether
     /// anything has forked from it yet. A session that's never branched has exactly one entry: the
-    /// active tip. Order is by leaf id, not creation time (ids aren't strictly time-ordered against
-    /// each other across branches) — stable and deterministic for a client rendering a list, not
-    /// meaningful beyond that.
+    /// active tip. Order is by each tip's own `timestamp` (oldest first), falling back to leaf id when
+    /// timestamps tie or are both the legacy `0` — matching pi's own chronological branch ordering
+    /// while staying stable and deterministic for a client rendering a list.
     pub fn list_branches(&self) -> Vec<BranchInfo> {
         let parents: HashSet<&str> = self
             .nodes
@@ -1421,10 +1486,15 @@ impl SessionStore {
                     is_active: active_tip == Some(id),
                     message_count: path.len(),
                     preview,
+                    timestamp: self.nodes[id].timestamp,
                 }
             })
             .collect();
-        branches.sort_by(|a, b| a.leaf_id.cmp(&b.leaf_id));
+        branches.sort_by(|a, b| {
+            a.timestamp
+                .cmp(&b.timestamp)
+                .then_with(|| a.leaf_id.cmp(&b.leaf_id))
+        });
         branches
     }
 
@@ -1435,8 +1505,8 @@ impl SessionStore {
     /// root-to-leaf chain, and `shared_prefix_len` is how many of its leading messages are identical
     /// (by id, positionally) to the active path's own leading messages — so a caller can render only
     /// the part that actually diverges, prefixed with a note of where it forked, rather than
-    /// duplicating content already shown as the main transcript. Order is by leaf id, matching
-    /// `list_branches`.
+    /// duplicating content already shown as the main transcript. Order is chronological by leaf
+    /// timestamp, matching `list_branches`.
     pub fn abandoned_branches(&self) -> Vec<(usize, Vec<Message>)> {
         let parents: HashSet<&str> = self
             .nodes
@@ -1450,7 +1520,12 @@ impl SessionStore {
             .map(String::as_str)
             .filter(|id| !parents.contains(id) && Some(*id) != active_tip)
             .collect();
-        leaf_ids.sort();
+        leaf_ids.sort_by(|a, b| {
+            self.nodes[*a]
+                .timestamp
+                .cmp(&self.nodes[*b].timestamp)
+                .then_with(|| a.cmp(b))
+        });
         leaf_ids
             .into_iter()
             .map(|id| {
@@ -1476,8 +1551,10 @@ impl SessionStore {
 
     /// Every node in the session's tree — every message on every branch, not just the active path
     /// [`BranchInfo`]/[`Self::list_branches`] surfaces only the leaves of. The `nodes` map already spans
-    /// the whole file, so this is a single pass over it with no new indexing. Order is by id, for
-    /// stable/deterministic client rendering.
+    /// the whole file, so this is a single pass over it with no new indexing. Order is chronological by
+    /// each node's own `timestamp`, falling back to id when timestamps tie or are both the legacy `0` —
+    /// matching pi's own `SessionTreeNode` ordering (pi sorts each node's children by timestamp when
+    /// rendering a tree) and letting a client reconstruct sibling/branch order without re-deriving it.
     pub fn tree(&self) -> Vec<TreeNode> {
         let mut nodes: Vec<TreeNode> = self
             .nodes
@@ -1493,10 +1570,11 @@ impl SessionStore {
                     role,
                     preview,
                     label: self.labels.get(id).cloned(),
+                    timestamp: node.timestamp,
                 }
             })
             .collect();
-        nodes.sort_by(|a, b| a.id.cmp(&b.id));
+        nodes.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
         nodes
     }
 
@@ -1528,7 +1606,7 @@ impl SessionStore {
         let leaf = Entry::Leaf {
             id: new_id(),
             parent_id: self.active.last().cloned(),
-            target_id: target_id.to_string(),
+            target_id: Some(target_id.to_string()),
         };
         let mut buf = Vec::new();
         write_line(&mut buf, &leaf)?;
@@ -1635,6 +1713,106 @@ impl SessionStore {
         Ok(messages)
     }
 
+    /// The immediate parent of `id` in the tree — `Some(None)` at the root (no parent), `Some(Some(p))`
+    /// for any other node, or `None` if `id` names no known message. Lets a caller resolve a "switch to
+    /// the position right before this entry" request (mirroring `SessionRepo::fork_at_entry`'s own
+    /// `before: bool`) into either a normal target (a real parent) or the tree's own root, without
+    /// touching `self.active` first.
+    pub fn parent_of(&self, id: &str) -> Option<Option<String>> {
+        self.nodes.get(id).map(|n| n.parent_id.clone())
+    }
+
+    /// Every message on the active path, paired with its own id — what a caller resetting to the
+    /// tree's root (see [`Self::switch_active_to_root`]) is abandoning: the whole active path, since
+    /// there's no target node to compute a common ancestor against (unlike
+    /// [`Self::abandoned_by_switch`], which abandons only the suffix past wherever `target_id` and the
+    /// active path last coincide). Empty when the session is already at its root.
+    pub fn abandoned_to_root(&self) -> Vec<(String, Message)> {
+        self.active
+            .iter()
+            .filter_map(|id| self.nodes[id].as_message().map(|m| (id.clone(), m.clone())))
+            .collect()
+    }
+
+    /// Switch the active branch back to the tree's own root — before any message — so the very first
+    /// message can be redone in place. A no-op (no `Leaf` entry appended) when already there, mirroring
+    /// [`Self::switch_active`]'s identical same-position no-op. Pi's own `SessionManager::resetLeaf`.
+    pub fn switch_active_to_root(&mut self) -> std::io::Result<Vec<Message>> {
+        if self.active.is_empty() {
+            return Ok(Vec::new());
+        }
+        let leaf = Entry::Leaf {
+            id: new_id(),
+            parent_id: self.active.last().cloned(),
+            target_id: None,
+        };
+        let mut buf = Vec::new();
+        write_line(&mut buf, &leaf)?;
+        let mut f = OpenOptions::new().append(true).open(&self.path)?;
+        f.write_all(&buf)?;
+        f.flush()?;
+        f.sync_all()?;
+
+        self.persisted = 0;
+        self.active = Vec::new();
+        Ok(Vec::new())
+    }
+
+    /// Switch to the tree's root *and* record a branch summary of everything abandoned by doing so —
+    /// the root-reset counterpart of [`Self::switch_active_with_summary`]. The summary becomes a new
+    /// root message (its own `parent_id: None`) and the new active path, so the recap actually reaches
+    /// the model on the next turn.
+    pub fn switch_active_to_root_with_summary(
+        &mut self,
+        summary: impl Into<String>,
+        from_id: impl Into<String>,
+        details: BranchSummaryDetails,
+    ) -> std::io::Result<Vec<Message>> {
+        self.meta.branch_summaries = self.meta.branch_summaries.saturating_add(1);
+        self.meta.summarized_branch_messages = self
+            .meta
+            .summarized_branch_messages
+            .saturating_add(details.summarized_messages);
+
+        let summary = summary.into();
+        let entry_id = new_id();
+        let details_for_index = details.clone();
+        let entry = Entry::BranchSummary {
+            id: entry_id.clone(),
+            parent_id: None,
+            summary: summary.clone(),
+            from_id: from_id.into(),
+            details,
+        };
+
+        let mut buf = Vec::new();
+        write_line(&mut buf, &Entry::Session(self.meta.clone()))?;
+        write_line(&mut buf, &entry)?;
+        let mut f = OpenOptions::new().append(true).open(&self.path)?;
+        f.write_all(&buf)?;
+        f.flush()?;
+        f.sync_all()?;
+
+        self.nodes.insert(
+            entry_id.clone(),
+            Node {
+                parent_id: None,
+                content: NodeContent::Message(branch_summary_message(&summary)),
+                timestamp: 0,
+            },
+        );
+        self.branch_summary_details
+            .insert(entry_id.clone(), details_for_index);
+        self.active = vec![entry_id];
+        let messages: Vec<Message> = self
+            .active
+            .iter()
+            .filter_map(|id| self.nodes[id].as_message().cloned())
+            .collect();
+        self.persisted = messages.len();
+        Ok(messages)
+    }
+
     /// Record that the active model changed to `model`, anchored to the current active tip — an O(1)
     /// append (see [`Entry::ModelChange`]'s doc comment), not a rewrite. Call only when the model
     /// actually changed (the caller compares against its own current value first) — recording a no-op
@@ -1676,6 +1854,19 @@ impl SessionStore {
     /// Same idea as [`Self::model_at`], for the portable thinking level.
     pub fn thinking_level_at(&self, target_id: &str) -> Option<&str> {
         change_at(&self.nodes, &self.level_changes, target_id)
+    }
+
+    /// The model recorded as active at the tree's own root (before any message) — the base case every
+    /// [`Self::model_at`] ancestor walk itself starts from (`changes.get(&None)`). What a caller needs
+    /// when switching to root directly (`before: true` reaching the very first message) rather than to
+    /// any real node — `model_at`/`thinking_level_at` require an existing id and can't express "root".
+    pub fn model_at_root(&self) -> Option<&str> {
+        self.model_changes.get(&None).map(String::as_str)
+    }
+
+    /// Same idea as [`Self::model_at_root`], for the portable thinking level.
+    pub fn thinking_level_at_root(&self) -> Option<&str> {
+        self.level_changes.get(&None).map(String::as_str)
     }
 
     /// Set (and persist) the session title — an O(1) append (see [`Entry::TitleChange`]'s doc
@@ -1799,16 +1990,25 @@ impl SessionRepo {
     /// expected to have already passed `cwd` through [`canonical_cwd`], so a symlinked or
     /// trailing-slashed spelling of the same real directory still matches (`serve`'s own startup
     /// reattach and `run --continue` both do). Shared by both, so they pick up "my last session in
-    /// this directory" the same way.
+    /// this directory" the same way. `id`, when given, names the fresh session in the no-match branch
+    /// instead of a freshly generated one — a caller-chosen id (`serve`'s own `--session-id`); ignored
+    /// when an existing session is reattached instead (already has a fixed id from disk). `run
+    /// --continue` always passes `None` here, matching its own documented contract that `--session-id`
+    /// applies only to a genuinely fresh `--session <path>` or a plain ephemeral run, never `--continue`.
     pub fn resume_or_create(
         &self,
         cwd: &str,
         model: &str,
+        id: Option<&str>,
     ) -> std::io::Result<(SessionStore, Session)> {
         match self.list()?.into_iter().find(|m| m.cwd == cwd) {
             Some(meta) => self.open_id(&meta.id),
             None => {
-                let store = self.create(SessionMeta::new(cwd, model))?;
+                let meta = match id {
+                    Some(id) => SessionMeta::with_id(id.to_string(), cwd, model),
+                    None => SessionMeta::new(cwd, model),
+                };
+                let store = self.create(meta)?;
                 Ok((store, Session::new()))
             }
         }
@@ -1863,7 +2063,11 @@ impl SessionRepo {
         Ok(metas)
     }
 
-    fn path_for(&self, meta: &SessionMeta) -> PathBuf {
+    /// The on-disk path a session with this metadata would live at within this repo. `pub(crate)`: also
+    /// used by [`fork_by_arg`] to locate a source session discovered via [`Self::list_all`] in some
+    /// *other* project's own repo (a `SessionRepo` opened just long enough to compute the path, not to
+    /// hold onto).
+    pub(crate) fn path_for(&self, meta: &SessionMeta) -> PathBuf {
         self.dir
             .join(format!("{}_{}.jsonl", meta.created_at, meta.id))
     }
@@ -1908,7 +2112,7 @@ impl SessionRepo {
 
     /// Open a session by id.
     pub fn open_id(&self, id: &str) -> std::io::Result<(SessionStore, Session)> {
-        let path = self.find_path(id).ok_or_else(|| {
+        let path = self.find_path(id)?.ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, format!("no session {id}"))
         })?;
         SessionStore::open(path)
@@ -1924,7 +2128,9 @@ impl SessionRepo {
     /// created or the move fails for any reason (a read-only filesystem, a cross-device rename) —
     /// losing the undo, not the delete itself.
     pub fn delete(&self, id: &str) -> std::io::Result<()> {
-        let Some(path) = self.find_path(id) else {
+        // An ambiguous prefix is a real error (surfaced to the caller so they can be more specific), not
+        // treated as "nothing to delete" — only a genuine zero-match lookup is a no-op.
+        let Some(path) = self.find_path(id)? else {
             return Ok(());
         };
         if let Some(file_name) = path.file_name() {
@@ -1951,7 +2157,37 @@ impl SessionRepo {
         let (src, src_session) = self.open_id(id)?;
         let upto = upto.min(src_session.messages.len());
         let mut meta = SessionMeta::new(src.meta.cwd.clone(), src.meta.model.clone());
-        meta.parent = Some(id.to_string());
+        // The source's own resolved id, not the caller's raw `id` argument — since `open_id` now accepts
+        // a unique prefix, blindly echoing `id` back would persist the *prefix* as `parent` instead of
+        // the real full id it resolved to.
+        meta.parent = Some(src.meta.id.clone());
+        meta.title = src.meta.title.clone();
+
+        let mut store = self.create(meta)?;
+        let prefix: Vec<Message> = src_session.messages[..upto].to_vec();
+        store.rewrite(&prefix)?;
+        let mut session = Session::new();
+        session.messages = Arc::new(prefix);
+        Ok((store, session))
+    }
+
+    /// Fork an arbitrary source session — one that need not live in `self.dir` at all — into a
+    /// brand-new session under `self`. This is [`fork`](Self::fork) generalized for pi's cross-project
+    /// `--fork <path|id>`: `source_path` is a fully resolved on-disk path (see [`fork_by_arg`], which
+    /// finds it by searching the current project and then every other project's own session directory),
+    /// and `target_cwd` becomes the new session's own `cwd` — the project being forked *into*, not
+    /// wherever the source was originally recorded against — matching pi's own
+    /// `SessionManager.forkFrom(path, targetCwd, …)`.
+    pub fn fork_from_path(
+        &self,
+        source_path: &Path,
+        target_cwd: &str,
+        upto: usize,
+    ) -> std::io::Result<(SessionStore, Session)> {
+        let (src, src_session) = SessionStore::open(source_path.to_path_buf())?;
+        let upto = upto.min(src_session.messages.len());
+        let mut meta = SessionMeta::new(target_cwd.to_string(), src.meta.model.clone());
+        meta.parent = Some(src.meta.id.clone());
         meta.title = src.meta.title.clone();
 
         let mut store = self.create(meta)?;
@@ -2036,7 +2272,9 @@ impl SessionRepo {
             ));
         }
         let mut meta = SessionMeta::new(src.meta.cwd.clone(), src.meta.model.clone());
-        meta.parent = Some(id.to_string());
+        // The source's own resolved id, not the caller's raw `id` argument — see `fork`'s identical fix
+        // for why: `open_id` now accepts a unique prefix, so `id` itself may not be the real full id.
+        meta.parent = Some(src.meta.id.clone());
         meta.title = src.meta.title.clone();
 
         let mut path = path_from_root(&src.nodes, Some(entry_id));
@@ -2080,13 +2318,51 @@ impl SessionRepo {
         Ok(self.fork_at_entry_prefix(id, entry_id, before)?.messages)
     }
 
-    fn find_path(&self, id: &str) -> Option<PathBuf> {
-        fs::read_dir(&self.dir).ok()?.flatten().find_map(|e| {
-            let path = e.path();
-            let name = path.file_name()?.to_str()?;
-            // `<created_at>_<id>.jsonl`
-            (name.ends_with(&format!("_{id}.jsonl"))).then_some(path)
-        })
+    /// Resolve `id` to its on-disk path in this repo: an exact match first (cheap, unambiguous), then a
+    /// unique-prefix match — pi's own convenience for typing a shortened id (`main.ts`'s
+    /// `resolveSessionPath`), but *not* pi's own silent "pick whichever sorts first" when a prefix
+    /// matches more than one session: that's a real footgun (operating on session B when the caller
+    /// typed a prefix meaning to reach session A), so an ambiguous prefix is an error naming every
+    /// candidate instead of a guess. `Ok(None)` when nothing matches at all — not found is not an error
+    /// here, matching every existing caller's own "session may not exist" handling.
+    fn find_path(&self, id: &str) -> std::io::Result<Option<PathBuf>> {
+        let entries: Vec<PathBuf> = match fs::read_dir(&self.dir) {
+            Ok(entries) => entries.flatten().map(|e| e.path()).collect(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let exact_suffix = format!("_{id}.jsonl");
+        if let Some(path) = entries.iter().find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(&exact_suffix))
+        }) {
+            return Ok(Some(path.clone()));
+        }
+        // No exact match: fall back to a unique-prefix match over each file's own `<id>` component
+        // (`split_once` on the *first* underscore only, since `<created_at>` is always plain digits —
+        // never itself containing one — while a caller-supplied `--session-id` legally can).
+        let matches: Vec<(&str, &PathBuf)> = entries
+            .iter()
+            .filter_map(|path| {
+                let name = path.file_name()?.to_str()?;
+                let rest = name.strip_suffix(".jsonl")?;
+                let (_, file_id) = rest.split_once('_')?;
+                file_id.starts_with(id).then_some((file_id, path))
+            })
+            .collect();
+        match matches.as_slice() {
+            [] => Ok(None),
+            [(_, path)] => Ok(Some((*path).clone())),
+            _ => {
+                let mut ids: Vec<&str> = matches.iter().map(|(id, _)| *id).collect();
+                ids.sort_unstable();
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("\"{id}\" matches more than one session: {}", ids.join(", ")),
+                ))
+            }
+        }
     }
 }
 
@@ -2112,15 +2388,149 @@ pub fn encode_cwd(cwd: &str) -> String {
         .collect()
 }
 
+/// The root every project's own session directory lives under: `~/.claude/sessions/`. Each immediate
+/// subdirectory is one project's `<encoded-cwd>/` (see [`default_session_dir`]) — this is the root
+/// [`SessionRepo::list_all`] scans for pi's cross-project session search (`--fork <id>` when the id
+/// isn't found in the current project — see [`fork_by_arg`]).
+pub fn sessions_root() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    home.join(".claude/sessions")
+}
+
 /// The default session directory for `cwd` when nothing more specific was given: `~/.claude/sessions/
 /// <encoded-cwd>/`, one subdirectory per project so unrelated projects' sessions never mix in the same
 /// listing. Shared by `serve`'s own default (`--session-file`/`--session-dir` absent) and `run
 /// --continue`.
 pub fn default_session_dir(cwd: &str) -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
-    home.join(".claude/sessions").join(encode_cwd(cwd))
+    sessions_root().join(encode_cwd(cwd))
+}
+
+/// Whether a `--fork`/`--session` argument looks like a path rather than a bare session id — pi's own
+/// `resolveSessionPath` treats any of these as "don't search, just resolve this as a file": a path
+/// separator, a leading `.`/`~`, or a `.jsonl` extension. A session id (`new_id()`'s shape, or a
+/// caller-supplied `--session-id`) never looks like this, so there's no realistic ambiguity.
+fn is_path_like(arg: &str) -> bool {
+    arg.contains('/') || arg.starts_with('.') || arg.starts_with('~') || arg.ends_with(".jsonl")
+}
+
+/// Resolve a path-like `--fork`/`--session` argument against `cwd`: `~`/`~/...` expands to the home
+/// directory (reusing the same convention `--skill`/`--prompt-template` extra paths already get via
+/// `tools::expand_tilde`), and a relative path resolves against `cwd` — matching pi's own
+/// `resolvePath(arg, cwd)`. An already-absolute path (post tilde-expansion) is returned unchanged.
+/// Existence is deliberately not checked here — the caller's eventual `SessionStore::open` surfaces a
+/// clear not-found error if it doesn't exist, consistent with every other path this crate resolves
+/// lazily rather than pre-validating.
+fn resolve_path_like(arg: &str, cwd: &str) -> PathBuf {
+    let expanded = crate::tools::expand_tilde(arg, std::env::var("HOME").ok().as_deref());
+    let path = PathBuf::from(expanded);
+    if path.is_absolute() {
+        path
+    } else {
+        Path::new(cwd).join(path)
+    }
+}
+
+/// Resolve a `--fork <arg>` argument and fork it into a brand-new session under `target`'s own repo —
+/// pi's own cross-project `--fork <path|id>` (`SessionManager.forkFrom`/`resolveSessionPath`). `arg` may
+/// be:
+/// - a direct path to a `.jsonl` file (any project — see [`is_path_like`]/[`resolve_path_like`]),
+/// - a session id that exists in `target`'s own project (forked in place via [`SessionRepo::fork`],
+///   identical to today's same-project fork),
+/// - a session id that exists in some *other* project's own directory under `sessions_root` (found via
+///   [`SessionRepo::list_all`], then forked cross-project via [`SessionRepo::fork_from_path`], with
+///   `target_cwd` — the project being forked *into* — becoming the new session's own `cwd`, not
+///   wherever the source was originally recorded against).
+///
+/// Prefix matching is intentionally out of scope here (a bare id must match exactly) — see the
+/// partial-session-id-resolution finding this crate tracks separately; this only ever resolves an exact
+/// id or an explicit path.
+pub fn fork_by_arg(
+    arg: &str,
+    target: &SessionRepo,
+    target_cwd: &str,
+    sessions_root: &Path,
+    upto: usize,
+) -> std::io::Result<(SessionStore, Session)> {
+    if is_path_like(arg) {
+        let path = resolve_path_like(arg, target_cwd);
+        return target.fork_from_path(&path, target_cwd, upto);
+    }
+    // Try the current project first — `fork`'s own `open_id` is exact-then-unique-prefix aware (see
+    // `SessionRepo::find_path`), so this alone already covers a prefix that resolves within this
+    // project. An ambiguous prefix here is a real error to surface immediately, not a reason to widen
+    // the search to other projects (that would risk silently reinterpreting the same prefix against a
+    // *different* set of candidates instead of just reporting the one ambiguity the caller already hit).
+    match target.fork(arg, upto) {
+        Ok(result) => return Ok(result),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    match find_session_path_under(sessions_root, arg)? {
+        Some(source_path) => target.fork_from_path(&source_path, target_cwd, upto),
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no session matching \"{arg}\" in this project or any other"),
+        )),
+    }
+}
+
+/// Locate a session matching `id` somewhere under `sessions_root`, by walking each immediate
+/// subdirectory the same way [`SessionRepo::list_all_with_progress`] does and checking filenames
+/// directly (`<created_at>_<id>.jsonl`) — deliberately *not* by recomputing a path from the session's
+/// own recorded `cwd` via `default_session_dir`/`encode_cwd`. A caller-supplied `--session-dir`/
+/// `AI_AGENT_SESSION_DIR` override need not follow that naming convention at all (it may be an
+/// arbitrarily-named shared directory), so reconstructing a path from `cwd` would silently miss a real
+/// session sitting right there under `sessions_root`. Cheaper than a full [`SessionRepo::list_all`] scan
+/// too: this only ever inspects filenames, never a file's contents.
+fn find_session_path_under(sessions_root: &Path, id: &str) -> std::io::Result<Option<PathBuf>> {
+    let project_dirs: Vec<PathBuf> = match fs::read_dir(sessions_root) {
+        Ok(entries) => entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let exact_suffix = format!("_{id}.jsonl");
+    let all_files: Vec<PathBuf> = project_dirs
+        .iter()
+        .filter_map(|d| fs::read_dir(d).ok())
+        .flat_map(|entries| entries.flatten().map(|e| e.path()))
+        .collect();
+    if let Some(path) = all_files.iter().find(|p| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(&exact_suffix))
+    }) {
+        return Ok(Some(path.clone()));
+    }
+    // No exact match anywhere: fall back to a unique-prefix match spanning every project — see
+    // `SessionRepo::find_path`'s identical reasoning (ambiguous is an error naming every candidate, not
+    // pi's own silent most-recent-wins).
+    let matches: Vec<(&str, &PathBuf)> = all_files
+        .iter()
+        .filter_map(|path| {
+            let name = path.file_name()?.to_str()?;
+            let rest = name.strip_suffix(".jsonl")?;
+            let (_, file_id) = rest.split_once('_')?;
+            file_id.starts_with(id).then_some((file_id, path))
+        })
+        .collect();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [(_, path)] => Ok(Some((*path).clone())),
+        _ => {
+            let mut ids: Vec<&str> = matches.iter().map(|(id, _)| *id).collect();
+            ids.sort_unstable();
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("\"{id}\" matches more than one session: {}", ids.join(", ")),
+            ))
+        }
+    }
 }
 
 /// Validate — and, in a future format, migrate — a header to the current [`VERSION`]. Today there is
@@ -2784,7 +3194,7 @@ mod tests {
         // A pathologically long line (well past MAX_LINE_BYTES) — the on-disk analogue of a
         // corrupted length delimiter or concatenated lines — must not be allocated in full; `open`
         // treats it as unreadable, the same as a torn write.
-        let path = repo.find_path(&id).unwrap();
+        let path = repo.find_path(&id).unwrap().unwrap();
         let mut f = OpenOptions::new().append(true).open(&path).unwrap();
         write!(f, "\"").unwrap();
         for _ in 0..(MAX_LINE_BYTES / 1024 + 10) {
@@ -2811,7 +3221,7 @@ mod tests {
         store.append_new(&session.messages).unwrap();
 
         // Simulate a crash mid-append: a half-written, unterminated JSON line.
-        let path = repo.find_path(&id).unwrap();
+        let path = repo.find_path(&id).unwrap().unwrap();
         let mut f = OpenOptions::new().append(true).open(&path).unwrap();
         write!(f, "{{\"type\":\"message\",\"role\":\"user\",\"cont").unwrap();
         drop(f);
@@ -2837,7 +3247,7 @@ mod tests {
         session.user("first");
         store.append_new(&session.messages).unwrap();
 
-        let path = repo.find_path(&id).unwrap();
+        let path = repo.find_path(&id).unwrap().unwrap();
         let mut f = OpenOptions::new().append(true).open(&path).unwrap();
         write!(f, "\"").unwrap();
         for _ in 0..(MAX_LINE_BYTES / 1024 + 10) {
@@ -2870,7 +3280,7 @@ mod tests {
         store.append_new(&session.messages).unwrap();
 
         // A line with invalid UTF-8 bytes (simulating bit rot) landing mid-file, not at the end.
-        let path = repo.find_path(&id).unwrap();
+        let path = repo.find_path(&id).unwrap().unwrap();
         let mut f = OpenOptions::new().append(true).open(&path).unwrap();
         f.write_all(b"\xff\xfe not valid utf-8\n").unwrap();
         drop(f);
@@ -2903,7 +3313,7 @@ mod tests {
 
         // A complete (newline-terminated), well-formed JSON line that isn't a valid `Entry` — not a
         // torn write, just corrupted/foreign content landing mid-file (disk bit rot, a manual edit).
-        let path = repo.find_path(&id).unwrap();
+        let path = repo.find_path(&id).unwrap().unwrap();
         let mut f = OpenOptions::new().append(true).open(&path).unwrap();
         writeln!(f, r#"{{"not":"a valid entry"}}"#).unwrap();
         drop(f);
@@ -2940,7 +3350,7 @@ mod tests {
         session.user("first good message");
         store.append_new(&session.messages).unwrap();
 
-        let path = repo.find_path(&id).unwrap();
+        let path = repo.find_path(&id).unwrap().unwrap();
         let mut f = OpenOptions::new().append(true).open(&path).unwrap();
         // Oversized line.
         write!(f, "\"").unwrap();
@@ -3148,7 +3558,7 @@ mod tests {
             session.user(text);
         }
         store.append_new(&session.messages).unwrap();
-        let path = repo.find_path(&store.meta().id.clone()).unwrap();
+        let path = repo.find_path(&store.meta().id.clone()).unwrap().unwrap();
         let before = fs::read(&path).unwrap();
 
         let compacted = vec![
@@ -3334,7 +3744,7 @@ mod tests {
         session.user("only message");
         store.append_new(&session.messages).unwrap();
         let root_id = store.active_ids()[0].clone();
-        let path = repo.find_path(&store.meta().id.clone()).unwrap();
+        let path = repo.find_path(&store.meta().id.clone()).unwrap().unwrap();
         let before = fs::read(&path).unwrap();
 
         store
@@ -3373,7 +3783,7 @@ mod tests {
         store.append_new(&session.messages).unwrap();
         let old_ids = store.active_ids().to_vec();
         let id = store.meta().id.clone();
-        let path = repo.find_path(&id).unwrap();
+        let path = repo.find_path(&id).unwrap().unwrap();
 
         // Simulate a crash mid-append: a torn, unterminated compaction-record line with nothing after
         // it — as if the process died right after starting to write the batch.
@@ -3414,6 +3824,297 @@ mod tests {
         assert_eq!(metas.len(), 2);
         // Newest first: the fork was created after `a`.
         assert!(metas[0].created_at >= metas[1].created_at);
+    }
+
+    #[test]
+    fn fork_from_path_copies_a_source_from_an_unrelated_repo_and_stamps_the_target_cwd() {
+        // The cross-project primitive `fork_by_arg` builds on: the source need not live in `self.dir`
+        // at all, and the new session's `cwd` is the *target* project, not wherever the source was
+        // originally recorded against — matching pi's `forkFrom(path, targetCwd, …)`.
+        let source_dir = tmpdir();
+        let source_repo = SessionRepo::open(source_dir.path()).unwrap();
+        let mut source = source_repo
+            .create(SessionMeta::new("/some/other/project", "m"))
+            .unwrap();
+        let mut s = Session::new();
+        s.user("hello from project A");
+        source.append_new(&s.messages).unwrap();
+        let source_id = source.meta().id.clone();
+        let source_path = source_dir
+            .path()
+            .read_dir()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+
+        let target_dir = tmpdir();
+        let target_repo = SessionRepo::open(target_dir.path()).unwrap();
+        let (forked, fsession) = target_repo
+            .fork_from_path(&source_path, "/current/project", usize::MAX)
+            .unwrap();
+
+        assert_eq!(fsession.messages.len(), 1);
+        assert_eq!(forked.meta().parent.as_deref(), Some(source_id.as_str()));
+        assert_eq!(forked.meta().cwd, "/current/project");
+        // The source file itself is untouched — this is a copy, not a move.
+        let (_, resumed_source) = SessionStore::open(source_path).unwrap();
+        assert_eq!(resumed_source.messages.len(), 1);
+    }
+
+    #[test]
+    fn fork_by_arg_with_a_path_like_argument_opens_that_file_directly_no_search() {
+        let source_dir = tmpdir();
+        let source_repo = SessionRepo::open(source_dir.path()).unwrap();
+        source_repo
+            .create(SessionMeta::new("/wherever", "m"))
+            .unwrap();
+        let source_path = source_dir
+            .path()
+            .read_dir()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+
+        let target_dir = tmpdir();
+        let target_repo = SessionRepo::open(target_dir.path()).unwrap();
+        // An empty `sessions_root` proves this path never falls through to the cross-project search —
+        // a path-like argument is resolved directly.
+        let empty_root = tmpdir();
+        let (forked, _) = fork_by_arg(
+            source_path.to_str().unwrap(),
+            &target_repo,
+            "/current",
+            empty_root.path(),
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(forked.meta().cwd, "/current");
+    }
+
+    #[test]
+    fn fork_by_arg_with_an_id_present_in_the_current_project_forks_in_place() {
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let source = repo.create(SessionMeta::new("/current", "m")).unwrap();
+        let source_id = source.meta().id.clone();
+
+        // No other project directory exists at all — proves the same-project match is tried (and
+        // wins) before any cross-project search would even be attempted.
+        let empty_root = tmpdir();
+        let (forked, _) =
+            fork_by_arg(&source_id, &repo, "/current", empty_root.path(), usize::MAX).unwrap();
+        assert_eq!(forked.meta().parent.as_deref(), Some(source_id.as_str()));
+        assert_eq!(forked.meta().cwd, "/current");
+    }
+
+    #[test]
+    fn fork_by_arg_with_an_id_found_in_no_project_is_a_clear_not_found_error() {
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let empty_root = tmpdir();
+        let result = fork_by_arg(
+            "no-such-id",
+            &repo,
+            "/current",
+            empty_root.path(),
+            usize::MAX,
+        );
+        let err = match result {
+            Ok(_) => panic!("expected a not-found error"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("no-such-id"), "{err}");
+    }
+
+    #[test]
+    fn fork_by_arg_falls_back_to_a_session_found_in_a_different_projects_own_directory() {
+        // The cross-project search itself, exercised directly against a synthetic `sessions_root`
+        // rather than the real `$HOME` (which `default_session_dir` reads) — the end-to-end version of
+        // this same fallback, wired through the real default directory, lives in the `run` binary's own
+        // `--fork` e2e tests.
+        let root = tmpdir();
+        let other_project_repo =
+            SessionRepo::open(root.path().join(encode_cwd("/some/other/project"))).unwrap();
+        let source = other_project_repo
+            .create(SessionMeta::new("/some/other/project", "m"))
+            .unwrap();
+        let source_id = source.meta().id.clone();
+
+        let current_repo =
+            SessionRepo::open(root.path().join(encode_cwd("/current/project"))).unwrap();
+        let (forked, _) = fork_by_arg(
+            &source_id,
+            &current_repo,
+            "/current/project",
+            root.path(),
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(forked.meta().parent.as_deref(), Some(source_id.as_str()));
+        assert_eq!(
+            forked.meta().cwd,
+            "/current/project",
+            "the fork's cwd must be the current project, not the source's original one"
+        );
+    }
+
+    #[test]
+    fn fork_by_arg_finds_a_cross_project_session_even_when_its_directory_name_does_not_encode_its_cwd()
+     {
+        // Pi-parity fix (`run --session-dir`/`AI_AGENT_SESSION_DIR`): the cross-project fallback used to
+        // recompute the source's directory from its own recorded `cwd` via
+        // `default_session_dir`/`encode_cwd`, which only holds for the *default* `~/.claude/sessions/
+        // <encoded-cwd>/` layout. An arbitrarily-named directory (exactly what `--session-dir` lets a
+        // caller point at) broke that assumption and the fork would fail with a bogus "not found" even
+        // though the session was sitting right there under `sessions_root`.
+        let root = tmpdir();
+        // Deliberately an arbitrary name, unrelated to `encode_cwd` of the session's own `cwd` below.
+        let other_project_repo =
+            SessionRepo::open(root.path().join("arbitrarily-named-repo")).unwrap();
+        let source = other_project_repo
+            .create(SessionMeta::new("/some/other/project", "m"))
+            .unwrap();
+        let source_id = source.meta().id.clone();
+
+        let current_repo = SessionRepo::open(root.path().join("another-arbitrary-name")).unwrap();
+        let (forked, _) = fork_by_arg(
+            &source_id,
+            &current_repo,
+            "/current/project",
+            root.path(),
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(forked.meta().parent.as_deref(), Some(source_id.as_str()));
+        assert_eq!(forked.meta().cwd, "/current/project");
+    }
+
+    #[test]
+    fn find_path_resolves_a_unique_prefix_when_no_exact_match_exists() {
+        // Pi-parity fix: matching used to be exact-only everywhere — a caller had to type the full id,
+        // unlike pi's own `resolveSessionPath`, which accepts a shortened prefix.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let id = store.meta().id.clone();
+        let prefix = &id[..id.len() / 2];
+
+        let (_, restored) = repo.open_id(prefix).unwrap();
+        assert_eq!(restored.messages.len(), 0);
+    }
+
+    #[test]
+    fn find_path_prefers_an_exact_match_over_a_prefix_match() {
+        // An id that happens to *also* be a prefix of some other session's id must still resolve to
+        // itself exactly, not get shadowed by the ambiguity check below.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let short = repo.create(SessionMeta::with_id("abc", "/w", "m")).unwrap();
+        repo.create(SessionMeta::with_id("abcdef", "/w", "m"))
+            .unwrap();
+
+        let (_, _) = repo.open_id("abc").unwrap();
+        let path = repo.find_path("abc").unwrap().unwrap();
+        assert!(path.to_string_lossy().contains(&short.meta().id));
+    }
+
+    #[test]
+    fn find_path_reports_an_ambiguous_prefix_naming_every_candidate_instead_of_guessing() {
+        // Pi's own `resolveSessionPath` silently picks whichever candidate sorts first on an ambiguous
+        // prefix — a real footgun (acting on the wrong session with no warning). This crate errors
+        // instead, naming every id that matched.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        repo.create(SessionMeta::with_id("abc111", "/w", "m"))
+            .unwrap();
+        repo.create(SessionMeta::with_id("abc222", "/w", "m"))
+            .unwrap();
+
+        let err = repo.open_id("abc").map(|_| ()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let msg = err.to_string();
+        assert!(msg.contains("abc111") && msg.contains("abc222"), "{msg}");
+    }
+
+    #[test]
+    fn find_path_returns_not_found_for_a_prefix_matching_nothing_at_all() {
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        repo.create(SessionMeta::with_id("abc111", "/w", "m"))
+            .unwrap();
+
+        let err = repo.open_id("zzz").map(|_| ()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn delete_by_prefix_removes_the_uniquely_matched_session() {
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let id = store.meta().id.clone();
+        let prefix = &id[..id.len() / 2];
+
+        repo.delete(prefix).unwrap();
+        assert!(repo.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_by_an_ambiguous_prefix_errors_instead_of_silently_no_opping() {
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        repo.create(SessionMeta::with_id("abc111", "/w", "m"))
+            .unwrap();
+        repo.create(SessionMeta::with_id("abc222", "/w", "m"))
+            .unwrap();
+
+        let err = repo.delete("abc").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        // Neither candidate was touched.
+        assert_eq!(repo.list().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn fork_by_arg_resolves_a_prefix_within_the_current_project_without_a_cross_project_search() {
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let store = repo.create(SessionMeta::new("/current", "m")).unwrap();
+        let id = store.meta().id.clone();
+        let prefix = &id[..id.len() / 2];
+
+        // An empty `sessions_root` proves the cross-project fallback was never needed — the prefix
+        // resolved within `repo` itself.
+        let empty_root = tmpdir();
+        let (forked, _) =
+            fork_by_arg(prefix, &repo, "/current", empty_root.path(), usize::MAX).unwrap();
+        assert_eq!(forked.meta().parent.as_deref(), Some(id.as_str()));
+    }
+
+    #[test]
+    fn fork_by_arg_finds_a_unique_prefix_across_projects() {
+        let root = tmpdir();
+        let other_repo = SessionRepo::open(root.path().join("other-project")).unwrap();
+        let source = other_repo
+            .create(SessionMeta::new("/other/project", "m"))
+            .unwrap();
+        let source_id = source.meta().id.clone();
+        let prefix = &source_id[..source_id.len() / 2];
+
+        let current_repo = SessionRepo::open(root.path().join("current-project")).unwrap();
+        let (forked, _) = fork_by_arg(
+            prefix,
+            &current_repo,
+            "/current/project",
+            root.path(),
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(forked.meta().parent.as_deref(), Some(source_id.as_str()));
     }
 
     #[test]
@@ -3525,7 +4226,7 @@ mod tests {
         sb.user("from my project");
         mine.append_new(&sb.messages).unwrap();
 
-        let (store, session) = repo.resume_or_create("/mine", "m").unwrap();
+        let (store, session) = repo.resume_or_create("/mine", "m", None).unwrap();
         assert_eq!(store.meta().id, mine.meta().id);
         assert_eq!(session.messages.len(), 1);
     }
@@ -3534,9 +4235,41 @@ mod tests {
     fn resume_or_create_makes_a_fresh_session_when_no_cwd_matches() {
         let dir = tmpdir();
         let repo = SessionRepo::open(dir.path()).unwrap();
-        let (store, session) = repo.resume_or_create("/brand/new", "m").unwrap();
+        let (store, session) = repo.resume_or_create("/brand/new", "m", None).unwrap();
         assert_eq!(store.meta().cwd, "/brand/new");
         assert!(session.messages.is_empty());
+    }
+
+    #[test]
+    fn resume_or_create_uses_the_given_id_for_a_genuinely_fresh_session() {
+        // Backs `serve`'s own `--session-id` flag (pi-parity: `run` already had this, `serve` didn't).
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let (store, session) = repo
+            .resume_or_create("/brand/new", "m", Some("my-chosen-id"))
+            .unwrap();
+        assert_eq!(store.meta().id, "my-chosen-id");
+        assert!(session.messages.is_empty());
+    }
+
+    #[test]
+    fn resume_or_create_ignores_the_given_id_when_an_existing_session_matches_the_cwd() {
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut mine = repo.create(SessionMeta::new("/mine", "m")).unwrap();
+        let mut s = Session::new();
+        s.user("already here");
+        mine.append_new(&s.messages).unwrap();
+
+        let (store, session) = repo
+            .resume_or_create("/mine", "m", Some("should-be-ignored"))
+            .unwrap();
+        assert_eq!(
+            store.meta().id,
+            mine.meta().id,
+            "an existing session's own id must win over a caller-supplied one"
+        );
+        assert_eq!(session.messages.len(), 1);
     }
 
     #[test]
@@ -3575,7 +4308,7 @@ mod tests {
         store.append_new(&s.messages).unwrap();
 
         let link_cwd = canonical_cwd(&link).to_string_lossy().into_owned();
-        let (reopened, session) = repo.resume_or_create(&link_cwd, "m").unwrap();
+        let (reopened, session) = repo.resume_or_create(&link_cwd, "m", None).unwrap();
         assert_eq!(
             reopened.meta().id,
             store.meta().id,
@@ -4068,6 +4801,102 @@ mod tests {
         assert_eq!(full["cwd"], "/w");
     }
 
+    fn meta_for_search(
+        id: &str,
+        title: Option<&str>,
+        search_text: &str,
+        updated_at: u64,
+    ) -> SessionMeta {
+        let mut m = SessionMeta::with_id(id, "/w", "m");
+        m.title = title.map(str::to_string);
+        m.search_text = search_text.to_string();
+        m.updated_at = updated_at;
+        m
+    }
+
+    #[test]
+    fn search_sessions_with_no_query_returns_the_input_unchanged_and_in_order() {
+        let sessions = vec![
+            meta_for_search("a", None, "alpha", 2),
+            meta_for_search("b", None, "beta", 1),
+        ];
+        let out = search_sessions(sessions.clone(), None);
+        assert_eq!(
+            out.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"],
+            "no query must be a true no-op, not even a re-sort"
+        );
+
+        // Empty/whitespace-only queries are treated the same as no query at all.
+        let out = search_sessions(sessions.clone(), Some(""));
+        assert_eq!(out.len(), 2);
+        let out = search_sessions(sessions, Some("   "));
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn search_sessions_filters_out_non_matching_sessions() {
+        let sessions = vec![
+            meta_for_search("a", None, "discusses widget-frobnication", 1),
+            meta_for_search("b", None, "a totally unrelated topic", 2),
+        ];
+        let out = search_sessions(sessions, Some("widget-frobnication"));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "a");
+    }
+
+    #[test]
+    fn search_sessions_matching_nothing_returns_empty_not_everything() {
+        let sessions = vec![meta_for_search("a", None, "alpha", 1)];
+        let out = search_sessions(sessions, Some("no-such-term"));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn search_sessions_is_case_insensitive() {
+        let sessions = vec![meta_for_search("a", None, "Zephyr Marker", 1)];
+        let out = search_sessions(sessions, Some("zephyr marker"));
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn search_sessions_ranks_a_title_match_above_a_search_text_only_match() {
+        let sessions = vec![
+            meta_for_search(
+                "text-only",
+                None,
+                "mentions rustacean deep in the transcript",
+                5,
+            ),
+            meta_for_search(
+                "title-match",
+                Some("rustacean project"),
+                "unrelated body",
+                1,
+            ),
+        ];
+        let out = search_sessions(sessions, Some("rustacean"));
+        assert_eq!(
+            out.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["title-match", "text-only"],
+            "a title hit must outrank a search_text-only hit even though it's less recent"
+        );
+    }
+
+    #[test]
+    fn search_sessions_breaks_ties_by_most_recently_active() {
+        let sessions = vec![
+            meta_for_search("older", None, "shared-term here", 1),
+            meta_for_search("newer", None, "shared-term here too", 2),
+        ];
+        let out = search_sessions(sessions, Some("shared-term"));
+        assert_eq!(
+            out.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["newer", "older"],
+            "equally-ranked matches must tiebreak by recency, newest first"
+        );
+    }
+
     #[test]
     fn preview_truncates_long_first_message() {
         let dir = tmpdir();
@@ -4090,7 +4919,7 @@ mod tests {
         let repo = SessionRepo::open(dir.path()).unwrap();
         let store = repo.create(SessionMeta::new("/w", "m")).unwrap();
         let id = store.meta().id.clone();
-        let path = repo.find_path(&id).unwrap();
+        let path = repo.find_path(&id).unwrap().unwrap();
 
         // Rewrite the header with a version newer than this build understands.
         let content = fs::read_to_string(&path).unwrap();
@@ -4118,7 +4947,7 @@ mod tests {
         let repo = SessionRepo::open(dir.path()).unwrap();
         let store = repo.create(SessionMeta::new("/w", "m")).unwrap();
         let id = store.meta().id.clone();
-        let path = repo.find_path(&id).unwrap();
+        let path = repo.find_path(&id).unwrap().unwrap();
 
         // Rewrite the header with `version` removed entirely, simulating a file from before the field
         // existed.
@@ -4717,7 +5546,7 @@ mod tests {
             serde_json::to_string(&Entry::Leaf {
                 id: "l1".into(),
                 parent_id: None,
-                target_id: "m3".into(),
+                target_id: Some("m3".into()),
             })
             .unwrap(),
         );
@@ -4729,6 +5558,78 @@ mod tests {
         assert!(dump.contains("first") && dump.contains("branched"));
         assert!(!dump.contains("second"));
         assert_eq!(store.active_ids(), &["m1".to_string(), "m3".to_string()]);
+    }
+
+    #[test]
+    fn tree_and_list_branches_carry_each_node_s_timestamp_and_sort_chronologically() {
+        // Pi-parity fix: `TreeNode`/`BranchInfo` now carry a `timestamp` field and order by it (not by
+        // id) — hand-construct a file where the alphabetically-earlier leaf ("m2") was actually created
+        // *after* the alphabetically-later one ("m3"), so an id-based sort and a timestamp-based sort
+        // disagree — proving the fix actually changed the sort key, not just added an unused field.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let meta = SessionMeta::new("/w", "m");
+        let id = meta.id.clone();
+        let path = repo.path_for(&meta);
+
+        let lines = [
+            serde_json::to_string(&Entry::Session(meta)).unwrap(),
+            serde_json::to_string(&Entry::Message {
+                id: Some("m1".into()),
+                parent_id: None,
+                timestamp: 0,
+                message: Message::user("root"),
+            })
+            .unwrap(),
+            serde_json::to_string(&Entry::Message {
+                id: Some("m3".into()),
+                parent_id: Some("m1".into()),
+                timestamp: 100,
+                message: Message::user("earlier-branch"),
+            })
+            .unwrap(),
+            serde_json::to_string(&Entry::Message {
+                id: Some("m2".into()),
+                parent_id: Some("m1".into()),
+                timestamp: 200,
+                message: Message::user("later-branch"),
+            })
+            .unwrap(),
+            serde_json::to_string(&Entry::Leaf {
+                id: "l1".into(),
+                parent_id: None,
+                target_id: Some("m2".into()),
+            })
+            .unwrap(),
+        ];
+        fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        let (store, _session) = repo.open_id(&id).unwrap();
+
+        let tree = store.tree();
+        let leaves: Vec<&TreeNode> = tree.iter().filter(|n| n.id != "m1").collect();
+        assert_eq!(
+            leaves.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            vec!["m3", "m2"],
+            "must sort by timestamp (m3=100 before m2=200), not by id: {leaves:?}"
+        );
+        assert_eq!(tree.iter().find(|n| n.id == "m1").unwrap().timestamp, 0);
+        assert_eq!(leaves[0].timestamp, 100);
+        assert_eq!(leaves[1].timestamp, 200);
+
+        let branches = store.list_branches();
+        assert_eq!(
+            branches
+                .iter()
+                .map(|b| b.leaf_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["m3", "m2"],
+            "must sort by timestamp (m3=100 before m2=200), not by leaf id: {branches:?}"
+        );
+        assert_eq!(branches[0].timestamp, 100);
+        assert_eq!(branches[1].timestamp, 200);
+        assert!(!branches[0].is_active);
+        assert!(branches[1].is_active, "the leaf entry points the tip at m2");
     }
 
     #[test]
@@ -4883,6 +5784,139 @@ mod tests {
             Some(&summary_id),
             "the summary must become the new leaf"
         );
+    }
+
+    #[test]
+    fn parent_of_reports_root_a_real_parent_and_unknown_ids_distinctly() {
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("first");
+        session.user("second");
+        store.append_new(&session.messages).unwrap();
+        let ids = store.active_ids().to_vec();
+
+        assert_eq!(
+            store.parent_of(&ids[0]),
+            Some(None),
+            "the first message's parent is the root — no parent, but a known node"
+        );
+        assert_eq!(
+            store.parent_of(&ids[1]),
+            Some(Some(ids[0].clone())),
+            "the second message's parent is the first"
+        );
+        assert_eq!(
+            store.parent_of("does-not-exist"),
+            None,
+            "an unknown id is distinguishable from a real root"
+        );
+    }
+
+    #[test]
+    fn switch_active_to_root_clears_the_active_path_and_persists_across_reopen() {
+        // Pi-parity fix: no way existed to navigate back to before the very first message (redo it in
+        // place) — pi's own `SessionManager::resetLeaf`.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("first");
+        session.user("second");
+        store.append_new(&session.messages).unwrap();
+
+        let messages = store.switch_active_to_root().unwrap();
+        assert!(messages.is_empty());
+        assert!(
+            store.active_ids().is_empty(),
+            "the active path must be empty at the root"
+        );
+
+        // Appending fresh messages now chains off the root (`parent_id: None`), redoing the first
+        // message in place rather than continuing the old branch.
+        let mut redo = Session::new();
+        redo.user("redone first message");
+        store.append_new(&redo.messages).unwrap();
+        let new_ids = store.active_ids().to_vec();
+        assert_eq!(new_ids.len(), 1);
+        assert_eq!(store.parent_of(&new_ids[0]), Some(None));
+
+        // Survives a reopen: the `Leaf{target_id: None}` marker resolves back to root, not to
+        // whatever message happens to be last in the file.
+        let (reopened, session) = repo.open_id(&store.meta().id.clone()).unwrap();
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(reopened.active_ids(), &new_ids[..]);
+    }
+
+    #[test]
+    fn switch_active_to_root_is_a_no_op_when_already_there() {
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        assert!(store.active_ids().is_empty());
+
+        store.switch_active_to_root().unwrap();
+        assert!(store.active_ids().is_empty());
+
+        // No `Leaf` entry appended — the file only ever gained the header line.
+        let raw = fs::read_to_string(&store.path).unwrap();
+        assert!(!raw.contains("\"leaf\""), "expected no Leaf entry: {raw}");
+    }
+
+    #[test]
+    fn abandoned_to_root_reports_the_whole_active_path() {
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        assert!(
+            store.abandoned_to_root().is_empty(),
+            "nothing to abandon at the root"
+        );
+
+        let mut session = Session::new();
+        session.user("first");
+        session.user("second");
+        store.append_new(&session.messages).unwrap();
+
+        let abandoned = store.abandoned_to_root();
+        assert_eq!(abandoned.len(), 2, "the whole active path is abandoned");
+        assert_eq!(abandoned[0].0, store.active_ids()[0]);
+        assert_eq!(abandoned[1].0, store.active_ids()[1]);
+    }
+
+    #[test]
+    fn switch_active_to_root_with_summary_makes_the_summary_a_new_root_and_the_new_leaf() {
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("first");
+        session.user("second");
+        store.append_new(&session.messages).unwrap();
+        let old_tip = store.active_ids().last().cloned().unwrap();
+
+        let messages = store
+            .switch_active_to_root_with_summary(
+                "recap of the whole abandoned conversation",
+                &old_tip,
+                BranchSummaryDetails::default(),
+            )
+            .unwrap();
+        assert_eq!(messages.len(), 1, "the summary is the sole active message");
+
+        let summary_id = store.active_ids().last().unwrap().clone();
+        assert_eq!(
+            store.parent_of(&summary_id),
+            Some(None),
+            "the summary must become a genuine new root, not a child of the old tree"
+        );
+        assert_eq!(store.active_ids(), std::slice::from_ref(&summary_id));
+
+        // Survives a reopen.
+        let (reopened, session) = repo.open_id(&store.meta().id.clone()).unwrap();
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(reopened.active_ids(), &[summary_id]);
     }
 
     #[test]
@@ -5301,7 +6335,7 @@ mod tests {
 
         // Simulate a crash partway through appending the `Leaf` marker for a `switch_active(&ids[0])`
         // that never completes: a half-written, unterminated JSON line.
-        let path = repo.find_path(&id).unwrap();
+        let path = repo.find_path(&id).unwrap().unwrap();
         let mut f = OpenOptions::new().append(true).open(&path).unwrap();
         write!(f, "{{\"type\":\"leaf\",\"id\":\"x").unwrap();
         drop(f);
@@ -5331,7 +6365,7 @@ mod tests {
         session.user("original content");
         store.append_new(&session.messages).unwrap();
 
-        let path = repo.find_path(&id).unwrap();
+        let path = repo.find_path(&id).unwrap().unwrap();
         let original_contents = fs::read_to_string(&path).unwrap();
 
         // Simulate the crash: a half-written temp file, never renamed over the original.

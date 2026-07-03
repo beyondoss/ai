@@ -71,9 +71,14 @@ pub fn build_body(req: &ModelRequest) -> Value {
             },
         );
     }
+    // Anthropic forbids `temperature` alongside extended thinking (thinking requires an implicit
+    // temperature of 1) — matches pi's own `!options?.thinkingEnabled` gate (`anthropic-messages.ts`).
+    if let (Some(temperature), None) = (req.temperature, &req.thinking) {
+        map.insert("temperature".into(), json!(temperature));
+    }
     if let Some(thinking) = &req.thinking {
         // Extended thinking. Anthropic requires `max_tokens > budget_tokens` and forbids `temperature`
-        // alongside it (we never set temperature). Newer models (the capability table's `Adaptive`
+        // alongside it. Newer models (the capability table's `Adaptive`
         // shape) take an effort-based shape instead of an explicit budget, with `output_config.effort`
         // as a *sibling top-level request field*, not nested under `thinking` — a request-shape detail
         // easy to get wrong. Both shapes explicitly set `display: "summarized"`: Anthropic's own API
@@ -658,6 +663,36 @@ mod tests {
         assert_eq!(body["messages"][0]["content"][0]["type"], "text");
         assert_eq!(body["tools"][0]["name"], "read");
         assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
+    }
+
+    #[test]
+    fn build_body_sends_temperature_when_set_and_not_thinking() {
+        let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 256)
+            .with_temperature(0.4);
+        let body = build_body(&req);
+        assert_eq!(body["temperature"], 0.4);
+    }
+
+    #[test]
+    fn build_body_omits_temperature_when_unset() {
+        let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 256);
+        let body = build_body(&req);
+        assert!(body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn build_body_omits_temperature_when_thinking_is_enabled() {
+        // Anthropic forbids `temperature` alongside extended thinking — matches pi's own
+        // `!options?.thinkingEnabled` gate.
+        let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 4096)
+            .with_temperature(0.9)
+            .with_thinking(1024);
+        let body = build_body(&req);
+        assert!(
+            body.get("temperature").is_none(),
+            "got: {:#?}",
+            body.get("temperature")
+        );
     }
 
     #[test]

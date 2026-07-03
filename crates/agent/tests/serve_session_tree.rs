@@ -4,6 +4,7 @@
 mod common;
 
 use std::io::{BufRead, BufReader, Read, Write};
+use std::process::{Command, Stdio};
 
 use common::{
     message_ids, read_until_response, serve_cmd, serve_dir_cmd, spawn_model_server, turn_text,
@@ -133,6 +134,206 @@ fn serve_get_messages_since_returns_only_what_was_appended_after_a_known_id() {
 }
 
 #[test]
+fn serve_set_label_and_get_label_round_trip_over_the_wire() {
+    // Pi-parity audit H3: `SessionStore::set_label`/`get_label` were fully built, persisted, and
+    // carried across forks, but had no RPC command at all — this proves the actual wire commands,
+    // not just the underlying `SessionStore` method.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![turn_text("hi there")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_messages");
+    let messages = frames.last().unwrap()["data"]["messages"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let target_id = messages[0]["id"].as_str().unwrap().to_string();
+
+    // No label yet.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "get_label", "target_id": target_id })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_label");
+    let resp = frames.last().unwrap();
+    assert_eq!(resp["success"], true, "{resp:#?}");
+    assert_eq!(resp["data"]["label"], Value::Null, "{resp:#?}");
+
+    // Set it.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_label", "target_id": target_id, "label": "checkpoint" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "set_label");
+    let resp = frames.last().unwrap();
+    assert_eq!(resp["success"], true, "{resp:#?}");
+    assert_eq!(resp["data"]["label"], "checkpoint", "{resp:#?}");
+
+    // Read it back.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "get_label", "target_id": target_id })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_label");
+    let resp = frames.last().unwrap();
+    assert_eq!(resp["success"], true, "{resp:#?}");
+    assert_eq!(resp["data"]["label"], "checkpoint", "{resp:#?}");
+
+    // Clear it (explicit `null`, not a missing key).
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_label", "target_id": target_id, "label": Value::Null })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "set_label");
+    let resp = frames.last().unwrap();
+    assert_eq!(resp["success"], true, "{resp:#?}");
+    assert_eq!(resp["data"]["label"], Value::Null, "{resp:#?}");
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "get_label", "target_id": target_id })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_label");
+    let resp = frames.last().unwrap();
+    assert_eq!(resp["data"]["label"], Value::Null, "{resp:#?}");
+
+    // An unknown target_id is a clear error, not a silent no-op.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_label", "target_id": "does-not-exist", "label": "x" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "set_label");
+    assert_eq!(frames.last().unwrap()["success"], false);
+
+    // A missing `label` key (as opposed to an explicit `null`) is an error too — matches
+    // `set_thinking`'s own "present-but-null clears, missing is a mistake" contract.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_label", "target_id": target_id })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "set_label");
+    assert_eq!(frames.last().unwrap()["success"], false);
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_append_custom_reaches_the_tree_but_not_the_active_messages() {
+    // Pi-parity audit: `SessionStore::append_custom` was fully built and tested (custom tree entries
+    // that occupy a real slot in the tree without contributing to `Session.messages`/LLM context) but
+    // had no RPC command at all — this proves the actual wire command, not just the underlying
+    // `SessionStore` method.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![turn_text("hi there")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "append_custom", "kind": "checkpoint-marker", "data": {"foo": "bar"} })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "append_custom");
+    let resp = frames.last().unwrap();
+    assert_eq!(resp["success"], true, "{resp:#?}");
+    let custom_id = resp["data"]["id"]
+        .as_str()
+        .expect("append_custom must return the new entry's id")
+        .to_string();
+
+    // It occupies a real slot in the tree...
+    writeln!(stdin, "{}", json!({ "type": "get_tree" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_tree");
+    let nodes = frames.last().unwrap()["data"]["nodes"].as_array().unwrap();
+    let custom_node = nodes
+        .iter()
+        .find(|n| n["id"] == custom_id)
+        .unwrap_or_else(|| panic!("custom entry must appear in get_tree: {nodes:#?}"));
+    assert_eq!(custom_node["preview"], "[custom: checkpoint-marker]");
+    assert_eq!(
+        custom_node["role"],
+        Value::Null,
+        "a custom entry has no role of its own"
+    );
+
+    // ...but contributes nothing to the materialized message list.
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_messages");
+    let messages = frames.last().unwrap()["data"]["messages"]
+        .as_array()
+        .unwrap();
+    assert!(
+        messages.iter().all(|m| m["id"] != custom_id),
+        "a custom entry must not appear in get_messages: {messages:#?}"
+    );
+
+    // `data` defaults to `{}` when omitted.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "append_custom", "kind": "bare" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "append_custom");
+    assert_eq!(frames.last().unwrap()["success"], true);
+
+    // A missing `kind` is a clear error, not a silent no-op.
+    writeln!(stdin, "{}", json!({ "type": "append_custom" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "append_custom");
+    assert_eq!(frames.last().unwrap()["success"], false);
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
 fn serve_repo_lists_switches_and_forks_sessions() {
     let dir = tempfile::tempdir().unwrap();
     let session_dir = dir.path().join("sessions").to_string_lossy().into_owned();
@@ -233,16 +434,16 @@ fn serve_repo_lists_switches_and_forks_sessions() {
         "switched-to session must restore its transcript: {dump}"
     );
 
-    // `get_fork_messages` previews the same prefix `fork` would copy, without creating anything: the
+    // `preview_fork` previews the same prefix `fork` would copy, without creating anything: the
     // session count in `list_sessions` must be unchanged afterward.
     writeln!(
         stdin,
         "{}",
-        json!({ "type": "get_fork_messages", "session_id": first_id, "upto": 1 })
+        json!({ "type": "preview_fork", "session_id": first_id, "upto": 1 })
     )
     .unwrap();
     stdin.flush().unwrap();
-    let frames = read_until_response(&mut stdout, "get_fork_messages");
+    let frames = read_until_response(&mut stdout, "preview_fork");
     let preview = frames.last().unwrap();
     assert_eq!(preview["success"], true);
     let preview_messages = preview["data"]["messages"].as_array().unwrap();
@@ -281,7 +482,7 @@ fn serve_repo_lists_switches_and_forks_sessions() {
     assert_eq!(
         count_after_fork,
         count_before_fork + 1,
-        "get_fork_messages must not itself have created a session"
+        "preview_fork must not itself have created a session"
     );
 
     drop(stdin);
@@ -536,7 +737,7 @@ fn serve_fork_by_target_id_reaches_an_off_active_path_branch() {
     stdin.flush().unwrap();
     read_until_response(&mut stdout, "prompt");
 
-    // `get_fork_messages` targeting b's own user turn (off-branch) with `before:true` previews just
+    // `preview_fork` targeting b's own user turn (off-branch) with `before:true` previews just
     // [a, a-reply] — b's user message excluded (its own parent is a-reply, so excluding just b's
     // message, not "the whole b pair", is exactly what `before` means: fork right before this entry).
     writeln!(stdin, "{}", json!({ "type": "list_sessions" })).unwrap();
@@ -551,11 +752,11 @@ fn serve_fork_by_target_id_reaches_an_off_active_path_branch() {
     writeln!(
         stdin,
         "{}",
-        json!({ "type": "get_fork_messages", "target_id": ids[2], "before": true })
+        json!({ "type": "preview_fork", "target_id": ids[2], "before": true })
     )
     .unwrap();
     stdin.flush().unwrap();
-    let preview = read_until_response(&mut stdout, "get_fork_messages");
+    let preview = read_until_response(&mut stdout, "preview_fork");
     let preview_messages = preview.last().unwrap()["data"]["messages"]
         .as_array()
         .unwrap()
@@ -578,7 +779,7 @@ fn serve_fork_by_target_id_reaches_an_off_active_path_branch() {
         .len();
     assert_eq!(
         count_after_preview, count_before_preview,
-        "get_fork_messages with target_id must not create a session file"
+        "preview_fork with target_id must not create a session file"
     );
 
     // A real `fork` at c's assistant reply (off-branch), `before:false` (the default) — includes it,
@@ -714,6 +915,54 @@ fn serve_get_tree_reports_every_node_not_just_leaves() {
     );
     // The root node has no parent.
     assert!(nodes.iter().any(|n| n["parent_id"].is_null()));
+
+    // Pi-parity fix: `get_tree` must also report the active path's own tip — pi's own `leafId` — so a
+    // client can tell which node is "where the session currently is" without a separate round trip.
+    let leaf_id = frames.last().unwrap()["data"]["leaf_id"].as_str().unwrap();
+    let assistant_id = nodes.iter().find(|n| n["role"] == "assistant").unwrap()["id"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        leaf_id, assistant_id,
+        "leaf_id must be the active path's own tip: {frames:#?}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_get_tree_leaf_id_is_null_without_persistence_configured() {
+    // Mirrors `serve_get_fork_messages_is_empty_without_persistence_configured`'s reasoning: pure
+    // in-memory mode has no `SessionStore` to track an active tip at all.
+    let (base, _bodies) = spawn_model_server(vec![]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = Command::new(bin)
+        .args([
+            "serve",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--no-session-persistence",
+        ])
+        .env("HOME", "/nonexistent-beyond-ai-agent-test-home")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "get_tree" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_tree");
+    let resp = frames.last().unwrap();
+    assert_eq!(resp["data"]["nodes"], json!([]), "got: {resp:#?}");
+    assert!(resp["data"]["leaf_id"].is_null(), "got: {resp:#?}");
 
     drop(stdin);
     child.wait().unwrap();
@@ -1019,6 +1268,77 @@ fn serve_switch_branch_restores_the_model_active_on_that_branch() {
 }
 
 #[test]
+fn serve_switch_branch_before_restores_the_model_at_the_resolved_parent_not_the_raw_target() {
+    // Regression guard for the `before: true` model/thinking-level restoration bug this feature
+    // could easily reintroduce: the restored model must be queried against the *resolved* target
+    // (`target_id`'s own parent), not the raw, pre-resolution `target_id` argument. Those two only
+    // disagree when a model change is anchored exactly at the parent itself — anchored-at-a-node
+    // changes take effect for what comes *next*, so querying the unresolved child would wrongly see
+    // its own parent's anchor as already in effect for the parent, not just its descendants.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+
+    let (base, _bodies) = spawn_model_server(vec![
+        turn_text("first answer"),  // m1 (user "first"), m2 (assistant)
+        turn_text("second answer"), // m3 (user "second"), m4 (assistant) — under model-B
+    ]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "first" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    // Anchored at m2 (the current tip) — takes effect for m3 onward, not for m2 itself.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_model", "model": "claude-test-2" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "set_model");
+    assert_eq!(frames.last().unwrap()["success"], true, "got: {frames:#?}");
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "second" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    let ids = message_ids(&session_file);
+    assert_eq!(ids.len(), 4, "expected 4 persisted messages: {ids:?}");
+    let m3 = ids[2].clone(); // the user message right after the model-B change took effect
+
+    // `before: true` on m3 resolves to m2 — must restore the model active AT m2 (before the change
+    // anchored there took effect), i.e. the original "claude-test", not "claude-test-2".
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "switch_branch", "target_id": m3, "before": true, "summarize": false })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "switch_branch");
+    let resp = frames.last().unwrap();
+    assert_eq!(resp["success"], true, "got: {resp:#?}");
+    assert_eq!(
+        resp["data"]["model"], "claude-test",
+        "before:true must restore the model at the resolved parent (m2), not wrongly pick up a \
+         change anchored there that only applies to its descendants: {resp:#?}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
 fn serve_switch_branch_resets_thinking_level_instead_of_bleeding_a_sibling_branchs_setting() {
     // Track L4: a `set_reasoning_effort` recorded on one branch must not silently keep applying after
     // switching to a point that never had it — that point genuinely never had a level recorded, so it
@@ -1206,6 +1526,477 @@ fn serve_switch_branch_rejects_unknown_target() {
     stdin.flush().unwrap();
     let frames = read_until_response(&mut stdout, "switch_branch");
     assert_eq!(frames.last().unwrap()["success"], false);
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_switch_branch_before_the_first_message_resets_to_root() {
+    // Pi-parity fix: no way existed to navigate back to before the very first message — pi's own
+    // `SessionManager::resetLeaf`, exposed by pointing `switch_branch` at the first message's own
+    // `target_id` with `before: true` (mirroring `fork`'s identical `before` semantics), rather than a
+    // separate root sentinel on the wire.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![
+        turn_text("first answer"),
+        turn_text("second answer"),
+        turn_text("redone first answer"),
+    ]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "first" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "second" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    let ids = message_ids(&session_file);
+    assert_eq!(ids.len(), 4, "expected 4 persisted messages: {ids:?}");
+    let first_message_id = ids[0].clone();
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "switch_branch", "target_id": first_message_id, "before": true, "summarize": false })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "switch_branch");
+    let resp = frames.last().unwrap();
+    assert_eq!(resp["success"], true, "switch_branch failed: {resp:#?}");
+
+    // The active transcript is now genuinely empty — reset all the way to root, not just to the
+    // first message itself.
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_messages");
+    let messages = frames.last().unwrap()["data"]["messages"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(
+        messages.is_empty(),
+        "expected an empty transcript: {messages:#?}"
+    );
+
+    // A fresh prompt now redoes the first message in place — the model sees no prior turns at all.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "redo the first message" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "prompt");
+    assert_eq!(
+        frames.last().unwrap()["success"],
+        true,
+        "the redone turn must actually run: {frames:#?}"
+    );
+
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_messages");
+    let messages = frames.last().unwrap()["data"]["messages"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        messages.len(),
+        2,
+        "expected exactly the redone user+assistant turn, no trace of the old branch: {messages:#?}"
+    );
+    let dump = format!("{messages:?}");
+    assert!(dump.contains("redone first answer"), "{dump}");
+    assert!(!dump.contains("second answer"), "{dump}");
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_list_sessions_query_filters_to_matching_sessions_only() {
+    // Pi-parity fix: `search_text`/`preview` were computed and serialized into every listing entry, but
+    // nothing ever filtered or ranked by them — `list_sessions`/`list_all_sessions` always returned
+    // every session regardless of any query. A `query` field must now narrow the result to sessions
+    // whose recorded text actually contains it.
+    let session_dir = tempfile::tempdir().unwrap();
+    let session_dir_str = session_dir.path().to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![turn_text("ok"), turn_text("ok")]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_dir_cmd(bin, &base, &session_dir_str).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "remember the marker: zephyr-unique-42" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    writeln!(stdin, "{}", json!({ "type": "new_session" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "new_session");
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "a totally unrelated topic" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    // No query: both sessions listed, matching today's existing behavior exactly.
+    writeln!(stdin, "{}", json!({ "type": "list_sessions" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "list_sessions");
+    let sessions = frames.last().unwrap()["data"]["sessions"]
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        sessions.len(),
+        2,
+        "an absent query must list every session, unfiltered: {sessions:#?}"
+    );
+
+    // A query matching only the first session's content.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "list_sessions", "query": "zephyr-unique-42" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "list_sessions");
+    let sessions = frames.last().unwrap()["data"]["sessions"]
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        sessions.len(),
+        1,
+        "the query must filter out the unrelated session: {sessions:#?}"
+    );
+    assert!(
+        sessions[0]["search_text"]
+            .as_str()
+            .unwrap()
+            .contains("zephyr-unique-42"),
+        "the surviving session must be the one that actually matched: {sessions:#?}"
+    );
+
+    // A query matching nothing at all is an empty (still successful) result, not an error.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "list_sessions", "query": "no-such-term-anywhere-xyz" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "list_sessions");
+    let response = frames.last().unwrap();
+    assert_eq!(response["success"], true, "got: {response:#?}");
+    assert!(
+        response["data"]["sessions"].as_array().unwrap().is_empty(),
+        "an unmatched query returns no sessions, not a fault: {response:#?}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_list_all_sessions_query_filters_across_every_project() {
+    // The cross-project half of the same fix: `list_all_sessions`'s `query` must narrow results spanning
+    // every project's own directory, not just the current one.
+    let root = tempfile::tempdir().unwrap();
+    let dir_a = root.path().join("proj-a").to_string_lossy().into_owned();
+    let dir_b = root.path().join("proj-b").to_string_lossy().into_owned();
+
+    let (base_a, _bodies_a) = spawn_model_server(vec![turn_text("ok")]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child_a = serve_dir_cmd(bin, &base_a, &dir_a).spawn().unwrap();
+    let mut stdin_a = child_a.stdin.take().unwrap();
+    let mut stdout_a = BufReader::new(child_a.stdout.take().unwrap());
+    writeln!(
+        stdin_a,
+        "{}",
+        json!({ "type": "prompt", "message": "project A discusses widget-frobnication" })
+    )
+    .unwrap();
+    stdin_a.flush().unwrap();
+    read_until_response(&mut stdout_a, "prompt");
+
+    let (base_b, _bodies_b) = spawn_model_server(vec![turn_text("ok")]);
+    let mut child_b = serve_dir_cmd(bin, &base_b, &dir_b).spawn().unwrap();
+    let mut stdin_b = child_b.stdin.take().unwrap();
+    let mut stdout_b = BufReader::new(child_b.stdout.take().unwrap());
+    writeln!(
+        stdin_b,
+        "{}",
+        json!({ "type": "prompt", "message": "project B is about something else entirely" })
+    )
+    .unwrap();
+    stdin_b.flush().unwrap();
+    read_until_response(&mut stdout_b, "prompt");
+
+    writeln!(
+        stdin_a,
+        "{}",
+        json!({ "type": "list_all_sessions", "query": "widget-frobnication" })
+    )
+    .unwrap();
+    stdin_a.flush().unwrap();
+    let frames = read_until_response(&mut stdout_a, "list_all_sessions");
+    let response = frames.last().unwrap();
+    assert_eq!(response["success"], true, "got: {response:#?}");
+    let sessions = response["data"]["sessions"].as_array().unwrap();
+    assert_eq!(
+        sessions.len(),
+        1,
+        "the query must narrow the cross-project result to the one matching session: {sessions:#?}"
+    );
+    assert!(
+        sessions[0]["search_text"]
+            .as_str()
+            .unwrap()
+            .contains("widget-frobnication"),
+        "the surviving session must be project A's, the one that actually matched: {sessions:#?}"
+    );
+
+    drop(stdin_a);
+    child_a.wait().unwrap();
+    drop(stdin_b);
+    child_b.wait().unwrap();
+}
+
+#[test]
+fn serve_get_fork_messages_lists_user_turn_candidates_for_the_active_path() {
+    // Pi-parity fix: `get_fork_messages` used to be this crate's own arbitrary-session/arbitrary-point
+    // fork *preview* (now `preview_fork`) — a different contract than pi's own same-named command, which
+    // takes no parameters and lists every user-turn entry on the *current* session's active path as
+    // `{entry_id, text}` fork-point candidates. A pi-compatible client's zero-arg call must now get that
+    // shape back, not the old preview's full multi-role `Message` array.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) =
+        spawn_model_server(vec![turn_text("first answer"), turn_text("second answer")]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "first user message" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "second user message" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    // No parameters — pi's own contract.
+    writeln!(stdin, "{}", json!({ "type": "get_fork_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_fork_messages");
+    let response = frames.last().unwrap();
+    assert_eq!(response["success"], true, "got: {response:#?}");
+    let candidates = response["data"]["messages"].as_array().unwrap();
+    assert_eq!(
+        candidates.len(),
+        2,
+        "only the two user turns are candidates, not the assistant replies: {candidates:#?}"
+    );
+    assert_eq!(candidates[0]["text"], "first user message");
+    assert_eq!(candidates[1]["text"], "second user message");
+    for c in candidates {
+        assert!(
+            c["entry_id"].as_str().is_some_and(|s| !s.is_empty()),
+            "each candidate must carry a usable entry_id: {c:#?}"
+        );
+    }
+
+    // Each `entry_id` must be a real, usable `target_id` — the same id `get_messages` tags that exact
+    // user turn with, so a client can feed it straight into `fork`'s own `target_id`.
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_messages");
+    let messages = frames.last().unwrap()["data"]["messages"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let user_ids: Vec<&str> = messages
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        candidates[0]["entry_id"].as_str().unwrap(),
+        user_ids[0],
+        "entry_id must match get_messages' own id for the same user turn"
+    );
+    assert_eq!(candidates[1]["entry_id"].as_str().unwrap(), user_ids[1]);
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_get_fork_messages_is_empty_without_persistence_configured() {
+    // In pure in-memory mode there are no stable entry ids to hand back for a later `fork` `target_id`
+    // — `get_fork_messages` must degrade to an empty (still successful) list, matching `get_messages`'s
+    // own precedent for the same mismatch, rather than erroring.
+    let (base, _bodies) = spawn_model_server(vec![turn_text("ok")]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = Command::new(bin)
+        .args([
+            "serve",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--no-session-persistence",
+        ])
+        .env("HOME", "/nonexistent-beyond-ai-agent-test-home")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    writeln!(stdin, "{}", json!({ "type": "get_fork_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_fork_messages");
+    let response = frames.last().unwrap();
+    assert_eq!(response["success"], true, "got: {response:#?}");
+    assert!(
+        response["data"]["messages"].as_array().unwrap().is_empty(),
+        "no persistence means no stable ids to offer: {response:#?}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_switch_session_resolves_a_unique_id_prefix() {
+    // Pi-parity fix: matching was exact-only everywhere — pi's own `resolveSessionPath` accepts a
+    // shortened, unambiguous prefix as a typing convenience.
+    let dir = tempfile::tempdir().unwrap();
+    let session_dir = dir.path().join("sessions").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![turn_text("first answer")]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_dir_cmd(bin, &base, &session_dir).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    let mut ready = String::new();
+    stdout.read_line(&mut ready).unwrap();
+    let ready: Value = serde_json::from_str(ready.trim()).unwrap();
+    let first_id = ready["session_id"].as_str().unwrap().to_string();
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    writeln!(stdin, "{}", json!({ "type": "new_session" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "new_session");
+
+    let prefix = &first_id[..first_id.len() / 2];
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "switch_session", "session_id": prefix })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "switch_session");
+    assert_eq!(frames.last().unwrap()["success"], true, "{frames:#?}");
+
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_messages");
+    let dump = frames.last().unwrap()["data"]["messages"].to_string();
+    assert!(
+        dump.contains("first answer"),
+        "switching via a prefix must reach the session it uniquely resolves to: {dump}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_switch_session_rejects_an_ambiguous_prefix_naming_every_candidate() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_dir = dir.path().join("sessions").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![turn_text("first"), turn_text("second")]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_dir_cmd(bin, &base, &session_dir).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+    writeln!(stdin, "{}", json!({ "type": "new_session" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "new_session");
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "yo" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    // A single character is virtually guaranteed to match both generated ids' shared leading hex nanos
+    // digit(s) is not reliable, so instead assert against the empty-string prefix, which unambiguously
+    // matches every session that exists.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "switch_session", "session_id": "" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "switch_session");
+    let response = frames.last().unwrap();
+    assert_eq!(response["success"], false, "{response:#?}");
+    assert!(
+        response["error"]
+            .as_str()
+            .unwrap()
+            .contains("more than one"),
+        "{response:#?}"
+    );
 
     drop(stdin);
     child.wait().unwrap();

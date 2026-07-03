@@ -52,7 +52,7 @@ pub use models::{
     thinking_for_level,
 };
 pub use session::Session;
-pub use steering::{QueueMode, Steering, SteeringMessage};
+pub use steering::{ModelSwitch, QueueMode, Steering, SteeringMessage};
 pub use tool::{Tool, ToolOutput, ToolProgress, ToolRegistry, ToolUpdate};
 pub use transport::{
     ModelRequest, ModelTransport, ReasoningEffort, ReasoningSummary, ServiceTier, ToolChoice,

@@ -30,7 +30,10 @@ use super::output::format_path;
 
 /// Default cap on reported matches.
 const DEFAULT_LIMIT: usize = 100;
-/// Long match lines are clipped to keep output readable.
+/// Long match lines are clipped to keep output readable — a *character* count, matching pi's own
+/// `GREP_MAX_LINE_LENGTH` (`truncateLine`'s `line.length`, UTF-16 code units — effectively chars for all
+/// BMP text), not a byte count: a CJK/Cyrillic/accented-Latin line costs more bytes per character than
+/// ASCII, so byte-clipping the same cap would truncate it to far fewer visible characters for no reason.
 const MAX_LINE: usize = 500;
 /// Hard ceiling on matches collected before the walk bails — an OOM guard for pathological patterns
 /// (matching nearly every line of a huge tree). Far above any sane `limit`; when it trips, the
@@ -108,11 +111,15 @@ impl GrepJob {
 
 /// Run the parallel search. `threads == 0` lets `ignore` choose (≈ CPU count); the bench passes 1 to
 /// measure the single-threaded baseline. Returns hits sorted by `(path, line)` — each flagged as a
-/// match or a context line — and whether the result was truncated (by `limit` or the hard cap).
+/// match or a context line — whether the result was truncated (by `limit` or the hard cap), and, when
+/// the walk hit at least one unreadable path (permission denied, a broken symlink, …), the first such
+/// error's message — matching real ripgrep, which exits non-zero and reports the real error text the
+/// moment it can't read *any* path in the tree, rather than silently treating it as "not found here."
 /// `limit` and the hard cap count *matches*, not context lines.
-pub fn search(job: &GrepJob, threads: usize) -> (Vec<Hit>, bool) {
+pub fn search(job: &GrepJob, threads: usize) -> (Vec<Hit>, bool, Option<String>) {
     let collected: Arc<Mutex<Vec<Hit>>> = Arc::new(Mutex::new(Vec::new()));
     let total = Arc::new(AtomicUsize::new(0));
+    let first_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     // The walk quits as soon as *either* threshold is crossed — `job.limit` in the common case (a
     // low-limit query against a match-dense tree should stop almost immediately, not walk the whole
     // tree only to throw away everything past the first `limit` matches), `HARD_CAP` as the outer
@@ -127,9 +134,17 @@ pub fn search(job: &GrepJob, threads: usize) -> (Vec<Hit>, bool) {
     // `require_git(false)` keeps that respect even outside an actual git repository (e.g. a plain
     // checkout with no `.git`, or a tree copied without its VCS metadata) — the ignore crate's default
     // otherwise silently stops honoring `.gitignore` the moment there's no repo to find. Only applied
-    // outside a real repo, though — matching pi's own `rg` invocation (`--no-require-git` only when the
-    // root isn't inside a git repo): inside one, the default git-aware walk keeps a nested repo's own
+    // outside a real repo, though: inside one, the default git-aware walk keeps a nested repo's own
     // `.gitignore` from leaking parent rules across its boundary.
+    //
+    // Pi-parity note: this is a deliberate DIVERGENCE, not a match. Pi's own grep tool shells out to
+    // real `rg` with no `--no-require-git`/git-detection logic at all, so it silently stops honoring
+    // `.gitignore` outside a git repo (ripgrep's own default). That conditional-on-repo-boundary
+    // handling exists only in pi's *find* tool (`fd --no-require-git`, added only when the search root
+    // isn't inside a git repo — see this same check in `find.rs`, which correctly cites it). Beyond
+    // extends the identical policy to grep too, for consistency between the two search tools and
+    // because it's strictly more useful (a plain checkout with no `.git` still gets its `.gitignore`
+    // honored) — kept rather than narrowed to match grep.ts's behavior here.
     let mut builder = WalkBuilder::new(&job.root);
     builder.hidden(false);
     if !super::root_is_inside_git_repo(&job.root) {
@@ -138,6 +153,7 @@ pub fn search(job: &GrepJob, threads: usize) -> (Vec<Hit>, bool) {
     builder.threads(threads).build_parallel().run(|| {
         let collected = Arc::clone(&collected);
         let total = Arc::clone(&total);
+        let first_error = Arc::clone(&first_error);
         let matcher = &job.matcher;
         let glob = &job.glob;
         // One `Searcher` per worker thread (it carries reusable line buffers): ripgrep's engine —
@@ -154,8 +170,19 @@ pub fn search(job: &GrepJob, threads: usize) -> (Vec<Hit>, bool) {
             if total.load(Ordering::Relaxed) >= stop_at {
                 return WalkState::Quit;
             }
-            let Ok(entry) = entry else {
-                return WalkState::Continue;
+            let entry = match entry {
+                Ok(entry) => entry,
+                // A walk-level error (permission denied on a directory, a broken symlink, …) — the
+                // entry itself is skipped, matching the prior behavior, but recorded so an
+                // otherwise-empty result can say "couldn't fully search" instead of a confidently
+                // wrong "no matches" — matching real ripgrep, which exits non-zero the moment it
+                // can't read *any* path in the tree, real or reported here or not.
+                Err(e) => {
+                    if let Ok(mut guard) = first_error.lock() {
+                        guard.get_or_insert_with(|| e.to_string());
+                    }
+                    return WalkState::Continue;
+                }
             };
             if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
                 return WalkState::Continue;
@@ -167,7 +194,8 @@ pub fn search(job: &GrepJob, threads: usize) -> (Vec<Hit>, bool) {
                 }
             }
             // Collect this file's hits into one local sink, then push once — one lock per matching
-            // file. An I/O error (unreadable file) skips it, like the prior behavior.
+            // file. An I/O error (unreadable file) skips it, like the prior behavior, but is likewise
+            // recorded for the same reason as a walk-level error above.
             // One `Arc<Path>` allocation for this file; every hit clones the pointer (refcount
             // bump), so a match-dense file no longer pays a `PathBuf` per hit.
             let mut sink = Collector {
@@ -175,7 +203,10 @@ pub fn search(job: &GrepJob, threads: usize) -> (Vec<Hit>, bool) {
                 hits: Vec::new(),
                 matches: 0,
             };
-            if searcher.search_path(matcher, path, &mut sink).is_err() {
+            if let Err(e) = searcher.search_path(matcher, path, &mut sink) {
+                if let Ok(mut guard) = first_error.lock() {
+                    guard.get_or_insert_with(|| format!("{}: {e}", path.display()));
+                }
                 return WalkState::Continue;
             }
             if !sink.hits.is_empty() {
@@ -221,7 +252,11 @@ pub fn search(job: &GrepJob, threads: usize) -> (Vec<Hit>, bool) {
             hits.pop();
         }
     }
-    (hits, truncated)
+    let first_error = Arc::try_unwrap(first_error)
+        .ok()
+        .and_then(|m| m.into_inner().ok())
+        .flatten();
+    (hits, truncated, first_error)
 }
 
 /// A [`Sink`] that gathers one file's matches and context lines. `matched`/`context` are called by the
@@ -270,16 +305,17 @@ fn trim_eol(s: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// Clip a long line to `MAX_LINE` bytes at a UTF-8 char boundary (never panics mid-codepoint).
+/// Clip a long line to `MAX_LINE` *characters*, not bytes — pi-parity fix: the previous byte-based cap
+/// (with a char-boundary backoff to avoid splitting a codepoint) never produced invalid UTF-8, but still
+/// truncated a non-ASCII line to far fewer visible characters than an ASCII line under the same nominal
+/// cap, unlike pi's own char-counting `truncateLine`.
 fn clip(line: &str) -> String {
-    if line.len() <= MAX_LINE {
-        return line.to_string();
+    let mut chars = line.chars();
+    let head: String = chars.by_ref().take(MAX_LINE).collect();
+    if chars.next().is_none() {
+        return head; // the whole line fit within the cap — nothing was truncated
     }
-    let mut end = MAX_LINE;
-    while !line.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}{LINE_TRUNCATED_SUFFIX}", &line[..end])
+    format!("{head}{LINE_TRUNCATED_SUFFIX}")
 }
 
 #[async_trait]
@@ -321,11 +357,18 @@ impl Tool for Grep {
             .get("ignore_case")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        // Floored at 1 — matches pi's own `grep.ts` (`Math.max(1, limit ?? DEFAULT_LIMIT)`). Without
+        // this, `limit: 0` makes `stop_at` (in `search`) zero, so the walk's very first "have we hit
+        // the threshold?" check is already true before a single file is scanned — a confidently wrong
+        // "no matches" even when real matches exist. `find`'s own `limit` deliberately has no such
+        // floor (pi's `find.ts` doesn't apply one either — a genuine asymmetry between the two tools
+        // upstream, not an oversight to "fix" into false symmetry here).
         let limit = input
             .get("limit")
             .and_then(Value::as_u64)
             .map(|n| n as usize)
-            .unwrap_or(DEFAULT_LIMIT);
+            .unwrap_or(DEFAULT_LIMIT)
+            .max(1);
 
         // Context lines around each match. `context` sets both sides; `before`/`after` override it per
         // side. Absent everywhere → 0 (the prior behavior, just the matching lines).
@@ -355,11 +398,21 @@ impl Tool for Grep {
             .map_err(ToolError::InvalidInput)?
             .with_context(before, after);
         // The walk blocks (its own thread pool, synchronous reads); keep it off the async runtime.
-        let (matches, truncated) = tokio::task::spawn_blocking(move || search(&job, 0))
+        let (matches, truncated, walk_error) = tokio::task::spawn_blocking(move || search(&job, 0))
             .await
             .map_err(|e| ToolError::Execution(format!("grep task failed: {e}")))?;
 
         if matches.is_empty() {
+            // A genuine zero-match walk and a walk that hit an unreadable path along the way both
+            // land here with an empty result — but they aren't the same thing, and reporting them
+            // identically ("no matches") tells the model a confident falsehood in the second case.
+            // Matches real ripgrep, which exits non-zero and reports the real error the moment it
+            // can't read *any* path in the tree.
+            if let Some(err) = walk_error {
+                return Err(ToolError::Execution(format!(
+                    "search was incomplete, so \"no matches\" may not be accurate: {err}"
+                )));
+            }
             return Ok(no_match.into());
         }
         let mut out = String::new();
@@ -397,6 +450,12 @@ impl Tool for Grep {
             }
             if lines_truncated {
                 notices.push("some lines truncated; use the read tool to see them in full".into());
+            }
+            if let Some(err) = &walk_error {
+                notices.push(format!(
+                    "search was incomplete — some paths couldn't be read, so there may be more \
+                     matches than shown: {err}"
+                ));
             }
             if !notices.is_empty() {
                 let _ = writeln!(out, "{}", super::output::marker(notices.join(". ")));
@@ -437,6 +496,69 @@ mod tests {
             trim_eol("first\rsecond"),
             std::borrow::Cow::Owned(_)
         ));
+    }
+
+    #[test]
+    fn clip_leaves_a_short_line_untouched() {
+        assert_eq!(clip("short line"), "short line");
+    }
+
+    #[test]
+    fn clip_truncates_an_ascii_line_at_exactly_max_line_characters() {
+        let line = "a".repeat(MAX_LINE + 50);
+        let clipped = clip(&line);
+        assert_eq!(
+            clipped,
+            format!("{}{LINE_TRUNCATED_SUFFIX}", "a".repeat(MAX_LINE))
+        );
+    }
+
+    #[test]
+    fn clip_counts_characters_not_bytes_for_non_ascii_text() {
+        // Pi-parity fix: the previous byte-based cap truncated a non-ASCII line to far fewer visible
+        // characters than an equivalent-length ASCII line under the same nominal `MAX_LINE` — pi's own
+        // `truncateLine` counts characters (`line.length`, UTF-16 code units), not bytes. A 3-byte-per-
+        // character CJK line at exactly `MAX_LINE` characters (so ~3x `MAX_LINE` bytes) must survive
+        // whole, not get chopped down to a third of its characters.
+        let line = "漢".repeat(MAX_LINE);
+        assert!(
+            line.len() > MAX_LINE * 2,
+            "sanity: this line must be well over MAX_LINE bytes"
+        );
+        let clipped = clip(&line);
+        assert_eq!(
+            clipped, line,
+            "exactly MAX_LINE characters must not be truncated, even though it's far more than \
+             MAX_LINE bytes"
+        );
+
+        // One character over the cap must truncate to exactly MAX_LINE characters, not MAX_LINE bytes'
+        // worth (which would be roughly a third as many characters for 3-byte-per-char text).
+        let over = "漢".repeat(MAX_LINE + 1);
+        let clipped_over = clip(&over);
+        assert_eq!(
+            clipped_over,
+            format!("{}{LINE_TRUNCATED_SUFFIX}", "漢".repeat(MAX_LINE))
+        );
+    }
+
+    #[test]
+    fn clip_never_splits_a_multi_byte_character_even_though_it_counts_characters_now() {
+        // A mixed-width line where the cut point (character MAX_LINE) falls squarely on a real
+        // character boundary already (since we now count whole characters, not bytes) — this can never
+        // regress into slicing mid-codepoint the way the old byte-index-with-boundary-backoff version
+        // theoretically could if miscounted.
+        let line = format!("{}{}", "a".repeat(MAX_LINE - 1), "漢漢漢");
+        let clipped = clip(&line);
+        assert!(clipped.is_char_boundary(clipped.len() - LINE_TRUNCATED_SUFFIX.len()));
+        assert_eq!(
+            clipped,
+            format!(
+                "{}{}{LINE_TRUNCATED_SUFFIX}",
+                "a".repeat(MAX_LINE - 1),
+                "漢"
+            )
+        );
     }
 
     #[tokio::test]
@@ -576,9 +698,10 @@ mod tests {
     #[tokio::test]
     async fn gitignore_is_still_honored_inside_a_real_git_repository() {
         // pi-parity fix (L7): `require_git(false)` is now conditional on the search root *not* being
-        // inside a real git repo (matching pi's own `rg --no-require-git` scoping) — this guards
-        // against the conditional accidentally breaking the far more common case, a search root that
-        // *is* inside a real repo, which must still honor `.gitignore` exactly as before.
+        // inside a real git repo (a deliberate divergence from pi's own `rg` invocation, which has no
+        // such conditional at all — see this module's doc comment on `require_git(false)`) — this
+        // guards against the conditional accidentally breaking the far more common case, a search root
+        // that *is* inside a real repo, which must still honor `.gitignore` exactly as before.
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join(".git")).unwrap();
         std::fs::write(dir.path().join(".gitignore"), "ignored.txt\n").unwrap();
@@ -606,6 +729,117 @@ mod tests {
             .unwrap()
             .text;
         assert!(out.contains("no matches"));
+    }
+
+    /// Skip a permission-bit test under a runtime that doesn't actually enforce them (root, some
+    /// sandboxes) — matches the same guard `resources.rs`'s unreadable-file tests use.
+    #[cfg(unix)]
+    fn mode_actually_blocks_reads(path: &std::path::Path) -> bool {
+        std::fs::read_dir(path).is_err()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_search_root_reports_an_error_not_a_false_no_matches() {
+        // Pi-parity audit H69: real ripgrep exits non-zero the moment it can't read a path in the
+        // tree, root included — this crate's own walk previously swallowed that into `WalkState::
+        // Continue`, so an unreadable root silently reported "no matches" instead of surfacing the
+        // real problem.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "needle\n").unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let blocks = mode_actually_blocks_reads(dir.path());
+
+        let result = Grep
+            .run(json!({ "pattern": "needle", "path": dir.path().to_str().unwrap() }))
+            .await;
+        let _ = std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755));
+
+        if !blocks {
+            return;
+        }
+        let err =
+            result.expect_err("an unreadable root must surface as an error, not empty output");
+        let ToolError::Execution(msg) = err else {
+            panic!("expected Execution error, got {err:?}")
+        };
+        assert!(
+            msg.contains("incomplete") && msg.contains("Permission denied"),
+            "must surface the real reason, not a bare confident-empty result: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_subdirectory_with_no_matches_elsewhere_reports_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("readable.txt"), "no match here\n").unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("secret.txt"), "needle\n").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let blocks = mode_actually_blocks_reads(&locked);
+
+        let result = Grep
+            .run(json!({ "pattern": "needle", "path": dir.path().to_str().unwrap() }))
+            .await;
+        let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
+
+        if !blocks {
+            return;
+        }
+        let err = result.expect_err(
+            "an unreadable subdirectory with no matches found elsewhere must surface as an error, \
+             not a false \"no matches\"",
+        );
+        let ToolError::Execution(msg) = err else {
+            panic!("expected Execution error, got {err:?}")
+        };
+        assert!(
+            !msg.contains("no matches for"),
+            "must not phrase this as a confident empty result: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_subdirectory_alongside_real_matches_still_returns_them_with_a_notice() {
+        // A real match elsewhere in the tree must not be discarded just because some other, unrelated
+        // path couldn't be read — a deliberate, documented divergence from pi's own all-or-nothing
+        // behavior (discarding every match the moment `rg` exits non-zero): silently losing real,
+        // already-found matches over an unrelated permission hiccup would make the tool much less
+        // useful in practice. The incompleteness is still surfaced, just as a notice, not a failure.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("readable.txt"), "needle here\n").unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("secret.txt"), "needle too\n").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let blocks = mode_actually_blocks_reads(&locked);
+
+        let result = Grep
+            .run(json!({ "pattern": "needle", "path": dir.path().to_str().unwrap() }))
+            .await;
+        let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
+
+        if !blocks {
+            return;
+        }
+        let out = result.unwrap().text;
+        assert!(
+            out.contains("readable.txt"),
+            "a real match elsewhere must still be reported: {out}"
+        );
+        assert!(
+            out.contains("incomplete"),
+            "the result must note it may be incomplete: {out}"
+        );
     }
 
     #[tokio::test]
@@ -841,6 +1075,25 @@ mod tests {
         assert_eq!(
             match_lines, 3,
             "at most `limit` matches must be reported: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_limit_of_zero_is_floored_to_one_not_a_confident_no_matches() {
+        // Pi-parity audit M10: matches pi's own `grep.ts` (`Math.max(1, limit ?? DEFAULT_LIMIT)`).
+        // Without the floor, `limit: 0` made `stop_at` zero, so `search`'s very first "have we hit the
+        // threshold?" check was already true before a single file was scanned — a confidently wrong
+        // "no matches" even though a real match exists.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "needle\n").unwrap();
+        let out = Grep
+            .run(json!({ "pattern": "needle", "path": dir.path().to_str().unwrap(), "limit": 0 }))
+            .await
+            .unwrap()
+            .text;
+        assert!(
+            out.contains("needle"),
+            "limit: 0 must still find the real match (floored to 1), not report false emptiness: {out}"
         );
     }
 

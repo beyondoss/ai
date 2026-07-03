@@ -5,7 +5,7 @@ mod common;
 
 use std::process::{Command, Stdio};
 
-use common::{run_cmd, spawn_model_server, turn_text, turn_tool_use};
+use common::{run_cmd, spawn_model_server, sse, turn_text, turn_text_responses, turn_tool_use};
 use serde_json::json;
 
 #[test]
@@ -62,6 +62,52 @@ fn run_binary_list_models_prints_known_model_ids_with_no_gateway_or_key() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("claude-opus-4-8"), "stdout: {stdout}");
     assert!(stdout.contains("gpt-5"), "stdout: {stdout}");
+}
+
+#[test]
+fn run_binary_list_models_prints_capability_columns_not_just_bare_ids() {
+    // Pi-parity fix: previously a bare list of model ids — pi's own `--list-models` prints a table
+    // with context/max-out/thinking/images columns, all already computed by `agent_core::capabilities`
+    // but never surfaced. This pins the enriched shape down so it can't silently regress back to a
+    // bare list.
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args(["list-models"])
+        .output()
+        .expect("spawn binary");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Header row names the columns.
+    assert!(stdout.contains("context"), "stdout: {stdout}");
+    assert!(stdout.contains("max-out"), "stdout: {stdout}");
+    assert!(stdout.contains("thinking"), "stdout: {stdout}");
+    assert!(stdout.contains("vision"), "stdout: {stdout}");
+
+    // `claude-opus-4-8`'s own row carries its actual capability numbers, not just its id.
+    let opus_line = stdout
+        .lines()
+        .find(|l| l.contains("claude-opus-4-8"))
+        .unwrap_or_else(|| panic!("no claude-opus-4-8 row: {stdout}"));
+    assert!(
+        opus_line.contains("1000000"),
+        "expected the real context window on claude-opus-4-8's row: {opus_line}"
+    );
+    assert!(
+        opus_line.contains("yes"),
+        "claude-opus-4-8 supports thinking and vision, expected at least one yes: {opus_line}"
+    );
+
+    // `gpt-4o` doesn't support thinking/reasoning at all — its row must say so, not just "yes"
+    // everywhere regardless of the actual model.
+    let gpt4o_line = stdout
+        .lines()
+        .find(|l| l.contains("gpt-4o"))
+        .unwrap_or_else(|| panic!("no gpt-4o row: {stdout}"));
+    assert!(
+        gpt4o_line.contains("no"),
+        "gpt-4o has no thinking mechanism, expected a real \"no\" on its row: {gpt4o_line}"
+    );
 }
 
 #[test]
@@ -247,6 +293,198 @@ fn run_binary_thinking_flag_reaches_the_wire_request() {
 }
 
 #[test]
+fn run_binary_temperature_flag_reaches_the_wire_request() {
+    // Pi-parity gap: none of the three dialects exposed a temperature knob at all.
+    let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "hi",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--temperature",
+            "0.25",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[0].contains(r#""temperature":0.25"#),
+        "--temperature must set the wire request's temperature: {}",
+        bodies[0]
+    );
+}
+
+#[test]
+fn run_binary_max_tokens_flag_reaches_the_wire_request() {
+    // Pi-parity audit: `Agent::with_max_tokens` existed but had no CLI/RPC override anywhere —
+    // every `run`/`serve` process was locked to the model-derived default.
+    let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "hi",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--max-tokens",
+            "555",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[0].contains(r#""max_tokens":555"#),
+        "--max-tokens must set the wire request's max_tokens: {}",
+        bodies[0]
+    );
+}
+
+#[test]
+fn run_binary_carries_a_stable_prompt_cache_affinity_key_on_the_wire() {
+    // Pi-parity audit: `serve` pins every request to a stable per-session `prompt_cache_key` (and
+    // OpenAI session-affinity headers) via `Agent::with_cache_key`, so repeated turns keep landing on
+    // the same cache-warmed backend node — but `run_task` never called `with_cache_key` at all, so a
+    // `run` invocation's requests carried no affinity key whatsoever. Anthropic's dialect has no wire
+    // manifestation of `cache_key` at all (it's an OpenAI-only concept), so this needs an OpenAI
+    // Responses-dialect turn (`gpt-4o`) to actually observe the field on the wire.
+    let (base, bodies) = spawn_model_server(vec![turn_text_responses("ok")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "hi",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "gpt-4o",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[0].contains(r#""prompt_cache_key""#),
+        "run's request must carry a stable prompt_cache_key: {}",
+        bodies[0]
+    );
+    assert!(
+        bodies[0]
+            .to_ascii_lowercase()
+            .contains("x-client-request-id:"),
+        "run's request must carry the x-client-request-id session-affinity header: {}",
+        bodies[0]
+    );
+}
+
+#[test]
+fn run_binary_context_window_flag_forces_proactive_compaction_on_a_resumed_session() {
+    // Pi-parity fix: `run` had no `--context-window` override at all — `serve`'s own identical flag
+    // already existed, but `run_task` hardcoded the model's own capability-table window with no way
+    // to pin a smaller one. Mirrors `serve_proactively_compacts_a_resumed_large_session_on_its_very_
+    // next_prompt`: seed a session already comfortably over a tiny pinned threshold, then confirm the
+    // very first prompt against it triggers compaction (the summarization call) before the real
+    // answer — proof `--context-window` actually reached the `Agent`'s `CompactionConfig`, not just
+    // that the flag parses.
+    let dir = tempfile::tempdir().unwrap();
+
+    let session_file = {
+        use agent_core::{ContentBlock, Message, Session};
+        use beyond_ai_agent::session_store::{SessionMeta, SessionRepo};
+
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "claude-test")).unwrap();
+        let mut seed = Session::new();
+        seed.user("u".repeat(400));
+        seed.push(Message::assistant(vec![ContentBlock::text(
+            "a".repeat(400),
+        )]));
+        seed.user("u".repeat(400));
+        seed.push(Message::assistant(vec![ContentBlock::text(
+            "a".repeat(400),
+        )]));
+        store.append_new(&seed.messages).unwrap();
+        store.path().to_string_lossy().into_owned()
+    };
+
+    let (base, bodies) = spawn_model_server(vec![turn_text("SUMMARY"), turn_text("answered")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "continue please",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--session",
+            &session_file,
+            "--context-window",
+            "200",
+            "--compaction-reserve-tokens",
+            "50",
+            "--compaction-keep-recent-tokens",
+            "1",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(
+        bodies.len(),
+        2,
+        "expected a summarization call before the real answer: {bodies:#?}"
+    );
+}
+
+#[test]
 fn run_binary_cache_long_flag_reaches_the_wire_request() {
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
 
@@ -337,5 +575,348 @@ fn run_binary_bash_shell_path_flag_is_used_for_bash_calls() {
         "--bash-shell-path must route the command through the given shell, not the real command's \
          own output: {}",
         bodies[1]
+    );
+}
+
+#[test]
+fn run_binary_bash_command_prefix_flag_runs_before_the_model_s_command() {
+    // Pi-parity fix: `Bash::with_command_prefix` (pi's own `shellCommandPrefix` setting) was fully
+    // built and tested at the tool level but had zero call sites reachable from either binary — no
+    // CLI flag or env var ever set it.
+    let dir = tempfile::tempdir().unwrap();
+    let marker_file = dir.path().join("prefix-ran.txt");
+
+    let turn1 = turn_tool_use(
+        "toolu_1",
+        "bash",
+        &json!({ "command": "cat prefix-ran.txt" }).to_string(),
+    );
+    let turn2 = turn_text("done");
+    let (base, bodies) = spawn_model_server(vec![turn1, turn2]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "run a command",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--bash-command-prefix",
+            &format!("echo prefix-marker > {}", marker_file.to_str().unwrap()),
+            "--max-steps",
+            "4",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[1].contains("prefix-marker"),
+        "--bash-command-prefix must run before the model's own command, in the same shell \
+         invocation, so the command can see its effects: {}",
+        bodies[1]
+    );
+}
+
+#[test]
+fn run_binary_ai_agent_bash_command_prefix_env_var_is_used_for_bash_calls() {
+    let turn1 = turn_tool_use(
+        "toolu_1",
+        "bash",
+        &json!({ "command": "echo real-command" }).to_string(),
+    );
+    let turn2 = turn_text("done");
+    let (base, bodies) = spawn_model_server(vec![turn1, turn2]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .env("AI_AGENT_BASH_COMMAND_PREFIX", "echo env-prefix-marker")
+        .args([
+            "run",
+            "run a command",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--max-steps",
+            "4",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(bodies[1].contains("env-prefix-marker"), "{}", bodies[1]);
+}
+
+#[test]
+fn run_binary_sequential_tools_flag_is_accepted_and_both_calls_still_run() {
+    // Pi-parity fix: `agent_core::Agent` had no way to force fully-sequential tool dispatch at all —
+    // see `agent_core::agent::tests::with_sequential_tools_forces_one_group_in_flight_at_a_time` for the
+    // mechanism itself (proven there with a non-exclusive counting tool, since `bash` is already
+    // `conservative_exclusive` and so always serializes regardless of this flag — it can't demonstrate
+    // a *timing* difference end to end). This is the CLI wiring smoke test: `--sequential-tools`
+    // parses, reaches `run_task`'s `Agent::with_sequential_tools`, and a turn batching two independent
+    // `bash` calls still dispatches both correctly (right result mapped to the right `tool_use_id`, both
+    // real commands actually ran) instead of the flag silently breaking multi-call turns.
+    let dir = tempfile::tempdir().unwrap();
+    let marker_a = dir.path().join("a.txt");
+    let marker_b = dir.path().join("b.txt");
+
+    let two_bash_calls = sse(&[
+        json!({ "type": "message_start", "message": { "usage": { "input_tokens": 10, "output_tokens": 1 } } }),
+        json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "tool_use", "id": "toolu_a", "name": "bash", "input": {} } }),
+        json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "input_json_delta", "partial_json": json!({ "command": format!("touch {}", marker_a.to_str().unwrap()) }).to_string() } }),
+        json!({ "type": "content_block_stop", "index": 0 }),
+        json!({ "type": "content_block_start", "index": 1, "content_block": { "type": "tool_use", "id": "toolu_b", "name": "bash", "input": {} } }),
+        json!({ "type": "content_block_delta", "index": 1, "delta": { "type": "input_json_delta", "partial_json": json!({ "command": format!("touch {}", marker_b.to_str().unwrap()) }).to_string() } }),
+        json!({ "type": "content_block_stop", "index": 1 }),
+        json!({ "type": "message_delta", "delta": { "stop_reason": "tool_use" }, "usage": { "output_tokens": 8 } }),
+        json!({ "type": "message_stop" }),
+    ]);
+    let (base, _bodies) = spawn_model_server(vec![two_bash_calls, turn_text("done")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "run two commands",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--sequential-tools",
+            "--max-steps",
+            "4",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(marker_a.exists(), "the first bash call must still run");
+    assert!(marker_b.exists(), "the second bash call must still run");
+}
+
+#[test]
+fn run_binary_deny_tool_flag_blocks_the_named_tool_end_to_end() {
+    // Pi-parity Critical fix: `agent_core::AgentHooks`/`with_hooks` was fully built and tested but had
+    // zero call sites outside its own unit test — every real `run`/`serve` process built its `Agent`
+    // with the no-op `NoHooks`, so `bash`/`write`/`edit` ran completely unconstrained. Proves the real
+    // compiled binary, not just `ToolPolicy`'s own unit tests, actually blocks a denied tool: the marker
+    // file must never be created, and the model must see a policy-blocked `tool_result`, not the real
+    // command's output.
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("should-not-exist.txt");
+
+    let turn1 = turn_tool_use(
+        "toolu_1",
+        "bash",
+        &json!({ "command": format!("touch {}", marker.to_str().unwrap()) }).to_string(),
+    );
+    let turn2 = turn_text("done");
+    let (base, bodies) = spawn_model_server(vec![turn1, turn2]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "run a command",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--deny-tool",
+            "bash",
+            "--max-steps",
+            "4",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !marker.exists(),
+        "--deny-tool bash must block the call before it ever runs — the marker file must not exist"
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[1].contains("denied by policy"),
+        "the model must see a policy-blocked tool_result, not the real command's output: {}",
+        bodies[1]
+    );
+}
+
+#[test]
+fn run_binary_deny_bash_pattern_flag_blocks_matching_commands_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("should-not-exist.txt");
+
+    let turn1 = turn_tool_use(
+        "toolu_1",
+        "bash",
+        &json!({ "command": format!("touch {}", marker.to_str().unwrap()) }).to_string(),
+    );
+    let turn2 = turn_text("done");
+    let (base, bodies) = spawn_model_server(vec![turn1, turn2]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "run a command",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--deny-bash-pattern",
+            "TOUCH", // uppercase, proving the match is case-insensitive against the lowercase command
+            "--model",
+            "claude-test",
+            "--max-steps",
+            "4",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !marker.exists(),
+        "--deny-bash-pattern must block a matching command before it ever runs"
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[1].contains("blocked by policy"),
+        "the model must see a policy-blocked tool_result: {}",
+        bodies[1]
+    );
+}
+
+#[test]
+fn run_binary_ai_agent_exclude_tools_env_var_restricts_the_registry() {
+    // Pi-parity audit: `Run`'s `tools`/`exclude_tools` clap fields carried no `env = ...` attribute at
+    // all, unlike every other shared flag and unlike `serve`'s identical flags — a deployment
+    // convention setting `AI_AGENT_EXCLUDE_TOOLS` to sandbox an agent (e.g. a read-only reviewer) had
+    // silently no effect on `run` invocations specifically, a security-relevant gap, not just an
+    // inconsistency.
+    let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .env("AI_AGENT_EXCLUDE_TOOLS", "bash")
+        .args([
+            "run",
+            "hi",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        !bodies[0].contains("\"bash\""),
+        "AI_AGENT_EXCLUDE_TOOLS=bash must remove it from the request (tool defs or system prompt): {}",
+        bodies[0]
+    );
+    assert!(
+        bodies[0].contains("\"read\""),
+        "other tools must remain advertised: {}",
+        bodies[0]
+    );
+}
+
+#[test]
+fn run_binary_ai_agent_tools_env_var_restricts_the_registry_to_an_allow_list() {
+    let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .env("AI_AGENT_TOOLS", "read,write")
+        .args([
+            "run",
+            "hi",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[0].contains("\"read\"") && bodies[0].contains("\"write\""),
+        "the allow-listed tools must be advertised: {}",
+        bodies[0]
+    );
+    assert!(
+        !bodies[0].contains("\"bash\""),
+        "AI_AGENT_TOOLS=read,write must exclude everything outside the allow-list: {}",
+        bodies[0]
     );
 }

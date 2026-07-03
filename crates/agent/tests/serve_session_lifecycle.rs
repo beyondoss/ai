@@ -492,6 +492,78 @@ fn serve_exits_gracefully_on_sigterm_mid_run() {
 }
 
 #[test]
+#[cfg(unix)]
+fn serve_exits_gracefully_on_sighup_mid_run() {
+    use std::time::{Duration, Instant};
+
+    // Pi-parity fix: SIGHUP had no handler at all — its default disposition is the same immediate
+    // termination as an unhandled SIGTERM (a controlling terminal closing, e.g. a bare `serve`
+    // backgrounded without `nohup`/`setsid`, would kill the process outright, losing the in-flight
+    // turn and orphaning the sleeping child). Same fixture as `serve_exits_gracefully_on_sigterm_mid_run`
+    // — SIGHUP must behave identically: graceful drain, persist, exit on its own.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir
+        .path()
+        .join("session.json")
+        .to_string_lossy()
+        .into_owned();
+
+    let turn1 = turn_tool_use(
+        "toolu_b",
+        "bash",
+        &json!({ "command": "sleep 30" }).to_string(),
+    );
+    let (base, _bodies) = spawn_model_server(vec![turn1]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let pid = child.id();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "run a long sleep" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+
+    std::thread::sleep(Duration::from_millis(500));
+
+    let status = Command::new("kill")
+        .args(["-HUP", &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success(), "failed to send SIGHUP to serve");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let exit = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "serve did not exit within 10s of SIGHUP"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        exit.success(),
+        "serve should exit cleanly on SIGHUP, got {exit:?}"
+    );
+
+    let mut trailing = String::new();
+    let _ = stdout.read_to_string(&mut trailing);
+
+    let contents = std::fs::read_to_string(&session_file).unwrap();
+    assert!(
+        !contents.trim().is_empty(),
+        "nothing was persisted before SIGHUP shutdown"
+    );
+}
+
+#[test]
 fn serve_streams_events_and_reattaches() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("hello.txt"), "secret-marker-77\n").unwrap();
@@ -579,13 +651,21 @@ fn serve_streams_events_and_reattaches() {
 }
 
 #[test]
-fn serve_survives_a_hard_crash_mid_run_with_the_first_round_trip_already_durable() {
+fn serve_survives_a_hard_crash_mid_run_with_both_round_trips_tool_use_already_durable() {
     use std::time::Duration;
 
     // A genuine crash (SIGKILL — no signal handler, no graceful drain, nothing like the SIGTERM path
     // above) partway through a *second* tool round-trip must still leave the *first* round-trip's
     // messages durable on disk: proof that incremental mid-run persistence (H-6), not the final
     // post-run persist or the graceful-shutdown path, is what saved them.
+    //
+    // Pi-parity fix (H4): a checkpoint now fires the instant the assistant's own `tool_use` turn is
+    // committed, *before* that tool ever runs — not only after the matching `tool_result` lands. So the
+    // second round-trip's `tool_use` (id `toolu_2`, the still-running `sleep 5`) must ALSO already be
+    // durable by the time the crash hits, even though its `tool_result` never will be (the crash lands
+    // mid-execution, before dispatch completes) — this is the whole point of the fix: without it, a
+    // crash here would lose the record that the model ever asked for this call at all, even though nothing
+    // it did had a chance to take effect yet.
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
 
@@ -627,11 +707,17 @@ fn serve_survives_a_hard_crash_mid_run_with_the_first_round_trip_already_durable
     let dump = frames.last().unwrap()["data"]["messages"].to_string();
     assert!(
         dump.contains("round-one-marker"),
-        "the first tool round-trip must have been checkpointed before the crash: {dump}"
+        "the first tool round-trip's tool_result must have been checkpointed before the crash: {dump}"
     );
     assert!(
-        !dump.contains("toolu_2"),
-        "the second (interrupted) round-trip must not appear as a completed pair: {dump}"
+        dump.contains("toolu_2"),
+        "the second round-trip's tool_use (the assistant asking to run `sleep 5`) must already be \
+         durable before that tool ever runs, per the pre-dispatch checkpoint fix: {dump}"
+    );
+    assert!(
+        !dump.contains("\"tool_use_id\":\"toolu_2\""),
+        "but the second round-trip's tool_result must NOT be present — the crash landed mid-execution, \
+         before dispatch completed: {dump}"
     );
 }
 
@@ -1048,4 +1134,170 @@ fn serve_name_flag_sets_the_initial_session_title() {
 
     drop(stdin);
     child.wait().unwrap();
+}
+
+#[test]
+fn serve_session_id_flag_applies_to_a_brand_new_session_file() {
+    // Pi-parity fix: `run` already had `--session-id` (a caller-chosen, predictable id instead of a
+    // freshly generated one), but `serve` had no equivalent at all — the gap ran in the opposite
+    // direction from most `run`-vs-`serve` parity gaps this audit found.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![turn_text("hi")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file)
+        .args(["--session-id", "my-chosen-serve-id"])
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
+    stdin.flush().unwrap();
+    let state = read_until_response(&mut stdout, "get_state");
+    assert_eq!(
+        state.last().unwrap()["data"]["session_id"],
+        "my-chosen-serve-id",
+        "got: {state:#?}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+
+    let content = std::fs::read_to_string(&session_file).unwrap();
+    let header: Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+    assert_eq!(
+        header["id"], "my-chosen-serve-id",
+        "the chosen id must actually be what's persisted to disk"
+    );
+}
+
+#[test]
+fn serve_session_id_flag_applies_to_the_default_repo_mode_when_no_session_exists_yet_for_this_cwd()
+{
+    // The gap this fixes matters most here: `serve`'s default startup (no `--session-file`/
+    // `--session-dir` at all) is repo mode via `Persistence::open`'s fallback — the single most common
+    // way `serve` actually gets invoked, and previously the one place `--session-id` had no effect
+    // whatsoever since there was no flag to pass at all.
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let (base, _bodies) = spawn_model_server(vec![]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut cmd = serve_default_persistence_cmd(bin, &base);
+    cmd.current_dir(project.path())
+        .env("HOME", home.path())
+        .args(["--session-id", "my-chosen-repo-id"]);
+    let mut child = cmd.spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
+    stdin.flush().unwrap();
+    let state = read_until_response(&mut stdout, "get_state");
+    assert_eq!(
+        state.last().unwrap()["data"]["session_id"],
+        "my-chosen-repo-id",
+        "got: {state:#?}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_session_id_flag_is_ignored_when_reattaching_to_an_existing_session() {
+    // Matches `run`'s own documented contract: a caller-chosen id only ever applies when a *new*
+    // `SessionMeta` is minted — reattaching to an existing session (already has a fixed id from disk)
+    // must not be silently renamed out from under it.
+    let session_dir_tmp = tempfile::tempdir().unwrap();
+    let session_dir = session_dir_tmp.path().to_string_lossy().into_owned();
+    let project = tempfile::tempdir().unwrap();
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+
+    // First process: no `--session-id` — mints a fresh, freshly-generated id for this cwd.
+    let existing_id = {
+        let (base, _bodies) = spawn_model_server(vec![turn_text("first")]);
+        let mut cmd = serve_dir_cmd(bin, &base, &session_dir);
+        cmd.current_dir(project.path());
+        let mut child = cmd.spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
+        stdin.flush().unwrap();
+        let state = read_until_response(&mut stdout, "get_state");
+        let id = state.last().unwrap()["data"]["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        drop(stdin);
+        child.wait().unwrap();
+        id
+    };
+
+    // Second process, same cwd/session-dir, now with `--session-id` — must reattach to the same
+    // existing session rather than minting (or renaming to) the given id.
+    let (base, _bodies) = spawn_model_server(vec![turn_text("second")]);
+    let mut cmd = serve_dir_cmd(bin, &base, &session_dir);
+    cmd.current_dir(project.path())
+        .args(["--session-id", "should-be-ignored"]);
+    let mut child = cmd.spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
+    stdin.flush().unwrap();
+    let state = read_until_response(&mut stdout, "get_state");
+    assert_eq!(
+        state.last().unwrap()["data"]["session_id"],
+        existing_id,
+        "reattaching to an existing session must keep its own id, not the --session-id argument"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_rejects_a_path_traversal_session_id_and_persists_nothing() {
+    // Same filesystem-path-injection concern as `run`'s identical, already-tested check
+    // (`run_binary_rejects_a_path_traversal_session_id_and_persists_nothing`) — `--session-id` is
+    // embedded directly into a filename with no other sanitization.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl");
+    let (base, _bodies) = spawn_model_server(vec![]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = Command::new(bin)
+        .args([
+            "serve",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--session-file",
+            session_file.to_str().unwrap(),
+            "--session-id",
+            "../../../tmp/pwned/evil",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "a path-traversal --session-id must fail serve at startup"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--session-id"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !session_file.exists(),
+        "nothing must be persisted when --session-id is rejected"
+    );
 }

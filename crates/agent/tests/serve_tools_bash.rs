@@ -6,7 +6,7 @@ mod common;
 use std::io::{BufReader, Read, Write};
 use std::process::Stdio;
 
-use common::{read_until_response, serve_cmd, spawn_model_server, turn_text, turn_tool_use};
+use common::{read_until_response, serve_cmd, spawn_model_server, sse, turn_text, turn_tool_use};
 use serde_json::json;
 
 #[test]
@@ -315,6 +315,90 @@ fn serve_bash_shell_path_overrides_the_auto_resolved_shell() {
 }
 
 #[test]
+fn serve_bash_command_prefix_flag_runs_before_the_given_command() {
+    // Pi-parity fix: `Bash::with_command_prefix` (pi's own `shellCommandPrefix` setting) was fully
+    // built and tested at the tool level but had zero call sites reachable from either binary.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut cmd = serve_cmd(bin, &base, &session_file);
+    cmd.args(["--bash-command-prefix", "export PREFIX_VAR=from-prefix"]);
+    let mut child = cmd.spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "bash", "command": "echo $PREFIX_VAR" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "bash");
+    drop(stdin);
+    child.wait().unwrap();
+
+    let resp = frames.last().unwrap();
+    assert_eq!(resp["success"], true, "frames: {frames:#?}");
+    assert_eq!(
+        resp["data"]["result"], "from-prefix\n",
+        "the prefix must run before the command, in the same shell invocation: {frames:#?}"
+    );
+}
+
+#[test]
+fn serve_sequential_tools_flag_is_accepted_and_both_calls_still_run() {
+    // Pi-parity fix: `agent_core::Agent` had no way to force fully-sequential tool dispatch at all —
+    // see `agent_core::agent::tests::with_sequential_tools_forces_one_group_in_flight_at_a_time` for the
+    // mechanism itself (proven there with a non-exclusive counting tool, since `bash` is already
+    // `conservative_exclusive` and so always serializes regardless of this flag). This is the `serve`
+    // wiring smoke test: `--sequential-tools` parses, reaches `build_agent`'s
+    // `Agent::with_sequential_tools`, and a turn batching two independent `bash` calls still dispatches
+    // both correctly instead of the flag silently breaking multi-call turns.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let marker_a = dir.path().join("a.txt");
+    let marker_b = dir.path().join("b.txt");
+
+    let two_bash_calls = sse(&[
+        json!({ "type": "message_start", "message": { "usage": { "input_tokens": 10, "output_tokens": 1 } } }),
+        json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "tool_use", "id": "toolu_a", "name": "bash", "input": {} } }),
+        json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "input_json_delta", "partial_json": json!({ "command": format!("touch {}", marker_a.to_str().unwrap()) }).to_string() } }),
+        json!({ "type": "content_block_stop", "index": 0 }),
+        json!({ "type": "content_block_start", "index": 1, "content_block": { "type": "tool_use", "id": "toolu_b", "name": "bash", "input": {} } }),
+        json!({ "type": "content_block_delta", "index": 1, "delta": { "type": "input_json_delta", "partial_json": json!({ "command": format!("touch {}", marker_b.to_str().unwrap()) }).to_string() } }),
+        json!({ "type": "content_block_stop", "index": 1 }),
+        json!({ "type": "message_delta", "delta": { "stop_reason": "tool_use" }, "usage": { "output_tokens": 8 } }),
+        json!({ "type": "message_stop" }),
+    ]);
+    let (base, _bodies) = spawn_model_server(vec![two_bash_calls, turn_text("done")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut cmd = serve_cmd(bin, &base, &session_file);
+    cmd.args(["--sequential-tools"]);
+    let mut child = cmd.spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "run two commands" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "prompt");
+    drop(stdin);
+    child.wait().unwrap();
+
+    let resp = frames.last().unwrap();
+    assert_eq!(resp["success"], true, "frames: {frames:#?}");
+    assert!(marker_a.exists(), "the first bash call must still run");
+    assert!(marker_b.exists(), "the second bash call must still run");
+}
+
+#[test]
 fn serve_fails_fast_when_bash_shell_path_does_not_exist() {
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
@@ -382,4 +466,116 @@ fn serve_abort_bash_cancels_a_running_host_command() {
         resp["data"]["is_error"], true,
         "a cancelled command must be reported as an error result: {frames:#?}"
     );
+}
+
+#[test]
+fn serve_abort_bash_returns_the_partial_output_streamed_before_cancellation() {
+    // Pi-parity: pi's `bash-executor.ts` returns whatever output already streamed when a command is
+    // cancelled (`BashResult { output, cancelled: true, .. }`), not a bare "cancelled" placeholder.
+    // Previously `abort_bash`'s result discarded every `ToolProgress` snapshot that had already been
+    // forwarded to the client, replacing it with the literal string "cancelled".
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    let cmd = "printf 'partial-output-line\\n'; sleep 30";
+    writeln!(stdin, "{}", json!({ "type": "bash", "command": cmd })).unwrap();
+    stdin.flush().unwrap();
+    // Give the printed output time to cross the `UPDATE_THROTTLE` (100ms) into at least one streamed
+    // `tool_progress` snapshot before cancelling.
+    std::thread::sleep(Duration::from_millis(300));
+    writeln!(stdin, "{}", json!({ "type": "abort_bash" })).unwrap();
+    stdin.flush().unwrap();
+
+    let start = Instant::now();
+    let frames = read_until_response(&mut stdout, "bash");
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "abort_bash should cancel promptly, not wait out the full sleep"
+    );
+    drop(stdin);
+    child.wait().unwrap();
+
+    assert!(
+        frames
+            .iter()
+            .any(|f| f["type"] == "event" && f["event"]["kind"] == "tool_progress"),
+        "the command must have streamed at least one progress snapshot before cancellation: {frames:#?}"
+    );
+    let resp = frames.last().unwrap();
+    assert_eq!(
+        resp["data"]["is_error"], true,
+        "a cancelled command must be reported as an error result: {frames:#?}"
+    );
+    let result_text = resp["data"]["result"].as_str().unwrap();
+    assert!(
+        result_text.contains("partial-output-line"),
+        "cancellation must preserve output that already streamed, not discard it: {result_text:?}"
+    );
+    assert!(
+        result_text.to_lowercase().contains("cancel"),
+        "cancellation result should still say it was cancelled: {result_text:?}"
+    );
+}
+
+#[test]
+fn serve_deny_tool_flag_blocks_a_model_invoked_call_end_to_end() {
+    // Pi-parity Critical fix: `agent_core::AgentHooks`/`with_hooks` was fully built and tested but had
+    // zero call sites outside its own unit test — every real `serve` process built its `Agent` with
+    // the no-op `NoHooks`. Proves the real compiled binary blocks a denied tool over the actual NDJSON
+    // protocol, not just in isolated unit tests.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let marker = dir.path().join("should-not-exist.txt");
+
+    let (base, _bodies) = spawn_model_server(vec![
+        turn_tool_use(
+            "toolu_d",
+            "bash",
+            &json!({ "command": format!("touch {}", marker.to_str().unwrap()) }).to_string(),
+        ),
+        turn_text("done"),
+    ]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file)
+        .args(["--deny-tool", "bash"])
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "run it" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "prompt");
+    drop(stdin);
+    child.wait().unwrap();
+
+    assert!(
+        !marker.exists(),
+        "--deny-tool bash must block the call before it ever runs"
+    );
+    let tool_end = frames
+        .iter()
+        .find(|f| f["type"] == "event" && f["event"]["kind"] == "tool_end")
+        .expect("a tool_end event must still fire for a blocked call");
+    assert!(
+        tool_end["event"]["result"]
+            .as_str()
+            .unwrap()
+            .contains("denied by policy"),
+        "the blocked call's result must explain it was policy-denied: {tool_end:#?}"
+    );
+    assert_eq!(tool_end["event"]["is_error"], true);
 }

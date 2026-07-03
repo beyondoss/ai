@@ -69,6 +69,18 @@ pub fn turn_text(text: &str) -> String {
     ])
 }
 
+/// An OpenAI **Responses** dialect SSE turn that emits text and completes — the `gpt-4o` counterpart
+/// to `turn_text`'s Anthropic shape, for tests that need to inspect a Responses-dialect-only wire
+/// field (e.g. `prompt_cache_key`, which Anthropic's dialect never sends).
+pub fn turn_text_responses(text: &str) -> String {
+    sse(&[
+        json!({ "type": "response.output_item.added", "output_index": 0, "item": { "type": "message", "id": "msg_1" } }),
+        json!({ "type": "response.output_text.delta", "output_index": 0, "delta": text }),
+        json!({ "type": "response.output_item.done", "output_index": 0, "item": { "type": "message", "id": "msg_1", "phase": "final_answer", "content": [{ "type": "output_text", "text": text }] } }),
+        json!({ "type": "response.completed", "response": { "status": "completed", "usage": { "input_tokens": 1, "output_tokens": 1 } } }),
+    ])
+}
+
 /// An Anthropic SSE turn that ends with `stop_reason: "refusal"` — a distinct terminal condition from
 /// a normal end-of-turn (see `agent_core::agent::Agent::run_events_steered`).
 pub fn turn_refusal(text: &str) -> String {

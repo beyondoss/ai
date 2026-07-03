@@ -9,11 +9,14 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod export;
+pub(crate) mod path_utils;
+pub mod policy;
 pub mod prompts;
 pub mod resources;
 pub mod retry;
 pub mod serve;
 pub mod session_store;
+pub mod settings;
 pub mod skills;
 pub mod timing;
 pub mod tools;

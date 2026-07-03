@@ -90,6 +90,12 @@ impl RealRunner {
     ) -> std::io::Result<ExecResult> {
         let mut cmd = tokio::process::Command::new(program);
         cmd.args(args)
+            // Closed, not inherited: a model-run command has no business reading the agent process's
+            // real stdin (a shared terminal in `run`, or `serve`'s NDJSON control pipe). Without this,
+            // a command that tries to read stdin (bare `cat`, `read`, a prompt left off `-y`) blocks
+            // forever waiting for input that will never come, instead of seeing immediate EOF — matches
+            // pi's own `spawn(..., { stdio: ["ignore", "pipe", "pipe"] })`.
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -381,6 +387,22 @@ async fn kill_process_group(pgid: u32) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn spawned_commands_see_stdin_already_closed_not_the_real_terminal() {
+        // Pi-parity audit H1: a model-run command must never inherit the agent process's real stdin —
+        // `serve`'s NDJSON control pipe or an interactive `run`'s terminal. `cat` with no args reads
+        // stdin until EOF; if stdin were inherited (and this test's own harness stdin stays open) it
+        // would hang until the timeout fired. With stdin closed, `cat` sees immediate EOF and exits
+        // clean well within the generous timeout below.
+        let res = RealRunner
+            .run("cat", &[], None, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(res.code, Some(0), "got: {res:?}");
+        assert!(!res.timed_out, "cat blocked on stdin instead of seeing EOF");
+        assert_eq!(res.stdout, "");
+    }
 
     #[tokio::test]
     async fn timeout_kills_backgrounded_grandchildren() {

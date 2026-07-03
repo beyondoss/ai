@@ -272,6 +272,19 @@ impl Message {
         self
     }
 
+    /// Stamp `error_message` on an assistant turn that otherwise carries *real* content — unlike
+    /// [`Message::error`] (a bare closing record for a run with no response at all), this is for a
+    /// mid-stream transport failure that struck after genuine content had already streamed: pi's
+    /// `anthropic-messages.ts`/`openai-completions.ts` keep whatever text/thinking/tool-call blocks
+    /// arrived before the failure, tagging the turn with the error rather than discarding them (the
+    /// same treatment its `"aborted"` sibling gets from [`with_aborted`](Self::with_aborted)). Not
+    /// replayed on the wire either way — `ensure_non_empty_content`/`transform-messages.ts`'s filtering
+    /// only cares about the error/aborted markers, not which one is set.
+    pub fn with_error(mut self, message: impl Into<String>) -> Self {
+        self.error_message = Some(message.into());
+        self
+    }
+
     /// The `ToolUse` blocks in this message, if any (what the loop dispatches each step).
     pub fn tool_uses(&self) -> impl Iterator<Item = (&str, &str, &Value)> {
         self.content.iter().filter_map(|b| match b {

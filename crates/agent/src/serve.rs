@@ -24,6 +24,11 @@
 //!   - `{type:"stop_after_turn"}`        request a graceful stop at the next turn boundary — the
 //!     current turn's tool calls (if any) still finish and their results are committed, unlike
 //!     `abort`. A no-op ack when no `prompt` is in flight (never affects a *future* prompt).
+//!   - `{type:"switch_model", model, thinking?}` retarget the *in-flight* `prompt` — pi's own
+//!     `prepareNextTurn`: unlike `set_model` (only takes effect on the next `prompt`), this changes
+//!     what every subsequent turn of the *current* run targets, without stopping and restarting it.
+//!     Applied at the next turn boundary; the turn already in flight when this arrives is unaffected.
+//!     A no-op ack (pointing the client at `set_model` instead) when no `prompt` is in flight.
 //!   - `{type:"get_state"}`              → `data: {session_id, model, steps, message_count, title,
 //!     thinking_level, auto_compaction, auto_retry, steering_mode, follow_up_mode, pending_messages, …}`
 //!     — the last six are the runtime-mutable settings and current steer/follow-up queue depth
@@ -37,15 +42,19 @@
 //!     (repo mode: `parent` is `parent_session` when given, else whatever session id was active
 //!     immediately before this call — pi's own `parentSession` lineage marker, provenance only, not a
 //!     fork; `null` in single-file/in-memory mode, where there's no *new* id to link)
-//!   - `{type:"list_sessions"}`          (repo mode) → `data: {sessions: [SessionMeta + updated_at/
+//!   - `{type:"list_sessions", query?}`  (repo mode) → `data: {sessions: [SessionMeta + updated_at/
 //!     message_count/preview/search_text…]}` (via `SessionMeta::to_listing_json` — those four fields are
 //!     `#[serde(skip)]` on the struct itself), this project's sessions only (matched by the default
-//!     per-cwd directory, or whatever `--session-dir` points at). The underlying scan
+//!     per-cwd directory, or whatever `--session-dir` points at). An optional `query` string filters and
+//!     ranks the result (`session_store::search_sessions` — case-insensitive substring match against
+//!     `title`/`id`/`preview`/`cwd`/`search_text`, in that priority order); omitted (or blank) returns
+//!     every session, recency-sorted, unchanged from before this existed. The underlying scan
 //!     (`SessionRepo::list_with_progress`) runs across a small worker pool rather than one file at a
 //!     time, and streams `list_progress` frames while it's in flight.
-//!   - `{type:"list_all_sessions"}`      (repo mode) → same shape and same `list_progress` streaming as
-//!     `list_sessions`, across every project's own session directory, not just this one's — each entry's
-//!     own `cwd` field says which project it belongs to (pi's cross-project `listAll`)
+//!   - `{type:"list_all_sessions", query?}` (repo mode) → same shape, same `query` handling, and same
+//!     `list_progress` streaming as `list_sessions`, across every project's own session directory, not
+//!     just this one's — each entry's own `cwd` field says which project it belongs to (pi's
+//!     cross-project `listAll`)
 //!   - `{type:"switch_session", session_id}` (repo mode) load another session
 //!   - `{type:"delete_session", session_id}` (repo mode) soft-delete another session (moved to
 //!     `.trash`, not the currently active one — see `Persistence::delete`'s doc comment); idempotent
@@ -57,12 +66,31 @@
 //!     full, at its current tip. pi's own `clone`: a thin, argument-free alias, not a separate code
 //!     path (pi needs it because pi's own `fork` requires an explicit entry id; this crate's `fork`
 //!     already defaults to the same behavior when called bare).
-//!   - `{type:"get_fork_messages", session_id?, upto?, target_id?, before?}` (repo mode) preview what
-//!     `fork` would produce — no new session, no switch
+//!   - `{type:"get_fork_messages"}` list this session's own candidate fork points — every user-turn
+//!     entry on the active path, `{entry_id, text}` — matching pi's own same-named command (which takes
+//!     no parameters and is scoped to the current session only); feed one `entry_id` to `fork`'s
+//!     `target_id` to actually fork there. Not a preview of `fork`'s output — see `preview_fork` for
+//!     that (this crate's own extension, previously misnamed `get_fork_messages`, which broke a
+//!     pi-compatible client expecting the shape above)
+//!   - `{type:"preview_fork", session_id?, upto?, target_id?, before?}` (repo mode) preview what `fork`
+//!     would produce for *any* session at an arbitrary point — no new session, no switch
 //!   - `{type:"set_session_name", title}` set the session's title → `data: {title}` (the final,
 //!     sanitized value — see `session_store::sanitize_title` — `null` if it sanitized to empty); also
 //!     pushes an unsolicited `session_info_changed` frame carrying the same `title`, so a client doesn't
 //!     need a follow-up `get_state` to learn what was actually recorded (pi's own `session_info_changed`)
+//!   - `{type:"set_label", target_id, label?}` set (or, with `label` omitted/`null`, clear) a
+//!     user-defined bookmark on any tree entry (not just the active tip) → `data: {target_id, label}`;
+//!     an error when `target_id` names no known entry, or persistence isn't configured (there's no tree
+//!     to label at all in pure in-memory mode) — `SessionStore::set_label`, fully built but previously
+//!     unreachable from any RPC command
+//!   - `{type:"get_label", target_id}`   the label currently set on `target_id`, if any → `data:
+//!     {target_id, label}` (`label: null` if never labeled or last cleared); same persistence-required
+//!     error as `set_label`
+//!   - `{type:"append_custom", kind, data?}` append an opaque, caller-defined entry as a child of the
+//!     active tip and advance the tip to it → `data: {id}` (the new entry's id); `data` defaults to `{}`
+//!     when omitted, `kind` identifies the shape of `data` to whatever produced it (this crate never
+//!     interprets either) — `SessionStore::append_custom`, fully built and tested but previously
+//!     unreachable from any RPC command; same persistence-required error as `set_label`
 //!   - `{type:"export_html", output_path?}` render the active session's transcript as a single
 //!     self-contained HTML file → `data: {path}`. `output_path` defaults to a timestamped
 //!     `session-<unix-seconds>.html` in the current directory; parent directories are created as
@@ -75,11 +103,15 @@
 //!   - `{type:"reload"}`                 re-run project-instruction/skill/prompt-template discovery and
 //!     re-check trust, refreshing the static half of the system prompt (the cheap date/cwd footer is
 //!     already refreshed every turn regardless)
-//!   - `{type:"set_model", model}`       switch the model for subsequent prompts → `data: {model}`.
-//!     `model` is trimmed and rejected if empty/whitespace-only — the one mistake this process can
-//!     catch on its own; an unrecognized-but-well-formed id is *not* rejected (every id is forwarded
-//!     verbatim through the gateway, with no local registry here to validate a real one against —
-//!     `available_models()` is a non-exhaustive picker hint, not an allowlist)
+//!   - `{type:"set_model", model}`       switch the model for subsequent prompts → `data:` the same
+//!     capability shape `get_available_models`' own entries carry (`model`, `provider`,
+//!     `context_window`, `max_output`, `reasoning`, `supports_vision`), plus `reasoning_effort` — so a
+//!     client learns the new model's capabilities without a separate round trip; `cycle_model` below
+//!     carries the identical shape (plus its own `scoped`). `model` is trimmed and rejected if
+//!     empty/whitespace-only — the one mistake this process can catch on its own; an
+//!     unrecognized-but-well-formed id is *not* rejected (every id is forwarded verbatim through the
+//!     gateway, with no local registry here to validate a real one against — `available_models()` is a
+//!     non-exhaustive picker hint, not an allowlist)
 //!   - `{type:"set_thinking", budget}`   set/clear an explicit raw thinking-budget override (integer,
 //!     or `null` to disable it and defer back to the portable level below) → `data: {thinking}`
 //!   - `{type:"set_reasoning_effort", effort}` set the portable thinking-depth level directly — one of
@@ -122,17 +154,21 @@
 //!     already consults (pi's own structured `Model<any>`, minus pricing — gateway-owned, out of scope
 //!     here)
 //!   - `{type:"list_branches"}`          → `data: {branches: [BranchInfo…]}` (the session's *leaves*)
-//!   - `{type:"get_tree"}`               → `data: {nodes: [TreeNode…]}` (every message on every
-//!     branch, not just the leaves `list_branches` reports)
-//!   - `{type:"switch_branch", target_id, summarize?, custom_instructions?}` navigate to another point
-//!     in the tree, summarizing the abandoned branch's activity first unless `summarize:false` (an
-//!     optional `custom_instructions` string steers what that recap emphasizes, the same "Additional
-//!     focus" framing `compact`'s own `custom_instructions` supports; ignored when `summarize:false`,
-//!     since no summarization call happens at all) → `data: {target_id, model, reasoning_effort}` —
-//!     also restores whichever model/thinking-level was actually active at
-//!     `target_id` (a `set_model`/`cycle_model`/`set_reasoning_effort`/`cycle_thinking_level` made
-//!     *after* leaving that point doesn't leak backward into it), rebuilding the `Agent` if either
-//!     differs from what's currently active
+//!   - `{type:"get_tree"}`               → `data: {nodes: [TreeNode…], leaf_id}` (every message on
+//!     every branch, not just the leaves `list_branches` reports; `leaf_id` is the active path's own
+//!     tip — `null` in pure in-memory mode — pi's own `get_tree`'s `leafId`)
+//!   - `{type:"switch_branch", target_id, before?, summarize?, custom_instructions?}` navigate to
+//!     another point in the tree — or, when `before:true`, to `target_id`'s own *parent* instead,
+//!     which is the tree's own root (before any message) when `target_id` is the very first message,
+//!     letting a client redo it in place (pi's own `SessionManager::resetLeaf`) — summarizing the
+//!     abandoned branch's activity first unless `summarize:false` (an optional `custom_instructions`
+//!     string steers what that recap emphasizes, the same "Additional focus" framing `compact`'s own
+//!     `custom_instructions` supports; ignored when `summarize:false`, since no summarization call
+//!     happens at all) → `data: {target_id, model, reasoning_effort}` — also restores whichever
+//!     model/thinking-level was actually active at wherever the session actually landed (a
+//!     `set_model`/`cycle_model`/`set_reasoning_effort`/`cycle_thinking_level` made *after* leaving
+//!     that point doesn't leak backward into it), rebuilding the `Agent` if either differs from what's
+//!     currently active
 //!   - `{type:"bash", command, cwd?, timeout_ms?, exclude_from_context?}` run a shell command directly
 //!     — independent of the model's own tool-call loop — streaming `tool_progress`/`tool_end` events
 //!     exactly like a model-invoked `bash` call. Recorded into the session as a plain informational
@@ -201,6 +237,7 @@ use tokio::sync::mpsc;
 
 use crate::session_store::{
     BranchInfo, BranchSummaryDetails, CompactionMeta, SessionMeta, SessionRepo, SessionStore,
+    search_sessions,
 };
 use crate::tools;
 
@@ -222,6 +259,13 @@ pub struct ServeConfig {
     /// Persist many sessions under this directory (a [`SessionRepo`]). Enables the multi-session
     /// commands (`list_sessions`, `switch_session`, `fork`, `set_session_name`).
     pub session_dir: Option<String>,
+    /// Use this exact session id instead of a freshly generated one, wherever a *new* `SessionMeta` is
+    /// actually minted by [`Persistence::open`] — already-validated by `main.rs` (embedded directly into
+    /// a persisted filename, so it must be sanitized before it ever reaches here). Matches `run`'s
+    /// identical `--session-id` flag/contract: ignored when reattaching to an existing session (already
+    /// has a fixed id from disk), whether that's an existing `session_file` or a repo-mode match on the
+    /// current `cwd`.
+    pub session_id: Option<String>,
     /// Skip persistence entirely, even though neither `session_file` nor `session_dir` was set —
     /// without this, `Persistence::open` defaults to a per-cwd directory under
     /// `~/.claude/sessions/<encoded-cwd>/` rather than silently running in-memory-only (an operator
@@ -234,6 +278,13 @@ pub struct ServeConfig {
     /// to a model with a different real window (via `set_model`) gets that model's true budget instead
     /// of a stale operator-supplied number. `Some` pins a fixed budget that survives model switches.
     pub context_window: Option<u32>,
+    /// The per-turn output token ceiling (`Agent::with_max_tokens`). `None` defers to `Agent::new`'s
+    /// own model-aware default (the model's own capability-table `max_output`, floored at
+    /// `DEFAULT_MAX_TOKENS`) — matches `context_window`'s own "unset means model-derived" convention.
+    /// Re-applied on every `build_agent` rebuild (`set_model`/`set_thinking`/…), same as every other
+    /// `cfg`-sourced override, so it survives a model switch rather than resetting to that new model's
+    /// own default.
+    pub max_tokens: Option<u32>,
     /// Use the 1-hour prompt-cache TTL (vs the default 5 minutes) — useful when turns are spaced out.
     pub cache_long: bool,
     /// Extended-thinking token budget, when enabled (`None` leaves thinking off). Must be below the
@@ -243,6 +294,10 @@ pub struct ServeConfig {
     /// reasoning models, Anthropic adaptive-thinking models). `None` leaves the provider default.
     /// Fixed for the process — unlike `thinking`, there's no `set_reasoning_effort` RPC command.
     pub reasoning_effort: Option<agent_core::ReasoningEffort>,
+    /// Sampling temperature. `None` leaves the provider default. Fixed for the process — no RPC
+    /// command to change it mid-run. See `agent_core::ModelRequest::temperature`'s doc comment for
+    /// per-dialect gating (Anthropic omits it while thinking is enabled).
+    pub temperature: Option<f64>,
     /// Trust the working directory for this run only, so a project-local `.claude/SYSTEM.md` is
     /// honored even if the directory isn't in the persisted allowlist (`agent trust <path>`). See
     /// `crate::trust_store`.
@@ -273,6 +328,9 @@ pub struct ServeConfig {
     /// `--bash-shell-path` in `main.rs`) — `build_tools` trusts it rather than re-checking on every
     /// rebuild.
     pub bash_shell_path: Option<String>,
+    /// Prepend this line to every `bash` command, in the same shell invocation — matches pi's own
+    /// `shellCommandPrefix` setting. Fixed for the process, like `bash_shell_path`.
+    pub bash_command_prefix: Option<String>,
     /// Restrict the tool set to exactly these names, dropping everything else. Combine with
     /// `exclude_tools` to carve one back out of the allow-list. Fixed for the process — like `system`,
     /// there's no runtime RPC to change it, but it does survive a `set_model`/`set_thinking` rebuild
@@ -282,6 +340,19 @@ pub struct ServeConfig {
     pub exclude_tools: Option<Vec<String>>,
     /// Register no tools at all. Wins over `tools`/`exclude_tools`.
     pub no_tools: bool,
+    /// Force every batch of tool calls in a turn to run one at a time instead of the default
+    /// bounded-concurrent dispatch (`agent_core::Agent::with_sequential_tools`). Fixed for the process,
+    /// like `tools`/`no_tools` — `build_agent` reapplies it every rebuild.
+    pub sequential_tools: bool,
+    /// Block every call to a tool named here, even though it stays registered/visible to the model —
+    /// unlike `exclude_tools` (the model never learns it exists), a denied call still surfaces as a
+    /// normal error `tool_result` explaining it was blocked by policy. Installs an `AgentHooks` gate
+    /// (`crate::policy::ToolPolicy`) on every `build_agent` rebuild; empty means no hook at all (the
+    /// `NoHooks` default), same zero-cost as before this flag existed.
+    pub deny_tool: Vec<String>,
+    /// Block a `bash` call whenever its command contains this substring, case-insensitively. Combines
+    /// with `deny_tool` under the same policy hook.
+    pub deny_bash_pattern: Vec<String>,
     /// Disable *standard-root* skills discovery/loading (`~/.claude/skills`, `<cwd>/.claude/skills`) —
     /// no `<available_skills>` listing in the system prompt from either, and a `/skill:name` invocation
     /// is sent through unexpanded unless it resolves against a `--skill` path instead. Matches pi's own
@@ -322,23 +393,32 @@ pub struct ServeConfig {
     pub models: Vec<String>,
 }
 
-/// Waits for an OS shutdown request (SIGTERM, or SIGINT/Ctrl-C) so `serve` can drain in-flight work
-/// and persist before exiting — the same graceful-shutdown path stdin closing already takes (cancel
-/// the run, persist, break), just with the process's terminate signal as a second trigger. Without
-/// this, a `systemctl restart`/`docker stop`/pod eviction mid-turn hits Rust's default disposition —
-/// immediate termination, no destructors run — losing that turn's unpersisted messages and orphaning
-/// any backgrounded child process `exec`'s `kill_on_drop` cleanup depends on `Drop` running to reap.
-struct ShutdownSignal {
+/// Waits for an OS shutdown request (SIGTERM, SIGHUP, or SIGINT/Ctrl-C) so `serve` (and `run` — see
+/// `main.rs::run_task`, which reuses this same type) can drain in-flight work and persist before
+/// exiting — the same graceful-shutdown path stdin closing already takes for `serve` (cancel the run,
+/// persist, break), just with the process's terminate/hangup signals as additional triggers. Without
+/// this, a `systemctl restart`/`docker stop`/pod eviction mid-turn (or a plain Ctrl-C on a `run`) hits
+/// Rust's default disposition — immediate termination, no destructors run — losing that turn's
+/// unpersisted messages and orphaning any backgrounded child process `exec`'s `kill_on_drop` cleanup
+/// depends on `Drop` running to reap. SIGHUP's own default disposition is the same immediate
+/// termination — a controlling terminal closing (a bare `serve` backgrounded without `nohup`/`setsid`)
+/// would otherwise kill the process outright, same failure mode as an unhandled SIGTERM. Matches pi's
+/// own `rpc-mode.ts`, which treats SIGHUP identically to SIGTERM (graceful shutdown, not a reload
+/// trigger — unlike this crate's own `reload` RPC command, which is unrelated and client-driven).
+pub struct ShutdownSignal {
     #[cfg(unix)]
     sigterm: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    sighup: tokio::signal::unix::Signal,
 }
 
 impl ShutdownSignal {
-    fn new() -> std::io::Result<Self> {
+    pub fn new() -> std::io::Result<Self> {
         #[cfg(unix)]
         {
             Ok(Self {
                 sigterm: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+                sighup: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?,
             })
         }
         #[cfg(not(unix))]
@@ -347,13 +427,14 @@ impl ShutdownSignal {
         }
     }
 
-    /// Resolves once a shutdown signal arrives. Safe to call fresh on every loop iteration — both
+    /// Resolves once a shutdown signal arrives. Safe to call fresh on every loop iteration — every
     /// `Signal::recv` and `tokio::signal::ctrl_c` are re-armable, not one-shot.
-    async fn wait(&mut self) {
+    pub async fn wait(&mut self) {
         #[cfg(unix)]
         {
             tokio::select! {
                 _ = self.sigterm.recv() => {}
+                _ = self.sighup.recv() => {}
                 _ = tokio::signal::ctrl_c() => {}
             }
         }
@@ -427,6 +508,15 @@ impl agent_core::CheckpointHook for ChannelCheckpoint {
     }
 }
 
+/// Mint a brand-new `SessionMeta`, using `session_id` in place of a freshly generated one when given
+/// (`ServeConfig::session_id`, already validated by `main.rs` before this is ever called).
+fn fresh_meta(cwd: &str, model: &str, session_id: Option<&str>) -> SessionMeta {
+    match session_id {
+        Some(id) => SessionMeta::with_id(id.to_string(), cwd, model),
+        None => SessionMeta::new(cwd, model),
+    }
+}
+
 /// Where the server persists sessions: a multi-session [`SessionRepo`] (`--session-dir`), a single
 /// JSONL file (`--session-file`), or nowhere (in-memory). It always carries the current session's
 /// [`SessionMeta`] so the session id is stable across reattaches.
@@ -444,7 +534,7 @@ impl Persistence {
             .to_string_lossy()
             .into_owned();
         if let Some(dir) = &cfg.session_dir {
-            return Self::open_repo(dir, &cwd, &cfg.model);
+            return Self::open_repo(dir, &cwd, &cfg.model, cfg.session_id.as_deref());
         }
         if let Some(path) = &cfg.session_file {
             let path = std::path::PathBuf::from(path);
@@ -455,7 +545,8 @@ impl Persistence {
             let (store, session) = if has_content {
                 SessionStore::open(path)?
             } else {
-                let store = SessionStore::create(path, SessionMeta::new(&cwd, &cfg.model))?;
+                let meta = fresh_meta(&cwd, &cfg.model, cfg.session_id.as_deref());
+                let store = SessionStore::create(path, meta)?;
                 (store, Session::new())
             };
             let meta = store.meta().clone();
@@ -473,7 +564,7 @@ impl Persistence {
                 Self {
                     repo: None,
                     store: None,
-                    meta: SessionMeta::new(&cwd, &cfg.model),
+                    meta: fresh_meta(&cwd, &cfg.model, cfg.session_id.as_deref()),
                 },
                 Session::new(),
             ));
@@ -485,6 +576,7 @@ impl Persistence {
             crate::session_store::default_session_dir(&cwd),
             &cwd,
             &cfg.model,
+            cfg.session_id.as_deref(),
         )
     }
 
@@ -492,14 +584,16 @@ impl Persistence {
     /// whose recorded cwd matches `cwd` — not just the globally newest one, so a shared `--session-dir`
     /// spanning multiple projects (or the shared default directory before cwd-encoding existed) doesn't
     /// resume a stranger's unrelated session. No match (a fresh directory, or one with no session for
-    /// this cwd yet) creates a new one.
+    /// this cwd yet) creates a new one, using `session_id` in place of a freshly generated one when
+    /// given (see `ServeConfig::session_id`'s doc comment).
     fn open_repo(
         dir: impl Into<std::path::PathBuf>,
         cwd: &str,
         model: &str,
+        session_id: Option<&str>,
     ) -> std::io::Result<(Self, Session)> {
         let repo = SessionRepo::open(dir)?;
-        let (store, session) = repo.resume_or_create(cwd, model)?;
+        let (store, session) = repo.resume_or_create(cwd, model, session_id)?;
         let meta = store.meta().clone();
         Ok((
             Self {
@@ -734,6 +828,50 @@ impl Persistence {
         Ok(())
     }
 
+    /// Set (`label: Some`) or clear (`label: None`) a bookmark on `target_id` — see
+    /// `SessionStore::set_label`. Unlike `set_title` (meaningful even without persistence, since
+    /// `self.meta` always exists), a label only makes sense against a persisted tree entry, so this
+    /// errors rather than silently no-oping when persistence isn't configured — the same contract
+    /// `switch_branch` already uses for a `target_id`-based command.
+    fn set_label(&mut self, target_id: &str, label: Option<&str>) -> std::io::Result<()> {
+        let store = self.store.as_mut().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "no session persistence configured (start serve with --session-file or --session-dir)",
+            )
+        })?;
+        store.set_label(target_id, label)
+    }
+
+    /// Append an opaque, caller-defined tree entry as a child of the active tip and advance the tip to
+    /// it — see `SessionStore::append_custom`. Same persistence-required contract as `set_label` (a
+    /// custom entry only makes sense against a persisted tree). Returns the new entry's id.
+    fn append_custom(
+        &mut self,
+        kind: impl Into<String>,
+        data: serde_json::Value,
+    ) -> std::io::Result<String> {
+        let store = self.store.as_mut().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "no session persistence configured (start serve with --session-file or --session-dir)",
+            )
+        })?;
+        store.append_custom(kind, data)
+    }
+
+    /// The label currently set on `target_id`, if any — see `SessionStore::get_label`. Same
+    /// persistence-required contract as `set_label`.
+    fn get_label(&self, target_id: &str) -> std::io::Result<Option<&str>> {
+        let store = self.store.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "no session persistence configured (start serve with --session-file or --session-dir)",
+            )
+        })?;
+        Ok(store.get_label(target_id))
+    }
+
     /// Every branch in the current session's tree (empty unless persistence is configured — a
     /// pure in-memory session, with no `--session-file`/`--session-dir`, has no tree to report).
     fn list_branches(&self) -> Vec<BranchInfo> {
@@ -771,24 +909,37 @@ impl Persistence {
             .unwrap_or(&[])
     }
 
-    /// Switch the active branch to `target_id`. When `summarize` and the branch being left behind has
-    /// unsummarized activity (see `SessionStore::abandoned_by_switch`), generates a summary via
-    /// `agent` and persists it *before* switching — mirroring pi's `navigateTree`. A summarization
-    /// failure (a network error, or the model returning nothing) is logged and the switch proceeds
-    /// anyway: losing the recap is far better than being unable to navigate away from a branch at all.
+    /// Switch the active branch to `target_id` — or, when `before` is set, to `target_id`'s own
+    /// *parent* instead, which is the tree's root (before any message) when `target_id` is the very
+    /// first message. That lets a client redo the first message in place (pi's own
+    /// `SessionManager::resetLeaf`) without a separate root sentinel on the wire: the client already
+    /// has real entry ids from `get_fork_messages`, so `{target_id: <first message>, before: true}`
+    /// means exactly that, mirroring `fork`'s identical `before` semantics.
+    ///
+    /// When `summarize` and the branch being left behind has unsummarized activity (see
+    /// `SessionStore::abandoned_by_switch`/`abandoned_to_root`), generates a summary via `agent` and
+    /// persists it *before* switching — mirroring pi's `navigateTree`. A summarization failure (a
+    /// network error, or the model returning nothing) is logged and the switch proceeds anyway: losing
+    /// the recap is far better than being unable to navigate away from a branch at all.
     ///
     /// `custom_instructions`, when given, steers *what* the branch recap emphasizes — the same
     /// "Additional focus" framing manual `compact` already supports — threaded straight through to
     /// [`Agent::summarize_branch`]; ignored (no summarization call happens at all) when `summarize` is
     /// `false`.
+    ///
+    /// Returns the resolved target alongside the switched-to `Session` — `None` when `before` resolved
+    /// to the tree's own root — so the caller can restore the correct model/thinking-level for
+    /// wherever the session actually landed (see [`Self::model_and_level_at_opt`]) instead of querying
+    /// against the raw, pre-resolution `target_id` argument.
     async fn switch_branch(
         &mut self,
         agent: &Agent,
         target_id: &str,
+        before: bool,
         summarize: bool,
         custom_instructions: Option<&str>,
         cancel: &CancellationToken,
-    ) -> std::io::Result<Session> {
+    ) -> std::io::Result<(Session, Option<String>)> {
         let store = self.store.as_mut().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -796,13 +947,34 @@ impl Persistence {
             )
         })?;
 
-        // A summary, once generated, is applied via `switch_active_with_summary` — it both persists
-        // the recap *and* installs it as the new active tip in one step, so it actually reaches the
-        // model on the next turn. Anything else (nothing abandoned, `summarize` off, the model call
-        // failed or returned nothing) falls through to a plain `switch_active`.
+        // Resolve `before` up front, rejecting an unknown `target_id` here rather than wasting a
+        // summarization call on a switch that's about to fail anyway. `resolved: None` means "reset to
+        // root" — everything else (including a normal, non-`before` switch) names a real node.
+        let resolved: Option<String> = if before {
+            match store.parent_of(target_id) {
+                Some(parent) => parent,
+                None => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("no message with id {target_id} in this session"),
+                    ));
+                }
+            }
+        } else {
+            Some(target_id.to_string())
+        };
+
+        // A summary, once generated, is applied via `switch_active_with_summary`/
+        // `switch_active_to_root_with_summary` — it both persists the recap *and* installs it as the
+        // new active tip in one step, so it actually reaches the model on the next turn. Anything else
+        // (nothing abandoned, `summarize` off, the model call failed or returned nothing) falls through
+        // to a plain `switch_active`/`switch_active_to_root`.
         let mut summary_to_apply: Option<(String, String, BranchSummaryDetails)> = None;
         if summarize {
-            let abandoned = store.abandoned_by_switch(target_id);
+            let abandoned = match &resolved {
+                Some(real_target) => store.abandoned_by_switch(real_target),
+                None => store.abandoned_to_root(),
+            };
             if !abandoned.is_empty() {
                 if let Some(from_id) = store.active_ids().last().cloned() {
                     let (ids, messages): (Vec<String>, Vec<agent_core::Message>) =
@@ -856,24 +1028,34 @@ impl Persistence {
             }
         }
 
-        let messages = match summary_to_apply {
-            Some((summary, from_id, details)) => {
-                match store.switch_active_with_summary(target_id, summary, from_id, details) {
+        let messages = match (&resolved, summary_to_apply) {
+            (Some(real_target), Some((summary, from_id, details))) => {
+                match store.switch_active_with_summary(real_target, summary, from_id, details) {
                     Ok(messages) => messages,
                     Err(e) => {
                         // Recording the summary failed (a disk error mid-rewrite) — the switch itself
                         // must still succeed rather than leaving the client stuck on the old branch.
                         eprintln!("serve: failed to persist branch summary, switching anyway: {e}");
-                        store.switch_active(target_id)?
+                        store.switch_active(real_target)?
                     }
                 }
             }
-            None => store.switch_active(target_id)?,
+            (None, Some((summary, from_id, details))) => {
+                match store.switch_active_to_root_with_summary(summary, from_id, details) {
+                    Ok(messages) => messages,
+                    Err(e) => {
+                        eprintln!("serve: failed to persist branch summary, switching anyway: {e}");
+                        store.switch_active_to_root()?
+                    }
+                }
+            }
+            (Some(real_target), None) => store.switch_active(real_target)?,
+            (None, None) => store.switch_active_to_root()?,
         };
         self.meta = store.meta().clone();
         let mut session = Session::new();
         session.messages = Arc::new(messages);
-        Ok(session)
+        Ok((session, resolved))
     }
 
     /// Record that the active model changed — a no-op when persistence isn't configured (in-memory
@@ -931,6 +1113,33 @@ impl Persistence {
                 .and_then(agent_core::ThinkingLevel::parse)
                 .unwrap_or(process_starting_level),
         )
+    }
+
+    /// [`Self::model_and_level_at`], but for a `switch_branch` target that may have resolved to the
+    /// tree's own root (`before: true` reaching the very first message) instead of a real node —
+    /// `model_at`/`thinking_level_at` require an existing id and can't express "root" directly, so
+    /// `None` here reads `SessionStore::model_at_root`/`thinking_level_at_root` instead.
+    fn model_and_level_at_opt(
+        &self,
+        target_id: Option<&str>,
+        process_starting_level: agent_core::ThinkingLevel,
+    ) -> (String, agent_core::ThinkingLevel) {
+        let Some(target_id) = target_id else {
+            let Some(store) = &self.store else {
+                return (self.meta.model.clone(), process_starting_level);
+            };
+            return (
+                store
+                    .model_at_root()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| self.meta.model.clone()),
+                store
+                    .thinking_level_at_root()
+                    .and_then(agent_core::ThinkingLevel::parse)
+                    .unwrap_or(process_starting_level),
+            );
+        };
+        self.model_and_level_at(target_id, process_starting_level)
     }
 
     /// [`Self::model_and_level_at`] resolved at the *currently active* session's own tip — what a
@@ -1001,7 +1210,9 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
     // so a long-running `serve` process doesn't re-walk the filesystem every turn just for the date.
     let cwd = crate::session_store::canonical_cwd(&std::env::current_dir().unwrap_or_default());
     let mut project_trusted = !cfg.force_untrusted
-        && (cfg.trust_project || crate::trust_store::TrustStore::open_default().is_trusted(&cwd));
+        && (cfg.trust_project
+            || crate::trust_store::TrustStore::open_default().is_trusted(&cwd)
+            || !crate::trust_store::has_trust_gated_resources(&cwd));
 
     // Slash-command prompt templates (`/name args`) and discoverable skills, for `get_commands`, for
     // expanding a `/name`/`/skill:name` prompt before it reaches the model, and — for skills — to
@@ -1460,6 +1671,27 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                                                 steering.request_stop();
                                                 let _ = out_tx.send(response(cid, "stop_after_turn", true, None, None));
                                             }
+                                            "switch_model" => {
+                                                // Pi-parity gap (pi's `prepareNextTurn`): unlike `set_model`
+                                                // (which only takes effect on the *next* `prompt`), this
+                                                // retargets the run already in flight — the current turn's
+                                                // own request is unaffected, but every subsequent turn of
+                                                // this same run targets the new model. See
+                                                // `agent_core::Steering::request_model_switch`.
+                                                match c.get("model").and_then(Value::as_str) {
+                                                    Some(model) => {
+                                                        let thinking = c
+                                                            .get("thinking")
+                                                            .and_then(Value::as_u64)
+                                                            .map(|t| t as u32);
+                                                        steering.request_model_switch(model, thinking);
+                                                        let _ = out_tx.send(response(cid, "switch_model", true, None, None));
+                                                    }
+                                                    None => {
+                                                        let _ = out_tx.send(response(cid, "switch_model", false, None, Some("missing `model`")));
+                                                    }
+                                                }
+                                            }
                                             cmd @ ("steer" | "follow_up") => {
                                                 match c.get("message").and_then(Value::as_str) {
                                                     Some(m) => {
@@ -1568,16 +1800,18 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                                                 let _ = out_tx.send(response(cid, "list_branches", true, Some(json!({ "branches": persistence.list_branches() })), None));
                                             }
                                             "get_tree" => {
-                                                let _ = out_tx.send(response(cid, "get_tree", true, Some(json!({ "nodes": persistence.tree() })), None));
+                                                let _ = out_tx.send(response(cid, "get_tree", true, Some(json!({ "nodes": persistence.tree(), "leaf_id": persistence.active_ids().last() })), None));
                                             }
                                             "list_sessions" => {
                                                 let progress_id = cid.clone();
-                                                let sessions: Vec<Value> = persistence
+                                                let query = c.get("query").and_then(Value::as_str);
+                                                let sessions = persistence
                                                     .list_with_progress(|scanned, total| {
                                                         if should_report_scan_progress(scanned, total) {
                                                             let _ = out_tx.send(list_progress_frame(progress_id.clone(), "list_sessions", scanned, total));
                                                         }
-                                                    })
+                                                    });
+                                                let sessions: Vec<Value> = search_sessions(sessions, query)
                                                     .iter()
                                                     .map(SessionMeta::to_listing_json)
                                                     .collect();
@@ -1585,13 +1819,14 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                                             }
                                             "list_all_sessions" => {
                                                 let progress_id = cid.clone();
+                                                let query = c.get("query").and_then(Value::as_str);
                                                 match persistence.list_all_with_progress(|scanned, total| {
                                                     if should_report_scan_progress(scanned, total) {
                                                         let _ = out_tx.send(list_progress_frame(progress_id.clone(), "list_all_sessions", scanned, total));
                                                     }
                                                 }) {
                                                     Ok(sessions) => {
-                                                        let sessions: Vec<Value> = sessions.iter().map(SessionMeta::to_listing_json).collect();
+                                                        let sessions: Vec<Value> = search_sessions(sessions, query).iter().map(SessionMeta::to_listing_json).collect();
                                                         let _ = out_tx.send(response(cid, "list_all_sessions", true, Some(json!({ "sessions": sessions })), None));
                                                     }
                                                     Err(e) => {
@@ -1824,6 +2059,19 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 // no-op instead, matching `abort`'s idle behavior.
                 emit!(response(id, "stop_after_turn", true, None, None));
             }
+            "switch_model" => {
+                // No run is in flight, so there is no next turn to retarget — changing the model while
+                // idle is `set_model`'s job (it takes effect immediately, on the very next `prompt`).
+                // Acknowledge as a no-op rather than silently queuing a switch that would surprise a
+                // later, unrelated run, matching `stop_after_turn`'s idle behavior.
+                emit!(response(
+                    id,
+                    "switch_model",
+                    true,
+                    Some(json!({ "note": "no run in flight; use set_model instead" })),
+                    None
+                ));
+            }
             "get_state" => {
                 let mut data = session_stats(&session, &current_model);
                 if let Value::Object(m) = &mut data {
@@ -1940,17 +2188,18 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
             },
             "list_sessions" => {
                 let progress_id = id.clone();
-                let sessions: Vec<Value> = persistence
-                    .list_with_progress(|scanned, total| {
-                        if should_report_scan_progress(scanned, total) {
-                            let _ = out_tx.send(list_progress_frame(
-                                progress_id.clone(),
-                                "list_sessions",
-                                scanned,
-                                total,
-                            ));
-                        }
-                    })
+                let query = cmd.get("query").and_then(Value::as_str);
+                let sessions = persistence.list_with_progress(|scanned, total| {
+                    if should_report_scan_progress(scanned, total) {
+                        let _ = out_tx.send(list_progress_frame(
+                            progress_id.clone(),
+                            "list_sessions",
+                            scanned,
+                            total,
+                        ));
+                    }
+                });
+                let sessions: Vec<Value> = search_sessions(sessions, query)
                     .iter()
                     .map(SessionMeta::to_listing_json)
                     .collect();
@@ -1964,6 +2213,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
             }
             "list_all_sessions" => {
                 let progress_id = id.clone();
+                let query = cmd.get("query").and_then(Value::as_str);
                 match persistence.list_all_with_progress(|scanned, total| {
                     if should_report_scan_progress(scanned, total) {
                         let _ = out_tx.send(list_progress_frame(
@@ -1975,8 +2225,10 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }) {
                     Ok(sessions) => {
-                        let sessions: Vec<Value> =
-                            sessions.iter().map(SessionMeta::to_listing_json).collect();
+                        let sessions: Vec<Value> = search_sessions(sessions, query)
+                            .iter()
+                            .map(SessionMeta::to_listing_json)
+                            .collect();
                         emit!(response(
                             id,
                             "list_all_sessions",
@@ -2141,9 +2393,44 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => emit!(response(id, "clone", false, None, Some(&e.to_string()))),
             },
             "get_fork_messages" => {
+                // pi-compatible contract: no parameters, scoped to *this* session only — every
+                // user-turn entry on the active path, as a flat `{entry_id, text}` candidate list (pi's
+                // own `getUserMessagesForForking`), for a client to build a fork-point picker from and
+                // then feed one `entry_id` to `fork`'s own `target_id`. This is a listing, not a preview
+                // of any one fork's output — see `preview_fork` for that.
+                let msg_ids = persistence.active_ids();
+                let candidates: Vec<Value> = if msg_ids.len() == session.messages.len() {
+                    session
+                        .messages
+                        .iter()
+                        .zip(msg_ids)
+                        .filter(|(m, _)| m.role == agent_core::Role::User)
+                        .filter_map(|(m, entry_id)| {
+                            user_message_text(m)
+                                .map(|text| json!({ "entry_id": entry_id, "text": text }))
+                        })
+                        .collect()
+                } else {
+                    // In-memory-only mode (no persistence configured), or some other length mismatch —
+                    // there are no stable entry ids to offer, so there is nothing a client could
+                    // meaningfully pass back to `fork`'s `target_id`. Matches `get_messages`'s own
+                    // precedent for this same mismatch: degrade gracefully, don't error.
+                    Vec::new()
+                };
+                emit!(response(
+                    id,
+                    "get_fork_messages",
+                    true,
+                    Some(json!({ "messages": candidates })),
+                    None,
+                ));
+            }
+            "preview_fork" => {
                 // A read-only preview of what `fork` would produce for `session_id` (default: the
                 // current session) at `upto` messages — no new session file, no switch. Lets a client
-                // browsing `list_sessions` show a fork point before committing to it.
+                // browsing `list_sessions` show a fork point before committing to it. This crate's own
+                // extension beyond pi's protocol (previously misnamed `get_fork_messages`, colliding
+                // with pi's own same-named but differently-shaped command — see the module doc comment).
                 let target_id = cmd
                     .get("session_id")
                     .and_then(Value::as_str)
@@ -2159,14 +2446,14 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 match persistence.fork_messages(&target_id, upto, entry_id, before) {
                     Ok(messages) => emit!(response(
                         id,
-                        "get_fork_messages",
+                        "preview_fork",
                         true,
                         Some(json!({ "messages": messages })),
                         None,
                     )),
                     Err(e) => emit!(response(
                         id,
-                        "get_fork_messages",
+                        "preview_fork",
                         false,
                         None,
                         Some(&e.to_string())
@@ -2234,6 +2521,108 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     Some("missing `title`")
                 )),
             },
+            "set_label" => match cmd.get("target_id").and_then(Value::as_str) {
+                Some(target_id) => match cmd.get("label") {
+                    // Present-but-null is the explicit "clear it" signal; a missing key is an error
+                    // (so a typo can't silently no-op) — matches `set_thinking`'s own `budget` contract.
+                    Some(Value::Null) => match persistence.set_label(target_id, None) {
+                        Ok(()) => emit!(response(
+                            id,
+                            "set_label",
+                            true,
+                            Some(json!({ "target_id": target_id, "label": Value::Null })),
+                            None,
+                        )),
+                        Err(e) => {
+                            emit!(response(id, "set_label", false, None, Some(&e.to_string())))
+                        }
+                    },
+                    Some(Value::String(label)) => {
+                        match persistence.set_label(target_id, Some(label)) {
+                            Ok(()) => emit!(response(
+                                id,
+                                "set_label",
+                                true,
+                                Some(json!({ "target_id": target_id, "label": label })),
+                                None,
+                            )),
+                            Err(e) => {
+                                emit!(response(id, "set_label", false, None, Some(&e.to_string())))
+                            }
+                        }
+                    }
+                    Some(_) => emit!(response(
+                        id,
+                        "set_label",
+                        false,
+                        None,
+                        Some("`label` must be a string or null")
+                    )),
+                    None => emit!(response(
+                        id,
+                        "set_label",
+                        false,
+                        None,
+                        Some("missing `label` — pass a string to set it or null to clear it")
+                    )),
+                },
+                None => emit!(response(
+                    id,
+                    "set_label",
+                    false,
+                    None,
+                    Some("missing `target_id`")
+                )),
+            },
+            "get_label" => match cmd.get("target_id").and_then(Value::as_str) {
+                Some(target_id) => match persistence.get_label(target_id) {
+                    Ok(label) => emit!(response(
+                        id,
+                        "get_label",
+                        true,
+                        Some(json!({ "target_id": target_id, "label": label })),
+                        None,
+                    )),
+                    Err(e) => emit!(response(id, "get_label", false, None, Some(&e.to_string()))),
+                },
+                None => emit!(response(
+                    id,
+                    "get_label",
+                    false,
+                    None,
+                    Some("missing `target_id`")
+                )),
+            },
+            "append_custom" => match cmd.get("kind").and_then(Value::as_str) {
+                Some(kind) => {
+                    let data = cmd.get("data").cloned().unwrap_or_else(|| json!({}));
+                    match persistence.append_custom(kind, data) {
+                        Ok(new_id) => emit!(response(
+                            id,
+                            "append_custom",
+                            true,
+                            Some(json!({ "id": new_id })),
+                            None,
+                        )),
+                        Err(e) => {
+                            emit!(response(
+                                id,
+                                "append_custom",
+                                false,
+                                None,
+                                Some(&e.to_string())
+                            ))
+                        }
+                    }
+                }
+                None => emit!(response(
+                    id,
+                    "append_custom",
+                    false,
+                    None,
+                    Some("missing `kind`")
+                )),
+            },
             "compact" => {
                 // Manual compaction (no run in flight here). Streams a `compacted` event if it cuts.
                 // `custom_instructions`, when given, steers what the summary emphasizes — pi's own
@@ -2241,14 +2630,27 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 let custom_instructions = cmd.get("custom_instructions").and_then(Value::as_str);
                 let tx = out_tx.clone();
                 let mut compacted_tokens_before: Option<u32> = None;
+                let mut compacted_summary: Option<String> = None;
+                let mut compacted_tokens_after: Option<u32> = None;
                 let result = agent
                     .compact(
                         &mut session,
                         agent_core::CompactionReason::Manual,
                         &CancellationToken::new(),
                         &mut |ev| {
-                            if let AgentEvent::Compacted { tokens_before, .. } = ev {
-                                compacted_tokens_before = Some(tokens_before);
+                            // Matched by reference: `summary` is owned (`String`), and binding it by
+                            // value here would partially move `ev` out from under the `event_frame(ev)`
+                            // call just below, which still needs the whole event intact to forward.
+                            if let AgentEvent::Compacted {
+                                tokens_before,
+                                summary,
+                                tokens_after,
+                                ..
+                            } = &ev
+                            {
+                                compacted_tokens_before = Some(*tokens_before);
+                                compacted_summary = Some(summary.clone());
+                                compacted_tokens_after = Some(*tokens_after);
                             }
                             if let Some(frame) = event_frame(ev) {
                                 let _ = tx.send(frame);
@@ -2268,7 +2670,12 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                                 id,
                                 "compact",
                                 true,
-                                Some(json!({ "compacted": did })),
+                                Some(json!({
+                                    "compacted": did,
+                                    "summary": compacted_summary,
+                                    "tokens_before": compacted_tokens_before,
+                                    "tokens_after": compacted_tokens_after,
+                                })),
                                 None
                             )),
                             Err(e) => emit!(response(
@@ -2335,7 +2742,8 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 // `full_system` refresh alone only ever picks up the cheap date/cwd footer.
                 project_trusted = !cfg.force_untrusted
                     && (cfg.trust_project
-                        || crate::trust_store::TrustStore::open_default().is_trusted(&cwd));
+                        || crate::trust_store::TrustStore::open_default().is_trusted(&cwd)
+                        || !crate::trust_store::has_trust_gated_resources(&cwd));
                 // `--no-skills`/`--no-prompt-templates` still honor an explicit `--skill`/
                 // `--prompt-template` extra path (pi-parity fix, M2) — see the identical reasoning at
                 // this function's startup discovery, above.
@@ -2427,10 +2835,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                                 id,
                                 "set_model",
                                 true,
-                                Some(json!({
-                                    "model": current_model,
-                                    "reasoning_effort": current_level.as_str(),
-                                })),
+                                Some(model_switch_response(&current_model, current_level)),
                                 None,
                             ));
                         }
@@ -2637,17 +3042,11 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                             &write_locks,
                             &checkpoint,
                         );
-                        emit!(response(
-                            id,
-                            "cycle_model",
-                            true,
-                            Some(json!({
-                                "model": current_model,
-                                "scoped": !cfg.models.is_empty(),
-                                "reasoning_effort": current_level.as_str(),
-                            })),
-                            None,
-                        ));
+                        let mut resp_data = model_switch_response(&current_model, current_level);
+                        if let Value::Object(map) = &mut resp_data {
+                            map.insert("scoped".to_string(), json!(!cfg.models.is_empty()));
+                        }
+                        emit!(response(id, "cycle_model", true, Some(resp_data), None));
                     }
                     Err(e) => emit!(response(
                         id,
@@ -2874,12 +3273,18 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     id,
                     "get_tree",
                     true,
-                    Some(json!({ "nodes": persistence.tree() })),
+                    Some(
+                        json!({ "nodes": persistence.tree(), "leaf_id": persistence.active_ids().last() })
+                    ),
                     None,
                 ));
             }
             "switch_branch" => match cmd.get("target_id").and_then(Value::as_str) {
                 Some(target_id) => {
+                    // When set, switches to `target_id`'s own parent instead — the tree's root (before
+                    // any message) when `target_id` is the very first one, letting a client redo it in
+                    // place. Mirrors `fork`'s identical `before` flag.
+                    let before = cmd.get("before").and_then(Value::as_bool).unwrap_or(false);
                     // Defaults to summarizing the abandoned branch's activity (mirroring pi's
                     // `navigateTree`); a client can pass `summarize:false` for a quick, cheap switch.
                     let summarize = cmd
@@ -2907,6 +3312,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                         let fut = persistence.switch_branch(
                             &agent,
                             &target_id,
+                            before,
                             summarize,
                             custom_instructions,
                             &branch_cancel,
@@ -2957,7 +3363,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     };
                     match switch_result {
-                        Ok(s) => {
+                        Ok((s, resolved_target)) => {
                             session = s;
                             steering.clear();
                             // Restore whichever model/thinking-level was actually active on this
@@ -2967,9 +3373,12 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                             // this guards against). Both always resolve to something real: the model
                             // falls back to the session's own creation-time model, the level to the
                             // process's own starting level (`starting_level`) — see
-                            // `model_and_level_at`'s doc comment.
-                            let (restored_model, restored_level) =
-                                persistence.model_and_level_at(&target_id, starting_level);
+                            // `model_and_level_at`'s doc comment. Queried against `resolved_target`
+                            // (`None` when `before` landed on the tree's own root), not the raw
+                            // `target_id` argument, which names the entry navigated *relative to*, not
+                            // necessarily where the session actually ended up.
+                            let (restored_model, restored_level) = persistence
+                                .model_and_level_at_opt(resolved_target.as_deref(), starting_level);
                             // Clamp against the *restored* model's capabilities, not the model that
                             // was active before the switch — a branch recorded at `Off` on a model
                             // that's since been superseded by a non-disable-capable one must not
@@ -3116,12 +3525,15 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                             biased;
                             r = &mut run => break r,
                             // `cancel.cancel()` alone (set by `abort_bash`/`abort` below, or by
-                            // shutdown) doesn't interrupt an in-flight `run` — `bash` has no
-                            // cooperative cancellation check of its own; it relies on the loop
-                            // *dropping* its future, same as the model-loop's own tool dispatch does.
-                            // Breaking here (rather than continuing to await `run`) drops the pinned
-                            // future when this block ends, killing the subprocess via its
-                            // `kill_on_drop`/process-group guard.
+                            // shutdown) doesn't, by itself, interrupt an in-flight `run` — but `bash`'s
+                            // own `exec` races the same token internally (see `tools::bash`) and returns
+                            // a graceful "Command cancelled" error carrying whatever output had already
+                            // accumulated, so in practice `r = &mut run` above resolves first and wins
+                            // this biased select on a real cancellation. This arm stays as a fallback for
+                            // a future tool reachable from this same host-command path that *isn't*
+                            // internally cancellation-aware — breaking here drops the pinned `run`
+                            // future, which still kills a `bash` subprocess via its
+                            // `kill_on_drop`/process-group guard even if that tool never noticed.
                             () = cancel.cancelled() => {
                                 break Err(agent_core::ToolError::Execution("cancelled".to_string()));
                             }
@@ -3299,6 +3711,7 @@ fn build_agent(
         .with_max_steps(cfg.max_steps)
         .with_compaction(compaction)
         .with_auto_retry(auto_retry)
+        .with_sequential_tools(cfg.sequential_tools)
         // Pin this session to a warm prompt-cache node via its stable id.
         .with_cache_key(cache_key.to_string())
         .with_cache_long(cfg.cache_long)
@@ -3322,6 +3735,16 @@ fn build_agent(
     if let Some(effort) = reasoning_effort {
         agent = agent.with_reasoning_effort(effort);
     }
+    if let Some(temperature) = cfg.temperature {
+        agent = agent.with_temperature(temperature);
+    }
+    if let Some(max_tokens) = cfg.max_tokens {
+        agent = agent.with_max_tokens(max_tokens);
+    }
+    let policy = crate::policy::ToolPolicy::from_lists(&cfg.deny_tool, &cfg.deny_bash_pattern);
+    if !policy.is_empty() {
+        agent = agent.with_hooks(Arc::new(policy));
+    }
     agent
 }
 
@@ -3330,8 +3753,11 @@ fn build_agent(
 /// from the model's own tool set also disables the host command rather than leaving a side door open
 /// around an operator's explicit restriction.
 fn build_tools(cfg: &ServeConfig) -> agent_core::ToolRegistry {
-    let mut registry =
-        tools::default_registry_with(cfg.bash_timeout_ms, cfg.bash_shell_path.as_deref());
+    let mut registry = tools::default_registry_with_prefix(
+        cfg.bash_timeout_ms,
+        cfg.bash_shell_path.as_deref(),
+        cfg.bash_command_prefix.as_deref(),
+    );
     tools::apply_filter(
         &mut registry,
         cfg.tools.as_deref(),
@@ -3452,8 +3878,44 @@ fn model_info(model: &str) -> Value {
         "id": model,
         "provider": provider,
         "context_window": caps.context_window,
+        "max_output": caps.max_output,
         "reasoning": caps.reasoning_effort || caps.thinking != agent_core::models::ThinkingShape::None,
+        "supports_vision": caps.supports_vision,
     })
+}
+
+/// [`model_info`] plus the thinking-level state a model *switch* also carries — the shared response
+/// shape for `set_model`/`cycle_model`, so a client gets the same capability info
+/// `get_available_models` already provides (context window, max output, reasoning/vision support)
+/// instead of just a bare model id, matching pi's own `set_model`/`cycle_model` (`rpc-mode.ts`), which
+/// embed the identical per-model object `get_available_models` uses. `model`/`reasoning_effort` are
+/// kept as top-level fields (not folded into `model_info`'s own `id`) for wire-compatibility with a
+/// client already reading this shape.
+fn model_switch_response(model: &str, level: agent_core::ThinkingLevel) -> Value {
+    let mut info = model_info(model);
+    if let Value::Object(map) = &mut info {
+        map.insert("model".to_string(), json!(model));
+        map.insert("reasoning_effort".to_string(), json!(level.as_str()));
+    }
+    info
+}
+
+/// The concatenated text of a `User`-role message, for `get_fork_messages`'s candidate list — pi's own
+/// `getUserMessagesForForking`. `None` for a message with no plain-text block at all (a pure
+/// tool-result turn), which isn't a meaningful fork-point candidate to offer.
+fn user_message_text(msg: &agent_core::Message) -> Option<String> {
+    if msg.role != agent_core::Role::User {
+        return None;
+    }
+    let text: String = msg
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            agent_core::ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    (!text.is_empty()).then_some(text)
 }
 
 /// The concatenated text of the most recent assistant message, for scripting clients that just want
@@ -4148,10 +4610,58 @@ mod tests {
         let cancel = CancellationToken::new();
 
         let err = persistence
-            .switch_branch(&agent, "some-id", true, None, &cancel)
+            .switch_branch(&agent, "some-id", false, true, None, &cancel)
             .await
             .expect_err("must fail clearly, not panic, when there's no session tree to navigate");
 
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        assert!(
+            err.to_string()
+                .contains("no session persistence configured"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn set_label_and_get_label_return_a_clear_error_when_no_session_persistence_is_configured() {
+        // Pi-parity audit H3: `SessionStore::set_label`/`get_label` were fully built, persisted, and
+        // even carried across forks, but had no RPC surface at all — `Persistence::set_label`/
+        // `get_label` are the RPC handlers' entry point. Same "no tree, no label" contract as
+        // `switch_branch` above.
+        let mut persistence = Persistence {
+            repo: None,
+            store: None,
+            meta: SessionMeta::new("/w", "claude-test"),
+        };
+        let err = persistence
+            .set_label("some-id", Some("checkpoint"))
+            .expect_err("must fail clearly when there's no session tree to label");
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        assert!(
+            err.to_string()
+                .contains("no session persistence configured"),
+            "got: {err}"
+        );
+
+        let err = persistence
+            .get_label("some-id")
+            .expect_err("must fail clearly when there's no session tree to query");
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn append_custom_returns_a_clear_error_when_no_session_persistence_is_configured() {
+        // Pi-parity audit: `SessionStore::append_custom` was fully built and tested but had no RPC
+        // surface at all — `Persistence::append_custom` is the RPC handler's entry point. Same
+        // "no tree, nothing to append to" contract as `set_label`/`get_label` above.
+        let mut persistence = Persistence {
+            repo: None,
+            store: None,
+            meta: SessionMeta::new("/w", "claude-test"),
+        };
+        let err = persistence
+            .append_custom("marker", json!({"k": "v"}))
+            .expect_err("must fail clearly when there's no session tree to append to");
         assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
         assert!(
             err.to_string()
