@@ -2,10 +2,10 @@
 //! the gateway binary.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, dead_code)]
 
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -82,7 +82,10 @@ pub fn turn_refusal(text: &str) -> String {
     ])
 }
 
-fn sse(events: &[Value]) -> String {
+/// Frame each event as its own `data: ...\n\n` SSE block — used directly by callers that build a turn
+/// out of the standard shape (`turn_text`/`turn_refusal`/`turn_tool_use`) as well as ones assembling a
+/// bespoke event sequence (e.g. chunked tool-call argument streaming).
+pub fn sse(events: &[Value]) -> String {
     events.iter().map(|e| format!("data: {e}\n\n")).collect()
 }
 
@@ -161,4 +164,90 @@ pub fn wait_for_port(port: u16) {
         thread::sleep(std::time::Duration::from_millis(10));
     }
     panic!("port {port} never came up");
+}
+
+/// Read stdout frames from a `serve` child until the `response` frame for `command` arrives; return
+/// all frames seen (including any `event`/progress frames along the way).
+pub fn read_until_response(reader: &mut impl BufRead, command: &str) -> Vec<Value> {
+    let mut frames = Vec::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).unwrap() == 0 {
+            break;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        let done = v.get("type").and_then(Value::as_str) == Some("response")
+            && v.get("command").and_then(Value::as_str) == Some(command);
+        frames.push(v);
+        if done {
+            break;
+        }
+    }
+    frames
+}
+
+/// A `serve` child bound to a single session file, talking to the mock gateway at `base`.
+pub fn serve_cmd(bin: &str, base: &str, session_file: &str) -> Command {
+    let mut c = Command::new(bin);
+    c.args([
+        "serve",
+        "--gateway-url",
+        base,
+        "--key",
+        "bai_v1.test",
+        "--model",
+        "claude-test",
+        "--session-file",
+        session_file,
+    ])
+    .env("HOME", ISOLATED_HOME)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
+    c
+}
+
+/// Like `serve_cmd`, but bound to a session *directory* (`--session-dir`) rather than a single file —
+/// exercises the multi-session-per-process repo mode (`list_sessions`, `switch`, fork).
+pub fn serve_dir_cmd(bin: &str, base: &str, session_dir: &str) -> Command {
+    let mut c = Command::new(bin);
+    c.args([
+        "serve",
+        "--gateway-url",
+        base,
+        "--key",
+        "bai_v1.test",
+        "--model",
+        "claude-test",
+        "--session-dir",
+        session_dir,
+    ])
+    .env("HOME", ISOLATED_HOME)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
+    c
+}
+
+/// [`Command::new`] for the `run` binary, pre-isolated from the real machine's `HOME` — see
+/// [`ISOLATED_HOME`]. A test that wants real HOME-relative behavior overrides it via its own
+/// `.env("HOME", ...)`, which simply wins (`Command::env` is last-write).
+pub fn run_cmd(bin: &str) -> Command {
+    let mut c = Command::new(bin);
+    c.env("HOME", ISOLATED_HOME);
+    c
+}
+
+/// Every persisted `message` entry's id, in order, read straight off a session JSONL file.
+pub fn message_ids(session_file: &str) -> Vec<String> {
+    std::fs::read_to_string(session_file)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|v| v["type"] == "message")
+        .filter_map(|v| v["id"].as_str().map(str::to_string))
+        .collect()
 }

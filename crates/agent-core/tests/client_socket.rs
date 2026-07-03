@@ -320,3 +320,52 @@ async fn gateway_client_retries_transient_503_then_succeeds() {
         "retry must transparently deliver the real stream, got: {events:?}"
     );
 }
+
+#[tokio::test]
+async fn gateway_client_retries_a_connection_reset_mid_send_then_succeeds() {
+    // Found live (a real fault-injecting proxy dropping connections against a genuine Anthropic/OpenAI
+    // gateway) before it was ever caught here: `is_retryable_send_error`'s own doc comment ("connection-
+    // level failures: refused, reset, timed out... worth retrying") already promised this class was
+    // covered, but the code only checked `e.is_timeout() || e.is_connect()` — neither matches a
+    // connection that accepted fine and was then reset *while sending the request*, which reqwest
+    // reports as `Kind::Request` (`e.is_request()`), a different bucket than `is_connect()`'s narrower
+    // "the TCP handshake itself failed" (refused/unreachable). The first connection here is accepted
+    // then dropped with zero bytes written back — exactly that reset-after-connect shape, not a 503 or
+    // a timeout — so this is real coverage for a genuinely different failure mode than the sibling test
+    // above, not a duplicate of it.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    thread::spawn(move || {
+        // First attempt: accept, then drop immediately — a connection reset mid-send, not a timeout and
+        // not a refused/unreachable connect failure.
+        if let Ok((stream, _)) = listener.accept() {
+            drop(stream);
+        }
+        // Second attempt: the real stream.
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{ANTHROPIC_SSE}"
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    let client = GatewayClient::new(format!("http://{addr}"), "bai_v1.test").expect("client");
+    let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 64);
+    let mut stream = client.stream(req).await.expect("stream");
+    let mut events = Vec::new();
+    while let Some(ev) = stream.next().await {
+        events.push(ev.expect("event after retry"));
+    }
+    assert!(
+        events.contains(&StreamEvent::TextDelta {
+            index: 0,
+            text: "hi over the wire".into()
+        }),
+        "a connection reset mid-send must be retried transparently, not surfaced as a hard failure on \
+         the very first attempt: {events:?}"
+    );
+}

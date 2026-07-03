@@ -37,12 +37,24 @@ pub fn backoff(attempt: u32) -> std::time::Duration {
 /// any narrower pattern but plausibly still deserves a retry.
 const WHOLE_RUN_RETRYABLE_STATUS_DIGITS: &[&str] = &["429", "500", "502", "503", "504"];
 
+/// Reqwest's own literal, stable wrapper text for a pre-response send failure (`Kind::Request`'s
+/// `Display` impl) — refused/reset/timed-out-while-connecting, DNS, TLS. Found live (a real
+/// fault-injecting proxy, not a mock): `client.rs`'s pre-first-byte retry already recognizes this exact
+/// class as transient (`is_retryable_send_error`) and retries it up to its own budget — but when a
+/// connection blip outlasts *that* tight budget too, the resulting `Error::Transport` carries only this
+/// generic reqwest string (never a real HTTP status, since no response was ever received), which neither
+/// `is_retryable_mid_stream`'s provider-error-text vocabulary nor the raw status-digit list above was
+/// ever going to match, silently downgrading "a network blip client.rs already tried and failed to ride
+/// out" into a hard, un-retried whole-run failure — exactly the case this whole layer exists to catch.
+const TRANSPORT_SEND_FAILURE_MARKER: &str = "error sending request for url";
+
 /// Whether a whole run that ended in `Err` is worth automatically re-invoking from scratch — a superset
 /// of `agent_core::agent::is_retryable_mid_stream` (every mid-stream-worth-retrying error is also worth
-/// a whole-run retry) plus [`WHOLE_RUN_RETRYABLE_STATUS_DIGITS`], appropriate only at this outer layer.
-/// Excludes a context-overflow rejection either way (`is_context_overflow`, `pub` for exactly this) —
-/// that's compact-and-retry's signal, not this one's; retrying it blindly here would just fail
-/// identically again without compacting first.
+/// a whole-run retry) plus [`WHOLE_RUN_RETRYABLE_STATUS_DIGITS`] and
+/// [`TRANSPORT_SEND_FAILURE_MARKER`], appropriate only at this outer layer. Excludes a context-overflow
+/// rejection either way (`is_context_overflow`, `pub` for exactly this) — that's compact-and-retry's
+/// signal, not this one's; retrying it blindly here would just fail identically again without
+/// compacting first.
 pub fn is_retryable_whole_run(e: &agent_core::Error) -> bool {
     if agent_core::agent::is_retryable_mid_stream(e) {
         return true;
@@ -61,9 +73,10 @@ pub fn is_retryable_whole_run(e: &agent_core::Error) -> bool {
     if agent_core::client::is_quota_exhausted(msg) {
         return false;
     }
-    WHOLE_RUN_RETRYABLE_STATUS_DIGITS
-        .iter()
-        .any(|d| msg.contains(d))
+    msg.contains(TRANSPORT_SEND_FAILURE_MARKER)
+        || WHOLE_RUN_RETRYABLE_STATUS_DIGITS
+            .iter()
+            .any(|d| msg.contains(d))
 }
 
 #[cfg(test)]
@@ -92,6 +105,34 @@ mod tests {
         assert!(
             is_retryable_whole_run(&e),
             "whole-run layer must catch what the narrower one misses"
+        );
+    }
+
+    #[test]
+    fn whole_run_retries_client_rs_own_exhausted_transport_send_failure() {
+        // Found live (a real fault-injecting proxy repeatedly dropping connections): client.rs's own
+        // pre-first-byte retry (`is_retryable_send_error`) already recognizes a reset-mid-send as
+        // transient and retries it — but its own budget is tight (4 attempts), and once that's
+        // exhausted the resulting `Error::Transport` carries only reqwest's generic
+        // `TRANSPORT_SEND_FAILURE_MARKER` text, with no HTTP status digit at all (no response was ever
+        // received) and no provider-error prose either — matching neither `is_retryable_mid_stream`'s
+        // vocabulary nor the raw-status-digit fallback, silently turning a network blip that outlasted
+        // the fast inner retry into a hard, un-retried whole-run failure.
+        let msg = "error sending request for url (http://127.0.0.1:9/v1/messages)";
+        let e = Error::Transport(msg.into());
+        assert!(
+            !agent_core::agent::is_retryable_mid_stream(&e),
+            "this is our own client's generic reqwest text, not provider error prose"
+        );
+        assert!(
+            !WHOLE_RUN_RETRYABLE_STATUS_DIGITS
+                .iter()
+                .any(|d| msg.contains(d)),
+            "no HTTP status digit is present at all — no response was ever received"
+        );
+        assert!(
+            is_retryable_whole_run(&e),
+            "an exhausted pre-connect transport failure must still be retried at the whole-run layer"
         );
     }
 

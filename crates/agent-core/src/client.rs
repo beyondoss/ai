@@ -418,8 +418,19 @@ pub fn is_quota_exhausted(body: &str) -> bool {
 }
 
 /// Whether a `reqwest` send error is the transient connection class (refused/reset/timed out).
+///
+/// `is_connect()` only covers a failed TCP *handshake* (refused/unreachable) — it doesn't match a
+/// connection that was accepted fine and then reset while the request was being sent, which reqwest
+/// reports as the broader `Kind::Request` (`is_request()`) instead. Found live (not by any mock): a
+/// fault-injecting proxy that accepts a connection and drops it immediately — a genuine network blip,
+/// the same class this function's own name promises to cover — surfaced as a hard, un-retried failure
+/// on the very first attempt, despite this exact case ("reset") already being named in this doc comment
+/// as something that should be retried. `is_request()` is deliberately broader than a hand-picked
+/// reset-specific check: everything in that bucket happens before any response is ever received, so
+/// retrying it can't double-apply a change a provider already committed — the same safety property
+/// `is_connect()`/`is_timeout()` already rely on.
 fn is_retryable_send_error(e: &reqwest::Error) -> bool {
-    e.is_timeout() || e.is_connect()
+    e.is_timeout() || e.is_connect() || e.is_request()
 }
 
 /// Cap on an upstream error body surfaced in [`Error::Transport`] — an error page (a misconfigured
