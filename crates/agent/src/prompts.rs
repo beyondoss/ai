@@ -9,6 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::path_utils::push_unique_root;
+use crate::skills::Collision;
 
 /// A discovered prompt template.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,9 +41,9 @@ pub fn discover(cwd: &Path, project_trusted: bool, extra_roots: &[String]) -> Ve
 }
 
 /// Like [`discover`], but also reports name collisions — the same `/name` defined by more than one
-/// template file, silently shadowed by `discover` (the later standard root wins) — as human-readable
-/// strings naming both paths, for `get_commands` to surface as a diagnostic rather than a client having
-/// no way to notice a template was shadowed.
+/// template file, silently shadowed by `discover` (the later standard root wins) — as structured
+/// [`Collision`]s naming both paths, for `get_commands` to surface as a diagnostic rather than a client
+/// having no way to notice a template was shadowed.
 ///
 /// `extra_roots` are additional, ad-hoc discovery roots beyond the two standard ones — pi's own
 /// `--prompt-template <path>` (repeatable), which accepts either a directory (walked like a standard
@@ -54,7 +55,7 @@ pub fn discover_with_diagnostics(
     cwd: &Path,
     project_trusted: bool,
     extra_roots: &[String],
-) -> (Vec<PromptTemplate>, Vec<String>) {
+) -> (Vec<PromptTemplate>, Vec<Collision>) {
     discover_with_diagnostics_impl(cwd, project_trusted, extra_roots, true)
 }
 
@@ -62,7 +63,7 @@ pub fn discover_with_diagnostics(
 /// `<cwd>/.claude/prompts`) entirely, keeping only `extra_roots` — what `--no-prompt-templates` needs,
 /// mirroring [`crate::skills::discover_extra_only`]'s identical reasoning: pi's own `noPromptTemplates`
 /// still honors an explicit `--prompt-template` path passed alongside it (pi-parity fix, M2).
-pub fn discover_extra_only(extra_roots: &[String]) -> (Vec<PromptTemplate>, Vec<String>) {
+pub fn discover_extra_only(extra_roots: &[String]) -> (Vec<PromptTemplate>, Vec<Collision>) {
     discover_with_diagnostics_impl(Path::new(""), false, extra_roots, false)
 }
 
@@ -71,10 +72,10 @@ fn discover_with_diagnostics_impl(
     project_trusted: bool,
     extra_roots: &[String],
     include_standard_roots: bool,
-) -> (Vec<PromptTemplate>, Vec<String>) {
+) -> (Vec<PromptTemplate>, Vec<Collision>) {
     let mut found: Vec<PromptTemplate> = Vec::new();
     let mut origins: HashMap<String, PathBuf> = HashMap::new();
-    let mut collisions: Vec<String> = Vec::new();
+    let mut collisions: Vec<Collision> = Vec::new();
     let mut standard_roots: Vec<PathBuf> = Vec::new();
     // Canonical form of every root added so far, across `standard_roots` and the extra-root loop
     // below — a root reached by two different paths (a symlink, a relative-vs-absolute spelling, `cwd`
@@ -180,7 +181,7 @@ fn discover_with_diagnostics_impl(
                 None => {
                     let message = format!("--prompt-template file could not be read: {extra}");
                     tracing::warn!("{message}");
-                    collisions.push(message);
+                    collisions.push(Collision::message_only("prompt", message));
                 }
             }
         } else {
@@ -189,7 +190,7 @@ fn discover_with_diagnostics_impl(
                  {extra}"
             );
             tracing::warn!("{message}");
-            collisions.push(message);
+            collisions.push(Collision::message_only("prompt", message));
         }
     }
 
@@ -203,7 +204,15 @@ fn discover_with_diagnostics_impl(
                     path.display()
                 );
                 tracing::warn!("{message}");
-                collisions.push(message);
+                collisions.push(Collision {
+                    resource_type: "prompt",
+                    name: name.clone(),
+                    winner_path: Some(path.clone()),
+                    loser_path: Some(existing_path.clone()),
+                    winner_source: None,
+                    loser_source: None,
+                    message,
+                });
             }
             origins.insert(name.clone(), path);
             if let Some(existing) = found.iter_mut().find(|t| t.name == name) {
@@ -231,7 +240,15 @@ fn discover_with_diagnostics_impl(
                     path.display()
                 );
                 tracing::warn!("{message}");
-                collisions.push(message);
+                collisions.push(Collision {
+                    resource_type: "prompt",
+                    name: name.clone(),
+                    winner_path: Some(existing_path.clone()),
+                    loser_path: Some(path.clone()),
+                    winner_source: Some("standard root"),
+                    loser_source: Some("--prompt-template"),
+                    message,
+                });
                 continue;
             }
             if let Some(existing_path) = origins.get(&name) {
@@ -241,7 +258,15 @@ fn discover_with_diagnostics_impl(
                     path.display()
                 );
                 tracing::warn!("{message}");
-                collisions.push(message);
+                collisions.push(Collision {
+                    resource_type: "prompt",
+                    name: name.clone(),
+                    winner_path: Some(path.clone()),
+                    loser_path: Some(existing_path.clone()),
+                    winner_source: None,
+                    loser_source: None,
+                    message,
+                });
             }
             origins.insert(name.clone(), path);
             if let Some(existing) = found.iter_mut().find(|t| t.name == name) {
@@ -653,9 +678,47 @@ mod tests {
         // scanning the real user root.
         let (_, collisions) = discover_with_diagnostics(tmp.path(), true, &[]);
         assert!(
-            !collisions.iter().any(|c| c.contains("solo")),
+            !collisions.iter().any(|c| c.to_string().contains("solo")),
             "got: {collisions:?}"
         );
+    }
+
+    #[test]
+    fn discover_with_diagnostics_populates_structured_collision_fields() {
+        // pi-parity fix: collision diagnostics used to be a flattened `Vec<String>` (pi's own
+        // `ResourceDiagnostic`/`ResourceCollision`, `diagnostics.ts:1-16`, is structured) — a client had
+        // no way to build tooling (e.g. "which one do you want?") on top of a plain sentence. This mirrors
+        // `skills.rs`'s own `discover_with_diagnostics_populates_structured_collision_fields` — same
+        // `Collision` type, reused by this module.
+        let tmp = tempfile::tempdir().unwrap();
+        let user_pdir = tmp.path().join("user/.claude/prompts");
+        let project_pdir = tmp.path().join("project/.claude/prompts");
+        fs::create_dir_all(&user_pdir).unwrap();
+        fs::create_dir_all(&project_pdir).unwrap();
+        fs::write(user_pdir.join("dup.md"), "user version").unwrap();
+        fs::write(project_pdir.join("dup.md"), "project version").unwrap();
+
+        // Standard roots are `$HOME/.claude/prompts` then `cwd/.claude/prompts` — simulate the "user"
+        // root directly via an extra root standing in for it, so this test doesn't need to touch the
+        // developer's real `$HOME`.
+        let (found, collisions) = discover_with_diagnostics(
+            &tmp.path().join("project"),
+            true,
+            &[user_pdir.to_string_lossy().into_owned()],
+        );
+        let dup = found.iter().find(|t| t.name == "dup").unwrap();
+        // The project's own standard root wins over the `--prompt-template` extra root standing in for
+        // "user" here.
+        assert_eq!(dup.body, "project version");
+        let collision = collisions
+            .iter()
+            .find(|c| c.name == "dup")
+            .expect("must report the collision");
+        assert_eq!(collision.resource_type, "prompt");
+        assert_eq!(collision.winner_path, Some(project_pdir.join("dup.md")));
+        assert_eq!(collision.loser_path, Some(user_pdir.join("dup.md")));
+        assert!(!collision.message.is_empty());
+        assert_eq!(collision.to_string(), collision.message);
     }
 
     #[test]
@@ -728,7 +791,7 @@ mod tests {
             "the same directory scanned via two paths must not double-count its templates: {found:?}"
         );
         assert!(
-            !collisions.iter().any(|c| c.contains("deploy")),
+            !collisions.iter().any(|c| c.to_string().contains("deploy")),
             "must not report a phantom self-collision: {collisions:?}"
         );
     }
@@ -740,9 +803,10 @@ mod tests {
         let (_, collisions) =
             discover_with_diagnostics(tmp.path(), true, &[missing.to_string_lossy().into_owned()]);
         assert!(
-            collisions
-                .iter()
-                .any(|c| c.contains("does not exist") && c.contains("does-not-exist")),
+            collisions.iter().any(|c| {
+                let m = c.to_string();
+                m.contains("does not exist") && m.contains("does-not-exist")
+            }),
             "got: {collisions:?}"
         );
     }
@@ -823,12 +887,19 @@ mod tests {
         );
         let dup = found.iter().find(|t| t.name == "dup").unwrap();
         assert_eq!(dup.body, "standard root version");
+        let collision = collisions
+            .iter()
+            .find(|c| c.name == "dup")
+            .expect("must report the collision");
         assert!(
-            collisions
-                .iter()
-                .any(|c| c.contains("dup") && c.contains("standard root wins")),
+            collision.to_string().contains("standard root wins"),
             "got: {collisions:?}"
         );
+        assert_eq!(collision.resource_type, "prompt");
+        assert_eq!(collision.winner_source, Some("standard root"));
+        assert_eq!(collision.loser_source, Some("--prompt-template"));
+        assert_eq!(collision.winner_path, Some(pdir.join("dup.md")));
+        assert_eq!(collision.loser_path, Some(extra_root.join("dup.md")));
     }
 
     #[test]

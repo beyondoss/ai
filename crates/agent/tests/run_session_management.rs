@@ -75,6 +75,145 @@ fn run_binary_session_flag_persists_and_resumes_across_invocations() {
 }
 
 #[test]
+fn run_binary_persists_and_resumes_a_session_by_default_with_no_session_flags_given() {
+    // pi-parity fix: a plain `run` with none of `--fork`/`--session`/`--continue` previously stayed
+    // in-memory-only — pi's own default (every mode, including one-shot print-mode) is a persisted,
+    // disk-backed session, matching `serve`'s own default repo-mode persistence. No `--continue` and no
+    // `--session` here at all: the second invocation must still pick up the first's history from the
+    // same per-cwd default repo `--continue` itself resolves against.
+    let home_dir = tempfile::tempdir().unwrap();
+    let project_dir = tempfile::tempdir().unwrap();
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+
+    let (base1, bodies1) = spawn_model_server(vec![turn_text("first answer")]);
+    let output1 = Command::new(bin)
+        .env("HOME", home_dir.path())
+        .args([
+            "run",
+            "remember the marker: default-persist-99",
+            "--gateway-url",
+            &base1,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+        ])
+        .current_dir(project_dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+    assert!(
+        output1.status.success(),
+        "first run failed.\nstderr: {}",
+        String::from_utf8_lossy(&output1.stderr)
+    );
+    drop(bodies1);
+    assert!(
+        home_dir.path().join(".claude/sessions").is_dir(),
+        "a plain no-flag run must persist under the default per-cwd sessions repo"
+    );
+
+    let (base2, bodies2) = spawn_model_server(vec![turn_text("second answer")]);
+    let output2 = Command::new(bin)
+        .env("HOME", home_dir.path())
+        .args([
+            "run",
+            "what was the marker?",
+            "--gateway-url",
+            &base2,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+        ])
+        .current_dir(project_dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+    assert!(
+        output2.status.success(),
+        "second run failed.\nstderr: {}",
+        String::from_utf8_lossy(&output2.stderr)
+    );
+
+    let bodies2 = bodies2.lock().unwrap();
+    assert!(
+        bodies2[0].contains("default-persist-99"),
+        "the second no-flag run must see the first no-flag run's history: {}",
+        bodies2[0]
+    );
+}
+
+#[test]
+fn run_binary_no_session_persistence_flag_opts_out_of_the_default_persistence() {
+    // The escape hatch for the fix above: `--no-session-persistence` restores the old ephemeral,
+    // in-memory-only behavior — no file on disk at all, and a second invocation has no history to see.
+    let home_dir = tempfile::tempdir().unwrap();
+    let project_dir = tempfile::tempdir().unwrap();
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+
+    let (base1, bodies1) = spawn_model_server(vec![turn_text("first answer")]);
+    let output1 = Command::new(bin)
+        .env("HOME", home_dir.path())
+        .args([
+            "run",
+            "remember the marker: should-not-persist-77",
+            "--gateway-url",
+            &base1,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--no-session-persistence",
+        ])
+        .current_dir(project_dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+    assert!(
+        output1.status.success(),
+        "first run failed.\nstderr: {}",
+        String::from_utf8_lossy(&output1.stderr)
+    );
+    drop(bodies1);
+    assert!(
+        !home_dir.path().join(".claude/sessions").exists(),
+        "--no-session-persistence must not create the default sessions repo at all"
+    );
+
+    let (base2, bodies2) = spawn_model_server(vec![turn_text("second answer")]);
+    let output2 = Command::new(bin)
+        .env("HOME", home_dir.path())
+        .args([
+            "run",
+            "what was the marker?",
+            "--gateway-url",
+            &base2,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--no-session-persistence",
+        ])
+        .current_dir(project_dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+    assert!(
+        output2.status.success(),
+        "second run failed.\nstderr: {}",
+        String::from_utf8_lossy(&output2.stderr)
+    );
+
+    let bodies2 = bodies2.lock().unwrap();
+    assert!(
+        !bodies2[0].contains("should-not-persist-77"),
+        "with --no-session-persistence the second run must not see the first run's history: {}",
+        bodies2[0]
+    );
+}
+
+#[test]
 fn run_binary_initializes_an_existing_empty_session_file_instead_of_hard_failing() {
     // Track L8: `--session <path>` pointing at a zero-byte file (e.g. `touch`'d ahead of time by a
     // caller that wants the path to already exist) must initialize it in place, not hard-fail with

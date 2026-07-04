@@ -494,6 +494,51 @@ impl Agent {
         }
         let _clear_stop_on_drop = ClearStopOnDrop(steering.clone());
         sink(AgentEvent::AgentStart);
+        // Drain the next-turn lane (pi's `nextTurnQueue`) before this run's very first request is
+        // built — a message queued via `Steering::push_next_turn` while the agent was idle (no run in
+        // flight for `push`/`push_steer` to attach to) must still land on turn 1 of whatever prompt
+        // comes next, not just eventually after a tool round-trip. Folded as leading content blocks on
+        // the same user turn the caller already pushed before calling this function, rather than as
+        // separate messages — inserting a *separate* user message here would land it right next to the
+        // caller's own user turn, a same-role pair no wire dialect accepts (`drain_steer`'s own
+        // "fold into the adjacent message" pattern, applied here instead of appending after).
+        let next_turn_queued = steering.drain_next_turn();
+        if !next_turn_queued.is_empty() {
+            let fold_into_prompt = session.messages.last().is_some_and(|m| m.role == Role::User);
+            if fold_into_prompt {
+                let mut prefix = Vec::with_capacity(next_turn_queued.len());
+                for msg in next_turn_queued {
+                    prefix.push(ContentBlock::text(msg.text));
+                    prefix.extend(
+                        msg.images
+                            .into_iter()
+                            .map(|source| ContentBlock::Image { source }),
+                    );
+                }
+                // `fold_into_prompt` already established `last_mut()` is `Some`.
+                if let Some(last) = Arc::make_mut(&mut session.messages).last_mut() {
+                    prefix.append(&mut last.content);
+                    last.content = prefix;
+                }
+            } else {
+                // No trailing user turn to fold onto (e.g. an empty session) — queue each as its own
+                // fresh user turn instead of losing it.
+                for msg in next_turn_queued {
+                    if msg.images.is_empty() {
+                        session.user(msg.text);
+                    } else {
+                        session.push(Message::user_with_images(msg.text, msg.images));
+                    }
+                }
+            }
+        }
+        // The user's own prompt (already pushed by the caller before this call, per every call site's
+        // own convention — see `session.user(...)` throughout this module's tests) — plus any
+        // next-turn message just folded onto it above — is durable now, before the model is ever
+        // called: a crash here must not lose it, exactly the exposure `CheckpointHook`'s own doc
+        // comment used to call out (the very first turn of a run was the one point a crash lost the
+        // user's own submitted prompt entirely).
+        self.checkpoint.checkpoint(session).await;
         // Set once we've already compacted to recover from a context-overflow this turn, so a second
         // overflow gives up instead of looping. Reset after each turn that lands cleanly.
         let mut overflow_recovered = false;
@@ -837,6 +882,14 @@ impl Agent {
                         }
                     }
                 }
+                // The assistant's tool-less reply is committed above (`session.push(assistant_message)`)
+                // regardless of how this branch resolves from here — a refusal, a graceful stop, or an
+                // ordinary end with nothing left to inject — so it's a valid, resumable checkpoint (see
+                // `CheckpointHook`) exactly like a tool round-trip's own pre-dispatch checkpoint just
+                // below this branch. Previously only the tool-calling half of a turn ever reached a
+                // checkpoint; a plain conversational reply (the model's *most* common shape) never did,
+                // silently relying on a caller's own post-run persist to ever see it recorded.
+                self.checkpoint.checkpoint(session).await;
                 // A refusal is a distinct terminal condition, not an ordinary stop: draining queued
                 // steer/follow-up messages here would inject a new user turn right after the model
                 // just declined to engage with the current one, which the model would likely refuse
@@ -905,8 +958,9 @@ impl Agent {
             // a crash mid-tool-execution (e.g. mid-`bash`) loses the record that the model asked for
             // these specific calls even though a tool that already ran (an `edit`, a `write`) already
             // took effect on disk — the persisted transcript and physical reality silently diverge on
-            // resume. Only reachable here (past the `calls.is_empty()` branch above), so a plain text
-            // turn with no tool calls doesn't pay for a redundant checkpoint before its own `AgentEnd`.
+            // resume. Only reachable here (past the `calls.is_empty()` branch above, which checkpoints
+            // its own tool-less case separately) — a call requesting tools never falls through to that
+            // other checkpoint, so this is the one and only checkpoint a `tool_use` turn pays for here.
             self.checkpoint.checkpoint(session).await;
 
             // Run the tools and feed results back as a single user turn. A tool's own failure becomes
@@ -1666,12 +1720,16 @@ impl Agent {
             .compaction
             .context_window
             .saturating_sub(self.compaction.reserve_tokens);
+        // `replace_instructions` is always `false` here: `summarize_branch`'s own signature has no
+        // caller-facing way to request it yet (no `switch_branch` RPC field threads it down) — see
+        // `branch_summary_request`'s own doc comment for the option itself.
         let req = self.with_reasoning(crate::branch_summary::branch_summary_request(
             &self.model,
             messages,
             self.compaction.summary_max_tokens,
             input_token_budget,
             custom_instructions,
+            false,
         ));
         let turn = self.run_utility_turn(req, cancel).await?;
         let summary: String = turn
@@ -6660,12 +6718,14 @@ mod tests {
 
     #[tokio::test]
     async fn checkpoint_fires_after_each_tool_round_trip_not_just_at_the_end() {
-        // Two tool round-trips followed by a final text turn: the checkpoint must fire *twice per
-        // round-trip* — once the instant the assistant's own `tool_use` turn is committed (before those
-        // tools ever run — a crash mid-execution must not lose the record that the model asked for
-        // them), and again once the matching `tool_results` land — and it must NOT fire for the final
-        // text-only turn's own `AgentEnd` (that path is already covered by a caller's own post-run
-        // persist).
+        // Two tool round-trips followed by a final text turn: the checkpoint must fire once before the
+        // very first request (covering the user's own prompt — the pi-parity gap where a crash before
+        // any tool round-trip completed used to lose it entirely), *twice per round-trip* — once the
+        // instant the assistant's own `tool_use` turn is committed (before those tools ever run — a
+        // crash mid-execution must not lose the record that the model asked for them), and again once
+        // the matching `tool_results` land — and once more for the final tool-less reply, before its own
+        // `AgentEnd`: a plain conversational turn is just as resumable a point as a tool round-trip's own
+        // halves, and must not rely solely on a caller's own post-run persist to ever be recorded.
         let mut tools = ToolRegistry::new();
         tools.register(Arc::new(EchoTool));
         let mock = Arc::new(MockTransport::new(vec![
@@ -6685,14 +6745,16 @@ mod tests {
         agent.run(&mut session, |_| {}).await.unwrap();
 
         let lens = checkpoint.lens.lock().unwrap().clone();
-        // user, assistant(tool_use) = 2 (pre-dispatch checkpoint) then +tool_results = 3
-        // (post-dispatch checkpoint); +assistant(tool_use) = 4, +tool_results = 5 for the second
-        // round-trip. The final text turn ends the run via `AgentEnd`, not a checkpoint.
+        // user = 1 (pre-first-request checkpoint); assistant(tool_use) = 2 (pre-dispatch checkpoint)
+        // then +tool_results = 3 (post-dispatch checkpoint); +assistant(tool_use) = 4, +tool_results = 5
+        // for the second round-trip; +assistant(text) = 6 for the final tool-less reply, checkpointed
+        // before its own `AgentEnd`.
         assert_eq!(
             lens,
-            vec![2, 3, 4, 5],
-            "checkpoint must fire both before dispatch (right after the tool_use turn commits) and \
-             after (once tool_results land), for each round-trip"
+            vec![1, 2, 3, 4, 5, 6],
+            "checkpoint must fire before the first request, both before dispatch (right after the \
+             tool_use turn commits) and after (once tool_results land) for each round-trip, and once \
+             more for the final tool-less reply"
         );
         assert_eq!(
             session.messages.len(),
@@ -6755,8 +6817,9 @@ mod tests {
         let lens = checkpoint.lens.lock().unwrap().clone();
         assert_eq!(
             lens,
-            vec![2],
-            "the tool_use turn must already be checkpointed even though the tool it called never \
+            vec![1, 2],
+            "the user's prompt must already be checkpointed before the first request (1), and the \
+             tool_use turn must already be checkpointed (2) even though the tool it called never \
              returned and the run was cancelled mid-dispatch"
         );
     }
@@ -6814,7 +6877,9 @@ mod tests {
     #[tokio::test]
     async fn checkpoint_fires_when_a_steered_message_is_injected_at_a_stop_boundary() {
         // A follow-up queued before the model would otherwise stop must also land on a checkpoint —
-        // the injected user message is itself a valid, resumable point.
+        // the injected user message is itself a valid, resumable point. Plus: every tool-less reply
+        // along the way (both "first answer", which continues via the queued follow-up, and "second
+        // answer", which actually ends the run) gets its own checkpoint too.
         let (agent, _mock) = agent_with(
             vec![turn::text("first answer"), turn::text("second answer")],
             ToolRegistry::new(),
@@ -6834,8 +6899,128 @@ mod tests {
             .unwrap();
 
         let lens = checkpoint.lens.lock().unwrap().clone();
-        // user, assistant("first answer"), user(follow-up) = 3, right when the follow-up is injected.
-        assert_eq!(lens, vec![3]);
+        // user = 1 (pre-first-request checkpoint); assistant("first answer") = 2 (tool-less-reply
+        // checkpoint); user(follow-up) = 3 (right when the follow-up is injected); assistant("second
+        // answer") = 4 (tool-less-reply checkpoint, right before this run's own final `AgentEnd`).
+        assert_eq!(lens, vec![1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_fires_before_returning_for_a_tool_less_reply_with_nothing_queued() {
+        // pi-parity gap (task 15): a run that never calls a tool at all — the single most common
+        // shape, a plain conversational reply — used to never reach a single checkpoint call before
+        // this fix, relying entirely on a caller's own post-run persist. It's now checkpointed right
+        // before its own `AgentEnd`, the same as every other terminal path in the loop.
+        let (agent, _mock) = agent_with(vec![turn::text("just a plain reply")], ToolRegistry::new());
+        let checkpoint = Arc::new(RecordingCheckpoint {
+            lens: std::sync::Mutex::new(Vec::new()),
+        });
+        let agent = agent.with_checkpoint_hook(checkpoint.clone());
+        let mut session = Session::new();
+        session.user("hi");
+
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        let lens = checkpoint.lens.lock().unwrap().clone();
+        // user = 1 (pre-first-request checkpoint); assistant(reply) = 2 (tool-less-reply checkpoint,
+        // right before the run's own `AgentEnd` — previously never reached at all).
+        assert_eq!(lens, vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_before_the_first_request_would_survive_a_crash_with_no_model_response_yet() {
+        // pi-parity gap (task 15): simulates the exact exposure this fix closes — a process killed
+        // between "the user's prompt is durably queued into the session" and "the model is ever
+        // called." Before this fix, nothing checkpointed the user's own prompt until *after* a full
+        // tool round-trip (or a would-stop boundary) completed, so a crash in this exact window lost
+        // the user's own prompt from the persisted transcript entirely — on restart it looked like it
+        // was never submitted. Confirms the *first* checkpoint call already fires before the model is
+        // ever invoked, and that its snapshot already contains the user's message.
+        struct SnapshotOnFirstCheckpoint {
+            mock: Arc<MockTransport>,
+            snapshot: std::sync::Mutex<Option<(usize, Vec<Message>)>>,
+        }
+        #[async_trait]
+        impl CheckpointHook for SnapshotOnFirstCheckpoint {
+            async fn checkpoint(&self, session: &Session) {
+                let mut guard = self.snapshot.lock().unwrap_or_else(|e| e.into_inner());
+                if guard.is_none() {
+                    *guard = Some((self.mock.calls(), session.messages.as_ref().clone()));
+                }
+            }
+        }
+
+        let (agent, mock) = agent_with(vec![turn::text("hello back")], ToolRegistry::new());
+        let checkpoint = Arc::new(SnapshotOnFirstCheckpoint {
+            mock: mock.clone(),
+            snapshot: std::sync::Mutex::new(None),
+        });
+        let agent = agent.with_checkpoint_hook(checkpoint.clone());
+        let mut session = Session::new();
+        session.user("don't lose me");
+
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        let (calls_at_first_checkpoint, messages_at_first_checkpoint) = checkpoint
+            .snapshot
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the checkpoint hook must have fired at least once");
+        assert_eq!(
+            calls_at_first_checkpoint, 0,
+            "the first checkpoint must fire before the model is ever called — a 'crash' right here \
+             must still find a durable copy of the user's prompt"
+        );
+        assert!(
+            messages_at_first_checkpoint.iter().any(|m| m.role == Role::User
+                && m.content.iter().any(
+                    |b| matches!(b, ContentBlock::Text { text, .. } if text == "don't lose me")
+                )),
+            "the user's own prompt must already be present in the snapshot a 'crash' here would \
+             leave behind: {messages_at_first_checkpoint:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn next_turn_queued_while_idle_lands_in_the_very_first_request_of_the_next_run() {
+        // pi-parity gap (task 43): pi's `nextTurnQueue` guarantees a message queued while idle is
+        // prepended to the very next prompt's own first model request — visible to the model on turn 1
+        // of that prompt, not just eventually after a tool round-trip or a stop boundary the way
+        // `steer`/`follow_up` are. Confirms `Steering::push_next_turn` actually reaches the first
+        // request `run_events_steered` sends, folded onto the same user turn as the prompt itself.
+        let (agent, mock) = agent_with(vec![turn::text("ok")], ToolRegistry::new());
+        let steering = Steering::new();
+        steering.push_next_turn("queued while idle");
+        let mut session = Session::new();
+        session.user("the actual prompt");
+
+        agent
+            .run_events_steered(&mut session, |_| {}, CancellationToken::new(), steering)
+            .await
+            .unwrap();
+
+        let requests = mock.requests();
+        let first_request = &requests[0];
+        let last_message = first_request
+            .messages
+            .last()
+            .expect("the first request must carry at least one message");
+        assert_eq!(last_message.role, Role::User);
+        let texts: Vec<&str> = last_message
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["queued while idle", "the actual prompt"],
+            "the next-turn message must be folded in front of the actual prompt, in the very first \
+             request this run sends"
+        );
     }
 
     #[tokio::test]

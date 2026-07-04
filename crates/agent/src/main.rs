@@ -14,11 +14,12 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+use std::fs;
 use std::io::{IsTerminal, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use agent_core::{Agent, GatewayClient, Session, StreamEvent};
+use agent_core::{Agent, GatewayClient, Session, StreamEvent, Tool};
 use beyond_ai_agent::policy::ToolPolicy;
 use beyond_ai_agent::session_store::{
     SessionMeta, SessionRepo, SessionStore, canonical_cwd, default_session_dir, fork_by_arg,
@@ -205,18 +206,22 @@ enum Command {
         #[arg(long, env = "AI_AGENT_SYSTEM_PROMPT")]
         system_prompt: Option<String>,
         /// Append extra instructions after the base system prompt (built-in, or `--system-prompt` if
-        /// also given). `serve`'s identical flag.
+        /// also given). Repeatable — pi-parity fix: previously a second occurrence silently clobbered
+        /// the first instead of accumulating (matches pi, whose `appendSystemPrompt` is itself an
+        /// array). Each occurrence is joined with the others by a blank line, in the order given.
+        /// `serve`'s identical flag.
         #[arg(long, env = "AI_AGENT_APPEND_SYSTEM_PROMPT")]
-        append_system_prompt: Option<String>,
+        append_system_prompt: Vec<String>,
         /// Trust `cwd` for this run only, so a project-local `.claude/SYSTEM.md` is honored even if
         /// `cwd` isn't in the persisted allowlist (`agent trust <path>`). A session-scoped override,
-        /// not a permanent grant — see `agent trust` to record one.
-        #[arg(long, default_value_t = false)]
+        /// not a permanent grant — see `agent trust` to record one. `-a` matches pi's own
+        /// `--approve`/`-a` (same "trust this project" meaning, different flag name here).
+        #[arg(short = 'a', long, default_value_t = false)]
         trust_project: bool,
         /// Force `cwd` *untrusted* for this run only, overriding both `--trust-project` and the
         /// persisted allowlist (`agent trust <path>`) — e.g. to test untrusted behavior against a
         /// directory that's otherwise permanently trusted. Wins over `--trust-project` if both are
-        /// somehow given.
+        /// somehow given. `-na` matches pi's own `--no-approve`/`-na`.
         #[arg(long, default_value_t = false)]
         force_untrusted: bool,
         /// Model context window (tokens); the loop summarizes older turns to stay below it. Defaults
@@ -233,6 +238,12 @@ enum Command {
         /// `CompactionConfig::default()`'s 40,000. `serve`'s identical flag.
         #[arg(long, env = "AI_AGENT_COMPACTION_KEEP_RECENT_TOKENS")]
         compaction_keep_recent_tokens: Option<u32>,
+        /// Disable automatic (threshold-triggered) compaction entirely — the loop only ever compacts on
+        /// a genuine overflow (`agent_core::CompactionConfig::enabled`'s own doc comment: manual/overflow
+        /// compaction ignores this setting), never proactively. For a caller that would rather fail/see
+        /// the raw context-window error than have older turns silently summarized away.
+        #[arg(long, env = "AI_AGENT_NO_COMPACTION", default_value_t = false)]
+        no_compaction: bool,
         /// How many times to retry a gateway request that fails before the first response byte
         /// arrives. Defaults to 3. `serve`'s identical flag.
         #[arg(long, env = "AI_AGENT_RETRY_MAX_RETRIES")]
@@ -257,15 +268,16 @@ enum Command {
         /// Restrict the tool set to exactly these names (comma-separated), dropping everything else.
         /// Combine with `--exclude-tools` to carve one back out of the allow-list. `serve`'s identical
         /// flag/env var — a deployment convention setting this env var to sandbox an agent must apply
-        /// here too, not just to `serve`.
-        #[arg(long, env = "AI_AGENT_TOOLS", value_delimiter = ',')]
+        /// here too, not just to `serve`. `-t` matches pi's own `--tools`/`-t`.
+        #[arg(short = 't', long, env = "AI_AGENT_TOOLS", value_delimiter = ',')]
         tools: Option<Vec<String>>,
         /// Drop these tools (comma-separated) from the default set — e.g. `--exclude-tools bash,write`
         /// for a read-only reviewer that can't run shell commands or mutate files. `serve`'s identical
-        /// flag/env var.
+        /// flag/env var. `-xt` matches pi's own `--exclude-tools`/`-xt`.
         #[arg(long, env = "AI_AGENT_EXCLUDE_TOOLS", value_delimiter = ',')]
         exclude_tools: Option<Vec<String>>,
         /// Register no tools at all — a pure-conversation run. Wins over `--tools`/`--exclude-tools`.
+        /// `-nt` matches pi's own `--no-tools`/`-nt`.
         #[arg(long, default_value_t = false)]
         no_tools: bool,
         /// Force every batch of tool calls in a turn to run one at a time instead of the default
@@ -280,31 +292,40 @@ enum Command {
         /// it was blocked by policy. Installs an `agent_core::AgentHooks` permission gate
         /// (`policy::ToolPolicy`) on the agent; a no-op (no hook installed at all) when combined with
         /// `--deny-bash-pattern` leaves the list empty.
-        #[arg(long, value_delimiter = ',')]
+        #[arg(long, env = "AI_AGENT_DENY_TOOL", value_delimiter = ',')]
         deny_tool: Vec<String>,
         /// Block a `bash` call whenever its command contains this substring, case-insensitively
         /// (comma-separated, repeatable) — e.g. `--deny-bash-pattern "rm -rf"`. Combines with
         /// `--deny-tool` under the same policy hook.
-        #[arg(long, value_delimiter = ',')]
+        #[arg(long, env = "AI_AGENT_DENY_BASH_PATTERN", value_delimiter = ',')]
         deny_bash_pattern: Vec<String>,
+        /// Block a `write`/`edit` call whenever its `path` argument matches this glob (comma-separated,
+        /// repeatable) — e.g. `--deny-path '.env,**/secrets/**'`. Same glob engine as `grep`'s
+        /// `--glob`/`find`'s pattern matching (`globset::Glob`). Combines with `--deny-tool`/
+        /// `--deny-bash-pattern` under the same policy hook.
+        #[arg(long, env = "AI_AGENT_DENY_PATH", value_delimiter = ',')]
+        deny_path: Vec<String>,
         /// Disable *standard-root* skills discovery/loading (`~/.claude/skills`, `<cwd>/.claude/skills`)
         /// — no `<available_skills>` listing in the system prompt from either, and a `/skill:name`
         /// invocation in the task message is sent through unexpanded unless it resolves against a
         /// `--skill` path instead. An explicit `--skill <path>` is still honored even so — pi's own
         /// `--no-skills` does the same (a documented, tested combination: it's a way to say "nothing
         /// auto-discovered, only what I explicitly listed", not "no skills at all"). A one-shot `run`
-        /// has no `reload` to re-enable it mid-process, unlike `serve`.
+        /// has no `reload` to re-enable it mid-process, unlike `serve`. `-ns` matches pi's own
+        /// `--no-skills`/`-ns`.
         #[arg(long, default_value_t = false)]
         no_skills: bool,
         /// Disable *standard-root* prompt-template discovery/loading (`~/.claude/prompts`,
         /// `<cwd>/.claude/prompts`) — a `/name` invocation in the task message is sent through
         /// unexpanded unless it resolves against a `--prompt-template` path instead. An explicit
         /// `--prompt-template <path>` is still honored even so, matching `--no-skills`'s identical
-        /// carve-out and pi's own `--no-prompt-templates`.
+        /// carve-out and pi's own `--no-prompt-templates`. `-np` matches pi's own
+        /// `--no-prompt-templates`/`-np`.
         #[arg(long, default_value_t = false)]
         no_prompt_templates: bool,
         /// Do not discover/inject AGENTS.md / CLAUDE.md project-instruction files. Matches `serve`'s
-        /// identical flag — `run` previously hardcoded this on with no way to opt out.
+        /// identical flag — `run` previously hardcoded this on with no way to opt out. `-nc` matches
+        /// pi's own `--no-context-files`/`-nc`.
         #[arg(long, default_value_t = false)]
         no_context_files: bool,
         /// Discover skills from this directory too, in addition to the two standard roots (repeatable).
@@ -347,27 +368,38 @@ enum Command {
         /// Use this exact session id instead of a freshly generated one — a caller (a script, a test
         /// harness) that wants a known, predictable id to correlate against rather than parsing it back
         /// out of the run's own output. Applies whenever a *new* `SessionMeta` is minted: a fresh
-        /// `--session <path>` (one that doesn't already exist) or a plain ephemeral run with neither
-        /// `--session` nor `--continue`; ignored when reopening an existing `--session <path>` or
-        /// resuming via `--continue` (the id is already fixed by whatever's on disk). Matches pi's own
-        /// `--session-id` flag.
+        /// `--session <path>` (one that doesn't already exist) or a plain run with neither `--session`
+        /// nor `--continue` given (still persisted by default — see `--no-session-persistence`); ignored
+        /// when reopening an existing `--session <path>` or resuming via `--continue` (the id is already
+        /// fixed by whatever's on disk). Matches pi's own `--session-id` flag.
         #[arg(long)]
         session_id: Option<String>,
         /// Continue the most recent session for the current directory (the same
         /// `~/.claude/sessions/<encoded-cwd>/` repo `serve` defaults to), creating one if this is the
-        /// first run here. Ignored if `--session` is also given.
+        /// first run here. Ignored if `--session` is also given. Kept as an explicit, self-documenting
+        /// spelling of what a plain no-flag `run` now does by default too (pi-parity fix — see
+        /// `--no-session-persistence`); harmless to pass either way.
         #[arg(long, short = 'c', default_value_t = false)]
         r#continue: bool,
         /// Use this directory as the session repo instead of the default `~/.claude/sessions/
         /// <encoded-cwd>/` — matches `serve`'s own `--session-dir`/`AI_AGENT_SESSION_DIR` (same flag,
         /// same meaning: the directory itself becomes the repo root, not a further per-cwd subdirectory
-        /// under it). Affects `--continue` and `--fork <id>`'s target project and cross-project search
-        /// root (that search then spans this directory's own siblings, matching how `serve`'s
-        /// `list_all_sessions` scopes its cross-project scan off `--session-dir`'s parent). Has no
-        /// effect on `--session <path>` (already names an exact file directly) or a plain no-flag run
-        /// (never persisted at all, so there is no repo to redirect).
+        /// under it). Affects `--continue`, `--fork <id>`'s target project and cross-project search root
+        /// (that search then spans this directory's own siblings, matching how `serve`'s
+        /// `list_all_sessions` scopes its cross-project scan off `--session-dir`'s parent), and a plain
+        /// no-flag run's own default repo. Has no effect on `--session <path>` (already names an exact
+        /// file directly) or `--no-session-persistence` (opts out of persistence entirely, so there is no
+        /// repo to redirect).
         #[arg(long, env = "AI_AGENT_SESSION_DIR")]
         session_dir: Option<String>,
+        /// Skip persistence entirely, even without `--session`/`--continue`/`--fork`. Without this, a
+        /// plain no-flag `run` now defaults to the same per-cwd repo `serve` does
+        /// (`~/.claude/sessions/<encoded-cwd>/`, or `--session-dir`) rather than running in-memory-only —
+        /// pass this for the rare case that's genuinely what you want (e.g. a short-lived script that
+        /// mustn't leave a session file behind). Matches `serve`'s identical flag, so the CLI vocabulary
+        /// for opting out is the same either way.
+        #[arg(long, default_value_t = false)]
+        no_session_persistence: bool,
         /// After the run completes, export the transcript as a self-contained HTML file at this path
         /// (parent directories are created as needed) — the same rendering `serve`'s `export_html` RPC
         /// command produces, for a one-shot run with no server involved.
@@ -419,10 +451,12 @@ enum Command {
         /// Replace the built-in base system prompt entirely.
         #[arg(long, env = "AI_AGENT_SYSTEM_PROMPT")]
         system_prompt: Option<String>,
-        /// Append extra instructions after the base system prompt.
+        /// Append extra instructions after the base system prompt. Repeatable — `run`'s identical flag;
+        /// each occurrence is joined with the others by a blank line, in the order given.
         #[arg(long, env = "AI_AGENT_APPEND_SYSTEM_PROMPT")]
-        append_system_prompt: Option<String>,
-        /// Do not discover/inject AGENTS.md / CLAUDE.md project-instruction files.
+        append_system_prompt: Vec<String>,
+        /// Do not discover/inject AGENTS.md / CLAUDE.md project-instruction files. `-nc` matches pi's
+        /// own `--no-context-files`/`-nc`.
         #[arg(long, default_value_t = false)]
         no_context_files: bool,
         /// Model context window (tokens); the loop summarizes older turns to stay below it. Defaults
@@ -454,13 +488,14 @@ enum Command {
         temperature: Option<f64>,
         /// Trust `cwd` for this run only, so a project-local `.claude/SYSTEM.md` is honored even if
         /// `cwd` isn't in the persisted allowlist (`agent trust <path>`). A session-scoped override,
-        /// not a permanent grant — see `agent trust` to record one.
-        #[arg(long, default_value_t = false)]
+        /// not a permanent grant — see `agent trust` to record one. `-a` matches pi's own
+        /// `--approve`/`-a` (same "trust this project" meaning, different flag name here).
+        #[arg(short = 'a', long, default_value_t = false)]
         trust_project: bool,
         /// Force `cwd` *untrusted* for this session only, overriding both `--trust-project` and the
         /// persisted allowlist (`agent trust <path>`) — e.g. to test untrusted behavior against a
         /// directory that's otherwise permanently trusted. Wins over `--trust-project` if both are
-        /// somehow given.
+        /// somehow given. `-na` matches pi's own `--no-approve`/`-na`.
         #[arg(long, default_value_t = false)]
         force_untrusted: bool,
         /// Compaction headroom (tokens) reserved below the context window before it fires. Defaults to
@@ -471,6 +506,12 @@ enum Command {
         /// `CompactionConfig::default()`'s 40,000.
         #[arg(long, env = "AI_AGENT_COMPACTION_KEEP_RECENT_TOKENS")]
         compaction_keep_recent_tokens: Option<u32>,
+        /// Disable automatic (threshold-triggered) compaction entirely — `run`'s identical flag. When
+        /// absent (and `AI_AGENT_NO_COMPACTION` unset), falls back to the persisted `agent settings`
+        /// `compaction_enabled` override before finally defaulting to enabled — see
+        /// `serve::ServeConfig::no_compaction`'s doc comment.
+        #[arg(long, env = "AI_AGENT_NO_COMPACTION", default_value_t = false)]
+        no_compaction: bool,
         /// How many times to retry a gateway request that fails before the first response byte
         /// arrives. Defaults to 3.
         #[arg(long, env = "AI_AGENT_RETRY_MAX_RETRIES")]
@@ -498,13 +539,16 @@ enum Command {
         bash_command_prefix: Option<String>,
         /// Restrict the tool set to exactly these names (comma-separated), dropping everything else.
         /// Fixed for the process, like `--system-prompt`; survives `set_model`/`set_thinking` rebuilds.
-        #[arg(long, env = "AI_AGENT_TOOLS", value_delimiter = ',')]
+        /// `-t` matches pi's own `--tools`/`-t`.
+        #[arg(short = 't', long, env = "AI_AGENT_TOOLS", value_delimiter = ',')]
         tools: Option<Vec<String>>,
         /// Drop these tools (comma-separated) from the default set — e.g. `--exclude-tools bash,write`
-        /// for a read-only reviewer that can't run shell commands or mutate files.
+        /// for a read-only reviewer that can't run shell commands or mutate files. `-xt` matches pi's
+        /// own `--exclude-tools`/`-xt`.
         #[arg(long, env = "AI_AGENT_EXCLUDE_TOOLS", value_delimiter = ',')]
         exclude_tools: Option<Vec<String>>,
         /// Register no tools at all — a pure-conversation session. Wins over `--tools`/`--exclude-tools`.
+        /// `-nt` matches pi's own `--no-tools`/`-nt`.
         #[arg(long, default_value_t = false)]
         no_tools: bool,
         /// Force every batch of tool calls in a turn to run one at a time instead of the default
@@ -522,6 +566,10 @@ enum Command {
         /// (comma-separated, repeatable). `run`'s identical flag.
         #[arg(long, env = "AI_AGENT_DENY_BASH_PATTERN", value_delimiter = ',')]
         deny_bash_pattern: Vec<String>,
+        /// Block a `write`/`edit` call whenever its `path` argument matches this glob (comma-separated,
+        /// repeatable). `run`'s identical flag.
+        #[arg(long, env = "AI_AGENT_DENY_PATH", value_delimiter = ',')]
+        deny_path: Vec<String>,
         /// Restrict `cycle_model`'s candidate list to exactly these ids, in this order
         /// (comma-separated) — e.g. `--models claude-opus-4-8,claude-sonnet-4-5,gpt-5`.
         /// `set_model`/`get_available_models` are unaffected; empty/absent cycles the full known-model
@@ -533,14 +581,14 @@ enum Command {
         /// invocation (however it reaches the session — `prompt`, `steer`, `follow_up`) is sent through
         /// unexpanded unless it resolves against a `--skill` path instead. An explicit `--skill <path>`
         /// is still honored even so, matching `run`'s identical flag and pi's own `--no-skills`. Applies
-        /// on every `reload` too.
+        /// on every `reload` too. `-ns` matches pi's own `--no-skills`/`-ns`.
         #[arg(long, default_value_t = false)]
         no_skills: bool,
         /// Disable *standard-root* prompt-template discovery/loading (`~/.claude/prompts`,
         /// `<cwd>/.claude/prompts`) — a `/name` invocation is sent through unexpanded unless it resolves
         /// against a `--prompt-template` path instead. An explicit `--prompt-template <path>` is still
         /// honored even so, matching `run`'s identical flag and pi's own `--no-prompt-templates`. Applies
-        /// on every `reload` too.
+        /// on every `reload` too. `-np` matches pi's own `--no-prompt-templates`/`-np`.
         #[arg(long, default_value_t = false)]
         no_prompt_templates: bool,
         /// Discover skills from this directory too, in addition to the two standard roots (repeatable).
@@ -571,7 +619,11 @@ enum Command {
     /// List a small, non-exhaustive set of model ids the capabilities table recognizes (a convenience
     /// hint for a model picker — the gateway forwards any id verbatim, so `--model`/`set_model` accept
     /// ids outside this list too).
-    ListModels,
+    ListModels {
+        /// Only print rows whose model id contains this substring, case-insensitively — a convenience
+        /// filter for a long list, matching pi's own `--list-models <search>`. Absent: print every row.
+        search: Option<String>,
+    },
     /// Record `path` (default: the current directory) in the persisted project-trust allowlist
     /// (`~/.claude/trusted-projects.json`), so its `.claude/SYSTEM.md` is honored on future runs
     /// without needing `--trust-project` every time. Idempotent — trusting an already-trusted path is
@@ -628,6 +680,13 @@ enum Command {
         /// Clear the stored default session directory.
         #[arg(long, default_value_t = false)]
         clear_session_dir: bool,
+        /// Set the stored default project-trust policy — `always`/`never`/`ask` (used when neither
+        /// `--trust-project` nor `--force-untrusted` is given; see `settings::TrustPolicy`).
+        #[arg(long)]
+        default_project_trust: Option<beyond_ai_agent::settings::TrustPolicy>,
+        /// Clear the stored default project-trust policy.
+        #[arg(long, default_value_t = false)]
+        clear_default_project_trust: bool,
     },
     /// Render an existing session's `.jsonl` file as a self-contained HTML transcript and exit — pure
     /// offline rendering of what's already on disk, no gateway/key/model involved at all (unlike `run
@@ -640,6 +699,42 @@ enum Command {
         /// Output HTML path. Defaults to `session-<timestamp>.html` in the current directory.
         output: Option<String>,
     },
+}
+
+/// Rewrites the multi-character short-flag aliases pi's own hand-rolled CLI parser accepts
+/// (`cli/args.ts`) to their long-flag equivalent before clap ever sees them. clap's own `short`
+/// mechanism (used below for the single-character aliases, e.g. `-t`/`-a`) is exactly one ASCII
+/// character, so a two-character form like `-nt` can't be expressed that way directly — pi's parser has
+/// no such restriction (it's hand-rolled, not clap-based). An exact whole-token match only (mirrors
+/// pi's own `arg === "-nt"` checks): never a prefix, so this can't misfire against an unrelated value
+/// that merely starts with the same two characters, and never touches anything after `--` (clap's own
+/// end-of-options marker) since that's the operator explicitly opting every remaining argument out of
+/// flag parsing.
+fn expand_short_aliases(args: Vec<String>) -> Vec<String> {
+    let expand = |a: &str| -> Option<&'static str> {
+        match a {
+            "-nt" => Some("--no-tools"),
+            "-xt" => Some("--exclude-tools"),
+            "-ns" => Some("--no-skills"),
+            "-np" => Some("--no-prompt-templates"),
+            "-nc" => Some("--no-context-files"),
+            "-na" => Some("--force-untrusted"),
+            _ => None,
+        }
+    };
+    let mut past_end_of_options = false;
+    args.into_iter()
+        .map(|a| {
+            if past_end_of_options {
+                return a;
+            }
+            if a == "--" {
+                past_end_of_options = true;
+                return a;
+            }
+            expand(&a).map(str::to_string).unwrap_or(a)
+        })
+        .collect()
 }
 
 /// [`Cli::parse`], except a `--help`/`-h` triggered while `run --json` is also present renders to
@@ -659,12 +754,13 @@ enum Command {
 /// help flag present anywhere else — sidesteps that: it doesn't need parsing to have succeeded, and a
 /// `--json`/`--help`/`-h` substring can only appear as those literal flags here, never as a task
 /// message (an argument starting with `-` is consumed as a flag by clap, not a positional, unless
-/// explicitly escaped with `--`).
+/// explicitly escaped with `--`). `args` here is already run through [`expand_short_aliases`], so the
+/// argv-position/substring checks below see the expanded (long-flag) form too.
 fn cli() -> Cli {
-    match Cli::try_parse() {
+    let args = expand_short_aliases(std::env::args().collect());
+    match Cli::try_parse_from(&args) {
         Ok(cli) => cli,
         Err(e) => {
-            let args: Vec<String> = std::env::args().collect();
             let run_json_help = args.get(1).map(String::as_str) == Some("run")
                 && args.iter().any(|a| a == "--json")
                 && args.iter().any(|a| a == "--help" || a == "-h");
@@ -717,6 +813,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             context_window,
             compaction_reserve_tokens,
             compaction_keep_recent_tokens,
+            no_compaction,
             retry_max_retries,
             retry_base_delay_ms,
             bash_timeout_ms,
@@ -728,6 +825,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             sequential_tools,
             deny_tool,
             deny_bash_pattern,
+            deny_path,
             no_skills,
             no_prompt_templates,
             no_context_files,
@@ -740,6 +838,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             session_id,
             r#continue,
             session_dir,
+            no_session_persistence,
             export,
             json,
         } => {
@@ -761,6 +860,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 context_window,
                 compaction_reserve_tokens,
                 compaction_keep_recent_tokens,
+                no_compaction,
                 retry_max_retries,
                 retry_base_delay_ms,
                 bash_timeout_ms,
@@ -772,6 +872,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 sequential_tools,
                 deny_tool,
                 deny_bash_pattern,
+                deny_path,
                 no_skills,
                 no_prompt_templates,
                 no_context_files,
@@ -784,6 +885,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 session_id,
                 r#continue,
                 session_dir,
+                no_session_persistence,
                 export,
                 json,
             )
@@ -811,6 +913,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             force_untrusted,
             compaction_reserve_tokens,
             compaction_keep_recent_tokens,
+            no_compaction,
             retry_max_retries,
             retry_base_delay_ms,
             bash_timeout_ms,
@@ -822,6 +925,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             sequential_tools,
             deny_tool,
             deny_bash_pattern,
+            deny_path,
             models,
             no_skills,
             no_prompt_templates,
@@ -855,18 +959,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .into());
                 }
             }
-            let system = system_prompt.unwrap_or_else(|| {
-                // Shell-path override doesn't affect this registry's use (listing tool
-                // names/descriptions for the default system prompt) — `describe()` doesn't mention it.
-                let mut reg = tools::default_registry_with(bash_timeout_ms, None);
-                tools::apply_filter(
-                    &mut reg,
-                    tools.as_deref(),
-                    exclude_tools.as_deref(),
-                    no_tools,
-                );
-                default_system_prompt(&reg, &prompt_guidelines)
-            });
+            // `--system-prompt`/`--append-system-prompt` may each name an existing, readable file
+            // instead of literal text (pi-parity fix — matches pi's own `resolvePromptInput`). `run`'s
+            // identical resolution (`main.rs::resolve_prompt_input`).
+            let system = system_prompt
+                .as_deref()
+                .map(resolve_prompt_input)
+                .unwrap_or_else(|| {
+                    // Shell-path override doesn't affect this registry's use (listing tool
+                    // names/descriptions for the default system prompt) — `describe()` doesn't mention it.
+                    let mut reg = tools::default_registry_with(bash_timeout_ms, None);
+                    tools::apply_filter(
+                        &mut reg,
+                        tools.as_deref(),
+                        exclude_tools.as_deref(),
+                        no_tools,
+                    );
+                    default_system_prompt(&reg, &prompt_guidelines)
+                });
+            // `--append-system-prompt` is repeatable (pi-parity fix: previously a second occurrence
+            // silently clobbered the first instead of accumulating) — each occurrence is resolved
+            // independently, then joined into one block. `run`'s identical handling.
+            let append_system_prompt = {
+                let resolved: Vec<String> = append_system_prompt
+                    .iter()
+                    .map(|s| resolve_prompt_input(s))
+                    .collect();
+                (!resolved.is_empty()).then(|| resolved.join("\n\n"))
+            };
             // A stored `agent settings` default sits between an explicit flag/env var and this crate's
             // own built-in default — same convention `run_task` applies (see its identical comment).
             let stored_settings = beyond_ai_agent::settings::SettingsStore::open_default();
@@ -907,6 +1027,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 force_untrusted,
                 compaction_reserve_tokens,
                 compaction_keep_recent_tokens,
+                no_compaction,
                 retry_max_retries,
                 retry_base_delay_ms: retry_base_delay_ms.map(std::time::Duration::from_millis),
                 bash_timeout_ms,
@@ -918,6 +1039,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 sequential_tools,
                 deny_tool,
                 deny_bash_pattern,
+                deny_path,
                 models: models.unwrap_or_default(),
                 no_skills,
                 no_prompt_templates,
@@ -942,18 +1064,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{} tools:\n", reg.len());
             println!("{}", serde_json::to_string_pretty(&reg.definitions())?);
         }
-        Command::ListModels => {
+        Command::ListModels { search } => {
             // Pi-parity fix: previously a bare list of ids — pi's own `--list-models` prints a table
             // (provider/model/context/max-out/thinking/images) built from data its model catalogue
             // already carries. Beyond has no separate provider field (a model id is forwarded verbatim;
             // see `agent_core::models`'s own module doc comment), so this mirrors the rest of pi's
             // columns from `agent_core::capabilities`, which already computes every one of them for
             // wire-shaping — nothing new is invented here, just surfaced.
+            //
+            // pi-parity fix: an optional positional `search` filters to model ids containing it
+            // (case-insensitive substring — matches pi's own `--list-models <search>`), for a long list
+            // with no separate provider column to filter on here (see the comment above).
+            let needle = search.map(|s| s.to_ascii_lowercase());
             println!(
                 "{:<22} {:>10} {:>9} {:<8} {:<6}",
                 "model", "context", "max-out", "thinking", "vision"
             );
             for model in serve::available_models() {
+                if let Some(needle) = &needle {
+                    if !model.to_ascii_lowercase().contains(needle.as_str()) {
+                        continue;
+                    }
+                }
                 let caps = agent_core::capabilities(model);
                 let thinking = caps.reasoning_effort
                     || caps.thinking != agent_core::models::ThinkingShape::None;
@@ -1014,6 +1146,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             clear_gateway_url,
             session_dir,
             clear_session_dir,
+            default_project_trust,
+            clear_default_project_trust,
         } => {
             let mut store = beyond_ai_agent::settings::SettingsStore::open_default();
             let any_write = model.is_some()
@@ -1021,7 +1155,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 || gateway_url.is_some()
                 || clear_gateway_url
                 || session_dir.is_some()
-                || clear_session_dir;
+                || clear_session_dir
+                || default_project_trust.is_some()
+                || clear_default_project_trust;
             if model.is_some() || clear_model {
                 store.set_default_model(model)?;
             }
@@ -1030,6 +1166,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             if session_dir.is_some() || clear_session_dir {
                 store.set_default_session_dir(session_dir)?;
+            }
+            if default_project_trust.is_some() || clear_default_project_trust {
+                store.set_default_project_trust(default_project_trust)?;
             }
             if any_write {
                 println!("updated settings:");
@@ -1047,16 +1186,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "default_session_dir: {}",
                 s.default_session_dir.as_deref().unwrap_or("(not set)")
             );
+            println!(
+                "default_project_trust: {}",
+                match s.default_project_trust {
+                    Some(beyond_ai_agent::settings::TrustPolicy::Always) => "always",
+                    Some(beyond_ai_agent::settings::TrustPolicy::Never) => "never",
+                    Some(beyond_ai_agent::settings::TrustPolicy::Ask) => "ask",
+                    None => "(not set)",
+                }
+            );
         }
         Command::Export { session, output } => {
             let (store, sess) =
                 beyond_ai_agent::session_store::SessionStore::open(PathBuf::from(&session))
                     .map_err(|e| format!("failed to open session {session}: {e}"))?;
             let branches = store.abandoned_branches();
-            let path = beyond_ai_agent::export::export_html(
+            let path = beyond_ai_agent::export::export_html_with_entries(
                 store.meta(),
                 &sess.messages,
                 &branches,
+                store.export_events(),
                 output.as_deref(),
             )?;
             println!("Exported to: {}", path.display());
@@ -1079,22 +1228,116 @@ fn partition_tasks(tasks: Vec<String>) -> (Vec<String>, Vec<String>) {
     (file_refs, messages)
 }
 
-/// Read each of `file_refs` (resolved against `cwd`; an already-absolute ref is used as-is) and wrap
-/// its contents in a `<file name="...">` block, concatenated in argument order. Errors naming the
-/// first unreadable file, so a typo'd `@path` fails loudly instead of silently vanishing from the
-/// prompt.
-fn read_file_refs(file_refs: &[String], cwd: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    let mut out = String::new();
+/// Text plus image attachments gathered from `@file` references, kept separate so the caller can
+/// build a `Message::user_with_images` turn when any image was found, rather than folding raw binary
+/// bytes into the same string every plain-text `@file` reference produces.
+#[derive(Debug)]
+struct FileRefs {
+    text: String,
+    images: Vec<agent_core::ImageSource>,
+}
+
+/// How many leading bytes are read to identify a supported image format by magic bytes (PNG's 8-byte
+/// signature, WebP's 12-byte `RIFF....WEBP` header, ...). Deliberately far short of `tools::read`'s own
+/// 4100-byte sniff window — that budget exists solely to reach a PNG's `acTL` chunk for the
+/// animated-PNG check, which this probe doesn't need to make itself (see [`looks_like_image`]'s doc
+/// comment): it only decides whether a file is worth routing through the `read` tool's full image
+/// pipeline at all, so every ordinary (non-image) `@file` reference — the overwhelming majority — pays
+/// for just this one short read, not a second full-file pass.
+const IMAGE_SNIFF_LEN: usize = 32;
+
+/// Whether `path`'s leading bytes match one of the image formats the `read` tool can inline as an
+/// attachment. Mirrors `tools::read`'s own magic-byte probe (matching only the five formats it can
+/// actually encode/re-encode) rather than reinventing format detection — `tools::read`'s sniffing
+/// helpers are private to that module, so the same `image::guess_format` call it wraps is made
+/// directly here instead. A `false` here doesn't rule out `path` truly being an image under a
+/// corrupted/truncated header, nor does it fall back to guessing by extension the way the `read`
+/// *tool* does for a model-issued call — matching pi's own CLI `@file` processor
+/// (`detectSupportedImageMimeTypeFromFile`), which likewise never falls back to extension guessing at
+/// this layer (only `read.ts`'s tool-call path does). A file that only *looks* like an image by name
+/// still reads as plain text below, same as before this fix.
+fn looks_like_image(path: &Path) -> bool {
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = [0u8; IMAGE_SNIFF_LEN];
+    let Ok(n) = f.read(&mut buf) else {
+        return false;
+    };
+    matches!(
+        image::guess_format(&buf[..n]),
+        Ok(
+            image::ImageFormat::Png
+                | image::ImageFormat::Jpeg
+                | image::ImageFormat::Gif
+                | image::ImageFormat::WebP
+                | image::ImageFormat::Bmp
+        )
+    )
+}
+
+/// Read each of `file_refs` (resolved against `cwd`; an already-absolute ref is used as-is). A plain
+/// (non-image) file's contents are wrapped in a `<file name="...">` block, concatenated in argument
+/// order — unchanged from before this fix. A file whose leading bytes identify it as an image (see
+/// [`looks_like_image`]) is instead run through the `read` tool's own image pipeline (sniffing,
+/// decode/validate, downscale-to-budget, format conversion) so it can be attached as a real
+/// [`agent_core::ImageSource`] rather than handed to `std::fs::read_to_string`, which errors outright
+/// on binary image bytes — the crash this fix closes (`run @screenshot.png "..."` previously failed
+/// instead of attaching the screenshot). Errors naming the first unreadable (or undecodable) file, so
+/// a typo'd `@path` — or a genuinely corrupt image — fails loudly instead of silently vanishing from
+/// the prompt.
+async fn read_file_refs(
+    file_refs: &[String],
+    cwd: &Path,
+) -> Result<FileRefs, Box<dyn std::error::Error>> {
+    let mut text = String::new();
+    let mut images = Vec::new();
     for r in file_refs {
         let path = cwd.join(r);
+        if looks_like_image(&path) {
+            let path_str = path.to_string_lossy().into_owned();
+            let out = tools::read::Read
+                .run(serde_json::json!({ "path": path_str }))
+                .await
+                .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+            // `out.images` is empty here only when the `read` tool sniffed a real image but couldn't
+            // inline it (too large to downscale under budget, or a BMP that failed to convert) —
+            // `out.text` already carries a `"[Image omitted: ...]"` explanation in that case, so use it
+            // as the note rather than falling through to a UTF-8 read of binary image bytes.
+            images.extend(out.images);
+            if !out.text.is_empty() {
+                text.push_str(&format!(
+                    "<file name=\"{}\">{}</file>\n",
+                    path.display(),
+                    out.text
+                ));
+            }
+            continue;
+        }
         let content = std::fs::read_to_string(&path)
             .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-        out.push_str(&format!(
+        text.push_str(&format!(
             "<file name=\"{}\">\n{content}\n</file>\n",
             path.display()
         ));
     }
-    Ok(out)
+    Ok(FileRefs { text, images })
+}
+
+/// Resolve a `--system-prompt`/`--append-system-prompt` value: if it names an existing, readable file,
+/// its contents are used instead of the literal string — matches pi's own `resolvePromptInput`
+/// (`existsSync(input)` check, then reads the file if so). Falls back to the literal value on a read
+/// error (permission denied, a race where the file vanished between the exists check and the read)
+/// rather than failing the whole invocation over what might still be a perfectly good literal string
+/// that merely happens to look like a path.
+fn resolve_prompt_input(raw: &str) -> String {
+    let path = Path::new(raw);
+    if path.is_file() {
+        if let Ok(contents) = fs::read_to_string(path) {
+            return contents;
+        }
+    }
+    raw.to_string()
 }
 
 /// The full contents of stdin, if it's piped (not an interactive terminal) and non-empty. `None`
@@ -1323,12 +1566,13 @@ async fn run_task(
     reasoning_effort: Option<agent_core::ReasoningEffort>,
     temperature: Option<f64>,
     system_prompt: Option<String>,
-    append_system_prompt: Option<String>,
+    append_system_prompt: Vec<String>,
     trust_project: bool,
     force_untrusted: bool,
     context_window: Option<u32>,
     compaction_reserve_tokens: Option<u32>,
     compaction_keep_recent_tokens: Option<u32>,
+    no_compaction: bool,
     retry_max_retries: Option<u32>,
     retry_base_delay_ms: Option<u64>,
     bash_timeout_ms: Option<u64>,
@@ -1340,6 +1584,7 @@ async fn run_task(
     sequential_tools: bool,
     deny_tool: Vec<String>,
     deny_bash_pattern: Vec<String>,
+    deny_path: Vec<String>,
     no_skills: bool,
     no_prompt_templates: bool,
     no_context_files: bool,
@@ -1352,6 +1597,7 @@ async fn run_task(
     session_id: Option<String>,
     continue_session: bool,
     session_dir: Option<String>,
+    no_session_persistence: bool,
     export: Option<String>,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1383,21 +1629,24 @@ async fn run_task(
     // Compose the first message from (in order) piped stdin, `@file` contents, then the first
     // plain-text message argument — mirroring the reference agent's own composition order. At least
     // one source must contribute something; a typo'd invocation with none of the three fails loudly
-    // here rather than sending the model an empty prompt.
+    // here rather than sending the model an empty prompt. An `@file` reference that's actually an image
+    // (see `read_file_refs`) contributes no text of its own but still counts as "something", so an
+    // invocation like `run @screenshot.png` with no other text still proceeds.
     let (file_refs, mut messages) = partition_tasks(tasks);
     let stdin_content = read_stdin_if_piped();
-    let file_content = read_file_refs(&file_refs, &cwd)?;
+    let file_refs = read_file_refs(&file_refs, &cwd).await?;
+    let initial_images = file_refs.images;
     let mut parts = Vec::new();
     if let Some(s) = stdin_content {
         parts.push(s);
     }
-    if !file_content.is_empty() {
-        parts.push(file_content);
+    if !file_refs.text.is_empty() {
+        parts.push(file_refs.text);
     }
     if !messages.is_empty() {
         parts.push(messages.remove(0));
     }
-    if parts.is_empty() {
+    if parts.is_empty() && initial_images.is_empty() {
         return Err("no task given: pass a message, an @file, or pipe input via stdin".into());
     }
     let initial_message = parts.join("");
@@ -1424,10 +1673,41 @@ async fn run_task(
     let key =
         key.ok_or("no gateway key: pass --key or set AI_AGENT_KEY (a bai_v1… virtual key)")?;
 
-    let project_trusted = !force_untrusted
-        && (trust_project
-            || beyond_ai_agent::trust_store::TrustStore::open_default().is_trusted(&cwd)
-            || !beyond_ai_agent::trust_store::has_trust_gated_resources(&cwd));
+    // Computed once and reused below (rather than called again inside the warning check) — it's a
+    // filesystem walk (`has_trust_gated_resources`'s own doc comment), not free.
+    let has_gated_resources = beyond_ai_agent::trust_store::has_trust_gated_resources(&cwd);
+    // `--trust-project`/`--force-untrusted` always win outright when explicitly given — a persisted
+    // `agent settings --default-project-trust` policy (pi-parity fix) is consulted only in their
+    // absence, same precedence tier as `default_model`/`default_gateway_url` above (an explicit
+    // per-run flag over a stored global default over this crate's own built-in behavior).
+    let project_trusted = if force_untrusted {
+        false
+    } else if trust_project {
+        true
+    } else {
+        use beyond_ai_agent::settings::TrustPolicy;
+        match stored_settings.get().default_project_trust {
+            Some(TrustPolicy::Always) => true,
+            Some(TrustPolicy::Never) => false,
+            Some(TrustPolicy::Ask) | None => {
+                beyond_ai_agent::trust_store::TrustStore::open_default().is_trusted(&cwd)
+                    || !has_gated_resources
+            }
+        }
+    };
+    // pi-parity fix: an untrusted project with a `SYSTEM.md`/skills/prompts on disk silently skipped all
+    // of them with no signal at all that anything was there — an operator debugging "why isn't my
+    // SYSTEM.md taking effect" had nothing to go on. One line, matching this function's existing
+    // `warning: ...` convention (see the `cwd_is_stale` check further down).
+    if !project_trusted && has_gated_resources {
+        eprintln!(
+            "warning: {} has a project-local SYSTEM.md/APPEND_SYSTEM.md, skills, or prompt templates \
+             on disk, but the project isn't trusted, so they were skipped — pass --trust-project or run \
+             `agent trust {}` to enable them",
+            cwd.display(),
+            cwd.display()
+        );
+    }
     // Discovered once, up front: a one-shot `run` has no `reload` to re-discover mid-process, unlike
     // `serve`. `/skill:name` and `/name` prompt-template invocations are expanded here exactly like
     // `serve`'s own "prompt" handler does — this was previously silently skipped in `run`, so a message
@@ -1460,25 +1740,50 @@ async fn run_task(
         tools_exclude.as_deref(),
         no_tools,
     );
-    // `--system-prompt` replaces the built-in base entirely — matches `serve`'s identical flag, and
-    // the same on-disk `SYSTEM.md` override still applies on top inside `build_system_prompt` either
-    // way (an explicit CLI flag doesn't disable that; a project's own `SYSTEM.md` still wins).
-    let base =
-        system_prompt.unwrap_or_else(|| default_system_prompt(&registry, &prompt_guidelines));
+    // `--system-prompt`/`--append-system-prompt` may each name an existing, readable file instead of
+    // literal text (pi-parity fix — matches pi's own `resolvePromptInput`); resolved once, here, rather
+    // than re-deriving it at each of the several places downstream that would otherwise need to repeat
+    // the same file-vs-literal check. `--append-system-prompt` is repeatable (pi-parity fix: previously
+    // a second occurrence silently clobbered the first instead of accumulating) — each occurrence is
+    // resolved independently, then joined into one block.
+    let system_prompt = system_prompt.as_deref().map(resolve_prompt_input);
+    let append_system_prompt = {
+        let resolved: Vec<String> = append_system_prompt
+            .iter()
+            .map(|s| resolve_prompt_input(s))
+            .collect();
+        (!resolved.is_empty()).then(|| resolved.join("\n\n"))
+    };
+    // `--system-prompt` replaces the built-in base entirely — matches `serve`'s identical flag. Threaded
+    // through as `Some`/`None` (rather than pre-collapsed with the computed default here) so
+    // `build_system_prompt` can tell "an explicit override was given" apart from "nothing given, use the
+    // built-in default" — an explicit flag must win outright over a trusted project's on-disk
+    // `SYSTEM.md`, which previously always won regardless (pi-parity fix).
+    let default_base = default_system_prompt(&registry, &prompt_guidelines);
+    // Skills are discovered by path, not inlined into the prompt — invoking one relies on the model
+    // being able to open its `SKILL.md` itself, so advertising them at all when `read` isn't registered
+    // (a restricted `--tools`/`--exclude-tools` invocation) just adds dead weight (pi-parity fix).
+    let has_read = registry.get("read").is_some();
     let system = beyond_ai_agent::resources::build_system_prompt(
         &beyond_ai_agent::resources::PromptOptions {
-            base: &base,
+            base: system_prompt.as_deref(),
+            default_base: &default_base,
             append: append_system_prompt.as_deref(),
             cwd: &cwd,
             include_context_files: !no_context_files,
             skills: &skills,
+            has_read,
             project_trusted,
         },
     );
     timing.mark("build system prompt");
 
     // `--session`/`--continue` persist this run (and load prior history to continue it) exactly like
-    // `serve`'s own repo/file modes; neither given keeps `run` in-memory-only, as before.
+    // `serve`'s own repo/file modes. pi-parity fix: neither given previously kept `run` in-memory-only —
+    // pi's own default (no flags at all, including one-shot print-mode) is a persisted, disk-backed
+    // session, matching `serve`'s own default repo-mode persistence; only an explicit
+    // `--no-session-persistence` now opts back out to the old ephemeral behavior (see the final `None`
+    // arm below).
     let cwd_str = cwd.to_string_lossy().into_owned();
     // `--session-id`, when given, applies only where a *new* `SessionMeta` is actually minted below —
     // reopening an existing `--session <path>` or resuming via `--continue` already has a fixed id from
@@ -1567,6 +1872,19 @@ async fn run_task(
                 let (store, session) = repo.resume_or_create(&cwd_str, &model, None)?;
                 (Some(store), session)
             }
+            // pi-parity fix: previously always `(None, Session::new())` — in-memory only. Matches
+            // `serve`'s own default (no `--session-file`/`--session-dir` given) exactly: the same
+            // per-cwd repo, reattaching to this directory's most recent session if one already exists
+            // rather than starting fresh every single invocation (`SessionRepo::resume_or_create`'s own
+            // doc comment). `--session-id` *does* apply here (unlike the `--continue` arm above) — this
+            // is exactly the "plain ephemeral run" case that flag's own doc comment already documents it
+            // for.
+            None if !no_session_persistence => {
+                let repo = SessionRepo::open(&repo_dir)?;
+                let (store, session) =
+                    repo.resume_or_create(&cwd_str, &model, session_id.as_deref())?;
+                (Some(store), session)
+            }
             None => (None, Session::new()),
         }
     };
@@ -1644,6 +1962,9 @@ async fn run_task(
     if let Some(keep_recent) = compaction_keep_recent_tokens {
         compaction.keep_recent_tokens = keep_recent;
     }
+    if no_compaction {
+        compaction.enabled = false;
+    }
     let mut agent = Agent::new(Arc::new(client), model.clone())
         .with_tools(registry)
         .with_system(system)
@@ -1667,7 +1988,7 @@ async fn run_task(
     if let Some(max_tokens) = max_tokens {
         agent = agent.with_max_tokens(max_tokens);
     }
-    let policy = ToolPolicy::from_lists(&deny_tool, &deny_bash_pattern);
+    let policy = ToolPolicy::from_lists(&deny_tool, &deny_bash_pattern, &deny_path);
     if !policy.is_empty() {
         agent = agent.with_hooks(Arc::new(policy));
     }
@@ -1702,7 +2023,15 @@ async fn run_task(
         }
     });
 
-    session.user(expand_message(&initial_message, &skills, &prompt_templates));
+    let initial_message = expand_message(&initial_message, &skills, &prompt_templates);
+    if initial_images.is_empty() {
+        session.user(initial_message);
+    } else {
+        session.push(agent_core::Message::user_with_images(
+            initial_message,
+            initial_images,
+        ));
+    }
     let turn_result = run_turn(&agent, &mut session, json, &cancel).await;
     // Persist whatever's in `session` regardless of outcome: `run_events_cancellable` mutates
     // `session` in place as it streams, so a cancelled turn still leaves behind whatever
@@ -1720,16 +2049,18 @@ async fn run_task(
     }
 
     if let Some(export) = export {
-        let branches = store
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .map(|s| s.abandoned_branches())
-            .unwrap_or_default();
-        match beyond_ai_agent::export::export_html(
+        let (branches, events) = {
+            let guard = store.lock().unwrap_or_else(|e| e.into_inner());
+            match guard.as_ref() {
+                Some(s) => (s.abandoned_branches(), s.export_events().to_vec()),
+                None => (Vec::new(), Vec::new()),
+            }
+        };
+        match beyond_ai_agent::export::export_html_with_entries(
             &meta,
             &session.messages,
             &branches,
+            &events,
             Some(&export),
         ) {
             Ok(path) => eprintln!("[exported transcript to {}]", path.display()),
@@ -1789,6 +2120,36 @@ mod tests {
     use super::*;
     use agent_core::Error;
     use agent_core::mock::{MockTransport, turn};
+
+    #[test]
+    fn resolve_prompt_input_reads_an_existing_files_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prompt.txt");
+        std::fs::write(&path, "FILE CONTENTS").unwrap();
+        assert_eq!(
+            resolve_prompt_input(path.to_str().unwrap()),
+            "FILE CONTENTS"
+        );
+    }
+
+    #[test]
+    fn resolve_prompt_input_treats_a_non_existent_path_as_a_literal_string() {
+        assert_eq!(
+            resolve_prompt_input("this is not a real file on disk"),
+            "this is not a real file on disk"
+        );
+    }
+
+    #[test]
+    fn resolve_prompt_input_treats_a_directory_as_a_literal_string_not_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // `is_file()` is false for a directory — must fall through to the literal-string path rather
+        // than erroring on a directory that happens to share a name with the input.
+        assert_eq!(
+            resolve_prompt_input(dir.path().to_str().unwrap()),
+            dir.path().to_str().unwrap()
+        );
+    }
 
     #[test]
     fn is_valid_session_id_accepts_ordinary_ids() {
@@ -2309,30 +2670,68 @@ mod tests {
         assert_eq!(messages, vec!["just a message"]);
     }
 
-    #[test]
-    fn read_file_refs_wraps_contents_in_a_file_tag_with_the_resolved_path() {
+    #[tokio::test]
+    async fn read_file_refs_wraps_contents_in_a_file_tag_with_the_resolved_path() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "hello world").unwrap();
-        let out = read_file_refs(&["a.txt".to_string()], dir.path()).unwrap();
-        assert!(out.contains("hello world"));
-        assert!(out.contains(&format!("name=\"{}\"", dir.path().join("a.txt").display())));
+        let out = read_file_refs(&["a.txt".to_string()], dir.path())
+            .await
+            .unwrap();
+        assert!(out.text.contains("hello world"));
+        assert!(out.text.contains(&format!("name=\"{}\"", dir.path().join("a.txt").display())));
+        assert!(out.images.is_empty());
     }
 
-    #[test]
-    fn read_file_refs_errors_naming_the_missing_file() {
+    #[tokio::test]
+    async fn read_file_refs_errors_naming_the_missing_file() {
         let dir = tempfile::tempdir().unwrap();
         let err = read_file_refs(&["does-not-exist.txt".to_string()], dir.path())
+            .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("does-not-exist.txt"), "got: {err}");
     }
 
-    #[test]
-    fn read_file_refs_concatenates_multiple_files_in_order() {
+    #[tokio::test]
+    async fn read_file_refs_concatenates_multiple_files_in_order() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "AAA").unwrap();
         std::fs::write(dir.path().join("b.txt"), "BBB").unwrap();
-        let out = read_file_refs(&["a.txt".to_string(), "b.txt".to_string()], dir.path()).unwrap();
-        assert!(out.find("AAA").unwrap() < out.find("BBB").unwrap());
+        let out = read_file_refs(&["a.txt".to_string(), "b.txt".to_string()], dir.path())
+            .await
+            .unwrap();
+        assert!(out.text.find("AAA").unwrap() < out.text.find("BBB").unwrap());
+    }
+
+    #[tokio::test]
+    async fn read_file_refs_attaches_an_at_referenced_image_instead_of_erroring() {
+        // Track L20 (pi-parity fix): `run @screenshot.png "..."` used to crash — `read_file_refs`
+        // called plain `std::fs::read_to_string` on every `@file` ref, which errors outright on binary
+        // image bytes. An image ref must now come back as an `ImageSource` attachment instead.
+        let img = image::RgbImage::from_pixel(4, 4, image::Rgb([200, 10, 10]));
+        let mut png_bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut png_bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("shot.png"), &png_bytes).unwrap();
+
+        let out = read_file_refs(&["shot.png".to_string()], dir.path())
+            .await
+            .unwrap();
+        assert_eq!(out.images.len(), 1, "the image must be attached, not read as text");
+        assert_eq!(out.images[0].media_type, "image/png");
+        assert!(!out.images[0].data.is_empty());
+    }
+
+    #[test]
+    fn looks_like_image_is_false_for_an_ordinary_text_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        std::fs::write(&path, "just some text").unwrap();
+        assert!(!looks_like_image(&path));
     }
 }

@@ -11,8 +11,9 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use serde_json::Value;
+use zeroize::Zeroize;
 
-use crate::dialect::{Dialect, push_sse_line};
+use crate::dialect::{Dialect, SseEventBuffer, push_sse_line};
 use crate::error::{Error, MID_STREAM_NETWORK_ERROR, Result};
 use crate::transport::{EventStream, ModelRequest, ModelTransport};
 
@@ -57,11 +58,56 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// downstream hop's patience must be at least its upstream's.
 const READ_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// A gateway credential that never appears in a `Debug` line and is best-effort scrubbed from memory
+/// on drop. A small local newtype rather than depending on `beyond-gateway`'s own `Secret` — this is
+/// the wrong dependency direction (agent-core is a lower-level library the gateway sits above) — so
+/// this intentionally covers only the one field that needs it, not a general secrets framework.
+#[derive(Clone)]
+struct ApiKey(String);
+
+impl ApiKey {
+    fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+
+    /// Borrow the plaintext for the one call site that needs it (the `Authorization` header).
+    fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for ApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ApiKey(***)")
+    }
+}
+
+impl Drop for ApiKey {
+    fn drop(&mut self) {
+        // Best-effort scrub, not a hard control: the key is necessarily long-lived in RAM for the
+        // life of the client, and this only helps at client-drop/rotation time. The workspace forbids
+        // `unsafe_code`, ruling out a hand-rolled `as_bytes_mut` overwrite — `zeroize` gives the same
+        // effect through a safe API (same crate the gateway's own `Secret` type already uses).
+        self.0.zeroize();
+    }
+}
+
+/// Build the underlying HTTP client with a given idle-read timeout, connect timeout fixed at
+/// [`CONNECT_TIMEOUT`]. Factored out so [`GatewayClient::new`] and
+/// [`GatewayClient::with_idle_timeout`] share one construction path.
+fn build_http(read_timeout: Duration) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(read_timeout)
+        .build()
+        .map_err(|e| Error::Transport(e.to_string()))
+}
+
 /// An HTTP client pointed at a Beyond gateway base URL, authenticated with a `bai_v1` virtual key.
 pub struct GatewayClient {
     http: reqwest::Client,
     base_url: String,
-    api_key: String,
+    api_key: ApiKey,
     max_retries: u32,
     base_backoff: Duration,
 }
@@ -71,16 +117,16 @@ impl GatewayClient {
     /// `api_key` (a `bai_v1…` virtual key, or a BYO provider key the gateway forwards untouched).
     /// Pre-first-byte retry defaults to [`MAX_RETRIES`]/[`BASE_BACKOFF`]; override with
     /// [`with_retry`](Self::with_retry) if an operator needs a different budget for this deployment.
+    /// Idle-read timeout defaults to [`READ_TIMEOUT`]; override with
+    /// [`with_idle_timeout`](Self::with_idle_timeout). Outbound proxy config isn't a client option
+    /// here — reqwest already reads `HTTP_PROXY`/`HTTPS_PROXY` from the environment at the library
+    /// level, with no code needed on our side.
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .read_timeout(READ_TIMEOUT)
-            .build()
-            .map_err(|e| Error::Transport(e.to_string()))?;
+        let http = build_http(READ_TIMEOUT)?;
         Ok(Self {
             http,
             base_url: base_url.into().trim_end_matches('/').to_string(),
-            api_key: api_key.into(),
+            api_key: ApiKey::new(api_key),
             max_retries: MAX_RETRIES,
             base_backoff: BASE_BACKOFF,
         })
@@ -92,6 +138,15 @@ impl GatewayClient {
         self.max_retries = max_retries;
         self.base_backoff = base_backoff;
         self
+    }
+
+    /// Builder-style: override the idle-read timeout between chunks on the streaming body (default
+    /// [`READ_TIMEOUT`] — see that constant's doc comment on why it's an idle timeout, not a ceiling
+    /// on total stream duration). Rebuilds the underlying HTTP client, since `reqwest::Client`'s
+    /// timeouts are fixed at construction; connect timeout is unaffected.
+    pub fn with_idle_timeout(mut self, timeout: Duration) -> Result<Self> {
+        self.http = build_http(timeout)?;
+        Ok(self)
     }
 }
 
@@ -158,7 +213,7 @@ impl ModelTransport for GatewayClient {
             let resp = send_with_retry(
                 &http,
                 &url,
-                &api_key,
+                api_key.expose(),
                 &body,
                 is_anthropic,
                 needs_interleaved_beta,
@@ -170,13 +225,16 @@ impl ModelTransport for GatewayClient {
             )
             .await?;
 
-            // Frame the chunked body line-by-line. SSE for both providers carries one JSON object
-            // per `data:` line, so a line splitter suffices; a partial trailing line is buffered
-            // across chunks until its newline arrives. The framing (byte buffering + newline split)
-            // lives in `LineFramer` — see its doc comment for why it buffers raw *bytes*, not a
-            // lossy per-chunk string.
+            // Frame the chunked body line-by-line. A partial trailing line is buffered across chunks
+            // until its newline arrives. The framing (byte buffering + newline split) lives in
+            // `LineFramer` — see its doc comment for why it buffers raw *bytes*, not a lossy per-chunk
+            // string. `sse_buf` is the separate SSE-level buffer that joins consecutive `data:` lines
+            // belonging to one logical event (see `SseEventBuffer`'s doc comment) — real
+            // Anthropic/OpenAI never split an event across lines, but a spec-conformant intermediary
+            // could, and the SSE spec's own event boundary is a blank line, not a per-`data:`-line one.
             let mut decoder = dialect.decoder();
             let mut framer = LineFramer::new();
+            let mut sse_buf = SseEventBuffer::new();
             let mut bytes = resp.bytes_stream();
             while let Some(chunk) = bytes.next().await {
                 // A tagged prefix, not `e.to_string()` alone: this is the one call site that turns a
@@ -191,7 +249,7 @@ impl ModelTransport for GatewayClient {
                 while let Some(line) = framer.next_line() {
                     let line = std::str::from_utf8(&line)
                         .map_err(|e| Error::Transport(format!("invalid UTF-8 in SSE stream: {e}")))?;
-                    for ev in push_sse_line(decoder.as_mut(), line)? {
+                    for ev in push_sse_line(decoder.as_mut(), &mut sse_buf, line)? {
                         yield ev;
                     }
                 }
@@ -199,9 +257,14 @@ impl ModelTransport for GatewayClient {
             if let Some(line) = framer.take_tail() {
                 let line = std::str::from_utf8(&line)
                     .map_err(|e| Error::Transport(format!("invalid UTF-8 in SSE stream: {e}")))?;
-                for ev in push_sse_line(decoder.as_mut(), line)? {
+                for ev in push_sse_line(decoder.as_mut(), &mut sse_buf, line)? {
                     yield ev;
                 }
+            }
+            // Flush a final event that never got its trailing blank-line terminator (a stream that
+            // ends mid-event) — matches pi's own end-of-stream `flushSseEvent` call.
+            for ev in push_sse_line(decoder.as_mut(), &mut sse_buf, "")? {
+                yield ev;
             }
             for ev in decoder.finish()? {
                 yield ev;
@@ -521,6 +584,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn api_key_debug_redacts_the_plaintext() {
+        let key = ApiKey::new("bai_v1_supersecret");
+        let debug = format!("{key:?}");
+        assert_eq!(debug, "ApiKey(***)");
+        assert!(!debug.contains("supersecret"), "got: {debug}");
+    }
+
+    #[test]
+    fn api_key_expose_returns_plaintext() {
+        assert_eq!(ApiKey::new("bai_v1_abc").expose(), "bai_v1_abc");
+    }
+
+    #[test]
     fn line_framer_splits_whole_lines_and_buffers_the_tail() {
         let mut framer = LineFramer::new();
         framer.extend(b"data: {\"a\":1}\ndata: {\"b").unwrap();
@@ -702,6 +778,52 @@ mod tests {
         assert!(
             tagged,
             "a mid-body connection drop must surface as a MID_STREAM_NETWORK_ERROR-tagged transport error"
+        );
+    }
+
+    /// A real TCP peer that answers headers plus one partial event, then goes silent (holds the
+    /// connection open, sends nothing) well past a deliberately shrunk idle-read timeout — proves
+    /// [`GatewayClient::with_idle_timeout`] actually reaches the underlying `reqwest::Client` rather
+    /// than being a dead field, since the default [`READ_TIMEOUT`] (600s) would never trip in a test.
+    #[tokio::test]
+    async fn with_idle_timeout_overrides_the_default_read_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100000\r\n\r\n\
+                      data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n",
+                )
+                .unwrap();
+            stream.flush().unwrap();
+            // Silent for longer than the client's configured idle timeout, but the test itself
+            // doesn't wait this long — the client errors out well before this elapses.
+            std::thread::sleep(Duration::from_millis(500));
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        });
+
+        let client = GatewayClient::new(format!("http://{addr}"), "test-key")
+            .unwrap()
+            .with_idle_timeout(Duration::from_millis(50))
+            .unwrap();
+        let req = ModelRequest::new("claude-test", Vec::new(), 100);
+        let mut events = client.stream(req).await.unwrap(); // the request itself succeeds
+        let mut tagged = false;
+        while let Some(ev) = events.next().await {
+            if let Err(Error::Transport(msg)) = ev {
+                tagged = msg.contains(MID_STREAM_NETWORK_ERROR);
+                break;
+            }
+        }
+        server.join().unwrap();
+        assert!(
+            tagged,
+            "a read past the configured idle timeout must surface as a mid-stream network error"
         );
     }
 

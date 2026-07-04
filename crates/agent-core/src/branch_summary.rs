@@ -97,13 +97,21 @@ fn windowed_by_budget(messages: &[Message], budget_tokens: u32) -> &[Message] {
 /// focus: {custom_instructions}" — the same framing [`crate::compaction::summary_request`] uses for a
 /// manual compaction's client-supplied steering, matching pi's own `generateSummary` — so a client
 /// navigating away from a branch can steer what the recap emphasizes without replacing the structured
-/// Markdown format itself.
+/// Markdown format itself. Set `replace_instructions` to use `custom_instructions` as the *entire*
+/// instruction section instead — pi's own `replaceInstructions` option
+/// (`branch-summarization.ts`'s `generateBranchSummary`: `if (replaceInstructions && customInstructions)
+/// instructions = customInstructions`) — for a caller that wants full control over the summarization
+/// task rather than steering the default one. Has no effect when `custom_instructions` is `None`: there's
+/// nothing to replace the base instruction *with*, so it's used as-is either way, matching pi's own
+/// `replaceInstructions && customInstructions` guard (a `true` with no instructions given falls through
+/// to the plain-`BRANCH_SUMMARY_PROMPT` case, not an empty prompt).
 pub fn branch_summary_request(
     model: &str,
     messages: &[Message],
     max_tokens: u32,
     input_token_budget: u32,
     custom_instructions: Option<&str>,
+    replace_instructions: bool,
 ) -> ModelRequest {
     let (read, modified) = extract_file_ops(messages);
     let windowed = windowed_by_budget(messages, input_token_budget);
@@ -129,10 +137,18 @@ pub fn branch_summary_request(
             modified.join("\n")
         ));
     }
-    prompt.push_str(BRANCH_SUMMARY_INSTRUCTION);
-    if let Some(custom) = custom_instructions {
-        prompt.push_str("\n\nAdditional focus: ");
-        prompt.push_str(custom);
+    // Matches pi's own `if (replaceInstructions && customInstructions) ... else if (customInstructions)
+    // ... else ...`: replacing only actually applies once there's something to replace the base
+    // instruction *with* — `replace_instructions` alone, with no custom instructions given, falls
+    // through to the plain base-instruction case rather than an empty instruction section.
+    match custom_instructions {
+        Some(custom) if replace_instructions => prompt.push_str(custom),
+        Some(custom) => {
+            prompt.push_str(BRANCH_SUMMARY_INSTRUCTION);
+            prompt.push_str("\n\nAdditional focus: ");
+            prompt.push_str(custom);
+        }
+        None => prompt.push_str(BRANCH_SUMMARY_INSTRUCTION),
     }
 
     ModelRequest::new(model, Arc::new(vec![Message::user(prompt)]), max_tokens)
@@ -189,7 +205,7 @@ mod tests {
 
     #[test]
     fn branch_summary_request_renders_transcript_and_tags_files() {
-        let req = branch_summary_request("claude-test", &branch(), 512, 100_000, None);
+        let req = branch_summary_request("claude-test", &branch(), 512, 100_000, None, false);
         let ContentBlock::Text { text, .. } = &req.messages[0].content[0] else {
             panic!("expected text");
         };
@@ -290,7 +306,7 @@ mod tests {
 
     #[test]
     fn branch_summary_request_notes_when_windowing_dropped_older_activity() {
-        let req = branch_summary_request("claude-test", &branch(), 512, 1, None);
+        let req = branch_summary_request("claude-test", &branch(), 512, 1, None, false);
         let ContentBlock::Text { text, .. } = &req.messages[0].content[0] else {
             panic!("expected text");
         };
@@ -305,7 +321,7 @@ mod tests {
         // File awareness is cheap metadata and should span the whole branch — a tiny budget that
         // windows out the early `read`/`edit` calls from the rendered transcript must still surface
         // them in `<read-files>`/`<modified-files>`.
-        let req = branch_summary_request("claude-test", &branch(), 512, 1, None);
+        let req = branch_summary_request("claude-test", &branch(), 512, 1, None, false);
         let ContentBlock::Text { text, .. } = &req.messages[0].content[0] else {
             panic!("expected text");
         };
@@ -320,7 +336,7 @@ mod tests {
             Message::user("just chatting"),
             Message::assistant(vec![ContentBlock::text("sure")]),
         ];
-        let req = branch_summary_request("claude-test", &messages, 512, 100_000, None);
+        let req = branch_summary_request("claude-test", &messages, 512, 100_000, None, false);
         let ContentBlock::Text { text, .. } = &req.messages[0].content[0] else {
             panic!("expected text");
         };
@@ -338,6 +354,7 @@ mod tests {
             512,
             100_000,
             Some("keep every detail about the auth refactor"),
+            false,
         );
         let ContentBlock::Text { text, .. } = &req.messages[0].content[0] else {
             panic!("expected text");
@@ -354,10 +371,59 @@ mod tests {
 
     #[test]
     fn branch_summary_request_omits_additional_focus_when_no_custom_instructions_given() {
-        let req = branch_summary_request("claude-test", &branch(), 512, 100_000, None);
+        let req = branch_summary_request("claude-test", &branch(), 512, 100_000, None, false);
         let ContentBlock::Text { text, .. } = &req.messages[0].content[0] else {
             panic!("expected text");
         };
         assert!(!text.contains("Additional focus"));
+    }
+
+    #[test]
+    fn branch_summary_request_replace_instructions_uses_custom_instructions_as_the_whole_prompt() {
+        // pi-parity gap (task 44): pi's `replaceInstructions` option lets custom instructions fully
+        // replace `BRANCH_SUMMARY_PROMPT` instead of being appended after it — for a caller that wants
+        // full control over the summarization task, not just to steer the default one.
+        let req = branch_summary_request(
+            "claude-test",
+            &branch(),
+            512,
+            100_000,
+            Some("Summarize only the auth-related changes, in one sentence."),
+            true,
+        );
+        let ContentBlock::Text { text, .. } = &req.messages[0].content[0] else {
+            panic!("expected text");
+        };
+        assert!(
+            text.contains("Summarize only the auth-related changes, in one sentence."),
+            "the custom instructions must be present: {text}"
+        );
+        assert!(
+            !text.contains("conversation branch for context when returning later"),
+            "the base BRANCH_SUMMARY_INSTRUCTION must be replaced, not appended alongside: {text}"
+        );
+        assert!(
+            !text.contains("Additional focus"),
+            "replace mode doesn't use the additive framing at all: {text}"
+        );
+        // The rendered transcript and file tags are still built the normal way — only the instruction
+        // section itself is replaced.
+        assert!(text.contains("try approach X"));
+        assert!(text.contains("<read-files>"));
+    }
+
+    #[test]
+    fn replace_instructions_without_custom_instructions_falls_back_to_the_base_prompt() {
+        // `replace_instructions: true` with no `custom_instructions` has nothing to replace the base
+        // prompt with — matches pi's own `replaceInstructions && customInstructions` guard, which falls
+        // through to plain `BRANCH_SUMMARY_PROMPT` rather than an empty instruction section.
+        let req = branch_summary_request("claude-test", &branch(), 512, 100_000, None, true);
+        let ContentBlock::Text { text, .. } = &req.messages[0].content[0] else {
+            panic!("expected text");
+        };
+        assert!(
+            text.contains("conversation branch for context when returning later"),
+            "must fall back to the base instruction: {text}"
+        );
     }
 }

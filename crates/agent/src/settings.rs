@@ -19,6 +19,29 @@ use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
+/// A persisted global default for project trust — pi-parity fix: previously the only durable trust
+/// state was the per-path `TrustStore` allowlist (`trust_store.rs`), with no way to set a blanket
+/// policy for every project that isn't otherwise explicitly trusted/untrusted. Consulted only when a
+/// given invocation passed neither `--trust-project` nor `--force-untrusted` explicitly (see
+/// `main.rs`'s trust-resolution call site) — an explicit per-run flag always wins over this global
+/// default, the same way an explicit `--model`/`--gateway-url` always wins over `default_model`/
+/// `default_gateway_url` above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[clap(rename_all = "snake_case")]
+pub enum TrustPolicy {
+    /// Treat every project as trusted by default, as if `--trust-project` were always passed.
+    Always,
+    /// Treat every project as untrusted by default, as if `--force-untrusted` were always passed.
+    Never,
+    /// No blanket override — fall back to this crate's existing per-path resolution (the persisted
+    /// `TrustStore` allowlist, or "no trust-gated resources present at all" — see
+    /// `trust_store::has_trust_gated_resources`). This binary is headless, so unlike pi's own
+    /// interactive "trust this folder?" prompt, `Ask` doesn't itself ask anything; it just means
+    /// "nothing new here, don't override."
+    Ask,
+}
+
 /// On-disk shape: every field optional and `#[serde(default)]`, so a file missing a field (or not
 /// existing at all) degrades to "no stored default" rather than a parse error.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,6 +55,18 @@ pub struct Settings {
     /// Used when neither `--session-dir` nor `AI_AGENT_SESSION_DIR` is given — pi's `sessionDir`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_session_dir: Option<String>,
+    /// Used when neither `--trust-project` nor `--force-untrusted` is given. See [`TrustPolicy`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_project_trust: Option<TrustPolicy>,
+    /// A persisted, cross-session override for auto-compaction — Track L26 (pi-parity fix).
+    /// `Some(false)` behaves as if `--no-compaction`/`AI_AGENT_NO_COMPACTION` were always passed;
+    /// `Some(true)` forces auto-compaction on even if some other layer would otherwise default it off;
+    /// `None` (the default) defers entirely to whatever the CLI flag/env var/built-in default already
+    /// resolve to. Consulted by `serve`'s `set_auto_compaction` RPC command (see `ServeConfig`'s own doc
+    /// comment) so a client's toggle survives a process restart instead of silently reverting to
+    /// whatever `--no-compaction` said at the *next* invocation's own startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_enabled: Option<bool>,
 }
 
 /// A persisted settings file, one per machine (not per-project — matches pi's own global settings tier;
@@ -74,6 +109,17 @@ impl SettingsStore {
     /// Set (`Some`) or clear (`None`) the stored default session directory, persisting atomically.
     pub fn set_default_session_dir(&mut self, dir: Option<String>) -> std::io::Result<()> {
         self.mutate_locked(move |s| s.default_session_dir = dir)
+    }
+
+    /// Set (`Some`) or clear (`None`) the stored default project-trust policy, persisting atomically.
+    pub fn set_default_project_trust(&mut self, policy: Option<TrustPolicy>) -> std::io::Result<()> {
+        self.mutate_locked(move |s| s.default_project_trust = policy)
+    }
+
+    /// Set (`Some`) or clear (`None`, deferring back to the CLI-flag-computed default) the persisted
+    /// auto-compaction override, persisting atomically.
+    pub fn set_compaction_enabled(&mut self, enabled: Option<bool>) -> std::io::Result<()> {
+        self.mutate_locked(move |s| s.compaction_enabled = enabled)
     }
 
     /// Acquire the cross-process lock (see [`FileLock`]), re-read the store's *current* on-disk state —
@@ -193,11 +239,27 @@ fn lock_path_for(store_path: &Path) -> PathBuf {
     PathBuf::from(os)
 }
 
-fn default_path() -> PathBuf {
+/// The root config directory both this store and `trust_store.rs`'s persist under — `~/.claude` unless
+/// overridden. pi-parity fix: previously hardcoded at each call site (here and in `trust_store.rs`),
+/// with no way to redirect it short of overriding the whole `$HOME` (which also moves every *other*
+/// HOME-relative thing — shells, other tools' own configs). `AI_AGENT_CONFIG_DIR`, when set, names the
+/// config directory itself directly (not a parent to append `.claude` under), so a caller who wants
+/// a wholly separate profile/sandbox doesn't have to also fake up a `.claude` subdirectory inside it.
+/// `session_store.rs` hardcodes the same `~/.claude/sessions` root independently (a separate agent's own
+/// file to update) — this helper is `pub(crate)` specifically so that call site can adopt it too, later,
+/// without needing to duplicate the env-var-vs-`HOME` precedence logic a second time.
+pub(crate) fn config_dir_root() -> PathBuf {
+    if let Some(dir) = std::env::var_os("AI_AGENT_CONFIG_DIR") {
+        return PathBuf::from(dir);
+    }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_default();
-    home.join(".claude/settings.json")
+    home.join(".claude")
+}
+
+fn default_path() -> PathBuf {
+    config_dir_root().join("settings.json")
 }
 
 #[cfg(test)]
@@ -229,6 +291,30 @@ mod tests {
             reopened.get().default_model.as_deref(),
             Some("claude-opus-4-8")
         );
+    }
+
+    #[test]
+    fn set_compaction_enabled_persists_and_reopening_sees_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut store = SettingsStore::open(path.clone());
+        assert_eq!(
+            store.get().compaction_enabled,
+            None,
+            "no stored override by default"
+        );
+
+        store.set_compaction_enabled(Some(false)).unwrap();
+        assert_eq!(store.get().compaction_enabled, Some(false));
+        let reopened = SettingsStore::open(path.clone());
+        assert_eq!(reopened.get().compaction_enabled, Some(false));
+
+        // Clearing it back to `None` (not just flipping to `true`) must also round-trip.
+        let mut store = SettingsStore::open(path.clone());
+        store.set_compaction_enabled(None).unwrap();
+        assert_eq!(store.get().compaction_enabled, None);
+        let reopened = SettingsStore::open(path);
+        assert_eq!(reopened.get().compaction_enabled, None);
     }
 
     #[test]

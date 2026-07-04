@@ -73,7 +73,12 @@ pub fn build_body(req: &ModelRequest) -> Value {
     }
     // Anthropic forbids `temperature` alongside extended thinking (thinking requires an implicit
     // temperature of 1) — matches pi's own `!options?.thinkingEnabled` gate (`anthropic-messages.ts`).
-    if let (Some(temperature), None) = (req.temperature, &req.thinking) {
+    // Separately, a handful of models (`claude-opus-4-7`/`claude-opus-4-8` — our own default model)
+    // reject `temperature` outright regardless of thinking state (pi: `compat.supportsTemperature`) —
+    // gated on the capability table rather than thinking state alone.
+    if let (Some(temperature), None, true) =
+        (req.temperature, &req.thinking, caps.supports_temperature)
+    {
         map.insert("temperature".into(), json!(temperature));
     }
     if let Some(thinking) = &req.thinking {
@@ -81,14 +86,17 @@ pub fn build_body(req: &ModelRequest) -> Value {
         // alongside it. Newer models (the capability table's `Adaptive`
         // shape) take an effort-based shape instead of an explicit budget, with `output_config.effort`
         // as a *sibling top-level request field*, not nested under `thinking` — a request-shape detail
-        // easy to get wrong. Both shapes explicitly set `display: "summarized"`: Anthropic's own API
-        // default for `adaptive` is "omitted" (no visible reasoning text at all), so leaving it unset
-        // on an adaptive model silently produces empty thinking output.
+        // easy to get wrong. Both shapes explicitly set `display`: Anthropic's own API default for
+        // `adaptive` is "omitted" (no visible reasoning text at all), so leaving it unset on an
+        // adaptive model silently produces empty thinking output unless the caller explicitly opted
+        // into `ThinkingDisplay::Omitted` themselves (pi: `thinkingDisplay: "omitted"`, for faster
+        // time-to-first-text-token when the UI doesn't surface thinking).
+        let display = thinking.display.as_str();
         match caps.thinking {
             crate::models::ThinkingShape::Adaptive => {
                 map.insert(
                     "thinking".into(),
-                    json!({ "type": "adaptive", "display": "summarized" }),
+                    json!({ "type": "adaptive", "display": display }),
                 );
                 if let Some(effort) = req.reasoning_effort {
                     let wire = crate::models::anthropic_adaptive_effort_wire(&caps, effort);
@@ -101,7 +109,7 @@ pub fn build_body(req: &ModelRequest) -> Value {
                     json!({
                         "type": "enabled",
                         "budget_tokens": thinking.budget_tokens,
-                        "display": "summarized",
+                        "display": display,
                     }),
                 );
             }
@@ -667,7 +675,9 @@ mod tests {
 
     #[test]
     fn build_body_sends_temperature_when_set_and_not_thinking() {
-        let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 256)
+        // A model that actually supports `temperature` (unlike our own default `claude-opus-4-8` —
+        // see `build_body_omits_temperature_for_a_model_that_rejects_it_outright` below).
+        let req = ModelRequest::new("claude-sonnet-4-5", vec![Message::user("hi")], 256)
             .with_temperature(0.4);
         let body = build_body(&req);
         assert_eq!(body["temperature"], 0.4);
@@ -683,10 +693,44 @@ mod tests {
     #[test]
     fn build_body_omits_temperature_when_thinking_is_enabled() {
         // Anthropic forbids `temperature` alongside extended thinking — matches pi's own
-        // `!options?.thinkingEnabled` gate.
-        let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 4096)
+        // `!options?.thinkingEnabled` gate. Uses a gen6+ model that *does* otherwise support
+        // `temperature` (opus-4-6, not opus-4-8), isolating this thinking-state gate from the
+        // separate per-model `supports_temperature` gate covered by the test below.
+        let req = ModelRequest::new("claude-opus-4-6", vec![Message::user("hi")], 4096)
             .with_temperature(0.9)
             .with_thinking(1024);
+        let body = build_body(&req);
+        assert!(
+            body.get("temperature").is_none(),
+            "got: {:#?}",
+            body.get("temperature")
+        );
+    }
+
+    #[test]
+    fn build_body_omits_temperature_for_a_model_that_rejects_it_outright() {
+        // pi-parity: `claude-opus-4-7`/`claude-opus-4-8` (`compat.supportsTemperature: false` in
+        // `anthropic.models.ts`) reject `temperature` unconditionally — not only while thinking is on.
+        // `claude-opus-4-8` is Beyond's own `DEFAULT_MODEL`, so this is a live, reachable 400 without
+        // the gate: thinking is left at its default (which resolves to an explicit `{"type":
+        // "disabled"}` on the wire for this model, since it's `reasoning_disableable`) and a
+        // `temperature` is explicitly requested — both must still not produce a `temperature` field.
+        let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 256)
+            .with_temperature(0.7);
+        let body = build_body(&req);
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert!(
+            body.get("temperature").is_none(),
+            "claude-opus-4-8 must never receive `temperature`, got: {:#?}",
+            body.get("temperature")
+        );
+    }
+
+    #[test]
+    fn build_body_omits_temperature_for_opus_4_7_too() {
+        // Same gate, the sibling id pi also marks `supportsTemperature: false` for.
+        let req = ModelRequest::new("claude-opus-4-7", vec![Message::user("hi")], 256)
+            .with_temperature(0.7);
         let body = build_body(&req);
         assert!(
             body.get("temperature").is_none(),
@@ -1316,6 +1360,37 @@ data: {"type":"message_stop"}
         assert_eq!(body["thinking"]["display"], "summarized");
         assert!(body["thinking"].get("budget_tokens").is_none());
         assert_eq!(body["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn build_body_honors_omitted_thinking_display_when_requested() {
+        // pi: `thinkingDisplay: "omitted"` (anthropic-messages.ts) — skips rendering thinking text
+        // (keeping the signature for replay) for faster time-to-first-text-token. Default stays
+        // "summarized" unless a caller explicitly opts in, on both thinking shapes.
+        let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 8192)
+            .with_thinking(4096)
+            .with_thinking_display(crate::transport::ThinkingDisplay::Omitted)
+            .with_reasoning_effort(crate::transport::ReasoningEffort::High);
+        let body = build_body(&req);
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["thinking"]["display"], "omitted");
+
+        // Same opt-in on a Budget-shape (pre-gen6) model.
+        let req = ModelRequest::new("claude-opus-4-5", vec![Message::user("hi")], 8192)
+            .with_thinking(4096)
+            .with_thinking_display(crate::transport::ThinkingDisplay::Omitted);
+        let body = build_body(&req);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["display"], "omitted");
+    }
+
+    #[test]
+    fn with_thinking_display_is_a_no_op_without_a_prior_with_thinking_call() {
+        // Setting the display mode before `thinking` is ever enabled must not panic or fabricate a
+        // `thinking` config out of nothing.
+        let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 8192)
+            .with_thinking_display(crate::transport::ThinkingDisplay::Omitted);
+        assert!(req.thinking.is_none());
     }
 
     #[test]

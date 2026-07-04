@@ -147,13 +147,16 @@ pub struct NoHooks;
 #[async_trait]
 impl AgentHooks for NoHooks {}
 
-/// Called when the session reaches a durable, resumable checkpoint mid-run — after a tool round-trip's
-/// results are recorded, or a steered/follow-up message is injected — points a host can persist from
-/// without ever writing a message half of a `tool_use`/`tool_result` pair (see the call sites in
-/// [`crate::agent::Agent::run_events_steered`] for exactly which points those are). Without this, a
-/// multi-step run (several tool round-trips) is only ever durable once the *entire* run finishes: a
-/// crash, OOM-kill, or panic mid-run loses everything back to the turn's start, including the user's
-/// own prompt.
+/// Called every time the session reaches a durable, resumable point — before the very first request of
+/// a fresh run (so the user's own just-submitted prompt is persisted before the model is ever called),
+/// after a tool round-trip's results are recorded, after a tool-less assistant reply, or when a steered/
+/// follow-up message is injected — points a host can persist from without ever writing a message half
+/// of a `tool_use`/`tool_result` pair (see the call sites in [`crate::agent::Agent::run_events_steered`]
+/// for exactly which points those are). Without this, a run is only ever durable once the *entire* run
+/// finishes: a crash, OOM-kill, or panic anywhere in between loses everything back to the last
+/// checkpoint, which used to include the pathological case of losing the user's own prompt outright
+/// (a crash before the first tool round-trip, or during a run that never calls a tool at all) — this
+/// call fires often enough that neither gap exists anymore.
 ///
 /// Async (unlike [`AgentHooks`]'s tool-interception methods, which stay on the hot per-call path) so a
 /// host can perform its own blocking I/O — appending to a session file — off of whatever executor it

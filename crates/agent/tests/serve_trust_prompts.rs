@@ -3,8 +3,8 @@
 
 mod common;
 
-use std::io::{BufReader, Write};
-use std::process::Command;
+use std::io::{BufReader, Read, Write};
+use std::process::{Command, Stdio};
 
 use common::{read_until_response, serve_cmd, spawn_model_server, turn_text};
 use serde_json::json;
@@ -386,12 +386,32 @@ fn serve_get_commands_reports_a_cross_root_skill_collision() {
         dup_count, 1,
         "the shadowed name must appear once: {commands:?}"
     );
+    // `collisions` is a structured `Collision` list (skills.rs's compile-fix change), not a flat
+    // string array — `name`/`resource_type`/`winner_path`/`loser_path` are each their own field, so a
+    // client can build real tooling on top of a collision instead of scraping a sentence apart.
     let collisions = data["collisions"].as_array().unwrap();
+    let dup_collision = collisions
+        .iter()
+        .find(|c| c["name"] == "dup")
+        .unwrap_or_else(|| panic!("collisions must report the shadowed skill: {collisions:?}"));
+    assert_eq!(dup_collision["resource_type"], "skill");
     assert!(
-        collisions
-            .iter()
-            .any(|c| c.as_str().is_some_and(|s| s.contains("dup"))),
-        "collisions must report the shadowed skill: {collisions:?}"
+        dup_collision["winner_path"]
+            .as_str()
+            .is_some_and(|p| p.contains(&dir.path().to_string_lossy().to_string())),
+        "the project copy must win: {dup_collision:?}"
+    );
+    assert!(
+        dup_collision["loser_path"]
+            .as_str()
+            .is_some_and(|p| p.contains(&home.path().to_string_lossy().to_string())),
+        "the user copy must be reported as shadowed: {dup_collision:?}"
+    );
+    assert!(
+        dup_collision["message"]
+            .as_str()
+            .is_some_and(|s| s.contains("dup")),
+        "the human-readable message must still be populated: {dup_collision:?}"
     );
 
     drop(stdin);
@@ -442,4 +462,46 @@ fn serve_get_commands_reports_the_prompt_templates_own_description_not_its_argum
 
     drop(stdin);
     child.wait().unwrap();
+}
+
+#[test]
+fn serve_warns_on_stderr_when_an_untrusted_projects_gated_resources_are_skipped() {
+    // Track L32 (pi-parity fix): mirrors `run`'s identical fix
+    // (`run_binary_warns_on_stderr_when_an_untrusted_projects_gated_resources_are_skipped`,
+    // `run_skills_prompts.rs`) — an untrusted project with a `SYSTEM.md`/skills/prompts on disk
+    // previously skipped all of them with no signal at all that anything was there. No
+    // `--trust-project` here at all: the project-local `SYSTEM.md` exists but is never honored, and
+    // the warning must fire on `serve`'s startup path too, not just `run`'s.
+    let dir = tempfile::tempdir().unwrap();
+    let claude_dir = dir.path().join(".claude");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    std::fs::write(claude_dir.join("SYSTEM.md"), "SHOULD-NOT-APPLY").unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+
+    let (base, _bodies) = spawn_model_server(vec![turn_text("ok")]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut cmd = serve_cmd(bin, &base, &session_file);
+    cmd.current_dir(dir.path());
+    cmd.stderr(Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+    drop(stdin);
+    child.wait().unwrap();
+
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(
+        stderr.contains("warning:") && stderr.contains("isn't trusted"),
+        "must warn on stderr that gated resources were found but skipped: {stderr}"
+    );
 }

@@ -320,24 +320,90 @@ pub trait StreamDecoder: Send {
     }
 }
 
+/// Accumulates consecutive `data:` line payloads belonging to one logical SSE event, per the SSE
+/// spec (a blank line, not the `data:` prefix itself, is what terminates an event) — mirrors pi's own
+/// `SseDecoderState`/`flushSseEvent` (`anthropic-messages.ts`). Real Anthropic/OpenAI never split a
+/// single JSON event across multiple `data:` lines in practice, so before this buffer existed
+/// [`push_sse_line`] just parsed each `data:` line the moment it arrived — a spec-conformant
+/// intermediary (a proxy that re-wraps long lines) legitimately could, though, so the join has to
+/// happen before the first JSON-parse attempt, not after.
+///
+/// One buffer is threaded through an entire stream by the caller ([`decode_sse`], or the streaming
+/// HTTP client) — [`push_sse_line`] itself is stateless and free, the same shape as [`LineFramer`]
+/// pairs with the streaming client for byte-level framing.
+///
+/// [`LineFramer`]: crate::client::LineFramer
+#[derive(Default)]
+pub struct SseEventBuffer {
+    data: Vec<String>,
+}
+
+impl SseEventBuffer {
+    /// A buffer with no pending data lines.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Buffer one `data:` line's payload (already stripped of the `data:` prefix and surrounding
+    /// whitespace).
+    fn push_data(&mut self, payload: &str) {
+        self.data.push(payload.to_string());
+    }
+
+    /// Join and clear the buffered payloads with `"\n"`, or `None` if nothing is buffered — matches
+    /// pi's `state.data.join("\n")`.
+    fn take(&mut self) -> Option<String> {
+        if self.data.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(&mut self.data).join("\n"))
+        }
+    }
+}
+
 /// Decode a complete SSE body into events. Splits on `data:` lines, skips comments/`event:` lines
 /// and the OpenAI `[DONE]` sentinel, and flushes the decoder at the end. The streaming HTTP client
 /// reuses the same decoder incrementally; this is the buffered form used by tests.
 pub fn decode_sse(decoder: &mut dyn StreamDecoder, raw: &str) -> Result<Vec<StreamEvent>> {
     let mut out = Vec::new();
+    let mut buf = SseEventBuffer::new();
     for line in raw.lines() {
-        out.extend(push_sse_line(decoder, line)?);
+        out.extend(push_sse_line(decoder, &mut buf, line)?);
     }
+    // Flush a final event that never got its trailing blank-line terminator (a stream that ends
+    // mid-event, with no closing `\n\n`) — matches pi's own end-of-stream `flushSseEvent` call in
+    // `iterateSseMessages`.
+    out.extend(push_sse_line(decoder, &mut buf, "")?);
     out.extend(decoder.finish()?);
     Ok(out)
 }
 
-/// Feed a single SSE line to the decoder, returning any events it produced. Non-`data:` lines
-/// (comments, `event:`, blanks) and the OpenAI `[DONE]` sentinel produce nothing. This is the
-/// incremental entry point the streaming HTTP client drives line-by-line off the socket; the caller
-/// is responsible for calling [`StreamDecoder::finish`] once the stream closes.
-pub fn push_sse_line(decoder: &mut dyn StreamDecoder, line: &str) -> Result<Vec<StreamEvent>> {
-    let line = line.trim_end_matches('\r');
+/// Feed a single SSE line to the decoder, returning any events it produced. A `data:` line is
+/// buffered in `buf`, not parsed immediately — a blank line (the SSE event terminator) joins every
+/// payload buffered since the last flush with `"\n"` and parses that as one JSON value, matching pi's
+/// `decodeSseLine`/`flushSseEvent`. Non-`data:`, non-blank lines (comments, `event:`) and the OpenAI
+/// `[DONE]` sentinel produce nothing and don't touch the buffer. This is the incremental entry point
+/// the streaming HTTP client drives line-by-line off the socket; the caller is responsible for
+/// flushing any trailing buffered payload (pass an empty `line`) and then calling
+/// [`StreamDecoder::finish`] once the stream closes.
+pub fn push_sse_line(
+    decoder: &mut dyn StreamDecoder,
+    buf: &mut SseEventBuffer,
+    line: &str,
+) -> Result<Vec<StreamEvent>> {
+    // Strip both a trailing `\r` (CRLF framing) *and* `\n`: `decode_sse`'s lines come from
+    // `str::lines()`, which already strips both terminators, but the streaming client's `LineFramer`
+    // hands back each line *including* its trailing `\n` (see its own doc comment) — a blank SSE line
+    // (the event terminator) arrives here as the single-character string `"\n"`, not `""`, unless the
+    // newline itself is stripped too. Without this, the blank-line flush below would never fire for
+    // the live streaming path and every event would join with the next, corrupting the JSON.
+    let line = line.trim_end_matches(['\n', '\r']);
+    if line.is_empty() {
+        return match buf.take() {
+            Some(payload) => parse_and_push(decoder, &payload),
+            None => Ok(Vec::new()),
+        };
+    }
     let Some(payload) = line.strip_prefix("data:") else {
         return Ok(Vec::new());
     };
@@ -345,6 +411,14 @@ pub fn push_sse_line(decoder: &mut dyn StreamDecoder, line: &str) -> Result<Vec<
     if payload.is_empty() || payload == "[DONE]" {
         return Ok(Vec::new());
     }
+    buf.push_data(payload);
+    Ok(Vec::new())
+}
+
+/// Parse one joined SSE `data:` payload (see [`SseEventBuffer`]) and push it into the decoder.
+/// Factored out of [`push_sse_line`] so both the blank-line flush and the end-of-stream flush share
+/// the same parse/repair/error-surfacing logic.
+fn parse_and_push(decoder: &mut dyn StreamDecoder, payload: &str) -> Result<Vec<StreamEvent>> {
     // LOW pi-parity gap, deliberately not fixed: pi's `JSON.parse` accepts a JSON string containing a
     // lone (unpaired) `\uD800`-`\uDFFF` escape — JS strings are UTF-16 code-unit sequences that can
     // hold one — while `serde_json::from_str` rejects it here, since Rust's `String`/`str` guarantee
@@ -495,6 +569,58 @@ mod tests {
         );
         // Ordinary events are not errors.
         assert_eq!(sse_error(&json!({"type":"message_start"})), None);
+    }
+
+    #[test]
+    fn multi_line_sse_event_is_joined_before_parsing() {
+        // pi-parity: a spec-conformant intermediary can legitimately split one logical SSE event
+        // across multiple `data:` lines (the SSE spec's own event boundary is a blank line, not a
+        // per-`data:`-line one) — never observed from real Anthropic/OpenAI in practice, but
+        // `decodeSseLine`/`flushSseEvent` (pi's `anthropic-messages.ts`) join every `data:` line since
+        // the last blank line with `"\n"` before parsing, rather than treating each as standalone
+        // JSON. Split `message_start`'s payload across two `data:` lines at a comma (valid JSON
+        // whitespace) — a value only reconstructible if the join actually happened before the first
+        // parse attempt.
+        const SPLIT_EVENT: &str = r#"
+event: message_start
+data: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":5,
+data: "output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}
+
+event: message_stop
+data: {"type":"message_stop"}
+"#;
+        let mut dec = anthropic::Decoder::default();
+        let events = decode_sse(&mut dec, SPLIT_EVENT).unwrap();
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::Usage(u) => Some(*u),
+                _ => None,
+            })
+            .expect("a usage event, proving the split message_start payload parsed correctly");
+        assert_eq!(
+            usage.input_tokens, 5,
+            "input_tokens only survives a correct join"
+        );
+        assert_eq!(usage.output_tokens, 7);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::TextDelta { text, .. } if text == "hi")),
+            "the rest of the stream must still decode normally: {events:?}"
+        );
     }
 
     #[test]

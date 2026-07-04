@@ -18,6 +18,39 @@ use crate::message::{Message, StreamEvent, ToolDef};
 #[derive(Debug, Clone, Copy)]
 pub struct ThinkingConfig {
     pub budget_tokens: u32,
+    /// How much of the model's reasoning to surface in the response (Anthropic dialect only — see
+    /// [`ThinkingDisplay`]). Defaults to [`ThinkingDisplay::Summarized`] via [`ModelRequest::with_thinking`];
+    /// override with [`ModelRequest::with_thinking_display`].
+    pub display: ThinkingDisplay,
+}
+
+/// How much of a model's reasoning Anthropic's `thinking.display` should surface in the response.
+/// Only meaningful alongside [`ThinkingConfig`] on the Anthropic dialect; every OpenAI-shaped dialect
+/// ignores it (a reasoning model there returns only an opaque `encrypted_content` blob for replay,
+/// never thinking text at all, so there is nothing for a display mode to control).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThinkingDisplay {
+    /// Thinking blocks contain a readable summary of the model's reasoning. Matches pi's own
+    /// cross-model default (`anthropic-messages.ts`) — kept as this crate's default too, even though
+    /// it differs from Anthropic's *own* undocumented API default on 4.7+/Fable-generation models
+    /// (which is `Omitted`), so behavior stays consistent across the whole Claude 4 family regardless
+    /// of which specific id a request targets.
+    #[default]
+    Summarized,
+    /// Thinking blocks stream back with an empty `thinking` text field; the signature still travels
+    /// back for multi-turn replay continuity. Lower latency to first visible text token — pi: "Use for
+    /// faster time-to-first-text-token when your UI does not surface thinking."
+    Omitted,
+}
+
+impl ThinkingDisplay {
+    /// The wire string Anthropic's `thinking.display` field expects.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThinkingDisplay::Summarized => "summarized",
+            ThinkingDisplay::Omitted => "omitted",
+        }
+    }
 }
 
 /// A provider-neutral reasoning effort level. Maps to OpenAI's `reasoning_effort` parameter on
@@ -178,8 +211,11 @@ pub struct ModelRequest {
     /// Sampling temperature. `None` leaves the provider default. On the Anthropic dialect this is
     /// silently omitted whenever `thinking` is set — Anthropic's API requires `temperature: 1` (or the
     /// field entirely absent) while extended thinking is enabled, matching pi's own
-    /// `!options?.thinkingEnabled` gate (`anthropic-messages.ts`). Both OpenAI-shaped dialects send it
-    /// unconditionally when set, matching pi's own unconditional `openai-completions.ts`/
+    /// `!options?.thinkingEnabled` gate (`anthropic-messages.ts`) — and also omitted unconditionally
+    /// for a model whose capability table marks `supports_temperature: false`
+    /// (`claude-opus-4-7`/`claude-opus-4-8`, which reject the field outright regardless of thinking
+    /// state; see `crate::models::ModelCaps::supports_temperature`). Both OpenAI-shaped dialects send
+    /// it unconditionally when set, matching pi's own unconditional `openai-completions.ts`/
     /// `openai-responses.ts` — a caller asking for a fixed temperature on a reasoning model that
     /// rejects it is a caller error, same as pi's.
     pub temperature: Option<f64>,
@@ -224,9 +260,23 @@ impl ModelRequest {
         self
     }
 
-    /// Builder-style: request extended thinking with the given token budget.
+    /// Builder-style: request extended thinking with the given token budget. Display defaults to
+    /// [`ThinkingDisplay::Summarized`]; override with [`with_thinking_display`](Self::with_thinking_display).
     pub fn with_thinking(mut self, budget_tokens: u32) -> Self {
-        self.thinking = Some(ThinkingConfig { budget_tokens });
+        self.thinking = Some(ThinkingConfig {
+            budget_tokens,
+            display: ThinkingDisplay::default(),
+        });
+        self
+    }
+
+    /// Builder-style: override the thinking display mode (see [`ThinkingDisplay`]) on a previously-set
+    /// `thinking` config. A no-op if `thinking` hasn't been set yet — call
+    /// [`with_thinking`](Self::with_thinking) first.
+    pub fn with_thinking_display(mut self, display: ThinkingDisplay) -> Self {
+        if let Some(thinking) = &mut self.thinking {
+            thinking.display = display;
+        }
         self
     }
 

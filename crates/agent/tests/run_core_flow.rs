@@ -512,6 +512,61 @@ fn run_binary_composes_an_at_file_reference_into_the_first_message() {
 }
 
 #[test]
+fn run_binary_attaches_an_at_referenced_image_instead_of_erroring() {
+    // Track L20 (pi-parity fix): `run @screenshot.png "..."` used to crash — `read_file_refs` plain
+    // `std::fs::read_to_string`'d every `@file` ref, which errors outright on binary image data. A
+    // real (magic-byte-detectable) image reference must now reach the model as an image content block
+    // instead of failing the whole invocation.
+    use base64::Engine as _;
+    // Same fixture `smoke.rs`'s real-provider vision test uses: a tiny, deterministically-generated,
+    // genuinely decodable PNG (not just a magic-byte prefix) — a 48x48 solid-red swatch.
+    const RED_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAIAAADYYG7QAAAANklEQVR42u3OQQ0AAAgAoetfWls4H2wEoKlXEhISEhISEhISEhISEhISEhISEhISEhISEhK6s98T93mKDkyKAAAAAElFTkSuQmCC";
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(RED_PNG_B64)
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("swatch.png"), &png).unwrap();
+    let (base, bodies) = spawn_model_server(vec![turn_text("I see a red swatch.")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "@swatch.png",
+            "what color is this?",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed instead of attaching the image.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[0].contains(RED_PNG_B64),
+        "the actual image bytes (base64) must reach the model, not a read error: {}",
+        bodies[0]
+    );
+    assert!(
+        bodies[0].contains("image/png"),
+        "the request must carry an image content block: {}",
+        bodies[0]
+    );
+}
+
+#[test]
 fn run_binary_reads_piped_stdin_into_the_first_message() {
     let dir = tempfile::tempdir().unwrap();
     let (base, bodies) = spawn_model_server(vec![turn_text("noted")]);

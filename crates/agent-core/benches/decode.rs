@@ -23,8 +23,8 @@
 use std::hint::black_box;
 
 use agent_core::client::LineFramer;
+use agent_core::dialect::{SseEventBuffer, decode_sse, push_sse_line};
 use agent_core::dialect::{anthropic, openai, openai_responses};
-use agent_core::dialect::{decode_sse, push_sse_line};
 use divan::Bencher;
 use divan::counter::BytesCount;
 
@@ -298,22 +298,28 @@ mod pipeline {
         bencher.counter(BytesCount::of_slice(bytes)).bench(|| {
             let mut decoder = new_decoder(which);
             let mut framer = LineFramer::new();
+            let mut sse_buf = SseEventBuffer::new();
             let mut events = 0usize;
             for chunk in &chunks {
                 framer.extend(black_box(chunk)).unwrap();
                 while let Some(line) = framer.next_line() {
                     let line = std::str::from_utf8(&line).expect("whole-line utf8");
-                    events += push_sse_line(decoder.as_mut(), line)
+                    events += push_sse_line(decoder.as_mut(), &mut sse_buf, line)
                         .expect("valid line")
                         .len();
                 }
             }
             if let Some(tail) = framer.take_tail() {
                 let line = std::str::from_utf8(&tail).expect("utf8 tail");
-                events += push_sse_line(decoder.as_mut(), line)
+                events += push_sse_line(decoder.as_mut(), &mut sse_buf, line)
                     .expect("valid tail")
                     .len();
             }
+            // Flush any event that never got its trailing blank-line terminator — matches
+            // `GatewayClient::stream`'s own final flush.
+            events += push_sse_line(decoder.as_mut(), &mut sse_buf, "")
+                .expect("valid flush")
+                .len();
             events += decoder.finish().expect("clean finish").len();
             events
         });

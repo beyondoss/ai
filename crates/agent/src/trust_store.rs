@@ -325,11 +325,12 @@ fn canonical_key(path: &Path) -> String {
     resolved_key_path(path).display().to_string()
 }
 
+/// pi-parity fix: previously hardcoded `home.join(".claude/...")` directly, with no way to redirect it
+/// short of overriding `$HOME` itself (which also moves every other HOME-relative thing). Shares
+/// `settings.rs::config_dir_root`'s `AI_AGENT_CONFIG_DIR`-aware resolution rather than duplicating it —
+/// both stores' config directory must agree on the same root.
 fn default_path() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
-    home.join(".claude/trusted-projects.json")
+    crate::settings::config_dir_root().join("trusted-projects.json")
 }
 
 #[cfg(test)]

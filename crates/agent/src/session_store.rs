@@ -302,6 +302,12 @@ enum Entry {
         summary: String,
         from_id: String,
         details: BranchSummaryDetails,
+        /// Unix seconds this entry was appended — absent (`#[serde(default)]`, reads as `0`) on a file
+        /// written before this field existed. Track L45 (pi-parity fix): previously missing entirely,
+        /// so a materialized branch-summary node always reported `timestamp: 0` in `Node`/`TreeNode`
+        /// regardless of when it was actually created, unlike `Entry::Message`/`Entry::Custom`.
+        #[serde(default)]
+        timestamp: u64,
     },
     /// Provenance for a compaction round — see [`SessionStore::rewrite_compacted`]. Unlike
     /// [`Entry::BranchSummary`], this is purely a provenance record: the folded messages named in
@@ -422,6 +428,42 @@ pub struct CompactionMeta {
     pub tokens_before: u32,
 }
 
+/// An [`Entry::Compaction`] record, indexed by its own id — read back out for [`SessionStore::tree`]
+/// (Track L25). `Entry::Compaction` is deliberately never a real chain node (see its own doc comment:
+/// "this one never should [redirect the tip]"), so it's tracked in this side index instead of
+/// `nodes`/`NodeContent`, the same way `branch_summary_details` tracks structured data for an
+/// `Entry::BranchSummary` alongside (rather than instead of) that one's real `NodeContent::Message`
+/// node.
+#[derive(Debug, Clone)]
+struct CompactionRecord {
+    parent_id: Option<String>,
+    tokens_before: u32,
+    folded_ids: Vec<String>,
+}
+
+/// A non-message session event, in file order — Track L36 (pi-parity fix): `Entry::ModelChange`/
+/// `Entry::ThinkingLevelChange`/`Entry::Label`/`Entry::Custom` are all durably tracked (as last-write-
+/// wins lookup maps, or — for `Custom` — a real tree node), but none of that is an ordered event log a
+/// human reader would want surfaced in an HTML export; before this existed, an export showed none of
+/// them at all. Deliberately not the internal `Entry` wire format itself (that stays private to this
+/// module) — just enough of each variant's payload for [`crate::export`] to render a simple block.
+/// `Entry::Message`/`Entry::BranchSummary` already reach an export via `messages`/`branches`;
+/// `Entry::Leaf`/`Entry::TitleChange`/`Entry::Session`/`Entry::Compaction` carry nothing a reader would
+/// want as its own block here, so this deliberately covers only the four that do.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExportEvent {
+    ModelChange(String),
+    ThinkingLevelChange(String),
+    Label {
+        target_id: String,
+        label: Option<String>,
+    },
+    Custom {
+        kind: String,
+        data: Value,
+    },
+}
+
 /// What [`SessionRepo::fork_at_entry_prefix`] computes before anything is written — the would-be
 /// child's metadata, its message prefix, and enough of the source's own bookkeeping
 /// ([`original_ids`](Self::original_ids), [`labels`](Self::labels)) for [`SessionRepo::fork_at_entry`]
@@ -522,6 +564,17 @@ pub struct TreeNode {
     /// client reconstruct sibling/branch order chronologically, matching pi's own
     /// `SessionTreeNode.entry.timestamp` (which pi sorts each node's children by when rendering a tree).
     pub timestamp: u64,
+    /// The real [`Entry`] variant this node came from: `"message"` for an ordinary conversation turn,
+    /// `"custom"` for [`Entry::Custom`], `"branch_summary"` for an [`Entry::BranchSummary`] recap
+    /// (materialized into a real `Message` so the model actually sees it — see
+    /// `branch_summary_message` — but still distinguishable here from an ordinary message), or
+    /// `"compaction"` for an [`Entry::Compaction`] provenance record (never part of the active-path
+    /// chain itself — see that variant's own doc comment — but still reported here, with its
+    /// `tokens_before`/folded count folded into `preview`, so a client can tell *that* a compaction
+    /// happened without re-parsing the raw session file). Track L25 (pi-parity fix): previously a
+    /// branch summary collapsed indistinguishably into a plain `"message"`-shaped node and a
+    /// compaction never appeared in [`SessionStore::tree`] at all.
+    pub entry_kind: &'static str,
 }
 
 /// Turn a persisted branch summary's text into the message that materializes at the tip of the branch
@@ -604,6 +657,13 @@ pub struct SessionStore {
     /// [`Entry::Label`] seen for it, with a `label: None` entry removing it from this map entirely
     /// (last-write-wins). See [`Self::set_label`]/[`Self::get_label`].
     labels: HashMap<String, String>,
+    /// Every [`Entry::Compaction`] record seen, by its own id — see [`CompactionRecord`]'s doc comment
+    /// for why this lives in its own side index rather than `nodes`. Read back out by
+    /// [`Self::tree`] (Track L25).
+    compactions: HashMap<String, CompactionRecord>,
+    /// Every [`ExportEvent`] seen, in file order — see that type's own doc comment. Read back out by
+    /// [`Self::export_events`] (Track L36).
+    events: Vec<ExportEvent>,
 }
 
 impl SessionStore {
@@ -662,6 +722,8 @@ impl SessionStore {
             model_changes: HashMap::new(),
             level_changes: HashMap::new(),
             labels: HashMap::new(),
+            compactions: HashMap::new(),
+            events: Vec::new(),
         })
     }
 
@@ -683,6 +745,8 @@ impl SessionStore {
         let mut model_changes: HashMap<Option<String>, String> = HashMap::new();
         let mut level_changes: HashMap<Option<String>, String> = HashMap::new();
         let mut labels: HashMap<String, String> = HashMap::new();
+        let mut compactions: HashMap<String, CompactionRecord> = HashMap::new();
+        let mut events: Vec<ExportEvent> = Vec::new();
 
         let mut reader = BufReader::new(file);
         let mut raw = Vec::new();
@@ -755,6 +819,7 @@ impl SessionStore {
                     parent_id,
                     summary,
                     details,
+                    timestamp,
                     ..
                 }) => {
                     nodes.insert(
@@ -762,11 +827,13 @@ impl SessionStore {
                         Node {
                             parent_id,
                             content: NodeContent::Message(branch_summary_message(&summary)),
-                            // `Entry::BranchSummary` carries no timestamp of its own (out of scope for
-                            // now — see `Node::timestamp`'s doc comment); `read_listing`'s `updated_at`
-                            // computation treats this as "no signal" and falls through to whatever else
-                            // it finds (a later real message, or mtime).
-                            timestamp: 0,
+                            // Track L45 (pi-parity fix): `Entry::BranchSummary` now carries its own
+                            // `timestamp`, same as `Entry::Message`/`Entry::Custom` — `0` here only for
+                            // a legacy file written before this field existed (`#[serde(default)]`),
+                            // in which case `read_listing`'s `updated_at` computation already treats
+                            // that as "no signal" and falls through to whatever else it finds (a later
+                            // real message, or mtime).
+                            timestamp,
                         },
                     );
                     branch_summary_details.insert(id.clone(), details);
@@ -781,6 +848,13 @@ impl SessionStore {
                     kind,
                     data,
                 }) => {
+                    // Track L36: also recorded as an `ExportEvent` — a custom entry contributes
+                    // nothing to `Session.messages` (see this variant's own doc comment), so an HTML
+                    // export has no other way to know it happened at all.
+                    events.push(ExportEvent::Custom {
+                        kind: kind.clone(),
+                        data: data.clone(),
+                    });
                     nodes.insert(
                         id.clone(),
                         Node {
@@ -793,18 +867,36 @@ impl SessionStore {
                 }
                 // Purely a provenance record (see `Entry::Compaction`'s doc comment) — the very next
                 // entry in the file is the real, live message this compaction produced, so this one
-                // must never itself move the tip.
-                Ok(Entry::Compaction { .. }) => {}
+                // must never itself move the tip. Still indexed by id (Track L25) so `SessionStore::tree`
+                // can report that a compaction happened here, distinctly from an ordinary message.
+                Ok(Entry::Compaction {
+                    id,
+                    parent_id,
+                    tokens_before,
+                    folded_ids,
+                    ..
+                }) => {
+                    compactions.insert(
+                        id,
+                        CompactionRecord {
+                            parent_id,
+                            tokens_before,
+                            folded_ids,
+                        },
+                    );
+                }
                 // Neither moves the tip — a pure lookup record, last-write-wins per anchor (see
                 // `Entry::ModelChange`'s doc comment).
                 Ok(Entry::ModelChange {
                     parent_id, model, ..
                 }) => {
+                    events.push(ExportEvent::ModelChange(model.clone()));
                     model_changes.insert(parent_id, model);
                 }
                 Ok(Entry::ThinkingLevelChange {
                     parent_id, level, ..
                 }) => {
+                    events.push(ExportEvent::ThinkingLevelChange(level.clone()));
                     level_changes.insert(parent_id, level);
                 }
                 // Whole-session-scoped, not anchored to `parent_id` — the most recent one in file order
@@ -821,14 +913,20 @@ impl SessionStore {
                 // matching pi's own `appendLabelChange`.
                 Ok(Entry::Label {
                     target_id, label, ..
-                }) => match label {
-                    Some(l) => {
-                        labels.insert(target_id, l);
+                }) => {
+                    events.push(ExportEvent::Label {
+                        target_id: target_id.clone(),
+                        label: label.clone(),
+                    });
+                    match label {
+                        Some(l) => {
+                            labels.insert(target_id, l);
+                        }
+                        None => {
+                            labels.remove(&target_id);
+                        }
                     }
-                    None => {
-                        labels.remove(&target_id);
-                    }
-                },
+                }
                 // A line that read fully (valid UTF-8, under the size cap) but failed to deserialize as
                 // an `Entry` — a bad line *other* than a torn final write (disk bit rot, a manual edit,
                 // a future `Entry` variant an older binary doesn't know about yet). Unlike the
@@ -886,6 +984,8 @@ impl SessionStore {
                 model_changes,
                 level_changes,
                 labels,
+                compactions,
+                events,
             },
             session,
         ))
@@ -999,6 +1099,10 @@ impl SessionStore {
             data: data.clone(),
         };
         append_line(&self.path, &entry)?;
+        self.events.push(ExportEvent::Custom {
+            kind: kind.clone(),
+            data: data.clone(),
+        });
         self.nodes.insert(
             id.clone(),
             Node {
@@ -1295,11 +1399,13 @@ impl SessionStore {
                     .map(str::to_string)
             })
             .unwrap_or_default();
+        let compaction_id = new_id();
+        let compaction_parent_id = folded_ids.last().cloned();
         let compaction_entry = Entry::Compaction {
-            id: new_id(),
-            parent_id: folded_ids.last().cloned(),
+            id: compaction_id.clone(),
+            parent_id: compaction_parent_id.clone(),
             tokens_before: meta.tokens_before,
-            folded_ids,
+            folded_ids: folded_ids.clone(),
             summary,
         };
 
@@ -1373,10 +1479,24 @@ impl SessionStore {
         self.nodes.extend(new_nodes);
         self.active = new_active;
         self.persisted = messages.len();
+        // So `tree()` reflects this round immediately, without requiring a reopen from disk first —
+        // `open()`'s replay populates the same map from the just-written `compaction_entry` line, but
+        // this is the same live `SessionStore` instance the caller is still holding (Track L25).
+        self.compactions.insert(
+            compaction_id,
+            CompactionRecord {
+                parent_id: compaction_parent_id,
+                tokens_before: meta.tokens_before,
+                folded_ids,
+            },
+        );
         if let Some(model) = effective_model {
+            self.events.push(ExportEvent::ModelChange(model.clone()));
             self.model_changes.insert(None, model);
         }
         if let Some(level) = effective_level {
+            self.events
+                .push(ExportEvent::ThinkingLevelChange(level.clone()));
             self.level_changes.insert(None, level);
         }
         Ok(())
@@ -1498,6 +1618,14 @@ impl SessionStore {
         branches
     }
 
+    /// Every [`ExportEvent`] recorded in this session, in file order — Track L36 (pi-parity fix), for
+    /// a caller (HTML export) that wants to surface a model/thinking-level switch, a label, or a custom
+    /// entry as its own visible block, the same way [`Self::abandoned_branches`] exists so an export can
+    /// render every branch's actual conversation instead of just the active path.
+    pub fn export_events(&self) -> &[ExportEvent] {
+        &self.events
+    }
+
     /// The full root-to-leaf message chain of every abandoned branch (every leaf *except* the active
     /// tip) — the full-content counterpart of [`Self::list_branches`] (which carries only a preview),
     /// for a caller (HTML export) that wants to render every branch's actual conversation, not just
@@ -1560,9 +1688,22 @@ impl SessionStore {
             .nodes
             .iter()
             .map(|(id, node)| {
-                let (role, preview) = match &node.content {
-                    NodeContent::Message(m) => (Some(m.role), message_text_preview(m)),
-                    NodeContent::Custom { kind, .. } => (None, Some(format!("[custom: {kind}]"))),
+                let (role, preview, entry_kind) = match &node.content {
+                    // A materialized branch-summary recap is a real `NodeContent::Message` (so it
+                    // actually reaches the model — see `branch_summary_message`), indistinguishable
+                    // from an ordinary message by content alone; `branch_summary_details` is exactly
+                    // the structured, id-keyed record of which nodes are actually recaps (Track L25).
+                    NodeContent::Message(m) => {
+                        let kind = if self.branch_summary_details.contains_key(id) {
+                            "branch_summary"
+                        } else {
+                            "message"
+                        };
+                        (Some(m.role), message_text_preview(m), kind)
+                    }
+                    NodeContent::Custom { kind, .. } => {
+                        (None, Some(format!("[custom: {kind}]")), "custom")
+                    }
                 };
                 TreeNode {
                     id: id.clone(),
@@ -1571,9 +1712,26 @@ impl SessionStore {
                     preview,
                     label: self.labels.get(id).cloned(),
                     timestamp: node.timestamp,
+                    entry_kind,
                 }
             })
             .collect();
+        // `Entry::Compaction` records are never `nodes` (see `CompactionRecord`'s doc comment), so they
+        // aren't covered by the map above at all — reported here as their own synthetic nodes instead,
+        // purely for this listing; nothing about active-path/fork traversal changes.
+        nodes.extend(self.compactions.iter().map(|(id, rec)| TreeNode {
+            id: id.clone(),
+            parent_id: rec.parent_id.clone(),
+            role: None,
+            preview: Some(format!(
+                "[compaction: folded {} message(s), {} tokens before]",
+                rec.folded_ids.len(),
+                rec.tokens_before
+            )),
+            label: self.labels.get(id).cloned(),
+            timestamp: 0,
+            entry_kind: "compaction",
+        }));
         nodes.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
         nodes
     }
@@ -1670,12 +1828,14 @@ impl SessionStore {
         let summary = summary.into();
         let entry_id = new_id();
         let details_for_index = details.clone();
+        let timestamp = now_secs();
         let entry = Entry::BranchSummary {
             id: entry_id.clone(),
             parent_id: Some(target_id.to_string()),
             summary: summary.clone(),
             from_id: from_id.into(),
             details,
+            timestamp,
         };
 
         // The updated header first (so a fresh `open()`'s last-`Entry::Session`-wins replay picks it
@@ -1696,9 +1856,7 @@ impl SessionStore {
             Node {
                 parent_id: Some(target_id.to_string()),
                 content: NodeContent::Message(branch_summary_message(&summary)),
-                // No content-derived timestamp for a materialized branch summary — same scope
-                // boundary as the `Entry::BranchSummary` arm in `open()`.
-                timestamp: 0,
+                timestamp,
             },
         );
         self.branch_summary_details
@@ -1777,12 +1935,14 @@ impl SessionStore {
         let summary = summary.into();
         let entry_id = new_id();
         let details_for_index = details.clone();
+        let timestamp = now_secs();
         let entry = Entry::BranchSummary {
             id: entry_id.clone(),
             parent_id: None,
             summary: summary.clone(),
             from_id: from_id.into(),
             details,
+            timestamp,
         };
 
         let mut buf = Vec::new();
@@ -1798,7 +1958,7 @@ impl SessionStore {
             Node {
                 parent_id: None,
                 content: NodeContent::Message(branch_summary_message(&summary)),
-                timestamp: 0,
+                timestamp,
             },
         );
         self.branch_summary_details
@@ -1825,6 +1985,7 @@ impl SessionStore {
             model: model.to_string(),
         };
         append_line(&self.path, &entry)?;
+        self.events.push(ExportEvent::ModelChange(model.to_string()));
         self.model_changes.insert(anchor, model.to_string());
         Ok(())
     }
@@ -1839,6 +2000,8 @@ impl SessionStore {
             level: level.to_string(),
         };
         append_line(&self.path, &entry)?;
+        self.events
+            .push(ExportEvent::ThinkingLevelChange(level.to_string()));
         self.level_changes.insert(anchor, level.to_string());
         Ok(())
     }
@@ -1917,6 +2080,10 @@ impl SessionStore {
             label: label.map(str::to_string),
         };
         append_line(&self.path, &entry)?;
+        self.events.push(ExportEvent::Label {
+            target_id: target_id.to_string(),
+            label: label.map(str::to_string),
+        });
         match label {
             Some(l) => {
                 self.labels.insert(target_id.to_string(), l.to_string());
@@ -2276,6 +2443,26 @@ impl SessionRepo {
         // for why: `open_id` now accepts a unique prefix, so `id` itself may not be the real full id.
         meta.parent = Some(src.meta.id.clone());
         meta.title = src.meta.title.clone();
+
+        // `before` (now the default — see `serve.rs`'s `fork`/`preview_fork` handlers) means "fork
+        // right before this entry", which only makes sense anchored to a user turn: popping a
+        // non-user entry (an assistant reply, a materialized branch-summary recap, or a custom entry)
+        // would silently land the fork one entry earlier than the caller actually asked for, with no
+        // way for them to tell. pi's own `getEntriesToFork` (`repo-utils.ts`) rejects the same case as
+        // `SessionError("invalid_fork_target")` — mirrored here rather than guessing.
+        if before {
+            let is_user_message = src
+                .nodes
+                .get(entry_id)
+                .and_then(Node::as_message)
+                .is_some_and(|m| m.role == Role::User);
+            if !is_user_message {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("invalid_fork_target: entry {entry_id} is not a user message"),
+                ));
+            }
+        }
 
         let mut path = path_from_root(&src.nodes, Some(entry_id));
         if before {
@@ -3543,6 +3730,80 @@ mod tests {
             .find(|v| v["id"] == json!(old_ids[1]))
             .expect("second folded message entry not found");
         assert_eq!(second_folded_entry["parent_id"], json!(old_ids[0]));
+    }
+
+    #[test]
+    fn tree_reports_entry_kind_for_a_compaction_and_a_branch_summary_not_just_a_plain_message() {
+        // Track L25 (pi-parity fix): `Entry::BranchSummary`/`Entry::Compaction` used to be
+        // indistinguishable from an ordinary message once materialized into `tree()`'s output — a
+        // client had no way to tell "this is a recap"/"a compaction happened here" apart from an
+        // everyday turn without guessing off `preview` text. Proves `entry_kind` recovers both, and
+        // that an ordinary message still reports `"message"`.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        for text in ["one", "two", "three", "four"] {
+            session.user(text);
+        }
+        store.append_new(&session.messages).unwrap();
+        let ids = store.active_ids().to_vec();
+
+        // An ordinary message reports the baseline kind.
+        let plain = store.tree().into_iter().find(|n| n.id == ids[0]).unwrap();
+        assert_eq!(plain.entry_kind, "message");
+
+        // A branch-summary recap, still a real `NodeContent::Message` under the hood (so it reaches
+        // the model), reports its own distinct kind instead.
+        store
+            .switch_active_with_summary(
+                &ids[0],
+                "recap of the abandoned branch",
+                &ids[3],
+                BranchSummaryDetails::default(),
+            )
+            .unwrap();
+        let summary_id = store.active_ids().last().unwrap().clone();
+        let tree = store.tree();
+        let summary_node = tree.iter().find(|n| n.id == summary_id).unwrap();
+        assert_eq!(summary_node.entry_kind, "branch_summary");
+        assert!(
+            summary_node.role.is_some(),
+            "a branch-summary node is still a real message with a role, just distinguishable by kind"
+        );
+
+        // A compaction round's own provenance record, never itself a chain node, is still surfaced as
+        // its own synthetic entry.
+        store
+            .rewrite_compacted(
+                &[Message::user("kept after compaction")],
+                CompactionMeta { tokens_before: 999 },
+            )
+            .unwrap();
+        let tree = store.tree();
+        let compaction_node = tree
+            .iter()
+            .find(|n| n.entry_kind == "compaction")
+            .expect("a compaction node must be recoverable from tree()'s output");
+        assert!(
+            compaction_node.preview.as_deref().is_some_and(|p| p.contains("999")),
+            "the compaction node's preview should still mention tokens_before: {compaction_node:#?}"
+        );
+
+        // Reopening from disk must agree — this isn't just an in-memory-only artifact of the live
+        // instance that ran the compaction.
+        let (reopened, _) = repo.open_id(&store.meta().id.clone()).unwrap();
+        let reopened_tree = reopened.tree();
+        assert!(
+            reopened_tree.iter().any(|n| n.entry_kind == "compaction"),
+            "a reopened session must still report the compaction node: {reopened_tree:#?}"
+        );
+        assert!(
+            reopened_tree
+                .iter()
+                .any(|n| n.entry_kind == "branch_summary"),
+            "a reopened session must still report the branch-summary node: {reopened_tree:#?}"
+        );
     }
 
     #[test]
@@ -5162,6 +5423,39 @@ mod tests {
     }
 
     #[test]
+    fn fork_at_entry_before_a_non_user_message_is_rejected() {
+        // Track L27: `before` (now the default — see `serve.rs`'s `fork`/`preview_fork`) means "fork
+        // right before this entry", which pi's own `getEntriesToFork` (`repo-utils.ts`) only allows
+        // anchored to a user turn — forking "before" an assistant reply is ambiguous (which point,
+        // exactly, is "before" a reply that has no message of its own between it and the prior turn?).
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("a");
+        session.push(Message::assistant(vec![ContentBlock::text("a-reply")]));
+        store.append_new(&session.messages).unwrap();
+        let ids = store.active_ids().to_vec(); // [user "a", assistant "a-reply"]
+
+        let session_id = store.meta().id.clone();
+        match repo.fork_at_entry(&session_id, &ids[1], true) {
+            Ok(_) => panic!("expected invalid_fork_target for a `before` fork at an assistant reply"),
+            Err(e) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+                assert!(
+                    e.to_string().contains("invalid_fork_target"),
+                    "error must be identifiable as pi's own `invalid_fork_target` case: {e}"
+                );
+            }
+        }
+
+        // "at" (before:false) the very same entry is perfectly valid — the restriction is specific to
+        // `before`, not to targeting a non-user entry at all.
+        let (_, fsession) = repo.fork_at_entry(&session_id, &ids[1], false).unwrap();
+        assert_eq!(fsession.messages.len(), 2);
+    }
+
+    #[test]
     fn set_label_sets_and_gets() {
         // pi: session-manager/labels.test.ts, "sets and gets labels".
         let dir = tmpdir();
@@ -5179,6 +5473,57 @@ mod tests {
         // The label is visible via `tree()` too, attached to the labeled node.
         let node = store.tree().into_iter().find(|n| n.id == msg_id).unwrap();
         assert_eq!(node.label.as_deref(), Some("checkpoint"));
+    }
+
+    #[test]
+    fn export_events_records_model_thinking_label_and_custom_changes_in_order() {
+        // Track L36 (pi-parity fix): `Entry::ModelChange`/`Entry::ThinkingLevelChange`/`Entry::Label`/
+        // `Entry::Custom` were all durably tracked but never reached an HTML export at all —
+        // `export_events` is the ordered event log that now lets `crate::export` render them.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("hello");
+        store.append_new(&session.messages).unwrap();
+        let msg_id = store.active_ids()[0].clone();
+
+        assert!(
+            store.export_events().is_empty(),
+            "no events recorded yet: {:?}",
+            store.export_events()
+        );
+
+        store.record_model_change("model-b").unwrap();
+        store.record_thinking_level_change("high").unwrap();
+        store.set_label(&msg_id, Some("checkpoint")).unwrap();
+        let custom_id = store
+            .append_custom("beyond:sync", json!({"marker": "m1"}))
+            .unwrap();
+
+        assert_eq!(
+            store.export_events(),
+            &[
+                ExportEvent::ModelChange("model-b".to_string()),
+                ExportEvent::ThinkingLevelChange("high".to_string()),
+                ExportEvent::Label {
+                    target_id: msg_id.clone(),
+                    label: Some("checkpoint".to_string()),
+                },
+                ExportEvent::Custom {
+                    kind: "beyond:sync".to_string(),
+                    data: json!({"marker": "m1"}),
+                },
+            ],
+            "events must be recorded in file order"
+        );
+
+        // Reopening from disk must recover the exact same ordered log — not just the live instance's
+        // own in-memory bookkeeping.
+        let (reopened, _) = repo.open_id(&store.meta().id.clone()).unwrap();
+        assert_eq!(reopened.export_events(), store.export_events());
+        // `custom_id` really is the id `append_custom` returned, sanity-checking the fixture itself.
+        assert!(reopened.tree().iter().any(|n| n.id == custom_id));
     }
 
     #[test]
@@ -5688,6 +6033,53 @@ mod tests {
                 "switch_active_with_summary's temp-file-then-rename must not loosen permissions"
             );
         }
+    }
+
+    #[test]
+    fn branch_summary_carries_a_real_timestamp_not_the_zero_placeholder() {
+        // Track L45 (pi-parity fix): `Entry::BranchSummary` used to have no `timestamp` field at all,
+        // unlike `Entry::Message`/`Entry::Custom` — a materialized branch-summary node always reported
+        // `timestamp: 0` in `tree()`'s output regardless of when it was actually created, breaking a
+        // client's ability to sort/reconstruct branch order chronologically for that one entry kind.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("alpha");
+        session.user("beta");
+        store.append_new(&session.messages).unwrap();
+        let ids = store.active_ids().to_vec();
+
+        let before = now_secs();
+        store
+            .switch_active_with_summary(
+                &ids[0],
+                "recap of the abandoned branch",
+                &ids[1],
+                BranchSummaryDetails::default(),
+            )
+            .unwrap();
+        let summary_id = store.active_ids().last().unwrap().clone();
+
+        // The live, in-memory instance already reports a real timestamp, not the old `0` placeholder.
+        let node = store.tree().into_iter().find(|n| n.id == summary_id).unwrap();
+        assert!(
+            node.timestamp >= before,
+            "expected a real timestamp (>= {before}), got {}",
+            node.timestamp
+        );
+
+        // Survives reopen from disk, read back from the persisted `Entry::BranchSummary` line itself.
+        let (reopened, _) = repo.open_id(&store.meta().id.clone()).unwrap();
+        let reopened_node = reopened
+            .tree()
+            .into_iter()
+            .find(|n| n.id == summary_id)
+            .unwrap();
+        assert_eq!(
+            reopened_node.timestamp, node.timestamp,
+            "a reopened session must recover the same real timestamp, not fall back to 0"
+        );
     }
 
     #[test]

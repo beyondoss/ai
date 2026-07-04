@@ -350,7 +350,11 @@ pub fn build_body(req: &ModelRequest) -> Value {
     // `ModelCaps::unknown()`'s conservative default (`supports_long_cache: false`) means an
     // unrecognized third-party model id omits the field unless a future capability-table entry opts it
     // in explicitly.
-    if caps.supports_long_cache {
+    //
+    // Also gated on `!req.no_cache` — `ModelRequest::no_cache`'s own doc comment promises to skip
+    // OpenAI's `prompt_cache_key`/`prompt_cache_retention` too (equivalently to Anthropic's
+    // `cache_control`), matching pi's `cacheRetention === "none"` check (`openai-completions.ts`).
+    if caps.supports_long_cache && !req.no_cache {
         if let Some(key) = &req.cache_key {
             map.insert(
                 "prompt_cache_key".into(),
@@ -360,7 +364,7 @@ pub fn build_body(req: &ModelRequest) -> Value {
     }
     // Opt into the 24h cache-retention tier (vs the default, shorter one) when the caller asked and the
     // model's capability entry allows it — mirrors the Anthropic dialect's `cache_long` gating.
-    if req.cache_long && caps.supports_long_cache {
+    if req.cache_long && caps.supports_long_cache && !req.no_cache {
         map.insert("prompt_cache_retention".into(), json!("24h"));
     }
     map.insert("messages".into(), Value::Array(messages));
@@ -957,6 +961,29 @@ mod tests {
             .with_cache_key("session-abc");
         let body = build_body(&req);
         assert!(body.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn no_cache_suppresses_prompt_cache_key_and_retention() {
+        // pi-parity: `ModelRequest::no_cache`'s own doc comment promises to skip
+        // `prompt_cache_key`/`prompt_cache_retention` too (equivalently to Anthropic's
+        // `cache_control`), matching pi's `cacheRetention === "none"` check — a genuinely one-off
+        // request has no follow-up turn to amortize a cache affinity hint against.
+        let req = ModelRequest::new("gpt-4o", vec![Message::user("hi")], 64)
+            .with_cache_key("session-abc")
+            .with_cache_long(true)
+            .with_no_cache(true);
+        let body = build_body(&req);
+        assert!(
+            body.get("prompt_cache_key").is_none(),
+            "got: {:#?}",
+            body.get("prompt_cache_key")
+        );
+        assert!(
+            body.get("prompt_cache_retention").is_none(),
+            "got: {:#?}",
+            body.get("prompt_cache_retention")
+        );
     }
 
     #[test]

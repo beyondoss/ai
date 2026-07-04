@@ -13,6 +13,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use serde::Serialize;
+
 use crate::path_utils::push_unique_root;
 
 /// A discovered skill: enough to advertise it; the body stays on disk until needed.
@@ -26,6 +28,61 @@ pub struct Skill {
     /// from its description, but a user can still trigger it explicitly via `/skill:name`. Such skills
     /// are discovered (so the explicit lookup works) but omitted from the `<available_skills>` listing.
     pub disable_model_invocation: bool,
+}
+
+/// A single diagnostic surfaced by [`discover_with_diagnostics`] / [`crate::prompts::discover_with_diagnostics`]
+/// — pi's own `ResourceDiagnostic`/`ResourceCollision` (`diagnostics.ts:1-16`), adapted. A genuine
+/// same-name collision (two `SKILL.md`/prompt-template files declaring the same name, one silently
+/// shadowing the other) has its winner/loser broken out into their own fields, so a client can build
+/// real tooling on top of it (e.g. "which one do you want?") instead of scraping a sentence apart. Not
+/// every diagnostic this module surfaces is actually a collision, though — an unreadable manifest, a
+/// `--skill`/`--prompt-template` path that doesn't exist, a missing `description` — those carry
+/// `winner_path`/`loser_path`/`winner_source`/`loser_source` as `None` and only `message` populated.
+/// `message` is always populated either way, so `Display`/`to_string()` (below) gets back exactly the
+/// plain string every call site got before this type existed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Collision {
+    /// `"skill"` or `"prompt"` — pi's `resourceType` (pi also has `"extension"`/`"theme"`, which this
+    /// codebase has no equivalent of).
+    pub resource_type: &'static str,
+    /// The colliding (or otherwise diagnosed) name. Empty when there's no single resource name to
+    /// attach a diagnostic to (e.g. a `--skill` path that isn't a directory or a `.md` file at all).
+    pub name: String,
+    /// For a genuine collision, the definition that was actually kept. `None` for a diagnostic that
+    /// isn't a same-name collision.
+    pub winner_path: Option<PathBuf>,
+    /// For a genuine collision, the definition that was shadowed. `None` alongside `winner_path`.
+    pub loser_path: Option<PathBuf>,
+    /// A short label for where the winner came from (e.g. `"standard root"`, `"--skill"`), when the
+    /// collision crosses root categories worth distinguishing. `None` when not tracked — a same-category
+    /// collision (two entries under the same root kind), or a non-collision diagnostic.
+    pub winner_source: Option<&'static str>,
+    /// The loser's equivalent of `winner_source`.
+    pub loser_source: Option<&'static str>,
+    /// Human-readable detail, always populated — what every caller got back before this type existed.
+    pub message: String,
+}
+
+impl std::fmt::Display for Collision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl Collision {
+    /// A diagnostic with no structured winner/loser of its own — just a human-readable `message` (an
+    /// unreadable manifest, a bad `--skill`/`--prompt-template` path, a missing description).
+    pub(crate) fn message_only(resource_type: &'static str, message: String) -> Self {
+        Self {
+            resource_type,
+            name: String::new(),
+            winner_path: None,
+            loser_path: None,
+            winner_source: None,
+            loser_source: None,
+            message,
+        }
+    }
 }
 
 /// How deep we descend looking for a `SKILL.md`. A skill may live in a directory tree, but a sane
@@ -48,7 +105,7 @@ pub fn discover(cwd: &Path, project_trusted: bool, extra_roots: &[String]) -> Ve
 
 /// Like [`discover`], but also reports name collisions — the same skill `name` declared by more than
 /// one `SKILL.md`/loose-`.md` file, silently shadowed by `discover` (the more specific standard root
-/// wins) — as human-readable strings naming both paths, for `get_commands` to surface as a diagnostic
+/// wins) — as structured [`Collision`]s naming both paths, for `get_commands` to surface as a diagnostic
 /// rather than a client having no way to notice a skill was shadowed.
 ///
 /// `extra_roots` are additional, ad-hoc discovery roots beyond the standard ones — pi's own
@@ -66,7 +123,7 @@ pub fn discover_with_diagnostics(
     cwd: &Path,
     project_trusted: bool,
     extra_roots: &[String],
-) -> (Vec<Skill>, Vec<String>) {
+) -> (Vec<Skill>, Vec<Collision>) {
     discover_with_diagnostics_impl(cwd, project_trusted, extra_roots, true)
 }
 
@@ -79,7 +136,7 @@ pub fn discover_with_diagnostics(
 /// roots are never gated on `project_trusted` (see [`discover`]'s doc comment), so there's no way to
 /// suppress every standard root through its existing parameters — this needs an actual "skip standard
 /// roots" switch.
-pub fn discover_extra_only(extra_roots: &[String]) -> (Vec<Skill>, Vec<String>) {
+pub fn discover_extra_only(extra_roots: &[String]) -> (Vec<Skill>, Vec<Collision>) {
     discover_with_diagnostics_impl(Path::new(""), false, extra_roots, false)
 }
 
@@ -88,9 +145,9 @@ fn discover_with_diagnostics_impl(
     project_trusted: bool,
     extra_roots: &[String],
     include_standard_roots: bool,
-) -> (Vec<Skill>, Vec<String>) {
+) -> (Vec<Skill>, Vec<Collision>) {
     let mut found: Vec<Skill> = Vec::new();
-    let mut collisions: Vec<String> = Vec::new();
+    let mut collisions: Vec<Collision> = Vec::new();
     // `.agents/skills` roots first, so `.claude/skills` — the tool-specific customization a project
     // maintainer wrote deliberately for this agent — wins on a same-named collision against the
     // vendor-neutral fallback convention (this crate's own `standard_roots` fold below keeps whichever
@@ -153,7 +210,11 @@ fn discover_with_diagnostics_impl(
                 continue;
             }
             let (skills, diagnostics) = discover_in_with_diagnostics(&root);
-            collisions.extend(diagnostics);
+            collisions.extend(
+                diagnostics
+                    .into_iter()
+                    .map(|m| Collision::message_only("skill", m)),
+            );
             extra_root_skills.push(skills);
         } else if root.extension().and_then(|e| e.to_str()) == Some("md") {
             // Same reasoning as the directory case above, for a standalone `.md` file.
@@ -173,7 +234,7 @@ fn discover_with_diagnostics_impl(
                          {extra}"
                     );
                     tracing::warn!("{message}");
-                    collisions.push(message);
+                    collisions.push(Collision::message_only("skill", message));
                 }
             }
         } else {
@@ -181,7 +242,7 @@ fn discover_with_diagnostics_impl(
                 "--skill path does not exist, or is not a directory or a .md file: {extra}"
             );
             tracing::warn!("{message}");
-            collisions.push(message);
+            collisions.push(Collision::message_only("skill", message));
         }
     }
 
@@ -190,12 +251,20 @@ fn discover_with_diagnostics_impl(
     // processed *later*, so `.claude/skills` ends up winning over `.agents/skills` overall.
     for root in agents_roots {
         let (skills, diagnostics) = discover_in_with_diagnostics_skill_md_only(&root);
-        collisions.extend(diagnostics);
+        collisions.extend(
+            diagnostics
+                .into_iter()
+                .map(|m| Collision::message_only("skill", m)),
+        );
         fold_skills_later_wins(&mut found, skills, &mut collisions);
     }
     for root in standard_roots {
         let (skills, diagnostics) = discover_in_with_diagnostics(&root);
-        collisions.extend(diagnostics);
+        collisions.extend(
+            diagnostics
+                .into_iter()
+                .map(|m| Collision::message_only("skill", m)),
+        );
         fold_skills_later_wins(&mut found, skills, &mut collisions);
     }
     // Names claimed by a standard root — snapshotted *before* extra roots are processed, so a
@@ -218,7 +287,15 @@ fn discover_with_diagnostics_impl(
                     skill.path.display()
                 );
                 tracing::warn!("{message}");
-                collisions.push(message);
+                collisions.push(Collision {
+                    resource_type: "skill",
+                    name: skill.name.clone(),
+                    winner_path: Some(existing.path.clone()),
+                    loser_path: Some(skill.path.clone()),
+                    winner_source: Some("standard root"),
+                    loser_source: Some("--skill"),
+                    message,
+                });
                 continue;
             }
             fold_skills_later_wins(&mut found, vec![skill], &mut collisions);
@@ -274,7 +351,7 @@ fn discover_in_with_diagnostics_skill_md_only(root: &Path) -> (Vec<Skill>, Vec<S
 fn fold_skills_later_wins(
     found: &mut Vec<Skill>,
     skills: Vec<Skill>,
-    collisions: &mut Vec<String>,
+    collisions: &mut Vec<Collision>,
 ) {
     for skill in skills {
         if let Some(existing) = found.iter_mut().find(|s| s.name == skill.name) {
@@ -285,7 +362,15 @@ fn fold_skills_later_wins(
                 skill.path.display()
             );
             tracing::warn!("{message}");
-            collisions.push(message);
+            collisions.push(Collision {
+                resource_type: "skill",
+                name: skill.name.clone(),
+                winner_path: Some(skill.path.clone()),
+                loser_path: Some(existing.path.clone()),
+                winner_source: None,
+                loser_source: None,
+                message,
+            });
             *existing = skill;
         } else {
             found.push(skill);
@@ -430,7 +515,8 @@ fn loose_root_skills(root: &Path, diagnostics: &mut Vec<String>) -> Vec<Skill> {
 /// the directory name for `name` if the frontmatter omits it.
 ///
 /// Both silent-drop paths — an unreadable manifest, and a missing/empty `description` — are reported
-/// through `diagnostics` (the same `Vec<String>` `discover_with_diagnostics` surfaces to a caller) and
+/// through `diagnostics` (folded into the `Vec<Collision>` `discover_with_diagnostics` surfaces to a
+/// caller, each wrapped as a message-only [`Collision`] since neither has a winner/loser of its own) and
 /// `tracing::warn!`-logged at the point of detection, matching every other malformed-skill case in this
 /// file: `validate_skill_name`/`validate_skill_description`'s issues below `warn!` even when the skill is
 /// still allowed to load, so a skill that fails to load at all must not produce *less* signal than one.
@@ -800,14 +886,56 @@ mod tests {
             "the later file must win, not duplicate the entry: {found:?}"
         );
         assert!(
-            collisions.iter().any(|c| c.contains("dup")),
+            collisions.iter().any(|c| c.to_string().contains("dup")),
             "collision must be reported: {collisions:?}"
         );
     }
 
     #[test]
+    fn discover_with_diagnostics_populates_structured_collision_fields() {
+        // pi-parity fix: collision diagnostics used to be a flattened `Vec<String>` (pi's own
+        // `ResourceDiagnostic`/`ResourceCollision`, `diagnostics.ts:1-16`, is structured) — a client had
+        // no way to build tooling (e.g. "which one do you want?") on top of a plain sentence.
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_root = tmp.path().join(".claude/skills");
+        write_skill(
+            &skills_root,
+            "one",
+            "---\nname: dup\ndescription: first\n---\n",
+        );
+        write_skill(
+            &skills_root,
+            "two",
+            "---\nname: dup\ndescription: second\n---\n",
+        );
+        let (_, collisions) = discover_with_diagnostics(tmp.path(), true, &[]);
+        let dup = collisions
+            .iter()
+            .find(|c| c.name == "dup")
+            .expect("the collision must be reported");
+        assert_eq!(dup.resource_type, "skill");
+        let winner = dup.winner_path.clone().expect("winner_path populated");
+        let loser = dup.loser_path.clone().expect("loser_path populated");
+        // The walk order between two same-depth manifests isn't itself guaranteed (filesystem
+        // readdir order), so this pins the two paths as a *set* rather than which specific one wins —
+        // the same reasoning `discover_with_diagnostics_reports_a_shadowed_skill_name` above already
+        // follows by not asserting which of "one"/"two" survives.
+        let mut got = [winner.clone(), loser.clone()];
+        got.sort();
+        let mut expected = [
+            skills_root.join("one/SKILL.md"),
+            skills_root.join("two/SKILL.md"),
+        ];
+        expected.sort();
+        assert_eq!(got, expected);
+        assert_ne!(winner, loser);
+        assert!(!dup.message.is_empty());
+        assert_eq!(dup.to_string(), dup.message);
+    }
+
+    #[test]
     fn discover_with_diagnostics_logs_a_shadowed_skill_name() {
-        // A collision returned in the `Vec<String>` is only ever seen by a client that proactively
+        // A collision returned in the `Vec<Collision>` is only ever seen by a client that proactively
         // calls `get_commands` — an operator watching server logs never would. `tracing::warn!` must
         // fire at the point of detection too, independent of any caller bothering to read the return
         // value.
@@ -1085,7 +1213,7 @@ mod tests {
             "the same directory scanned via two paths must not double-count its skills: {found:?}"
         );
         assert!(
-            !collisions.iter().any(|c| c.contains("shared")),
+            !collisions.iter().any(|c| c.to_string().contains("shared")),
             "must not report a phantom self-collision: {collisions:?}"
         );
     }
@@ -1124,9 +1252,10 @@ mod tests {
         let (_, collisions) =
             discover_with_diagnostics(tmp.path(), true, &[missing.to_string_lossy().into_owned()]);
         assert!(
-            collisions
-                .iter()
-                .any(|c| c.contains("does not exist") && c.contains("does-not-exist")),
+            collisions.iter().any(|c| {
+                let m = c.to_string();
+                m.contains("does not exist") && m.contains("does-not-exist")
+            }),
             "got: {collisions:?}"
         );
     }
@@ -1195,12 +1324,21 @@ mod tests {
         );
         let dup = found.iter().find(|s| s.name == "dup").unwrap();
         assert_eq!(dup.description, "standard root version");
+        let collision = collisions
+            .iter()
+            .find(|c| c.name == "dup")
+            .expect("must report the collision");
         assert!(
-            collisions
-                .iter()
-                .any(|c| c.contains("dup") && c.contains("standard root wins")),
+            collision.to_string().contains("standard root wins"),
             "got: {collisions:?}"
         );
+        assert_eq!(collision.winner_source, Some("standard root"));
+        assert_eq!(collision.loser_source, Some("--skill"));
+        assert_eq!(
+            collision.winner_path,
+            Some(tmp.path().join(".claude/skills/dup/SKILL.md"))
+        );
+        assert_eq!(collision.loser_path, Some(extra_root.join("dup/SKILL.md")));
     }
 
     #[test]
@@ -1437,7 +1575,7 @@ mod tests {
         // zero diagnostic signal — unlike every other malformed-skill case in this file (e.g.
         // `validate_skill_name`'s issues, which `warn!` even when the skill is still allowed to load).
         // A missing `description:` must now surface through both the `tracing::warn!` channel and the
-        // diagnostics `Vec<String>` `discover_with_diagnostics` returns to a caller.
+        // diagnostics list `discover_with_diagnostics` folds into its own `Vec<Collision>` for a caller.
         let tmp = tempfile::tempdir().unwrap();
         write_skill(tmp.path(), "broken", "---\nname: broken\n---\n");
         let mut skills = Vec::new();

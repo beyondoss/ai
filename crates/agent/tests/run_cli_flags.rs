@@ -65,6 +65,33 @@ fn run_binary_list_models_prints_known_model_ids_with_no_gateway_or_key() {
 }
 
 #[test]
+fn run_binary_list_models_search_argument_filters_to_matching_model_ids() {
+    // pi-parity fix: `list-models` had no way to narrow a long table down to models matching a search
+    // term (pi's own `--list-models <search>`) — an optional positional argument, case-insensitive
+    // substring match against the model id.
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args(["list-models", "GPT"])
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("gpt-5"),
+        "a case-insensitive match on 'GPT' must still find gpt-5: {stdout}"
+    );
+    assert!(
+        !stdout.contains("claude-opus-4-8"),
+        "a model id not matching the search term must be filtered out: {stdout}"
+    );
+}
+
+#[test]
 fn run_binary_list_models_prints_capability_columns_not_just_bare_ids() {
     // Pi-parity fix: previously a bare list of model ids — pi's own `--list-models` prints a table
     // with context/max-out/thinking/images columns, all already computed by `agent_core::capabilities`
@@ -485,6 +512,73 @@ fn run_binary_context_window_flag_forces_proactive_compaction_on_a_resumed_sessi
 }
 
 #[test]
+fn run_binary_no_compaction_flag_suppresses_proactive_compaction_on_a_resumed_session() {
+    // pi-parity fix: no way to disable automatic compaction entirely — `--no-compaction` must suppress
+    // the exact same proactive trigger the sibling test above forces, even with the same tiny pinned
+    // `--context-window`/`--compaction-reserve-tokens` that would otherwise guarantee it fires.
+    let dir = tempfile::tempdir().unwrap();
+
+    let session_file = {
+        use agent_core::{ContentBlock, Message, Session};
+        use beyond_ai_agent::session_store::{SessionMeta, SessionRepo};
+
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "claude-test")).unwrap();
+        let mut seed = Session::new();
+        seed.user("u".repeat(400));
+        seed.push(Message::assistant(vec![ContentBlock::text(
+            "a".repeat(400),
+        )]));
+        seed.user("u".repeat(400));
+        seed.push(Message::assistant(vec![ContentBlock::text(
+            "a".repeat(400),
+        )]));
+        store.append_new(&seed.messages).unwrap();
+        store.path().to_string_lossy().into_owned()
+    };
+
+    let (base, bodies) = spawn_model_server(vec![turn_text("answered")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "continue please",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--session",
+            &session_file,
+            "--context-window",
+            "200",
+            "--compaction-reserve-tokens",
+            "50",
+            "--compaction-keep-recent-tokens",
+            "1",
+            "--no-compaction",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(
+        bodies.len(),
+        1,
+        "--no-compaction must suppress the proactive summarization call entirely: {bodies:#?}"
+    );
+}
+
+#[test]
 fn run_binary_cache_long_flag_reaches_the_wire_request() {
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
 
@@ -785,6 +879,62 @@ fn run_binary_deny_tool_flag_blocks_the_named_tool_end_to_end() {
 }
 
 #[test]
+fn run_binary_deny_tool_env_var_blocks_the_named_tool_end_to_end() {
+    // pi-parity fix: `deny_tool`/`deny_bash_pattern` had no `env = "..."` attrs on `Run` even though
+    // the identical `Serve` fields did — so `AI_AGENT_DENY_TOOL`/`AI_AGENT_DENY_BASH_PATTERN` silently
+    // had no effect on `run`, only on `serve`. Proves the env var alone (no `--deny-tool` flag at all)
+    // blocks the call end-to-end, the same way the sibling flag-based test above does.
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("should-not-exist.txt");
+
+    let turn1 = turn_tool_use(
+        "toolu_1",
+        "bash",
+        &json!({ "command": format!("touch {}", marker.to_str().unwrap()) }).to_string(),
+    );
+    let turn2 = turn_text("done");
+    let (base, bodies) = spawn_model_server(vec![turn1, turn2]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "run a command",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--max-steps",
+            "4",
+        ])
+        .env("AI_AGENT_DENY_TOOL", "bash")
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !marker.exists(),
+        "AI_AGENT_DENY_TOOL=bash must block the call before it ever runs — the marker file must not \
+         exist"
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[1].contains("denied by policy"),
+        "the model must see a policy-blocked tool_result, not the real command's output: {}",
+        bodies[1]
+    );
+}
+
+#[test]
 fn run_binary_deny_bash_pattern_flag_blocks_matching_commands_end_to_end() {
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("should-not-exist.txt");
@@ -832,6 +982,62 @@ fn run_binary_deny_bash_pattern_flag_blocks_matching_commands_end_to_end() {
     assert!(
         bodies[1].contains("blocked by policy"),
         "the model must see a policy-blocked tool_result: {}",
+        bodies[1]
+    );
+}
+
+#[test]
+fn run_binary_deny_path_flag_blocks_a_write_to_the_matching_path_end_to_end() {
+    // Track L22: `ToolPolicy` previously had no way to gate `write`/`edit` by their `path` argument at
+    // all — only whole-tool-name (`--deny-tool`) or `bash`-substring (`--deny-bash-pattern`) denial.
+    // Proves the real compiled binary blocks a `write` whose path matches `--deny-path`'s glob, before
+    // the file is ever created.
+    let dir = tempfile::tempdir().unwrap();
+    let secret = dir.path().join("secrets.env");
+
+    let turn1 = turn_tool_use(
+        "toolu_1",
+        "write",
+        &json!({ "path": secret.to_str().unwrap(), "content": "TOKEN=abc" }).to_string(),
+    );
+    let turn2 = turn_text("done");
+    let (base, bodies) = spawn_model_server(vec![turn1, turn2]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "write the secret",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--deny-path",
+            "*.env",
+            "--max-steps",
+            "4",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !secret.exists(),
+        "--deny-path '*.env' must block the write before it ever runs — the file must not exist"
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[1].contains("denied by policy"),
+        "the model must see a policy-blocked tool_result, not the real write's output: {}",
         bodies[1]
     );
 }
@@ -917,6 +1123,295 @@ fn run_binary_ai_agent_tools_env_var_restricts_the_registry_to_an_allow_list() {
     assert!(
         !bodies[0].contains("\"bash\""),
         "AI_AGENT_TOOLS=read,write must exclude everything outside the allow-list: {}",
+        bodies[0]
+    );
+}
+
+#[test]
+fn run_binary_short_t_flag_is_an_alias_for_tools() {
+    // pi-parity fix: `--tools`/`--exclude-tools`/`--no-tools`/`--no-skills`/`--no-prompt-templates`/
+    // `--no-context-files`/`--trust-project`/`--force-untrusted` had no short-flag aliases at all,
+    // unlike pi's own CLI (`cli/args.ts`). `-t` matches pi's `--tools`/`-t`.
+    let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "hi",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "-t",
+            "read,write",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[0].contains("\"read\"") && bodies[0].contains("\"write\""),
+        "-t must behave exactly like --tools: {}",
+        bodies[0]
+    );
+    assert!(!bodies[0].contains("\"bash\""), "{}", bodies[0]);
+}
+
+#[test]
+fn run_binary_short_xt_flag_is_an_alias_for_exclude_tools() {
+    let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "hi",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "-xt",
+            "bash",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        !bodies[0].contains("\"bash\""),
+        "-xt must behave exactly like --exclude-tools: {}",
+        bodies[0]
+    );
+    assert!(bodies[0].contains("\"read\""), "{}", bodies[0]);
+}
+
+#[test]
+fn run_binary_short_nt_flag_is_an_alias_for_no_tools() {
+    let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "hi",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "-nt",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        !bodies[0].contains("\"tools\":"),
+        "-nt must behave exactly like --no-tools (no tools field on the wire at all): {}",
+        bodies[0]
+    );
+}
+
+#[test]
+fn run_binary_short_a_and_na_flags_are_aliases_for_trust_project_and_force_untrusted() {
+    // `-a` matches pi's own `--approve`/`-a`; `-na` matches pi's own `--no-approve`/`-na`. Proven
+    // together, mirroring `run_binary_force_untrusted_overrides_trust_project`: `-na` must still win
+    // even when `-a` is also given.
+    let dir = tempfile::tempdir().unwrap();
+    let skill_dir = dir.path().join(".claude/skills/greet");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: greet\ndescription: a test skill\n---\nSKILL-BODY-MARKER-123",
+    )
+    .unwrap();
+    let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "/skill:greet",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "-a",
+            "-na",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        !bodies[0].contains("SKILL-BODY-MARKER-123"),
+        "-na must override -a, so the skill must not expand: {}",
+        bodies[0]
+    );
+}
+
+#[test]
+fn run_binary_short_ns_flag_is_an_alias_for_no_skills() {
+    let dir = tempfile::tempdir().unwrap();
+    let skill_dir = dir.path().join(".claude/skills/greet");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: greet\ndescription: a test skill\n---\nSKILL-BODY-MARKER-123",
+    )
+    .unwrap();
+    let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "/skill:greet",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "-a",
+            "-ns",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        !bodies[0].contains("SKILL-BODY-MARKER-123"),
+        "-ns must behave exactly like --no-skills: {}",
+        bodies[0]
+    );
+    assert!(bodies[0].contains("/skill:greet"), "{}", bodies[0]);
+}
+
+#[test]
+fn run_binary_short_np_flag_is_an_alias_for_no_prompt_templates() {
+    let dir = tempfile::tempdir().unwrap();
+    let prompt_dir = dir.path().join(".claude/prompts");
+    std::fs::create_dir_all(&prompt_dir).unwrap();
+    std::fs::write(
+        prompt_dir.join("fix.md"),
+        "Fix the bug in $1 — TEMPLATE-BODY-MARKER-456",
+    )
+    .unwrap();
+    let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "/fix foo.rs",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "-a",
+            "-np",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        !bodies[0].contains("TEMPLATE-BODY-MARKER-456"),
+        "-np must behave exactly like --no-prompt-templates: {}",
+        bodies[0]
+    );
+}
+
+#[test]
+fn run_binary_short_nc_flag_is_an_alias_for_no_context_files() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("CLAUDE.md"), "PROJECT-MARKER-777").unwrap();
+    let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "hello",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "-nc",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        !bodies[0].contains("PROJECT-MARKER-777"),
+        "-nc must behave exactly like --no-context-files: {}",
         bodies[0]
     );
 }

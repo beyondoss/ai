@@ -1,6 +1,6 @@
 //! Steering — injecting user input into a run in flight.
 //!
-//! A [`Steering`] handle holds two shared queues, distinguished by *when* the loop injects them:
+//! A [`Steering`] handle holds three shared queues, distinguished by *when* the loop injects them:
 //!
 //! - **steer** ([`push_steer`](Steering::push_steer)) — injected *mid-run*, between tool-executing
 //!   turns, folded onto the same tool-results user turn. This is how a client redirects a busy agent
@@ -8,25 +8,35 @@
 //! - **follow-up** ([`push`](Steering::push)) — injected only at a *would-stop* boundary (the model
 //!   ended its turn without asking for tools), as a fresh user turn. This is "keep going / now do the
 //!   next thing" once the current work is done.
+//! - **next-turn** ([`push_next_turn`](Steering::push_next_turn)) — injected before a *fresh* run's
+//!   very first request, folded onto the same user turn as the prompt that starts it. This is how a
+//!   message queued while the agent is idle (no run in flight for either of the other two lanes to
+//!   attach to) still lands on turn 1 of whatever prompt comes next, rather than waiting for a tool
+//!   round-trip or a stop boundary that may never arrive. Mirrors pi's `nextTurnQueue`
+//!   (`agent-harness.ts`'s `executeTurn`, which splices it onto the front of a fresh turn's own
+//!   messages before the first model call).
 //!
-//! Both injection points place messages where the previous message is the assistant's, so a pushed
-//! user turn never lands next to another user turn (which the wire would reject). The two lanes mirror
-//! pi's separate `steerQueue` and `followUpQueue`.
+//! Both the steer and follow-up injection points place messages where the previous message is the
+//! assistant's, so a pushed user turn never lands next to another user turn (which the wire would
+//! reject); the next-turn lane instead folds into the prompt's own user turn for the same reason. The
+//! three lanes mirror pi's separate `steerQueue`, `followUpQueue`, and `nextTurnQueue`.
 //!
-//! A third, independent signal lives here too: [`request_stop`](Steering::request_stop) — a graceful,
+//! A fourth, independent signal lives here too: [`request_stop`](Steering::request_stop) — a graceful,
 //! host-initiated "stop after the current turn" request, mirroring pi's `shouldStopAfterTurn`. Unlike
 //! cancellation (which drops an in-flight future and can abandon a tool mid-execution), this is checked
 //! only at a turn boundary, after that turn's tool calls (if any) have already completed and their
 //! results are durably committed — so it never leaves an orphaned `tool_use` behind. It's a flag, not a
 //! queue: a second request before the first is observed is indistinguishable from one.
 //!
-//! A fourth and fifth setting — [`QueueMode`], one per lane — govern how much of that lane a single
-//! drain point consumes: `All` (the historical behavior here) folds everything queued into one
-//! injection; `OneAtATime` (pi's `PendingMessageQueue` default) takes only the oldest message, leaving
-//! the rest queued for the *next* drain point, so several quick messages from a client land as separate
-//! turns instead of one merged one. The steer and follow-up lanes carry **independent** `QueueMode`
-//! settings (matching pi's own separate `steeringMode`/`followUpMode`) — a client may want, say, every
-//! mid-run redirect folded together while follow-ups still land one at a time, or vice versa.
+//! A fifth and sixth setting — [`QueueMode`], one per lane — govern how much of the steer/follow-up
+//! lanes a single drain point consumes: `All` (the historical behavior here) folds everything queued
+//! into one injection; `OneAtATime` (pi's `PendingMessageQueue` default) takes only the oldest message,
+//! leaving the rest queued for the *next* drain point, so several quick messages from a client land as
+//! separate turns instead of one merged one. The steer and follow-up lanes carry **independent**
+//! `QueueMode` settings (matching pi's own separate `steeringMode`/`followUpMode`) — a client may want,
+//! say, every mid-run redirect folded together while follow-ups still land one at a time, or vice versa.
+//! The next-turn lane has no `QueueMode` of its own — like pi's `nextTurnQueue.splice(0)`, a drain
+//! always takes everything queued; there's no "one at a time" reading of "prepended to the next prompt."
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -125,6 +135,8 @@ pub struct Steering {
     steer: Queue,
     /// Injected at a would-stop boundary.
     follow_up: Queue,
+    /// Injected before a fresh run's very first request, folded onto that request's own prompt turn.
+    next_turn: Queue,
     /// Set by [`request_stop`](Self::request_stop); consumed by the loop at the next turn boundary.
     stop_requested: Arc<AtomicBool>,
     /// How much of the steer lane [`drain_steer`](Self::drain_steer) consumes per call — see
@@ -156,15 +168,27 @@ impl Steering {
         lock(&self.steer).push_back(message.into());
     }
 
-    /// Whether either queue currently holds any messages.
-    pub fn is_empty(&self) -> bool {
-        lock(&self.steer).is_empty() && lock(&self.follow_up).is_empty()
+    /// Queue a **next-turn** message: folded onto the very first request of whatever run comes next,
+    /// before that run's own first model call — pi's `nextTurn()`. Unlike `push`/`push_steer`, this is
+    /// meant to be called while the agent is idle (nothing else queued has a run in flight to attach
+    /// to), though nothing here enforces that — a caller can queue one mid-run too, and it simply waits
+    /// for the *next* fresh run to start. Accepts a plain string or a [`SteeringMessage`] (with image
+    /// attachments).
+    pub fn push_next_turn(&self, message: impl Into<SteeringMessage>) {
+        lock(&self.next_turn).push_back(message.into());
     }
 
-    /// Total queued messages across both lanes — pi's `pendingMessageCount` (`get_state`'s queue-depth
-    /// field). A peek, not a drain: calling this doesn't consume anything.
+    /// Whether any lane currently holds any messages.
+    pub fn is_empty(&self) -> bool {
+        lock(&self.steer).is_empty()
+            && lock(&self.follow_up).is_empty()
+            && lock(&self.next_turn).is_empty()
+    }
+
+    /// Total queued messages across all three lanes — pi's `pendingMessageCount` (`get_state`'s
+    /// queue-depth field). A peek, not a drain: calling this doesn't consume anything.
     pub fn pending_count(&self) -> usize {
-        lock(&self.steer).len() + lock(&self.follow_up).len()
+        lock(&self.steer).len() + lock(&self.follow_up).len() + lock(&self.next_turn).len()
     }
 
     /// Set how much of the steer lane a single [`drain_steer`](Self::drain_steer) consumes (see
@@ -231,7 +255,14 @@ impl Steering {
         }
     }
 
-    /// Drop everything queued in both lanes without returning it — for a caller (`new_session`/
+    /// Take every queued **next-turn** message — pi's `nextTurnQueue.splice(0)`. Unlike
+    /// [`drain_steer`](Self::drain_steer)/[`drain_at_stop`](Self::drain_at_stop), this always takes the
+    /// whole lane; there's no `QueueMode` for it (see the module doc comment for why).
+    pub(crate) fn drain_next_turn(&self) -> Vec<SteeringMessage> {
+        lock(&self.next_turn).drain(..).collect()
+    }
+
+    /// Drop everything queued in every lane without returning it — for a caller (`new_session`/
     /// `switch_session`/`fork`/`switch_branch`) that's about to swap in a different session's
     /// conversation, so a message queued for the *old* session's next turn can't leak into the newly
     /// switched-to one. Also clears any pending stop request, for the same reason: a graceful-stop
@@ -239,6 +270,7 @@ impl Steering {
     pub fn clear(&self) {
         lock(&self.steer).clear();
         lock(&self.follow_up).clear();
+        lock(&self.next_turn).clear();
         self.stop_requested.store(false, Ordering::Relaxed);
         *lock_switch(&self.model_switch) = None;
     }
@@ -561,5 +593,67 @@ mod tests {
         let b = a.clone();
         a.request_stop();
         assert!(b.take_stop_requested());
+    }
+
+    #[test]
+    fn next_turn_is_a_lane_distinct_from_steer_and_follow_up() {
+        // pi-parity gap: pi's `nextTurnQueue` is a third lane, separate from `steerQueue`/
+        // `followUpQueue` — queuing to it must not drain (or be drained by) either of the other two.
+        let s = Steering::new();
+        s.push_next_turn("next");
+        s.push("follow");
+        s.push_steer("steer");
+        assert_eq!(s.drain_steer(), vec!["steer".to_string()]);
+        assert_eq!(s.drain_at_stop(), vec!["follow".to_string()]);
+        assert_eq!(
+            s.drain_next_turn(),
+            vec!["next".to_string()],
+            "next-turn must survive both other lanes' drains untouched"
+        );
+    }
+
+    #[test]
+    fn drain_next_turn_always_takes_the_whole_lane() {
+        // No `QueueMode` for this lane — matching pi's unconditional `nextTurnQueue.splice(0)`.
+        let s = Steering::new();
+        s.push_next_turn("a");
+        s.push_next_turn("b");
+        s.push_next_turn("c");
+        assert_eq!(
+            s.drain_next_turn(),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        assert_eq!(s.drain_next_turn(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn next_turn_counts_toward_is_empty_and_pending_count() {
+        let s = Steering::new();
+        assert!(s.is_empty());
+        s.push_next_turn("queued while idle");
+        assert!(!s.is_empty());
+        assert_eq!(s.pending_count(), 1);
+        s.drain_next_turn();
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn clear_also_drops_a_pending_next_turn_message() {
+        let s = Steering::new();
+        s.push_next_turn("stale");
+        s.clear();
+        assert_eq!(
+            s.drain_next_turn(),
+            Vec::<String>::new(),
+            "clear must not leave a next-turn message that could bleed into a different session's run"
+        );
+    }
+
+    #[test]
+    fn next_turn_is_shared_across_clones() {
+        let a = Steering::new();
+        let b = a.clone();
+        a.push_next_turn("x");
+        assert_eq!(b.drain_next_turn(), vec!["x".to_string()]);
     }
 }

@@ -59,6 +59,89 @@ fn serve_set_auto_compaction_toggles_and_rejects_a_non_boolean() {
 }
 
 #[test]
+fn serve_no_compaction_flag_starts_with_auto_compaction_disabled() {
+    // Track L26 (pi-parity fix): `serve` had no `--no-compaction`/`AI_AGENT_NO_COMPACTION` equivalent
+    // of `run`'s identical flag at all — `current_auto_compaction` was hardcoded `true` at startup,
+    // only ever changeable afterward via `set_auto_compaction`.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file)
+        .args(["--no-compaction"])
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_state");
+    assert_eq!(
+        frames.last().unwrap()["data"]["auto_compaction"],
+        false,
+        "--no-compaction must start the process with auto-compaction already disabled: {frames:#?}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_set_auto_compaction_persists_across_a_restart() {
+    // Track L26 (pi-parity fix): `set_auto_compaction` used to mutate only an in-process local — a
+    // restarted `serve` (no `--no-compaction`/env var given either time) silently reverted to
+    // enabled-by-default, with no way for a client's toggle to survive the restart. Uses a real,
+    // writable `HOME` (not the usual `ISOLATED_HOME`) so the persisted `agent settings` file genuinely
+    // round-trips across the two separate process spawns below.
+    let home = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+
+    let (base, _bodies) = spawn_model_server(vec![]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file)
+        .env("HOME", home.path())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_auto_compaction", "enabled": false })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "set_auto_compaction");
+    assert_eq!(frames.last().unwrap()["success"], true, "{frames:#?}");
+    drop(stdin);
+    child.wait().unwrap();
+
+    // A brand-new process, same HOME, no `--no-compaction` flag and no env var at all — must still
+    // start with auto-compaction disabled, purely from the persisted setting the first process wrote.
+    let (base2, _bodies2) = spawn_model_server(vec![]);
+    let session_file2 = dir.path().join("s2.jsonl").to_string_lossy().into_owned();
+    let mut child2 = serve_cmd(bin, &base2, &session_file2)
+        .env("HOME", home.path())
+        .spawn()
+        .unwrap();
+    let mut stdin2 = child2.stdin.take().unwrap();
+    let mut stdout2 = BufReader::new(child2.stdout.take().unwrap());
+    writeln!(stdin2, "{}", json!({ "type": "get_state" })).unwrap();
+    stdin2.flush().unwrap();
+    let frames2 = read_until_response(&mut stdout2, "get_state");
+    assert_eq!(
+        frames2.last().unwrap()["data"]["auto_compaction"],
+        false,
+        "a restarted process must recover the persisted auto-compaction override: {frames2:#?}"
+    );
+
+    drop(stdin2);
+    child2.wait().unwrap();
+}
+
+#[test]
 fn serve_compact_forwards_custom_instructions_to_the_summarization_call() {
     // Track M14: `compact`'s `custom_instructions` must actually reach the summarization model call —
     // matching pi's own `compact(customInstructions)` — not just be silently ignored.

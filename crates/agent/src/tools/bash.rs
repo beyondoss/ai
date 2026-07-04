@@ -242,7 +242,15 @@ impl Bash {
                     if le.elapsed() >= UPDATE_THROTTLE {
                         *le = Instant::now();
                         drop(le);
-                        let snap = a.snapshot(false);
+                        // pi-parity fix (task 58): pi forces a spill to the temp file on *every* live
+                        // progress emit once the output is truncated (50KB), not just on the final
+                        // snapshot — `false` here left a live update in the 50-100KB range (`truncated`
+                        // already true, but under the ~100KB rolling cap that auto-spills during
+                        // `append`) reporting `truncated: true` with no `full_output_path` to point at
+                        // yet. `snapshot`'s own `persist_if_truncated` gate means this is a no-op unless
+                        // the 50KB mark has actually been crossed, and a no-op again once already
+                        // spilled, so this doesn't force an extra file open on every throttled tick.
+                        let snap = a.snapshot(true);
                         emit_update(p, &snap);
                     }
                 }
@@ -1073,6 +1081,112 @@ mod tests {
         assert!(
             count < 100,
             "expected a throttled handful of updates for 5000 rapid chunks, got {count}"
+        );
+    }
+
+    /// A streaming runner that delivers a fixed sequence of chunks with a real delay between each —
+    /// unlike `ChunkedRunner` (which fires every chunk back-to-back with no elapsed time, so
+    /// `UPDATE_THROTTLE` never trips before the run completes), this lets a test force a live throttled
+    /// emit to land at a chosen point mid-stream.
+    struct DelayedChunksRunner {
+        chunks: Vec<Vec<u8>>,
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl CommandRunner for DelayedChunksRunner {
+        async fn run(
+            &self,
+            _program: &str,
+            _args: &[String],
+            _cwd: Option<&str>,
+            _timeout: Duration,
+        ) -> std::io::Result<ExecResult> {
+            unreachable!("test only exercises the streaming path")
+        }
+
+        async fn run_streaming(
+            &self,
+            _program: &str,
+            _args: &[String],
+            _cwd: Option<&str>,
+            _timeout: Duration,
+            on_chunk: ChunkSink<'_>,
+        ) -> std::io::Result<ExecResult> {
+            for (i, chunk) in self.chunks.iter().enumerate() {
+                if i > 0 {
+                    tokio::time::sleep(self.delay).await;
+                }
+                on_chunk(chunk);
+            }
+            Ok(ExecResult {
+                code: Some(0),
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_live_progress_emit_between_50kb_and_100kb_carries_a_full_output_path() {
+        // pi-parity fix (task 58): pi spills to a temp file at 50KB and forces this on *every* live
+        // progress emit, not just the final one. This crate's auto-spill during `append` didn't trip
+        // until the output outgrew `rolling_cap` (2x the 50KB display budget, i.e. ~100KB), and the
+        // live-emit path passed `persist_if_truncated: false` — so a live snapshot taken while the
+        // output sat between 50KB and 100KB reported `truncated: true` with no `full_output_path` to
+        // point at, even though the final result would have one. Two chunks with a real delay between
+        // them (well past `UPDATE_THROTTLE`) force a live emit to land after the first 60KB chunk
+        // (over pi's 50KB mark, under the old ~100KB auto-spill mark) and before the run completes.
+        let first = vec![b'a'; 60 * 1024];
+        let second = b"tail\n".to_vec();
+        let runner = Arc::new(DelayedChunksRunner {
+            chunks: vec![first, second],
+            delay: UPDATE_THROTTLE * 3,
+        });
+
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        let progress = ToolProgress::new(
+            tx,
+            "id".into(),
+            "bash".into(),
+            agent_core::CancellationToken::new(),
+        );
+        Bash::with_runner(runner)
+            .run_streaming(json!({ "command": "x" }), &progress)
+            .await
+            .unwrap();
+        drop(progress);
+
+        // Extract each update's `full_output_path` (or `None` for the initial content-less update),
+        // dropping straight to `Option<String>` since `ToolUpdate` itself carries no `Debug` impl to
+        // print on assertion failure.
+        let mut full_paths = Vec::new();
+        while let Ok(update) = rx.try_recv() {
+            let agent_core::ToolUpdate::Progress { details, .. } = update else {
+                continue;
+            };
+            let path = details
+                .as_ref()
+                .and_then(|d| d.get("full_output_path"))
+                .and_then(|p| p.as_str())
+                .map(str::to_string);
+            full_paths.push(path);
+        }
+        assert!(
+            full_paths.len() >= 2,
+            "expected at least one live emit plus the final one, got {}",
+            full_paths.len()
+        );
+        // The *last* update is the final snapshot, which was already forced to persist before this
+        // fix — the bug is specifically about every update *before* it.
+        let (last, live) = full_paths.split_last().expect("checked non-empty above");
+        assert!(
+            live.iter().any(Option::is_some),
+            "a live (pre-final) progress update in the 50-100KB range must already carry a \
+             full_output_path, not just the final one: {full_paths:?}"
+        );
+        assert!(
+            last.is_some(),
+            "sanity: the final update must still carry a full_output_path too: {full_paths:?}"
         );
     }
 

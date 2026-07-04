@@ -348,8 +348,12 @@ continues rather than aborting.
 ```
 TCP chunks (Bytes) ──► Vec<u8> byte buffer ──split on '\n'──► whole UTF-8 line ──► push_sse_line()
                                                                                           │
-                                                                     strip "data:" prefix; skip blank/
-                                                                     comment/`event:`/`[DONE]` lines
+                                                                     strip "data:" prefix, buffer payload
+                                                                     in SseEventBuffer; skip comment/
+                                                                     `event:`/`[DONE]` lines outright
+                                                                                          │
+                                                              blank line (or end-of-stream) flushes the
+                                                              buffer: join buffered payloads with "\n"
                                                                                           │
                                                                     serde_json::from_str(payload) → Value
                                                                                           │
@@ -357,6 +361,13 @@ TCP chunks (Bytes) ──► Vec<u8> byte buffer ──split on '\n'──► wh
                                                                                           │
                                                                           0..N StreamEvent
 ```
+
+A `data:` line is buffered, not parsed immediately — the SSE spec's own event boundary is a blank
+line, not a per-`data:`-line one, so a logical event can (rarely, and not from real Anthropic/OpenAI in
+practice, but legitimately from a spec-conformant intermediary) span multiple consecutive `data:` lines
+that must be joined with `"\n"` before the first JSON-parse attempt. `SseEventBuffer` accumulates them;
+a blank line or end-of-stream (the streaming client and `decode_sse` both flush once after their last
+line) triggers the join-and-parse. See `dialect/mod.rs`'s `SseEventBuffer`/`push_sse_line` doc comments.
 
 Anthropic emits an explicit `content_block_stop` per block; OpenAI doesn't, so its decoder synthesizes
 `ContentBlockStop` when a tool call's `id` arrives (closing the prior block) or `finish_reason` shows
@@ -583,7 +594,10 @@ _provider_ connection — the gateway can legitimately hold this connection open
 600s while waiting on a slow provider (e.g. an extended-thinking gap). A downstream hop's patience must
 be at least its upstream's, so `READ_TIMEOUT` mirrors the gateway's `read_timeout_secs` exactly, and is
 applied between reads (not as a `Client::timeout` over the whole response) so a long-but-healthy stream
-is never killed mid-flight.
+is never killed mid-flight. `GatewayClient::with_idle_timeout` overrides it for a deployment that sits
+behind a different upstream (rebuilds the underlying `reqwest::Client`, since its timeouts are fixed at
+construction); outbound proxy config needs no client-side option at all — `reqwest` already reads
+`HTTP_PROXY`/`HTTPS_PROXY` from the environment at the library level.
 
 ### Why the Anthropic body stamps three prompt-cache breakpoints
 
@@ -609,10 +623,14 @@ reattach. The decoder reads `cache_read_input_tokens`/`cache_creation_input_toke
 `TokenUsage`, so hits are observable. The OpenAI dialect needs no breakpoints — its provider caches
 prefixes automatically — but sets `prompt_cache_key` (from `cache_key`) for cache-node affinity, gated
 on `capabilities(model).supports_long_cache` (the same flag `cache_long`/24h-retention reuses just
-below it): `openai.rs`'s Chat Completions dialect is the fallback for every third-party
-OpenAI-compatible provider (`Dialect::for_model` routes native OpenAI ids to the Responses dialect
-instead), and a strict-schema third-party endpoint can 400 the whole request over an unrecognized
-field — `ModelCaps::unknown()`'s conservative default omits it unless a capability-table entry opts in.
+below it) *and* on `!req.no_cache`: `openai.rs`'s Chat Completions dialect is the fallback for every
+third-party OpenAI-compatible provider (`Dialect::for_model` routes native OpenAI ids to the Responses
+dialect instead), and a strict-schema third-party endpoint can 400 the whole request over an
+unrecognized field — `ModelCaps::unknown()`'s conservative default omits it unless a capability-table
+entry opts in. `no_cache` skips `prompt_cache_key`/`prompt_cache_retention` on both OpenAI dialects the
+same way it skips Anthropic's `cache_control` breakpoints — a one-off request has no follow-up turn to
+route back to the same cache node, so the affinity hint is pointless even on the Responses dialect,
+where sending it costs nothing extra (no cache-write premium to opt out of there, unlike Anthropic's).
 
 ### Why malformed streamed tool arguments are recoverable, not fatal
 

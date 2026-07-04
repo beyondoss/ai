@@ -76,6 +76,84 @@ fn serve_export_html_writes_a_self_contained_transcript() {
 }
 
 #[test]
+fn serve_export_html_includes_model_change_and_label_events() {
+    // Track L36 (pi-parity fix): `Entry::ModelChange`/`Entry::Label` (and `ThinkingLevelChange`/
+    // `Custom`) are durably tracked but previously never reached `export_html`'s output at all — a
+    // model switch or a label set mid-session was invisible in the exported transcript.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![turn_text("hello there")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "say hi" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_messages");
+    let msg_id = frames.last().unwrap()["data"]["messages"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_model", "model": "claude-other-model" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "set_model");
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_label", "target_id": msg_id, "label": "checkpoint" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "set_label");
+
+    let output_path = dir.path().join("out.html").to_string_lossy().into_owned();
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "export_html", "output_path": output_path })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "export_html");
+    assert_eq!(frames.last().unwrap()["success"], true, "{frames:#?}");
+
+    let html = std::fs::read_to_string(&output_path).unwrap();
+    assert!(
+        html.contains("Session Events"),
+        "expected an events section: {html}"
+    );
+    assert!(
+        html.contains("Model changed to <code>claude-other-model</code>"),
+        "expected the model change to be visible: {html}"
+    );
+    assert!(
+        html.contains("Labeled: checkpoint"),
+        "expected the label to be visible: {html}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
 fn serve_export_html_includes_abandoned_branches_not_just_the_active_path() {
     // Track M19: an abandoned branch (created by rewinding via `switch_branch`) must still show up in
     // the export — the whole point being that the old flat `export_html` silently dropped anything not
@@ -402,10 +480,17 @@ fn serve_list_sessions_streams_progress_frames_correlated_to_the_request_id() {
 
     let response = frames.last().unwrap();
     assert_eq!(response["success"], true);
+    // Track L28 (pi-parity fix): `list_sessions` now filters to this process's own cwd (matching
+    // `resume_or_create`'s identical filter at startup — see `Persistence::list_with_progress`'s doc
+    // comment), so the returned count is no longer `total` itself once other cwds are mixed into the
+    // same directory: `total`/`scanned` still reflect the raw, unfiltered file scan (the same
+    // scan-vs-filtered-result split `list_sessions`'s own `query` parameter already has), but the 6
+    // seeded here all carry a fake `/w{i}` cwd that matches none of them — only the server's own real
+    // startup session (this cwd) survives the filter.
     assert_eq!(
-        response["data"]["sessions"].as_array().unwrap().len() as u64,
-        total,
-        "progress total must match the number of sessions actually returned"
+        response["data"]["sessions"].as_array().unwrap().len(),
+        1,
+        "list_sessions must filter out every session recorded under a different cwd: {response:#?}"
     );
 
     drop(stdin);

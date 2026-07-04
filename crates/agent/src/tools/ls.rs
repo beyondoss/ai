@@ -15,11 +15,27 @@ use agent_core::tool::Tool;
 use agent_core::{ToolError, ToolOutput};
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use unicode_normalization::UnicodeNormalization;
 
 /// Default cap on entries returned before truncating, to protect the model's context from a
 /// `node_modules`-sized directory. Overridable per call via the `limit` argument. The model can also
 /// narrow with a more specific path or `find`/`grep`.
 const DEFAULT_LIMIT: usize = 500;
+
+/// A cheap Unicode-aware sort key: lowercase, then NFD-decompose and drop combining marks, so an
+/// accented Latin letter collates next to its unaccented form (e.g. "café" sorts next to "cafe", ahead
+/// of "cafz") instead of by raw codepoint (where "é" is U+00E9 — after "z" — so a plain codepoint
+/// compare would sort "café.txt" *after* "cafz.txt", nowhere near where a human, or pi's own
+/// `localeCompare`, would place it). Not full Unicode collation (DUCET; that needs an ICU-sized
+/// dependency this crate deliberately doesn't take just for `ls`'s display order) — but `unicode-
+/// normalization` is already linked directly by this crate (`edit.rs`'s NFKC folding), so this reuses
+/// machinery already paid for rather than adding anything new for a cosmetic-only improvement.
+fn collation_key(name: &str) -> String {
+    name.to_lowercase()
+        .nfd()
+        .filter(|c| !unicode_normalization::char::is_combining_mark(*c))
+        .collect()
+}
 
 pub struct Ls;
 
@@ -97,17 +113,18 @@ impl Tool for Ls {
             };
             entries.push((name.into_owned(), meta.is_dir()));
         }
-        // Directories first, then case-insensitive alphabetical by bare name — matches pi's
-        // `a.toLowerCase().localeCompare(b.toLowerCase())`, not a byte-order compare (which would sort
-        // every uppercase-leading name before every lowercase one, e.g. "Zebra.txt" before "apple.txt",
-        // unlike what a human — or pi — would expect). Falls back to a case-sensitive compare only to
-        // break an exact case-insensitive tie (e.g. "Foo"/"foo" coexisting in one directory), so the
-        // order stays deterministic instead of depending on the OS's arbitrary `readdir` order.
+        // Directories first, then case-insensitive alphabetical by bare name, collated in a way that
+        // groups an accented letter with its unaccented form (`collation_key`) rather than a raw
+        // codepoint compare — matches pi's `a.toLowerCase().localeCompare(b.toLowerCase())` far more
+        // closely than a byte-order compare would (which would also sort every uppercase-leading name
+        // before every lowercase one, e.g. "Zebra.txt" before "apple.txt", unlike what a human — or pi —
+        // would expect). Falls back to a case-sensitive compare only to break an exact tie (e.g.
+        // "Foo"/"foo" coexisting in one directory), so the order stays deterministic instead of
+        // depending on the OS's arbitrary `readdir` order.
         entries.sort_by(|(a_name, a_dir), (b_name, b_dir)| {
             b_dir.cmp(a_dir).then_with(|| {
-                a_name
-                    .to_lowercase()
-                    .cmp(&b_name.to_lowercase())
+                collation_key(a_name)
+                    .cmp(&collation_key(b_name))
                     .then_with(|| a_name.cmp(b_name))
             })
         });
@@ -293,6 +310,24 @@ mod tests {
             .unwrap()
             .text;
         assert_eq!(out, "apple.txt\nbanana.txt\nZebra.txt", "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn accented_names_collate_near_their_unaccented_form_not_by_raw_codepoint() {
+        // pi-parity fix (task 47): a raw codepoint compare sorts "café.txt" (with U+00E9) *after*
+        // "cafz.txt" ('z' is U+007A, well below U+00E9), unlike pi's own `localeCompare`, which groups
+        // an accented letter with its unaccented form — "café.txt" should land between "cafe.txt" and
+        // "cafz.txt", not after both.
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["cafz.txt", "café.txt", "cafe.txt"] {
+            std::fs::write(dir.path().join(name), "x").unwrap();
+        }
+        let out = Ls
+            .run(json!({ "path": dir.path().to_str().unwrap() }))
+            .await
+            .unwrap()
+            .text;
+        assert_eq!(out, "cafe.txt\ncafé.txt\ncafz.txt", "got: {out}");
     }
 
     #[tokio::test]

@@ -67,6 +67,12 @@ pub struct ModelCaps {
     pub supports_long_cache: bool,
     /// Whether the model accepts image input.
     pub supports_vision: bool,
+    /// Whether the model accepts a `temperature` parameter at all. `true` for almost every model;
+    /// `false` for `claude-opus-4-7`/`claude-opus-4-8` specifically, which reject it outright (pi:
+    /// `compat.supportsTemperature: false`, `anthropic.models.ts`) — distinct from the existing
+    /// thinking-enabled gate (`ModelRequest::temperature`'s own doc comment), which omits the field
+    /// only while extended thinking is on. A model can need both gates at once.
+    pub supports_temperature: bool,
     /// The extended-thinking shape the model accepts.
     pub thinking: ThinkingShape,
     /// Whether the model takes an OpenAI `reasoning_effort` parameter.
@@ -112,6 +118,7 @@ impl ModelCaps {
             max_tokens_field: MaxTokensField::MaxTokens,
             supports_long_cache: false,
             supports_vision: false,
+            supports_temperature: true,
             thinking: ThinkingShape::None,
             reasoning_effort: false,
             reasoning_disableable: false,
@@ -185,12 +192,19 @@ pub fn capabilities(model: &str) -> ModelCaps {
             } else {
                 "xhigh"
             };
+            // opus-4-7 and opus-4-8 reject `temperature` outright — pi's `compat.supportsTemperature:
+            // false` is set on exactly these two ids in `anthropic.models.ts` and no other gen6+ entry
+            // (opus-4-6, sonnet-4-6, sonnet-5, fable-5 all default to supported). Our own DEFAULT_MODEL
+            // is `claude-opus-4-8`, so this is a live, reachable 400 without the gate.
+            let supports_temperature =
+                !(m.starts_with("claude-opus-4-7") || m.starts_with("claude-opus-4-8"));
             return ModelCaps {
                 context_window: 1_000_000,
                 max_output,
                 max_tokens_field: MaxTokensField::MaxTokens,
                 supports_long_cache: true,
                 supports_vision: true,
+                supports_temperature,
                 thinking: ThinkingShape::Adaptive,
                 reasoning_effort: false,
                 reasoning_disableable,
@@ -224,6 +238,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
                 // these ids to the standard 5-minute TTL instead of the 1-hour one asked for.
                 supports_long_cache: true,
                 supports_vision: true,
+                supports_temperature: true,
                 thinking: ThinkingShape::None,
                 reasoning_effort: false,
                 // No thinking support at all here — nothing to explicitly disable, so the `thinking`
@@ -251,6 +266,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
             max_tokens_field: MaxTokensField::MaxTokens,
             supports_long_cache: true,
             supports_vision: true,
+            supports_temperature: true,
             thinking: ThinkingShape::Budget,
             reasoning_effort: false,
             reasoning_disableable: true,
@@ -300,6 +316,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
             // retired it (no entry at all, as of this writing) — nothing upstream still serves it, so
             // there's no longer a live model to special-case.
             supports_vision: !m.starts_with("o3-mini"),
+            supports_temperature: true,
             thinking: ThinkingShape::None,
             reasoning_effort: true,
             // o-series ids are disable-capable by default in pi's catalogue (no override).
@@ -331,6 +348,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
                 max_tokens_field: MaxTokensField::MaxTokens,
                 supports_long_cache: true,
                 supports_vision: true,
+                supports_temperature: true,
                 thinking: ThinkingShape::None,
                 reasoning_effort,
                 reasoning_disableable: false,
@@ -353,6 +371,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
                 max_tokens_field: MaxTokensField::MaxCompletionTokens,
                 supports_long_cache: true,
                 supports_vision: true,
+                supports_temperature: true,
                 thinking: ThinkingShape::None,
                 reasoning_effort: true,
                 reasoning_disableable: false,
@@ -405,6 +424,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
             max_tokens_field: MaxTokensField::MaxCompletionTokens,
             supports_long_cache: true,
             supports_vision: true,
+            supports_temperature: true,
             thinking: ThinkingShape::None,
             reasoning_effort: true,
             reasoning_disableable,
@@ -427,6 +447,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
                 max_tokens_field: MaxTokensField::MaxTokens,
                 supports_long_cache: true,
                 supports_vision: true,
+                supports_temperature: true,
                 thinking: ThinkingShape::None,
                 reasoning_effort: false,
                 reasoning_disableable: false,
@@ -446,6 +467,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
                 max_tokens_field: MaxTokensField::MaxTokens,
                 supports_long_cache: true,
                 supports_vision: true,
+                supports_temperature: true,
                 thinking: ThinkingShape::None,
                 reasoning_effort: false,
                 reasoning_disableable: false,
@@ -476,6 +498,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
             // "gpt-4-turbo" (`input: ["text","image"]`) and every 4o-family id. Every other id in this
             // branch does accept image input.
             supports_vision: m != "gpt-4",
+            supports_temperature: true,
             thinking: ThinkingShape::None,
             reasoning_effort: false,
             reasoning_disableable: false,
@@ -771,6 +794,35 @@ mod tests {
         assert_eq!(c.thinking, ThinkingShape::Adaptive);
         assert_eq!(c.context_window, 1_000_000);
         assert_eq!(c.max_output, 64_000);
+    }
+
+    #[test]
+    fn only_opus_4_7_and_opus_4_8_reject_temperature() {
+        // pi: `compat.supportsTemperature: false` is set on exactly these two ids in
+        // `anthropic.models.ts`; every other current id (including the rest of gen6+, legacy Budget-
+        // shape Claude, and every OpenAI-wire model) defaults to supporting it.
+        for id in ["claude-opus-4-7", "claude-opus-4-8"] {
+            assert!(
+                !capabilities(id).supports_temperature,
+                "{id} should reject temperature"
+            );
+        }
+        for id in [
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-sonnet-5",
+            "claude-fable-5",
+            "claude-opus-4-5",
+            "claude-sonnet-4-5",
+            "claude-3-5-sonnet-20241022",
+            "gpt-4o",
+            "o3",
+        ] {
+            assert!(
+                capabilities(id).supports_temperature,
+                "{id} should still support temperature"
+            );
+        }
     }
 
     #[test]

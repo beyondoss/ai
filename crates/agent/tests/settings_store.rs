@@ -300,3 +300,203 @@ fn settings_file_never_exists_under_the_isolated_test_home() {
             .exists()
     );
 }
+
+#[test]
+fn settings_default_project_trust_round_trips_across_invocations() {
+    // pi-parity fix: no persisted global default-trust policy existed at all — `always`/`never`/`ask`,
+    // consulted only when neither `--trust-project` nor `--force-untrusted` is explicitly given.
+    let home = tempfile::tempdir().unwrap();
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+
+    let set = Command::new(bin)
+        .args(["settings", "--default-project-trust", "always"])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        set.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&set.stdout);
+    assert!(
+        stdout.contains("default_project_trust: always"),
+        "{stdout}"
+    );
+
+    let show = Command::new(bin)
+        .arg("settings")
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(show.status.success());
+    let stdout = String::from_utf8_lossy(&show.stdout);
+    assert!(
+        stdout.contains("default_project_trust: always"),
+        "a fresh invocation must see the persisted policy: {stdout}"
+    );
+
+    let cleared = Command::new(bin)
+        .args(["settings", "--clear-default-project-trust"])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(cleared.status.success());
+    let stdout = String::from_utf8_lossy(&cleared.stdout);
+    assert!(
+        stdout.contains("default_project_trust: (not set)"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn run_binary_stored_default_project_trust_always_enables_a_project_system_md_with_no_explicit_flag() {
+    // The consultation point itself: with neither `--trust-project` nor `--force-untrusted` passed, a
+    // stored `always` policy must make the on-disk SYSTEM.md take effect exactly like `--trust-project`
+    // would.
+    let home = tempfile::tempdir().unwrap();
+    let project_dir = tempfile::tempdir().unwrap();
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+
+    let set = Command::new(bin)
+        .args(["settings", "--default-project-trust", "always"])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(set.status.success());
+
+    let claude_dir = project_dir.path().join(".claude");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    std::fs::write(claude_dir.join("SYSTEM.md"), "STORED-ALWAYS-TRUST-MARKER").unwrap();
+
+    let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
+    let output = Command::new(bin)
+        .env("HOME", home.path())
+        .args([
+            "run",
+            "hi",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+        ])
+        .current_dir(project_dir.path())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[0].contains("STORED-ALWAYS-TRUST-MARKER"),
+        "a stored default_project_trust=always must apply the on-disk SYSTEM.md with no explicit \
+         --trust-project flag: {}",
+        bodies[0]
+    );
+}
+
+#[test]
+fn run_binary_explicit_force_untrusted_wins_over_a_stored_default_project_trust_always() {
+    // An explicit per-run flag must always win over the stored global default, the same precedence
+    // `default_model`/`default_gateway_url` already have relative to their own explicit flags.
+    let home = tempfile::tempdir().unwrap();
+    let project_dir = tempfile::tempdir().unwrap();
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+
+    let set = Command::new(bin)
+        .args(["settings", "--default-project-trust", "always"])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(set.status.success());
+
+    let claude_dir = project_dir.path().join(".claude");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    std::fs::write(claude_dir.join("SYSTEM.md"), "SHOULD-NOT-APPLY-MARKER").unwrap();
+
+    let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
+    let output = Command::new(bin)
+        .env("HOME", home.path())
+        .args([
+            "run",
+            "hi",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--force-untrusted",
+        ])
+        .current_dir(project_dir.path())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        !bodies[0].contains("SHOULD-NOT-APPLY-MARKER"),
+        "an explicit --force-untrusted must win over a stored default_project_trust=always: {}",
+        bodies[0]
+    );
+}
+
+#[test]
+fn ai_agent_config_dir_env_var_redirects_settings_and_trust_store_off_of_home() {
+    // pi-parity fix: `settings.json`/`trusted-projects.json` previously always lived under
+    // `$HOME/.claude/`, with no way to redirect them short of overriding `$HOME` itself (which also
+    // moves every other HOME-relative thing this binary or the wider shell environment reads).
+    let home = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+
+    let set = Command::new(bin)
+        .args(["settings", "--model", "claude-opus-4-8"])
+        .env("HOME", home.path())
+        .env("AI_AGENT_CONFIG_DIR", config_dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        set.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+    assert!(
+        config_dir.path().join("settings.json").exists(),
+        "settings.json must land under AI_AGENT_CONFIG_DIR"
+    );
+    assert!(
+        !home.path().join(".claude/settings.json").exists(),
+        "settings.json must not also land under $HOME/.claude when AI_AGENT_CONFIG_DIR overrides it"
+    );
+
+    let trust = Command::new(bin)
+        .args(["trust", "."])
+        .env("HOME", home.path())
+        .env("AI_AGENT_CONFIG_DIR", config_dir.path())
+        .current_dir(config_dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        trust.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&trust.stderr)
+    );
+    assert!(
+        config_dir.path().join("trusted-projects.json").exists(),
+        "trusted-projects.json must land under AI_AGENT_CONFIG_DIR too"
+    );
+}

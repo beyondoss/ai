@@ -56,12 +56,13 @@ pub struct Grep;
 /// refcount bump, not a fresh `PathBuf` per hit.
 type Hit = (Arc<Path>, usize, String, bool);
 
-/// A prepared grep: ripgrep's regex matcher, an optional file glob, the search root, the report cap,
-/// and how many lines of context to show around each match (`before`/`after`, like ripgrep's
-/// `-B`/`-A`/`-C`).
+/// A prepared grep: ripgrep's regex matcher, an optional file glob (with whether it's negated — a
+/// leading `!` in the original pattern, ripgrep-CLI-style — so `search` can invert the match test), the
+/// search root, the report cap, and how many lines of context to show around each match (`before`/
+/// `after`, like ripgrep's `-B`/`-A`/`-C`).
 pub struct GrepJob {
     matcher: RegexMatcher,
-    glob: Option<GlobMatcher>,
+    glob: Option<(GlobMatcher, bool)>,
     root: PathBuf,
     limit: usize,
     before: usize,
@@ -75,7 +76,7 @@ impl GrepJob {
         pattern: &str,
         literal: bool,
         ignore_case: bool,
-        glob: Option<GlobMatcher>,
+        glob: Option<(GlobMatcher, bool)>,
         root: PathBuf,
         limit: usize,
     ) -> Result<Self, String> {
@@ -188,8 +189,10 @@ pub fn search(job: &GrepJob, threads: usize) -> (Vec<Hit>, bool, Option<String>)
                 return WalkState::Continue;
             }
             let path = entry.path();
-            if let Some(g) = glob {
-                if !g.is_match(path) {
+            if let Some((g, negate)) = glob {
+                let matched = g.is_match(path);
+                let keep = if *negate { !matched } else { matched };
+                if !keep {
                     return WalkState::Continue;
                 }
             }
@@ -334,7 +337,7 @@ impl Tool for Grep {
             "properties": {
                 "pattern": { "type": "string", "description": "Regular expression to search for." },
                 "path": { "type": "string", "description": "Directory or file to search (default \".\")." },
-                "glob": { "type": "string", "description": "Only search files matching this glob." },
+                "glob": { "type": "string", "description": "Only search files matching this glob. Prefix with \"!\" to exclude files matching it instead." },
                 "ignore_case": { "type": "boolean", "description": "Case-insensitive (default false)." },
                 "literal": { "type": "boolean", "description": "Treat `pattern` as a literal string, not a regex (default false)." },
                 "limit": { "type": "integer", "description": "Max matches to report (default 100)." },
@@ -383,12 +386,23 @@ impl Tool for Grep {
             .get("literal")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        // A leading "!" negates the glob (ripgrep-CLI-style: `rg --glob '!*.test.rs'` excludes rather
+        // than restricts). `globset::Glob` has no negation syntax of its own — a leading "!" would
+        // otherwise be matched literally, so `!*.test.rs` would confidently match nothing at all and
+        // the whole query would report zero results instead of applying the exclusion.
         let glob = match input.get("glob").and_then(Value::as_str) {
-            Some(g) => Some(
-                Glob::new(g)
-                    .map_err(|e| ToolError::InvalidInput(format!("bad glob: {e}")))?
-                    .compile_matcher(),
-            ),
+            Some(g) => {
+                let (negate, pattern) = match g.strip_prefix('!') {
+                    Some(rest) => (true, rest),
+                    None => (false, g),
+                };
+                Some((
+                    Glob::new(pattern)
+                        .map_err(|e| ToolError::InvalidInput(format!("bad glob: {e}")))?
+                        .compile_matcher(),
+                    negate,
+                ))
+            }
             None => None,
         };
 
@@ -672,6 +686,33 @@ mod tests {
             .text;
         assert!(out.contains("keep.rs"));
         assert!(!out.contains("skip.txt"));
+    }
+
+    #[tokio::test]
+    async fn a_leading_bang_in_the_glob_negates_it() {
+        // pi-parity fix (task 16): `globset::Glob` has no negation syntax, so a leading "!" was
+        // matched literally and `!*.test.rs` confidently matched nothing at all — the entire query
+        // returned zero results instead of applying the exclusion, unlike real `rg --glob`.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("plain.rs"), "fn target() {}\n").unwrap();
+        std::fs::write(dir.path().join("thing.test.rs"), "fn target() {}\n").unwrap();
+        let out = Grep
+            .run(json!({
+                "pattern": "target",
+                "path": dir.path().to_str().unwrap(),
+                "glob": "!*.test.rs"
+            }))
+            .await
+            .unwrap()
+            .text;
+        assert!(
+            out.contains("plain.rs"),
+            "the non-excluded file must still be found: {out}"
+        );
+        assert!(
+            !out.contains("thing.test.rs"),
+            "the excluded file must not be reported: {out}"
+        );
     }
 
     #[tokio::test]

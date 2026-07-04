@@ -14,8 +14,20 @@ use crate::skills::{self, Skill};
 
 /// Options controlling how the system prompt is assembled.
 pub struct PromptOptions<'a> {
-    /// The base agent identity/instructions. A `SYSTEM.md` on disk (project, then user) overrides it.
-    pub base: &'a str,
+    /// An explicit override for the base agent identity/instructions (`--system-prompt`), if the caller
+    /// was given one. `None` means no explicit override was passed — a trusted project's on-disk
+    /// `SYSTEM.md` still gets a chance to apply in that case, falling through to `default_base` only
+    /// when that's also absent. Distinguishing "explicitly asked for X" from "nothing asked, use the
+    /// built-in default" is what lets `SYSTEM.md` apply in exactly the cases pi's own resource-loader
+    /// does (no explicit flag) without ever silently outranking an operator's own explicit
+    /// `--system-prompt` — previously this distinction was collapsed away before ever reaching here
+    /// (`base` was always a plain, already-defaulted `&str`), so a project's `SYSTEM.md` always won even
+    /// over an explicit flag.
+    pub base: Option<&'a str>,
+    /// The computed built-in default base prompt (`main.rs::default_system_prompt`), used only when
+    /// neither `base` nor an on-disk `SYSTEM.md` override applies. Cheap and pure to compute (no I/O),
+    /// so a caller builds it eagerly even on the common path where it goes unused.
+    pub default_base: &'a str,
     /// Extra text appended after the base (e.g. `--append-system-prompt`). When `None`, an on-disk
     /// `APPEND_SYSTEM.md` (project, then user — same discovery/trust order as `SYSTEM.md`) is used
     /// instead, if one exists; an explicit `append` here wins outright rather than combining with it.
@@ -36,6 +48,13 @@ pub struct PromptOptions<'a> {
     /// upstream, matching `--no-skills`'s existing "skip outright rather than discover-then-discard"
     /// pattern) to build a prompt with no skills at all.
     pub skills: &'a [Skill],
+    /// Whether the registered tool set includes `read`. A model with no way to open a file it doesn't
+    /// already have inline can't act on a skill's own `SKILL.md` contents (skills are discovered by path,
+    /// not inlined into the prompt — invoking one relies on the model reading the file itself), so
+    /// advertising `<available_skills>` when `read` isn't registered just adds dead weight to the prompt:
+    /// entries the model has no way to actually use. `false` skips the whole section regardless of
+    /// `skills`'s own contents.
+    pub has_read: bool,
     /// Whether `cwd` is a trusted project (an explicit `--trust-project`/RPC override, or recorded in
     /// `TrustStore`). Gates the *project-local* `SYSTEM.md`/`APPEND_SYSTEM.md` overrides and the
     /// project-local skills root (`<cwd>/.claude/skills`, see `skills::discover`) — an untrusted
@@ -62,11 +81,16 @@ pub fn build_system_prompt(opts: &PromptOptions) -> String {
 /// meant to be rebuilt only at startup and on a model/thinking-triggered `Agent` rebuild — not on every
 /// turn, unlike the cheap dynamic footer.
 pub fn build_static_system_prompt(opts: &PromptOptions) -> String {
-    // An on-disk `SYSTEM.md` (project `<cwd>/.claude/`, else user `~/.claude/`) replaces the built-in
-    // base entirely — that's how a project pins its own agent identity (pi's resource-loader does the
-    // same). Absent one, the caller-supplied `base` stands.
-    let mut s = system_prompt_override(opts.cwd, opts.project_trusted)
-        .unwrap_or_else(|| opts.base.to_string());
+    // An explicit `--system-prompt` (`opts.base`) wins outright, exactly like `opts.append` below —
+    // never even consulting the on-disk `SYSTEM.md`. Only when no explicit override was given does a
+    // trusted project's on-disk `SYSTEM.md` (project `<cwd>/.claude/`, else user `~/.claude/`) get a
+    // chance to replace the built-in base — that's how a project pins its own agent identity (pi's
+    // resource-loader does the same) — and only when *that's* absent too does `default_base` apply.
+    let mut s = opts
+        .base
+        .map(str::to_string)
+        .or_else(|| system_prompt_override(opts.cwd, opts.project_trusted))
+        .unwrap_or_else(|| opts.default_base.to_string());
     let append = opts
         .append
         .map(str::to_string)
@@ -98,10 +122,16 @@ pub fn build_static_system_prompt(opts: &PromptOptions) -> String {
     // non-empty list where every skill is `disable-model-invocation` still built an empty
     // `<available_skills>…</available_skills>` shell. `format_available` itself now returns `""` in
     // that case (see its doc comment); check its actual output instead of the raw skill count.
-    let available = skills::format_available(opts.skills);
-    if !available.is_empty() {
-        s.push_str("\n\n");
-        s.push_str(&available);
+    //
+    // pi-parity fix: also gated on `has_read` — advertising skills to a model with no way to open the
+    // file a skill invocation points at (skills are discovered by path, not inlined; see `has_read`'s
+    // own doc comment) just adds dead weight the model can never act on.
+    if opts.has_read {
+        let available = skills::format_available(opts.skills);
+        if !available.is_empty() {
+            s.push_str("\n\n");
+            s.push_str(&available);
+        }
     }
 
     s
@@ -584,24 +614,60 @@ mod tests {
     }
 
     #[test]
-    fn system_md_overrides_base_prompt_when_trusted() {
+    fn system_md_overrides_the_computed_default_base_when_trusted_and_no_explicit_flag_was_given() {
+        // No explicit `--system-prompt` here (`base: None`) — a trusted project's on-disk `SYSTEM.md`
+        // still gets to replace the computed built-in default in that case. See the sibling test below
+        // for the case this one used to get wrong: an *explicit* `--system-prompt` must win outright
+        // instead of being silently overridden the same way.
         let tmp = tempfile::tempdir().unwrap();
         let claude_dir = tmp.path().join(".claude");
         fs::create_dir_all(&claude_dir).unwrap();
         fs::write(claude_dir.join("SYSTEM.md"), "OVERRIDE IDENTITY").unwrap();
 
         let prompt = build_system_prompt(&PromptOptions {
-            base: "DEFAULT IDENTITY",
+            base: None,
+            default_base: "DEFAULT IDENTITY",
             append: None,
             cwd: tmp.path(),
             include_context_files: false,
             skills: &[],
+            has_read: true,
             project_trusted: true,
         });
         assert!(prompt.contains("OVERRIDE IDENTITY"));
         assert!(
             !prompt.contains("DEFAULT IDENTITY"),
-            "a trusted project's on-disk SYSTEM.md must replace the built-in base"
+            "a trusted project's on-disk SYSTEM.md must replace the computed default base when no \
+             explicit --system-prompt was given"
+        );
+    }
+
+    #[test]
+    fn an_explicit_system_prompt_wins_outright_over_a_trusted_on_disk_system_md() {
+        // pi-parity fix: previously `PromptOptions::base` was always a plain, already-defaulted `&str`
+        // with no way to tell "this is an explicit --system-prompt" apart from "this is just the
+        // built-in default" — so a trusted project's on-disk SYSTEM.md silently overrode an operator's
+        // own explicit flag too, exactly like it does the computed default. An explicit override must
+        // win outright instead, matching `append`'s own (always-correct) precedence.
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(claude_dir.join("SYSTEM.md"), "ON-DISK IDENTITY").unwrap();
+
+        let prompt = build_system_prompt(&PromptOptions {
+            base: Some("EXPLICIT IDENTITY"),
+            default_base: "DEFAULT IDENTITY",
+            append: None,
+            cwd: tmp.path(),
+            include_context_files: false,
+            skills: &[],
+            has_read: true,
+            project_trusted: true,
+        });
+        assert!(prompt.contains("EXPLICIT IDENTITY"));
+        assert!(
+            !prompt.contains("ON-DISK IDENTITY"),
+            "an explicit --system-prompt must win outright over a trusted project's on-disk SYSTEM.md"
         );
     }
 
@@ -616,11 +682,13 @@ mod tests {
         fs::write(claude_dir.join("SYSTEM.md"), "MALICIOUS OVERRIDE").unwrap();
 
         let prompt = build_system_prompt(&PromptOptions {
-            base: "DEFAULT IDENTITY",
+            base: None,
+            default_base: "DEFAULT IDENTITY",
             append: None,
             cwd: tmp.path(),
             include_context_files: false,
             skills: &[],
+            has_read: true,
             project_trusted: false,
         });
         assert!(prompt.contains("DEFAULT IDENTITY"));
@@ -643,11 +711,13 @@ mod tests {
             disable_model_invocation: false,
         };
         let prompt = build_system_prompt(&PromptOptions {
-            base: "DEFAULT IDENTITY",
+            base: Some("DEFAULT IDENTITY"),
+            default_base: "",
             append: None,
             cwd: tmp.path(),
             include_context_files: false,
             skills: std::slice::from_ref(&skill),
+            has_read: true,
             project_trusted: true,
         });
         assert!(
@@ -671,16 +741,47 @@ mod tests {
             disable_model_invocation: true,
         };
         let prompt = build_system_prompt(&PromptOptions {
-            base: "DEFAULT IDENTITY",
+            base: Some("DEFAULT IDENTITY"),
+            default_base: "",
             append: None,
             cwd: tmp.path(),
             include_context_files: false,
             skills: std::slice::from_ref(&skill),
+            has_read: true,
             project_trusted: true,
         });
         assert!(
             !prompt.contains("available_skills"),
             "no wrapper at all when nothing is model-visible: {prompt}"
+        );
+    }
+
+    #[test]
+    fn skills_are_not_advertised_at_all_when_the_read_tool_is_not_registered() {
+        // pi-parity fix: a skill is discovered by path, not inlined into the prompt — invoking one
+        // relies on the model being able to open its `SKILL.md` itself. Advertising
+        // `<available_skills>` to a model with no `read` tool at all just adds dead weight it can never
+        // act on.
+        let tmp = tempfile::tempdir().unwrap();
+        let skill = Skill {
+            name: "visible-but-unusable".into(),
+            description: "would be model-visible if read were registered".into(),
+            path: tmp.path().join("SKILL.md"),
+            disable_model_invocation: false,
+        };
+        let prompt = build_system_prompt(&PromptOptions {
+            base: Some("DEFAULT IDENTITY"),
+            default_base: "",
+            append: None,
+            cwd: tmp.path(),
+            include_context_files: false,
+            skills: std::slice::from_ref(&skill),
+            has_read: false,
+            project_trusted: true,
+        });
+        assert!(
+            !prompt.contains("available_skills") && !prompt.contains("visible-but-unusable"),
+            "no skills section at all without the read tool: {prompt}"
         );
     }
 
@@ -692,11 +793,13 @@ mod tests {
         fs::write(claude_dir.join("APPEND_SYSTEM.md"), "EXTRA HOUSE RULES").unwrap();
 
         let prompt = build_system_prompt(&PromptOptions {
-            base: "DEFAULT IDENTITY",
+            base: Some("DEFAULT IDENTITY"),
+            default_base: "",
             append: None,
             cwd: tmp.path(),
             include_context_files: false,
             skills: &[],
+            has_read: true,
             project_trusted: true,
         });
         assert!(prompt.contains("DEFAULT IDENTITY"));
@@ -714,11 +817,13 @@ mod tests {
         fs::write(claude_dir.join("APPEND_SYSTEM.md"), "MALICIOUS EXTRA RULES").unwrap();
 
         let prompt = build_system_prompt(&PromptOptions {
-            base: "DEFAULT IDENTITY",
+            base: Some("DEFAULT IDENTITY"),
+            default_base: "",
             append: None,
             cwd: tmp.path(),
             include_context_files: false,
             skills: &[],
+            has_read: true,
             project_trusted: false,
         });
         assert!(!prompt.contains("MALICIOUS EXTRA RULES"));
@@ -732,11 +837,13 @@ mod tests {
         fs::write(claude_dir.join("APPEND_SYSTEM.md"), "ON-DISK APPEND").unwrap();
 
         let prompt = build_system_prompt(&PromptOptions {
-            base: "DEFAULT IDENTITY",
+            base: Some("DEFAULT IDENTITY"),
+            default_base: "",
             append: Some("CLI APPEND"),
             cwd: tmp.path(),
             include_context_files: false,
             skills: &[],
+            has_read: true,
             project_trusted: true,
         });
         assert!(prompt.contains("CLI APPEND"));
@@ -799,11 +906,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("CLAUDE.md"), "Be excellent.").unwrap();
         let prompt = build_system_prompt(&PromptOptions {
-            base: "You are an agent.",
+            base: Some("You are an agent."),
+            default_base: "",
             append: Some("Stay terse."),
             cwd: tmp.path(),
             include_context_files: true,
             skills: &[],
+            has_read: true,
             project_trusted: false,
         });
         assert!(prompt.contains("You are an agent."));
@@ -825,11 +934,13 @@ mod tests {
     fn static_prompt_plus_dynamic_footer_equals_the_full_prompt() {
         let tmp = tempfile::tempdir().unwrap();
         let opts = PromptOptions {
-            base: "You are an agent.",
+            base: Some("You are an agent."),
+            default_base: "",
             append: None,
             cwd: tmp.path(),
             include_context_files: false,
             skills: &[],
+            has_read: true,
             project_trusted: false,
         };
         let full = build_system_prompt(&opts);
@@ -852,11 +963,13 @@ mod tests {
         // exists on a real dev machine, so an empty-tempdir-cwd variant of this test would be flaky).
         let tmp = tempfile::tempdir().unwrap();
         let prompt = build_system_prompt(&PromptOptions {
-            base: "You are an agent.",
+            base: Some("You are an agent."),
+            default_base: "",
             append: None,
             cwd: tmp.path(),
             include_context_files: false,
             skills: &[],
+            has_read: true,
             project_trusted: false,
         });
         assert!(!prompt.contains("<project_context>"));

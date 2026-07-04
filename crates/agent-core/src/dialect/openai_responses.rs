@@ -474,15 +474,21 @@ pub fn build_body(req: &ModelRequest) -> Value {
     }
 
     // Prompt-cache affinity, same as the Chat Completions dialect: OpenAI caches prefixes
-    // automatically, so this is only a routing hint (no `no_cache` gate — there's no cache-write
-    // premium to opt out of, unlike Anthropic's `cache_control`).
-    if let Some(key) = &req.cache_key {
-        map.insert(
-            "prompt_cache_key".into(),
-            json!(super::openai::clamp_prompt_cache_key(key)),
-        );
+    // automatically, so this is only a routing hint. Still gated on `!req.no_cache`, though —
+    // `ModelRequest::no_cache`'s own doc comment promises to skip OpenAI's
+    // `prompt_cache_key`/`prompt_cache_retention` too (equivalently to Anthropic's `cache_control`),
+    // matching pi's `cacheRetention === "none"` check (`openai-completions.ts`): a genuinely one-off
+    // request has no follow-up turn to route back to the same cache node, so the affinity hint is
+    // pointless even though sending it wouldn't itself cost a cache-write premium here.
+    if !req.no_cache {
+        if let Some(key) = &req.cache_key {
+            map.insert(
+                "prompt_cache_key".into(),
+                json!(super::openai::clamp_prompt_cache_key(key)),
+            );
+        }
     }
-    if req.cache_long && caps.supports_long_cache {
+    if req.cache_long && caps.supports_long_cache && !req.no_cache {
         map.insert("prompt_cache_retention".into(), json!("24h"));
     }
 
@@ -1445,6 +1451,29 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
             ModelRequest::new("gpt-4o", vec![Message::user("hi")], 64).with_cache_key(long_key);
         let body = build_body(&req);
         assert_eq!(body["prompt_cache_key"].as_str().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn no_cache_suppresses_prompt_cache_key_and_retention() {
+        // pi-parity: `ModelRequest::no_cache`'s own doc comment promises to skip
+        // `prompt_cache_key`/`prompt_cache_retention` too (equivalently to Anthropic's
+        // `cache_control`), matching pi's `cacheRetention === "none"` check — a genuinely one-off
+        // request has no follow-up turn to route back to the same cache node.
+        let req = ModelRequest::new("gpt-4o", vec![Message::user("hi")], 64)
+            .with_cache_key("session-abc")
+            .with_cache_long(true)
+            .with_no_cache(true);
+        let body = build_body(&req);
+        assert!(
+            body.get("prompt_cache_key").is_none(),
+            "got: {:#?}",
+            body.get("prompt_cache_key")
+        );
+        assert!(
+            body.get("prompt_cache_retention").is_none(),
+            "got: {:#?}",
+            body.get("prompt_cache_retention")
+        );
     }
 
     // A recorded text-then-tool-call Responses stream: reasoning summary, then a message, then a

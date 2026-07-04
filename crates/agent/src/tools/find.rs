@@ -162,6 +162,21 @@ impl Tool for Find {
 
         let no_match = format!("no files matching {pattern:?}");
         let root = PathBuf::from(root);
+        // `search`'s walk unconditionally skips the root entry itself (see its own doc comment on that
+        // check) — meant for a directory root, whose *contents* are what gets matched. Passing a file
+        // as `path` therefore always walked to nothing and silently reported "no files matching", a
+        // false negative regardless of whether the pattern would've matched — real `fd` instead errors
+        // clearly the moment the search path isn't a directory. Checked via `metadata` (not
+        // `is_dir()`) so a path that doesn't exist at all still falls through to the walk below, which
+        // already reports that case via `walk_error`.
+        if let Ok(meta) = std::fs::metadata(&root) {
+            if !meta.is_dir() {
+                return Err(ToolError::Execution(format!(
+                    "Search path '{}' is not a directory.",
+                    root.display()
+                )));
+            }
+        }
         let job = FindJob::new(matcher, basename_only, root.clone(), limit);
         // The walk blocks (synchronous directory reads); keep it off the async runtime.
         let (paths, truncated, walk_error) = tokio::task::spawn_blocking(move || search(&job))
@@ -342,6 +357,32 @@ mod tests {
         assert!(
             out.contains("node_modules"),
             "directory-name searches must return the directory: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_path_is_a_clear_error_not_a_silent_no_files_matching() {
+        // pi-parity fix (task 46): the walk unconditionally skips the root entry (meant for a
+        // directory whose contents get matched), so passing a file as `path` always fell through to
+        // "no files matching {pattern}" — a false negative regardless of whether the pattern would
+        // have matched. Real `fd` errors clearly instead: "Search path '...' is not a directory."
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("plain.rs");
+        std::fs::write(&file, "").unwrap();
+        let err = Find
+            .run(json!({ "pattern": "*.rs", "path": file.to_str().unwrap() }))
+            .await
+            .unwrap_err();
+        let ToolError::Execution(msg) = err else {
+            panic!("expected Execution error, got {err:?}")
+        };
+        assert!(
+            msg.contains("is not a directory"),
+            "must give a clear directory error, not silently report zero matches: {msg}"
+        );
+        assert!(
+            !msg.contains("no files matching"),
+            "must not be phrased as a confident empty result: {msg}"
         );
     }
 

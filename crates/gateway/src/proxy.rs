@@ -56,6 +56,14 @@ use tracing::{info, warn};
 /// response and every reject body so a client can quote it and an oncall can grep for it.
 const REQUEST_ID_HEADER: &str = "x-beyond-request-id";
 
+/// OpenRouter's dashboard-attribution headers (https://openrouter.ai/docs/quickstart): purely
+/// cosmetic on OpenRouter's side (their own cost/usage categorization), no effect on the request
+/// or response. Static — this doesn't need to be configurable, just present. Only OpenRouter is in
+/// `KNOWN_PROVIDERS` among the providers pi attributes to (NVIDIA NIM, Cloudflare, Vercel AI
+/// Gateway aren't routed providers here), so this is the one case worth porting.
+const OPENROUTER_REFERER: &str = "https://beyond.build";
+const OPENROUTER_TITLE: &str = "Beyond Gateway";
+
 /// Reject requests whose declared Content-Length exceeds this. The body itself is **not** buffered
 /// (it streams straight through); this is purely an abuse guard checked up front via the header.
 const MAX_REQUEST_BODY: usize = 100 * 1024 * 1024;
@@ -198,6 +206,20 @@ fn sanitize_model(model: String) -> Cow<'static, str> {
     } else {
         Cow::Owned(model)
     }
+}
+
+/// Set OpenRouter's attribution headers when (and only when) `provider_name` is `"openrouter"` —
+/// every other provider is untouched, so this is a no-op dead weight of one string compare on the
+/// hot path for everyone else.
+fn apply_provider_attribution(
+    upstream_request: &mut pingora::http::RequestHeader,
+    provider_name: &str,
+) -> Result<()> {
+    if provider_name == "openrouter" {
+        upstream_request.insert_header("HTTP-Referer", OPENROUTER_REFERER)?;
+        upstream_request.insert_header("X-Title", OPENROUTER_TITLE)?;
+    }
+    Ok(())
 }
 
 fn dialect_for_path(path: &str) -> Dialect {
@@ -587,6 +609,9 @@ impl ProxyHttp for AiProxy {
 
         // Point Host at the upstream.
         upstream_request.insert_header("host", rc.provider.host.as_str())?;
+
+        // Dashboard-attribution headers (OpenRouter only — see `apply_provider_attribution`).
+        apply_provider_attribution(upstream_request, rc.provider.name.as_str())?;
 
         // Forward the provider-native path (computed in `request_filter`): the client path with the
         // `/{provider}` segment stripped, or unchanged for a bare-path default. We send it verbatim —
@@ -1002,5 +1027,36 @@ mod tests {
         assert!(!is_streamable_path("/v1/embeddings"));
         assert!(!is_streamable_path("/v1/messages"));
         assert!(!is_streamable_path("/v1/models"));
+    }
+
+    #[test]
+    fn openrouter_attribution_present_only_for_openrouter() {
+        let mut openrouter_req =
+            pingora::http::RequestHeader::build(http::Method::POST, b"/api/v1/chat/completions", None)
+                .unwrap();
+        apply_provider_attribution(&mut openrouter_req, "openrouter").unwrap();
+        assert_eq!(
+            openrouter_req.headers.get("HTTP-Referer").unwrap(),
+            OPENROUTER_REFERER
+        );
+        assert_eq!(
+            openrouter_req.headers.get("X-Title").unwrap(),
+            OPENROUTER_TITLE
+        );
+
+        for other in ["openai", "anthropic", "fireworks", "groq"] {
+            let mut req =
+                pingora::http::RequestHeader::build(http::Method::POST, b"/v1/chat/completions", None)
+                    .unwrap();
+            apply_provider_attribution(&mut req, other).unwrap();
+            assert!(
+                req.headers.get("HTTP-Referer").is_none(),
+                "{other} should not get HTTP-Referer"
+            );
+            assert!(
+                req.headers.get("X-Title").is_none(),
+                "{other} should not get X-Title"
+            );
+        }
     }
 }

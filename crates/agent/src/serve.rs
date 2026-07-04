@@ -227,8 +227,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use agent_core::{
-    Agent, AgentEvent, CancellationToken, GatewayClient, Session, StopReason, StreamEvent,
-    ToolUpdate,
+    Agent, AgentEvent, AgentHooks, CancellationToken, GatewayClient, Session, StopReason,
+    StreamEvent, ToolUpdate,
 };
 use futures::StreamExt;
 use serde_json::{Map, Value, json};
@@ -314,6 +314,13 @@ pub struct ServeConfig {
     /// Roughly how many tokens of recent conversation compaction keeps verbatim. `None` keeps
     /// `CompactionConfig::default()`'s value.
     pub compaction_keep_recent_tokens: Option<u32>,
+    /// Disable automatic (threshold-triggered) compaction entirely for this process — `run`'s
+    /// identical flag. Only ever a one-way "definitely off" here: when `false` (the flag/env's own
+    /// default, indistinguishable from "not given" for a bare disable-only flag), `serve`'s startup
+    /// falls back to the persisted `agent settings` `compaction_enabled` override (see
+    /// `settings::Settings::compaction_enabled`'s doc comment) before finally defaulting to enabled —
+    /// see [`serve`]'s own resolution of `current_auto_compaction`.
+    pub no_compaction: bool,
     /// How many times to retry a gateway request that fails before the first response byte arrives.
     /// `None` keeps the client's built-in default.
     pub retry_max_retries: Option<u32>,
@@ -353,6 +360,9 @@ pub struct ServeConfig {
     /// Block a `bash` call whenever its command contains this substring, case-insensitively. Combines
     /// with `deny_tool` under the same policy hook.
     pub deny_bash_pattern: Vec<String>,
+    /// Block a `write`/`edit` call whenever its `path` argument matches this glob. Combines with
+    /// `deny_tool`/`deny_bash_pattern` under the same policy hook.
+    pub deny_path: Vec<String>,
     /// Disable *standard-root* skills discovery/loading (`~/.claude/skills`, `<cwd>/.claude/skills`) —
     /// no `<available_skills>` listing in the system prompt from either, and a `/skill:name` invocation
     /// is sent through unexpanded unless it resolves against a `--skill` path instead. Matches pi's own
@@ -779,9 +789,16 @@ impl Persistence {
         repo.delete(id)
     }
 
-    /// All sessions' metadata, newest first (empty unless in repo mode). `on_progress(scanned, total)`
-    /// is invoked once per file as the scan completes it — see
+    /// This process's own cwd's sessions, newest first (empty unless in repo mode).
+    /// `on_progress(scanned, total)` is invoked once per file as the scan completes it — see
     /// [`SessionRepo::list_with_progress`](crate::session_store::SessionRepo::list_with_progress).
+    ///
+    /// Filtered to `self.meta.cwd` — the exact match [`SessionRepo::resume_or_create`] already applies
+    /// when reattaching at startup. A no-op under the default per-cwd repo directory (every session
+    /// there already shares this cwd, by construction — see `default_session_dir`), but load-bearing
+    /// under an explicit `--session-dir` shared across projects: Track L28 (pi-parity fix) — this used
+    /// to return every session in the directory unfiltered, so a shared `--session-dir` leaked another
+    /// project's sessions into this one's `list_sessions` response.
     fn list_with_progress(
         &self,
         on_progress: impl Fn(usize, usize) + Send + Sync,
@@ -796,6 +813,9 @@ impl Persistence {
                 }
             })
             .unwrap_or_default()
+            .into_iter()
+            .filter(|m| m.cwd == self.meta.cwd)
+            .collect()
     }
 
     /// Every session across every project's own repo directory (pi's cross-project `listAll`), not
@@ -896,6 +916,15 @@ impl Persistence {
         self.store
             .as_ref()
             .map(SessionStore::abandoned_branches)
+            .unwrap_or_default()
+    }
+
+    /// Every non-message session event recorded so far, for `export_html` — see
+    /// `SessionStore::export_events` (Track L36; empty unless persistence is configured).
+    fn export_events(&self) -> &[crate::session_store::ExportEvent] {
+        self.store
+            .as_ref()
+            .map(SessionStore::export_events)
             .unwrap_or_default()
     }
 
@@ -1209,10 +1238,24 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
     // and a cheap dynamic footer (current date/cwd, recomputed before every `prompt` via `full_system`)
     // so a long-running `serve` process doesn't re-walk the filesystem every turn just for the date.
     let cwd = crate::session_store::canonical_cwd(&std::env::current_dir().unwrap_or_default());
+    let has_gated_resources = crate::trust_store::has_trust_gated_resources(&cwd);
     let mut project_trusted = !cfg.force_untrusted
         && (cfg.trust_project
             || crate::trust_store::TrustStore::open_default().is_trusted(&cwd)
-            || !crate::trust_store::has_trust_gated_resources(&cwd));
+            || !has_gated_resources);
+    // Track L32 (pi-parity fix): mirrors `main.rs`'s identical warning for `run` — an untrusted
+    // project with a `SYSTEM.md`/skills/prompts on disk silently skipped all of them with no signal at
+    // all that anything was there. Re-checked (not just at startup) on every `reload`, below, since
+    // trust can change mid-process (`agent trust`/`--trust-project` since startup) without a restart.
+    if !project_trusted && has_gated_resources {
+        eprintln!(
+            "warning: {} has a project-local SYSTEM.md/APPEND_SYSTEM.md, skills, or prompt templates \
+             on disk, but the project isn't trusted, so they were skipped — pass --trust-project or run \
+             `agent trust {}` to enable them",
+            cwd.display(),
+            cwd.display()
+        );
+    }
 
     // Slash-command prompt templates (`/name args`) and discoverable skills, for `get_commands`, for
     // expanding a `/name`/`/skill:name` prompt before it reaches the model, and — for skills — to
@@ -1256,13 +1299,21 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
     };
     timing.mark("discover prompt templates/skills");
 
+    // Skills are discovered by path, not inlined into the prompt — invoking one relies on the model
+    // being able to open its `SKILL.md` itself, so advertising them at all when `read` isn't registered
+    // (a restricted `--tools`/`--exclude-tools` invocation) just adds dead weight (pi-parity fix).
+    // Tools are fixed for the whole process (see `build_agent`'s doc comment), so this one check is
+    // reused verbatim by `reload`'s own rebuild below rather than re-deriving it.
+    let has_read = build_tools(&cfg).get("read").is_some();
     let mut static_system =
         crate::resources::build_static_system_prompt(&crate::resources::PromptOptions {
-            base: &cfg.system,
+            base: None,
+            default_base: &cfg.system,
             append: cfg.append_system.as_deref(),
             cwd: &cwd,
             include_context_files: cfg.context_files,
             skills: &skills,
+            has_read,
             project_trusted,
         });
     timing.mark("build static system prompt");
@@ -1317,7 +1368,18 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
     // change (see `Persistence::model_and_level_at`), so switching to it lands on the process's real
     // starting depth instead of silently keeping whatever a *different* branch last set.
     let mut current_level = starting_level;
-    let mut current_auto_compaction = true;
+    // Track L26 (pi-parity fix): `--no-compaction`/`AI_AGENT_NO_COMPACTION` (`cfg.no_compaction`) wins
+    // outright when given; otherwise a persisted `agent settings` override survives across restarts
+    // where the flag/env is absent (matching `default_project_trust`'s identical precedence tier —
+    // `settings::Settings::compaction_enabled`'s own doc comment), finally defaulting to enabled.
+    // `settings_store` is kept open for the rest of this process so `set_auto_compaction`, below, can
+    // write a later runtime toggle straight back through to the same file.
+    let mut settings_store = crate::settings::SettingsStore::open_default();
+    let mut current_auto_compaction = if cfg.no_compaction {
+        false
+    } else {
+        settings_store.get().compaction_enabled.unwrap_or(true)
+    };
     // Mid-stream transport-failure retry (`agent_core::Agent::with_auto_retry`) — on by default;
     // `set_auto_retry` lets an operator debugging a flaky network hop disable it to see the raw failure
     // on the very first hiccup instead of after several silent retries.
@@ -1364,6 +1426,16 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
     // `Arc<dyn Tool>` handle, not routed through `agent`/the model loop: the host `bash` RPC command runs
     // independent of any conversation turn.
     let bash_tool = build_tools(&cfg).get("bash");
+    // The same deny-list `build_agent` installs as an `AgentHooks` gate on the model's own tool calls —
+    // built once here rather than inline in the `bash` RPC arm below, since `--deny-tool`/
+    // `--deny-bash-pattern`/`--deny-path` are fixed for the whole process (`build_agent`'s doc comment).
+    // Track L23 (pi-parity fix): the host `bash` RPC command used to call `tool.run_streaming` directly,
+    // never consulting this policy at all — `--exclude-tools bash` already gated it (`bash_tool` above
+    // is `None`), but `--deny-tool`/`--deny-bash-pattern`/`--deny-path` didn't, a side door around an
+    // operator's own restriction for any client speaking the wire protocol directly instead of through
+    // the model.
+    let bash_policy =
+        crate::policy::ToolPolicy::from_lists(&cfg.deny_tool, &cfg.deny_bash_pattern, &cfg.deny_path);
     // Distinguishes successive host `bash` calls in their `tool_start`/`tool_progress`/`tool_end` event
     // ids — only ever one in flight at a time (see the `bash` command arm), but a stable, incrementing
     // id per call still lets a client correlate a run's own three events without ambiguity.
@@ -1631,8 +1703,10 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                                 // `ChannelCheckpoint`). `persistence` isn't touched by `run` itself (only
                                 // `session` is borrowed there), so reassigning it here is safe exactly like
                                 // `stdin_open`/`cancel` being mutated from a sibling branch above. Any
-                                // checkpoint left undrained when the run ends is harmless — the unconditional
-                                // full persist right after this loop (below) is a strict superset of it.
+                                // checkpoint still left undrained once the run ends is explicitly swept up
+                                // right after this loop, below, before it can leak into some later, unrelated
+                                // turn — see that drain's own comment for why "harmless, the final persist
+                                // is a superset" isn't quite true on its own.
                                 Some(messages) = checkpoint_rx.recv() => {
                                     let (p, r) = persist_messages_blocking(persistence, messages).await;
                                     persistence = p;
@@ -1793,7 +1867,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                                                 commands.extend(prompt_templates.iter().map(|t| {
                                                     json!({ "name": t.name, "source": "prompt", "description": t.description })
                                                 }));
-                                                let collisions: Vec<&str> = skill_collisions.iter().chain(prompt_collisions.iter()).map(String::as_str).collect();
+                                                let collisions: Vec<&crate::skills::Collision> = skill_collisions.iter().chain(prompt_collisions.iter()).collect();
                                                 let _ = out_tx.send(response(cid, "get_commands", true, Some(json!({ "commands": commands, "collisions": collisions })), None));
                                             }
                                             "list_branches" => {
@@ -1862,6 +1936,23 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     };
+
+                    // A checkpoint sent right as the run above ended (see `agent_core::Agent`'s final,
+                    // unconditional post-run `checkpoint.checkpoint(session)`) races the `r = &mut run`
+                    // arm above under `biased` select: whichever is ready first wins, so a checkpoint
+                    // that arrived in the same instant the run itself completed can be left sitting in
+                    // `checkpoint_rx`'s buffer, undrained. Track (pi-parity fix, found via this crate's
+                    // own test suite going red): left alone, that stale message would only ever get
+                    // drained during some *later*, unrelated prompt's own inner loop — by which point an
+                    // intervening `new_session`/`switch_session`/`fork`/`switch_branch` may have already
+                    // swapped `persistence` onto a *different* session's store, so draining it there
+                    // would silently write *this* turn's content into that other session's file (and,
+                    // via `append_new`'s `messages.len() <= self.persisted` dedup guard, could mask that
+                    // later turn's own real content entirely). Discarded here, not persisted: the
+                    // unconditional `persist_blocking` right below is a strict superset of it for this
+                    // turn's own final state, and this must run *before* any later command gets a chance
+                    // to swap `persistence` out from under it.
+                    while checkpoint_rx.try_recv().is_ok() {}
 
                     // Persist whatever this attempt produced (even a failed one may have committed a tool
                     // round-trip or two before the error) before deciding whether to retry.
@@ -2351,7 +2442,9 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     .map(|n| n as usize)
                     .unwrap_or(usize::MAX);
                 let target_id = cmd.get("target_id").and_then(Value::as_str);
-                let before = cmd.get("before").and_then(Value::as_bool).unwrap_or(false);
+                // Defaults to `true` (excluding the target entry itself), matching pi's real
+                // production client convention — pi-parity fix; previously defaulted to including it.
+                let before = cmd.get("before").and_then(Value::as_bool).unwrap_or(true);
                 match persistence.fork(upto, target_id, before) {
                     Ok(s) => {
                         session = s;
@@ -2442,7 +2535,9 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     .map(|n| n as usize)
                     .unwrap_or(usize::MAX);
                 let entry_id = cmd.get("target_id").and_then(Value::as_str);
-                let before = cmd.get("before").and_then(Value::as_bool).unwrap_or(false);
+                // Same default as `fork` itself, above — a preview must match what `fork` would
+                // actually produce.
+                let before = cmd.get("before").and_then(Value::as_bool).unwrap_or(true);
                 match persistence.fork_messages(&target_id, upto, entry_id, before) {
                     Ok(messages) => emit!(response(
                         id,
@@ -2463,10 +2558,12 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
             "export_html" => {
                 let output_path = cmd.get("output_path").and_then(Value::as_str);
                 let branches = persistence.abandoned_branches();
-                match crate::export::export_html(
+                let events = persistence.export_events();
+                match crate::export::export_html_with_entries(
                     &persistence.meta,
                     &session.messages,
                     &branches,
+                    events,
                     output_path,
                 ) {
                     Ok(path) => emit!(response(
@@ -2661,6 +2758,13 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     .await;
                 match result {
                     Ok(did) => {
+                        // `agent.compact` can itself fire a mid-compaction `CheckpointHook` call (see
+                        // `agent_core::Agent::compact`'s own doc comment) — swept up here for the same
+                        // reason the `prompt` handler's own inner run-loop does, right before its
+                        // identical `persist_blocking` call: left in the channel, it would otherwise only
+                        // ever be drained by some later, unrelated turn's inner loop, by which point
+                        // `persistence` may already be pointed at a different session entirely.
+                        while checkpoint_rx.try_recv().is_ok() {}
                         let (p, persist_result) =
                             persist_blocking(persistence, session.clone(), compacted_tokens_before)
                                 .await;
@@ -2722,10 +2826,9 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 ));
                 // Every shadowed name (a skill or template defined at more than one path) is otherwise
                 // silently resolved with no way for a client to notice — surfaced here instead.
-                let collisions: Vec<&str> = skill_collisions
+                let collisions: Vec<&crate::skills::Collision> = skill_collisions
                     .iter()
                     .chain(prompt_collisions.iter())
-                    .map(String::as_str)
                     .collect();
                 emit!(response(
                     id,
@@ -2740,10 +2843,24 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 // changed (`agent trust`/`--trust-project` since startup), and project instructions,
                 // `SYSTEM.md`, and skills/prompt templates may have changed on disk. The per-turn
                 // `full_system` refresh alone only ever picks up the cheap date/cwd footer.
+                let has_gated_resources = crate::trust_store::has_trust_gated_resources(&cwd);
                 project_trusted = !cfg.force_untrusted
                     && (cfg.trust_project
                         || crate::trust_store::TrustStore::open_default().is_trusted(&cwd)
-                        || !crate::trust_store::has_trust_gated_resources(&cwd));
+                        || !has_gated_resources);
+                // Track L32 (pi-parity fix): same warning as startup, above — trust may have just
+                // changed to untrusted (or gated resources may have just appeared on disk) as of this
+                // very `reload`, and an operator watching stderr deserves the same signal they'd have
+                // gotten from a fresh `serve` invocation instead of silence.
+                if !project_trusted && has_gated_resources {
+                    eprintln!(
+                        "warning: {} has a project-local SYSTEM.md/APPEND_SYSTEM.md, skills, or \
+                         prompt templates on disk, but the project isn't trusted, so they were \
+                         skipped — pass --trust-project or run `agent trust {}` to enable them",
+                        cwd.display(),
+                        cwd.display()
+                    );
+                }
                 // `--no-skills`/`--no-prompt-templates` still honor an explicit `--skill`/
                 // `--prompt-template` extra path (pi-parity fix, M2) — see the identical reasoning at
                 // this function's startup discovery, above.
@@ -2767,11 +2884,13 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 };
                 static_system = crate::resources::build_static_system_prompt(
                     &crate::resources::PromptOptions {
-                        base: &cfg.system,
+                        base: None,
+                        default_base: &cfg.system,
                         append: cfg.append_system.as_deref(),
                         cwd: &cwd,
                         include_context_files: cfg.context_files,
                         skills: &skills,
+                        has_read,
                         project_trusted,
                     },
                 );
@@ -3116,6 +3235,16 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
             "set_auto_compaction" => match cmd.get("enabled").and_then(Value::as_bool) {
                 Some(enabled) => {
                     current_auto_compaction = enabled;
+                    // Track L26 (pi-parity fix): previously mutated only this in-process local, so a
+                    // restarted `serve` (with neither `--no-compaction` nor its env var given) silently
+                    // reverted to the built-in enabled-by-default behavior — surviving a restart is the
+                    // whole point of `agent settings`' persisted-default tier (same as
+                    // `default_project_trust`). Best-effort: a failed write still applies for the rest
+                    // of *this* process (the in-memory toggle above already took effect), it just won't
+                    // survive a restart.
+                    if let Err(e) = settings_store.set_compaction_enabled(Some(enabled)) {
+                        eprintln!("serve: failed to persist auto-compaction setting: {e}");
+                    }
                     agent = build_agent(
                         client.clone(),
                         &full_system(&static_system, &cwd),
@@ -3484,6 +3613,18 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(timeout_ms) = cmd.get("timeout_ms").and_then(Value::as_u64) {
                     input["timeout_ms"] = json!(timeout_ms);
                 }
+                // Track L23 (pi-parity fix): this host command used to call `tool.run_streaming`
+                // directly, bypassing `--deny-tool`/`--deny-bash-pattern`/`--deny-path` entirely (only
+                // `--exclude-tools bash` — the `bash_tool` check above — actually gated it). Checked
+                // before the `ToolStart` event fires, matching the "not registered" early-return just
+                // above: a blocked call never starts, so it never needs a `tool_end` to close it out.
+                if let Some(reason) = bash_policy
+                    .before_tool_call("bash", &input, &session, &CancellationToken::new())
+                    .await
+                {
+                    emit!(response(id, "bash", false, None, Some(&reason)));
+                    continue;
+                }
                 // Recorded into session context by default — pi's `recordBashResult`, opted out of via
                 // `excludeFromContext` — so a diagnostic command run outside the model's own turn is
                 // still visible to it on the *next* turn. Previously this command never touched
@@ -3741,7 +3882,8 @@ fn build_agent(
     if let Some(max_tokens) = cfg.max_tokens {
         agent = agent.with_max_tokens(max_tokens);
     }
-    let policy = crate::policy::ToolPolicy::from_lists(&cfg.deny_tool, &cfg.deny_bash_pattern);
+    let policy =
+        crate::policy::ToolPolicy::from_lists(&cfg.deny_tool, &cfg.deny_bash_pattern, &cfg.deny_path);
     if !policy.is_empty() {
         agent = agent.with_hooks(Arc::new(policy));
     }
@@ -3984,11 +4126,20 @@ fn session_stats(session: &Session, model: &str) -> Value {
     // compaction, before a new reply" case (compaction never sets this field itself — only a real
     // provider response does) — both genuinely have no current-context figure to report, so `null`
     // rather than a misleading `0%`. Matches pi's `contextUsage` being `null` in the same situations.
+    // Track L37 (pi-parity fix): `last_input_tokens` alone is only ever as fresh as the last turn's
+    // own provider-reported usage — every message appended *since* then (this turn's own user prompt,
+    // a mid-run tool round-trip) was missing from the reported figure entirely. `trailing_tokens` is
+    // the exact same delta `should_compact`/`is_hard_overflow` already fold in before comparing against
+    // the context window, so a client reading `context_usage` sees the same live-prompt size the
+    // compaction trigger itself is actually watching, not a stale undercount.
     let context_usage = (session.last_input_tokens > 0).then(|| {
+        let tokens = session
+            .last_input_tokens
+            .saturating_add(agent_core::compaction::trailing_tokens(session));
         json!({
-            "tokens": session.last_input_tokens,
+            "tokens": tokens,
             "context_window": context_window,
-            "percent": (session.last_input_tokens as f64 / context_window as f64 * 100.0),
+            "percent": (tokens as f64 / context_window as f64 * 100.0),
         })
     });
     let breakdown = message_type_breakdown(session);
@@ -4460,6 +4611,39 @@ mod tests {
         assert!(
             (usage["percent"].as_f64().unwrap() - expected_percent).abs() < f64::EPSILON,
             "got: {usage}"
+        );
+    }
+
+    #[test]
+    fn session_stats_context_usage_folds_in_trailing_tokens_since_the_last_usage_snapshot() {
+        // Track L37 (pi-parity fix): `context_usage` used to report `last_input_tokens` alone, which
+        // is only ever as fresh as the last turn's own provider-reported usage — every message
+        // appended *since* (this turn's own prompt, a mid-run tool round-trip) was invisible to a
+        // client reading this field, even though `should_compact`/`is_hard_overflow` already fold the
+        // same `agent_core::compaction::trailing_tokens` delta in before comparing against the window.
+        let mut session = Session::new();
+        session.last_input_tokens = 50_000;
+        session.last_usage_message_count = session.messages.len(); // snapshot taken with no messages yet
+        let stats_before = session_stats(&session, "claude-opus-4-8");
+        assert_eq!(
+            stats_before["context_usage"]["tokens"], 50_000,
+            "no trailing messages yet: {stats_before}"
+        );
+
+        // ~100 estimated tokens' worth of message appended since the snapshot (400 chars / 4).
+        session.push(agent_core::Message::user("x".repeat(400)));
+        let stats_after = session_stats(&session, "claude-opus-4-8");
+        let tokens_after = stats_after["context_usage"]["tokens"].as_u64().unwrap();
+        assert!(
+            tokens_after > 50_000,
+            "trailing tokens since the last usage snapshot must be folded into `context_usage`: {stats_after}"
+        );
+        let context_window = agent_core::models::capabilities("claude-opus-4-8").context_window;
+        let expected_percent = tokens_after as f64 / context_window as f64 * 100.0;
+        assert!(
+            (stats_after["context_usage"]["percent"].as_f64().unwrap() - expected_percent).abs()
+                < f64::EPSILON,
+            "percent must be derived from the same trailing-inclusive figure, not just last_input_tokens: {stats_after}"
         );
     }
 

@@ -574,3 +574,187 @@ fn run_binary_append_system_prompt_flag_appends_after_the_base_prompt() {
         bodies[0]
     );
 }
+
+#[test]
+fn run_binary_explicit_system_prompt_wins_over_a_trusted_projects_system_md() {
+    // pi-parity fix: a trusted project's on-disk `.claude/SYSTEM.md` previously always won, silently
+    // discarding an explicit `--system-prompt` too — not just the built-in default. `--trust-project`
+    // makes the on-disk file eligible at all; the explicit flag must still win outright over it.
+    let dir = tempfile::tempdir().unwrap();
+    let claude_dir = dir.path().join(".claude");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    std::fs::write(claude_dir.join("SYSTEM.md"), "ON-DISK-SYSTEM-MD-MARKER").unwrap();
+    let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "hi",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--trust-project",
+            "--system-prompt",
+            "EXPLICIT-FLAG-MARKER",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[0].contains("EXPLICIT-FLAG-MARKER"),
+        "an explicit --system-prompt must win outright over a trusted project's on-disk SYSTEM.md: {}",
+        bodies[0]
+    );
+    assert!(
+        !bodies[0].contains("ON-DISK-SYSTEM-MD-MARKER"),
+        "the on-disk SYSTEM.md must not apply at all once an explicit --system-prompt was given: {}",
+        bodies[0]
+    );
+}
+
+#[test]
+fn run_binary_system_prompt_flag_reads_an_existing_file_as_its_contents() {
+    // pi-parity fix: pi's own `resolvePromptInput` checks `existsSync(input)` first and reads the
+    // file's contents if so, falling back to the literal string otherwise — `run` previously always
+    // treated the CLI value as literal text, so `--system-prompt ./persona.md` sent the literal path
+    // string to the model instead of the file's contents.
+    let dir = tempfile::tempdir().unwrap();
+    let persona_path = dir.path().join("persona.md");
+    std::fs::write(&persona_path, "FILE-CONTENTS-PERSONA-MARKER").unwrap();
+    let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "hi",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--system-prompt",
+            persona_path.to_str().unwrap(),
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[0].contains("FILE-CONTENTS-PERSONA-MARKER"),
+        "--system-prompt naming an existing file must send the file's contents, not the literal path: \
+         {}",
+        bodies[0]
+    );
+    assert!(
+        !bodies[0].contains("persona.md"),
+        "the literal path string must not itself reach the wire once resolved to file contents: {}",
+        bodies[0]
+    );
+}
+
+#[test]
+fn run_binary_append_system_prompt_flag_accumulates_across_repeated_occurrences() {
+    // pi-parity fix: `--append-system-prompt` was a single-value flag, so a second occurrence silently
+    // clobbered the first instead of accumulating (matches pi, whose `appendSystemPrompt` is an array).
+    let dir = tempfile::tempdir().unwrap();
+    let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "hi",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--append-system-prompt",
+            "FIRST-APPEND-MARKER",
+            "--append-system-prompt",
+            "SECOND-APPEND-MARKER",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[0].contains("FIRST-APPEND-MARKER") && bodies[0].contains("SECOND-APPEND-MARKER"),
+        "both occurrences of --append-system-prompt must reach the wire system prompt: {}",
+        bodies[0]
+    );
+    let first_pos = bodies[0].find("FIRST-APPEND-MARKER").unwrap();
+    let second_pos = bodies[0].find("SECOND-APPEND-MARKER").unwrap();
+    assert!(
+        first_pos < second_pos,
+        "accumulated occurrences must be joined in the order given: {}",
+        bodies[0]
+    );
+}
+
+#[test]
+fn run_binary_warns_on_stderr_when_an_untrusted_projects_gated_resources_are_skipped() {
+    // pi-parity fix: an untrusted project with a SYSTEM.md/skills/prompts on disk previously skipped
+    // all of them with no signal at all — an operator debugging "why isn't my SYSTEM.md taking effect"
+    // had nothing to go on. No `--trust-project` here at all: the project-local SYSTEM.md exists but is
+    // never honored, and the warning must fire regardless of whether the run itself succeeds.
+    let dir = tempfile::tempdir().unwrap();
+    let claude_dir = dir.path().join(".claude");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    std::fs::write(claude_dir.join("SYSTEM.md"), "SHOULD-NOT-APPLY").unwrap();
+    let (base, _bodies) = spawn_model_server(vec![turn_text("ok")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run", "hi", "--gateway-url", &base, "--key", "bai_v1.test", "--model", "claude-test",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("warning:") && stderr.contains("isn't trusted"),
+        "must warn on stderr that gated resources were found but skipped: {stderr}"
+    );
+}

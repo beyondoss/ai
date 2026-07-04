@@ -280,6 +280,51 @@ fn serve_bash_is_rejected_when_the_tool_is_excluded() {
 }
 
 #[test]
+fn serve_bash_rpc_command_is_blocked_by_deny_bash_pattern() {
+    // Track L23 (pi-parity fix): the host `{"type":"bash"}` RPC command used to call
+    // `tool.run_streaming` directly, never consulting the `ToolPolicy` `build_agent` installs for the
+    // model's own tool calls — only `--exclude-tools bash` (proven by
+    // `serve_bash_is_rejected_when_the_tool_is_excluded`, above) actually gated it. Proves
+    // `--deny-bash-pattern` now blocks this RPC path too, the same way it already blocks a
+    // model-invoked `bash` call.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let marker = dir.path().join("should-not-exist.txt");
+    let (base, _bodies) = spawn_model_server(vec![]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut cmd = serve_cmd(bin, &base, &session_file);
+    cmd.args(["--deny-bash-pattern", "touch"]);
+    let mut child = cmd.spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "bash", "command": format!("touch {}", marker.to_str().unwrap()) })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "bash");
+    drop(stdin);
+    child.wait().unwrap();
+
+    assert!(
+        !marker.exists(),
+        "--deny-bash-pattern must block the host `bash` RPC command before it ever runs"
+    );
+    let resp = frames.last().unwrap();
+    assert_eq!(resp["success"], false, "frames: {frames:#?}");
+    assert!(
+        resp["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("blocked by policy"),
+        "frames: {frames:#?}"
+    );
+}
+
+#[test]
 #[cfg(unix)]
 fn serve_bash_shell_path_overrides_the_auto_resolved_shell() {
     if !std::path::Path::new("/bin/sh").exists() {
@@ -565,6 +610,63 @@ fn serve_deny_tool_flag_blocks_a_model_invoked_call_end_to_end() {
     assert!(
         !marker.exists(),
         "--deny-tool bash must block the call before it ever runs"
+    );
+    let tool_end = frames
+        .iter()
+        .find(|f| f["type"] == "event" && f["event"]["kind"] == "tool_end")
+        .expect("a tool_end event must still fire for a blocked call");
+    assert!(
+        tool_end["event"]["result"]
+            .as_str()
+            .unwrap()
+            .contains("denied by policy"),
+        "the blocked call's result must explain it was policy-denied: {tool_end:#?}"
+    );
+    assert_eq!(tool_end["event"]["is_error"], true);
+}
+
+#[test]
+fn serve_deny_path_flag_blocks_a_model_invoked_write_end_to_end() {
+    // Track L22: `ToolPolicy` previously had no way to gate `write`/`edit` by their `path` argument —
+    // only whole-tool-name (`--deny-tool`) or `bash`-substring (`--deny-bash-pattern`) denial. Proves
+    // the real compiled `serve` binary blocks a `write` whose path matches `--deny-path`'s glob over
+    // the actual NDJSON protocol, the same way `serve_deny_tool_flag_blocks_a_model_invoked_call_end_to_end`
+    // proves it for `--deny-tool`.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let secret = dir.path().join("secrets.env");
+
+    let (base, _bodies) = spawn_model_server(vec![
+        turn_tool_use(
+            "toolu_d",
+            "write",
+            &json!({ "path": secret.to_str().unwrap(), "content": "TOKEN=abc" }).to_string(),
+        ),
+        turn_text("done"),
+    ]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file)
+        .args(["--deny-path", "*.env"])
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "write the secret" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "prompt");
+    drop(stdin);
+    child.wait().unwrap();
+
+    assert!(
+        !secret.exists(),
+        "--deny-path '*.env' must block the write before it ever runs"
     );
     let tool_end = frames
         .iter()

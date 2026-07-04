@@ -782,9 +782,16 @@ fn serve_fork_by_target_id_reaches_an_off_active_path_branch() {
         "preview_fork with target_id must not create a session file"
     );
 
-    // A real `fork` at c's assistant reply (off-branch), `before:false` (the default) — includes it,
+    // A real `fork` at c's assistant reply (off-branch), explicit `before:false` — includes it,
     // reaching the full original a->b->c line, none of which is the *current* active path (a->d).
-    writeln!(stdin, "{}", json!({ "type": "fork", "target_id": ids[5] })).unwrap();
+    // Explicit here because `before` now defaults to `true` (matching pi's real client), and `true`
+    // at a non-user-message entry (c's assistant reply) is an invalid fork target (Track L27).
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "fork", "target_id": ids[5], "before": false })
+    )
+    .unwrap();
     stdin.flush().unwrap();
     let fork_response = read_until_response(&mut stdout, "fork");
     assert_eq!(fork_response.last().unwrap()["success"], true);
@@ -797,6 +804,81 @@ fn serve_fork_by_target_id_reaches_an_off_active_path_branch() {
     assert!(
         !dump.contains("d-reply"),
         "the fork reached the off-branch a->b->c line, not the active a->d one: {dump}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_fork_and_preview_fork_default_before_to_true() {
+    // Track L17: pi's real production client always forks with `position:"before"` — this crate's
+    // `before` used to default to `false` (include the target entry), the opposite of pi's actual
+    // convention. Omitting `before` entirely from both `fork` and `preview_fork` must now exclude the
+    // targeted entry, matching pi without the client having to say so explicitly every time.
+    let dir = tempfile::tempdir().unwrap();
+    let session_dir = dir.path().join("sessions").to_string_lossy().into_owned();
+
+    let (base, _bodies) = spawn_model_server(vec![turn_text("a-reply"), turn_text("b-reply")]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_dir_cmd(bin, &base, &session_dir).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    for msg in ["a", "b"] {
+        writeln!(stdin, "{}", json!({ "type": "prompt", "message": msg })).unwrap();
+        stdin.flush().unwrap();
+        read_until_response(&mut stdout, "prompt");
+    }
+
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_messages");
+    let ids: Vec<String> = frames.last().unwrap()["data"]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap().to_string())
+        .collect();
+    // ids[0] = user "a", ids[1] = assistant "a-reply", ids[2] = user "b", ids[3] = assistant "b-reply".
+
+    // `preview_fork` at b's own user turn, no `before` field at all — must exclude it, leaving just a's
+    // pair, exactly as an explicit `before:true` would.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "preview_fork", "target_id": ids[2] })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let preview = read_until_response(&mut stdout, "preview_fork");
+    let preview_messages = preview.last().unwrap()["data"]["messages"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        preview_messages.len(),
+        2,
+        "no `before` field defaults to true, excluding b's own turn: {preview_messages:#?}"
+    );
+
+    // A real `fork` at the same target, again with no `before` field — same exclusion.
+    writeln!(stdin, "{}", json!({ "type": "fork", "target_id": ids[2] })).unwrap();
+    stdin.flush().unwrap();
+    assert_eq!(
+        read_until_response(&mut stdout, "fork").last().unwrap()["success"],
+        true
+    );
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let dump = read_until_response(&mut stdout, "get_messages")
+        .last()
+        .unwrap()["data"]["messages"]
+        .to_string();
+    assert!(dump.contains("a-reply"));
+    assert!(
+        !dump.contains("b-reply"),
+        "no `before` field must exclude b's own turn from the forked session: {dump}"
     );
 
     drop(stdin);
@@ -853,6 +935,71 @@ fn serve_list_all_sessions_spans_every_project_under_the_shared_root() {
         sessions.len(),
         2,
         "list_all_sessions must span both projects: {sessions:#?}"
+    );
+
+    drop(stdin_a);
+    child_a.wait().unwrap();
+    drop(stdin_b);
+    child_b.wait().unwrap();
+}
+
+#[test]
+fn serve_list_sessions_filters_by_cwd_under_one_shared_session_dir() {
+    // Track L28 (pi-parity fix): unlike `serve_list_all_sessions_spans_every_project_under_the_shared_root`
+    // (above), which uses one subdirectory *per* project — so `list_sessions` there was only ever
+    // "correct" by construction (each repo directory physically holds just one project's sessions) —
+    // this drives two `serve` processes at *one* literal `--session-dir`, from two different cwds. Only
+    // `resume_or_create` (at startup) used to filter by cwd; `list_sessions` returned every session in
+    // the shared directory unfiltered, leaking another project's sessions into this one's listing.
+    let shared_dir = tempfile::tempdir().unwrap();
+    let cwd_a = tempfile::tempdir().unwrap();
+    let cwd_b = tempfile::tempdir().unwrap();
+
+    let (base_a, _bodies_a) = spawn_model_server(vec![turn_text("answer from a")]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child_a = serve_dir_cmd(bin, &base_a, &shared_dir.path().to_string_lossy())
+        .current_dir(cwd_a.path())
+        .spawn()
+        .unwrap();
+    let mut stdin_a = child_a.stdin.take().unwrap();
+    let mut stdout_a = BufReader::new(child_a.stdout.take().unwrap());
+    writeln!(stdin_a, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
+    stdin_a.flush().unwrap();
+    read_until_response(&mut stdout_a, "prompt");
+
+    let (base_b, _bodies_b) = spawn_model_server(vec![turn_text("answer from b")]);
+    let mut child_b = serve_dir_cmd(bin, &base_b, &shared_dir.path().to_string_lossy())
+        .current_dir(cwd_b.path())
+        .spawn()
+        .unwrap();
+    let mut stdin_b = child_b.stdin.take().unwrap();
+    let mut stdout_b = BufReader::new(child_b.stdout.take().unwrap());
+    writeln!(stdin_b, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
+    stdin_b.flush().unwrap();
+    read_until_response(&mut stdout_b, "prompt");
+
+    // Both sessions really do live in the one shared directory.
+    let jsonl_count = std::fs::read_dir(shared_dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("jsonl"))
+        .count();
+    assert_eq!(
+        jsonl_count, 2,
+        "expected both sessions physically in the one shared --session-dir"
+    );
+
+    // `list_sessions` from process A must only ever return *its own* cwd's session.
+    writeln!(stdin_a, "{}", json!({ "type": "list_sessions" })).unwrap();
+    stdin_a.flush().unwrap();
+    let frames = read_until_response(&mut stdout_a, "list_sessions");
+    let sessions = frames.last().unwrap()["data"]["sessions"]
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        sessions.len(),
+        1,
+        "list_sessions must filter to this process's own cwd under a shared --session-dir: {sessions:#?}"
     );
 
     drop(stdin_a);
