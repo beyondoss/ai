@@ -23,7 +23,11 @@ const MAX_IMAGE_DIMENSION: u32 = 2000;
 /// original format, unmodified.
 const JPEG_QUALITY: u8 = 80;
 
-/// Default cap on returned lines when no `limit` is given (keeps large files from flooding context).
+/// Hard ceiling on returned lines: the default when the caller omits `limit` entirely, and a secondary
+/// cap even when an explicit, larger `limit` is given — matching pi's `read.ts`, which always runs the
+/// selected window through `truncateHead`'s own default `maxLines` (2000) regardless of the caller's
+/// `limit`. A single request asking for a much larger explicit limit must not flood context any more
+/// than the omitted-limit case already doesn't.
 const DEFAULT_LIMIT: usize = 2000;
 /// Cap on bytes kept per line. Streaming by line already bounds memory to one line, but a file with a
 /// single pathological line (a minified bundle, a one-line JSON/CSV blob) is one unbounded line — so
@@ -43,6 +47,13 @@ const MAX_LINE_BYTES: usize = 4000;
 /// loses nothing — it just means one more `read` call). Shares `grep`/`find`/`ls`'s own budget
 /// ([`super::output::DEFAULT_MAX_BYTES`], pi's uniform 50KB) rather than a bespoke, 5x-larger constant.
 const MAX_OUTPUT_BYTES: usize = super::output::DEFAULT_MAX_BYTES;
+
+/// pi's `getNonVisionImageNote` (`read.ts`) — appended to an image read's text whenever the active
+/// model can't accept image input at all, so the model understands why an attachment (or an
+/// omitted-image placeholder) is missing or irrelevant to it. See `Read::run`'s `supports_vision` for
+/// how (and how incompletely) that capability reaches this tool.
+const NON_VISION_IMAGE_NOTE: &str =
+    "[Current model does not support images. The image will be omitted from this request.]";
 
 pub struct Read;
 
@@ -144,6 +155,18 @@ impl Tool for Read {
             .ok_or_else(|| ToolError::InvalidInput("missing `path`".into()))?;
         let path = resolve_read_path(&super::normalize_path(path));
 
+        // Whether the active model can accept image input at all. `agent_core::tool::Tool::run` takes
+        // only a bare `Value` — unlike pi's `execute(..., ctx)`, there's no separate model-capability
+        // context parameter reaching this tool (adding one is a `Tool`-trait-wide change) — so this is
+        // read from an internal, schema-undocumented input field instead: `agent_core::agent`'s dispatch
+        // loop injects it before every tool call, keyed off the active model's own
+        // `agent_core::models::ModelCaps::supports_vision`. Defaults to `true` (vision capable) if
+        // absent (e.g. a direct `Tool::run` call in a test, bypassing dispatch).
+        let supports_vision = input
+            .get("_model_supports_vision")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+
         // An image file is returned as an attachment the multimodal model can see, not decoded as
         // UTF-8 text (which would hand back garbage). Routing is decided primarily by sniffing the
         // real magic bytes (matching pi, which always probes regardless of extension) — a real image
@@ -178,7 +201,15 @@ impl Tool for Read {
                 .await
                 .map_err(|e| ToolError::Execution(format!("image read task failed: {e}")))?;
             match result {
-                Ok(out) => return Ok(out),
+                Ok(mut out) => {
+                    if !supports_vision {
+                        if !out.text.is_empty() {
+                            out.text.push('\n');
+                        }
+                        out.text.push_str(NON_VISION_IMAGE_NOTE);
+                    }
+                    return Ok(out);
+                }
                 // A real magic-byte match (`sniffed_format` is `Some`) that still fails to decode is a
                 // genuinely corrupt/truncated image — surface that as a hard error, matching the
                 // existing `a_small_file_with_valid_magic_bytes_but_no_real_image_body_is_rejected`
@@ -201,7 +232,7 @@ impl Tool for Read {
         let limit = input
             .get("limit")
             .and_then(Value::as_u64)
-            .map(|n| n as usize)
+            .map(|n| (n as usize).min(DEFAULT_LIMIT))
             .unwrap_or(DEFAULT_LIMIT);
 
         // Stream the file line-by-line rather than slurping it whole: a windowed read
@@ -337,9 +368,12 @@ enum Sniff {
 /// might recognize (TIFF, ICO, …) is treated the same as "not an image" here, since there's no
 /// supported path to serve it as an attachment. A PNG whose chunk stream is animated (see
 /// [`is_animated_png`]) reports [`Sniff::AnimatedPng`] instead of [`Sniff::Format`], regardless of how
-/// confidently `guess_format` would otherwise call it a plain PNG. [`Sniff::Unknown`] on any read/probe
-/// failure (missing file, a directory, too few bytes, no recognizable header) — the caller falls back
-/// to the extension gate, or ultimately the ordinary text path.
+/// confidently `guess_format` would otherwise call it a plain PNG. A "BM"-prefixed file that doesn't
+/// pass [`is_valid_bmp`]'s structural check, or a JPEG-signatured file whose 4th byte is `0xF7` (SOF55 —
+/// see the inline match arm), reports [`Sniff::Unknown`] too, same as any other non-image file.
+/// [`Sniff::Unknown`] on any read/probe failure (missing file, a directory, too few bytes, no
+/// recognizable header) — the caller falls back to the extension gate, or ultimately the ordinary text
+/// path.
 fn sniff_image_format(path: &str) -> Sniff {
     use std::io::Read as _;
     let mut buf = [0u8; SNIFF_LEN];
@@ -352,6 +386,15 @@ fn sniff_image_format(path: &str) -> Sniff {
     let buf = &buf[..n];
     match image::guess_format(buf) {
         Ok(image::ImageFormat::Png) if is_animated_png(buf) => Sniff::AnimatedPng,
+        // `image::guess_format`'s own BMP signature is just the 2 ASCII bytes "BM" (an empty mask in
+        // its `MAGIC_BYTES` table) — any file merely starting with those two bytes (ordinary text, a
+        // changelog entry, a variable name) would otherwise sniff as BMP. `is_valid_bmp` requires an
+        // actually plausible DIB header first (pi's `isBmp`).
+        Ok(image::ImageFormat::Bmp) if !is_valid_bmp(buf) => Sniff::Unknown,
+        // SOF55 (JPEG-LS, a rare lossless variant) shares the ordinary JPEG's 3-byte SOI+marker prefix
+        // but isn't a format this tool (or most vision APIs) can actually decode/display — pi's
+        // `detectSupportedImageMimeType` (`mime.ts:6-9`) excludes it the same way.
+        Ok(image::ImageFormat::Jpeg) if buf.get(3) == Some(&0xF7) => Sniff::Unknown,
         Ok(
             format @ (image::ImageFormat::Png
             | image::ImageFormat::Jpeg
@@ -403,6 +446,60 @@ fn is_animated_png(buf: &[u8]) -> bool {
         offset = next_offset;
     }
     false
+}
+
+/// Whether `buf` (a "BM"-prefixed file's leading bytes) is a *structurally plausible* BMP, not just one
+/// starting with the right 2-byte ASCII signature — matching pi's `isBmp` (`mime.ts:57-81`). Requires a
+/// declared file size of at least 26 bytes (or `0`, some encoders' "unknown" sentinel), a pixel-data
+/// offset that lands at or after the end of the file+DIB headers and strictly before the declared end
+/// of file, and a DIB header (`BITMAPINFOHEADER`-family, size 12 or 40-124) reporting exactly one color
+/// plane and a bits-per-pixel value real BMP encoders actually use (1/4/8/16/24/32). `buf` is only ever
+/// the sniff-window prefix, not necessarily the whole file, so out-of-range field reads degrade to `0`
+/// (via [`read_u16_le`]/[`read_u32_le`]) rather than panicking — same as pi's own `?? 0` fallback.
+fn is_valid_bmp(buf: &[u8]) -> bool {
+    if buf.len() < 26 {
+        return false;
+    }
+    let declared_file_size = read_u32_le(buf, 2);
+    let pixel_data_offset = read_u32_le(buf, 10);
+    let dib_header_size = read_u32_le(buf, 14);
+    if declared_file_size != 0 && declared_file_size < 26 {
+        return false;
+    }
+    if pixel_data_offset < 14u32.saturating_add(dib_header_size) {
+        return false;
+    }
+    if declared_file_size != 0 && pixel_data_offset >= declared_file_size {
+        return false;
+    }
+    let (color_planes, bits_per_pixel) = if dib_header_size == 12 {
+        (read_u16_le(buf, 22), read_u16_le(buf, 24))
+    } else if (40..=124).contains(&dib_header_size) {
+        if buf.len() < 30 {
+            return false;
+        }
+        (read_u16_le(buf, 26), read_u16_le(buf, 28))
+    } else {
+        return false;
+    };
+    color_planes == 1 && matches!(bits_per_pixel, 1 | 4 | 8 | 16 | 24 | 32)
+}
+
+/// Little-endian `u16` at `offset`, or `0` for any byte that falls outside `buf` — mirrors pi's
+/// `readUint16LE`'s `?? 0` fallback so a truncated sniff window degrades to "not a valid BMP" rather
+/// than panicking.
+fn read_u16_le(buf: &[u8], offset: usize) -> u16 {
+    let lo = *buf.get(offset).unwrap_or(&0) as u16;
+    let hi = *buf.get(offset + 1).unwrap_or(&0) as u16;
+    lo | (hi << 8)
+}
+
+/// Little-endian `u32` at `offset`, with the same out-of-range-degrades-to-`0` behavior as
+/// [`read_u16_le`].
+fn read_u32_le(buf: &[u8], offset: usize) -> u32 {
+    (0..4u32).fold(0u32, |acc, i| {
+        acc | (u32::from(*buf.get(offset + i as usize).unwrap_or(&0)) << (8 * i))
+    })
 }
 
 /// The image format implied by a path's extension, or `None` if it isn't a recognized one. Used only
@@ -1671,6 +1768,139 @@ mod tests {
         );
     }
 
+    /// A complete, structurally valid BMP (`BITMAPFILEHEADER` + 40-byte `BITMAPINFOHEADER`, followed by
+    /// zeroed, correctly row-padded pixel data) — passes [`is_valid_bmp`]'s structural checks and its
+    /// declared file size genuinely matches the buffer's length.
+    fn valid_bmp_header(width: i32, height: i32, bits_per_pixel: u16) -> Vec<u8> {
+        let row_bytes = (width.unsigned_abs() * u32::from(bits_per_pixel)).div_ceil(32) * 4;
+        let pixel_data_len = (row_bytes * height.unsigned_abs()) as usize;
+        let file_size = 54 + pixel_data_len;
+        let mut b = vec![0u8; file_size];
+        b[0] = b'B';
+        b[1] = b'M';
+        b[2..6].copy_from_slice(&(file_size as u32).to_le_bytes()); // declared file size
+        b[10..14].copy_from_slice(&54u32.to_le_bytes()); // pixel data offset: right after both headers
+        b[14..18].copy_from_slice(&40u32.to_le_bytes()); // DIB header size: BITMAPINFOHEADER
+        b[18..22].copy_from_slice(&width.to_le_bytes());
+        b[22..26].copy_from_slice(&height.to_le_bytes());
+        b[26..28].copy_from_slice(&1u16.to_le_bytes()); // color planes
+        b[28..30].copy_from_slice(&bits_per_pixel.to_le_bytes());
+        b
+    }
+
+    /// A BMP whose file+DIB header passes [`is_valid_bmp`]'s structural checks (so it *does* sniff as
+    /// BMP) but carries no actual pixel payload — decoding it still fails, exercising `read_image`'s
+    /// graceful "could not be converted" outcome on a genuinely BMP-shaped (not just loosely
+    /// magic-byte-matched) file.
+    fn bmp_header_only_no_pixel_data() -> Vec<u8> {
+        let mut b = valid_bmp_header(4, 4, 24);
+        b.truncate(54); // drop the pixel data entirely…
+        b[2..6].copy_from_slice(&58u32.to_le_bytes()); // …but still declare a few bytes of it present
+        b // (needed for `is_valid_bmp` to accept the header at all), so decoding fails on truncated data.
+    }
+
+    #[test]
+    fn is_valid_bmp_accepts_a_well_formed_header() {
+        assert!(is_valid_bmp(&valid_bmp_header(4, 4, 24)));
+    }
+
+    #[test]
+    fn is_valid_bmp_rejects_a_file_shorter_than_the_minimum_header() {
+        assert!(!is_valid_bmp(b"BM"));
+    }
+
+    #[test]
+    fn is_valid_bmp_rejects_a_pixel_data_offset_inside_the_headers() {
+        let mut bmp = valid_bmp_header(4, 4, 24);
+        bmp[10..14].copy_from_slice(&0u32.to_le_bytes()); // offset 0 lands before the headers even end
+        assert!(!is_valid_bmp(&bmp));
+    }
+
+    #[test]
+    fn is_valid_bmp_rejects_an_implausible_bits_per_pixel() {
+        let mut bmp = valid_bmp_header(4, 4, 24);
+        bmp[28..30].copy_from_slice(&7u16.to_le_bytes()); // not in {1,4,8,16,24,32}
+        assert!(!is_valid_bmp(&bmp));
+    }
+
+    #[test]
+    fn is_valid_bmp_rejects_more_than_one_color_plane() {
+        let mut bmp = valid_bmp_header(4, 4, 24);
+        bmp[26..28].copy_from_slice(&2u16.to_le_bytes());
+        assert!(!is_valid_bmp(&bmp));
+    }
+
+    #[test]
+    fn is_valid_bmp_rejects_plain_text_that_happens_to_start_with_bm() {
+        // The exact shape of the original bug: ordinary text reinterpreted as BMP header fields almost
+        // never lands on a plausible DIB header size (12, or 40-124) — an all-printable-ASCII buffer's
+        // 4-byte little-endian read at the DIB-header-size offset is always some large, implausible
+        // value (the high-order bytes are themselves printable-ASCII, i.e. >= 0x20).
+        let text = b"BM this is definitely not an image, just some text.";
+        assert!(!is_valid_bmp(text));
+    }
+
+    #[test]
+    fn sniff_image_format_treats_an_invalid_bmp_header_as_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake.bmp");
+        std::fs::write(&path, b"BM not a real bmp header at all").unwrap();
+        assert!(matches!(
+            sniff_image_format(path.to_str().unwrap()),
+            Sniff::Unknown
+        ));
+    }
+
+    #[test]
+    fn sniff_image_format_still_accepts_a_structurally_valid_bmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("real.bmp");
+        std::fs::write(&path, valid_bmp_header(4, 4, 24)).unwrap();
+        assert!(matches!(
+            sniff_image_format(path.to_str().unwrap()),
+            Sniff::Format(image::ImageFormat::Bmp)
+        ));
+    }
+
+    #[test]
+    fn sniff_image_format_excludes_the_sof55_jpeg_ls_marker() {
+        // pi: `detectSupportedImageMimeType` (`mime.ts:6-9`) — a 4th byte of 0xF7 is SOF55 (JPEG-LS), a
+        // format this tool can't actually decode/display despite sharing JPEG's SOI+marker prefix.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("maybe.jpg");
+        std::fs::write(&path, [0xFF, 0xD8, 0xFF, 0xF7, 0, 0, 0, 0]).unwrap();
+        assert!(matches!(
+            sniff_image_format(path.to_str().unwrap()),
+            Sniff::Unknown
+        ));
+    }
+
+    #[test]
+    fn sniff_image_format_accepts_an_ordinary_jpeg_marker() {
+        // Sanity: an ordinary (non-SOF55) 4th byte is unaffected by the new guard.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ordinary.jpg");
+        std::fs::write(&path, [0xFF, 0xD8, 0xFF, 0xE0, 0, 0, 0, 0]).unwrap(); // 0xE0 = APP0 (JFIF)
+        assert!(matches!(
+            sniff_image_format(path.to_str().unwrap()),
+            Sniff::Format(image::ImageFormat::Jpeg)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_lossless_jpeg_ls_file_falls_back_to_text_instead_of_a_decode_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-really-jpeg.dat"); // no image extension, so only sniffing decides
+        std::fs::write(&path, [0xFF, 0xD8, 0xFF, 0xF7, b'h', b'i']).unwrap();
+
+        let out = Read
+            .run(json!({ "path": path.to_str().unwrap() }))
+            .await
+            .unwrap();
+        assert!(out.images.is_empty(), "SOF55 must not be sent as an image");
+        assert!(!out.text.contains("Read image"), "got: {}", out.text);
+    }
+
     #[tokio::test]
     async fn read_returns_a_graceful_text_result_not_an_error_when_bmp_conversion_fails() {
         // Same graceful-outcome pattern as the resize-failure case above, for the other `read_image`
@@ -1678,11 +1908,12 @@ mod tests {
         // returns `{ ok: false, message: "[Image omitted: could not be converted to a supported inline
         // image format.]" }` rather than throwing; mirrored here as `Ok` text, not `Err`.
         //
-        // BMP's magic signature is just the 2 ASCII bytes "BM" (`image::guess_format`'s own MAGIC_BYTES
-        // table has an empty mask for it), so a file starting with "BM" but with no valid BMP header
-        // after it sniffs as BMP — routing into image handling — while still failing to actually decode.
-        let mut bytes = b"BM".to_vec();
-        bytes.extend(vec![0u8; 16]); // nowhere near a real 14+40-byte BMP file+DIB header
+        // This fixture's file+DIB header is *structurally valid* (passes `is_valid_bmp`, so it sniffs as
+        // a real BMP, not a fallback-by-extension guess) but carries no actual pixel payload, so the
+        // decode genuinely fails — proving the graceful path still works for a real BMP with a corrupt
+        // body, distinct from `a_text_file_starting_with_bm_bytes_is_read_as_text_not_a_corrupt_bmp_
+        // placeholder` below, which covers a file that was never really BMP at all.
+        let bytes = bmp_header_only_no_pixel_data();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("corrupt.bmp");
         std::fs::write(&path, &bytes).unwrap();
@@ -1695,6 +1926,140 @@ mod tests {
         assert_eq!(
             out.text,
             "[Image omitted: could not be converted to a supported inline image format.]"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_text_file_starting_with_bm_bytes_is_read_as_text_not_a_corrupt_bmp_placeholder() {
+        // pi-parity gap (fixed): `image::guess_format`'s BMP signature is just the 2 ASCII bytes "BM"
+        // (an empty mask in its own `MAGIC_BYTES` table) — before this fix, *any* file starting with
+        // those two bytes sniffed as BMP, so an ordinary text file that happened to start with "BM"
+        // would get routed into image handling, fail to decode, and come back as the
+        // "[Image omitted: …]" placeholder instead of its real text content. `is_valid_bmp` (pi's
+        // `isBmp`, `mime.ts:57-81`) now requires a plausible DIB header before treating a "BM"-prefixed
+        // file as BMP at all, so a genuinely non-image file never reaches image handling — it's read as
+        // ordinary text, same as any other file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        let content =
+            "BM this file just happens to start with the letters B and M, nothing more.\n";
+        std::fs::write(&path, content).unwrap();
+
+        let out = Read
+            .run(json!({ "path": path.to_str().unwrap() }))
+            .await
+            .unwrap();
+        assert!(out.images.is_empty(), "must not be treated as an image");
+        assert!(
+            out.text.contains(content.trim_end()),
+            "must show the real text content, not an image placeholder: {}",
+            out.text
+        );
+    }
+
+    #[tokio::test]
+    async fn an_explicit_limit_above_2000_is_still_capped_at_the_default_ceiling() {
+        // pi's `read.ts` always runs the selected window through `truncateHead`'s own default
+        // `maxLines` (2000) *on top of* whatever `limit` the caller passed — an explicit `limit` larger
+        // than 2000 must not bypass the ceiling `no_limit_argument_defaults_to_a_2000_line_cap` already
+        // proves for the omitted-limit case.
+        let body = (1..=3000)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let f = tmp_file(&format!("{body}\n"));
+        let out = Read
+            .run(json!({ "path": f.path().to_str().unwrap(), "limit": 5000 }))
+            .await
+            .unwrap()
+            .text;
+        assert!(out.contains("  2000\t2000"), "line 2000 must be shown");
+        assert!(
+            !out.contains("\t2001\n"),
+            "line 2001 must not be shown despite limit=5000"
+        );
+        assert!(
+            out.contains("use offset=2001 to continue"),
+            "got: {}",
+            &out[out.len().saturating_sub(200)..]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_vision_model_gets_a_note_appended_to_an_image_read() {
+        // pi: `getNonVisionImageNote` (`read.ts`) — appended whenever the active model lacks image
+        // input support. `Tool::run` has no model-capability context of its own, so this is driven via
+        // the internal `_model_supports_vision` field `agent_core::agent`'s dispatch loop injects before
+        // every tool call, keyed off the active model's own capability-table entry.
+        let img = image::RgbImage::from_pixel(4, 4, image::Rgb([10, 20, 30]));
+        let mut png_bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut png_bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shot.png");
+        std::fs::write(&path, &png_bytes).unwrap();
+
+        let out = Read
+            .run(json!({ "path": path.to_str().unwrap(), "_model_supports_vision": false }))
+            .await
+            .unwrap();
+        assert!(
+            out.text.contains(
+                "[Current model does not support images. The image will be omitted from this request.]"
+            ),
+            "got: {}",
+            out.text
+        );
+    }
+
+    #[tokio::test]
+    async fn a_vision_capable_model_gets_no_note_by_default() {
+        let img = image::RgbImage::from_pixel(4, 4, image::Rgb([10, 20, 30]));
+        let mut png_bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut png_bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shot2.png");
+        std::fs::write(&path, &png_bytes).unwrap();
+
+        let out = Read
+            .run(json!({ "path": path.to_str().unwrap() }))
+            .await
+            .unwrap();
+        assert!(
+            !out.text.contains("does not support images"),
+            "got: {}",
+            out.text
+        );
+    }
+
+    #[tokio::test]
+    async fn the_non_vision_note_is_also_appended_when_the_image_is_omitted() {
+        // pi appends `getNonVisionImageNote` in both branches (`processed.ok` and not) — the note is
+        // about whether the model can *see* an attachment at all, independent of whether this
+        // particular image could actually be inlined.
+        let bytes = bmp_header_only_no_pixel_data();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt2.bmp");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let out = Read
+            .run(json!({ "path": path.to_str().unwrap(), "_model_supports_vision": false }))
+            .await
+            .unwrap();
+        assert!(out.text.contains("Image omitted"), "got: {}", out.text);
+        assert!(
+            out.text.contains("does not support images"),
+            "got: {}",
+            out.text
         );
     }
 }

@@ -28,7 +28,8 @@
 //!
 //! Auth branches on key format: `bai_…` is a managed virtual key (verify → deny-check → swap to
 //! the pool key); anything else is a **BYO** request — the user's own provider token, passed
-//! through unchanged (no swap, no Beyond identity, no deny-set).
+//! through unchanged (no swap, no Beyond identity, no deny-set). The key is read from whichever
+//! header (or, for Google Gemini, query param) the client's SDK uses — see `extract_virtual_key`.
 //!
 //! Routing is by the **first path segment** = provider name (`route`, data-driven): `/{provider}/…`
 //! selects the provider and the rest of the path is forwarded **verbatim** (the gateway holds no
@@ -173,17 +174,44 @@ impl AiProxy {
     }
 }
 
-fn extract_virtual_key(session: &Session) -> Option<&str> {
-    let h = session.req_header();
-    // Anthropic SDK sends `x-api-key`; OpenAI SDK sends `Authorization: Bearer`. One neutral
-    // virtual key works in either, so check both. Borrowed from the header — no per-request copy.
-    if let Some(v) = h.headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
-        return Some(v);
+/// Header names carrying a plain static API key (no OAuth/signing), checked in order. Anthropic:
+/// `x-api-key`. Azure OpenAI: `api-key`. Google Gemini: `x-goog-api-key`. `Authorization: Bearer`
+/// (OpenAI and everyone else) is checked separately below since it needs prefix-stripping.
+const STATIC_KEY_HEADERS: [&str; 3] = ["x-api-key", "api-key", "x-goog-api-key"];
+
+/// Extract query-param `name`'s value from a raw query string (`k=v&k2=v2`). Used only for Google
+/// Gemini's `?key=` convention — the sole query-param credential shape among recognized providers.
+/// No percent-decoding: a real API key is alphanumeric, so a plain split is exact, and decoding would
+/// let a crafted query smuggle characters past the literal `name=` match.
+fn query_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
+    query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == name).then_some(v)
+    })
+}
+
+/// Extract the presented key (virtual or BYO) from wherever the client's SDK puts it. Every
+/// recognized shape is a **plain static key** (no OAuth/signing), so one neutral virtual key works
+/// in any of them: Anthropic's `x-api-key`, Azure OpenAI's `api-key`, Google Gemini's
+/// `x-goog-api-key` (header, falling back to the `?key=` query param — Gemini accepts either),
+/// OpenAI's `Authorization: Bearer`. Header checks first since they're the common case and cheaper
+/// (no query parse); query param last since it's the least-preferred shape (keys in a URL end up in
+/// proxy/access logs). Borrowed from the request — no per-request copy.
+fn extract_virtual_key(req: &pingora::http::RequestHeader) -> Option<&str> {
+    for header in STATIC_KEY_HEADERS {
+        if let Some(v) = req.headers.get(header).and_then(|v| v.to_str().ok()) {
+            return Some(v);
+        }
     }
-    h.headers
+    if let Some(v) = req
+        .headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
+    {
+        return Some(v);
+    }
+    req.uri.query().and_then(|q| query_param(q, "key"))
 }
 
 /// Upper bound on a model id we'll record. Real ids are short (`claude-opus-4-8`,
@@ -321,7 +349,7 @@ impl ProxyHttp for AiProxy {
         let dialect = provider.dialect;
 
         // 2. Extract the presented key — a managed virtual key (`bai_…`) or a raw BYO provider token.
-        let Some(raw_key) = extract_virtual_key(session) else {
+        let Some(raw_key) = extract_virtual_key(session.req_header()) else {
             return Self::reject(
                 session,
                 &request_id,
@@ -950,6 +978,10 @@ impl ProxyHttp for AiProxy {
                 output_tokens = usage.output_tokens,
                 cache_read_tokens = usage.cache_read_tokens,
                 cache_write_tokens = usage.cache_write_tokens,
+                // `Some(0)` (reported, none used) vs `None` (not reported at all — an unreasoning
+                // model, or a provider that doesn't surface it) matters and is unrecoverable once this
+                // line ships, so it's logged as `?` (Debug) rather than collapsed to a bare `0`.
+                reasoning_tokens = ?usage.reasoning_tokens,
                 latency_ms = rc.start.elapsed().as_millis() as u64,
                 "usage"
             );
@@ -960,6 +992,87 @@ impl ProxyHttp for AiProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a `RequestHeader` for a given path (+ optional query) with the given headers set —
+    /// mirrors the shape `session.req_header()` hands `extract_virtual_key` on the real path.
+    fn req_with_headers(
+        path: &str,
+        headers: &[(&'static str, &'static str)],
+    ) -> pingora::http::RequestHeader {
+        let mut req =
+            pingora::http::RequestHeader::build(http::Method::POST, path.as_bytes(), None).unwrap();
+        for (k, v) in headers {
+            req.insert_header(*k, *v).unwrap();
+        }
+        req
+    }
+
+    #[test]
+    fn extract_virtual_key_recognizes_anthropic_x_api_key() {
+        let req = req_with_headers("/v1/messages", &[("x-api-key", "sk-ant-key")]);
+        assert_eq!(extract_virtual_key(&req), Some("sk-ant-key"));
+    }
+
+    #[test]
+    fn extract_virtual_key_recognizes_openai_bearer() {
+        let req = req_with_headers(
+            "/v1/chat/completions",
+            &[("authorization", "Bearer sk-openai-key")],
+        );
+        assert_eq!(extract_virtual_key(&req), Some("sk-openai-key"));
+    }
+
+    #[test]
+    fn extract_virtual_key_recognizes_azure_api_key_header() {
+        // Task #31: Azure OpenAI authenticates via the bare `api-key` header (no `Bearer` prefix, no
+        // OAuth). Before this fix, a client presenting only this header got a 401.
+        let req = req_with_headers("/v1/responses", &[("api-key", "azure-secret")]);
+        assert_eq!(extract_virtual_key(&req), Some("azure-secret"));
+    }
+
+    #[test]
+    fn extract_virtual_key_recognizes_google_goog_api_key_header() {
+        // Task #31: Google Gemini authenticates via `x-goog-api-key`.
+        let req = req_with_headers(
+            "/v1beta/models/gemini-2.5-pro:generateContent",
+            &[("x-goog-api-key", "goog-secret")],
+        );
+        assert_eq!(extract_virtual_key(&req), Some("goog-secret"));
+    }
+
+    #[test]
+    fn extract_virtual_key_recognizes_google_key_query_param() {
+        // Task #31: Google Gemini also accepts the key as a `?key=` query param — no header at all.
+        let req = req_with_headers(
+            "/v1beta/models/gemini-2.5-pro:generateContent?key=goog-query-secret",
+            &[],
+        );
+        assert_eq!(extract_virtual_key(&req), Some("goog-query-secret"));
+    }
+
+    #[test]
+    fn extract_virtual_key_query_param_only_used_as_last_resort() {
+        // A header takes precedence over a `key=` query param if both are somehow present.
+        let req = req_with_headers(
+            "/v1beta/models/gemini-2.5-pro:generateContent?key=query-secret",
+            &[("x-goog-api-key", "header-secret")],
+        );
+        assert_eq!(extract_virtual_key(&req), Some("header-secret"));
+    }
+
+    #[test]
+    fn extract_virtual_key_returns_none_when_absent() {
+        let req = req_with_headers("/v1/chat/completions", &[]);
+        assert_eq!(extract_virtual_key(&req), None);
+    }
+
+    #[test]
+    fn query_param_finds_key_among_multiple_params() {
+        assert_eq!(query_param("a=1&key=abc123&b=2", "key"), Some("abc123"));
+        assert_eq!(query_param("key=solo", "key"), Some("solo"));
+        assert_eq!(query_param("a=1&b=2", "key"), None);
+        assert_eq!(query_param("", "key"), None);
+    }
 
     #[test]
     fn sanitize_model_passes_real_ids() {
@@ -1031,9 +1144,12 @@ mod tests {
 
     #[test]
     fn openrouter_attribution_present_only_for_openrouter() {
-        let mut openrouter_req =
-            pingora::http::RequestHeader::build(http::Method::POST, b"/api/v1/chat/completions", None)
-                .unwrap();
+        let mut openrouter_req = pingora::http::RequestHeader::build(
+            http::Method::POST,
+            b"/api/v1/chat/completions",
+            None,
+        )
+        .unwrap();
         apply_provider_attribution(&mut openrouter_req, "openrouter").unwrap();
         assert_eq!(
             openrouter_req.headers.get("HTTP-Referer").unwrap(),
@@ -1045,9 +1161,12 @@ mod tests {
         );
 
         for other in ["openai", "anthropic", "fireworks", "groq"] {
-            let mut req =
-                pingora::http::RequestHeader::build(http::Method::POST, b"/v1/chat/completions", None)
-                    .unwrap();
+            let mut req = pingora::http::RequestHeader::build(
+                http::Method::POST,
+                b"/v1/chat/completions",
+                None,
+            )
+            .unwrap();
             apply_provider_attribution(&mut req, other).unwrap();
             assert!(
                 req.headers.get("HTTP-Referer").is_none(),

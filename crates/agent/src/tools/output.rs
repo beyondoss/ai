@@ -392,8 +392,22 @@ impl OutputAccumulator {
 
     /// The tail decoded lossily to UTF-8, with a leading partial line dropped when the tail was
     /// trimmed mid-line — so display never shows a half-line at the top of the window.
+    ///
+    /// While the command is still running, any trailing bytes that look like an incomplete
+    /// multi-byte UTF-8 sequence (a chunk boundary landing mid-character) are held back rather
+    /// than lossily decoded to U+FFFD — mirroring pi's stateful `TextDecoder({stream: true})`,
+    /// which withholds an incomplete trailing sequence until the rest arrives in a later chunk.
+    /// Once [`finish`](Self::finish) has run there's no "more bytes coming" to wait for, so the
+    /// whole tail — including any genuinely truncated/invalid trailing bytes — goes through the
+    /// same lossy fallback as before.
     fn snapshot_text(&self) -> String {
-        let s = String::from_utf8_lossy(&self.tail).into_owned();
+        let decodable = if self.finished {
+            &self.tail[..]
+        } else {
+            let held_back = incomplete_utf8_suffix_len(&self.tail);
+            &self.tail[..self.tail.len() - held_back]
+        };
+        let s = String::from_utf8_lossy(decodable).into_owned();
         if self.tail_starts_at_line_boundary {
             return s;
         }
@@ -548,6 +562,23 @@ fn truncate_tail(content: &str, max_lines: usize, max_bytes: usize) -> TailTrunc
         output_bytes,
         last_line_partial,
         truncated_by: Some(truncated_by),
+    }
+}
+
+/// Number of trailing bytes in `bytes` that form an incomplete-but-potentially-valid UTF-8
+/// sequence — a multi-byte lead byte whose continuation bytes haven't all arrived yet. Returns 0
+/// when `bytes` is already valid UTF-8, or when the first error is a genuinely invalid sequence
+/// (not simply truncated): either way there's nothing left to wait for, so the caller should just
+/// decode the bytes as they are. `std::str::from_utf8`'s own error already distinguishes the two
+/// cases exactly (`error_len() == None` means "ran out of input mid-sequence"), so there's no need
+/// to hand-roll continuation-byte counting.
+fn incomplete_utf8_suffix_len(bytes: &[u8]) -> usize {
+    match std::str::from_utf8(bytes) {
+        Ok(_) => 0,
+        Err(e) => match e.error_len() {
+            None => bytes.len() - e.valid_up_to(),
+            Some(_) => 0,
+        },
     }
 }
 
@@ -1002,6 +1033,49 @@ mod tests {
         assert!(r.truncated_by.is_none());
         assert_eq!(r.content, content);
         assert!(!r.last_line_partial);
+    }
+
+    #[test]
+    fn live_snapshot_holds_back_an_incomplete_trailing_utf8_sequence() {
+        // pi: TextDecoder({stream: true}) withholds a trailing partial multi-byte sequence until
+        // the rest arrives — a live snapshot taken right after a chunk boundary splits a
+        // character mid-sequence must show clean, complete text, not a U+FFFD placeholder.
+        let mut acc = OutputAccumulator::new();
+        acc.append(b"hi ");
+        let emoji = "🙂".as_bytes(); // 4 bytes: F0 9F 99 82
+        acc.append(&emoji[..2]); // first half only — an incomplete lead sequence
+
+        let mid_snap = acc.snapshot(false);
+        assert!(
+            !mid_snap.content.contains('\u{FFFD}'),
+            "a live snapshot must not show a replacement character for bytes still in flight: {:?}",
+            mid_snap.content
+        );
+        assert_eq!(mid_snap.content, "hi ");
+
+        // The rest of the character arrives — the next snapshot shows it whole.
+        acc.append(&emoji[2..]);
+        let healed_snap = acc.snapshot(false);
+        assert_eq!(healed_snap.content, "hi 🙂");
+
+        acc.finish();
+        let final_snap = acc.snapshot(false);
+        assert_eq!(final_snap.content, "hi 🙂");
+    }
+
+    #[test]
+    fn finished_snapshot_lossily_decodes_a_genuinely_truncated_tail() {
+        // Once the stream is finished there's no more data coming, so an incomplete trailing
+        // sequence left in the tail is a real truncation, not an in-flight chunk boundary — it
+        // must fall back to the existing lossy decode (U+FFFD) rather than being held back
+        // forever.
+        let mut acc = OutputAccumulator::new();
+        acc.append(b"hi ");
+        acc.append(&"🙂".as_bytes()[..2]); // never completed
+        acc.finish();
+
+        let snap = acc.snapshot(false);
+        assert!(snap.content.contains('\u{FFFD}'), "got: {:?}", snap.content);
     }
 
     #[test]

@@ -29,6 +29,23 @@ pub enum Dialect {
     Anthropic,
 }
 
+impl Dialect {
+    /// Parse a config-supplied dialect name (case-insensitive): `"openai"` or `"anthropic"`. Used
+    /// only for a **config-added** provider (`state::build_providers`) — a known provider's dialect
+    /// is fixed in [`KNOWN_PROVIDERS`] and never parsed from a string. `None` on anything else, which
+    /// the caller turns into a hard boot failure rather than a silent default: real Anthropic-wire
+    /// vendors (MiniMax, MiniMax-CN, Kimi-Coding) added via config with a typo'd dialect must not
+    /// silently fall back to OpenAI-wire, which zero-bills every request (see
+    /// `usage::openai_body`'s dialect-mismatch guard for the runtime backstop).
+    pub fn parse_config(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "openai" => Some(Dialect::OpenAI),
+            "anthropic" => Some(Dialect::Anthropic),
+            _ => None,
+        }
+    }
+}
+
 /// How the upstream expects the API key. OpenAI-wire providers use `Authorization: Bearer <key>`;
 /// Anthropic uses the `x-api-key` header. The gateway swaps the client's virtual key for the real
 /// pool key in whichever header the upstream wants (see `proxy`).
@@ -54,6 +71,18 @@ impl AuthScheme {
             AuthScheme::XApiKey => key.to_string(),
         }
     }
+
+    /// Parse a config-supplied auth scheme name (case-insensitive, `-`/`_` ignored): `"bearer"` or
+    /// `"x-api-key"`/`"xapikey"`. Used only for a **config-added** provider (`state::build_providers`)
+    /// — a known provider's scheme is fixed in [`KNOWN_PROVIDERS`]. `None` on anything else, which the
+    /// caller turns into a hard boot failure rather than a silent default.
+    pub fn parse_config(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().replace(['-', '_'], "").as_str() {
+            "bearer" => Some(AuthScheme::Bearer),
+            "xapikey" => Some(AuthScheme::XApiKey),
+            _ => None,
+        }
+    }
 }
 
 /// Static wire facts for a known provider. Adding a provider = one row in [`KNOWN_PROVIDERS`].
@@ -70,7 +99,7 @@ pub struct ProviderSpec {
 
 /// The providers the gateway knows out of the box. All but Anthropic speak the OpenAI wire format
 /// (Bearer auth, chat/completions + embeddings); a new one is a single row here, then reachable at
-/// `/{name}/…`. (Config can add further OpenAI-wire providers or override any authority — see
+/// `/{name}/…`. (Config can add further providers of either dialect, or override any authority — see
 /// `state::build_providers`.)
 ///
 /// We forward the path after `/{name}` **verbatim**, so the gateway carries no per-provider mount
@@ -264,6 +293,35 @@ mod tests {
             };
             assert_eq!(spec.dialect, want, "{} dialect", spec.name);
         }
+    }
+
+    #[test]
+    fn dialect_parse_config_accepts_known_case_insensitive() {
+        assert_eq!(Dialect::parse_config("openai"), Some(Dialect::OpenAI));
+        assert_eq!(Dialect::parse_config("OpenAI"), Some(Dialect::OpenAI));
+        assert_eq!(Dialect::parse_config("anthropic"), Some(Dialect::Anthropic));
+        assert_eq!(Dialect::parse_config("Anthropic"), Some(Dialect::Anthropic));
+        assert_eq!(Dialect::parse_config("bogus"), None);
+        assert_eq!(Dialect::parse_config(""), None);
+    }
+
+    #[test]
+    fn auth_scheme_parse_config_accepts_known_variants() {
+        assert_eq!(AuthScheme::parse_config("bearer"), Some(AuthScheme::Bearer));
+        assert_eq!(AuthScheme::parse_config("Bearer"), Some(AuthScheme::Bearer));
+        assert_eq!(
+            AuthScheme::parse_config("x-api-key"),
+            Some(AuthScheme::XApiKey)
+        );
+        assert_eq!(
+            AuthScheme::parse_config("xapikey"),
+            Some(AuthScheme::XApiKey)
+        );
+        assert_eq!(
+            AuthScheme::parse_config("x_api_key"),
+            Some(AuthScheme::XApiKey)
+        );
+        assert_eq!(AuthScheme::parse_config("bogus"), None);
     }
 
     #[test]

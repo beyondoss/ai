@@ -5,6 +5,7 @@
 //! the real provider, and meters usage. The client only picks the *dialect* (by model id), builds
 //! the request body, and frames the streaming SSE response back into [`StreamEvent`]s.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -27,6 +28,20 @@ const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 /// are mutually exclusive; no current model needs this branch, since every current id supports the
 /// per-tool marker instead, but it exists for correctness if that ever changes.
 const FINE_GRAINED_TOOL_STREAMING_BETA: &str = "fine-grained-tool-streaming-2025-05-14";
+
+/// Anthropic's OAuth (Claude Pro/Max subscription) beta opt-ins — sent only when the attached
+/// credential came from an OAuth login (`is_oauth`), never for a plain API key. Anthropic gates this
+/// subscription-authenticated endpoint to its own official Claude Code client; these two beta tokens
+/// plus [`CLAUDE_CLI_IDENTITY`]/the `x-app`/`anthropic-dangerous-direct-browser-access` headers below
+/// are what tell it this request is that client. Presenting this tool as Claude Code is a deliberate,
+/// user-confirmed choice (see `crates/agent/src/oauth/anthropic.rs`), not an oversight — full pi
+/// parity rather than the "false attribution" this crate previously declined to send.
+const CLAUDE_CODE_BETA: &str = "claude-code-20250219";
+const OAUTH_BETA: &str = "oauth-2025-04-20";
+/// The identity string Anthropic's OAuth gating checks for (`user-agent`). **A moving target, not a
+/// one-time constant**: if Anthropic starts rejecting a stale `claude-cli/<version>`, bump this to
+/// whatever the real Claude Code CLI currently reports.
+const CLAUDE_CLI_IDENTITY: &str = "claude-cli/2.1.75";
 
 /// How many times to re-issue a request that failed transiently (connection refused, timeout, or a
 /// retryable status) before giving up. A multi-step agent run re-issues a request every turn, so a
@@ -92,6 +107,50 @@ impl Drop for ApiKey {
     }
 }
 
+/// A live, ready-to-attach bearer credential for one request, plus the one bit of context header
+/// construction needs: whether this token came from an OAuth subscription login, which unlocks a
+/// provider-specific extra header set (see `send_with_retry`) — distinct from a plain static key.
+pub struct Credential {
+    key: ApiKey,
+    is_oauth: bool,
+}
+
+impl Credential {
+    pub fn new(key: impl Into<String>, is_oauth: bool) -> Self {
+        Self {
+            key: ApiKey::new(key),
+            is_oauth,
+        }
+    }
+}
+
+/// How [`GatewayClient`] obtains the token attached to every request — resolved fresh immediately
+/// before each send rather than fixed at construction, so a token can expire and be refreshed
+/// mid-process without this crate knowing anything about *how*. The only implementation shipped in
+/// this crate is [`GatewayClient::new`]'s trivial static one; an OAuth-aware implementation (login,
+/// local credential storage, locked cross-process refresh) belongs in a higher-level crate that
+/// depends on this one, never the reverse — the same "wrong dependency direction" rule already
+/// documented on [`ApiKey`], and the reason this crate still never *holds* a provider key of its own,
+/// only ever borrows one fetched through this trait for the span of one request.
+#[async_trait]
+pub trait CredentialSource: Send + Sync {
+    async fn credential(&self) -> Result<Credential>;
+}
+
+/// The default source: a single string fixed for the client's lifetime — what
+/// [`GatewayClient::new`] builds internally.
+struct StaticCredential(ApiKey);
+
+#[async_trait]
+impl CredentialSource for StaticCredential {
+    async fn credential(&self) -> Result<Credential> {
+        Ok(Credential {
+            key: self.0.clone(),
+            is_oauth: false,
+        })
+    }
+}
+
 /// Build the underlying HTTP client with a given idle-read timeout, connect timeout fixed at
 /// [`CONNECT_TIMEOUT`]. Factored out so [`GatewayClient::new`] and
 /// [`GatewayClient::with_idle_timeout`] share one construction path.
@@ -103,30 +162,41 @@ fn build_http(read_timeout: Duration) -> Result<reqwest::Client> {
         .map_err(|e| Error::Transport(e.to_string()))
 }
 
-/// An HTTP client pointed at a Beyond gateway base URL, authenticated with a `bai_v1` virtual key.
+/// An HTTP client pointed at a Beyond gateway base URL, authenticated with a `bai_v1` virtual key (or
+/// any other [`CredentialSource`]).
 pub struct GatewayClient {
     http: reqwest::Client,
     base_url: String,
-    api_key: ApiKey,
+    credential_source: Arc<dyn CredentialSource>,
     max_retries: u32,
     base_backoff: Duration,
 }
 
 impl GatewayClient {
     /// Build a client for `base_url` (e.g. `http://ai.internal` or `http://127.0.0.1:8080`) using
-    /// `api_key` (a `bai_v1…` virtual key, or a BYO provider key the gateway forwards untouched).
-    /// Pre-first-byte retry defaults to [`MAX_RETRIES`]/[`BASE_BACKOFF`]; override with
-    /// [`with_retry`](Self::with_retry) if an operator needs a different budget for this deployment.
-    /// Idle-read timeout defaults to [`READ_TIMEOUT`]; override with
-    /// [`with_idle_timeout`](Self::with_idle_timeout). Outbound proxy config isn't a client option
-    /// here — reqwest already reads `HTTP_PROXY`/`HTTPS_PROXY` from the environment at the library
-    /// level, with no code needed on our side.
+    /// `api_key` (a `bai_v1…` virtual key, or a BYO provider key the gateway forwards untouched) as a
+    /// fixed, non-expiring credential. Pre-first-byte retry defaults to [`MAX_RETRIES`]/
+    /// [`BASE_BACKOFF`]; override with [`with_retry`](Self::with_retry) if an operator needs a
+    /// different budget for this deployment. Idle-read timeout defaults to [`READ_TIMEOUT`]; override
+    /// with [`with_idle_timeout`](Self::with_idle_timeout). Outbound proxy config isn't a client
+    /// option here — reqwest already reads `HTTP_PROXY`/`HTTPS_PROXY` from the environment at the
+    /// library level, with no code needed on our side.
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Result<Self> {
+        Self::with_credential_source(base_url, Arc::new(StaticCredential(ApiKey::new(api_key))))
+    }
+
+    /// Build a client whose credential is resolved fresh via `source` immediately before every
+    /// request — e.g. an OAuth-aware source that transparently refreshes an expiring token. See
+    /// [`CredentialSource`].
+    pub fn with_credential_source(
+        base_url: impl Into<String>,
+        source: Arc<dyn CredentialSource>,
+    ) -> Result<Self> {
         let http = build_http(READ_TIMEOUT)?;
         Ok(Self {
             http,
             base_url: base_url.into().trim_end_matches('/').to_string(),
-            api_key: ApiKey::new(api_key),
+            credential_source: source,
             max_retries: MAX_RETRIES,
             base_backoff: BASE_BACKOFF,
         })
@@ -174,7 +244,11 @@ impl ModelTransport for GatewayClient {
         let url = format!("{}{}", self.base_url, dialect.endpoint_path());
         let body = dialect.build_body(&req);
         let http = self.http.clone();
-        let api_key = self.api_key.clone();
+        // Resolved fresh for this turn rather than a field snapshot — the seam that lets a
+        // credential expire and be refreshed mid-process (see `CredentialSource`'s doc comment).
+        // `send_with_retry`'s own internal transient-failure retries never hit 401, so one fetch per
+        // `stream()` call (once per model turn) is all that's needed, not one per retry attempt.
+        let credential = self.credential_source.credential().await?;
         let max_retries = self.max_retries;
         let base_backoff = self.base_backoff;
 
@@ -196,13 +270,7 @@ impl ModelTransport for GatewayClient {
         // and `x-client-request-id` (`openai-completions.ts`'s `compat.sendSessionAffinityHeaders`
         // branch); the Responses dialect never sends it.
         let send_x_session_affinity = dialect == Dialect::OpenAi;
-        // Interleaved thinking lets the model weave thinking between tool calls across a turn — but
-        // it's only meaningful for the `Budget` shape; `Adaptive` models interleave by default, and
-        // sending the beta opt-in for them is a harmless no-op at best, so skip it to keep the header
-        // list accurate to what the request actually needs.
-        let needs_interleaved_beta = req.thinking.is_some()
-            && crate::models::capabilities(&req.model).thinking
-                != crate::models::ThinkingShape::Adaptive;
+        let needs_interleaved_beta = needs_interleaved_thinking_beta(&req.model);
         let needs_fine_grained_tool_streaming_beta = !req.tools.is_empty()
             && !crate::models::capabilities(&req.model).supports_eager_tool_streaming;
         let stream = async_stream::try_stream! {
@@ -213,9 +281,10 @@ impl ModelTransport for GatewayClient {
             let resp = send_with_retry(
                 &http,
                 &url,
-                api_key.expose(),
+                credential.key.expose(),
                 &body,
                 is_anthropic,
+                credential.is_oauth,
                 needs_interleaved_beta,
                 needs_fine_grained_tool_streaming_beta,
                 session_affinity_header.as_deref(),
@@ -342,13 +411,25 @@ impl LineFramer {
     }
 }
 
+/// Whether an Anthropic-dialect request needs the interleaved-thinking beta opt-in, letting the model
+/// weave thinking between tool calls across a turn. Sent by default for every request to a model whose
+/// thinking shape isn't already `Adaptive` — matches pi's own default-on gate (`anthropic-messages.ts`:
+/// `interleavedThinking ?? true`, `needsInterleavedBeta = interleavedThinking &&
+/// model.compat?.forceAdaptiveThinking !== true`), independent of whether *this particular turn*
+/// requests new thinking (a later turn with thinking off still benefits from interleaving on a turn
+/// that follows it, or from consistent headers across a session's history of requests). `Adaptive`
+/// models interleave by default, so sending the opt-in for them would be a harmless no-op at best —
+/// skipped to keep the header list accurate to what the request actually needs.
+fn needs_interleaved_thinking_beta(model: &str) -> bool {
+    crate::models::capabilities(model).thinking != crate::models::ThinkingShape::Adaptive
+}
+
 /// Comma-joined `anthropic-beta` opt-ins for a request, or empty when neither applies — prompt
 /// caching has been GA for a long time now and no longer needs (or accepts as meaningful) the old
 /// `prompt-caching-2024-07-31` opt-in header pi itself has already dropped, so this crate doesn't send
-/// it either. Interleaved thinking is added only for `Budget`-shape thinking requests; the
-/// fine-grained tool-streaming beta and each tool definition's own `eager_input_streaming` marker (see
-/// `dialect::anthropic::mark_eager_tool_streaming`) are mutually exclusive, so the beta only fires for a
-/// model that lacks the per-tool marker.
+/// it either. The fine-grained tool-streaming beta and each tool definition's own
+/// `eager_input_streaming` marker (see `dialect::anthropic::mark_eager_tool_streaming`) are mutually
+/// exclusive, so that beta only fires for a model that lacks the per-tool marker.
 fn anthropic_betas(
     needs_interleaved: bool,
     needs_fine_grained_tool_streaming: bool,
@@ -377,6 +458,7 @@ async fn send_with_retry(
     api_key: &str,
     body: &Value,
     is_anthropic: bool,
+    is_oauth: bool,
     needs_interleaved_beta: bool,
     needs_fine_grained_tool_streaming_beta: bool,
     session_affinity_header: Option<&str>,
@@ -402,14 +484,30 @@ async fn send_with_retry(
         }
         if is_anthropic {
             builder = builder.header("anthropic-version", ANTHROPIC_VERSION);
-            let betas = anthropic_betas(
+            // OAuth betas lead the list — matches pi's own exact ordering
+            // (`claude-code-20250219,oauth-2025-04-20,[...]`).
+            let mut betas = Vec::new();
+            if is_oauth {
+                betas.push(CLAUDE_CODE_BETA);
+                betas.push(OAUTH_BETA);
+            }
+            betas.extend(anthropic_betas(
                 needs_interleaved_beta,
                 needs_fine_grained_tool_streaming_beta,
-            );
+            ));
             // Omit the header entirely when nothing needs it, rather than sending an empty
             // `anthropic-beta:` value — matching pi's own conditional-spread behavior.
             if !betas.is_empty() {
                 builder = builder.header("anthropic-beta", betas.join(","));
+            }
+            if is_oauth {
+                // Identity headers Anthropic's OAuth-gated endpoint expects from its own official
+                // Claude Code client — see `CLAUDE_CODE_BETA`'s doc comment for why sending these is
+                // a deliberate, confirmed choice, not an oversight.
+                builder = builder
+                    .header("anthropic-dangerous-direct-browser-access", "true")
+                    .header("user-agent", CLAUDE_CLI_IDENTITY)
+                    .header("x-app", "cli");
             }
         }
         match builder.send().await {
@@ -639,6 +737,19 @@ mod tests {
     }
 
     #[test]
+    fn interleaved_thinking_beta_is_sent_regardless_of_this_turns_own_thinking_flag() {
+        // pi-parity fix (Task #29): pi sends the interleaved-thinking beta by default for every
+        // request to a non-adaptive-thinking model (`interleavedThinking ?? true`), gated only on the
+        // model's own thinking *shape* (`model.compat?.forceAdaptiveThinking !== true`) — not on
+        // whether this particular turn requested thinking. `claude-sonnet-4-5` is `Budget`-shape
+        // (non-Adaptive) — must get the header even with no `thinking` on this turn.
+        assert!(needs_interleaved_thinking_beta("claude-sonnet-4-5"));
+        // `Adaptive`-shape models (our own default, `claude-opus-4-8`) interleave by default — sending
+        // the opt-in would be a no-op, so it's skipped.
+        assert!(!needs_interleaved_thinking_beta("claude-opus-4-8"));
+    }
+
+    #[test]
     fn retryable_status_classification() {
         for s in [429, 500, 502, 503, 504, 529, 408, 409] {
             assert!(is_retryable_status(s), "{s} should be retryable");
@@ -731,6 +842,98 @@ mod tests {
         assert!(
             delay > Duration::ZERO && delay <= MAX_BACKOFF,
             "future http-date should yield a bounded positive delay, got {delay:?}"
+        );
+    }
+
+    /// A source that always yields a fixed OAuth-flagged credential — the test double for
+    /// [`CredentialSource`] exercising the `is_oauth` header seam without a real credential store.
+    struct OauthTestCredential;
+    #[async_trait]
+    impl CredentialSource for OauthTestCredential {
+        async fn credential(&self) -> Result<Credential> {
+            Ok(Credential::new("test-oauth-token", true))
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_credential_adds_anthropics_identity_headers() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            // The test only inspects the request headers the client sent — an empty
+            // close-delimited response is enough to let `stream()` complete without needing a real
+            // decodable event.
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+            drop(stream);
+            request
+        });
+
+        let client = GatewayClient::with_credential_source(
+            format!("http://{addr}"),
+            Arc::new(OauthTestCredential),
+        )
+        .unwrap();
+        let req = ModelRequest::new("claude-test", Vec::new(), 100);
+        let mut events = client.stream(req).await.unwrap();
+        while events.next().await.is_some() {} // drain to completion; content doesn't matter here
+
+        let request = server.join().unwrap().to_lowercase();
+        assert!(
+            request.contains("anthropic-beta: claude-code-20250219,oauth-2025-04-20"),
+            "missing/wrong anthropic-beta header, got:\n{request}"
+        );
+        assert!(
+            request.contains("user-agent: claude-cli/"),
+            "missing claude-cli user-agent, got:\n{request}"
+        );
+        assert!(
+            request.contains("x-app: cli"),
+            "missing x-app header, got:\n{request}"
+        );
+        assert!(
+            request.contains("anthropic-dangerous-direct-browser-access: true"),
+            "missing direct-browser-access header, got:\n{request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_static_credential_never_sends_oauth_headers() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+            drop(stream);
+            request
+        });
+
+        let client = GatewayClient::new(format!("http://{addr}"), "test-key").unwrap();
+        let req = ModelRequest::new("claude-test", Vec::new(), 100);
+        let mut events = client.stream(req).await.unwrap();
+        while events.next().await.is_some() {}
+
+        let request = server.join().unwrap().to_lowercase();
+        assert!(!request.contains("claude-code-20250219"), "got:\n{request}");
+        assert!(!request.contains("oauth-2025-04-20"), "got:\n{request}");
+        assert!(!request.contains("x-app:"), "got:\n{request}");
+        assert!(
+            !request.contains("anthropic-dangerous-direct-browser-access"),
+            "got:\n{request}"
         );
     }
 

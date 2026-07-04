@@ -112,7 +112,10 @@ impl SettingsStore {
     }
 
     /// Set (`Some`) or clear (`None`) the stored default project-trust policy, persisting atomically.
-    pub fn set_default_project_trust(&mut self, policy: Option<TrustPolicy>) -> std::io::Result<()> {
+    pub fn set_default_project_trust(
+        &mut self,
+        policy: Option<TrustPolicy>,
+    ) -> std::io::Result<()> {
         self.mutate_locked(move |s| s.default_project_trust = policy)
     }
 

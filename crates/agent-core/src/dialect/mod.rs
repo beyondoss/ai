@@ -215,18 +215,33 @@ fn answered(messages: &[Message], i: usize, tool_use_id: &str) -> bool {
     })
 }
 
-/// Ensure every message reaches the wire with at least one non-empty content block. Filters out
-/// whitespace-only `Text` blocks — matching pi's `convertMessages` (`anthropic-messages.ts`) and
-/// `openai-completions.ts:1007-1018` ("Some providers require 'either content or tool_calls, but not
-/// none'"). Anthropic 400s on an empty `text` content block (see `anthropic::downgrade_unsigned_
-/// thinking`'s doc comment); an OpenAI-shaped `{content: null}` with no `tool_calls` hits the same
-/// rejection class. Reachable today via `Message::error()`'s empty closing record (a whole-run
-/// failure with no partial response), the immediate-abort turn (`Agent::run_events_steered`), and
-/// `Session::scrub_cross_model_state` leaving `content: []` behind after dropping a foreign model's
-/// empty thinking block (`scrub_cross_model_state_drops_an_empty_thinking_block_instead_of_
-/// downgrading_it`) — none of these were filtered before reaching a request.
+/// Ensure every message reaches the wire with at least one non-empty content block, and that an
+/// aborted or errored assistant turn never replays its (possibly partial) real content. Two related
+/// fixups, both padding rather than dropping the message's *slot* (see below):
 ///
-/// Unlike pi, a message left with zero content after filtering is NOT dropped from the list: this
+/// - Filters out whitespace-only `Text` blocks — matching pi's `convertMessages`
+///   (`anthropic-messages.ts`) and `openai-completions.ts:1007-1018` ("Some providers require 'either
+///   content or tool_calls, but not none'"). Anthropic 400s on an empty `text` content block (see
+///   `anthropic::downgrade_unsigned_thinking`'s doc comment); an OpenAI-shaped `{content: null}` with
+///   no `tool_calls` hits the same rejection class. Reachable today via `Message::error()`'s empty
+///   closing record (a whole-run failure with no partial response), the immediate-abort turn
+///   (`Agent::run_events_steered`), and `Session::scrub_cross_model_state` leaving `content: []`
+///   behind after dropping a foreign model's empty thinking block
+///   (`scrub_cross_model_state_drops_an_empty_thinking_block_instead_of_downgrading_it`).
+/// - Drops *all* content from a message marked [`Message::aborted`] or carrying
+///   [`Message::error_message`] — matching pi's `transform-messages.ts:186-194`, which skips any
+///   assistant message with `stopReason: "error"`/`"aborted"` outright when building the next
+///   request ("may have partial content (reasoning without message, incomplete tool calls) …
+///   replaying them can cause API errors"). A stream cancelled right after a `Thinking` block's
+///   signature landed but before anything else opened persists `Turn::blocks = [Thinking{signature}]`
+///   via `with_aborted`/`with_error` — replayed verbatim, that's exactly Anthropic/OpenAI's "reasoning
+///   with nothing following it in this turn" rejection, and once one turn hits it every later turn
+///   resends the same dangling block and fails identically. `Message::with_error`'s own doc comment
+///   already promised this ("Not replayed on the wire either way") — this is where that promise is
+///   actually kept for the block *content*, not just the `error_message`/`aborted` marker fields
+///   themselves (`anthropic::strip_model_id` already scrubs those).
+///
+/// Unlike pi, a message left with zero content after either fixup is NOT dropped from the list: this
 /// codebase relies on that record staying present to keep role alternation valid for whatever prompt
 /// follows it (see `a_prompt_after_a_failed_run_does_not_double_push_a_user_turn` — dropping
 /// `assistant(error)` from `[user, assistant(error), user]` would leave two consecutive `user` turns,
@@ -248,12 +263,15 @@ pub(crate) fn ensure_non_empty_content(messages: &[Message]) -> std::borrow::Cow
                 if !needs_content_fixup(m) {
                     return m.clone();
                 }
-                let mut content: Vec<ContentBlock> = m
-                    .content
-                    .iter()
-                    .filter(|b| !is_empty_text(b))
-                    .cloned()
-                    .collect();
+                let mut content: Vec<ContentBlock> = if is_incomplete_turn(m) {
+                    Vec::new()
+                } else {
+                    m.content
+                        .iter()
+                        .filter(|b| !is_empty_text(b))
+                        .cloned()
+                        .collect()
+                };
                 if content.is_empty() {
                     content.push(ContentBlock::text(EMPTY_MESSAGE_PLACEHOLDER));
                 }
@@ -266,10 +284,19 @@ pub(crate) fn ensure_non_empty_content(messages: &[Message]) -> std::borrow::Cow
     )
 }
 
-/// Whether `message` has any whitespace-only `Text` block, or has no content at all — either case
-/// needs [`ensure_non_empty_content`]'s fixup.
+/// Whether `message` needs [`ensure_non_empty_content`]'s fixup: an aborted/errored turn (whose
+/// content must be dropped outright, however much of it there is), a whitespace-only `Text` block, or
+/// no content at all.
 fn needs_content_fixup(message: &Message) -> bool {
-    message.content.is_empty() || message.content.iter().any(is_empty_text)
+    is_incomplete_turn(message)
+        || message.content.is_empty()
+        || message.content.iter().any(is_empty_text)
+}
+
+/// Whether `message` is a partial/aborted assistant turn whose real content must never reach the
+/// wire — see [`ensure_non_empty_content`]'s doc comment.
+fn is_incomplete_turn(message: &Message) -> bool {
+    message.aborted || message.error_message.is_some()
 }
 
 fn is_empty_text(block: &ContentBlock) -> bool {
@@ -818,6 +845,73 @@ data: {"type":"message_stop"}
         assert!(matches!(fixed, std::borrow::Cow::Owned(_)));
         assert_eq!(fixed[0].content.len(), 1, "got: {:?}", fixed[0].content);
         assert!(matches!(fixed[0].content[0], ContentBlock::ToolUse { .. }));
+    }
+
+    #[test]
+    fn ensure_non_empty_content_drops_a_dangling_thinking_block_from_an_aborted_middle_turn() {
+        // pi-parity fix (Task #27): a stream cancelled right after a `Thinking` block's signature
+        // landed but before anything else opened persists `Turn::blocks = [Thinking{signature}]` via
+        // `with_aborted` — replayed verbatim on every later request, that's Anthropic/OpenAI's own
+        // "reasoning with nothing following it" rejection, poisoning every subsequent turn identically.
+        // Matches pi's `transform-messages.ts:186-194`, which skips the whole assistant message
+        // outright rather than replaying any of its partial content.
+        let messages = vec![
+            Message::user("start"),
+            Message::assistant(vec![ContentBlock::Thinking {
+                text: "reasoning that never finished".into(),
+                signature: "sig-dangling".into(),
+            }])
+            .with_model_id("claude-opus-4-8")
+            .with_aborted(),
+            Message::user("try again"),
+        ];
+        let fixed = ensure_non_empty_content(&messages);
+        assert!(matches!(fixed, std::borrow::Cow::Owned(_)));
+        assert_eq!(fixed.len(), 3, "the record's slot must survive: {fixed:?}");
+        assert_eq!(
+            fixed[1].content,
+            vec![ContentBlock::text(EMPTY_MESSAGE_PLACEHOLDER)],
+            "the dangling Thinking block must not reach the wire, not even downgraded to text"
+        );
+        // Persistence-relevant fields (what a human reading the session transcript still sees) survive
+        // the wire-only fixup untouched — only the outbound copy's content is affected.
+        assert!(fixed[1].aborted);
+        assert_eq!(
+            messages[1].content,
+            vec![ContentBlock::Thinking {
+                text: "reasoning that never finished".into(),
+                signature: "sig-dangling".into(),
+            }],
+            "the original session messages must be untouched by the wire-only fixup"
+        );
+        assert_eq!(
+            fixed.iter().map(|m| m.role).collect::<Vec<_>>(),
+            vec![Role::User, Role::Assistant, Role::User],
+            "role alternation must stay valid"
+        );
+    }
+
+    #[test]
+    fn ensure_non_empty_content_drops_full_real_content_from_a_mid_stream_error() {
+        // The `with_error` sibling case: real content (not just a dangling thinking block) that
+        // streamed before a mid-turn transport failure must also be fully excluded from the next
+        // request, not just have its `error_message` marker field stripped.
+        let messages = vec![
+            Message::user("hi"),
+            Message::assistant(vec![
+                ContentBlock::text("here is what I found so far"),
+                ContentBlock::tool_use("t1", "bash", serde_json::json!({})),
+            ])
+            .with_model_id("claude-opus-4-8")
+            .with_error("transport error: connection reset"),
+        ];
+        let fixed = ensure_non_empty_content(&messages);
+        assert_eq!(
+            fixed[1].content,
+            vec![ContentBlock::text(EMPTY_MESSAGE_PLACEHOLDER)],
+            "got: {:?}",
+            fixed[1].content
+        );
     }
 
     #[test]

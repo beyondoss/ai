@@ -1736,6 +1736,32 @@ impl SessionStore {
         nodes
     }
 
+    /// Every user-turn message anywhere in the tree — every branch, not just the active path
+    /// [`Self::active_ids`]/live `Session.messages` covers — as `(id, Message)` pairs, chronologically
+    /// ordered like [`Self::tree`] (by each node's own `timestamp`, falling back to id on a tie). Feeds
+    /// `serve`'s `get_fork_messages`: pi's real `getUserMessagesForForking` returns candidates from the
+    /// *whole* tree, not only whichever branch happens to be active right now — a client building a
+    /// fork-point picker needs every message that could still be forked from, including ones on a
+    /// branch the session already navigated away from. `Node::as_message` already excludes non-message
+    /// nodes ([`Entry::Custom`]) the same way [`Self::tree`] does.
+    pub fn all_user_messages(&self) -> Vec<(String, Message)> {
+        let mut items: Vec<(String, Message)> = self
+            .nodes
+            .iter()
+            .filter_map(|(id, node)| {
+                let m = node.as_message()?;
+                (m.role == Role::User).then(|| (id.clone(), m.clone()))
+            })
+            .collect();
+        items.sort_by(|(a_id, _), (b_id, _)| {
+            self.nodes[a_id]
+                .timestamp
+                .cmp(&self.nodes[b_id].timestamp)
+                .then_with(|| a_id.cmp(b_id))
+        });
+        items
+    }
+
     /// Switch the active branch to the message `target_id` — anywhere in the tree, on or off the
     /// current active path — persisting a `Leaf` marker so a later `open()` resolves the new tip.
     /// Returns the branch's materialized messages (root through `target_id`, root-first); the caller
@@ -1985,7 +2011,8 @@ impl SessionStore {
             model: model.to_string(),
         };
         append_line(&self.path, &entry)?;
-        self.events.push(ExportEvent::ModelChange(model.to_string()));
+        self.events
+            .push(ExportEvent::ModelChange(model.to_string()));
         self.model_changes.insert(anchor, model.to_string());
         Ok(())
     }
@@ -2597,8 +2624,11 @@ pub fn default_session_dir(cwd: &str) -> PathBuf {
 /// Whether a `--fork`/`--session` argument looks like a path rather than a bare session id — pi's own
 /// `resolveSessionPath` treats any of these as "don't search, just resolve this as a file": a path
 /// separator, a leading `.`/`~`, or a `.jsonl` extension. A session id (`new_id()`'s shape, or a
-/// caller-supplied `--session-id`) never looks like this, so there's no realistic ambiguity.
-fn is_path_like(arg: &str) -> bool {
+/// caller-supplied `--session-id`) never looks like this, so there's no realistic ambiguity. `pub`
+/// (crosses the `main.rs` binary/lib boundary): shared with `run --session <arg>`'s own resolution
+/// (Task #24), which needs the identical literal-path-or-bare-id classification [`fork_by_arg`] already
+/// applies for `--fork <arg>`.
+pub fn is_path_like(arg: &str) -> bool {
     arg.contains('/') || arg.starts_with('.') || arg.starts_with('~') || arg.ends_with(".jsonl")
 }
 
@@ -2663,6 +2693,38 @@ pub fn fork_by_arg(
     }
 }
 
+/// Resolve a bare session id (or unique prefix) for `run --session <arg>` (Task #24) and reopen it *in
+/// place* — pi's own `resolveSessionPath`'s "local"/"global" branches (`main.ts`), except a cross-project
+/// match is reopened directly rather than routed through pi's own interactive fork-confirmation prompt:
+/// this crate's `run` is headless, with no TTY-prompt path anywhere else to hang that on. Only ever
+/// consulted once the caller has already ruled out a literal path (`is_path_like`, or one that already
+/// exists on disk as-is) — unlike [`fork_by_arg`], which this otherwise mirrors tier-for-tier, `arg`
+/// here is never treated as a path at all. Tries `target`'s own project first (`SessionRepo::open_id`,
+/// exact-then-unique-prefix — the same first tier `--fork <id>` uses), then, on a genuine not-found,
+/// every other project's own directory under `sessions_root` (`find_session_path_under`, `--fork`'s
+/// identical second tier). `Err(NotFound)` naming `arg` when nothing matches anywhere — unlike a literal
+/// path (which `--session` creates fresh when absent), a bare identifier that resolves to nothing is a
+/// likely typo, not a request to start a new session named after it.
+pub fn open_session_by_id(
+    arg: &str,
+    target: &SessionRepo,
+    sessions_root: &Path,
+) -> std::io::Result<(SessionStore, Session)> {
+    match target.open_id(arg) {
+        Ok(result) => Ok(result),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            match find_session_path_under(sessions_root, arg)? {
+                Some(path) => SessionStore::open(path),
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("no session matching \"{arg}\" found as a path or session id"),
+                )),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Locate a session matching `id` somewhere under `sessions_root`, by walking each immediate
 /// subdirectory the same way [`SessionRepo::list_all_with_progress`] does and checking filenames
 /// directly (`<created_at>_<id>.jsonl`) — deliberately *not* by recomputing a path from the session's
@@ -2670,8 +2732,9 @@ pub fn fork_by_arg(
 /// `AI_AGENT_SESSION_DIR` override need not follow that naming convention at all (it may be an
 /// arbitrarily-named shared directory), so reconstructing a path from `cwd` would silently miss a real
 /// session sitting right there under `sessions_root`. Cheaper than a full [`SessionRepo::list_all`] scan
-/// too: this only ever inspects filenames, never a file's contents.
-fn find_session_path_under(sessions_root: &Path, id: &str) -> std::io::Result<Option<PathBuf>> {
+/// too: this only ever inspects filenames, never a file's contents. `pub` (crosses the `main.rs`
+/// binary/lib boundary): shared with [`open_session_by_id`]'s own cross-project fallback (Task #24).
+pub fn find_session_path_under(sessions_root: &Path, id: &str) -> std::io::Result<Option<PathBuf>> {
     let project_dirs: Vec<PathBuf> = match fs::read_dir(sessions_root) {
         Ok(entries) => entries
             .flatten()
@@ -3786,7 +3849,10 @@ mod tests {
             .find(|n| n.entry_kind == "compaction")
             .expect("a compaction node must be recoverable from tree()'s output");
         assert!(
-            compaction_node.preview.as_deref().is_some_and(|p| p.contains("999")),
+            compaction_node
+                .preview
+                .as_deref()
+                .is_some_and(|p| p.contains("999")),
             "the compaction node's preview should still mention tokens_before: {compaction_node:#?}"
         );
 
@@ -5439,7 +5505,9 @@ mod tests {
 
         let session_id = store.meta().id.clone();
         match repo.fork_at_entry(&session_id, &ids[1], true) {
-            Ok(_) => panic!("expected invalid_fork_target for a `before` fork at an assistant reply"),
+            Ok(_) => {
+                panic!("expected invalid_fork_target for a `before` fork at an assistant reply")
+            }
             Err(e) => {
                 assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
                 assert!(
@@ -6062,7 +6130,11 @@ mod tests {
         let summary_id = store.active_ids().last().unwrap().clone();
 
         // The live, in-memory instance already reports a real timestamp, not the old `0` placeholder.
-        let node = store.tree().into_iter().find(|n| n.id == summary_id).unwrap();
+        let node = store
+            .tree()
+            .into_iter()
+            .find(|n| n.id == summary_id)
+            .unwrap();
         assert!(
             node.timestamp >= before,
             "expected a real timestamp (>= {before}), got {}",

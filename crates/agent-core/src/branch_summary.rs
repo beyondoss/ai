@@ -4,20 +4,33 @@
 //! network-free summarization request for whatever calls it — the headless server's branch-navigation
 //! RPC handler).
 //!
-//! This reuses [`crate::compaction`]'s `render_prefix`/`SUMMARY_SYSTEM`/`extract_file_ops` unchanged —
-//! a branch summary and a compaction summary are the same kind of "condense this transcript into a
-//! structured recap" operation, just triggered by different events (navigating away from a branch vs.
-//! the context window filling up) and framed by a different instruction. No incremental-update path
-//! (unlike compaction's [`crate::compaction::previous_summary`]): a branch is summarized once, when
-//! it's abandoned, not repeatedly re-summarized forward.
+//! This reuses [`crate::compaction`]'s `SUMMARY_SYSTEM`/`extract_file_ops` unchanged, and its
+//! `render_prefix` in spirit but not verbatim (see
+//! [`crate::compaction::render_prefix_without_tool_results`]) — a branch summary and a compaction
+//! summary are the same kind of "condense this transcript into a structured recap" operation, just
+//! triggered by different events (navigating away from a branch vs. the context window filling up),
+//! framed by a different instruction, and — since a branch summary is read once on return rather than
+//! carried forward as live context — rendered tersely enough to drop tool-result content entirely
+//! rather than truncating it. No incremental-update path (unlike compaction's
+//! [`crate::compaction::previous_summary`]): a branch is summarized once, when it's abandoned, not
+//! repeatedly re-summarized forward.
 
 use std::sync::Arc;
 
 use crate::compaction::{
-    SUMMARY_MARKER, SUMMARY_SYSTEM, estimate_message_tokens, extract_file_ops, render_prefix,
+    SUMMARY_MARKER, SUMMARY_SYSTEM, estimate_message_tokens, extract_file_ops,
+    render_prefix_without_tool_results,
 };
 use crate::message::{ContentBlock, Message};
 use crate::transport::ModelRequest;
+
+/// The branch-summarization call's output budget — a small fixed constant, unlike compaction's own
+/// `CompactionConfig::summary_max_tokens` (scaled off `reserve_tokens`). Matches pi's own
+/// `generateBranchSummary` (`branch-summarization.ts`), which hardcodes `maxTokens: 2048` for this call
+/// independent of `reserveTokens`: a branch recap is inherently a short, single-shot summary (no
+/// incremental-update path to budget for), so it doesn't need — and shouldn't scale with — the same
+/// headroom-proportional budget a live compaction summary does.
+pub const BRANCH_SUMMARY_MAX_TOKENS: u32 = 2_048;
 
 /// The instruction appended after the rendered branch transcript. Matches pi's own
 /// `BRANCH_SUMMARY_PROMPT` structurally — the same bracketed-exemplar/"(none)"-fallback/checkbox/
@@ -123,8 +136,12 @@ pub fn branch_summary_request(
             messages.len() - windowed.len()
         ));
     }
-    prompt.push_str(&render_prefix(windowed));
-    prompt.push_str("\n\n");
+    // `<conversation>` wraps the rendered transcript, matching pi's own `generateBranchSummary`
+    // (`branch-summarization.ts`) and this crate's own compaction summary-request path (see
+    // `crate::compaction::summary_request`'s fresh/split-turn path).
+    prompt.push_str("<conversation>\n");
+    prompt.push_str(&render_prefix_without_tool_results(windowed));
+    prompt.push_str("\n</conversation>\n\n");
     if !read.is_empty() {
         prompt.push_str(&format!(
             "<read-files>\n{}\n</read-files>\n",
@@ -181,6 +198,14 @@ mod tests {
     }
 
     #[test]
+    fn branch_summary_max_tokens_is_a_small_fixed_constant_independent_of_reserve_tokens() {
+        // pi-parity gap (fixed): pi's `generateBranchSummary` hardcodes `maxTokens: 2048` for this call,
+        // independent of `reserveTokens` — unlike compaction's own scaled `summary_max_tokens`
+        // (0.8 * reserve_tokens, which at typical defaults is an order of magnitude larger).
+        assert_eq!(BRANCH_SUMMARY_MAX_TOKENS, 2_048);
+    }
+
+    #[test]
     fn branch_summary_instruction_gives_pi_parity_structural_guidance() {
         // Same pi-parity gap as `crate::compaction::SUMMARY_INSTRUCTION` — matches pi's own
         // `BRANCH_SUMMARY_PROMPT` (`branch-summarization.ts`) structurally.
@@ -218,6 +243,49 @@ mod tests {
         assert_eq!(req.system.as_deref(), Some(SUMMARY_SYSTEM));
         assert_eq!(req.model, "claude-test");
         assert_eq!(req.max_tokens, 512);
+    }
+
+    #[test]
+    fn branch_summary_request_wraps_the_transcript_in_conversation_tags() {
+        let req = branch_summary_request("claude-test", &branch(), 512, 100_000, None, false);
+        let ContentBlock::Text { text, .. } = &req.messages[0].content[0] else {
+            panic!("expected text");
+        };
+        assert!(text.contains("<conversation>"));
+        assert!(text.contains("</conversation>"));
+        let open = text.find("<conversation>").unwrap();
+        let close = text.find("</conversation>").unwrap();
+        assert!(
+            text[open..close].contains("try approach X"),
+            "the rendered transcript must live inside the conversation tags: {text}"
+        );
+    }
+
+    #[test]
+    fn branch_summary_request_excludes_tool_result_content_from_the_rendered_transcript() {
+        // pi-parity gap (fixed): pi's `getMessageFromEntry` (branch-summarization.ts) drops every
+        // tool-result-role entry entirely, so a branch summary's rendered transcript never includes
+        // tool output — only user/assistant text, thinking, and tool-call names.
+        let messages = vec![
+            Message::user("try approach X"),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "1",
+                "read",
+                json!({ "path": "src/x.rs" }),
+            )]),
+            Message::tool_result("1", "SECRET FILE CONTENTS should not appear", false),
+            Message::assistant(vec![ContentBlock::text("approach X didn't pan out")]),
+        ];
+        let req = branch_summary_request("claude-test", &messages, 512, 100_000, None, false);
+        let ContentBlock::Text { text, .. } = &req.messages[0].content[0] else {
+            panic!("expected text");
+        };
+        assert!(text.contains("try approach X"));
+        assert!(text.contains("Assistant called tool `read`"));
+        assert!(
+            !text.contains("SECRET FILE CONTENTS"),
+            "tool result content must not survive into the rendered transcript: {text}"
+        );
     }
 
     #[test]

@@ -8,7 +8,6 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::path_utils::push_unique_root;
 use crate::skills::Collision;
 
 /// A discovered prompt template.
@@ -23,6 +22,18 @@ pub struct PromptTemplate {
     pub description: String,
     /// The template body (frontmatter stripped).
     pub body: String,
+    /// Absolute path to the template's own `.md` file. Surfaced via `serve`'s `get_commands` (Task #39
+    /// pi-parity fix: previously omitted entirely, even though `discover_with_diagnostics_impl` already
+    /// tracked it internally for collision reporting).
+    pub path: PathBuf,
+    /// Which discovery root this template actually came from — `"user"` (`~/.claude/prompts`),
+    /// `"project"` (`<cwd>/.claude/prompts`), or `"temporary"` (an operator-supplied
+    /// `--prompt-template` extra root) — matching pi's own `SourceScope` (`source-info.ts`) and
+    /// [`crate::skills::Skill::scope`]'s identical convention. Set once per discovery-root group in
+    /// `discover_with_diagnostics_impl`, not by `load_file`/`load_dir` themselves (neither has any
+    /// notion of which root it was reached from) — every constructor of a fresh `PromptTemplate` picks
+    /// *some* placeholder value, always overwritten immediately after by that per-root pass.
+    pub scope: &'static str,
 }
 
 /// Discover prompt templates under the user root, plus the project root when `project_trusted`;
@@ -76,26 +87,32 @@ fn discover_with_diagnostics_impl(
     let mut found: Vec<PromptTemplate> = Vec::new();
     let mut origins: HashMap<String, PathBuf> = HashMap::new();
     let mut collisions: Vec<Collision> = Vec::new();
-    let mut standard_roots: Vec<PathBuf> = Vec::new();
+    // Paired with the `scope` (Task #39 — `"user"`/`"project"`, matching pi's own `SourceScope`) each
+    // root's own templates get tagged with — `load_file`/`load_dir` have no notion of which root they
+    // were reached from, so it's set once per root group below instead.
+    let mut standard_roots: Vec<(PathBuf, &'static str)> = Vec::new();
     // Canonical form of every root added so far, across `standard_roots` and the extra-root loop
     // below — a root reached by two different paths (a symlink, a relative-vs-absolute spelling, `cwd`
     // itself equaling `~/.claude/prompts` in some deployment) must only be walked once, or its
     // templates would double-count and self-collide against a phantom duplicate rather than a genuine
-    // collision. See `push_unique_root`'s own doc comment.
+    // collision. See `path_utils::push_unique_scoped_root`'s own doc comment.
     let mut seen_roots: HashSet<PathBuf> = HashSet::new();
+    use crate::path_utils::push_unique_scoped_root as push_scoped;
     if include_standard_roots {
         if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-            push_unique_root(
+            push_scoped(
                 &mut standard_roots,
                 &mut seen_roots,
                 home.join(".claude/prompts"),
+                "user",
             );
         }
         if project_trusted {
-            push_unique_root(
+            push_scoped(
                 &mut standard_roots,
                 &mut seen_roots,
                 cwd.join(".claude/prompts"),
+                "project",
             );
         }
     }
@@ -112,6 +129,9 @@ fn discover_with_diagnostics_impl(
                 argument_hint: hint,
                 description,
                 body,
+                path: path.to_path_buf(),
+                // Always overwritten by the caller — see `PromptTemplate::scope`'s own doc comment.
+                scope: "temporary",
             },
         ))
     }
@@ -194,8 +214,9 @@ fn discover_with_diagnostics_impl(
         }
     }
 
-    for root in &standard_roots {
-        for (name, path, template) in load_dir(root) {
+    for (root, scope) in &standard_roots {
+        for (name, path, mut template) in load_dir(root) {
+            template.scope = *scope;
             // Later standard roots (project) win over earlier (user) on name collisions.
             if let Some(existing_path) = origins.get(&name) {
                 let message = format!(
@@ -227,6 +248,8 @@ fn discover_with_diagnostics_impl(
     // other (later wins), matching this function's doc comment.
     let standard_names: std::collections::HashSet<String> = origins.keys().cloned().collect();
     for entries in extra_entries {
+        // `template.scope` needs no further tagging here — `load_file`'s own placeholder ("temporary")
+        // already is the correct final value for every entry reached through this extra-roots path.
         for (name, path, template) in entries {
             if let Some(existing_path) = standard_names
                 .contains(&name)
@@ -1136,6 +1159,8 @@ mod tests {
             argument_hint: None,
             description: String::new(),
             body: body.into(),
+            path: PathBuf::from("/x/.claude/prompts/x.md"),
+            scope: "user",
         }
     }
 }

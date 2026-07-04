@@ -70,6 +70,16 @@ fn serve_export_html_writes_a_self_contained_transcript() {
     assert!(html.starts_with("<!DOCTYPE html>"));
     assert!(html.contains("say hi"));
     assert!(html.contains("hello there"));
+    // Task #44 integration: the `export_html` RPC command now calls `export_html_full` with this
+    // session's real system prompt and tool set, not the plainer entries-only form.
+    assert!(
+        html.contains("System Prompt"),
+        "expected a rendered system-prompt section: {html}"
+    );
+    assert!(
+        html.contains("Available Tools"),
+        "expected a rendered tools section: {html}"
+    );
 
     drop(stdin);
     child.wait().unwrap();
@@ -216,8 +226,13 @@ fn serve_export_html_includes_abandoned_branches_not_just_the_active_path() {
         active_section.contains("first answer"),
         "the active path: {html}"
     );
+    // Task #44 integration: the exported page now also renders a real Available Tools section (Task
+    // #44), whose own tool-parameter descriptions include the word "milliseconds" — which itself
+    // contains "second" as a substring — so this checks the actual rendered turn content (the bare
+    // "second" user message's own markdown paragraph, and the unambiguous "second answer" reply)
+    // rather than the bare substring "second", which no longer distinguishes the two.
     assert!(
-        !active_section.contains("second"),
+        !active_section.contains("<p>second</p>") && !active_section.contains("second answer"),
         "abandoned by the rewind, must not be on the active path: {active_section}"
     );
     assert!(
@@ -557,9 +572,13 @@ fn serve_exits_gracefully_on_sigterm_mid_run() {
         );
         std::thread::sleep(Duration::from_millis(50));
     };
-    assert!(
-        exit.success(),
-        "serve should exit cleanly on SIGTERM, got {exit:?}"
+    // Task #41 (pi-parity fix): `serve` now exits with the matching POSIX `128+signal` code (143 for
+    // SIGTERM, matching pi's own `rpc-mode.ts`) rather than the unconditional `exit(0)` every graceful
+    // shutdown path used to get regardless of cause.
+    assert_eq!(
+        exit.code(),
+        Some(143),
+        "serve should exit 143 on SIGTERM, got {exit:?}"
     );
 
     // The stdout writer flushes on shutdown; whatever is left in the pipe just needs to not panic
@@ -633,9 +652,12 @@ fn serve_exits_gracefully_on_sighup_mid_run() {
         );
         std::thread::sleep(Duration::from_millis(50));
     };
-    assert!(
-        exit.success(),
-        "serve should exit cleanly on SIGHUP, got {exit:?}"
+    // Task #41 (pi-parity fix): `129` (POSIX `128+1`), matching pi's own `rpc-mode.ts`/`print-mode.ts`
+    // SIGHUP code exactly.
+    assert_eq!(
+        exit.code(),
+        Some(129),
+        "serve should exit 129 on SIGHUP, got {exit:?}"
     );
 
     let mut trailing = String::new();
@@ -645,6 +667,77 @@ fn serve_exits_gracefully_on_sighup_mid_run() {
     assert!(
         !contents.trim().is_empty(),
         "nothing was persisted before SIGHUP shutdown"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn serve_exits_with_130_on_sigint_mid_run() {
+    use std::time::{Duration, Instant};
+
+    // Task #41 (pi-parity fix): Ctrl-C (SIGINT) gets the same graceful-shutdown treatment as
+    // SIGTERM/SIGHUP above (`ShutdownSignal::wait` races all three uniformly) and now exits with its
+    // own distinct POSIX code (`128 + 2`) instead of the same undifferentiated `exit(0)`.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir
+        .path()
+        .join("session.json")
+        .to_string_lossy()
+        .into_owned();
+
+    let turn1 = turn_tool_use(
+        "toolu_b",
+        "bash",
+        &json!({ "command": "sleep 30" }).to_string(),
+    );
+    let (base, _bodies) = spawn_model_server(vec![turn1]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let pid = child.id();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "run a long sleep" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+
+    std::thread::sleep(Duration::from_millis(500));
+
+    let status = Command::new("kill")
+        .args(["-INT", &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success(), "failed to send SIGINT to serve");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let exit = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "serve did not exit within 10s of SIGINT"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(
+        exit.code(),
+        Some(130),
+        "serve should exit 130 on SIGINT, got {exit:?}"
+    );
+
+    let mut trailing = String::new();
+    let _ = stdout.read_to_string(&mut trailing);
+
+    let contents = std::fs::read_to_string(&session_file).unwrap();
+    assert!(
+        !contents.trim().is_empty(),
+        "nothing was persisted before SIGINT shutdown"
     );
 }
 

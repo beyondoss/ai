@@ -310,10 +310,14 @@ The harness layers several capabilities over the bare tools + loop:
   (parsed via `parse_images` into an `agent_core::SteeringMessage`), so neither expansion nor image
   attachments are a `prompt`-only behavior a client has to special-case. `compact`(optional `custom_instructions` steers what the summary
   emphasizes, passed straight through to `Agent::compact` — matching pi's own `compact(customInstructions)`;
-  response is `{compacted, summary, tokens_before, tokens_after}` — all three of the latter `null` on a
-  no-op, or a real compaction's own generated summary text and its `AgentEvent::Compacted`-carried
+  response is `{compacted, reason, summary, tokens_before, tokens_after}` — all four of the latter `null`
+  on a no-op, or a real compaction's own generated summary text and its `AgentEvent::Compacted`-carried
   before/after token estimates otherwise, matching pi's own `CompactionResult` shape rather than the bare
-  `{compacted: bool}` this used to return),
+  `{compacted: bool}` this used to return; `reason` (Task #26 pi-parity fix) is `agent_core::CompactOutcome`'s
+  own `"too_small"`/`"already_compacted"` discriminator when `compacted` is `false` — `Agent::compact`
+  itself returns a `CompactOutcome` rather than a bare `bool` for exactly this, matching pi's own two
+  distinct thrown errors ("Nothing to compact (session too small)" / "Already compacted") instead of
+  collapsing both into the same undifferentiated no-op),
   `list_sessions`/`list_all_sessions`(cross-project — every project's own session directory under the
   shared root, not just this one's; each streams unsolicited `list_progress` frames, correlated to the
   request's own `id`, while its parallel scan is in flight — throttled to roughly ten frames regardless
@@ -329,10 +333,12 @@ The harness layers several capabilities over the bare tools + loop:
   name for a bare `fork` — no `upto`/`target_id` — kept as a thin alias, not a second code path, since
   this crate's `fork` already defaults to the same behavior pi needs `clone` for)/`get_fork_messages`
   (pi's own contract exactly: no parameters, current session only, `{entry_id, text}` per user-turn
-  entry on the active path — a candidate list for a client's own fork-point picker, feeding one
-  `entry_id` to `fork`'s `target_id`; previously misnamed onto this crate's own arbitrary-session/
-  arbitrary-point *preview* feature instead, breaking a pi-compatible client's zero-arg call — that
-  feature now lives at `preview_fork`, unchanged otherwise)/`preview_fork`
+  entry anywhere in the tree — every branch, not just the active path, matching pi's own
+  `getUserMessagesForForking`/`getEntries()` (every entry ever appended, tree-wide) rather than only the
+  active-path chain (`session_store::SessionStore::all_user_messages`) — a candidate list for a client's
+  own fork-point picker, feeding one `entry_id` to `fork`'s `target_id`; previously misnamed onto this
+  crate's own arbitrary-session/arbitrary-point *preview* feature instead, breaking a pi-compatible
+  client's zero-arg call — that feature now lives at `preview_fork`, unchanged otherwise)/`preview_fork`
   (read-only fork
   preview, any session/point, this crate's own extension beyond pi's protocol)/`set_session_name`(an O(1) `Entry::TitleChange` append, not a rewrite of the whole
   file — a rename used to cost rewriting every message already on disk just to update the header's
@@ -352,7 +358,14 @@ The harness layers several capabilities over the bare tools + loop:
   populated for display — not `argument_hint`, the separate `<file>`-style hint for what to type after
   the name; each skill's `name` is prefixed `skill:` — matching pi's own `get_commands` shape — so the
   listed `name` is always exactly what a client appends after `/` to invoke it, a skill needing the
-  `skill:` prefix and a prompt template not)/`reload`,
+  `skill:` prefix and a prompt template not; each entry also carries `scope` (`"user"`/`"project"`/
+  `"temporary"` — which discovery root it actually came from) and `path` (its on-disk location) — Task
+  #39 pi-parity fix, matching pi's own `sourceInfo.scope`/`sourceInfo.path`, previously omitted entirely.
+  `skills::Skill`/`prompts::PromptTemplate` are tagged with their own `scope`/`path` once per
+  discovery-root group in each module's `discover_with_diagnostics_impl` — `path_utils::
+  push_unique_scoped_root` (generalized from the prior `push_unique_root`, which had no callers left
+  once both modules needed to carry a scope tag alongside each root) threads the tag through the same
+  root-list/dedup structure both already built)/`reload`,
   `set_model`/`set_thinking`(raw budget override)/`set_reasoning_effort`(the portable
   `agent_core::ThinkingLevel`, correct for whichever mechanism the active model actually
   uses)/`cycle_model`(steps through `--models`'s scoped list when given — comma-separated patterns
@@ -399,7 +412,8 @@ The harness layers several capabilities over the bare tools + loop:
   `Error::Cancelled` transitively, but checked explicitly too). Each attempt persists whatever it
   produced (even a failed one may have committed a
   tool round-trip before erroring) before deciding whether to retry, and emits an unsolicited
-  `auto_retry` frame just before its backoff sleep so a client can distinguish "still working, retrying
+  `auto_retry_start` frame (matching pi's own wire discriminator — this crate previously emitted a bare
+  `auto_retry`) just before its backoff sleep so a client can distinguish "still working, retrying
   a hiccup" from silence. The backoff sleep *is* raced — against `abort`/`abort_retry`/shutdown, via a
   dedicated inner `select!` scoped to the wait itself (no run is in flight during backoff, so it
   accepts only those two commands plus stdin closing; anything else is rejected as busy) — so a client
@@ -410,13 +424,19 @@ The harness layers several capabilities over the bare tools + loop:
   when a retried attempt recovers, or `success:false` (with `final_error`) when retries exhaust, the
   failure turns out non-retryable, or the pending backoff is itself cancelled
   (`final_error:"retry cancelled"`) — mirroring pi's own `auto_retry_end` event; never sent for a
-  first-attempt success or an immediately-non-retryable failure, which never emitted `auto_retry` to
+  first-attempt success or an immediately-non-retryable failure, which never emitted `auto_retry_start` to
   begin with. `main.rs`'s
   one-shot `run`/`run --json` share the same [`retry`](src/retry.rs) policy (`run_turn`,
   unconditionally on — a scripted/cron invocation has no interactive toggle, and so no `abort_retry`
   either — a bare sleep between attempts is correct there) rather than propagating a transient failure
   straight out of the process; a retried attempt's streamed output follows a
-  `[transient error, retrying …]` stderr notice.
+  `[transient error, retrying …]` stderr notice. `--retry-max-retries`/`--retry-base-delay-ms`
+  (`AI_AGENT_RETRY_MAX_RETRIES`/`AI_AGENT_RETRY_BASE_DELAY_MS`) now also configure this whole-run layer
+  (`retry::RunRetryPolicy::from_overrides`, Task #50 pi-parity fix), not just `agent_core::client`'s
+  pre-connect/mid-stream layer as before — the two flags previously had no effect at all on `run_turn`'s
+  own whole-run retry loop, which stayed pinned to the bare `MAX_RUN_RETRIES`/`RUN_RETRY_BASE_BACKOFF`
+  constants regardless of what an operator asked for; `max_backoff` still has no override of its own
+  either way, capping at the fixed `RUN_RETRY_MAX_BACKOFF` constant even with a custom base.
 - **Stale-cwd detection** — `cwd_is_stale` compares a session's recorded `cwd` against reality: the
   directory no longer exists, or (since `switch_session`/`fork`/reattaching never change the process's
   actual working directory) it simply isn't where this process is running. Surfaced as `cwd_stale` on
@@ -482,8 +502,9 @@ stderr: "[done in N step(s); X in / Y out tokens]"   (or the propagated Error::M
         `TurnEnd` event in its own stream, so its exit code stays reserved for a genuine process failure.
         `StopReason::Aborted` gets the identical treatment (stderr "[cancelled]", exit(1)) — see
         `text_mode_failure_message`'s own doc comment for why this is currently unreachable from
-        `run_task` (every reachable cancellation path already exits(1) earlier, via
-        `unwrap_turn_result`'s `Err(Error::Cancelled)` handling) but checked anyway, defensively
+        `run_task` (every reachable cancellation path already exits earlier, via `unwrap_turn_result`'s
+        `Err(Error::Cancelled)` handling, with the matching POSIX `128+signal` code — see below — when a
+        real shutdown signal caused it, else `exit(1)`) but checked anyway, defensively
 ```
 
 With `--session`/`--continue`, persistence is incremental, not just once at the end of each whole turn:
@@ -544,8 +565,20 @@ destructors run — a bash tool's `GroupKillGuard` never gets to `Drop` and reap
 process group). `run_turn`/`run_turn_once` take the token by reference and pass a clone into
 `run_events_cancellable`/`run_cancellable`; `Error::Cancelled` is deliberately excluded from both retry
 layers (`is_retryable_mid_stream`/`is_retryable_whole_run`), so a shutdown request is never retried away.
-A cancelled turn prints a clean `[cancelled]` (matching the `[refused]` precedent above) and `exit(1)`,
-not a raw `Error: Cancelled` `Debug` dump of the bare enum variant.
+A cancelled turn prints a clean `[cancelled]` (matching the `[refused]` precedent above) and exits —
+Task #41 (pi-parity fix): `ShutdownSignal::wait` now returns *which* signal actually fired
+(`serve::Signal::{Term,Hup,Int}`), recorded into a `run_task`-local `Arc<Mutex<Option<Signal>>>`
+(genuinely shared across a task boundary — the signal wait runs on its own spawned task — unlike
+`serve()`'s own equivalent tracking, a bare local since every `shutdown.wait()` site there lives in one
+async fn body) the spawned signal-waiting task writes to right before cancelling; `unwrap_turn_result`
+reads it to exit with the matching POSIX `128+signal` code (143/129/130 for SIGTERM/SIGHUP/Ctrl-C — see
+`Signal::exit_code`, matching pi's own `rpc-mode.ts`/`print-mode.ts`'s 143/129 for SIGTERM/SIGHUP,
+extended to Ctrl-C for consistency since this crate already treats it as an equal graceful-shutdown
+trigger) rather than the same undifferentiated `exit(1)` every cancellation used to get regardless of
+cause — not a raw `Error: Cancelled` `Debug` dump of the bare enum variant either way. `serve` gets the
+identical treatment: `serve()`'s own return type changed from bare `Result<(), _>` to
+`Result<Option<Signal>, _>`, and `main.rs`'s `Command::Serve` arm exits with `shutdown_cause.map(
+Signal::exit_code).unwrap_or(0)` instead of an unconditional `exit(0)`.
 
 ### `serve` — headless NDJSON control protocol
 
@@ -613,7 +646,7 @@ by every `build_agent` rebuild (`set_model`/`set_thinking`/`cycle_model`/`cycle_
 | **`ToolRegistry`**          | The name → `Tool` map advertised to the model every turn (`default_registry_with(..)`, then `tools::apply_filter`'d by `--tools`/`--exclude-tools`/`--no-tools`) | Not per-session or hot-reloadable at runtime — filtering happens once when the process's registry is built, not per turn |
 | **`CommandRunner`**         | The seam between a tool and real process execution (`exec.rs`)                                   | Not a sandbox — `RealRunner` execs a resolved real `bash` (falling back to `sh`) / `beyond …` with the host process's full ambient privilege |
 | **`TrustStore`**            | Tri-state (trusted/untrusted/unknown), ancestor-inheriting allowlist gating `SYSTEM.md`/skill/prompt-template access | Not a sandbox or a permission system for tools (only gates *which instructions the model sees*, not what it can do) — and not `AGENTS.md`/`CLAUDE.md` project-instruction files either, which have no trust gate at all (matching pi) |
-| **`ToolPolicy`** (`policy.rs`) | This crate's own `agent_core::AgentHooks` impl: a static config-time deny-list — `--deny-tool <name>` blocks a tool outright, `--deny-bash-pattern <substr>` blocks a matching `bash` command, both case-insensitive on the pattern side. Installed on `Agent` only when non-empty (`ToolPolicy::is_empty`), else the zero-cost `NoHooks` default. The seam `agent_core::hooks` ships bare (no concrete `Tool`s of its own to gate); this is the concrete policy that actually runs in `run`/`serve` | Not dynamic — fixed at process startup from CLI flags/env, no RPC command to change it mid-`serve` process; not argument-aware beyond the bash-command substring match (can't gate `write`/`edit` by target path, say) |
+| **`ToolPolicy`** (`policy.rs`) | This crate's own `agent_core::AgentHooks` impl: a static config-time deny-list — `--deny-tool <name>` blocks a tool outright, `--deny-bash-pattern <substr>` blocks a matching `bash` command (case-insensitive substring), `--deny-path <glob>` (pi-parity fix, folded into this same policy rather than a parallel mechanism) blocks a `write`/`edit` call whose target `path` matches a `globset` glob — checked against the same canonicalized-against-cwd, symlink-resolved form `WriteLockRegistry` keys on, so a relative/`./`/`..`-laden spelling can't dodge the pattern; an unparseable glob is reported and dropped rather than failing the whole process or silently denying everything. Installed on `Agent` only when non-empty (`ToolPolicy::is_empty`), else the zero-cost `NoHooks` default. The seam `agent_core::hooks` ships bare (no concrete `Tool`s of its own to gate); this is the concrete policy that actually runs in `run`/`serve` | Not dynamic — fixed at process startup from CLI flags/env, no RPC command to change it mid-`serve` process; still only three shapes — no gating by tool-call *outcome*, no read-path gating (`--deny-path` only checks `write`/`edit`'s `path` argument, not `read`/`grep`/`find`, and doesn't parse a path back out of a `bash` command string) |
 | **`Session`**               | Message history + step/token counters; optionally `serde`-persisted (single file or a `SessionRepo`) | Not multi-session by itself — one `serve` process holds exactly one *active* `Session`, though a repo can hold many on disk |
 | **`Steering`**               | The two-lane queue (`steer`/`follow_up`) a client injects mid-run or at a stop boundary, plus a graceful stop-request flag (`request_stop`/`stop_after_turn`); persistent across a whole `serve` process, not just one `prompt` call | Not drained on a refusal (a distinct terminal condition) — queues cleared only on `new_session`/`switch_session`/`fork`/`switch_branch`; the stop flag is *also* always cleared when the run it was set on returns, however it ends, so it can never bind to a later, unrelated run |
 | **`AgentEvent`**            | `Stream`/`ToolStart`/`ToolProgress`/`ToolEnd`/`TurnEnd`/`Steered` boundaries streamed as `event` frames during a `prompt` | Not the terminal answer — the `response` frame (success/data/error) is separate and always comes last, after an immediate `ack` frame |
@@ -664,7 +697,12 @@ directory named `~`. `write`/`edit`'s `write_target` (the same-turn concurrency-
 below) normalizes identically, so `write("~/f")` and `edit("~/f")` land on the same canonical key
 as `write("/home/…/f")` would.
 
-- **`read`** numbers every line (`{lineno:>6}\t{line}`), 1-based `offset`, default `limit` 2000,
+- **`read`** numbers every line (`{lineno:>6}\t{line}`), 1-based `offset`, default `limit` 2000 — also
+  the hard ceiling for an *explicit* `limit`: a caller asking for `limit: 5000` still gets capped at
+  2000 (`.min(DEFAULT_LIMIT)`), matching pi's `read.ts`, which always runs the selected window through
+  `truncateHead`'s own default `maxLines` (2000) regardless of the caller's own requested limit — a
+  single request for a much larger explicit window mustn't flood context any more than the
+  omitted-limit case already doesn't,
   appends a bracketed `[showing lines A-B; use offset=N to continue]` marker (the same
   `output::marker` bracket convention every truncating tool now shares) if more lines remain. It streams
   line-by-line and caps each line at `MAX_LINE_BYTES` (4000) — bytes past the cap are drained but not
@@ -683,7 +721,19 @@ as `write("/home/…/f")` would.
   parity goal worth having. An **image** file skips text decoding entirely: sniffing the real magic
   bytes (`image::guess_format`) always decides routing (an extension is only the fallback when
   sniffing can't identify a format at all), and the reported format comes from that same sniff — a
-  mislabeled extension still reports its true type. It's returned as a
+  mislabeled extension still reports its true type. Two sniff-level pi-parity fixes narrow what counts
+  as "really an image": `image::guess_format`'s BMP signature is just the 2 ASCII bytes `"BM"` (an
+  empty mask in its own `MAGIC_BYTES` table), so any file merely starting with those two bytes —
+  ordinary text, a changelog entry, a variable name — used to sniff as BMP and get routed into image
+  handling, failing to decode and coming back as an opaque "could not be converted" placeholder instead
+  of its real text; `is_valid_bmp` (pi's `isBmp`) now additionally requires a structurally plausible DIB
+  header (declared file size, a pixel-data offset that actually lands past the headers and before EOF,
+  one color plane, a real bits-per-pixel value) before treating a `"BM"`-prefixed file as BMP at all.
+  Separately, a JPEG-signatured file whose 4th byte is `0xF7` (SOF55/JPEG-LS — shares the ordinary
+  JPEG's SOI+marker prefix but isn't a format this tool or most vision APIs can decode/display) is
+  excluded the same way pi's `detectSupportedImageMimeType` does, falling back to `Sniff::Unknown` — the
+  ordinary ("not really any recognized image") path — rather than an image-handling attempt doomed to
+  fail. It's returned as a
   base64 `ImageSource` attachment the multimodal model can see; one already under a 4.5 MB base64
   budget goes out as its original bytes/format unmodified, an oversized one has its Exif orientation
   applied first (`image::ImageDecoder::orientation`/`DynamicImage::apply_orientation` — generic across
@@ -691,7 +741,12 @@ as `write("/home/…/f")` would.
   re-encoded — a lossless PNG is tried first (a downscaled screenshot/diagram/text-heavy image often
   already fits that way), falling back to JPEG (quality 80) only if the PNG doesn't fit, stepping
   dimensions/quality down further if still over budget — only refused outright if even the smallest
-  re-encode can't fit.
+  re-encode can't fit. Either way (sent as a real attachment, or refused/omitted), `read` appends pi's
+  own `getNonVisionImageNote` text ("Current model does not support images…") whenever the active
+  model can't see images at all — read from a schema-undocumented `_model_supports_vision` field
+  `agent_core`'s dispatch loop injects into every tool call's input, keyed off the active model's own
+  capability-table entry (see `agent-core/ARCHITECTURE.md`'s "Vision downgrade" capability); defaults to
+  vision-capable (`true`) when absent, e.g. a direct `Tool::run` call in a test that bypasses dispatch.
 - **`write`** creates parent directories (`create_dir_all`), then writes **atomically** (sibling temp
   file + `rename`, shared with `edit` via `tools::write_atomic`) so a kill mid-write can't leave a
   half-written file; always overwrites.
@@ -852,7 +907,16 @@ and `serve`'s own `bash`/`abort_bash` RPC commands reuse `RealRunner` directly, 
   once it outgrows that window (`"Full output: <path>"` marker), so the model can go read the whole
   thing if the tail isn't enough; while the command runs, `ToolProgress` streams an initial empty
   update then throttled snapshots (`UPDATE_THROTTLE`, 100 ms) of the output so far, plus truncation
-  details, ahead of the final result. The combined text is run through output hygiene — ANSI/OSC escape
+  details, ahead of the final result. A **live** (not-yet-finished) snapshot holds back any trailing
+  bytes that look like an incomplete multi-byte UTF-8 sequence (`incomplete_utf8_suffix_len`, keyed off
+  `str::from_utf8`'s own `error_len() == None` — "ran out of input mid-sequence" — case) rather than
+  lossily decoding them to `U+FFFD` right away, matching pi's stateful `TextDecoder({stream: true})`,
+  which withholds an incomplete trailing sequence until the rest of it arrives in a later chunk; a chunk
+  boundary landing mid-character (e.g. splitting a 4-byte emoji across two `append` calls) used to show
+  a transient replacement character in the interim progress update even though the full character was
+  never actually lost, just not fully buffered yet. Once `finish()` has run there's no more data coming,
+  so the same held-back bytes (if still incomplete) fall through to the ordinary lossy decode — a
+  genuine truncation, not an in-flight boundary. The combined text is run through output hygiene — ANSI/OSC escape
   stripping and C0 control-char sanitizing so terminal/binary noise can't corrupt the model's context —
   before either an `(no output)` placeholder (success, genuinely silent) or an appended status line
   (`"Command exited with code N"` / `"Command timed out after Ns"` / `"Command cancelled"`, all but the
@@ -1028,27 +1092,65 @@ hypothetical future requirements." Add one (a small, message-deduped `tracing::w
 natural shape here, consistent with `session_store.rs`'s corrupt-line warning and `skills.rs`'s
 discovery warning) when an actual deprecated flag/RPC command/config value first needs one, not before.
 
-### Why this crate never holds a provider key
+### Provider keys: managed vs. BYO vs. OAuth subscription
 
-Model traffic always flows through the Beyond gateway; this crate's only network code is
-`GatewayClient` (in `agent_core`), which sends a Bearer token and lets the gateway decide
-authentication, routing, and key-swapping. Centralizing that in the gateway means this crate (and
-every other agent harness) doesn't duplicate Ed25519 verification, deny-set checks, or per-provider
-auth schemes — it just forwards a token and trusts the gateway's response.
+Model traffic always flows through the Beyond gateway; `GatewayClient` (in `agent_core`) never picks a
+provider or decides routing itself — it sends a Bearer token to the gateway and lets the gateway
+decide authentication, routing, and key-swapping. Centralizing that in the gateway means this crate
+(and every other agent harness) doesn't duplicate Ed25519 verification, deny-set checks, or
+per-provider auth schemes.
 
-The same boundary rules out pi's own provider-*attribution* headers, not just its auth ones: pi's
-Anthropic dialect (`anthropic-messages.ts`), specifically inside its OAuth-token branch (a Claude
-Pro/Max subscription token, distinct from a plain API key), sends `anthropic-beta:
-claude-code-20250219,oauth-2025-04-20,…`, `user-agent: claude-cli/<version>`, and `x-app: cli` —
-identity headers Anthropic's OAuth endpoint specifically expects from the official Claude Code
-client, since that OAuth flow is gated to it. This crate has no equivalent code path to add them to:
-it never sees a raw provider credential of any kind (OAuth token or otherwise) to attach an OAuth-
-specific header set to, and if it somehow did, sending Anthropic's own `claude-cli`/`x-app: cli`
-identity strings from a *different* client would be a false attribution, not parity — the header
-exists to say "this really is Claude Code," which this crate isn't. The Codex dialect's
-`User-Agent: pi (<platform> <release>; <arch>)` is the same story: an identity string for a specific
-first-party client, moot once every request already goes out from `GatewayClient` — which doesn't set
-a `User-Agent` at all today, leaving `reqwest`'s own default, not one borrowed from pi's identity.
+There are three distinct shapes that token can take, and the gateway already treats two of them
+identically:
+
+- **Managed** — a `bai_v1…` virtual key. The gateway verifies it, swaps in its own pool credential,
+  and meters usage against the tenant it identifies.
+- **BYO** — any other string, forwarded to the upstream provider *unchanged*
+  (`crates/gateway/src/proxy.rs`'s "leave the user's own auth header exactly as presented" comment) —
+  no pool-key swap, no per-tenant billing record (there's no Beyond identity to attribute cost to).
+- **OAuth subscription** (`crate::oauth`/`crate::auth_store`) — a Claude Pro/Max, GitHub Copilot, or
+  ChatGPT Plus/Pro login. From the gateway's perspective this is **just another BYO token** — the
+  gateway needed *zero* changes to support it. The insight that made this the right design: a
+  subscription-authenticated request is paid for directly by the user, not by Beyond's pool, so BYO's
+  existing "no billing record" behavior is exactly correct here, not an accident of reuse.
+
+`agent_core::client::CredentialSource` is the seam that makes this work without `agent_core` ever
+learning *how* a token was obtained: `GatewayClient` resolves a fresh `Credential` immediately before
+every request (`client.rs`'s `stream()`) rather than holding one fixed at construction. The trivial
+`StaticCredential` (managed/BYO) ships in `agent_core`; the OAuth-aware
+`crate::auth_credential_source::OAuthCredentialSource` — which transparently refreshes an expiring
+token via `AuthStore`'s locked, cross-process-safe `refreshed()` — lives in `agent`, which depends on
+`agent_core`, never the reverse. `agent_core` still never *holds* a provider key of its own; it only
+ever borrows one fetched through this trait for the span of one request, the same rule that governed
+it before OAuth existed.
+
+**Identity headers — a confirmed, deliberate divergence from an earlier version of this document.**
+Anthropic's and GitHub Copilot's OAuth-gated endpoints check for identity headers naming their own
+first-party client before serving a subscription-authenticated request: Anthropic wants
+`anthropic-beta: claude-code-20250219,oauth-2025-04-20,…`, `user-agent: claude-cli/<version>`, and
+`x-app: cli`; Copilot wants `Editor-Version: vscode/…`, `Editor-Plugin-Version: copilot-chat/…`, and
+`Copilot-Integration-Id: vscode-chat`. An earlier version of this document declined to send these,
+calling it "false attribution, not parity." That call has been revisited and reversed, on the user's
+explicit, informed decision: this crate now sends the real headers — full pi parity, matching pi,
+opencode, and other OSS coding agents that all do the same thing. Presenting this tool as Claude
+Code/VS Code Copilot Chat to those providers' servers is a real tradeoff (a gray area against both
+providers' subscription terms, with some risk of account action if a provider decides to enforce
+against it) that the user chose to accept in exchange for the feature actually working end-to-end.
+See `client.rs`'s `CLAUDE_CODE_BETA`/`CLAUDE_CLI_IDENTITY` constants for where Anthropic's headers are
+attached (gated on `Credential::is_oauth`, threaded through `send_with_retry` alongside the existing
+`is_anthropic` bool) — `CLAUDE_CLI_IDENTITY` in particular is a moving target, not a one-time
+constant: if Anthropic starts rejecting a stale `claude-cli/<version>`, it needs bumping to whatever
+the real Claude Code CLI currently reports. GitHub Copilot's own identity headers ride a different
+path: Copilot's proxy endpoint (`api.{individual,enterprise}.githubcopilot.com`) is a different host
+than `GatewayClient` targets at all, so those headers are attached by `crate::oauth::github_copilot`'s
+own direct HTTP calls, not `client.rs`'s gateway-request seam.
+
+**Deliberate divergence: no `api_key` credential type in `AuthStore`.** pi's own credential store can
+also hold a plain API key per provider, as an alternative to OAuth. This crate already has a working
+static-credential mechanism for exactly that job — the `--key`/`AI_AGENT_KEY` flag, resolved through
+the gateway's managed/BYO path above — so a second, parallel place to store a static key would be two
+mechanisms for one job. `crate::auth_store`'s `AuthCredential`/`StoredCredential` types are
+OAuth-only by design.
 
 ---
 
@@ -1119,29 +1221,32 @@ container/VM — not by this crate restricting its own tools.
 
 | File                   | What It Does                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `src/main.rs`          | CLI entry point (`run`/`serve`/`tools`/`list-models`/`trust`/`untrust`/`clear-trust`/`trust-status`/`settings`/`export` subcommands — `list-models` prints a table (`model`/`context`/`max-out`/`thinking`/`vision` columns) over `serve::available_models()`, no gateway/key needed, each row's capability data pulled straight from `agent_core::capabilities` — pi's own `--list-models` table, minus a `provider` column this crate has no separate field for (a model id is forwarded verbatim; see `agent_core::models`'s own module doc comment); `settings` views/updates `settings::SettingsStore`'s stored defaults, printing every field's current value after any requested update); `DEFAULT_MODEL`, `DEFAULT_GATEWAY`, `default_system_prompt(&registry)` (generated from the actually-registered, filtered tool set); renders streamed text + `[tool: name]` markers (followed live by each `InputJsonDelta` fragment — a
-  growing preview of the call's arguments as they stream in, not just its name) to stdout for `run` in its default text mode, or (`run --json`) one `AgentEvent` object per line via `run_events`/`serde_json::to_string` — the same full observation surface (tool calls/results, turn boundaries) `serve`'s NDJSON protocol streams, preceded by a `{"kind":"session", id, model, cwd}` header line — for a scripting caller that wants structured output without spawning `serve`; `run` composes its first message from piped stdin + `@file` references (`partition_tasks`/`read_file_refs`) + the first positional message, runs any further positional messages as separate sequential turns, and — via `--session <path>`/`--continue` (reusing `SessionStore`/`SessionRepo::resume_or_create`) — can persist and resume a transcript across invocations exactly like `serve`'s own repo/file modes; `--fork <path|id>` (pi's own cross-project `--fork`, wins over `--session`/`--continue`) instead copies an *existing* session's transcript into a brand-new one under the current project and continues from there — a path opens that `.jsonl` file directly regardless of which project it belongs to, an id is searched in the current project's own repo first and then, by filename rather than by recomputing a path from the source's recorded `cwd` (`session_store::find_session_path_under` — the recompute approach broke under a non-default `--session-dir`, whose directory name need not encode any `cwd` at all), across every project's own directory under the session root, so a session started in one project can be picked up and continued from a different one (`session_store::fork_by_arg`/`fork_from_path`); `--session-dir`/`AI_AGENT_SESSION_DIR` (matching `serve`'s identical flag) redirects that root — both the repo `--continue` reopens and the root `--fork`'s cross-project search spans (that search then scopes to the given directory's own *parent*, the same convention `serve`'s `list_all_sessions` uses) — away from the default `~/.claude/sessions/<encoded-cwd>/`; `--session-id <id>` (matching pi's own flag) overrides the freshly-generated id with a caller-chosen one, wherever a *new* `SessionMeta` is actually minted (a fresh `--session <path>` or a plain ephemeral run) — a script/test harness gets a known id to correlate against instead of parsing one back out of the run's own output; `run --export <path>` renders the finished transcript via `export::export_html` after a live run completes, while the standalone `export <session.jsonl> [output.html]` subcommand renders an *already-persisted* session file straight off disk — no gateway, key, or model involved at all (`SessionStore::open` + `export::export_html`)                                                                          |
-| `src/lib.rs`           | Library root; re-exports `serve`/`tools`/`resources`/`skills`/`prompts`/`session_store`/`trust_store`/`export` for tests/benches                                                                                                                                                                                                                                                                                                         |
+| `src/main.rs`          | CLI entry point (`run`/`serve`/`tools`/`list-models`/`trust`/`untrust`/`clear-trust`/`trust-status`/`settings`/`export`/`login`/`logout`/`auth-status` subcommands (the last three: `crate::auth_store`/`crate::oauth`'s CLI surface, same dispatch shape as `trust`/`settings`) — `list-models` prints a table (`model`/`context`/`max-out`/`thinking`/`vision` columns) over `serve::available_models()`, no gateway/key needed, each row's capability data pulled straight from `agent_core::capabilities` — pi's own `--list-models` table, minus a `provider` column this crate has no separate field for (a model id is forwarded verbatim; see `agent_core::models`'s own module doc comment); an optional positional `search` (Task #51 pi-parity fix) fuzzy-filters/ranks rows via `fuzzy_match` — a ported, non-contiguous, order-preserving, word-boundary-scored subsequence match (plus a letters/digits-swapped fallback try for a query typed in the opposite order, e.g. "5sonnet") matching pi's own `fuzzyFilter`/`fuzzyMatch` (`packages/tui/src/fuzzy.ts`), so e.g. "sn5" finds "claude-sonnet-4-5" — previously a plain case-insensitive substring `contains` check, which that query would never match at all; `settings` views/updates `settings::SettingsStore`'s stored defaults, printing every field's current value after any requested update); `expand_short_aliases` rewrites pi's own hand-rolled multi-character short flags (`-np`/`-nc`/`-na`, …) to their long form before clap sees them, including (Task #43 pi-parity fix) a lowercase `-v` alias for `--version` — clap's auto-generated version flag only binds capital `-V`; `DEFAULT_MODEL`, `DEFAULT_GATEWAY`, `default_system_prompt(&registry)` (generated from the actually-registered, filtered tool set); renders streamed text + `[tool: name]` markers (followed live by each `InputJsonDelta` fragment — a
+  growing preview of the call's arguments as they stream in, not just its name) to stdout for `run` in its default text mode, or (`run --json`) one `AgentEvent` object per line via `run_events`/`serde_json::to_string` — the same full observation surface (tool calls/results, turn boundaries) `serve`'s NDJSON protocol streams, preceded by a `{"kind":"session", id, model, cwd}` header line — for a scripting caller that wants structured output without spawning `serve`; `run` composes its first message from piped stdin + `@file` references (`partition_tasks`/`read_file_refs`) + the first positional message, runs any further positional messages as separate sequential turns, and — via `--session <arg>`/`--continue` (reusing `SessionStore`/`SessionRepo::resume_or_create`) — can persist and resume a transcript across invocations exactly like `serve`'s own repo/file modes; `--session <arg>` (Task #24 pi-parity fix, matching pi's own `resolveSessionPath`) accepts either a literal path (path-like — has a `/`, or a leading `./`/`~` — or one that already exists on disk, used as-is, creating a fresh session there when absent exactly as always) *or* a bare session id/prefix, resolved (`open_session_by_id`) against the current project's own repo first, then cross-project — the identical two-tier search `--fork <id>` already does via `fork_by_arg` — and reopened **in place**, continuing that session rather than forking a new one (unlike `--fork`, which always copies); previously `arg` was always treated as a literal filesystem path, so a bare id silently created an empty, wrongly-named session file instead of reopening the one actually meant; `--fork <path|id>` (pi's own cross-project `--fork`, wins over `--session`/`--continue`) instead copies an *existing* session's transcript into a brand-new one under the current project and continues from there — a path opens that `.jsonl` file directly regardless of which project it belongs to, an id is searched in the current project's own repo first and then, by filename rather than by recomputing a path from the source's recorded `cwd` (`session_store::find_session_path_under` — the recompute approach broke under a non-default `--session-dir`, whose directory name need not encode any `cwd` at all), across every project's own directory under the session root, so a session started in one project can be picked up and continued from a different one (`session_store::fork_by_arg`/`fork_from_path`); `--session-dir`/`AI_AGENT_SESSION_DIR` (matching `serve`'s identical flag) redirects that root — both the repo `--continue` reopens and the root `--fork`'s cross-project search spans (that search then scopes to the given directory's own *parent*, the same convention `serve`'s `list_all_sessions` uses) — away from the default `~/.claude/sessions/<encoded-cwd>/`; `--session-id <id>` (matching pi's own flag) overrides the freshly-generated id with a caller-chosen one, wherever a *new* `SessionMeta` is actually minted (a fresh `--session <path>` or a plain ephemeral run) — a script/test harness gets a known id to correlate against instead of parsing one back out of the run's own output; `run --export <path>` renders the finished transcript via `export::export_html` after a live run completes, while the standalone `export <session.jsonl> [output.html]` subcommand renders an *already-persisted* session file straight off disk — no gateway, key, or model involved at all (`SessionStore::open` + `export::export_html`)                                                                          |
+| `src/lib.rs`           | Library root; re-exports `serve`/`tools`/`resources`/`skills`/`prompts`/`session_store`/`trust_store`/`export`/`auth_store`/`auth_credential_source`/`oauth` for tests/benches                                                                                                                                                                                                                                                          |
 | `src/serve.rs`         | NDJSON control protocol: single stdout-writer task, `Persistence` (file/dir/none, default-per-cwd directory), a large command set (session/branch nav, `reload`, model/thinking/tool/auto-compaction tuning, `bash`/`abort_bash`, `export_html`) — see the module's own doc comment for the exhaustive list; prompt runs concurrently with stdin routing `steer`/`follow_up` (also accepted while idle, via a persistent `Steering` handle) |
-| `src/export.rs`        | `export_html`/`render_html` — renders a session's transcript as one self-contained, dependency-free HTML file (inline CSS, no client-side JS, images inlined as data URIs); every abandoned branch (passed in as `SessionStore::abandoned_branches`'s output) renders inline as a collapsible `<details>` block right after the message it actually diverged from (`render_branches_diverging_at`, native HTML — no script) — only the divergent suffix, not the shared prefix already shown above, and numbered sequentially across the whole document; every built-in tool call (`edit`/`write`/`bash`/`read`/`grep`/`find`/`ls`, and the Beyond platform tools `fork`/`sync`/`logs`) gets a dedicated renderer (`render_tool_call`) instead of raw pretty-printed JSON — `edit` reuses the diff-coloring machinery (`diff_pair_html`) to show its before/after as a real diff, falling back to generic JSON if `input` doesn't parse as a valid edit shape; only a genuinely unrecognized tool name (a third-party extension) stays generic JSON; message text is rendered as markdown (`render_markdown`, `pulldown-cmark`, server-side at export time — not pi's client-side `marked`/`highlight.js`) with raw HTML defused to visible text and link/image URLs scheme-allow-listed (`sanitize_url`); a fenced ` ```diff ` block or diff-shaped tool-result content (`looks_like_diff`) gets per-line +/- coloring (`diff_html`) instead of real syntax highlighting, which is deliberately not implemented (would need a heavy crate like `syntect`, bloating every build of this CLI for a nice-to-have); reuses `skills::xml_escape` for HTML-text escaping; shared by `serve`'s `export_html` RPC command, `run --export`, and the standalone `export` subcommand                                                                                                                                                    |
-| `src/policy.rs`        | `ToolPolicy` — the concrete `agent_core::AgentHooks` implementation this crate installs: `--deny-tool`/`--deny-bash-pattern` (both repeatable, comma-separated, `serve` also env-var-backed) build a static deny-list gating `before_tool_call`; installed on `Agent` only when non-empty, else the zero-cost `NoHooks` default; shared by `run` and `serve` (`ToolPolicy::from_lists`) |
+| `src/export.rs`        | `export_html`/`render_html` — renders a session's transcript as one self-contained, dependency-free HTML file (inline CSS, no client-side JS, images inlined as data URIs); every abandoned branch (passed in as `SessionStore::abandoned_branches`'s output) renders inline as a collapsible `<details>` block right after the message it actually diverged from (`render_branches_diverging_at`, native HTML — no script) — only the divergent suffix, not the shared prefix already shown above, and numbered sequentially across the whole document; every built-in tool call (`edit`/`write`/`bash`/`read`/`grep`/`find`/`ls`, and the Beyond platform tools `fork`/`sync`/`logs`) gets a dedicated renderer (`render_tool_call`) instead of raw pretty-printed JSON — `edit` reuses the diff-coloring machinery (`diff_pair_html`) to show its before/after as a real diff, falling back to generic JSON if `input` doesn't parse as a valid edit shape; only a genuinely unrecognized tool name (a third-party extension) stays generic JSON; message text is rendered as markdown (`render_markdown`, `pulldown-cmark`, server-side at export time — not pi's client-side `marked`/`highlight.js`) — a bare `\n` not preceded by two-plus trailing spaces (CommonMark's own soft break) now renders as a hard `<br>`, matching pi's own `marked.use({ breaks: true })` (previously the two collapsed into a run-on paragraph with no visible break at all) — with raw HTML defused to visible text and link/image URLs scheme-allow-listed (`sanitize_url` — `http(s):`/`mailto:` plus, as of a pi-parity fix, `tel:`/`ftp:`; everything else, `javascript:` included, is neutralized); a `[Earlier conversation compacted…]`/branch-summary marker line (`parse_summary_marker`/`render_summary_marker`) renders as its own distinct styled block rather than plain markdown, and — for a real compaction specifically — surfaces the token count `compaction::apply_summary` now embeds as a leading `"Compacted from {N} tokens\n\n"` line in the summary body (`parse_compaction_tokens_before` strips and parses it back out, `format_thousands` for display; `None`/absent for a branch summary, which never carries that line) as a `· Compacted from N tokens` note on the block's label; `serve.rs`'s host-bash-command marker (a `[Host bash command, run outside the model's own turn]\n$ …` prefix — commands run out-of-band of the model's own turn) is recognized the same way (`parse_host_bash_marker`/`render_host_bash_marker`) and rendered as its own styled `tool-call host-bash` block instead of falling through to plain markdown, with a distinct `.error` variant; a fenced ` ```diff ` block or diff-shaped tool-result content (`looks_like_diff`) gets per-line +/- coloring (`diff_html`) instead of real syntax highlighting, which is deliberately not implemented (would need a heavy crate like `syntect`, bloating every build of this CLI for a nice-to-have); reuses `skills::xml_escape` for HTML-text escaping; `export_html_full`/`render_html_full` additionally render the system prompt and tool set (each a collapsed-by-default `<details>` section) plus token-usage totals — pi's own always-included `systemPrompt`/`tools` fields, previously omitted entirely — with `serve`'s `export_html` RPC command and `run --export` (Task #44) both passing the actually-running agent's real system prompt/`agent_core::ToolRegistry::definitions`/session usage; the standalone `export` subcommand passes `None` for all three (no live `Agent`/`ToolRegistry`/`Session` to pull any of them from — a genuine absence, not an oversight); shared by `serve`'s `export_html` RPC command, `run --export`, and the standalone `export` subcommand                                                                                                                                                    |
+| `src/policy.rs`        | `ToolPolicy` — the concrete `agent_core::AgentHooks` implementation this crate installs: `--deny-tool`/`--deny-bash-pattern`/`--deny-path` (all three repeatable, comma-separated, `serve` also env-var-backed via `AI_AGENT_DENY_PATH` etc.) build a static deny-list gating `before_tool_call` — `--deny-path` compiles each pattern to a `globset::GlobMatcher` once at construction and matches it against a `write`/`edit` call's canonicalized target path; installed on `Agent` only when non-empty, else the zero-cost `NoHooks` default; shared by `run` and `serve` (`ToolPolicy::from_lists`) |
 | `src/trust_store.rs`   | Tri-state (`Trust::{Trusted,Untrusted,Unknown}`), ancestor-inheriting trust allowlist (`~/.claude/trusted-projects.json`); `trust`/`distrust` record an explicit grant/denial, `clear` removes a directory's own entry (trusted *or* untrusted) without recording a new one, reverting it to inheriting its nearest ancestor's decision; legacy bare-array files still parse (trusted-only); allowlist keys are resolved via `path_utils::resolved_path` (absolutize-and-lexically-normalize *before* a real `canonicalize()` attempt) — matching pi's `resolvePath` → `canonicalizePath` order, so pre-trusting a not-yet-created directory via a relative or trailing-slash path (`agent trust newproj/`) still matches once the directory exists and a later `lookup()` canonicalizes an absolute `cwd`, instead of comparing against the stale literal string `canonicalize()` alone would have fallen back to on its `ENOENT`; `read_store_file` distinguishes a missing file (silent — nothing has ever been trusted yet) from an existing-but-unreadable one or one that fails to parse as either the current or legacy shape (both `warn!`, since either would otherwise silently discard every persisted trust/untrust decision with no signal anything was wrong) |
-| `src/path_utils.rs`    | Shared path-normalization helpers, extracted from `trust_store.rs` once `skills.rs`/`prompts.rs` needed the identical logic: `absolutize`/`lexically_normalize` (pure, no filesystem access beyond reading the cwd — work even for a path that doesn't exist yet) and `resolved_path` (canonicalize on top of that, falling back to the absolutized-and-normalized form on failure); `push_unique_root` — push a discovery root onto a `Vec<PathBuf>` only if its canonical form hasn't already been seen (tracked in a caller-owned `HashSet`), so a root reached by two different paths (a symlink, a relative-vs-absolute spelling, `cwd` itself equaling a global root) is scanned only once — used by `skills.rs`/`prompts.rs` to keep a real directory reached twice from double-counting its contents and self-colliding every name in it against a phantom duplicate; pi doesn't dedupe at the root-list level either (only file-level, in `skills.ts`'s own `realPathSet`) — a Beyond-specific hardening                                                                                                                                                                            |
+| `src/auth_store.rs`    | `AuthStore` — OAuth/subscription-credential storage (`~/.claude/auth.json`), same shape family as `trust_store.rs`/`settings.rs` (own small `FileLock`, atomic writes, re-read-under-lock-before-mutate, no shared code with either); `refreshed()` is the one genuinely new piece — double-checked-locked refresh that holds the lock across the *entire* refresh including the network call, preserves the credential bit-for-bit and records `last_refresh_error` (not deletion) on failure; the store file is created at `0600` atomically on first write (`write_atomic` only *preserves* an existing file's mode, so this is a real, deliberate first-write step, not redundant with it); a local `Secret` type round-trips its real value through `serde` (unlike `agent_core::client::ApiKey`, never serialized, or `beyond-gateway::Secret`, which redacts on serialize) since persisting the real value to disk is this store's whole job; deliberately OAuth-only, no `api_key` credential variant — see "Provider keys" above |
+| `src/auth_credential_source.rs` | `OAuthCredentialSource` — the one `agent_core::client::CredentialSource` implementation this crate ships: an in-memory fast path for a still-valid cached token, else `spawn_blocking`s into `AuthStore::refreshed` (bridging its one async sub-step, the provider's token-endpoint call, back in via `Handle::current().block_on`) — kept off the tokio worker thread the same way `serve.rs`'s `persist_blocking` keeps a blocking session write off it |
+| `src/oauth/`           | The three providers' OAuth protocol flows — `anthropic.rs` (PKCE + local callback, port `53692`, the `state = verifier` quirk), `github_copilot.rs` (device-code, Copilot-internal-token re-derivation, model-availability discovery), `openai_codex.rs` (user-selectable browser PKCE / custom device-code, JWT-claim account-id extraction) — plus shared `pkce.rs`/`device_code.rs`/`callback_server.rs`/`callbacks.rs` (the `LoginCallbacks` trait a CLI or `serve` implements) /`error.rs`. Lives in `agent`, not `agent_core`: a second, direct-to-provider network surface `agent_core`'s own doc comment explicitly disclaims owning, and device-code polling/the local callback listener both need a live tokio runtime as a real (non-dev) dependency, which `agent_core` deliberately doesn't have. See "OAuth / Subscription-Credential Authentication" above for the full picture. |
+| `src/path_utils.rs`    | Shared path-normalization helpers, extracted from `trust_store.rs` once `skills.rs`/`prompts.rs` needed the identical logic: `absolutize`/`lexically_normalize` (pure, no filesystem access beyond reading the cwd — work even for a path that doesn't exist yet) and `resolved_path` (canonicalize on top of that, falling back to the absolutized-and-normalized form on failure); `push_unique_scoped_root` — push a `(discovery root, scope tag)` pair onto a `Vec<(PathBuf, T)>` only if the root's canonical form hasn't already been seen (tracked in a caller-owned `HashSet`), so a root reached by two different paths (a symlink, a relative-vs-absolute spelling, `cwd` itself equaling a global root) is scanned only once — used by `skills.rs`/`prompts.rs` to keep a real directory reached twice from double-counting its contents and self-colliding every name in it against a phantom duplicate, and to carry each root's own `"user"`/`"project"` scope tag (Task #39) alongside it without a second parallel structure; pi doesn't dedupe at the root-list level either (only file-level, in `skills.ts`'s own `realPathSet`) — a Beyond-specific hardening                                                                                                                                                                            |
 | `src/settings.rs`      | `SettingsStore` — persisted `default_model`/`default_gateway_url`/`default_session_dir` (`~/.claude/settings.json`), consulted by `run_task`/`Command::Serve` as the last fallback before this crate's own built-in default; managed via `agent settings`, mirroring `trust_store.rs`'s own out-of-band management convention and reusing its exact on-disk pattern (own small `FileLock`, atomic writes, re-read-under-lock-before-mutate) without sharing code with it                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `src/session_store.rs` | JSONL `SessionStore` (fsync'd append/atomic-rewrite/mid-file-corruption recovery, header metadata + durable `Entry::Compaction` provenance, version-migration guard, collision-safe ids; `create` initializes an existing but zero-byte file in place — `touch`'d ahead of time, or left over from a crash before the header write landed — rather than hard-failing, while still refusing (`AlreadyExists`) a genuinely non-empty one; `run`/`serve`'s own `--session <path>` open-vs-create decision checks file *content*, not just existence, so this path actually gets exercised) + multi-session `SessionRepo` (list-with-metadata, soft-delete-to-`.trash`, fork + read-only fork preview, `resume_or_create` — reopen the most recent session matching a `cwd` or make a fresh one, shared by `serve`'s startup reattach and `run --continue`; `fork_from_path` forks an arbitrary source session that need not live in `self.dir` at all, stamping the *target* project's own `cwd` rather than the source's — the primitive `fork_by_arg` (module-level, not a `SessionRepo` method: it may need to open a *second* repo for the source) builds `run --fork <path|id>`/`--session-dir` on top of, resolving a path-like argument directly or an id by trying `target.fork` first (itself exact-then-unique-prefix aware — see `find_path` below — so this alone covers a prefix resolving within the current project; an ambiguous prefix errors immediately here rather than widening to a cross-project search that could reinterpret it against a different candidate set) and, only on a genuine not-found, falling back to `find_session_path_under(sessions_root, id)` — a filename-only scan across every immediate subdirectory (also exact-then-unique-prefix aware), *not* a re-derivation of the source's directory from its own recorded `cwd`, since a caller-supplied `--session-dir` need not follow the `encode_cwd` naming convention at all); `find_path` (private, backing `open_id`/`delete`/`fork`/`fork_at_entry`) tries an exact filename match first, then a unique-prefix match over each file's own id component — pi's own convenience for a shortened id (`resolveSessionPath`), but an ambiguous prefix is an `InvalidInput` error naming every candidate id rather than pi's silent most-recent-wins pick; `fork`/`fork_at_entry` record the *resolved* source's own `meta.id` as the new session's `parent`, not the caller's raw (possibly-truncated) argument; `default_session_dir`/`sessions_root`/`encode_cwd`/`canonical_cwd` — the `~/.claude/sessions/<encoded-cwd>/` convention (and its shared root, for cross-project search) and the symlink/trailing-separator-safe form every recorded `cwd` is passed through first, likewise shared; tree-shaped history (`id`/`parent_id` per message, `Leaf`/`BranchSummary`/`Compaction`/`ModelChange`/`ThinkingLevelChange`/`TitleChange` entries, `switch_active_with_summary`/`list_branches`/`tree`/`abandoned_by_switch`/`abandoned_branches`(every non-active leaf's full root-to-leaf message chain, plus how much of it is shared with the active path — for HTML export), legacy migration, off-branch-preserving compaction); `set_title` — an O(1) `TitleChange` append, not a rewrite, whole-session-scoped (most-recent-wins across the whole file) unlike the branch-scoped model/thinking-level changes, sanitizing `\r`/`\n` to a single collapsed space and treating a sanitizes-to-empty title as clearing it (`None`) rather than persisting a blank string, at both the write path and the two read-reconstruction paths (`open`'s tree build, `read_listing`'s cheap scan); `SessionMeta::to_listing_json` — the derived listing fields (`updated_at`/`message_count`/`preview`/`search_text`) are `#[serde(skip)]` on the struct itself, so this is the only path that actually surfaces them as JSON |
 | `src/resources.rs`     | System-prompt assembly split into `build_static_system_prompt` (on-disk `SYSTEM.md` override + additive `APPEND_SYSTEM.md`, one-file-per-dir `AGENTS.md`>`CLAUDE.md` discovery, skill injection from an already-discovered `PromptOptions::skills` slice — the caller's job, not this function's, since every real caller already discovers skills separately for its own purposes and re-discovering here too would walk the same directories twice — expensive, cached) and `dynamic_footer` (local date/cwd — cheap, refreshed every turn); `build_system_prompt` composes both for a one-shot caller                                                                                                                   |
-| `src/skills.rs`        | Recursive skill discovery (`SKILL.md` frontmatter up to `MAX_DEPTH` — 8 — levels deep per root, a Beyond-specific bound pi's own unbounded walk doesn't have, `disable-model-invocation`, `/skill:` lookup — expands into a `<skill name=".." location="..">` tag with the frontmatter stripped, not the raw file) across `~/.claude/skills`+`<cwd>/.claude/skills` and the vendor-neutral `~/.agents/skills`+every `.agents/skills` between `cwd` and the enclosing git-repo root (`collect_ancestor_agents_skill_dirs`/`find_git_repo_root` — `.agents/skills` never recognizes the loose-root-`.md`-file shape `.claude/skills` does) + `<available_skills>` rendering + `discover_with_diagnostics` (name-collision reporting; `.claude/skills` wins over `.agents/skills`, and the `.agents/skills` level closest to `cwd` wins over one further up; every discovery root, standard or `--skill` extra, is deduped by canonical path via `path_utils::push_unique_root` before it's ever walked, so the same real directory reached twice can't double-count its skills into a phantom self-collision); `project_trusted` gates only the project-local roots, the user-global roots are always scanned; `validate_skill_name`/`validate_skill_description` — non-fatal, `warn!`-logged shape/length checks (a bad `name`, or a `description` past 1024 chars) that never block discovery                |
-| `src/prompts.rs`       | `/name args` prompt-template discovery (gitignore-aware, non-recursive single-directory scan — `.gitignore`/`.ignore`/`.fdignore` only, no global excludes/`.git/info/exclude`, matching pi's own `IGNORE_FILE_NAMES`/`readdirSync` scope) + bash-style expansion (quote-aware args, `$N`, `${@:N:L}` slices, `${N:-default}`, `description`/`argument-hint` frontmatter — parsed via `skills::parse_frontmatter`, shared rather than reimplemented, so a YAML block scalar is understood the same way a skill's frontmatter already is) + `discover_with_diagnostics` (name-collision reporting; same canonical-path root dedup as `skills.rs`, via the identical `path_utils::push_unique_root`)                                                                                                                                                                                                                           |
+| `src/skills.rs`        | Recursive skill discovery (`SKILL.md` frontmatter up to `MAX_DEPTH` — 8 — levels deep per root, a Beyond-specific bound pi's own unbounded walk doesn't have, `disable-model-invocation`, `/skill:` lookup — expands into a `<skill name=".." location="..">` tag with the frontmatter stripped, not the raw file) across `~/.claude/skills`+`<cwd>/.claude/skills` and the vendor-neutral `~/.agents/skills`+every `.agents/skills` between `cwd` and the enclosing git-repo root (`collect_ancestor_agents_skill_dirs`/`find_git_repo_root` — `.agents/skills` never recognizes the loose-root-`.md`-file shape `.claude/skills` does) + `<available_skills>` rendering + `discover_with_diagnostics` (name-collision reporting; `.claude/skills` wins over `.agents/skills`, and the `.agents/skills` level closest to `cwd` wins over one further up; every discovery root, standard or `--skill` extra, is deduped by canonical path via `path_utils::push_unique_scoped_root` before it's ever walked, so the same real directory reached twice can't double-count its skills into a phantom self-collision); `project_trusted` gates only the project-local roots, the user-global roots are always scanned; `validate_skill_name`/`validate_skill_description` — non-fatal, `warn!`-logged shape/length checks (a bad `name`, or a `description` past 1024 chars) that never block discovery                |
+| `src/prompts.rs`       | `/name args` prompt-template discovery (gitignore-aware, non-recursive single-directory scan — `.gitignore`/`.ignore`/`.fdignore` only, no global excludes/`.git/info/exclude`, matching pi's own `IGNORE_FILE_NAMES`/`readdirSync` scope) + bash-style expansion (quote-aware args, `$N`, `${@:N:L}` slices, `${N:-default}`, `description`/`argument-hint` frontmatter — parsed via `skills::parse_frontmatter`, shared rather than reimplemented, so a YAML block scalar is understood the same way a skill's frontmatter already is) + `discover_with_diagnostics` (name-collision reporting; same canonical-path root dedup as `skills.rs`, via the identical `path_utils::push_unique_scoped_root`)                                                                                                                                                                                                                           |
 | `src/timing.rs`        | `StartupTiming` — `AI_AGENT_TIMING=1`-gated startup profiling (pi's own `PI_TIMING=1`/`timings.ts`); `mark(label)`/`print()` are no-ops (don't even read the clock) when unset, so it's safe to sprinkle through `run`/`serve`'s startup path unconditionally; prints to stderr only, never stdout                                                                                                                                      |
 | `src/tools/mod.rs`     | `default_registry_with(bash_timeout_ms)` — assembles the base 10-tool `ToolRegistry`; `apply_filter(&mut registry, tools, exclude_tools, no_tools)` — allow/deny-list/no-tools filtering applied once at process build time                                                                                                                                                                                                             |
-| `src/tools/read.rs`    | `read` — line-numbered read with `offset`/`limit`, byte budget, offset-past-EOF error, continuation hints; image files sniffed by magic bytes and downscaled/re-encoded (Lanczos3, PNG-then-JPEG, Exif orientation via `image`'s own generic decoder API — JPEG and WebP both) to fit a 4.5 MB base64 budget; an image already under that budget is still decode-validated (not just magic-byte-sniffed) before being sent as-is — matching pi's `resizeImageInProcess`, which always decodes even on its own already-fits fast path — so a truncated/bit-rotted/polyglot file that merely starts with a real image's magic bytes gets a clear tool error instead of being forwarded to the model unchecked                                                                                                                            |
+| `src/tools/read.rs`    | `read` — line-numbered read with `offset`/`limit` (explicit `limit` also capped at `DEFAULT_LIMIT`, 2000), byte budget, offset-past-EOF error, continuation hints; image files sniffed by magic bytes (`is_valid_bmp` structurally validates a `"BM"`-prefixed file's DIB header rather than trusting the bare 2-byte signature; a SOF55/JPEG-LS 4th byte excludes an undecodable JPEG variant) and downscaled/re-encoded (Lanczos3, PNG-then-JPEG, Exif orientation via `image`'s own generic decoder API — JPEG and WebP both) to fit a 4.5 MB base64 budget; an image already under that budget is still decode-validated (not just magic-byte-sniffed) before being sent as-is — matching pi's `resizeImageInProcess`, which always decodes even on its own already-fits fast path — so a truncated/bit-rotted/polyglot file that merely starts with a real image's magic bytes gets a clear tool error instead of being forwarded to the model unchecked; appends pi's `getNonVisionImageNote` when dispatch's injected `_model_supports_vision` field says the active model can't see images at all |
 | `src/tools/write.rs`   | `write` — create/overwrite a file, creating parent directories                                                                                                                                                                                                                                                                                                                                                                           |
 | `src/tools/edit.rs`    | `edit` — exact-then-fuzzy (NFKC/quote/dash/space/trailing-ws) replacement matched in LF space (CRLF/BOM restored), against the original, overlap/no-op checks, `replace_all`                                                                                                                                                                                                                                                             |
 | `src/tools/ls.rs`      | `ls` — directory listing, directories-first sort, dotfile filtering, `limit` entry cap                                                                                                                                                                                                                                                                                                                                                   |
 | `src/tools/grep.rs`    | `grep` — parallel, gitignore-aware regex (or `literal`) search with `context`/`before`/`after` lines, a whole-output byte cap (`MAX_OUTPUT_BYTES`), deterministic sort+truncate                                                                                                                                                                                                                                                          |
 | `src/tools/find.rs`    | `find` — sequential, gitignore-aware glob search over files **and** dirs; deterministic sort+truncate                                                                                                                                                                                                                                                                                                                                    |
 | `src/tools/bash.rs`    | `bash` — resolved real-`bash` (falling back to `sh`) execution with a 30-minute default timeout, streaming `OutputAccumulator` (tail-truncated display + full-output temp-file spill), output hygiene (ANSI strip/control sanitize)                                                                                                                                                                                                     |
-| `src/tools/output.rs`  | Shared `OutputAccumulator`/`format_size`/`marker` — the bounded, spill-to-disk output-truncation machinery every truncating tool (`bash`/`read`/`grep`/`ls`/`find`) now shares                                                                                                                                                                                                                                                            |
+| `src/tools/output.rs`  | Shared `OutputAccumulator`/`format_size`/`marker` — the bounded, spill-to-disk output-truncation machinery every truncating tool (`bash`/`read`/`grep`/`ls`/`find`) now shares; `snapshot_text` holds back an incomplete trailing UTF-8 sequence (`incomplete_utf8_suffix_len`) on a live (not-yet-`finish`ed) snapshot instead of transiently lossy-decoding it to `U+FFFD` at a chunk boundary                                                                                                                                                                            |
 | `src/tools/beyond.rs`  | `fork`/`sync`/`logs` — shell out to the `beyond` platform CLI                                                                                                                                                                                                                                                                                                                                                                            |
 | `src/tools/exec.rs`    | `CommandRunner` trait + `RealRunner` (stdin closed via `Stdio::null()`, `GroupKillGuard` process-group kill on timeout *or* a dropped/cancelled future, bounded head+tail streaming capture, `ExecResult.truncated`) — the process-execution seam shared by `bash`/`beyond` tools and `serve`'s own `bash`/`abort_bash` RPC                                                                                                                                                |
 | `benches/search.rs`    | Criterion macro-bench: `grep` (1 vs auto threads) and `find` (sequential) over a 5,000-file tree                                                                                                                                                                                                                                                                                                                                         |
@@ -1167,6 +1272,7 @@ container/VM — not by this crate restricting its own tools.
 | `--tools` / `--exclude-tools` / `--no-tools` (+ `AI_AGENT_TOOLS`/`AI_AGENT_EXCLUDE_TOOLS`, `run` and `serve` alike) | none (full default registry) | Restrict/drop from the advertised tool set before the process's `Agent`/system prompt are built; `--no-tools` wins outright        |
 | `--sequential-tools` (`run` and `serve`)                       | `false`                     | Force every batch of tool calls in a turn to run one at a time instead of the default bounded-concurrent dispatch (`agent_core::Agent::with_sequential_tools`) — e.g. a deterministic repro, or a host policy that never wants two tool calls actually overlapping; matches pi's own `AgentOptions.toolExecution: "sequential"`, which pi's own CLI doesn't expose either (library-only there) |
 | `--no-skills` / `--no-prompt-templates` (`run` and `serve`)    | `false`                     | Skip *standard-root* skill/prompt-template discovery outright (`~/.claude/skills`+`<cwd>/.claude/skills`+`~/.agents/skills`+the `.agents/skills` ancestor walk, `~/.claude/prompts`+`<cwd>/.claude/prompts`) — no `<available_skills>` listing from either, and a `/skill:name`/`/name` invocation passes through unexpanded unless it resolves against a `--skill`/`--prompt-template` extra path instead, which is still honored even so; matches pi's own flags (a documented, tested combination — `discover_extra_only`). On `serve`, applies on every `reload` too |
+| `--skill` / `AI_AGENT_SKILL_PATH`, `--prompt-template` / `AI_AGENT_PROMPT_TEMPLATE_PATH` (`run` and `serve`) | none (only the two standard roots) | Extra discovery root(s) beyond the standard `.claude/skills`/`.claude/prompts` roots — repeatable on the CLI, or comma-separated in the env var, matching `--tools`/`AI_AGENT_TOOLS`'s identical convention (Task #40 pi-parity fix: previously CLI-only, with no env-var fallback unlike most other flags here) |
 | `--no-context-files` (`run` and `serve`)                       | `false`                     | Skip AGENTS.md/CLAUDE.md project-instruction discovery/injection entirely; matches pi's own flag       |
 | `--system-prompt` / `AI_AGENT_SYSTEM_PROMPT` (`run` and `serve`) | none (built-in base identity) | Replaces the built-in base system prompt entirely (an on-disk project/user `SYSTEM.md` still overrides it — see `resources::build_static_system_prompt`) |
 | `--append-system-prompt` / `AI_AGENT_APPEND_SYSTEM_PROMPT` (`run` and `serve`) | none (falls back to an on-disk `APPEND_SYSTEM.md`, if any) | Extra instructions appended after the base/override; an explicit flag wins outright over the on-disk file rather than combining with it |
@@ -1215,15 +1321,52 @@ process, same as `--temperature`/`--reasoning-effort`.
 
 ---
 
-## Known Gaps / Future Work
+## OAuth / Subscription-Credential Authentication
 
-- **OAuth / subscription-credential authentication.** pi supports full OAuth for three providers
-  (Anthropic PKCE + local-callback, GitHub Copilot and Codex device-code) with locked auto-refresh,
-  letting a user authenticate with a subscription instead of a metered API key. This crate has none of
-  that at any layer: `GatewayClient` only ever sends a static, non-expiring `bai_v1…` pool key
-  (`gateway/`'s own key pool, loaded once at boot) — there is no token-exchange, PKCE, device-code, or
-  refresh flow anywhere in the stack. This is a categorical architecture gap, not a small bug: adding it
-  would mean deciding how a per-user subscription credential coexists with the gateway's own
-  usage-based metering (which currently assumes every request is billed the same way, regardless of
-  which credential funded it upstream) — a product decision, not a pure implementation task. Worth
-  doing; flagged here rather than attempted blind.
+Full pi parity: logging in with a Claude Pro/Max, GitHub Copilot, or ChatGPT Plus/Pro subscription
+instead of a metered API key. See "Provider keys: managed vs. BYO vs. OAuth subscription" above for
+*why* this needed no gateway changes at all and the identity-header tradeoff; this section is *what's
+built* and *where*.
+
+**Protocol flows** (`crate::oauth`, one module per provider — `anthropic`/`github_copilot`/
+`openai_codex` — plus shared `pkce`/`device_code`/`callback_server` helpers):
+
+- **Anthropic**: PKCE + a local callback listener on the fixed port `53692`. A real quirk, replicated
+  exactly: `state` is the raw PKCE verifier itself, not an independently generated CSRF token. No
+  bind-failure fallback — a port conflict is a hard error, matching pi.
+- **GitHub Copilot**: device-code (`Iv1.b507a08c87ecfe98`), waits one poll interval before its first
+  attempt. Refreshing re-derives a short-lived Copilot-internal proxy token from the long-lived GitHub
+  device-flow token every time; `login` additionally does a best-effort, parallel model-"enable"
+  fan-out and records which models are actually available — `refresh` re-checks availability but never
+  repeats the enable step.
+- **OpenAI Codex**: user picks browser PKCE (port `1455`, an *independent* random CSRF state, unlike
+  Anthropic) or a custom, non-RFC-8628 device-code flow (403/404 both mean "pending"; the token server
+  issues its own PKCE verifier for this path, not the client's). No early-refresh buffer, unlike the
+  other two providers' 5-minute buffer.
+
+**Storage** (`crate::auth_store::AuthStore`, `~/.claude/auth.json` by default): same shape family as
+`SettingsStore`/`TrustStore` — a hand-rolled cross-process `FileLock`, `mutate_locked`'s
+re-read-fresh-under-lock discipline, tolerant of a missing/corrupt file. `refreshed()` is the one
+new piece of substance: double-checked-locked refresh (the lock is held across the *entire* refresh,
+including the network call, so two concurrent processes sharing a credential can't both consume a
+single-use refresh token) that preserves the credential bit-for-bit and records
+`last_refresh_error` on failure, rather than deleting it — a transient failure must never cost the
+user their login. The file is created at `0600` on first write, atomically, not via a later `chmod`.
+
+**CLI**: `agent login <provider>` (blocks in-terminal, prints a URL/device-code, races a manual-paste
+fallback against the local callback listener), `agent logout <provider>`, `agent auth-status
+[provider]` — same dispatch shape as `agent trust`/`agent settings`.
+
+**`serve` RPC**: `login`/`logout`/`auth_status`/`submit_code`/`abort_login` — see the wire-protocol
+doc comment at the top of `serve.rs` for the exact frame shapes. `login` runs as a detached background
+task (not an inline nested busy-loop like `prompt`'s), pushing `login_progress` frames and an
+eventual `response`, precisely because a subscription login has nothing to do with `session`/`agent`
+state — every other command keeps working while one is pending; only a second concurrent `login` is
+rejected.
+
+**The client-side credential seam**: `main.rs`'s `resolve_gateway_credential` is the one further
+fallback tier below `--key`/`AI_AGENT_KEY` — consulted only when both are absent, inferring a provider
+from the resolved model id (Anthropic: any Claude-dialect id; Codex: a `"codex"`-containing id;
+Copilot: *not* inferred by model prefix at all, since its model set is dynamic — matched only against
+a stored credential's own `available_model_ids`) and building an `OAuthCredentialSource` for it. See
+`agent_core::client::CredentialSource` above for how that source plugs into `GatewayClient`.

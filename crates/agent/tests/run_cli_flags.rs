@@ -27,6 +27,7 @@ fn run_binary_exports_the_transcript_when_asked() {
             "claude-test",
             "--export",
             export_path.to_str().unwrap(),
+            "--no-session-persistence",
         ])
         .current_dir(dir.path())
         .output()
@@ -43,6 +44,21 @@ fn run_binary_exports_the_transcript_when_asked() {
     assert!(html.starts_with("<!DOCTYPE html>"));
     assert!(html.contains("say hi"));
     assert!(html.contains("all done"));
+    // Task #44 integration: `run --export` now calls `export_html_full` with the actually-running
+    // agent's real system prompt and tool set, not the plainer entries-only form — both sections must
+    // be present, not just the transcript.
+    assert!(
+        html.contains("System Prompt"),
+        "expected a rendered system-prompt section: {html}"
+    );
+    assert!(
+        html.contains("Available Tools"),
+        "expected a rendered tools section: {html}"
+    );
+    assert!(
+        html.contains("bash") && html.contains("read") && html.contains("write"),
+        "the tools section should list the default registry's own tools: {html}"
+    );
 }
 
 #[test]
@@ -88,6 +104,33 @@ fn run_binary_list_models_search_argument_filters_to_matching_model_ids() {
     assert!(
         !stdout.contains("claude-opus-4-8"),
         "a model id not matching the search term must be filtered out: {stdout}"
+    );
+}
+
+#[test]
+fn run_binary_list_models_search_argument_fuzzy_matches_a_non_contiguous_subsequence() {
+    // Task #51 (pi-parity fix): `--list-models <search>` used to be a plain case-insensitive substring
+    // check, which "sn5" would never match against "claude-sonnet-4-5" (no such literal substring
+    // exists). pi's own `--list-models` uses a fuzzy, order-preserving subsequence match instead.
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args(["list-models", "sn5"])
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("claude-sonnet-4-5"),
+        "a fuzzy subsequence match on \"sn5\" must find claude-sonnet-4-5: {stdout}"
+    );
+    assert!(
+        !stdout.contains("gpt-5-mini"),
+        "a model id whose characters don't appear in \"sn5\" order must still be filtered out: {stdout}"
     );
 }
 
@@ -169,6 +212,30 @@ fn run_binary_version_flag_prints_only_the_version_to_stdout() {
 }
 
 #[test]
+fn run_binary_lowercase_v_alias_prints_the_same_version_as_capital_v() {
+    // Task #43: clap's auto-generated version flag only binds the capital `-V`; pi documents a
+    // lowercase `-v` alias too. `expand_short_aliases` (`main.rs`) rewrites it to `--version` before
+    // clap ever sees it — this pins down that the two really produce identical output, not just that
+    // the process happens to exit 0.
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let lower = run_cmd(bin).arg("-v").output().expect("spawn binary");
+    let upper = run_cmd(bin).arg("-V").output().expect("spawn binary");
+
+    assert!(
+        lower.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&lower.stderr)
+    );
+    assert!(
+        upper.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&upper.stderr)
+    );
+    assert_eq!(lower.stdout, upper.stdout);
+    assert_eq!(lower.stderr, b"");
+}
+
+#[test]
 fn run_binary_help_flag_prints_usage_to_stdout_with_empty_stderr() {
     // F-L3 (pi: stdout-cleanliness.test.ts "prints plain --help to stdout when stdout is redirected"):
     // same idea as the `--version` case above, for clap's generated `--help`.
@@ -202,7 +269,9 @@ fn run_binary_json_help_flag_routes_usage_to_stderr_with_empty_stdout() {
     // any of that is ever read.
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let output = run_cmd(bin)
-        .args(["run", "--json", "--help"])
+        .args(["run", "--json", "--help",
+            "--no-session-persistence",
+        ])
         .output()
         .expect("spawn binary");
 
@@ -243,6 +312,7 @@ fn export_subcommand_renders_an_existing_session_file_with_no_gateway_or_key() {
             "claude-test",
             "--session",
             session_file.to_str().unwrap(),
+            "--no-session-persistence",
         ])
         .current_dir(dir.path())
         .stdin(Stdio::null())
@@ -279,6 +349,18 @@ fn export_subcommand_renders_an_existing_session_file_with_no_gateway_or_key() {
     assert!(html.starts_with("<!DOCTYPE html>"));
     assert!(html.contains("what is the answer?"));
     assert!(html.contains("the answer is 42"));
+    // Task #44 integration: the standalone subcommand has no live `Agent`/`ToolRegistry` to pull a
+    // system prompt/tool set from (no gateway/key/model given at all, proven above) — it correctly
+    // passes `None` for both rather than fabricating data, so neither section should render, unlike
+    // `run --export`'s own live-run equivalent (see `run_binary_exports_the_transcript_when_asked`).
+    assert!(
+        !html.contains("System Prompt"),
+        "the standalone export has no live system prompt to render: {html}"
+    );
+    assert!(
+        !html.contains("Available Tools"),
+        "the standalone export has no live tool registry to render: {html}"
+    );
 }
 
 #[test]
@@ -300,6 +382,7 @@ fn run_binary_thinking_flag_reaches_the_wire_request() {
             "claude-test",
             "--thinking",
             "2048",
+            "--no-session-persistence",
         ])
         .stdin(Stdio::null())
         .output()
@@ -337,6 +420,7 @@ fn run_binary_temperature_flag_reaches_the_wire_request() {
             "claude-test",
             "--temperature",
             "0.25",
+            "--no-session-persistence",
         ])
         .stdin(Stdio::null())
         .output()
@@ -375,6 +459,7 @@ fn run_binary_max_tokens_flag_reaches_the_wire_request() {
             "claude-test",
             "--max-tokens",
             "555",
+            "--no-session-persistence",
         ])
         .stdin(Stdio::null())
         .output()
@@ -415,6 +500,7 @@ fn run_binary_carries_a_stable_prompt_cache_affinity_key_on_the_wire() {
             "bai_v1.test",
             "--model",
             "gpt-4o",
+            "--no-session-persistence",
         ])
         .stdin(Stdio::null())
         .output()
@@ -492,6 +578,7 @@ fn run_binary_context_window_flag_forces_proactive_compaction_on_a_resumed_sessi
             "50",
             "--compaction-keep-recent-tokens",
             "1",
+            "--no-session-persistence",
         ])
         .stdin(Stdio::null())
         .output()
@@ -514,8 +601,21 @@ fn run_binary_context_window_flag_forces_proactive_compaction_on_a_resumed_sessi
 #[test]
 fn run_binary_no_compaction_flag_suppresses_proactive_compaction_on_a_resumed_session() {
     // pi-parity fix: no way to disable automatic compaction entirely — `--no-compaction` must suppress
-    // the exact same proactive trigger the sibling test above forces, even with the same tiny pinned
-    // `--context-window`/`--compaction-reserve-tokens` that would otherwise guarantee it fires.
+    // the *soft*, proactive threshold (`compaction::should_compact`) the sibling test above forces.
+    //
+    // Deliberately NOT the sibling's own `--context-window 200`/`--compaction-reserve-tokens 50`: this
+    // test's ~400-estimated-token seed (4 messages × 400 chars ÷ 4) would then *also* cross the raw
+    // `context_window` itself, tripping `compaction::is_hard_overflow`'s hard-overflow backstop — which
+    // `agent.rs`'s turn loop deliberately runs regardless of `--no-compaction` (disabling proactive
+    // compaction isn't license to keep sending requests already guaranteed to overflow — see
+    // `is_hard_overflow`'s own doc comment). That would make this test pass for the wrong reason (the
+    // unsuppressible hard backstop just happening not to fire) or fail outright (it does fire), neither
+    // of which says anything about whether `--no-compaction` actually suppressed the *soft* trigger.
+    // `--context-window 1000`/`--compaction-reserve-tokens 700` instead: the soft threshold
+    // (1000 − 700 = 300) is still comfortably crossed by ~400 estimated tokens (proving there's a real
+    // soft-threshold trigger to suppress), while the raw window (1000) is not (keeping the hard backstop
+    // out of play), so the only thing standing between this session and a compaction call is
+    // `--no-compaction` itself.
     let dir = tempfile::tempdir().unwrap();
 
     let session_file = {
@@ -553,9 +653,9 @@ fn run_binary_no_compaction_flag_suppresses_proactive_compaction_on_a_resumed_se
             "--session",
             &session_file,
             "--context-window",
-            "200",
+            "1000",
             "--compaction-reserve-tokens",
-            "50",
+            "700",
             "--compaction-keep-recent-tokens",
             "1",
             "--no-compaction",
@@ -594,6 +694,7 @@ fn run_binary_cache_long_flag_reaches_the_wire_request() {
             "--model",
             "claude-test",
             "--cache-long",
+            "--no-session-persistence",
         ])
         .stdin(Stdio::null())
         .output()
@@ -651,6 +752,7 @@ fn run_binary_bash_shell_path_flag_is_used_for_bash_calls() {
             fake_shell.to_str().unwrap(),
             "--max-steps",
             "4",
+            "--no-session-persistence",
         ])
         .current_dir(dir.path())
         .stdin(Stdio::null())
@@ -703,6 +805,7 @@ fn run_binary_bash_command_prefix_flag_runs_before_the_model_s_command() {
             &format!("echo prefix-marker > {}", marker_file.to_str().unwrap()),
             "--max-steps",
             "4",
+            "--no-session-persistence",
         ])
         .current_dir(dir.path())
         .stdin(Stdio::null())
@@ -748,6 +851,7 @@ fn run_binary_ai_agent_bash_command_prefix_env_var_is_used_for_bash_calls() {
             "claude-test",
             "--max-steps",
             "4",
+            "--no-session-persistence",
         ])
         .stdin(Stdio::null())
         .output()
@@ -804,6 +908,7 @@ fn run_binary_sequential_tools_flag_is_accepted_and_both_calls_still_run() {
             "--sequential-tools",
             "--max-steps",
             "4",
+            "--no-session-persistence",
         ])
         .current_dir(dir.path())
         .stdin(Stdio::null())
@@ -854,6 +959,7 @@ fn run_binary_deny_tool_flag_blocks_the_named_tool_end_to_end() {
             "bash",
             "--max-steps",
             "4",
+            "--no-session-persistence",
         ])
         .current_dir(dir.path())
         .stdin(Stdio::null())
@@ -908,6 +1014,7 @@ fn run_binary_deny_tool_env_var_blocks_the_named_tool_end_to_end() {
             "claude-test",
             "--max-steps",
             "4",
+            "--no-session-persistence",
         ])
         .env("AI_AGENT_DENY_TOOL", "bash")
         .current_dir(dir.path())
@@ -962,6 +1069,7 @@ fn run_binary_deny_bash_pattern_flag_blocks_matching_commands_end_to_end() {
             "claude-test",
             "--max-steps",
             "4",
+            "--no-session-persistence",
         ])
         .current_dir(dir.path())
         .stdin(Stdio::null())
@@ -1018,6 +1126,7 @@ fn run_binary_deny_path_flag_blocks_a_write_to_the_matching_path_end_to_end() {
             "*.env",
             "--max-steps",
             "4",
+            "--no-session-persistence",
         ])
         .current_dir(dir.path())
         .stdin(Stdio::null())
@@ -1063,6 +1172,7 @@ fn run_binary_ai_agent_exclude_tools_env_var_restricts_the_registry() {
             "bai_v1.test",
             "--model",
             "claude-test",
+            "--no-session-persistence",
         ])
         .stdin(Stdio::null())
         .output()
@@ -1103,6 +1213,7 @@ fn run_binary_ai_agent_tools_env_var_restricts_the_registry_to_an_allow_list() {
             "bai_v1.test",
             "--model",
             "claude-test",
+            "--no-session-persistence",
         ])
         .stdin(Stdio::null())
         .output()
@@ -1147,6 +1258,7 @@ fn run_binary_short_t_flag_is_an_alias_for_tools() {
             "claude-test",
             "-t",
             "read,write",
+            "--no-session-persistence",
         ])
         .stdin(Stdio::null())
         .output()
@@ -1184,6 +1296,7 @@ fn run_binary_short_xt_flag_is_an_alias_for_exclude_tools() {
             "claude-test",
             "-xt",
             "bash",
+            "--no-session-persistence",
         ])
         .stdin(Stdio::null())
         .output()
@@ -1220,6 +1333,7 @@ fn run_binary_short_nt_flag_is_an_alias_for_no_tools() {
             "--model",
             "claude-test",
             "-nt",
+            "--no-session-persistence",
         ])
         .stdin(Stdio::null())
         .output()
@@ -1267,6 +1381,7 @@ fn run_binary_short_a_and_na_flags_are_aliases_for_trust_project_and_force_untru
             "claude-test",
             "-a",
             "-na",
+            "--no-session-persistence",
         ])
         .current_dir(dir.path())
         .stdin(Stdio::null())
@@ -1312,6 +1427,7 @@ fn run_binary_short_ns_flag_is_an_alias_for_no_skills() {
             "claude-test",
             "-a",
             "-ns",
+            "--no-session-persistence",
         ])
         .current_dir(dir.path())
         .stdin(Stdio::null())
@@ -1358,6 +1474,7 @@ fn run_binary_short_np_flag_is_an_alias_for_no_prompt_templates() {
             "claude-test",
             "-a",
             "-np",
+            "--no-session-persistence",
         ])
         .current_dir(dir.path())
         .stdin(Stdio::null())
@@ -1396,6 +1513,7 @@ fn run_binary_short_nc_flag_is_an_alias_for_no_context_files() {
             "--model",
             "claude-test",
             "-nc",
+            "--no-session-persistence",
         ])
         .current_dir(dir.path())
         .stdin(Stdio::null())

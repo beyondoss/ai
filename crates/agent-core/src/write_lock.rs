@@ -11,6 +11,17 @@
 //! Deliberately minimal: an in-process map of async mutexes, not a full queue or scheduler. It only
 //! serializes within one OS process — two separate `serve` processes against the same file would need
 //! a filesystem advisory lock (e.g. `flock`), which is out of scope here.
+//!
+//! Entries are evicted once nothing references them any more: when a [`WriteLockGuard`] drops, it
+//! checks whether the registry's map is the *only* remaining holder of that key's `Arc` (`strong_count
+//! == 1`) — i.e. no other guard and no other in-flight `lock()` call still needs it — and if so removes
+//! the map entry. The check-and-remove happens while holding the map's own lock, so a concurrent
+//! `lock()` call for the same key can never observe (or create) a state where the entry is removed out
+//! from under it: it either wins the race and clones the `Arc` before eviction runs (bumping the count
+//! so eviction is skipped), or it runs after eviction and simply inserts a fresh mutex. This mirrors
+//! pi's `file-mutation-queue.ts` `withFileMutationQueue`, which deletes its map entry in a `finally`
+//! block only if the map still points at that same queue object — the identity check there and the
+//! refcount check here both exist to avoid tearing down an entry a concurrent caller still needs.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as SyncMutex};
@@ -20,12 +31,15 @@ use std::sync::{Arc, Mutex as SyncMutex};
 // `tokio::sync::Mutex`: it's a pure `Future`-based mutex with no ties to any particular executor.
 use futures::lock::{Mutex as AsyncMutex, OwnedMutexGuard};
 
-/// A registry of per-key async mutexes. Cheap to construct and share via `Arc`; entries accumulate
-/// for the registry's lifetime (one per distinct path ever locked) rather than being cleaned up, since
-/// a long-running `serve` process touches a bounded set of paths in practice.
+type LockMap = Arc<SyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>;
+
+/// A registry of per-key async mutexes. Cheap to construct and share via `Arc`. An entry exists only
+/// while at least one caller holds or is waiting on the lock for its key; the last [`WriteLockGuard`]
+/// to drop for a given key removes it (see the module doc comment), so the map stays bounded by the
+/// number of *currently* contended paths rather than growing for the registry's whole lifetime.
 #[derive(Default)]
 pub struct WriteLockRegistry {
-    locks: SyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    locks: LockMap,
 }
 
 impl WriteLockRegistry {
@@ -33,10 +47,11 @@ impl WriteLockRegistry {
         Self::default()
     }
 
-    /// Acquire the lock for `key`, creating it if this is the first call for that key. The returned
-    /// guard is `'static` (owns its `Arc`), so it can be held across `.await` points and moved into a
-    /// spawned task.
-    pub async fn lock(&self, key: &str) -> OwnedMutexGuard<()> {
+    /// Acquire the lock for `key`, creating its entry if this is the first call for that key. The
+    /// returned guard is `'static` (owns its `Arc`), so it can be held across `.await` points and moved
+    /// into a spawned task; dropping it releases the lock and, if no one else is waiting on this key,
+    /// evicts the key's entry from the registry.
+    pub async fn lock(&self, key: &str) -> WriteLockGuard {
         let mutex: Arc<AsyncMutex<()>> = self
             .locks
             .lock()
@@ -44,7 +59,50 @@ impl WriteLockRegistry {
             .entry(key.to_string())
             .or_insert_with(|| Arc::new(AsyncMutex::new(())))
             .clone();
-        mutex.lock_owned().await
+        let guard = mutex.lock_owned().await;
+        WriteLockGuard {
+            guard: Some(guard),
+            locks: self.locks.clone(),
+            key: key.to_string(),
+        }
+    }
+
+    #[cfg(test)]
+    fn key_count(&self) -> usize {
+        self.locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+}
+
+/// RAII guard returned by [`WriteLockRegistry::lock`]. Releases the per-key mutex on drop and, if that
+/// was the last outstanding reference to the key (no other guard or in-flight `lock()` call still holds
+/// a clone of its `Arc`), removes the key's entry from the registry so it doesn't linger forever.
+pub struct WriteLockGuard {
+    guard: Option<OwnedMutexGuard<()>>,
+    locks: LockMap,
+    key: String,
+}
+
+impl Drop for WriteLockGuard {
+    fn drop(&mut self) {
+        // Drop the mutex guard first: this both unlocks the per-key mutex and releases this holder's
+        // own strong reference to its `Arc`, so the strong-count check below reflects reality.
+        self.guard.take();
+        let mut locks = self
+            .locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(arc) = locks.get(&self.key) {
+            // Only the map itself still references this key's `Arc` — no other guard or queued
+            // `lock()` caller holds a clone — so it's safe to evict. Checked while holding `locks`'
+            // own lock, which every `lock()` call must also acquire to clone the `Arc`, so a
+            // concurrent caller can't slip in between this check and the removal.
+            if Arc::strong_count(arc) == 1 {
+                locks.remove(&self.key);
+            }
+        }
     }
 }
 
@@ -167,6 +225,61 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_millis(180),
             "distinct keys must run concurrently, not serialize"
+        );
+    }
+
+    #[tokio::test]
+    async fn releasing_the_only_holder_evicts_the_key() {
+        let registry = WriteLockRegistry::new();
+        assert_eq!(registry.key_count(), 0);
+
+        let guard = registry.lock("evict.rs").await;
+        assert_eq!(registry.key_count(), 1);
+        drop(guard);
+
+        assert_eq!(
+            registry.key_count(),
+            0,
+            "the map entry must be evicted once its only holder drops"
+        );
+    }
+
+    #[tokio::test]
+    async fn entry_survives_until_every_concurrent_holder_has_finished() {
+        use std::time::Duration;
+
+        let registry = Arc::new(WriteLockRegistry::new());
+
+        let first_registry = registry.clone();
+        let first = tokio::spawn(async move {
+            let _guard = first_registry.lock("contended.rs").await;
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        });
+        // Let the first task actually acquire before the second queues up behind it.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(registry.key_count(), 1);
+
+        let second_registry = registry.clone();
+        let second = tokio::spawn(async move {
+            let _guard = second_registry.lock("contended.rs").await;
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        });
+        // Give the second task time to queue up (clone the `Arc`) behind the first.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        first.await.unwrap();
+        // The first holder finished, but the second is still queued/holding — must not be evicted yet.
+        assert_eq!(
+            registry.key_count(),
+            1,
+            "entry must not be evicted while a second caller is still using it"
+        );
+
+        second.await.unwrap();
+        assert_eq!(
+            registry.key_count(),
+            0,
+            "entry must be evicted once every concurrent holder has finished"
         );
     }
 }

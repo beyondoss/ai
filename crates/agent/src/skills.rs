@@ -15,8 +15,6 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::path_utils::push_unique_root;
-
 /// A discovered skill: enough to advertise it; the body stays on disk until needed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skill {
@@ -28,6 +26,15 @@ pub struct Skill {
     /// from its description, but a user can still trigger it explicitly via `/skill:name`. Such skills
     /// are discovered (so the explicit lookup works) but omitted from the `<available_skills>` listing.
     pub disable_model_invocation: bool,
+    /// Which discovery root this skill actually came from — `"user"` (`~/.claude/skills`,
+    /// `~/.agents/skills`), `"project"` (`<cwd>/.claude/skills`, an `.agents/skills` ancestor), or
+    /// `"temporary"` (an operator-supplied `--skill` extra root) — matching pi's own `SourceScope`
+    /// (`source-info.ts`). Surfaced via `serve`'s `get_commands` (Task #39 pi-parity fix: previously
+    /// omitted entirely). Set once per discovery-root group in `discover_with_diagnostics_impl`
+    /// (`parse_skill` itself has no notion of which root it was reached from), so every constructor of
+    /// a fresh `Skill` picks *some* value here — never left meaningfully unset — even though the exact
+    /// value is always overwritten immediately by that per-root pass.
+    pub scope: &'static str,
 }
 
 /// A single diagnostic surfaced by [`discover_with_diagnostics`] / [`crate::prompts::discover_with_diagnostics`]
@@ -151,16 +158,20 @@ fn discover_with_diagnostics_impl(
     // `.agents/skills` roots first, so `.claude/skills` — the tool-specific customization a project
     // maintainer wrote deliberately for this agent — wins on a same-named collision against the
     // vendor-neutral fallback convention (this crate's own `standard_roots` fold below keeps whichever
-    // root is processed *later*; see the loop's own comment).
-    let mut agents_roots: Vec<PathBuf> = Vec::new();
-    let mut standard_roots: Vec<PathBuf> = Vec::new();
+    // root is processed *later*; see the loop's own comment). Paired with the `scope` (Task #39 —
+    // `"user"`/`"project"`, matching pi's own `SourceScope`) each root's own skills get tagged with,
+    // since `Skill::scope` is set once per root group below rather than threaded through `parse_skill`
+    // itself, which has no notion of which root it was reached from.
+    let mut agents_roots: Vec<(PathBuf, &'static str)> = Vec::new();
+    let mut standard_roots: Vec<(PathBuf, &'static str)> = Vec::new();
     // Canonical form of every root added so far, across `agents_roots`/`standard_roots`/the extra-root
-    // loop below (see `push_unique_root`'s own doc comment).
+    // loop below — see `path_utils::push_unique_scoped_root`'s own doc comment.
     let mut seen_roots: HashSet<PathBuf> = HashSet::new();
+    use crate::path_utils::push_unique_scoped_root as push_scoped;
     if include_standard_roots {
         let user_agents_skills = home_dir().map(|h| h.join(".agents/skills"));
         if let Some(dir) = &user_agents_skills {
-            push_unique_root(&mut agents_roots, &mut seen_roots, dir.clone());
+            push_scoped(&mut agents_roots, &mut seen_roots, dir.clone(), "user");
         }
         if project_trusted {
             // Furthest (enclosing git-repo root, or filesystem root if none) to nearest (`cwd`), so the
@@ -173,22 +184,24 @@ fn discover_with_diagnostics_impl(
             ancestors.reverse();
             for dir in ancestors {
                 if user_agents_skills.as_deref() != Some(dir.as_path()) {
-                    push_unique_root(&mut agents_roots, &mut seen_roots, dir);
+                    push_scoped(&mut agents_roots, &mut seen_roots, dir, "project");
                 }
             }
         }
         if let Some(home) = home_dir() {
-            push_unique_root(
+            push_scoped(
                 &mut standard_roots,
                 &mut seen_roots,
                 home.join(".claude/skills"),
+                "user",
             );
         }
         if project_trusted {
-            push_unique_root(
+            push_scoped(
                 &mut standard_roots,
                 &mut seen_roots,
                 cwd.join(".claude/skills"),
+                "project",
             );
         }
     }
@@ -209,7 +222,13 @@ fn discover_with_diagnostics_impl(
             if !seen_roots.insert(crate::path_utils::resolved_path(&root)) {
                 continue;
             }
-            let (skills, diagnostics) = discover_in_with_diagnostics(&root);
+            let (mut skills, diagnostics) = discover_in_with_diagnostics(&root);
+            // Task #39: an operator-supplied `--skill` root is pi's own "temporary" scope
+            // (`createSyntheticSourceInfo`'s own default when no `scope` is given at all) — neither the
+            // user's own machine-wide directory nor the current project's standard root.
+            for skill in &mut skills {
+                skill.scope = "temporary";
+            }
             collisions.extend(
                 diagnostics
                     .into_iter()
@@ -227,7 +246,10 @@ fn discover_with_diagnostics_impl(
             // more specific "--skill file" framing below, so `parse_skill`'s own diagnostic (which
             // would otherwise duplicate it) is intentionally not folded into `collisions`.
             match parse_skill(&root, &mut Vec::new()) {
-                Some(skill) => extra_root_skills.push(vec![skill]),
+                Some(mut skill) => {
+                    skill.scope = "temporary";
+                    extra_root_skills.push(vec![skill]);
+                }
                 None => {
                     let message = format!(
                         "--skill file has no usable frontmatter (needs a non-empty description): \
@@ -249,8 +271,11 @@ fn discover_with_diagnostics_impl(
     // `.agents/skills` roots first (see the comment where `agents_roots` was built above), then the
     // two `.claude/skills` roots — each fold keeps whichever definition of a same-named skill is
     // processed *later*, so `.claude/skills` ends up winning over `.agents/skills` overall.
-    for root in agents_roots {
-        let (skills, diagnostics) = discover_in_with_diagnostics_skill_md_only(&root);
+    for (root, scope) in agents_roots {
+        let (mut skills, diagnostics) = discover_in_with_diagnostics_skill_md_only(&root);
+        for skill in &mut skills {
+            skill.scope = scope;
+        }
         collisions.extend(
             diagnostics
                 .into_iter()
@@ -258,8 +283,11 @@ fn discover_with_diagnostics_impl(
         );
         fold_skills_later_wins(&mut found, skills, &mut collisions);
     }
-    for root in standard_roots {
-        let (skills, diagnostics) = discover_in_with_diagnostics(&root);
+    for (root, scope) in standard_roots {
+        let (mut skills, diagnostics) = discover_in_with_diagnostics(&root);
+        for skill in &mut skills {
+            skill.scope = scope;
+        }
         collisions.extend(
             diagnostics
                 .into_iter()
@@ -567,6 +595,9 @@ fn parse_skill(manifest: &Path, diagnostics: &mut Vec<String>) -> Option<Skill> 
         description,
         path: manifest.to_path_buf(),
         disable_model_invocation,
+        // Always overwritten by the caller — see `Skill::scope`'s own doc comment for why `parse_skill`
+        // itself has no way to know which root this manifest was actually reached through.
+        scope: "temporary",
     })
 }
 
@@ -1994,6 +2025,7 @@ mod tests {
             description: "Run the linter".into(),
             path: PathBuf::from("/x/.claude/skills/lint/SKILL.md"),
             disable_model_invocation: false,
+            scope: "user",
         }];
         let rendered = format_available(&skills);
         assert!(rendered.contains("<available_skills>"));
@@ -2016,6 +2048,7 @@ mod tests {
             description: "Hidden".into(),
             path: PathBuf::from("/x/.claude/skills/hidden/SKILL.md"),
             disable_model_invocation: true,
+            scope: "user",
         }];
         assert_eq!(format_available(&skills), "");
         assert_eq!(format_available(&[]), "");
@@ -2029,12 +2062,14 @@ mod tests {
                 description: "Visible".into(),
                 path: PathBuf::from("/x/.claude/skills/visible/SKILL.md"),
                 disable_model_invocation: false,
+                scope: "user",
             },
             Skill {
                 name: "hidden".into(),
                 description: "Hidden".into(),
                 path: PathBuf::from("/x/.claude/skills/hidden/SKILL.md"),
                 disable_model_invocation: true,
+                scope: "user",
             },
         ];
         let rendered = format_available(&skills);
@@ -2053,6 +2088,7 @@ mod tests {
                 .into(),
             path: PathBuf::from("/x/.claude/skills/innocuous/SKILL.md"),
             disable_model_invocation: false,
+            scope: "user",
         }];
         let rendered = format_available(&skills);
         assert!(
@@ -2072,6 +2108,7 @@ mod tests {
             description: "plain".into(),
             path: PathBuf::from("/x/<injected>/SKILL.md"),
             disable_model_invocation: false,
+            scope: "user",
         }];
         let rendered = format_available(&skills);
         assert!(!rendered.contains("<b>bold</b>"));

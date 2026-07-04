@@ -23,7 +23,7 @@ use agent_core::{Agent, GatewayClient, Session, StreamEvent, Tool};
 use beyond_ai_agent::policy::ToolPolicy;
 use beyond_ai_agent::session_store::{
     SessionMeta, SessionRepo, SessionStore, canonical_cwd, default_session_dir, fork_by_arg,
-    sessions_root,
+    is_path_like, open_session_by_id, sessions_root,
 };
 use beyond_ai_agent::{serve, tools};
 use clap::{Parser, Subcommand};
@@ -143,6 +143,155 @@ fn parse_reasoning_effort(s: &str) -> Result<agent_core::ReasoningEffort, String
         other => Err(format!(
             "invalid reasoning effort {other:?}; expected one of minimal/low/medium/high/xhigh"
         )),
+    }
+}
+
+/// The one further fallback tier below `--key`/`AI_AGENT_KEY`: an inferred, stored OAuth
+/// subscription login for whichever provider `model` implies. Consulted only when no explicit
+/// key/env var was given — an explicit `--key`/`AI_AGENT_KEY` always wins outright, unchanged.
+///
+/// Inference is deliberately non-uniform across providers — a bare model id is unambiguous for some,
+/// not others:
+/// - Anthropic: any Claude-dialect model id ([`agent_core::dialect::Dialect::for_model`]'s own rule)
+///   — there's only one possible account for a Claude request, safe to infer unconditionally.
+/// - OpenAI Codex: a model id containing `"codex"` — this crate has no ChatGPT-Codex model catalog of
+///   its own to consult, so a name heuristic is as precise as it gets today.
+/// - GitHub Copilot: *not* inferred by model-id prefix at all — Copilot's model set is dynamic,
+///   discovered at login time and recorded in the stored credential's own `available_model_ids`, so
+///   it's matched only if `model` actually appears there.
+///
+/// If both a direct Anthropic credential and a Copilot credential (whose `available_model_ids`
+/// includes `model`) are stored, the direct credential wins — checked first below, preferring the
+/// more specific, directly-authenticated relationship over a proxy.
+fn resolve_gateway_credential(
+    key: Option<String>,
+    model: &str,
+) -> Result<serve::GatewayCredential, String> {
+    if let Some(key) = key {
+        return Ok(serve::GatewayCredential::Static(key));
+    }
+
+    let store = beyond_ai_agent::auth_store::AuthStore::open_default();
+    let oauth_source = |provider: beyond_ai_agent::oauth::OAuthProviderId| {
+        serve::GatewayCredential::Oauth(Arc::new(
+            beyond_ai_agent::auth_credential_source::OAuthCredentialSource::new(
+                provider,
+                beyond_ai_agent::auth_store::default_path(),
+            ),
+        ))
+    };
+
+    if agent_core::dialect::Dialect::for_model(model) == agent_core::dialect::Dialect::Anthropic
+        && store.get("anthropic").is_some()
+    {
+        return Ok(oauth_source(beyond_ai_agent::oauth::OAuthProviderId::Anthropic));
+    }
+    if model.contains("codex") && store.get("openai-codex").is_some() {
+        return Ok(oauth_source(
+            beyond_ai_agent::oauth::OAuthProviderId::OpenaiCodex,
+        ));
+    }
+    if let Some(stored) = store.get("github-copilot") {
+        if let beyond_ai_agent::oauth::OAuthCredential::GithubCopilot(c) = &stored.credential {
+            if c.available_model_ids.iter().any(|m| m == model) {
+                return Ok(oauth_source(
+                    beyond_ai_agent::oauth::OAuthProviderId::GithubCopilot,
+                ));
+            }
+        }
+    }
+
+    Err(format!(
+        "no gateway key: pass --key or set AI_AGENT_KEY (a bai_v1… virtual key), or run `agent login \
+         <provider>` to use a subscription for model {model:?}"
+    ))
+}
+
+fn unknown_provider_error(provider: &str) -> String {
+    format!("unknown provider {provider:?}; expected one of: anthropic, github-copilot, openai-codex")
+}
+
+/// Drives `agent login`'s interactive prompts over stderr/stdin — the CLI's one implementation of
+/// [`beyond_ai_agent::oauth::LoginCallbacks`]. `agent login` is a dedicated, single-purpose blocking
+/// invocation with no concurrent-command concerns (unlike `serve`), so blocking stdin reads (moved to
+/// a `spawn_blocking` task, out of hygiene rather than necessity here) are the whole interaction —
+/// there's no need for `serve`'s RPC surface's separate ack-now/respond-later, push-frame shape.
+struct CliLoginCallbacks;
+
+#[async_trait::async_trait]
+impl beyond_ai_agent::oauth::LoginCallbacks for CliLoginCallbacks {
+    async fn show_auth_url(&self, url: &str, instructions: Option<&str>) {
+        eprintln!("Open this URL in a browser to continue:\n\n  {url}\n");
+        if let Some(instructions) = instructions {
+            eprintln!("{instructions}");
+        }
+    }
+
+    async fn show_device_code(&self, info: &beyond_ai_agent::oauth::DeviceCodeInfo) {
+        eprintln!(
+            "Go to {} and enter this code: {}",
+            info.verification_uri, info.user_code
+        );
+        eprintln!("Waiting for authorization...");
+    }
+
+    async fn progress(&self, message: &str) {
+        eprintln!("{message}");
+    }
+
+    async fn prompt_text(
+        &self,
+        prompt: &beyond_ai_agent::oauth::TextPrompt<'_>,
+    ) -> Result<String, beyond_ai_agent::oauth::OAuthError> {
+        eprint!("{}", prompt.message);
+        if let Some(placeholder) = prompt.placeholder {
+            eprint!(" [{placeholder}]");
+        }
+        eprint!(": ");
+        let _ = std::io::stderr().flush();
+        tokio::task::spawn_blocking(|| {
+            let mut line = String::new();
+            std::io::stdin()
+                .read_line(&mut line)
+                .map_err(|e| beyond_ai_agent::oauth::OAuthError::InvalidInput(e.to_string()))?;
+            Ok(line.trim().to_string())
+        })
+        .await
+        .map_err(|e| beyond_ai_agent::oauth::OAuthError::InvalidInput(e.to_string()))?
+    }
+
+    async fn select(
+        &self,
+        prompt: &beyond_ai_agent::oauth::SelectPrompt<'_>,
+    ) -> Result<Option<String>, beyond_ai_agent::oauth::OAuthError> {
+        eprintln!("{}", prompt.message);
+        for (i, opt) in prompt.options.iter().enumerate() {
+            eprintln!("  {}. {} ({})", i + 1, opt.label, opt.id);
+        }
+        eprint!("Enter a number [1]: ");
+        let _ = std::io::stderr().flush();
+        let choice = tokio::task::spawn_blocking(|| {
+            let mut line = String::new();
+            let _ = std::io::stdin().read_line(&mut line);
+            line.trim().to_string()
+        })
+        .await
+        .unwrap_or_default();
+
+        let options: Vec<&str> = prompt.options.iter().map(|o| o.id.as_str()).collect();
+        if choice.is_empty() {
+            return Ok(options.first().map(|s| s.to_string()));
+        }
+        if let Ok(n) = choice.parse::<usize>() {
+            if n >= 1 && n <= options.len() {
+                return Ok(Some(options[n - 1].to_string()));
+            }
+        }
+        // Also accept typing the id directly.
+        Ok(options
+            .into_iter()
+            .find(|id| *id == choice)
+            .map(str::to_string))
     }
 }
 
@@ -328,15 +477,27 @@ enum Command {
         /// pi's own `--no-context-files`/`-nc`.
         #[arg(long, default_value_t = false)]
         no_context_files: bool,
-        /// Discover skills from this directory too, in addition to the two standard roots (repeatable).
-        /// Matches pi's own `--skill <path>`. A path that doesn't exist is warned about, not silently
-        /// ignored. Wins over the standard roots on a name collision.
-        #[arg(long = "skill", value_name = "PATH")]
+        /// Discover skills from this directory too, in addition to the two standard roots (repeatable,
+        /// or comma-separated via `AI_AGENT_SKILL_PATH` — matching `--tools`/`AI_AGENT_TOOLS`'s own
+        /// comma-separated env-var convention). Matches pi's own `--skill <path>`. A path that doesn't
+        /// exist is warned about, not silently ignored. Wins over the standard roots on a name collision.
+        #[arg(
+            long = "skill",
+            env = "AI_AGENT_SKILL_PATH",
+            value_delimiter = ',',
+            value_name = "PATH"
+        )]
         extra_skill_paths: Vec<String>,
         /// Discover prompt templates from this directory too, in addition to the two standard roots
-        /// (repeatable). Matches pi's own `--prompt-template <path>`; see `--skill`'s doc comment for
-        /// the missing-path/shadow-order behavior, which applies identically here.
-        #[arg(long = "prompt-template", value_name = "PATH")]
+        /// (repeatable, or comma-separated via `AI_AGENT_PROMPT_TEMPLATE_PATH`). Matches pi's own
+        /// `--prompt-template <path>`; see `--skill`'s doc comment for the missing-path/shadow-order
+        /// behavior, which applies identically here.
+        #[arg(
+            long = "prompt-template",
+            env = "AI_AGENT_PROMPT_TEMPLATE_PATH",
+            value_delimiter = ',',
+            value_name = "PATH"
+        )]
         extra_prompt_template_paths: Vec<String>,
         /// Set this run's session name up front, before the first turn even starts — a whitespace-only
         /// value is rejected rather than silently producing a blank/meaningless name, matching pi's own
@@ -360,8 +521,11 @@ enum Command {
         /// RPC commands cover forking at an earlier point once a session is running.
         #[arg(long, value_name = "PATH_OR_ID")]
         fork: Option<String>,
-        /// Persist this run to a specific session file, creating it if missing or continuing it if it
-        /// already exists — so a later `run --session <path>` picks up where this one left off. Wins
+        /// Persist this run to a specific session, creating it if missing or continuing it if it already
+        /// exists — so a later `run --session <path|id>` picks up where this one left off. Accepts
+        /// either a direct path to a `.jsonl` file (created fresh if it doesn't exist yet) or a bare
+        /// session id/unique prefix, resolved against the current project's own repo first, then every
+        /// other project's under `--session-dir`'s root — matching pi's own `--session <path|id>`. Wins
         /// over `--continue` if both are given.
         #[arg(long)]
         session: Option<String>,
@@ -591,14 +755,25 @@ enum Command {
         /// on every `reload` too. `-np` matches pi's own `--no-prompt-templates`/`-np`.
         #[arg(long, default_value_t = false)]
         no_prompt_templates: bool,
-        /// Discover skills from this directory too, in addition to the two standard roots (repeatable).
-        /// Matches pi's own `--skill <path>` and `run`'s identical flag; applies on every `reload` too.
-        #[arg(long = "skill", value_name = "PATH")]
+        /// Discover skills from this directory too, in addition to the two standard roots (repeatable,
+        /// or comma-separated via `AI_AGENT_SKILL_PATH`). Matches pi's own `--skill <path>` and `run`'s
+        /// identical flag; applies on every `reload` too.
+        #[arg(
+            long = "skill",
+            env = "AI_AGENT_SKILL_PATH",
+            value_delimiter = ',',
+            value_name = "PATH"
+        )]
         extra_skill_paths: Vec<String>,
         /// Discover prompt templates from this directory too, in addition to the two standard roots
-        /// (repeatable). Matches pi's own `--prompt-template <path>` and `run`'s identical flag; applies
-        /// on every `reload` too.
-        #[arg(long = "prompt-template", value_name = "PATH")]
+        /// (repeatable, or comma-separated via `AI_AGENT_PROMPT_TEMPLATE_PATH`). Matches pi's own
+        /// `--prompt-template <path>` and `run`'s identical flag; applies on every `reload` too.
+        #[arg(
+            long = "prompt-template",
+            env = "AI_AGENT_PROMPT_TEMPLATE_PATH",
+            value_delimiter = ',',
+            value_name = "PATH"
+        )]
         extra_prompt_template_paths: Vec<String>,
         /// Set the initial session's name up front, before the first turn even starts — a whitespace-only
         /// value is rejected, matching pi's own `--name`. Unlike pi (which renames unconditionally on
@@ -654,6 +829,27 @@ enum Command {
         /// The project directory to query. Defaults to the current directory.
         path: Option<String>,
     },
+    /// Log into a subscription provider (`anthropic`, `github-copilot`, or `openai-codex`) instead of
+    /// a metered API key — an OAuth PKCE or device-code flow, printing progress to stderr and
+    /// blocking until it completes, is cancelled (Ctrl-C), or times out. Overwrites any existing
+    /// stored credential for `provider` on success only. See `beyond_ai_agent::oauth`/`auth_store`.
+    Login {
+        /// `anthropic`, `github-copilot`, or `openai-codex`.
+        provider: String,
+    },
+    /// Remove `provider`'s stored subscription credential, if any. Idempotent.
+    Logout {
+        /// `anthropic`, `github-copilot`, or `openai-codex`.
+        provider: String,
+    },
+    /// Report stored subscription-login status — `logged_in`/`logged_out`/`needs_reauth` — for
+    /// `provider`, or every known provider when omitted. A pure read of the local store; never makes
+    /// a network call (so a `needs_reauth` credential still shows as configured until an actual
+    /// request or `agent login` re-establishes it).
+    AuthStatus {
+        /// `anthropic`, `github-copilot`, or `openai-codex`. Omit to report every known provider.
+        provider: Option<String>,
+    },
     /// View or update persisted defaults for `run`/`serve` flags — model, gateway URL, session
     /// directory — stored at `~/.claude/settings.json` (see `settings::SettingsStore`) and consulted as
     /// the last fallback after an explicit `--flag`/environment variable, before this crate's own
@@ -701,6 +897,97 @@ enum Command {
     },
 }
 
+/// Whether `candidate` fuzzy-matches `query`, and if so a score for ranking (lower is a better match) —
+/// `Command::ListModels`'s `--list-models <search>` fuzzy filter, porting pi's own `fuzzyMatch`
+/// (`packages/tui/src/fuzzy.ts`): every character of `query` must appear in `candidate`, in order and
+/// case-insensitively, but not necessarily adjacent — so "sn5" matches "claude-sonnet-4-5", which a
+/// plain substring check never would. A consecutive run of matched characters, and a match starting
+/// right at a word boundary (candidate index 0, or right after `-`/`_`/`.`/`/`/`:`/whitespace), both
+/// score better (more negative); a gap between two matches and a later match position both score
+/// slightly worse. `None` when `query` doesn't match at all (including as the alpha/digit-swapped
+/// fallback below).
+fn fuzzy_match(query: &str, candidate: &str) -> Option<f64> {
+    fn match_subsequence(query: &str, candidate: &str) -> Option<f64> {
+        if query.is_empty() {
+            return Some(0.0);
+        }
+        let candidate_chars: Vec<char> = candidate.chars().collect();
+        let query_chars: Vec<char> = query.chars().collect();
+        if query_chars.len() > candidate_chars.len() {
+            return None;
+        }
+        let mut query_index = 0usize;
+        let mut score = 0.0f64;
+        let mut last_match_index: i64 = -1;
+        let mut consecutive: i64 = 0;
+        for (i, &c) in candidate_chars.iter().enumerate() {
+            if query_index >= query_chars.len() {
+                break;
+            }
+            if c != query_chars[query_index] {
+                continue;
+            }
+            let i64_i = i as i64;
+            let is_word_boundary =
+                i == 0 || matches!(candidate_chars[i - 1], ' ' | '-' | '_' | '.' | '/' | ':');
+            if last_match_index == i64_i - 1 {
+                consecutive += 1;
+                score -= (consecutive * 5) as f64;
+            } else {
+                consecutive = 0;
+                if last_match_index >= 0 {
+                    score += ((i64_i - last_match_index - 1) * 2) as f64;
+                }
+            }
+            if is_word_boundary {
+                score -= 10.0;
+            }
+            score += i as f64 * 0.1;
+            last_match_index = i64_i;
+            query_index += 1;
+        }
+        if query_index < query_chars.len() {
+            return None;
+        }
+        if query == candidate {
+            score -= 100.0;
+        }
+        Some(score)
+    }
+
+    let query_lower = query.to_ascii_lowercase();
+    let candidate_lower = candidate.to_ascii_lowercase();
+    if let Some(score) = match_subsequence(&query_lower, &candidate_lower) {
+        return Some(score);
+    }
+    // A query typed in the opposite letter/digit order (e.g. "5sonnet" for "sonnet5") — pi's own
+    // regex-based fallback, tried only once the direct match fails outright, with a flat penalty for
+    // having needed it.
+    swap_alpha_digit(&query_lower)
+        .and_then(|swapped| match_subsequence(&swapped, &candidate_lower))
+        .map(|score| score + 5.0)
+}
+
+/// Swap a query that's entirely `letters` followed by `digits` (or vice versa) to the other order — the
+/// two shapes [`fuzzy_match`]'s fallback tries, matching pi's own `^[a-z]+[0-9]+$`/`^[0-9]+[a-z]+$`
+/// regex pair. `None` for anything else (mixed/interleaved characters, or already all one class).
+fn swap_alpha_digit(query: &str) -> Option<String> {
+    let chars: Vec<char> = query.chars().collect();
+    if let Some(split) = chars.iter().position(|c| !c.is_ascii_lowercase()) {
+        if split > 0 && chars[split..].iter().all(char::is_ascii_digit) {
+            let (letters, digits) = (&chars[..split], &chars[split..]);
+            return Some(digits.iter().chain(letters).collect());
+        }
+    }
+    if let Some(split) = chars.iter().position(|c| !c.is_ascii_digit()) {
+        if split > 0 && chars[split..].iter().all(char::is_ascii_lowercase) {
+            let (digits, letters) = (&chars[..split], &chars[split..]);
+            return Some(letters.iter().chain(digits).collect());
+        }
+    }
+    None
+}
+
 /// Rewrites the multi-character short-flag aliases pi's own hand-rolled CLI parser accepts
 /// (`cli/args.ts`) to their long-flag equivalent before clap ever sees them. clap's own `short`
 /// mechanism (used below for the single-character aliases, e.g. `-t`/`-a`) is exactly one ASCII
@@ -719,6 +1006,12 @@ fn expand_short_aliases(args: Vec<String>) -> Vec<String> {
             "-np" => Some("--no-prompt-templates"),
             "-nc" => Some("--no-context-files"),
             "-na" => Some("--force-untrusted"),
+            // Task #43: clap's auto-generated version flag only binds the capital `-V`; pi documents a
+            // lowercase `-v` alias too (`cli/args.ts`). A one-character alias could in principle use
+            // clap's own `short` mechanism directly (unlike the two-character aliases above, which
+            // can't), but doing it here keeps every alias in this one table rather than splitting the
+            // convention across two different mechanisms for no real benefit.
+            "-v" => Some("--version"),
             _ => None,
         }
     };
@@ -934,8 +1227,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             name,
             prompt_guidelines,
         } => {
-            let key = key
-                .ok_or("no gateway key: pass --key or set AI_AGENT_KEY (a bai_v1… virtual key)")?;
             if let Some(path) = &bash_shell_path {
                 if !std::path::Path::new(path).exists() {
                     return Err(format!("--bash-shell-path not found: {path}").into());
@@ -990,6 +1281,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // A stored `agent settings` default sits between an explicit flag/env var and this crate's
             // own built-in default — same convention `run_task` applies (see its identical comment).
             let stored_settings = beyond_ai_agent::settings::SettingsStore::open_default();
+            let resolved_model = model
+                .or_else(|| stored_settings.get().default_model.clone())
+                .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+            // The one further fallback tier below `--key`/`AI_AGENT_KEY`: an inferred, stored OAuth
+            // subscription login for whichever provider `resolved_model` implies. See
+            // `resolve_gateway_credential`'s own doc comment.
+            let key = resolve_gateway_credential(key, &resolved_model)?;
             let resolved_session_dir = session_dir.or_else(|| {
                 // Only synthesize a stored default when *neither* explicit flag was given —
                 // `Persistence::open` checks `session_dir` before `session_file`, so filling in a
@@ -1001,14 +1299,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     None
                 }
             });
-            serve::serve(serve::ServeConfig {
+            let shutdown_cause = serve::serve(serve::ServeConfig {
                 gateway: gateway_url
                     .or_else(|| stored_settings.get().default_gateway_url.clone())
                     .unwrap_or_else(|| DEFAULT_GATEWAY.to_string()),
                 key,
-                model: model
-                    .or_else(|| stored_settings.get().default_model.clone())
-                    .unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+                model: resolved_model,
                 max_steps,
                 max_tokens,
                 system,
@@ -1057,7 +1353,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // a `Runtime` waits for every outstanding blocking task, and a parked stdin read never
             // completes on its own. Exit explicitly instead — `serve` has already drained,
             // persisted, and flushed everything before returning, so there's nothing left to lose.
-            std::process::exit(0);
+            // Task #41 (pi-parity fix): `shutdown_cause` distinguishes a real signal-triggered
+            // shutdown from a clean stdin-EOF one — previously every graceful path exited 0
+            // unconditionally, matching neither pi's own `rpc-mode.ts` (143/129 for SIGTERM/SIGHUP)
+            // nor a shell's own convention for reporting which signal actually stopped a process.
+            std::process::exit(shutdown_cause.map(serve::Signal::exit_code).unwrap_or(0));
         }
         Command::Tools => {
             let reg = tools::default_registry();
@@ -1072,20 +1372,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // columns from `agent_core::capabilities`, which already computes every one of them for
             // wire-shaping — nothing new is invented here, just surfaced.
             //
-            // pi-parity fix: an optional positional `search` filters to model ids containing it
-            // (case-insensitive substring — matches pi's own `--list-models <search>`), for a long list
-            // with no separate provider column to filter on here (see the comment above).
-            let needle = search.map(|s| s.to_ascii_lowercase());
+            // Task #51 (pi-parity fix): an optional positional `search` fuzzy-filters model ids —
+            // matches pi's own `--list-models <search>` (`fuzzyFilter`/`fuzzyMatch`,
+            // `packages/tui/src/fuzzy.ts`), a non-contiguous, order-preserving, word-boundary-scored
+            // subsequence match rather than a plain substring check, so e.g. "sn5" finds
+            // "claude-sonnet-4-5" the way pi's own table search does. Previously a plain
+            // case-insensitive `contains`, which that query would never match at all.
+            let models: Vec<&str> = match &search {
+                Some(query) => {
+                    let mut scored: Vec<(&str, f64)> = serve::available_models()
+                        .iter()
+                        .filter_map(|m| fuzzy_match(query, m).map(|score| (*m, score)))
+                        .collect();
+                    // Lower score is a better match (mirrors pi's own ascending sort) — a stable sort
+                    // keeps `available_models()`'s own relative order as the tie-break, same as pi's
+                    // `Array.prototype.sort` (stable per spec).
+                    scored
+                        .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                    scored.into_iter().map(|(m, _)| m).collect()
+                }
+                None => serve::available_models().to_vec(),
+            };
             println!(
                 "{:<22} {:>10} {:>9} {:<8} {:<6}",
                 "model", "context", "max-out", "thinking", "vision"
             );
-            for model in serve::available_models() {
-                if let Some(needle) = &needle {
-                    if !model.to_ascii_lowercase().contains(needle.as_str()) {
-                        continue;
-                    }
-                }
+            for model in models {
                 let caps = agent_core::capabilities(model);
                 let thinking = caps.reasoning_effort
                     || caps.thinking != agent_core::models::ThinkingShape::None;
@@ -1138,6 +1450,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 beyond_ai_agent::trust_store::Trust::Unknown => "unknown",
             };
             println!("{status}: {}", dir.display());
+        }
+        Command::Login { provider } => {
+            let provider_id = beyond_ai_agent::oauth::OAuthProviderId::parse(&provider)
+                .ok_or_else(|| unknown_provider_error(&provider))?;
+            let cancel = agent_core::CancellationToken::new();
+            let credential =
+                beyond_ai_agent::oauth::login(provider_id, &CliLoginCallbacks, &cancel).await?;
+            let mut store = beyond_ai_agent::auth_store::AuthStore::open_default();
+            store.set(provider_id.store_key(), credential)?;
+            println!("logged in: {provider_id}");
+        }
+        Command::Logout { provider } => {
+            let provider_id = beyond_ai_agent::oauth::OAuthProviderId::parse(&provider)
+                .ok_or_else(|| unknown_provider_error(&provider))?;
+            let mut store = beyond_ai_agent::auth_store::AuthStore::open_default();
+            if store.remove(provider_id.store_key())? {
+                println!("logged out: {provider_id}");
+            } else {
+                println!("not logged in: {provider_id}");
+            }
+        }
+        Command::AuthStatus { provider } => {
+            let store = beyond_ai_agent::auth_store::AuthStore::open_default();
+            let providers = match &provider {
+                Some(p) => vec![
+                    beyond_ai_agent::oauth::OAuthProviderId::parse(p)
+                        .ok_or_else(|| unknown_provider_error(p))?,
+                ],
+                None => beyond_ai_agent::oauth::OAuthProviderId::all().to_vec(),
+            };
+            for id in providers {
+                let status = match store.get(id.store_key()) {
+                    None => "logged_out",
+                    Some(stored) if stored.last_refresh_error.is_some() => "needs_reauth",
+                    Some(_) => "logged_in",
+                };
+                println!("{id}: {status}");
+            }
         }
         Command::Settings {
             model,
@@ -1201,11 +1551,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 beyond_ai_agent::session_store::SessionStore::open(PathBuf::from(&session))
                     .map_err(|e| format!("failed to open session {session}: {e}"))?;
             let branches = store.abandoned_branches();
-            let path = beyond_ai_agent::export::export_html_with_entries(
+            // `export_html_full` (Task #44 integration), but with `system_prompt`/`tools` genuinely
+            // `None`: this standalone subcommand renders an already-persisted session file straight off
+            // disk with no gateway/key/model involved at all (see this crate's own ARCHITECTURE.md), so
+            // there's no live `Agent`/`ToolRegistry` here to pull either from — and the session file
+            // itself records neither the exact system prompt text nor which `--tools`/`--exclude-tools`
+            // filter (if any) a past run used, so reconstructing either would mean fabricating data
+            // that may not match what actually ran. `usage: None` for the same reason `sess`'s own
+            // token counters are never persisted/restored across a process restart (only
+            // `last_input_tokens` is, for compaction — see `SessionStore::open`) — a bare zero would
+            // misrepresent unknown as "no usage at all".
+            let path = beyond_ai_agent::export::export_html_full(
                 store.meta(),
                 &sess.messages,
                 &branches,
+                None,
                 store.export_events(),
+                None,
+                None,
                 output.as_deref(),
             )?;
             println!("Exported to: {}", path.display());
@@ -1266,13 +1629,11 @@ fn looks_like_image(path: &Path) -> bool {
     };
     matches!(
         image::guess_format(&buf[..n]),
-        Ok(
-            image::ImageFormat::Png
-                | image::ImageFormat::Jpeg
-                | image::ImageFormat::Gif
-                | image::ImageFormat::WebP
-                | image::ImageFormat::Bmp
-        )
+        Ok(image::ImageFormat::Png
+            | image::ImageFormat::Jpeg
+            | image::ImageFormat::Gif
+            | image::ImageFormat::WebP
+            | image::ImageFormat::Bmp)
     )
 }
 
@@ -1361,21 +1722,32 @@ fn read_stdin_if_piped() -> Option<String> {
 /// invocation (plausibly unattended — a cron job, a CI step) outright on a hiccup that `serve` would
 /// have quietly recovered from. A retried attempt's own streamed output (text/JSON events) follows
 /// directly after a `[retrying...]` stderr notice — nothing is erased, matching how `serve` demarcates
-/// attempts with an `auto_retry` frame rather than hiding the failed one.
-/// A cancelled turn (SIGTERM/SIGINT — see the `ShutdownSignal` wiring in `run_task`, or a future
+/// attempts with an `auto_retry_start` frame rather than hiding the failed one.
+/// A cancelled turn (SIGTERM/SIGHUP/Ctrl-C — see the `ShutdownSignal` wiring in `run_task`, or a future
 /// `--timeout` equivalent) is an expected, clean stop, not a crash: printing it through `main`'s
 /// default `Result` `Termination` would dump `Error: Cancelled` (the bare enum variant, via `Debug`)
 /// with no context a script/CI caller could act on. Matches the `[refused]`/exit(1) precedent just
 /// below in `run_task` — a clear bracketed status line on stderr, then a distinct process exit
 /// instead of unwinding further. Any other error still propagates normally via `?`.
+///
+/// `shutdown_cause` (Task #41 pi-parity fix) picks the exit code: the matching POSIX `128 + signal`
+/// code when a real shutdown signal caused this cancellation, or the prior bare `exit(1)` for a genuine
+/// non-signal cancellation (there is currently no other way `run_task`'s own `cancel` token gets
+/// tripped — see its construction in `run_task` — but this doesn't assume that stays true forever).
 fn unwrap_turn_result(
     result: agent_core::Result<agent_core::StopReason>,
+    shutdown_cause: &std::sync::Mutex<Option<serve::Signal>>,
 ) -> Result<agent_core::StopReason, Box<dyn std::error::Error>> {
     match result {
         Ok(reason) => Ok(reason),
         Err(agent_core::Error::Cancelled) => {
             eprintln!("[cancelled]");
-            std::process::exit(1);
+            let code = shutdown_cause
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .map(serve::Signal::exit_code)
+                .unwrap_or(1);
+            std::process::exit(code);
         }
         Err(e) => Err(e.into()),
     }
@@ -1386,20 +1758,21 @@ async fn run_turn(
     session: &mut Session,
     json: bool,
     cancel: &agent_core::CancellationToken,
+    retry_policy: &beyond_ai_agent::retry::RunRetryPolicy,
 ) -> agent_core::Result<agent_core::StopReason> {
     let mut attempt = 0u32;
     loop {
         let result = run_turn_once(agent, session, json, cancel).await;
         match &result {
             Err(e)
-                if attempt < beyond_ai_agent::retry::MAX_RUN_RETRIES
+                if attempt < retry_policy.max_retries
                     && beyond_ai_agent::retry::is_retryable_whole_run(e) =>
             {
                 attempt += 1;
-                let delay = beyond_ai_agent::retry::backoff(attempt);
+                let delay = retry_policy.backoff(attempt);
                 eprintln!(
                     "\n[transient error, retrying {attempt}/{}: {e}]",
-                    beyond_ai_agent::retry::MAX_RUN_RETRIES
+                    retry_policy.max_retries
                 );
                 // The failed attempt's closing error record must not survive into the retry — see
                 // `Session::pop_error_record`'s doc comment (this is the same run resuming from
@@ -1670,8 +2043,7 @@ async fn run_task(
     let model = model
         .or_else(|| stored_settings.get().default_model.clone())
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
-    let key =
-        key.ok_or("no gateway key: pass --key or set AI_AGENT_KEY (a bai_v1… virtual key)")?;
+    let key = resolve_gateway_credential(key, &model)?;
 
     // Computed once and reused below (rather than called again inside the warning check) — it's a
     // filesystem walk (`has_trust_gated_resources`'s own doc comment), not free.
@@ -1827,41 +2199,52 @@ async fn run_task(
         (Some(store), session)
     } else {
         match session_path {
-            Some(path) => {
-                let path = PathBuf::from(path);
-                // A zero-byte file at `path` (e.g. `touch`'d ahead of time, or left over from a crash
-                // before the header write landed) has nothing to open — route it through `create`, which
-                // now initializes an empty file in place rather than failing (see its own doc comment).
-                let has_content = path.metadata().is_ok_and(|m| m.len() > 0);
-                if has_content {
-                    // pi-parity fix (C-M6): bare `?` here propagated the raw `std::io::Error` straight to
-                    // `main`'s `Result`, which Rust's default `Termination` impl prints via `{:?}` — a
-                    // Debug dump of the error's internal shape (`Custom { kind: InvalidData, error: "..." }`)
-                    // with no file path at all, matching neither pi's own clear
-                    // `"Error: Session file is not a valid pi session: <path>"` nor this project's own
-                    // no-leaked-internals bar for user-facing errors. Wrapping in a plain `String` message
-                    // (still `Error: "..."` once printed, but a human-readable sentence, not an internal
-                    // struct shape) and naming `path` fixes both: the operator now sees *which* file and
-                    // *why*, instead of guessing.
-                    // pi-parity fix (C-M6): bare `?` here propagated the raw `std::io::Error` straight to
-                    // `main`'s `Result`, which Rust's default `Termination` impl prints via `{:?}` — a
-                    // Debug dump of the error's internal shape (`Custom { kind: InvalidData, error: "..." }`)
-                    // with no file path at all, matching neither pi's own clear
-                    // `"Error: Session file is not a valid pi session: <path>"` nor this project's own
-                    // no-leaked-internals bar for user-facing errors. Wrapping in a plain `String` message
-                    // (still `Error: "..."` once printed, but a human-readable sentence, not an internal
-                    // struct shape) and naming `path` fixes both: the operator now sees *which* file and
-                    // *why*, instead of guessing.
-                    let (store, session) = SessionStore::open(path.clone()).map_err(|e| {
-                        format!(
-                            "session file is not a valid session: {}: {e}",
-                            path.display()
-                        )
-                    })?;
-                    (Some(store), session)
+            Some(arg) => {
+                let literal_path = PathBuf::from(&arg);
+                // Task #24 (pi-parity fix): `--session <arg>` accepts either a literal path or a bare
+                // session id, matching pi's own `resolveSessionPath` — previously this always treated
+                // `arg` as a literal filesystem path, so a bare id (no `/`, no leading `.`/`~`, no
+                // `.jsonl` suffix — almost certainly not an existing relative path) silently created an
+                // empty, wrongly-named session file instead of reopening the one actually meant. A
+                // path-like argument, or one that already exists as a literal file, is still used as-is
+                // below (creating a fresh session there when absent, exactly as `--session` always has);
+                // anything else is resolved as a session id against the current project's repo first,
+                // then cross-project (`open_session_by_id`, the identical two-tier search `--fork <id>`
+                // already does via `fork_by_arg`) and REOPENED in place — continuing that session, not
+                // forking a new one, since that's what `--session` (unlike `--fork`) has always meant.
+                if is_path_like(&arg) || literal_path.exists() {
+                    // A zero-byte file at `literal_path` (e.g. `touch`'d ahead of time, or left over
+                    // from a crash before the header write landed) has nothing to open — route it
+                    // through `create`, which now initializes an empty file in place rather than failing
+                    // (see its own doc comment).
+                    let has_content = literal_path.metadata().is_ok_and(|m| m.len() > 0);
+                    if has_content {
+                        // pi-parity fix (C-M6): bare `?` here propagated the raw `std::io::Error`
+                        // straight to `main`'s `Result`, which Rust's default `Termination` impl prints
+                        // via `{:?}` — a Debug dump of the error's internal shape (`Custom { kind:
+                        // InvalidData, error: "..." }`) with no file path at all, matching neither pi's
+                        // own clear `"Error: Session file is not a valid pi session: <path>"` nor this
+                        // project's own no-leaked-internals bar for user-facing errors. Wrapping in a
+                        // plain `String` message (still `Error: "..."` once printed, but a human-readable
+                        // sentence, not an internal struct shape) and naming the path fixes both: the
+                        // operator now sees *which* file and *why*, instead of guessing.
+                        let (store, session) =
+                            SessionStore::open(literal_path.clone()).map_err(|e| {
+                                format!(
+                                    "session file is not a valid session: {}: {e}",
+                                    literal_path.display()
+                                )
+                            })?;
+                        (Some(store), session)
+                    } else {
+                        let store = SessionStore::create(literal_path, fresh_meta())?;
+                        (Some(store), Session::new())
+                    }
                 } else {
-                    let store = SessionStore::create(path, fresh_meta())?;
-                    (Some(store), Session::new())
+                    let repo = SessionRepo::open(&repo_dir)?;
+                    let (store, session) = open_session_by_id(&arg, &repo, &fork_search_root)
+                        .map_err(|e| format!("--session {arg:?}: {e}"))?;
+                    (Some(store), session)
                 }
             }
             None if continue_session => {
@@ -1936,11 +2319,24 @@ async fn run_task(
     timing.mark("open session");
     timing.print();
 
-    let client = GatewayClient::new(gateway, key)?.with_retry(
+    let client = match key {
+        serve::GatewayCredential::Static(key) => GatewayClient::new(gateway, key)?,
+        serve::GatewayCredential::Oauth(source) => {
+            GatewayClient::with_credential_source(gateway, source)?
+        }
+    }
+    .with_retry(
         retry_max_retries.unwrap_or(agent_core::client::MAX_RETRIES),
         retry_base_delay_ms
             .map(std::time::Duration::from_millis)
             .unwrap_or(agent_core::client::BASE_BACKOFF),
+    );
+    // Task #50: the same two operator-supplied overrides also drive the *whole-run* retry layer
+    // (`retry::RunRetryPolicy`), not just the pre-connect/mid-stream layer just above — previously
+    // `--retry-max-retries`/`--retry-base-delay-ms` silently had no effect on `run_turn`'s own retry loop.
+    let retry_policy = beyond_ai_agent::retry::RunRetryPolicy::from_overrides(
+        retry_max_retries,
+        retry_base_delay_ms.map(std::time::Duration::from_millis),
     );
     // Shared with `DirectCheckpoint` below (built before `agent`, so the hook can be installed at
     // construction) so a long multi-step turn (many tool round-trips) is persisted incrementally —
@@ -1965,6 +2361,11 @@ async fn run_task(
     if no_compaction {
         compaction.enabled = false;
     }
+    // Captured before each is moved into the builder chain below — `Agent` exposes no getter for
+    // either back, and `run --export`'s own call to `export_html_full` further down needs the exact
+    // system prompt/tool set this run actually used, not a recomputed (and possibly out-of-sync) guess.
+    let tool_defs = registry.definitions();
+    let system_for_export = system.clone();
     let mut agent = Agent::new(Arc::new(client), model.clone())
         .with_tools(registry)
         .with_system(system)
@@ -2016,9 +2417,21 @@ async fn run_task(
     // instead of a raw kill.
     let cancel = agent_core::CancellationToken::new();
     let shutdown_cancel = cancel.clone();
+    // Task #41 (pi-parity fix): which signal (if any) actually triggered a cancellation, so
+    // `unwrap_turn_result` below can exit with the matching POSIX code instead of the same bare
+    // `exit(1)` every cancellation used to get regardless of cause. A real `Mutex` (not a bare local,
+    // unlike `serve.rs`'s own `shutdown_cause`) since this is genuinely shared across a task boundary:
+    // the signal wait runs on its own spawned task, concurrently with the run this variable is read
+    // from.
+    let shutdown_cause: Arc<std::sync::Mutex<Option<serve::Signal>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let shutdown_cause_writer = shutdown_cause.clone();
     tokio::spawn(async move {
         if let Ok(mut shutdown) = serve::ShutdownSignal::new() {
-            shutdown.wait().await;
+            let sig = shutdown.wait().await;
+            *shutdown_cause_writer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(sig);
             shutdown_cancel.cancel();
         }
     });
@@ -2032,7 +2445,7 @@ async fn run_task(
             initial_images,
         ));
     }
-    let turn_result = run_turn(&agent, &mut session, json, &cancel).await;
+    let turn_result = run_turn(&agent, &mut session, json, &cancel, &retry_policy).await;
     // Persist whatever's in `session` regardless of outcome: `run_events_cancellable` mutates
     // `session` in place as it streams, so a cancelled turn still leaves behind whatever
     // assistant/tool content had already landed — the same partial-content guarantee `serve` gives
@@ -2040,12 +2453,12 @@ async fn run_task(
     // incrementally, but the turn's own tail (its final, possibly-partial assistant message) is
     // only ever captured here.
     persist_run_tail(&store, &session)?;
-    let mut stop_reason = unwrap_turn_result(turn_result)?;
+    let mut stop_reason = unwrap_turn_result(turn_result, &shutdown_cause)?;
     for message in messages {
         session.user(expand_message(&message, &skills, &prompt_templates));
-        let turn_result = run_turn(&agent, &mut session, json, &cancel).await;
+        let turn_result = run_turn(&agent, &mut session, json, &cancel, &retry_policy).await;
         persist_run_tail(&store, &session)?;
-        stop_reason = unwrap_turn_result(turn_result)?;
+        stop_reason = unwrap_turn_result(turn_result, &shutdown_cause)?;
     }
 
     if let Some(export) = export {
@@ -2056,11 +2469,24 @@ async fn run_task(
                 None => (Vec::new(), Vec::new()),
             }
         };
-        match beyond_ai_agent::export::export_html_with_entries(
+        // `export_html_full` (Task #44 integration): the running agent's actual system prompt/tool
+        // set, not the plainer `export_html_with_entries` this call site used before — so an exported
+        // transcript's own System Prompt/Available Tools sections reflect what this run really used.
+        // `session`'s own running token counters are right here too, so the stats section gets real
+        // usage numbers rather than omitting that line entirely.
+        match beyond_ai_agent::export::export_html_full(
             &meta,
             &session.messages,
             &branches,
+            Some(beyond_ai_agent::export::UsageTotals {
+                input_tokens: session.input_tokens,
+                output_tokens: session.output_tokens,
+                cache_read_tokens: session.cache_read_tokens,
+                cache_write_tokens: session.cache_write_tokens,
+            }),
             &events,
+            Some(&system_for_export),
+            Some(&tool_defs),
             Some(&export),
         ) {
             Ok(path) => eprintln!("[exported transcript to {}]", path.display()),
@@ -2092,8 +2518,8 @@ async fn run_task(
 /// In text mode, a refusal would otherwise still exit 0, indistinguishable from a normal completion —
 /// matches pi's own print-mode, which treats a refusal (folded into its generic "error" stop reason
 /// there, unlike this crate's distinct `Refusal` variant) the same way. `Aborted` is checked
-/// defensively alongside it: `unwrap_turn_result` already exits(1) on every currently-reachable
-/// cancellation path (`Err(Error::Cancelled)`, e.g. `ShutdownSignal`-triggered SIGTERM/SIGHUP/Ctrl-C —
+/// defensively alongside it: `unwrap_turn_result` already exits with the matching signal code (or 1)
+/// on every currently-reachable cancellation path (`Err(Error::Cancelled)`, e.g. `ShutdownSignal`-triggered SIGTERM/SIGHUP/Ctrl-C —
 /// see `agent_core::Agent::run_events_cancellable`'s doc comment, which guarantees cancellation always
 /// surfaces that way, never as an `Ok(..)` carrying `Aborted`), so this arm is currently unreachable
 /// from `run_task` — but a mid-stream cancellation genuinely can produce `Ok(Turn { stop_reason:
@@ -2178,10 +2604,48 @@ mod tests {
     }
 
     #[test]
+    fn fuzzy_match_finds_a_non_contiguous_subsequence_a_substring_check_would_miss() {
+        // Task #51: "sn5" is a valid in-order subsequence of "claude-sonnet-4-5" (s..n..5) even though
+        // it's never a literal substring of it.
+        assert!(fuzzy_match("sn5", "claude-sonnet-4-5").is_some());
+        assert!(
+            !"claude-sonnet-4-5".contains("sn5"),
+            "sanity: not a real substring"
+        );
+        assert!(
+            fuzzy_match("sn5", "gpt-5-mini").is_none(),
+            "no 's' at all in this candidate"
+        );
+    }
+
+    #[test]
+    fn fuzzy_match_is_case_insensitive_and_rejects_out_of_order_characters() {
+        assert!(fuzzy_match("SONNET", "claude-sonnet-4-5").is_some());
+        assert!(
+            fuzzy_match("5-sonnet", "claude-sonnet-4-5").is_none(),
+            "the query's own character order must still be respected"
+        );
+    }
+
+    #[test]
+    fn fuzzy_match_scores_a_consecutive_word_boundary_match_better_than_a_scattered_one() {
+        // "sonnet" matches "claude-sonnet-4-5" as one consecutive run starting right at a word
+        // boundary; the same characters also appear scattered (worse) in a longer candidate — the
+        // consecutive, word-boundary-aligned match must score lower (better).
+        let tight = fuzzy_match("sonnet", "claude-sonnet-4-5").unwrap();
+        let scattered = fuzzy_match("sonnet", "s-o-n-n-e-t-mixed-up-id").unwrap();
+        assert!(
+            tight < scattered,
+            "tight={tight} scattered={scattered}: a consecutive run should score better"
+        );
+    }
+
+    #[test]
     fn text_mode_failure_message_flags_a_refusal_and_an_aborted_stop_reason_as_failures() {
         // pi-parity fix: `Aborted` previously wasn't checked at all alongside the existing `Refusal`
-        // check — defensive, since `unwrap_turn_result` already exits(1) on every currently-reachable
-        // cancellation path, but this closes the gap outright if that internal contract ever changes.
+        // check — defensive, since `unwrap_turn_result` already exits with the matching signal code
+        // (or 1) on every currently-reachable cancellation path, but this closes the gap outright if
+        // that internal contract ever changes.
         assert_eq!(
             text_mode_failure_message(false, agent_core::StopReason::Refusal),
             Some("[refused]")
@@ -2251,6 +2715,7 @@ mod tests {
             &mut session,
             false,
             &agent_core::CancellationToken::new(),
+            &beyond_ai_agent::retry::RunRetryPolicy::default(),
         )
         .await
         .unwrap();
@@ -2500,6 +2965,7 @@ mod tests {
             &mut session,
             false,
             &agent_core::CancellationToken::new(),
+            &beyond_ai_agent::retry::RunRetryPolicy::default(),
         )
         .await
         .expect("the whole-run retry must recover once a real turn is finally scripted");
@@ -2534,6 +3000,7 @@ mod tests {
             &mut session,
             false,
             &agent_core::CancellationToken::new(),
+            &beyond_ai_agent::retry::RunRetryPolicy::default(),
         )
         .await
         .expect_err("must eventually give up, not retry forever");
@@ -2678,7 +3145,10 @@ mod tests {
             .await
             .unwrap();
         assert!(out.text.contains("hello world"));
-        assert!(out.text.contains(&format!("name=\"{}\"", dir.path().join("a.txt").display())));
+        assert!(
+            out.text
+                .contains(&format!("name=\"{}\"", dir.path().join("a.txt").display()))
+        );
         assert!(out.images.is_empty());
     }
 
@@ -2722,7 +3192,11 @@ mod tests {
         let out = read_file_refs(&["shot.png".to_string()], dir.path())
             .await
             .unwrap();
-        assert_eq!(out.images.len(), 1, "the image must be attached, not read as text");
+        assert_eq!(
+            out.images.len(),
+            1,
+            "the image must be attached, not read as text"
+        );
         assert_eq!(out.images[0].media_type, "image/png");
         assert!(!out.images[0].data.is_empty());
     }

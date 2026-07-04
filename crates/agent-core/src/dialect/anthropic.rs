@@ -49,6 +49,7 @@ pub fn build_body(req: &ModelRequest) -> Value {
     // (unlike the OpenAI dialects, which build each wire message from named fields rather than
     // serializing `Message` wholesale, so they never had this exposure).
     strip_model_id(&mut messages);
+    normalize_cross_model_tool_ids(&mut messages, &req.messages, &req.model);
     downgrade_unsigned_thinking(&mut messages);
     downgrade_unsupported_images(&mut messages, caps.supports_vision);
     encode_tool_result_images(&mut messages);
@@ -184,6 +185,102 @@ fn strip_model_id(messages: &mut Value) {
         m.remove("error_message");
         m.remove("aborted");
     }
+}
+
+/// Normalize a `tool_use.id` produced by a *different* model than `req.model` is about to see it, to
+/// match Anthropic's required `^[a-zA-Z0-9_-]+$`, max-64-char shape — mirrors pi's
+/// `normalizeToolCallId` (`anthropic-messages.ts:1006-1009`), applied by its `transformMessages`
+/// whenever `!isSameModel`. A cross-model tool-call id can be non-conformant in two ways Anthropic
+/// itself never produces: the OpenAI Responses API's combined `"call_id|item_id"` shape (already
+/// truncated to `call_id` by `Session::scrub_cross_model_state` before a *persisted* session reaches
+/// this point, but that scrub only ever runs at an explicit model-switch — this is the belt-and-
+/// suspenders check at the point the id actually reaches the wire, covering every other path: a
+/// same-turn multi-model fan-out, a hand-edited or externally-loaded session, a future caller that
+/// builds a `ModelRequest` directly), or a non-standard OpenAI-compatible provider's own id shape
+/// (GitHub Copilot's 450+-char blobs, arbitrary punctuation). `Message::model_id` is the same
+/// per-message provenance field `scrub_cross_model_state` keys off; a message with `model_id ==
+/// Some(&req.model)` (produced by the very model about to see it again) is left untouched — its ids
+/// are guaranteed Anthropic-native already, and are also candidates a paired-later `ToolResult` might
+/// still reference, so skipping them here doubles as skipping unnecessary remap bookkeeping. Every
+/// rewrite is recorded and replayed onto the matching `tool_result` in a second pass, the same
+/// two-pass shape `scrub_cross_model_state` already uses — a `ToolResult` block never carries
+/// `model_id` itself, so its pairing can only be kept correct by propagating the assistant-side
+/// rewrite forward.
+fn normalize_cross_model_tool_ids(
+    messages: &mut Value,
+    typed: &[crate::message::Message],
+    model: &str,
+) {
+    let Some(msgs) = messages.as_array_mut() else {
+        return;
+    };
+    let mut id_remap: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (m, src) in msgs.iter_mut().zip(typed) {
+        if src.model_id.as_deref() == Some(model) {
+            continue;
+        }
+        let Some(content) = m.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for block in content.iter_mut() {
+            let Some(obj) = block.as_object_mut() else {
+                continue;
+            };
+            if obj.get("type").and_then(Value::as_str) != Some("tool_use") {
+                continue;
+            }
+            let Some(id) = obj.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let normalized = normalize_tool_call_id(id);
+            if normalized != id {
+                id_remap.insert(id.to_string(), normalized.clone());
+                obj.insert("id".into(), Value::String(normalized));
+            }
+        }
+    }
+    if id_remap.is_empty() {
+        return;
+    }
+    for m in msgs.iter_mut() {
+        let Some(content) = m.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for block in content.iter_mut() {
+            let Some(obj) = block.as_object_mut() else {
+                continue;
+            };
+            if obj.get("type").and_then(Value::as_str) != Some("tool_result") {
+                continue;
+            }
+            if let Some(new_id) = obj
+                .get("tool_use_id")
+                .and_then(Value::as_str)
+                .and_then(|id| id_remap.get(id))
+            {
+                obj.insert("tool_use_id".into(), Value::String(new_id.clone()));
+            }
+        }
+    }
+}
+
+/// Replace every character outside `[a-zA-Z0-9_-]` with `_`, then truncate to 64 chars — Anthropic's
+/// own `tool_use.id`/`tool_result.tool_use_id` pattern requirement. Every substituted character is
+/// ASCII, so byte-truncation and char-truncation coincide; a plain already-conformant id (the common
+/// case) round-trips as a no-op beyond the linear scan.
+fn normalize_tool_call_id(id: &str) -> String {
+    let mut out: String = id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    out.truncate(64);
+    out
 }
 
 /// Stamp a cache breakpoint onto the last content block of the last message. No-op if the history is
@@ -941,6 +1038,86 @@ mod tests {
         assert_eq!(body["messages"][1]["content"][0]["id"], "toolu_1");
         assert_eq!(body["messages"][2]["content"][0]["type"], "tool_result");
         assert_eq!(body["messages"][2]["content"][0]["tool_use_id"], "toolu_1");
+    }
+
+    #[test]
+    fn cross_model_tool_use_id_gets_disallowed_characters_normalized() {
+        // pi-parity (Task #28): pi's `normalizeToolCallId` (`anthropic-messages.ts:1006-1009`)
+        // replaces any character outside `[a-zA-Z0-9_-]` with `_`, applied by `transformMessages`
+        // whenever the message wasn't produced by the model about to see it again. A foreign-model-
+        // produced tool_use id containing a `|` (the OpenAI Responses combined-id separator) or a
+        // space must be normalized before it reaches an Anthropic request — and the paired
+        // tool_result's `tool_use_id` must follow so the pairing survives.
+        let req = ModelRequest::new(
+            "claude-opus-4-8",
+            vec![
+                Message::user("weather?"),
+                Message::assistant(vec![ContentBlock::tool_use(
+                    "call_1|weird id",
+                    "get_weather",
+                    json!({ "city": "SF" }),
+                )])
+                .with_model_id("gpt-4o"),
+                Message::tool_result("call_1|weird id", "72F", false),
+            ],
+            256,
+        );
+        let body = build_body(&req);
+        assert_eq!(body["messages"][1]["content"][0]["id"], "call_1_weird_id");
+        assert_eq!(
+            body["messages"][2]["content"][0]["tool_use_id"],
+            "call_1_weird_id"
+        );
+    }
+
+    #[test]
+    fn cross_model_tool_use_id_over_64_chars_gets_truncated() {
+        // OpenAI Responses' own combined ids can run to 450+ chars (GitHub Copilot in particular) —
+        // Anthropic rejects anything past 64.
+        let long_id = "x".repeat(450);
+        let req = ModelRequest::new(
+            "claude-opus-4-8",
+            vec![
+                Message::user("weather?"),
+                Message::assistant(vec![ContentBlock::tool_use(
+                    long_id.clone(),
+                    "get_weather",
+                    json!({ "city": "SF" }),
+                )])
+                .with_model_id("gpt-4o"),
+                Message::tool_result(long_id, "72F", false),
+            ],
+            256,
+        );
+        let body = build_body(&req);
+        let expected = "x".repeat(64);
+        assert_eq!(body["messages"][1]["content"][0]["id"], expected);
+        assert_eq!(body["messages"][2]["content"][0]["tool_use_id"], expected);
+    }
+
+    #[test]
+    fn same_model_tool_use_id_is_left_untouched_even_if_it_would_otherwise_normalize() {
+        // A message produced by the very model about to see it again is never "foreign" — its id must
+        // not be rewritten, matching `Session::scrub_cross_model_state`'s identical same-model
+        // exemption. Not a realistic id for Anthropic to have generated itself (it always produces
+        // conformant ids), but proves the gate is keyed on `model_id`, not on the id's own shape.
+        let req = ModelRequest::new(
+            "claude-opus-4-8",
+            vec![
+                Message::user("weather?"),
+                Message::assistant(vec![ContentBlock::tool_use(
+                    "toolu 1",
+                    "get_weather",
+                    json!({ "city": "SF" }),
+                )])
+                .with_model_id("claude-opus-4-8"),
+                Message::tool_result("toolu 1", "72F", false),
+            ],
+            256,
+        );
+        let body = build_body(&req);
+        assert_eq!(body["messages"][1]["content"][0]["id"], "toolu 1");
+        assert_eq!(body["messages"][2]["content"][0]["tool_use_id"], "toolu 1");
     }
 
     // A recorded text + tool_use streamed response.

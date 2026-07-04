@@ -13,6 +13,14 @@
 //! `"42.1"` does NOT coerce to `integer` (fractional), and `"1"`/`"0"` do NOT coerce to `boolean` (only
 //! the literal strings `"true"`/`"false"` do) — see this module's tests, ported from pi's own
 //! `validation.test.ts` fixture table.
+//!
+//! Recursion follows pi's `coerceWithJsonSchema` into every shape a tool schema can nest a sub-schema
+//! in, not just an object's declared `properties`: array `items` (both the tuple form, one schema per
+//! index, and the single-schema-for-every-element form), `additionalProperties` when it's itself a
+//! schema (not a bare `true`/`false`), and `allOf`/`anyOf`/`oneOf` composition. `allOf`/`anyOf`/`oneOf`
+//! are best-effort the way pi's own composition handling is (never fails the surrounding value over a
+//! member mismatch — see [`apply_composition`]); everywhere else in this module, a sub-schema that
+//! can't be coerced fails the whole call, matching AJV's own all-or-nothing `coerceTypes`.
 
 use serde_json::Value;
 
@@ -96,56 +104,141 @@ fn try_coerce(t: &str, input: &Value) -> Option<Value> {
     }
 }
 
-/// Recurse into an already-typed-correctly `object` value's `properties`, coercing each present
-/// property against its own sub-schema. Missing/extra properties are left alone — presence/`required`
-/// enforcement stays each tool's own job (its existing `input.get("x").ok_or_else(...)` pattern), not
-/// this pass's.
+/// Recurse into an already-typed-correctly `object` value's `properties` (and, when it's itself a
+/// schema rather than a bare `true`/`false`, `additionalProperties` for every key `properties` didn't
+/// already claim), coercing each present property against its own sub-schema. Missing properties, and
+/// extra ones with no `additionalProperties` schema to coerce against, are left alone —
+/// presence/`required` enforcement stays each tool's own job (its existing
+/// `input.get("x").ok_or_else(...)` pattern), not this pass's.
 fn coerce_object_properties(schema: &Value, input: Value) -> Result<Value, String> {
     let Value::Object(mut obj) = input else {
         return Ok(input);
     };
-    let Some(props) = schema.get("properties").and_then(Value::as_object) else {
-        return Ok(Value::Object(obj));
-    };
-    for (key, sub_schema) in props {
-        if let Some(v) = obj.remove(key) {
-            // A property that fails to coerce fails the *whole* call — matching AJV/pi's own
-            // all-or-nothing `validateToolArguments` (it throws on the first sub-schema mismatch, it
-            // doesn't silently null out just the offending field and let the rest through).
-            obj.insert(key.clone(), coerce_value(sub_schema, v)?);
+    let props = schema.get("properties").and_then(Value::as_object);
+    if let Some(props) = props {
+        for (key, sub_schema) in props {
+            if let Some(v) = obj.remove(key) {
+                // A property that fails to coerce fails the *whole* call — matching AJV/pi's own
+                // all-or-nothing `validateToolArguments` (it throws on the first sub-schema mismatch, it
+                // doesn't silently null out just the offending field and let the rest through).
+                obj.insert(key.clone(), coerce_value(sub_schema, v)?);
+            }
+        }
+    }
+    if let Some(additional_schema) = schema.get("additionalProperties").filter(|v| v.is_object()) {
+        let extra_keys: Vec<String> = obj
+            .keys()
+            .filter(|k| !props.is_some_and(|p| p.contains_key(k.as_str())))
+            .cloned()
+            .collect();
+        for key in extra_keys {
+            if let Some(v) = obj.remove(&key) {
+                obj.insert(key, coerce_value(additional_schema, v)?);
+            }
         }
     }
     Ok(Value::Object(obj))
 }
 
-fn coerce_value(schema: &Value, input: Value) -> Result<Value, String> {
-    let Some(types) = declared_types(schema) else {
-        // No `type` constraint at all — an object schema with only `properties` (no explicit
-        // `"type":"object"`) still implies object shape, matching pi's own lenient JSON-Schema reading.
-        if schema.get("properties").is_some() && input.is_object() {
-            return coerce_object_properties(schema, input);
-        }
+/// Recurse into an already-array-typed value's `items`: either a single schema applied to every
+/// element (`"items": {...}`), or JSON Schema's positional "tuple validation" form (`"items": [...]`,
+/// one schema per index — an index past the tuple list's own length is left alone, same
+/// missing/extra-is-not-this-pass's-job rationale as `coerce_object_properties`).
+fn coerce_array_items(schema: &Value, input: Value) -> Result<Value, String> {
+    let Value::Array(mut items) = input else {
         return Ok(input);
+    };
+    match schema.get("items") {
+        Some(Value::Array(item_schemas)) => {
+            for (item, item_schema) in items.iter_mut().zip(item_schemas) {
+                *item = coerce_value(item_schema, item.take())?;
+            }
+        }
+        Some(item_schema) if item_schema.is_object() => {
+            for item in items.iter_mut() {
+                *item = coerce_value(item_schema, item.take())?;
+            }
+        }
+        _ => {}
+    }
+    Ok(Value::Array(items))
+}
+
+/// Apply `allOf`/`anyOf`/`oneOf` composition, if present, before the schema's own `type`-driven
+/// coercion runs. Matches pi's `coerceWithJsonSchema`/`coerceWithUnionSchema`: composition is always
+/// best-effort and never fails the surrounding value over a member mismatch — an `allOf` member that
+/// can't be coerced is skipped rather than aborting its siblings, and `anyOf`/`oneOf` take the first
+/// member that *does* coerce, falling back to the value untouched if none do. Real, non-composition
+/// type mismatches are still caught downstream by `coerce_value`'s own `type` handling once composition
+/// hands its result off.
+fn apply_composition(schema: &Value, mut value: Value) -> Value {
+    if let Some(members) = schema.get("allOf").and_then(Value::as_array) {
+        for member in members {
+            if let Ok(coerced) = coerce_value(member, value.clone()) {
+                value = coerced;
+            }
+        }
+    }
+    if let Some(members) = schema.get("anyOf").and_then(Value::as_array) {
+        value = coerce_union(members, value);
+    }
+    if let Some(members) = schema.get("oneOf").and_then(Value::as_array) {
+        value = coerce_union(members, value);
+    }
+    value
+}
+
+/// Try each union member in turn, keeping the first one that coerces cleanly; if none do, the value is
+/// handed back untouched rather than treated as a failure — same rationale as `apply_composition`'s own
+/// doc comment.
+fn coerce_union(members: &[Value], value: Value) -> Value {
+    for member in members {
+        if let Ok(coerced) = coerce_value(member, value.clone()) {
+            return coerced;
+        }
+    }
+    value
+}
+
+fn coerce_value(schema: &Value, input: Value) -> Result<Value, String> {
+    let value = apply_composition(schema, input);
+
+    let Some(types) = declared_types(schema) else {
+        // No `type` constraint at all — an object schema with only `properties`/`additionalProperties`
+        // (no explicit `"type":"object"`), or an array schema with only `items`, still implies that
+        // shape, matching pi's own lenient JSON-Schema reading.
+        if value.is_object()
+            && (schema.get("properties").is_some()
+                || schema
+                    .get("additionalProperties")
+                    .is_some_and(Value::is_object))
+        {
+            return coerce_object_properties(schema, value);
+        }
+        if value.is_array() && schema.get("items").is_some() {
+            return coerce_array_items(schema, value);
+        }
+        return Ok(value);
     };
 
     for t in &types {
-        if matches_type_raw(t, &input) {
-            return if *t == "object" {
-                coerce_object_properties(schema, input)
-            } else {
-                Ok(input)
+        if matches_type_raw(t, &value) {
+            return match *t {
+                "object" => coerce_object_properties(schema, value),
+                "array" => coerce_array_items(schema, value),
+                _ => Ok(value),
             };
         }
     }
 
     for t in &types {
-        if let Some(coerced) = try_coerce(t, &input) {
+        if let Some(coerced) = try_coerce(t, &value) {
             return Ok(coerced);
         }
     }
 
     Err(format!(
-        "Validation failed: {input} does not match schema type(s) {types:?}"
+        "Validation failed: {value} does not match schema type(s) {types:?}"
     ))
 }
 
@@ -257,6 +350,108 @@ mod tests {
         assert_eq!(
             coerce_tool_arguments(&schema, input).unwrap(),
             json!({"count": 7, "label": "42"})
+        );
+    }
+
+    #[test]
+    fn recurses_into_array_items_sharing_a_single_schema() {
+        let schema = json!({"type": "array", "items": {"type": "integer"}});
+        assert_eq!(
+            coerce_tool_arguments(&schema, json!(["1", "2", "3"])).unwrap(),
+            json!([1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn recurses_into_tuple_form_array_items() {
+        let schema = json!({
+            "type": "array",
+            "items": [{"type": "integer"}, {"type": "string"}],
+        });
+        assert_eq!(
+            coerce_tool_arguments(&schema, json!(["1", 2])).unwrap(),
+            json!([1, "2"])
+        );
+    }
+
+    #[test]
+    fn recurses_into_array_of_objects_coercing_each_elements_nested_properties() {
+        // pi-parity: mirrors `edit`'s real `edits` schema (`crates/agent/src/tools/edit.rs`) — a model
+        // emitting a number for `old_string` inside the array used to sail through uncoerced because
+        // `coerce_value` never recursed past a bare `properties` object into an array's `items`.
+        let schema = json!({
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "old_string": {"type": "string"},
+                    "new_string": {"type": "string"},
+                },
+                "required": ["old_string", "new_string"],
+            },
+        });
+        let input = json!([{"old_string": 42, "new_string": "bar"}]);
+        assert_eq!(
+            coerce_tool_arguments(&schema, input).unwrap(),
+            json!([{"old_string": "42", "new_string": "bar"}])
+        );
+    }
+
+    #[test]
+    fn recurses_through_all_of_members_in_order() {
+        let schema = json!({"allOf": [{"type": "integer"}]});
+        assert_eq!(
+            coerce_tool_arguments(&schema, json!("5")).unwrap(),
+            json!(5)
+        );
+    }
+
+    #[test]
+    fn any_of_picks_the_first_member_schema_that_coerces_cleanly() {
+        let schema = json!({"anyOf": [{"type": "boolean"}, {"type": "integer"}]});
+        assert_eq!(
+            coerce_tool_arguments(&schema, json!("42")).unwrap(),
+            json!(42)
+        );
+    }
+
+    #[test]
+    fn any_of_leaves_the_value_untouched_when_no_member_coerces() {
+        // Matches pi's `coerceWithUnionSchema`: a union with no coercible member is left as-is rather
+        // than treated as a hard failure — that decision belongs to the tool's own downstream
+        // validation, not this best-effort pass.
+        let schema = json!({"anyOf": [{"type": "boolean"}, {"type": "null"}]});
+        assert_eq!(
+            coerce_tool_arguments(&schema, json!("hello")).unwrap(),
+            json!("hello")
+        );
+    }
+
+    #[test]
+    fn recurses_into_schema_typed_additional_properties() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"id": {"type": "string"}},
+            "additionalProperties": {"type": "integer"},
+        });
+        let input = json!({"id": 7, "extra": "42"});
+        assert_eq!(
+            coerce_tool_arguments(&schema, input).unwrap(),
+            json!({"id": "7", "extra": 42})
+        );
+    }
+
+    #[test]
+    fn boolean_additional_properties_is_not_treated_as_a_schema() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"id": {"type": "string"}},
+            "additionalProperties": true,
+        });
+        let input = json!({"id": 7, "extra": "unchanged"});
+        assert_eq!(
+            coerce_tool_arguments(&schema, input).unwrap(),
+            json!({"id": "7", "extra": "unchanged"})
         );
     }
 }

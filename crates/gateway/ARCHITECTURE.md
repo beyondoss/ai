@@ -36,7 +36,7 @@ Client (stock OpenAI/Anthropic SDK)
   │
   ▼  request_filter (proxy.rs)
   │  ├─ Route: first segment → provider row (authority, dialect, auth scheme)
-  │  ├─ Extract key from Authorization: Bearer or x-api-key
+  │  ├─ Extract key: x-api-key / api-key / x-goog-api-key / Authorization Bearer / ?key= query param
   │  ├─ Rate guardrails (BEFORE verify — keeps forged-key floods at ns cost)
   │  │    per-credential count-min  ──────────────────────────────► 429
   │  │    global BYO aggregate (managed exempt)  ─────────────────► 429
@@ -80,7 +80,7 @@ Client (stock OpenAI/Anthropic SDK)
   │
   ▼  logging (proxy.rs)
      Parse usage from tail (by dialect + streaming flag)
-     Emit ai.usage fact: tenant, vpc, model, requested_model, token counts (managed only)
+     Emit ai.usage fact: tenant, vpc, model, requested_model, token counts + reasoning breakout (managed only)
      Record circuit-breaker outcome (once): 5xx / connect-fail → failure; else → success (429 incl.)
      Decrement requests_in_flight gauge
 ```
@@ -110,7 +110,9 @@ Providers are **data rows**, not code paths. `KNOWN_PROVIDERS` in `route.rs` lis
 providers (openai, anthropic, openrouter, fireworks, groq, deepseek, together, cerebras, mistral,
 xai); each row carries its authority (host:port), dialect (OpenAI-wire vs Anthropic-wire), and auth
 scheme (Bearer vs x-api-key). The `provider_authorities` config key adds or overrides rows at boot
-with zero code change.
+with zero code change; `provider_dialects`/`provider_auth_schemes` set the dialect/auth scheme for a
+**config-added** provider (default OpenAI/Bearer for backward compatibility — see Configuration). A
+known provider's dialect/scheme is always fixed in `KNOWN_PROVIDERS`, never overridable from config.
 
 The routing rule: **first path segment = provider name**. `/groq/openai/v1/chat/completions` routes
 to Groq and forwards `/openai/v1/chat/completions` verbatim. A bare `/v1/…` path matches the
@@ -154,14 +156,27 @@ The tail tap feeds the parser after `logging` fires. Two dialects:
 
 | Dialect   | Format     | Fields                                                                                                            |
 | --------- | ---------- | ----------------------------------------------------------------------------------------------------------------- |
-| OpenAI    | JSON body  | `usage.prompt_tokens`, `usage.completion_tokens`, `usage.prompt_tokens_details.cached_tokens`                     |
-| OpenAI    | SSE stream | Terminal `data:` line (before `[DONE]`), same fields                                                              |
-| Anthropic | JSON body  | `usage.input_tokens`, `usage.output_tokens`, `usage.cache_read_input_tokens`, `usage.cache_creation_input_tokens` |
-| Anthropic | SSE stream | `message_delta` event with `usage` block                                                                          |
+| OpenAI    | JSON body  | `usage.prompt_tokens`, `usage.completion_tokens`, `usage.prompt_tokens_details.cached_tokens`, `usage.completion_tokens_details.reasoning_tokens` |
+| OpenAI    | SSE stream | Terminal `data:` line (before `[DONE]`), same fields (Responses API: nested `response.usage`, `output_tokens_details.reasoning_tokens`) |
+| Anthropic | JSON body  | `usage.input_tokens`, `usage.output_tokens`, `usage.cache_read_input_tokens`, `usage.cache_creation_input_tokens`, `usage.output_tokens_details.thinking_tokens` |
+| Anthropic | SSE stream | `message_delta` event with `usage` block (thinking tokens on the same block)                                      |
 
-Missing or zero usage fields deserialize to zero (safe default). If the tail is truncated by the
-compaction drain, the usage chunk is still present because SSE usage is always the final `data:`
-line and the tail keeps the last 64KB.
+Missing or zero usage fields deserialize to zero (safe default) — **except** `reasoning_tokens`
+(`Usage::reasoning_tokens: Option<u64>`), which stays `None` when the provider didn't report it at
+all, distinct from `Some(0)` when it reported a real zero; that distinction is unrecoverable once the
+request completes, so it's never collapsed to a bare zero. If the tail is truncated by the compaction
+drain, the usage chunk is still present because SSE usage is always the final `data:` line and the
+tail keeps the last 64KB.
+
+**Dialect-mismatch guard:** a config-added provider whose `provider_dialects` value doesn't match its
+actual wire (e.g. an Anthropic-wire vendor left at the default OpenAI dialect) would otherwise have
+its `usage` block parsed by the wrong dialect's parser. Because both parsers' fields are
+`#[serde(default)]`, that misparse used to succeed silently — every field defaults to zero, producing
+`Some(Usage::default())`: a zero-token billing row indistinguishable from a real (and wrong)
+zero-usage response. `openai_body`/`openai_stream` and `anthropic_body`/`anthropic_stream` now check
+for the *other* dialect's characteristic field names (Anthropic's `input_tokens`/`output_tokens` vs
+OpenAI's `prompt_tokens`/`completion_tokens`) before accepting a parse, and return `None` on a match —
+tripping `usage_parse_errors_total` (see Metrics) instead of a silent zero-billing row.
 
 ### Deny-Set (`deny.rs`)
 
@@ -258,6 +273,32 @@ returns 401 if the token is invalid — the client sees the same rejection it wo
 just routed through the gateway. Adding a gateway-side preflight check would double the latency for
 every BYO request on the error path with no security benefit at the gateway layer.
 
+### Why AWS SigV4 (Bedrock's default credential chain) is not supported
+
+`AuthScheme` has two variants — `Bearer` and `XApiKey` — because every supported provider
+authenticates with a **static credential string** that the gateway can swap verbatim into a header.
+Bedrock's default AWS credential chain (access keys, `AWS_PROFILE`, the ECS task role, a web identity
+token) doesn't work that way: each request is signed with **SigV4**, a signature computed over the
+method, path, headers, timestamp, and a hash of the body, using credentials the *signer* holds. There
+is no static string to swap in — the signature is derived fresh, per request, from the exact bytes
+being sent.
+
+That's structurally incompatible with a byte-relay-plus-key-swap gateway. Supporting it for real
+would mean the gateway holds AWS credentials itself and **re-signs every relayed request** — a
+SigV4 implementation covering canonical request construction, credential-scope derivation, and
+clock-skew handling, running per-request server-side. That's a materially different feature (an AWS
+signing proxy), not a config knob or a small patch to `AuthScheme`, and it doesn't fit this gateway's
+"provider is a data row" model, where adding a vendor is a struct literal, not a signing engine. We
+deliberately do not bolt on a partial implementation (e.g. accepting only unsigned requests, or
+signing with a fixed clock skew) — a SigV4 gateway that's subtly wrong fails silently at the provider
+with a cryptic signature-mismatch 403, which is worse than not supporting the mode at all.
+
+**The supported path for Bedrock today is `AWS_BEARER_TOKEN_BEDROCK` mode** — Bedrock also accepts a
+plain long-lived bearer token (no signing), which is exactly the `Bearer`/`XApiKey` shape this gateway
+already handles as a config-added provider (see `provider_authorities`/`provider_dialects` in
+Configuration). An operator wiring up Bedrock through this gateway should provision that token, not
+the classic SigV4 credential chain.
+
 ### Why pricing is absent from the gateway
 
 The gateway emits token _facts_ (`ai.usage`): counts and model identifiers. Applying prices to
@@ -315,6 +356,8 @@ Secret-bearing fields (`pool_keys`, `nats_creds`) are held as `Secret<T>` — st
 | `require_signing_keys`          | `false`                           | When `true`, an empty `signing_keys` is a hard boot failure instead of silent BYO-only mode. Set on managed deployments so a typo'd/absent SSM param fails fast rather than silently serving for free. |
 | `pool_keys.<name>`              | _(from `AI_POOL_KEY_<NAME>` env)_ | Real provider API key. Missing for a provider → managed requests to that provider return 503 before any upstream connection.                                                                           |
 | `provider_authorities.<name>`   | _(none)_                          | Override or add a provider's `authority` (host:port). Enables config-added providers beyond `KNOWN_PROVIDERS` with zero code change.                                                                   |
+| `provider_dialects.<name>`      | `"openai"`                        | Wire dialect for a **config-added** provider (`"openai"` or `"anthropic"`, case-insensitive). No effect on a known provider (dialect fixed in code). Unrecognized value → hard boot failure.           |
+| `provider_auth_schemes.<name>`  | `"bearer"`                        | Managed auth scheme for a **config-added** provider (`"bearer"` or `"x-api-key"`). No effect on a known provider. Unrecognized value → hard boot failure.                                              |
 | `snapshot_path`                 | _(unset)_                         | Path for the on-disk deny-set cache. Unset → re-scan NATS on every cold boot. Set → load from disk and enforce before NATS reconnects (edge/tunnel deployments).                                       |
 | `rate_limit_rps`                | `100`                             | Per-credential request ceiling (count-min, keyed on raw key hash). `0` disables. Exceeded → 429. Checked before Ed25519 verify.                                                                        |
 | `byo_rate_limit_rps`            | `1000`                            | Aggregate ceiling for all BYO traffic (single shared bucket). `0` disables. Managed traffic exempt. Exceeded → 429.                                                                                    |
@@ -344,6 +387,8 @@ Secret-bearing fields (`pool_keys`, `nats_creds`) are held as `Secret<T>` — st
 | Virtual key tampered or forged              | Ed25519 verify fails → falls through to BYO treatment. No billing event. No error reveals which part failed.                                                                   | Billing miss detectable downstream; no security boundary breach.                                                                                                          |
 | `signing_keys` absent (typo'd/missing SSM)  | Default: warn + BYO-only (silently drops all managed billing + deny-set). With `require_signing_keys=true`: hard boot failure.                                                 | Set `require_signing_keys=true` on managed deployments so the mis-deploy fails fast and visibly at boot.                                                                  |
 | Pool key missing for provider               | Managed request returns 503 before any upstream connection.                                                                                                                    | Add `AI_POOL_KEY_<NAME>` env and redeploy.                                                                                                                                |
+| `provider_dialects`/`provider_auth_schemes` value unrecognized | Hard boot failure (`GatewayError::Config`) naming the provider and the bad value.                                                                              | Fix the typo — `"openai"`/`"anthropic"` and `"bearer"`/`"x-api-key"` are the only accepted values.                                                                        |
+| Config-added provider's dialect misconfigured (wire doesn't match) | `usage::openai_body`/`anthropic_body` (and the stream variants) detect the other dialect's characteristic field names and return `None` instead of a zeroed `Usage`. | `usage_parse_errors_total` fires + a `warn!` log; fix `provider_dialects.<name>` to match the vendor's actual wire.                                                       |
 | Provider DNS fails                          | `upstream_peer` returns error → 502 to client.                                                                                                                                 | TTL-cached DNS (60s) serves stale; poisoned-lock guard re-resolves on next request.                                                                                       |
 | Provider TCP connect fails                  | `fail_to_connect` retries up to 2×, then returns 502. Counts as a circuit-breaker failure.                                                                                     | Client SDK retries with backoff. No HTTP-status retries (Pingora-idiomatic).                                                                                              |
 | Provider brownout (sustained 5xx)           | After `circuit_breaker_threshold` 5xx/connect failures in the window, the breaker opens; requests fast-fail 503 (`circuit_open`) instead of stalling against the read timeout. | Auto: after `circuit_breaker_reset_secs` a half-open probe is admitted — success closes the breaker, failure reopens it. Per-provider, so other providers are unaffected. |

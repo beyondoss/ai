@@ -159,6 +159,45 @@ const MID_STREAM_BASE_BACKOFF: Duration = Duration::from_millis(250);
 /// Ceiling on a single mid-stream retry wait.
 const MID_STREAM_MAX_BACKOFF: Duration = Duration::from_secs(5);
 
+/// Outcome of a manual or automatic compaction attempt (see [`Agent::compact`]) — distinguishes an
+/// actual compaction from the two distinct reasons nothing happened, so a headless caller (`serve`'s
+/// `compact` RPC) can report *why* instead of collapsing both into the same bare `false` pi's own two
+/// distinct thrown errors ("Nothing to compact (session too small)" / "Already compacted",
+/// `agent-session.ts::compact`) never actually are. Track (pi-parity fix, Task #26).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactOutcome {
+    /// A worthwhile prefix was found and folded into a fresh summary.
+    Compacted,
+    /// No cut point exists at all yet ([`compaction::find_split_cut`] returned `None`) — too few
+    /// messages, or no clean assistant boundary to summarize up to. Matches pi's "Nothing to compact
+    /// (session too small)".
+    TooSmall,
+    /// A cut point exists, but there's nothing new worth a fresh summary: either a prior summary
+    /// already covers everything up to a clean boundary and nothing since has grown past
+    /// `keep_recent_tokens`, or (rare) a genuine summarization call ran and the model's own response
+    /// came back blank. Matches pi's "Already compacted".
+    AlreadyCompacted,
+}
+
+impl CompactOutcome {
+    /// `true` only for [`Self::Compacted`] — the bare bool this type replaces. What every caller that
+    /// only cares *whether* room was freed (not why not) actually wants: `serve`'s `compact` RPC
+    /// response's own `compacted` field, and the overflow-retry call sites in [`Agent::run_events`]/
+    /// turn handling below, which only ever branch on "did this recover room."
+    pub fn compacted(self) -> bool {
+        matches!(self, Self::Compacted)
+    }
+
+    /// A stable wire/log discriminator for the no-op reason — `None` when a real compaction happened.
+    pub fn reason(self) -> Option<&'static str> {
+        match self {
+            Self::Compacted => None,
+            Self::TooSmall => Some("too_small"),
+            Self::AlreadyCompacted => Some("already_compacted"),
+        }
+    }
+}
+
 /// A configured agent: a model, a transport, a tool set, and loop bounds. Cheap to clone-construct;
 /// `run` borrows it so one agent can drive many sessions.
 pub struct Agent {
@@ -504,7 +543,10 @@ impl Agent {
         // "fold into the adjacent message" pattern, applied here instead of appending after).
         let next_turn_queued = steering.drain_next_turn();
         if !next_turn_queued.is_empty() {
-            let fold_into_prompt = session.messages.last().is_some_and(|m| m.role == Role::User);
+            let fold_into_prompt = session
+                .messages
+                .last()
+                .is_some_and(|m| m.role == Role::User);
             if fold_into_prompt {
                 let mut prefix = Vec::with_capacity(next_turn_queued.len());
                 for msg in next_turn_queued {
@@ -679,11 +721,11 @@ impl Agent {
                         )
                         .await
                     {
-                        Ok(true) => {
+                        Ok(outcome) if outcome.compacted() => {
                             overflow_recovered = true;
                             continue;
                         }
-                        Ok(false) => {
+                        Ok(_) => {
                             sink(AgentEvent::Error {
                                 message: e.to_string(),
                             });
@@ -821,7 +863,13 @@ impl Agent {
                 })
                 .unwrap_or_default();
 
-            if calls.is_empty() || turn.stop_reason != StopReason::ToolUse {
+            // Dispatch is gated on the presence of complete `tool_use` blocks alone, never on
+            // `stop_reason` — matching pi's `agent-loop.ts` (it dispatches off the assistant message's
+            // own content, full stop). A turn can legitimately end `MaxTokens` *after* the model already
+            // emitted one or more complete tool calls (e.g. it calls two tools, then starts trailing
+            // commentary that gets cut off) — gating on `stop_reason == ToolUse` there would silently
+            // drop tool calls the model actually made.
+            if calls.is_empty() {
                 // Silent truncation: the provider replied successfully, but the response was cut off by
                 // `max_tokens` alone (no tool calls, so this isn't a "the model needs another turn to
                 // keep working" shape) — the model didn't get to finish because there wasn't room left,
@@ -834,8 +882,7 @@ impl Agent {
                 // every turn), so a second silent truncation right after this recovery doesn't loop
                 // forever; a genuine improvement should always show up as *some* progress within one
                 // retry, same rationale as the error-based path.
-                if calls.is_empty()
-                    && turn.stop_reason == StopReason::MaxTokens
+                if turn.stop_reason == StopReason::MaxTokens
                     && !overflow_recovered
                     && self.compaction.enabled
                     && compaction::is_hard_overflow(
@@ -855,7 +902,7 @@ impl Agent {
                         )
                         .await
                     {
-                        Ok(true) => {
+                        Ok(outcome) if outcome.compacted() => {
                             // Compaction freed real room — discard the truncated response and retry the
                             // same turn fresh; keeping both would leave two consecutive assistant turns
                             // once the retry's real response lands, a shape no dialect accepts.
@@ -865,7 +912,7 @@ impl Agent {
                             overflow_recovered = true;
                             continue;
                         }
-                        Ok(false) => {
+                        Ok(_) => {
                             // Nothing worth compacting (already at a clean, minimal boundary) — the
                             // truncated response is the best available answer; fall through and report
                             // it normally rather than silently discarding it with nothing to replace it.
@@ -1098,11 +1145,23 @@ impl Agent {
                                             // a genuinely malformed call still surfaces through the
                                             // tool's own existing, clearer validation error rather than
                                             // a new failure path.
-                                            let coerced = crate::validation::coerce_tool_arguments(
+                                            let mut coerced = crate::validation::coerce_tool_arguments(
                                                 &tool.input_schema(),
                                                 input.clone(),
                                             )
                                             .unwrap_or_else(|_| input.clone());
+                                            // Task #36 (pi-parity): lets `read` append a "current model
+                                            // doesn't support images" note when it reads an image file —
+                                            // schema-undocumented, so it's invisible to the model and
+                                            // ignored by every other tool.
+                                            if let Some(obj) = coerced.as_object_mut() {
+                                                obj.insert(
+                                                    "_model_supports_vision".to_string(),
+                                                    crate::models::capabilities(&this.model)
+                                                        .supports_vision
+                                                        .into(),
+                                                );
+                                            }
                                             match catch_tool_panic(
                                                 tool.run_streaming(coerced, &progress),
                                             )
@@ -1479,9 +1538,11 @@ impl Agent {
     /// Summarize the conversation prefix in place, keeping the recent turns verbatim. Makes one
     /// summarization model call (silently — its tokens aren't surfaced as assistant output), splices
     /// the summary into `session`, folds this round's file-ops into `session.compaction` (see
-    /// [`CompactionProvenance`]), and emits an [`AgentEvent::Compacted`]. Returns `false` (a no-op)
-    /// when there's no worthwhile prefix to summarize or the model returns an empty summary. Exposed
-    /// so a headless server can offer a manual `compact` command (pass [`CompactionReason::Manual`]).
+    /// [`CompactionProvenance`]), and emits an [`AgentEvent::Compacted`]. Returns
+    /// [`CompactOutcome::TooSmall`]/[`CompactOutcome::AlreadyCompacted`] (both no-ops) when there's no
+    /// worthwhile prefix to summarize or the model returns an empty summary — see [`CompactOutcome`]'s
+    /// own doc comment for exactly which of the two each case maps to. Exposed so a headless server can
+    /// offer a manual `compact` command (pass [`CompactionReason::Manual`]).
     ///
     /// `custom_instructions`, when given, steers *what* the summary emphasizes (see
     /// [`compaction::summary_request`]'s doc comment) — a manual compaction's client-supplied focus.
@@ -1515,11 +1576,11 @@ impl Agent {
         cancel: &CancellationToken,
         sink: &mut dyn FnMut(AgentEvent),
         custom_instructions: Option<&str>,
-    ) -> Result<bool> {
+    ) -> Result<CompactOutcome> {
         let Some(cut) =
             compaction::find_split_cut(&session.messages, self.compaction.keep_recent_tokens)
         else {
-            return Ok(false);
+            return Ok(CompactOutcome::TooSmall);
         };
         // Nothing new worth folding in since the last compaction: on a clean boundary, once a prior
         // summary occupies `messages[0]` (`apply_summary` always splices it in there), `find_cut`'s
@@ -1544,7 +1605,7 @@ impl Agent {
                 .map(compaction::estimate_message_tokens)
                 .fold(0u32, |acc, n| acc.saturating_add(n));
             if since_last_summary < self.compaction.keep_recent_tokens {
-                return Ok(false);
+                return Ok(CompactOutcome::AlreadyCompacted);
             }
         }
         sink(AgentEvent::CompactionStart { reason });
@@ -1576,7 +1637,11 @@ impl Agent {
                 // single-concurrency local providers do not fail with 429 errors" — a self-hosted/local
                 // model behind a one-request-at-a-time server rejects the second of two simultaneous
                 // completions).
-                let turn_prefix_max_tokens = ((self.compaction.summary_max_tokens as f64)
+                // Off the raw `reserve_tokens`, not `summary_max_tokens` (already `0.8 *
+                // reserve_tokens`) — matches pi's own `generateTurnPrefixSummary`
+                // (`Math.floor(0.5 * reserveTokens)`, `compaction.ts`), rather than compounding the two
+                // scale factors into an effective ~0.4 * reserve_tokens.
+                let turn_prefix_max_tokens = ((self.compaction.reserve_tokens as f64)
                     * compaction::SPLIT_TURN_PREFIX_SCALE)
                     as u32;
                 let history = async {
@@ -1625,7 +1690,10 @@ impl Agent {
             }
         };
         if summary.trim().is_empty() {
-            return Ok(false);
+            // A genuine summarization call ran (unlike the two early no-ops above, which never call the
+            // model at all) but came back blank — functionally the same "nothing new to say" no-op as
+            // the clean-boundary case above, just discovered a call later.
+            return Ok(CompactOutcome::AlreadyCompacted);
         }
         // Append the file list deterministically rather than trusting the summarizing model to have
         // mentioned exact paths in its own prose — see `format_file_operations`'s doc comment.
@@ -1633,7 +1701,7 @@ impl Agent {
             "{summary}{}",
             compaction::format_file_operations(&file_ops.read_files, &file_ops.modified_files)
         );
-        compaction::apply_summary(session, first_kept, &summary);
+        compaction::apply_summary(session, first_kept, &summary, tokens_before);
         session.compaction = file_ops;
         // Computed from the freshly-rebuilt list (summary + kept suffix), not `trailing_tokens` — that
         // one measures a delta since the last real usage snapshot, which `apply_summary` just reset to
@@ -1656,7 +1724,7 @@ impl Agent {
             summary,
             tokens_after,
         });
-        Ok(true)
+        Ok(CompactOutcome::Compacted)
     }
 
     /// Runs an *automatic* (proactive-threshold or hard-overflow) compaction and swallows a failure
@@ -1726,7 +1794,7 @@ impl Agent {
         let req = self.with_reasoning(crate::branch_summary::branch_summary_request(
             &self.model,
             messages,
-            self.compaction.summary_max_tokens,
+            crate::branch_summary::BRANCH_SUMMARY_MAX_TOKENS,
             input_token_budget,
             custom_instructions,
             false,
@@ -2778,6 +2846,64 @@ mod tests {
         );
         // The tool actually ran against the retry's complete, valid arguments — not an error result
         // from attempt 1's truncated `{"tex` fragment.
+        assert_eq!(
+            session.messages[2].content,
+            vec![ContentBlock::ToolResult {
+                tool_use_id: "tu_1".into(),
+                content: "pong".into(),
+                is_error: false,
+                images: Vec::new(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_call_dispatches_even_when_stop_reason_is_max_tokens() {
+        // pi-parity fix: dispatch must key off the presence of a complete `tool_use` block alone, never
+        // `stop_reason` — a turn can legitimately emit one or more complete tool calls and *then* get cut
+        // off by `max_tokens` while the model was still writing trailing commentary. Gating dispatch on
+        // `stop_reason == ToolUse` would silently drop the call the model actually made.
+        let mock = Arc::new(MockTransport::scripted(vec![
+            vec![
+                Ok(StreamEvent::MessageStart),
+                Ok(StreamEvent::ToolUseStart {
+                    index: 0,
+                    id: "tu_1".into(),
+                    name: "echo".into(),
+                }),
+                Ok(StreamEvent::InputJsonDelta {
+                    index: 0,
+                    partial_json: r#"{"text":"pong"}"#.into(),
+                }),
+                Ok(StreamEvent::ContentBlockStop { index: 0 }),
+                Ok(StreamEvent::MessageStop {
+                    stop_reason: StopReason::MaxTokens,
+                }),
+            ],
+            turn::text("done").into_iter().map(Ok).collect(),
+        ]));
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8")
+            .with_tools(tools)
+            .with_max_steps(8);
+        let mut session = Session::new();
+        session.user("say pong");
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        // Both turns ran (the tool round-trip, then the follow-up text) — dispatch happened despite
+        // `MaxTokens`, so this isn't the silent-truncation/no-dispatch path collapsing it to one call.
+        assert_eq!(mock.calls(), 2);
+        // user, assistant(tool_use), user(tool_result), assistant(text)
+        assert_eq!(session.messages.len(), 4);
+        assert_eq!(
+            session.messages[1].content,
+            vec![ContentBlock::tool_use(
+                "tu_1",
+                "echo",
+                json!({ "text": "pong" }),
+            )]
+        );
         assert_eq!(
             session.messages[2].content,
             vec![ContentBlock::ToolResult {
@@ -4087,6 +4213,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_tells_a_tool_whether_the_active_model_supports_vision() {
+        // Task #36 (pi-parity): `read`'s "current model doesn't support images" note (matching pi's
+        // `getNonVisionImageNote`) reads a schema-undocumented `_model_supports_vision` field off its
+        // input — this pins that dispatch actually injects it, keyed off the model's own capability
+        // table entry, for both a vision-capable and a non-vision-capable model.
+        struct CapturesVisionFlagTool(Arc<std::sync::Mutex<Option<Value>>>);
+        #[async_trait]
+        impl Tool for CapturesVisionFlagTool {
+            fn name(&self) -> &str {
+                "probe"
+            }
+            fn description(&self) -> &str {
+                "captures the _model_supports_vision flag it was dispatched with"
+            }
+            fn input_schema(&self) -> Value {
+                json!({ "type": "object" })
+            }
+            async fn run(
+                &self,
+                input: Value,
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+                *self.0.lock().unwrap() = input.get("_model_supports_vision").cloned();
+                Ok("ok".into())
+            }
+        }
+
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(CapturesVisionFlagTool(captured.clone())));
+        let mock = Arc::new(MockTransport::new(vec![
+            turn::tool_call("tu_1", "probe", "{}"),
+            turn::text("done"),
+        ]));
+        // o3-mini has no vision support (`models::capabilities`'s own table); claude-opus-4-8 does.
+        let agent = Agent::new(mock, "o3-mini")
+            .with_tools(tools)
+            .with_max_steps(8);
+        let mut session = Session::new();
+        session.user("go");
+        agent.run(&mut session, |_| {}).await.unwrap();
+        assert_eq!(
+            *captured.lock().unwrap(),
+            Some(Value::Bool(false)),
+            "a non-vision model must dispatch with _model_supports_vision: false"
+        );
+
+        let captured2 = Arc::new(std::sync::Mutex::new(None));
+        let mut tools2 = ToolRegistry::new();
+        tools2.register(Arc::new(CapturesVisionFlagTool(captured2.clone())));
+        let mock2 = Arc::new(MockTransport::new(vec![
+            turn::tool_call("tu_1", "probe", "{}"),
+            turn::text("done"),
+        ]));
+        let agent2 = Agent::new(mock2, "claude-opus-4-8")
+            .with_tools(tools2)
+            .with_max_steps(8);
+        let mut session2 = Session::new();
+        session2.user("go");
+        agent2.run(&mut session2, |_| {}).await.unwrap();
+        assert_eq!(
+            *captured2.lock().unwrap(),
+            Some(Value::Bool(true)),
+            "a vision-capable model must dispatch with _model_supports_vision: true"
+        );
+    }
+
+    #[tokio::test]
     async fn request_snapshots_are_isolated_across_turns() {
         // History is shared via `Arc`, so copy-on-write in `Session::push` must keep each request's
         // snapshot frozen: a later turn appending tool results must not retroactively mutate the
@@ -5055,6 +5248,21 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn compact_outcome_compacted_and_reason_agree() {
+        assert!(CompactOutcome::Compacted.compacted());
+        assert_eq!(CompactOutcome::Compacted.reason(), None);
+
+        assert!(!CompactOutcome::TooSmall.compacted());
+        assert_eq!(CompactOutcome::TooSmall.reason(), Some("too_small"));
+
+        assert!(!CompactOutcome::AlreadyCompacted.compacted());
+        assert_eq!(
+            CompactOutcome::AlreadyCompacted.reason(),
+            Some("already_compacted")
+        );
+    }
+
     #[tokio::test]
     async fn compaction_start_fires_with_the_right_reason_before_compacted() {
         // LOW pi-parity gap (fixed): `serve.rs` surfaces pi's `isCompacting` via `get_state`, tracked
@@ -5540,7 +5748,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            compacted,
+            compacted.compacted(),
             "a split-turn compaction round should still apply"
         );
         assert_eq!(mock.calls(), 2, "a split turn must issue two summary calls");
@@ -5593,7 +5801,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(compacted);
+        assert!(compacted.compacted());
 
         let ContentBlock::Text { text, .. } = &session.messages[0].content[0] else {
             panic!("expected the spliced summary message to be text");
@@ -5651,7 +5859,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(compacted);
+        assert!(compacted.compacted());
 
         let summary = event_summary.expect("Compacted event must carry a summary");
         assert!(
@@ -5659,13 +5867,17 @@ mod tests {
             "the event's summary must be the actual generated text: {summary}"
         );
         // Matches what was actually spliced into the session (modulo `apply_summary`'s own
-        // `SUMMARY_MARKER` prefix, which wraps the summary text but isn't part of it).
+        // `SUMMARY_MARKER` prefix and `tokens_before` line, which wrap the summary text but aren't part
+        // of it).
         let ContentBlock::Text { text: spliced, .. } = &session.messages[0].content[0] else {
             panic!("expected the spliced summary message to be text");
         };
         assert_eq!(
             spliced,
-            &format!("{}\n\n{summary}", compaction::SUMMARY_MARKER)
+            &format!(
+                "{}\n\nCompacted from 12345 tokens\n\n{summary}",
+                compaction::SUMMARY_MARKER
+            )
         );
 
         assert_eq!(
@@ -5907,8 +6119,10 @@ mod tests {
 
     #[tokio::test]
     async fn compact_uses_half_budget_for_split_turn_prefix_call() {
-        // Of the two calls a split-turn compaction issues, the turn-prefix one gets half the
-        // history call's `summary_max_tokens` budget — a partial turn needs proportionally less room.
+        // Of the two calls a split-turn compaction issues, the turn-prefix one gets half of
+        // `reserve_tokens` directly (matching pi's `Math.floor(0.5 * reserveTokens)`) — a partial turn
+        // needs proportionally less room, and this budget is deliberately independent of
+        // `summary_max_tokens` (itself a separate, larger scaling off `reserve_tokens`).
         let session_messages = vec![
             Message::user("first request"),
             Message::assistant(vec![ContentBlock::text("first done")]),
@@ -5936,6 +6150,7 @@ mod tests {
         let agent = Agent::new(mock.clone(), "claude-opus-4-8").with_compaction(CompactionConfig {
             keep_recent_tokens: 1,
             summary_max_tokens: 1000,
+            reserve_tokens: 1000,
             ..CompactionConfig::default()
         });
         let cancel = CancellationToken::new();
@@ -5958,7 +6173,7 @@ mod tests {
         );
         assert_eq!(
             reqs[1].max_tokens, 500,
-            "the turn-prefix call gets half the budget"
+            "the turn-prefix call gets half of reserve_tokens directly"
         );
     }
 
@@ -6012,7 +6227,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(compacted);
+        assert!(compacted.compacted());
         assert_eq!(
             mock.calls(),
             1,
@@ -6067,7 +6282,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!compacted, "must report a no-op, not a real compaction");
+        // Task #26: distinguishes from `CompactOutcome::TooSmall` — a prior summary already covers
+        // this cleanly, matching pi's own "Already compacted" error rather than "session too small".
+        assert_eq!(compacted, CompactOutcome::AlreadyCompacted);
         assert_eq!(mock.calls(), 0, "must not make any model call at all");
         assert_eq!(
             session.messages.as_ref(),
@@ -6112,7 +6329,47 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!compacted, "must report a no-op, not a real compaction");
+        // Task #26: same "already compacted" reason as the test above — a real cut point exists
+        // (`find_split_cut` succeeds), just nothing new worth a fresh summary yet.
+        assert_eq!(compacted, CompactOutcome::AlreadyCompacted);
+        assert_eq!(mock.calls(), 0, "must not make any model call at all");
+        assert_eq!(
+            session.messages.as_ref(),
+            &session_messages,
+            "the session must be left completely unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_reports_too_small_when_theres_no_worthwhile_cut_point_at_all() {
+        // Task #26: distinguishes `CompactOutcome::TooSmall` from `CompactOutcome::AlreadyCompacted` —
+        // this session has no prior summary and far too few messages for `find_split_cut` to find any
+        // cut point at all (`n < 4`), matching pi's own "Nothing to compact (session too small)" rather
+        // than "Already compacted".
+        let session_messages = vec![
+            Message::user("hi"),
+            Message::assistant(vec![ContentBlock::text("hello")]),
+        ];
+        let mut session = Session::new();
+        session.messages = Arc::new(session_messages.clone());
+
+        // No turns scripted at all: any model call would panic/error the mock, failing the test loudly.
+        let mock = Arc::new(MockTransport::new(vec![]));
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8");
+        let cancel = CancellationToken::new();
+        let compacted = agent
+            .compact(
+                &mut session,
+                CompactionReason::Manual,
+                &cancel,
+                &mut |_| {},
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(compacted, CompactOutcome::TooSmall);
+        assert!(!compacted.compacted());
         assert_eq!(mock.calls(), 0, "must not make any model call at all");
         assert_eq!(
             session.messages.as_ref(),
@@ -6157,7 +6414,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            compacted,
+            compacted.compacted(),
             "genuinely new large content must still trigger compaction"
         );
         assert_eq!(mock.calls(), 1);
@@ -6862,7 +7119,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(compacted);
+        assert!(compacted.compacted());
 
         let lens = checkpoint.lens.lock().unwrap().clone();
         assert_eq!(
@@ -6911,7 +7168,8 @@ mod tests {
         // shape, a plain conversational reply — used to never reach a single checkpoint call before
         // this fix, relying entirely on a caller's own post-run persist. It's now checkpointed right
         // before its own `AgentEnd`, the same as every other terminal path in the loop.
-        let (agent, _mock) = agent_with(vec![turn::text("just a plain reply")], ToolRegistry::new());
+        let (agent, _mock) =
+            agent_with(vec![turn::text("just a plain reply")], ToolRegistry::new());
         let checkpoint = Arc::new(RecordingCheckpoint {
             lens: std::sync::Mutex::new(Vec::new()),
         });
@@ -6928,7 +7186,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_before_the_first_request_would_survive_a_crash_with_no_model_response_yet() {
+    async fn checkpoint_before_the_first_request_would_survive_a_crash_with_no_model_response_yet()
+    {
         // pi-parity gap (task 15): simulates the exact exposure this fix closes — a process killed
         // between "the user's prompt is durably queued into the session" and "the model is ever
         // called." Before this fix, nothing checkpointed the user's own prompt until *after* a full
@@ -6973,10 +7232,12 @@ mod tests {
              must still find a durable copy of the user's prompt"
         );
         assert!(
-            messages_at_first_checkpoint.iter().any(|m| m.role == Role::User
-                && m.content.iter().any(
-                    |b| matches!(b, ContentBlock::Text { text, .. } if text == "don't lose me")
-                )),
+            messages_at_first_checkpoint
+                .iter()
+                .any(|m| m.role == Role::User
+                    && m.content.iter().any(
+                        |b| matches!(b, ContentBlock::Text { text, .. } if text == "don't lose me")
+                    )),
             "the user's own prompt must already be present in the snapshot a 'crash' here would \
              leave behind: {messages_at_first_checkpoint:?}"
         );

@@ -1,0 +1,487 @@
+//! GitHub Copilot — device-code login. Standard (non-Enterprise) GitHub only for the interactive
+//! `login()` flow (this port's scoped simplification — Enterprise's own device/token endpoints are
+//! identical modulo the domain, so `refresh()`/`base_url_from_token()` both still take an
+//! `enterprise_domain` for a credential that already has one recorded, e.g. hand-edited into
+//! `auth.json`; only the initial interactive login doesn't prompt for one).
+
+use std::time::Duration;
+
+use futures::future::join_all;
+use reqwest::{Client, RequestBuilder};
+use serde::Deserialize;
+use tokio_util::sync::CancellationToken;
+
+use super::callbacks::{DeviceCodeInfo, LoginCallbacks};
+use super::device_code::{self, DevicePollStep};
+use super::error::{OAuthError, Result};
+
+const CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
+const DEVICE_SCOPE: &str = "read:user";
+const COPILOT_USER_AGENT: &str = "GitHubCopilotChat/0.35.0";
+const COPILOT_EDITOR_VERSION: &str = "vscode/1.107.0";
+const COPILOT_EDITOR_PLUGIN_VERSION: &str = "copilot-chat/0.35.0";
+const COPILOT_INTEGRATION_ID: &str = "vscode-chat";
+const COPILOT_API_VERSION: &str = "2026-06-01";
+const EARLY_REFRESH_BUFFER_MS: i64 = 5 * 60 * 1000;
+
+#[derive(Debug, Clone)]
+pub struct GithubCopilotCredential {
+    pub access: String,
+    /// The long-lived GitHub device-flow token (`ghu_...`) — unchanged across refreshes; the
+    /// short-lived Copilot-internal proxy token (`access`) is re-derived from this every refresh.
+    pub refresh: String,
+    pub expires_at_ms: i64,
+    pub enterprise_url: Option<String>,
+    pub available_model_ids: Vec<String>,
+}
+
+/// Log in via GitHub's device-code flow, then exchange for a Copilot-internal token, enable every
+/// model in `known_model_ids` (best-effort, login-only), and record which ones are actually
+/// available.
+pub async fn login(
+    callbacks: &dyn LoginCallbacks,
+    cancel: &CancellationToken,
+    known_model_ids: &[&str],
+) -> Result<GithubCopilotCredential> {
+    let http = Client::new();
+    let domain = "github.com";
+    let device = request_device_code(&http, domain).await?;
+
+    callbacks
+        .show_device_code(&DeviceCodeInfo {
+            user_code: device.user_code.clone(),
+            verification_uri: device.verification_uri.clone(),
+            interval: device.interval.map(Duration::from_secs),
+            expires_in: Some(Duration::from_secs(device.expires_in)),
+        })
+        .await;
+
+    let access_token_url = format!("https://{domain}/login/oauth/access_token");
+    let interval = Duration::from_secs(device.interval.unwrap_or(5));
+    let expires_in = Duration::from_secs(device.expires_in);
+    let device_code_value = device.device_code.clone();
+    let github_token = device_code::poll_device_code(interval, Some(expires_in), true, cancel, {
+        let http = http.clone();
+        let access_token_url = access_token_url.clone();
+        move || {
+            let http = http.clone();
+            let access_token_url = access_token_url.clone();
+            let device_code_value = device_code_value.clone();
+            async move { poll_access_token_once(&http, &access_token_url, &device_code_value).await }
+        }
+    })
+    .await?;
+
+    callbacks.progress("Fetching Copilot token...").await;
+    let (copilot_token, expires_at_ms) = fetch_copilot_token(&http, &github_token, None).await?;
+    let base_url = base_url_from_token(Some(&copilot_token), None);
+
+    callbacks.progress("Enabling available models...").await;
+    enable_models(&http, &base_url, &copilot_token, known_model_ids).await;
+    let available_model_ids = fetch_available_models(&http, &base_url, &copilot_token)
+        .await
+        .unwrap_or_default();
+
+    Ok(GithubCopilotCredential {
+        access: copilot_token,
+        refresh: github_token,
+        expires_at_ms,
+        enterprise_url: None,
+        available_model_ids,
+    })
+}
+
+/// Refresh the Copilot-internal token from the long-lived GitHub device-flow token. Unlike `login`,
+/// this never re-runs the best-effort model-enable fan-out — only `login` does that — but it does
+/// re-fetch model availability, since newly-enabled/disabled models should still be reflected.
+pub async fn refresh(
+    refresh_token: &str,
+    enterprise_domain: Option<&str>,
+) -> Result<GithubCopilotCredential> {
+    let http = Client::new();
+    let (access, expires_at_ms) = fetch_copilot_token(&http, refresh_token, enterprise_domain).await?;
+    let base_url = base_url_from_token(Some(&access), enterprise_domain);
+    let available_model_ids = fetch_available_models(&http, &base_url, &access)
+        .await
+        .unwrap_or_default();
+    Ok(GithubCopilotCredential {
+        access,
+        refresh: refresh_token.to_string(),
+        expires_at_ms,
+        enterprise_url: enterprise_domain.map(str::to_string),
+        available_model_ids,
+    })
+}
+
+#[derive(Deserialize)]
+struct DeviceCodeResponse {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    expires_in: u64,
+    #[serde(default)]
+    interval: Option<u64>,
+}
+
+async fn request_device_code(http: &Client, domain: &str) -> Result<DeviceCodeResponse> {
+    let url = format!("https://{domain}/login/device/code");
+    let resp = http
+        .post(&url)
+        .header("Accept", "application/json")
+        .header("User-Agent", COPILOT_USER_AGENT)
+        .form(&[("client_id", CLIENT_ID), ("scope", DEVICE_SCOPE)])
+        .send()
+        .await
+        .map_err(|source| OAuthError::Network {
+            url: url.clone(),
+            source,
+        })?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(OAuthError::Http {
+            provider: "github",
+            status: status.as_u16(),
+            body,
+        });
+    }
+    let device: DeviceCodeResponse = resp.json().await.map_err(|source| OAuthError::Network {
+        url: url.clone(),
+        source,
+    })?;
+    validate_verification_uri(&device.verification_uri)?;
+    Ok(device)
+}
+
+/// Rejects anything but `http`/`https` — a real security check against a malicious/compromised
+/// device-flow server smuggling a shell-executable string into whatever opens this URI for the user.
+fn validate_verification_uri(uri: &str) -> Result<()> {
+    let parsed = url::Url::parse(uri).map_err(|_| OAuthError::InvalidResponse {
+        provider: "github",
+        detail: format!("verification_uri is not a valid URL: {uri}"),
+    })?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err(OAuthError::InvalidResponse {
+            provider: "github",
+            detail: format!("untrusted verification_uri scheme: {}", parsed.scheme()),
+        });
+    }
+    Ok(())
+}
+
+async fn poll_access_token_once(
+    http: &Client,
+    url: &str,
+    device_code: &str,
+) -> Result<DevicePollStep<String>> {
+    let resp = http
+        .post(url)
+        .header("Accept", "application/json")
+        .header("User-Agent", COPILOT_USER_AGENT)
+        .form(&[
+            ("client_id", CLIENT_ID),
+            ("device_code", device_code),
+            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+        ])
+        .send()
+        .await
+        .map_err(|source| OAuthError::Network {
+            url: url.to_string(),
+            source,
+        })?;
+    let body: serde_json::Value = resp.json().await.map_err(|source| OAuthError::Network {
+        url: url.to_string(),
+        source,
+    })?;
+    if let Some(token) = body.get("access_token").and_then(|v| v.as_str()) {
+        return Ok(DevicePollStep::Complete(token.to_string()));
+    }
+    let error = body.get("error").and_then(|v| v.as_str()).unwrap_or_default();
+    match error {
+        "authorization_pending" => Ok(DevicePollStep::Pending),
+        "slow_down" => Ok(DevicePollStep::SlowDown),
+        other => {
+            let description = body
+                .get("error_description")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            Err(OAuthError::DeviceFlowFailed(format!(
+                "{other}: {description}"
+            )))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct CopilotTokenResponse {
+    token: String,
+    /// Unix seconds, not milliseconds.
+    expires_at: i64,
+}
+
+async fn fetch_copilot_token(
+    http: &Client,
+    refresh_token: &str,
+    enterprise_domain: Option<&str>,
+) -> Result<(String, i64)> {
+    let domain = enterprise_domain.unwrap_or("github.com");
+    let url = format!("https://api.{domain}/copilot_internal/v2/token");
+    let req = apply_copilot_headers(
+        http.get(&url)
+            .header("Accept", "application/json")
+            .header("Authorization", format!("Bearer {refresh_token}")),
+    );
+    let resp = req.send().await.map_err(|source| OAuthError::Network {
+        url: url.clone(),
+        source,
+    })?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(OAuthError::Http {
+            provider: "github-copilot",
+            status: status.as_u16(),
+            body,
+        });
+    }
+    let parsed: CopilotTokenResponse = resp.json().await.map_err(|source| OAuthError::Network {
+        url: url.clone(),
+        source,
+    })?;
+    let expires_at_ms = parsed
+        .expires_at
+        .saturating_mul(1000)
+        .checked_sub(EARLY_REFRESH_BUFFER_MS)
+        .unwrap_or(0);
+    Ok((parsed.token, expires_at_ms))
+}
+
+fn apply_copilot_headers(req: RequestBuilder) -> RequestBuilder {
+    req.header("User-Agent", COPILOT_USER_AGENT)
+        .header("Editor-Version", COPILOT_EDITOR_VERSION)
+        .header("Editor-Plugin-Version", COPILOT_EDITOR_PLUGIN_VERSION)
+        .header("Copilot-Integration-Id", COPILOT_INTEGRATION_ID)
+}
+
+/// Parses the access token itself for `proxy-ep=([^;]+)` and rewrites a leading `proxy.` to `api.`;
+/// falls back to `https://copilot-api.{enterprise_domain}` if Enterprise and no proxy-ep found, else
+/// `https://api.individual.githubcopilot.com`. Pure string logic, no network — the *only*
+/// token-dependent request-time detail besides the bearer value itself.
+pub fn base_url_from_token(access_token: Option<&str>, enterprise_domain: Option<&str>) -> String {
+    if let Some(token) = access_token {
+        if let Some(proxy_ep) = extract_proxy_ep(token) {
+            let api_host = match proxy_ep.strip_prefix("proxy.") {
+                Some(rest) => format!("api.{rest}"),
+                None => proxy_ep,
+            };
+            return format!("https://{api_host}");
+        }
+    }
+    if let Some(domain) = enterprise_domain {
+        return format!("https://copilot-api.{domain}");
+    }
+    "https://api.individual.githubcopilot.com".to_string()
+}
+
+fn extract_proxy_ep(token: &str) -> Option<String> {
+    token
+        .split(';')
+        .find_map(|part| part.trim().strip_prefix("proxy-ep=").map(str::to_string))
+}
+
+#[derive(Deserialize)]
+struct ModelsResponse {
+    data: Vec<ModelEntry>,
+}
+
+#[derive(Deserialize)]
+struct ModelEntry {
+    id: String,
+    #[serde(default)]
+    model_picker_enabled: bool,
+    #[serde(default)]
+    policy: Option<ModelPolicy>,
+    #[serde(default)]
+    capabilities: Option<ModelCapabilities>,
+}
+
+#[derive(Deserialize)]
+struct ModelPolicy {
+    state: String,
+}
+
+#[derive(Deserialize)]
+struct ModelCapabilities {
+    supports: ModelSupports,
+}
+
+#[derive(Deserialize)]
+struct ModelSupports {
+    #[serde(default = "default_true")]
+    tool_calls: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Selectable iff `model_picker_enabled && policy?.state != "disabled" && capabilities.supports
+/// .tool_calls != false` — a model with no `policy`/`capabilities` block at all defaults open (not
+/// disabled, tool calls assumed supported), matching pi's own optional-chaining semantics.
+fn is_model_selectable(entry: &ModelEntry) -> bool {
+    entry.model_picker_enabled
+        && entry.policy.as_ref().map(|p| p.state.as_str()) != Some("disabled")
+        && entry
+            .capabilities
+            .as_ref()
+            .map(|c| c.supports.tool_calls)
+            .unwrap_or(true)
+}
+
+async fn fetch_available_models(http: &Client, base_url: &str, token: &str) -> Result<Vec<String>> {
+    let url = format!("{base_url}/models");
+    let req = apply_copilot_headers(
+        http.get(&url)
+            .timeout(Duration::from_secs(5))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-GitHub-Api-Version", COPILOT_API_VERSION),
+    );
+    let resp = req.send().await.map_err(|source| OAuthError::Network {
+        url: url.clone(),
+        source,
+    })?;
+    if !resp.status().is_success() {
+        // Best-effort: a failure here shouldn't fail the whole login/refresh — an empty list just
+        // means "unknown," not "nothing available."
+        return Ok(Vec::new());
+    }
+    let parsed: ModelsResponse = resp.json().await.map_err(|source| OAuthError::Network {
+        url: url.clone(),
+        source,
+    })?;
+    Ok(parsed
+        .data
+        .into_iter()
+        .filter(is_model_selectable)
+        .map(|m| m.id)
+        .collect())
+}
+
+/// Best-effort, parallel, login-only: enable every model in `model_ids` for this account. Failures
+/// are swallowed — matching pi, which only reports them via a progress callback, never fails login
+/// over a policy-enable rejection.
+async fn enable_models(http: &Client, base_url: &str, token: &str, model_ids: &[&str]) {
+    let calls = model_ids.iter().map(|id| {
+        let url = format!("{base_url}/models/{id}/policy");
+        let http = http.clone();
+        let token = token.to_string();
+        async move {
+            let req = apply_copilot_headers(
+                http.post(&url)
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header("openai-intent", "chat-policy")
+                    .header("x-interaction-type", "chat-policy")
+                    .json(&serde_json::json!({ "state": "enabled" })),
+            );
+            let _ = req.send().await;
+        }
+    });
+    join_all(calls).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base_url_extracts_proxy_ep_and_rewrites_proxy_prefix_to_api() {
+        let token = "tid=abc;proxy-ep=proxy.business.githubcopilot.com;exp=123";
+        assert_eq!(
+            base_url_from_token(Some(token), None),
+            "https://api.business.githubcopilot.com"
+        );
+    }
+
+    #[test]
+    fn base_url_keeps_a_proxy_ep_without_a_proxy_prefix_as_is() {
+        let token = "tid=abc;proxy-ep=api.already-correct.com";
+        assert_eq!(
+            base_url_from_token(Some(token), None),
+            "https://api.already-correct.com"
+        );
+    }
+
+    #[test]
+    fn base_url_falls_back_to_enterprise_when_no_proxy_ep_found() {
+        assert_eq!(
+            base_url_from_token(Some("tid=abc;exp=123"), Some("ghe.example.com")),
+            "https://copilot-api.ghe.example.com"
+        );
+    }
+
+    #[test]
+    fn base_url_falls_back_to_individual_when_nothing_else_applies() {
+        assert_eq!(
+            base_url_from_token(None, None),
+            "https://api.individual.githubcopilot.com"
+        );
+        assert_eq!(
+            base_url_from_token(Some("tid=abc;exp=123"), None),
+            "https://api.individual.githubcopilot.com"
+        );
+    }
+
+    #[test]
+    fn validate_verification_uri_accepts_https() {
+        validate_verification_uri("https://github.com/login/device").unwrap();
+    }
+
+    #[test]
+    fn validate_verification_uri_rejects_a_non_http_scheme() {
+        // A malicious/compromised device-flow server smuggling a shell-executable string.
+        let err = validate_verification_uri("javascript:alert(1)").unwrap_err();
+        assert!(matches!(err, OAuthError::InvalidResponse { .. }));
+    }
+
+    #[test]
+    fn validate_verification_uri_rejects_garbage() {
+        let err = validate_verification_uri("$(id>/tmp/pwned)").unwrap_err();
+        assert!(matches!(err, OAuthError::InvalidResponse { .. }));
+    }
+
+    fn entry(model_picker_enabled: bool, state: Option<&str>, tool_calls: Option<bool>) -> ModelEntry {
+        ModelEntry {
+            id: "m".to_string(),
+            model_picker_enabled,
+            policy: state.map(|s| ModelPolicy { state: s.to_string() }),
+            capabilities: tool_calls.map(|t| ModelCapabilities {
+                supports: ModelSupports { tool_calls: t },
+            }),
+        }
+    }
+
+    #[test]
+    fn a_fully_enabled_model_with_no_policy_or_capabilities_block_is_selectable() {
+        assert!(is_model_selectable(&entry(true, None, None)));
+    }
+
+    #[test]
+    fn model_picker_disabled_is_never_selectable() {
+        assert!(!is_model_selectable(&entry(false, None, None)));
+    }
+
+    #[test]
+    fn an_explicitly_disabled_policy_is_not_selectable() {
+        assert!(!is_model_selectable(&entry(true, Some("disabled"), None)));
+    }
+
+    #[test]
+    fn a_non_disabled_policy_state_is_still_selectable() {
+        assert!(is_model_selectable(&entry(true, Some("enabled"), None)));
+    }
+
+    #[test]
+    fn tool_calls_false_is_not_selectable() {
+        assert!(!is_model_selectable(&entry(true, None, Some(false))));
+    }
+}

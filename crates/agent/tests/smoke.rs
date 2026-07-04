@@ -1906,12 +1906,12 @@ fn smoke_whole_run_auto_retry_recovers_from_a_real_dropped_connection_live() {
             .rev()
             .find(|f| f["type"] == "response" && f["command"] == "prompt")
             .expect("a prompt response");
-        // `auto_retry`/`auto_retry_end` are their own top-level frame types (`{"type":"auto_retry",
+        // `auto_retry_start`/`auto_retry_end` are their own top-level frame types (`{"type":"auto_retry_start",
         // attempt, delay_ms, error, ...}`), not nested under the generic `{"type":"event","event":{...}}`
         // wrapper the rest of a run's frames use.
         let retry_events: Vec<&Value> = frames
             .iter()
-            .filter(|f| f["type"] == "auto_retry" || f["type"] == "auto_retry_end")
+            .filter(|f| f["type"] == "auto_retry_start" || f["type"] == "auto_retry_end")
             .collect();
         eprintln!(
             "--- [{}] retry-recovery run ({elapsed:?}) ---\nretry events: {retry_events:?}\nfinal: {resp}",

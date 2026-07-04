@@ -24,7 +24,7 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agent_core::{ContentBlock, Message, Role};
+use agent_core::{ContentBlock, Message, Role, ToolDef};
 
 use crate::session_store::SessionMeta;
 use crate::skills::xml_escape as html_escape;
@@ -42,7 +42,7 @@ pub fn render_html(
     branches: &[(usize, Vec<Message>)],
     usage: Option<UsageTotals>,
 ) -> String {
-    render_html_inner(meta, messages, branches, usage, &[])
+    render_html_inner(meta, messages, branches, usage, &[], None, None)
 }
 
 /// Like [`render_html`], but also renders `events` — every [`crate::session_store::ExportEvent`]
@@ -59,7 +59,36 @@ pub fn render_html_with_entries(
     usage: Option<UsageTotals>,
     events: &[crate::session_store::ExportEvent],
 ) -> String {
-    render_html_inner(meta, messages, branches, usage, events)
+    render_html_inner(meta, messages, branches, usage, events, None, None)
+}
+
+/// Like [`render_html_with_entries`], but also renders `system_prompt` and `tools` as collapsible
+/// sections near the top of the document, right after the header — pi's own always-included
+/// `systemPrompt`/`tools` fields (`export-html/index.ts:263-270`, `template.js:1405-1435`), previously
+/// omitted from this crate's export entirely. `None` (either individually or both) renders no section
+/// at all, so every existing caller of the plainer forms above — this module's own test call sites,
+/// plus the standalone `export` subcommand (no live `Agent`/`ToolRegistry` to pull either from,
+/// genuinely not just an oversight — see its own call site's comment) — keeps rendering exactly as
+/// before. `main.rs`'s `run --export` and `serve.rs`'s `export_html` RPC command both now call this
+/// directly with a live system prompt and [`agent_core::ToolRegistry::definitions`] (Task #44).
+pub fn render_html_full(
+    meta: &SessionMeta,
+    messages: &[Message],
+    branches: &[(usize, Vec<Message>)],
+    usage: Option<UsageTotals>,
+    events: &[crate::session_store::ExportEvent],
+    system_prompt: Option<&str>,
+    tools: Option<&[ToolDef]>,
+) -> String {
+    render_html_inner(
+        meta,
+        messages,
+        branches,
+        usage,
+        events,
+        system_prompt,
+        tools,
+    )
 }
 
 fn render_html_inner(
@@ -68,6 +97,8 @@ fn render_html_inner(
     branches: &[(usize, Vec<Message>)],
     usage: Option<UsageTotals>,
     events: &[crate::session_store::ExportEvent],
+    system_prompt: Option<&str>,
+    tools: Option<&[ToolDef]>,
 ) -> String {
     let mut out = String::new();
     out.push_str("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n");
@@ -90,7 +121,10 @@ fn render_html_inner(
         messages.len()
     ));
     render_stats_section(&mut out, meta, messages, usage);
-    out.push_str("</header>\n<main>\n");
+    out.push_str("</header>\n");
+    render_system_prompt_section(&mut out, system_prompt);
+    render_tools_section(&mut out, tools);
+    out.push_str("<main>\n");
     // Every branch is rendered *inline*, immediately after the message it actually diverged from
     // (`shared` is a message-count prefix — the branch shares `messages[..shared]` with the active
     // path) — a real tree laid out in reading order, rather than one flat "other branches" dump
@@ -125,9 +159,14 @@ fn render_events_section(out: &mut String, events: &[crate::session_store::Expor
                 format!("Model changed to <code>{}</code>", html_escape(model))
             }
             crate::session_store::ExportEvent::ThinkingLevelChange(level) => {
-                format!("Thinking level changed to <code>{}</code>", html_escape(level))
+                format!(
+                    "Thinking level changed to <code>{}</code>",
+                    html_escape(level)
+                )
             }
-            crate::session_store::ExportEvent::Label { label: Some(label), .. } => {
+            crate::session_store::ExportEvent::Label {
+                label: Some(label), ..
+            } => {
                 format!("Labeled: {}", html_escape(label))
             }
             crate::session_store::ExportEvent::Label { label: None, .. } => {
@@ -144,6 +183,91 @@ fn render_events_section(out: &mut String, events: &[crate::session_store::Expor
         out.push_str(&format!("<li>{line}</li>\n"));
     }
     out.push_str("</ul>\n</section>\n");
+}
+
+/// Render the session's system prompt as a collapsed-by-default `<details>` block — pi's own
+/// always-included `systemPrompt` section (`export-html/index.ts:267`, `template.js:1405-1417`). A
+/// no-op when `system_prompt` is `None`, which is every caller today except [`render_html_full`] (see
+/// that function's own doc comment for why).
+fn render_system_prompt_section(out: &mut String, system_prompt: Option<&str>) {
+    let Some(prompt) = system_prompt else {
+        return;
+    };
+    out.push_str(&format!(
+        "<details class=\"system-prompt\"><summary>System Prompt</summary>\n<pre>{}</pre>\n</details>\n",
+        html_escape(prompt)
+    ));
+}
+
+/// Render the session's registered tools (name, description, and JSON-Schema parameters) as a
+/// collapsed-by-default `<details>` block — pi's own always-included `tools` section
+/// (`export-html/index.ts:268`, `template.js:1423-1447`). A no-op when `tools` is `None` or empty.
+fn render_tools_section(out: &mut String, tools: Option<&[ToolDef]>) {
+    let Some(tools) = tools.filter(|t| !t.is_empty()) else {
+        return;
+    };
+    out.push_str(&format!(
+        "<details class=\"tools-list\"><summary>Available Tools ({})</summary>\n\
+         <div class=\"tools-content\">\n",
+        tools.len()
+    ));
+    for tool in tools {
+        out.push_str(&format!(
+            "<div class=\"tool-item\"><span class=\"tool-item-name\">{}</span> &mdash; \
+             <span class=\"tool-item-desc\">{}</span>\n",
+            html_escape(&tool.name),
+            html_escape(&tool.description)
+        ));
+        render_tool_params(out, &tool.input_schema);
+        out.push_str("</div>\n");
+    }
+    out.push_str("</div>\n</details>\n");
+}
+
+/// Render one tool's JSON-Schema `input_schema`'s `properties`/`required` as a per-parameter list —
+/// matching pi's own `t.parameters.properties`/`required` walk (`template.js:1428-1440`). A no-op when
+/// `schema` has no non-empty `properties` object, same as pi's own `hasParams` guard.
+fn render_tool_params(out: &mut String, schema: &serde_json::Value) {
+    let Some(properties) = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return;
+    };
+    if properties.is_empty() {
+        return;
+    }
+    let required: Vec<&str> = schema
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .map(|a| a.iter().filter_map(serde_json::Value::as_str).collect())
+        .unwrap_or_default();
+    out.push_str("<div class=\"tool-params\">\n");
+    for (name, prop) in properties {
+        let ty = prop
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("any");
+        let (req_class, req_label) = if required.contains(&name.as_str()) {
+            ("tool-param-required", "required")
+        } else {
+            ("tool-param-optional", "optional")
+        };
+        out.push_str(&format!(
+            "<div class=\"tool-param\"><span class=\"tool-param-name\">{}</span> \
+             <span class=\"tool-param-type\">{}</span> <span class=\"{req_class}\">{req_label}</span>",
+            html_escape(name),
+            html_escape(ty),
+        ));
+        if let Some(desc) = prop.get("description").and_then(serde_json::Value::as_str) {
+            out.push_str(&format!(
+                "<div class=\"tool-param-desc\">{}</div>",
+                html_escape(desc)
+            ));
+        }
+        out.push_str("</div>\n");
+    }
+    out.push_str("</div>\n");
 }
 
 /// Render every branch whose `shared` divergence point equals `at`, as a collapsed-by-default
@@ -217,8 +341,7 @@ impl MessageStats {
                     // A message carrying only `ToolResult` blocks is the model's tool feedback, not a
                     // real user turn — don't double-count it as one just because it rides on `Role::User`
                     // (Anthropic's own convention for where tool results live).
-                    if m
-                        .content
+                    if m.content
                         .iter()
                         .any(|b| !matches!(b, ContentBlock::ToolResult { .. }))
                     {
@@ -314,6 +437,8 @@ h1 { font-size: 1.3rem; margin: 0 0 0.25rem; }\n\
 color: #999; margin-bottom: 0.4rem; }\n\
 .tool-call, .tool-result { border-left: 3px solid #666; padding-left: 0.75rem; margin: 0.5rem 0; }\n\
 .tool-result.error { border-left-color: #c94f4f; }\n\
+.tool-call.host-bash { border-left-color: #d0a94c; }\n\
+.tool-call.host-bash.error { border-left-color: #c94f4f; }\n\
 .skill-invocation { border-left: 3px solid #a67ee2; padding-left: 0.75rem; margin: 0.5rem 0; }\n\
 .tool-title { font-size: 0.8rem; color: #aaa; margin-bottom: 0.25rem; }\n\
 pre { white-space: pre-wrap; word-wrap: break-word; background: #151515; padding: 0.5rem; \
@@ -356,6 +481,24 @@ margin: 0.5rem 0; background: #232323; }\n\
 .stat { font-size: 0.85rem; }\n\
 .stat-label { color: #888; margin-right: 0.35rem; }\n\
 .stat-value { color: #d4d4d4; }\n\
+.system-prompt, .tools-list { border: 1px dashed #555; border-radius: 6px; padding: 0.5rem 0.75rem; \
+margin: 0.75rem 0; background: #232323; }\n\
+.system-prompt summary, .tools-list summary { cursor: pointer; font-size: 0.85rem; font-weight: 600; \
+color: #bbb; user-select: none; }\n\
+.system-prompt summary:hover, .tools-list summary:hover { color: #fff; }\n\
+.system-prompt pre { margin-top: 0.5rem; }\n\
+.tools-content { margin-top: 0.5rem; }\n\
+.tool-item { padding: 0.4rem 0; border-bottom: 1px solid #333; }\n\
+.tool-item:last-child { border-bottom: none; }\n\
+.tool-item-name { font-weight: 600; font-family: monospace; color: #6cb6ff; }\n\
+.tool-item-desc { color: #ccc; }\n\
+.tool-params { margin: 0.35rem 0 0 1rem; }\n\
+.tool-param { font-size: 0.85rem; margin: 0.2rem 0; }\n\
+.tool-param-name { font-family: monospace; color: #d0a94c; }\n\
+.tool-param-type { color: #888; font-style: italic; }\n\
+.tool-param-required { color: #f0908f; font-size: 0.75rem; }\n\
+.tool-param-optional { color: #7ee2a8; font-size: 0.75rem; }\n\
+.tool-param-desc { color: #999; font-size: 0.8rem; margin-left: 0.25rem; }\n\
 </style>\n";
 
 fn role_label(role: Role) -> &'static str {
@@ -403,14 +546,22 @@ fn render_message(out: &mut String, message: &Message) {
 fn render_block(out: &mut String, block: &ContentBlock) {
     match block {
         ContentBlock::Text { text, .. } => {
-            // A compaction or branch-summary recap materializes as a plain `Role::User` text block
-            // carrying a literal bracketed marker line (`agent_core::compaction::apply_summary` /
-            // `session_store.rs::branch_summary_message`) — detect and render it as its own distinctly
-            // labeled block, matching pi's dedicated `.compaction`/`.branch-summary` blocks
-            // (`template.js:1294-1306`), instead of plain markdown text with the marker line still
-            // visible verbatim as if the model had actually written it.
-            if let Some((class, label, body)) = parse_summary_marker(text) {
-                render_summary_marker(out, class, label, body);
+            // A host-run bash command (`serve.rs`'s `bash` RPC command, run from the idle loop rather
+            // than the model's own turn) materializes as a plain `Role::User` text block carrying a
+            // literal bracketed marker line — detect and render it as its own distinct, code-styled
+            // block instead of falling through to `render_markdown`, where multi-line output collapsed
+            // into one unreadable run-on line (pi-parity gap; pi has a dedicated `bashExecution` role,
+            // `template.js:1273-1285`).
+            if let Some(host_bash) = parse_host_bash_marker(text) {
+                render_host_bash_marker(out, &host_bash);
+            } else if let Some((class, label, tokens_before, body)) = parse_summary_marker(text) {
+                // A compaction or branch-summary recap materializes as a plain `Role::User` text block
+                // carrying a literal bracketed marker line (`agent_core::compaction::apply_summary` /
+                // `session_store.rs::branch_summary_message`) — detect and render it as its own
+                // distinctly labeled block, matching pi's dedicated `.compaction`/`.branch-summary`
+                // blocks (`template.js:1294-1306`), instead of plain markdown text with the marker line
+                // still visible verbatim as if the model had actually written it.
+                render_summary_marker(out, class, label, tokens_before, body);
             } else {
                 // A `/skill:name` invocation stores its expansion as a structural
                 // `<skill name="..." location="...">...</skill>` wrapper around the model-facing text
@@ -700,6 +851,13 @@ fn render_markdown(text: &str) -> String {
         Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
     let mut iter = Parser::new_ext(text, options).map(|event| match event {
         Event::Html(s) | Event::InlineHtml(s) => Event::Text(s),
+        // CommonMark's soft break (a single `\n` not preceded by two-plus trailing spaces) renders as
+        // a literal newline character by default — invisible once collapsed into HTML whitespace. pi's
+        // own markdown renderer configures `marked.use({ breaks: true })` so every single `\n` becomes
+        // a real `<br>` instead; promoting the event to a hard break here is pulldown-cmark's
+        // equivalent (renders as `<br />`), matching pi's actual appearance for multi-line, non-blank-
+        // line-separated text.
+        Event::SoftBreak => Event::HardBreak,
         Event::Start(Tag::Link {
             link_type,
             dest_url,
@@ -749,9 +907,9 @@ fn render_markdown(text: &str) -> String {
     html_out
 }
 
-/// Allow-list a markdown link/image URL to http(s)/mailto or a same-document/relative reference,
-/// dropping anything else (`javascript:`, `data:`, `vbscript:`, ...) rather than emitting it as a live
-/// `href`/`src` — pi's own `sanitizeMarkdownUrl`.
+/// Allow-list a markdown link/image URL to http(s)/mailto/tel/ftp or a same-document/relative
+/// reference, dropping anything else (`javascript:`, `data:`, `vbscript:`, ...) rather than emitting it
+/// as a live `href`/`src` — pi's own `sanitizeMarkdownUrl` (`template.js:616-626`).
 fn sanitize_url(url: pulldown_cmark::CowStr) -> pulldown_cmark::CowStr {
     // Strip C0 controls + DEL before the scheme check — matches pi's own
     // `.replace(/[\x00-\x1f\x7f]/g, '')`. Not an active bypass-prevention here (the scheme check is
@@ -768,6 +926,8 @@ fn sanitize_url(url: pulldown_cmark::CowStr) -> pulldown_cmark::CowStr {
     let safe = lower.starts_with("http://")
         || lower.starts_with("https://")
         || lower.starts_with("mailto:")
+        || lower.starts_with("tel:")
+        || lower.starts_with("ftp:")
         || trimmed.starts_with('#')
         || trimmed.starts_with('/')
         || trimmed.starts_with("./")
@@ -824,11 +984,12 @@ fn diff_html(content: &str) -> String {
 /// `agent_core::compaction::SUMMARY_MARKER` or [`agent_core::BRANCH_SUMMARY_MARKER`], each always
 /// followed by exactly `\n\n` and then the summary body (`agent_core::compaction::apply_summary` /
 /// `crate::session_store`'s `branch_summary_message`, the only two places either message shape is ever
-/// constructed). Returns the CSS class, a display label, and the body — `None` for ordinary text,
+/// constructed). Returns the CSS class, a display label, the pre-compaction token count if the body
+/// embeds one (see [`parse_compaction_tokens_before`]), and the body — `None` for ordinary text,
 /// including text that merely happens to start with one marker's literal characters but isn't followed
 /// by the exact separator both call sites always produce (mirrors [`parse_skill_block`]'s same
 /// exact-shape-or-not-at-all precedent).
-fn parse_summary_marker(text: &str) -> Option<(&'static str, &'static str, &str)> {
+fn parse_summary_marker(text: &str) -> Option<(&'static str, &'static str, Option<u64>, &str)> {
     for (marker, class, label) in [
         (
             agent_core::compaction::SUMMARY_MARKER,
@@ -841,23 +1002,132 @@ fn parse_summary_marker(text: &str) -> Option<(&'static str, &'static str, &str)
             "Branch Summary",
         ),
     ] {
-        if let Some(body) = text.strip_prefix(marker).and_then(|r| r.strip_prefix("\n\n")) {
-            return Some((class, label, body));
+        if let Some(body) = text
+            .strip_prefix(marker)
+            .and_then(|r| r.strip_prefix("\n\n"))
+        {
+            let (tokens_before, body) = if class == "compaction" {
+                parse_compaction_tokens_before(body)
+            } else {
+                (None, body)
+            };
+            return Some((class, label, tokens_before, body));
         }
     }
     None
 }
 
+/// Parse the pre-compaction token count `agent_core::compaction::apply_summary` embeds as a literal
+/// leading line of a compaction summary's body, in the shape `"Compacted from {N} tokens\n\n"` — the
+/// same value pi's own dedicated `entry.tokensBefore` field renders (`template.js:1294-1299`). Absent
+/// entirely from a branch-summary body (that class never carries this line) or from a legacy/malformed
+/// marker predating this line's introduction, in which case this is a no-op (`None`, `body` unchanged).
+fn parse_compaction_tokens_before(body: &str) -> (Option<u64>, &str) {
+    if let Some(rest) = body.strip_prefix("Compacted from ") {
+        if let Some((count, rest)) = rest.split_once(" tokens\n\n") {
+            if let Ok(n) = count.parse::<u64>() {
+                return (Some(n), rest);
+            }
+        }
+    }
+    (None, body)
+}
+
+/// Render an integer with `,`-grouped thousands (`12345` -> `"12,345"`) — matching pi's own
+/// `tokensBefore.toLocaleString()` (`template.js:1298`).
+fn format_thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out.chars().rev().collect()
+}
+
 /// Render a parsed compaction/branch-summary marker (see [`parse_summary_marker`]) as its own
 /// distinctly labeled, styled block (markdown body) — matching pi's own dedicated `.compaction`/
 /// `.branch-summary` blocks (`template.js:1294-1306`) instead of plain markdown text that still shows
-/// the bracketed marker line verbatim, as if the model itself had written it.
-fn render_summary_marker(out: &mut String, class: &str, label: &str, body: &str) {
+/// the bracketed marker line verbatim, as if the model itself had written it. `tokens_before`, when
+/// present, appends a "Compacted from N tokens" note to the label — always present for a real
+/// compaction, `None` for a branch summary (see [`parse_compaction_tokens_before`]).
+fn render_summary_marker(
+    out: &mut String,
+    class: &str,
+    label: &str,
+    tokens_before: Option<u64>,
+    body: &str,
+) {
+    let tokens_note = match tokens_before {
+        Some(n) => format!(" &middot; Compacted from {} tokens", format_thousands(n)),
+        None => String::new(),
+    };
     out.push_str(&format!(
-        "<div class=\"summary-marker {class}\"><div class=\"tool-title\">{}</div>\n{}</div>\n",
+        "<div class=\"summary-marker {class}\"><div class=\"tool-title\">{}{tokens_note}</div>\n{}</div>\n",
         html_escape(label),
         render_markdown(body)
     ));
+}
+
+/// A parsed host-run bash command marker (`serve.rs`'s `bash` RPC command, invoked from the idle loop
+/// rather than the model's own turn) — see [`parse_host_bash_marker`].
+struct HostBashBlock<'a> {
+    command: &'a str,
+    is_error: bool,
+    output: &'a str,
+}
+
+/// The exact literal prefix `serve.rs` tags a host-run bash command with (`~serve.rs:3765`), immediately
+/// followed by the command itself.
+const HOST_BASH_MARKER_PREFIX: &str = "[Host bash command, run outside the model's own turn]\n$ ";
+
+/// Detect and split apart `serve.rs`'s host-bash-command marker: the fixed prefix, the command up to
+/// the first `\n\n`, then either the result text directly or (if the command errored) a literal
+/// `"(error)\n"` immediately before it. Anything that doesn't fit this exact shape isn't a host-bash
+/// marker at all — returns `None`, and the caller falls through to ordinary text rendering (mirrors
+/// [`parse_summary_marker`]/[`parse_skill_block`]'s same exact-shape-or-not-at-all precedent). Not
+/// robust to a `command` that itself contains a blank line (an embedded `\n\n`) — splits at the first
+/// one, same simplifying assumption `parse_skill_block` makes for its own body boundary.
+fn parse_host_bash_marker(text: &str) -> Option<HostBashBlock<'_>> {
+    let rest = text.strip_prefix(HOST_BASH_MARKER_PREFIX)?;
+    let (command, rest) = rest.split_once("\n\n")?;
+    let (is_error, output) = match rest.strip_prefix("(error)\n") {
+        Some(o) => (true, o),
+        None => (false, rest),
+    };
+    Some(HostBashBlock {
+        command,
+        is_error,
+        output,
+    })
+}
+
+/// Render a parsed host-bash-command marker (see [`parse_host_bash_marker`]) as its own distinct,
+/// code-styled block — a shell-prompt-styled command line (matching [`render_bash_call`]'s own
+/// styling) followed by the raw result in a `<pre>` (never markdown — it's command output, not prose),
+/// instead of falling through to `render_markdown`, where multi-line output used to collapse into one
+/// unreadable run-on line. `is_error` gets its own CSS class, matching pi's own success/error coloring
+/// for its dedicated `bashExecution` role (`template.js:1273-1285`).
+fn render_host_bash_marker(out: &mut String, block: &HostBashBlock) {
+    let class = if block.is_error {
+        "tool-call host-bash error"
+    } else {
+        "tool-call host-bash"
+    };
+    out.push_str(&format!(
+        "<div class=\"{class}\"><div class=\"tool-title\">Host bash command (run outside the model's \
+         own turn)</div>\n"
+    ));
+    out.push_str(&format!(
+        "<pre class=\"bash-command\">$ {}</pre>",
+        html_escape(block.command)
+    ));
+    if !block.output.is_empty() {
+        out.push_str(&format!("<pre>{}</pre>", html_escape(block.output)));
+    }
+    out.push_str("</div>\n");
 }
 
 /// A parsed `<skill name="..." location="...">...</skill>` invocation wrapper, plus any trailing
@@ -999,6 +1269,49 @@ pub fn export_html_with_entries(
         }
     }
     let html = render_html_with_entries(meta, messages, branches, None, events);
+    let mut file = std::fs::File::create(&path)?;
+    file.write_all(html.as_bytes())?;
+    file.sync_all()?;
+    Ok(path)
+}
+
+/// Like [`export_html_with_entries`], but also renders `system_prompt`/`tools` (see
+/// [`render_html_full`]) and folds in `usage`'s token totals — the one entry point that renders
+/// everything this module knows how to, for a caller holding a live session, its
+/// [`agent_core::ToolRegistry::definitions`], and its running token totals. Task #44: `main.rs`'s
+/// `run --export`/standalone `export` subcommand and `serve.rs`'s `export_html` RPC command all call
+/// this directly now — the standalone subcommand passes `None` for `system_prompt`/`tools`/`usage`
+/// (no live `Agent`/`ToolRegistry`/`Session` to pull any of them from; see its own call site's comment
+/// for why that's a genuine absence, not an oversight), the other two pass real values.
+#[allow(clippy::too_many_arguments)]
+pub fn export_html_full(
+    meta: &SessionMeta,
+    messages: &[Message],
+    branches: &[(usize, Vec<Message>)],
+    usage: Option<UsageTotals>,
+    events: &[crate::session_store::ExportEvent],
+    system_prompt: Option<&str>,
+    tools: Option<&[ToolDef]>,
+    output_path: Option<&str>,
+) -> std::io::Result<PathBuf> {
+    let path = match output_path {
+        Some(p) => PathBuf::from(p),
+        None => default_export_path(),
+    };
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let html = render_html_full(
+        meta,
+        messages,
+        branches,
+        usage,
+        events,
+        system_prompt,
+        tools,
+    );
     let mut file = std::fs::File::create(&path)?;
     file.write_all(html.as_bytes())?;
     file.sync_all()?;
@@ -1224,6 +1537,21 @@ mod tests {
     }
 
     #[test]
+    fn a_single_newline_not_separated_by_a_blank_line_renders_as_a_hard_line_break() {
+        // pi-parity gap (fixed): pi's own markdown renderer configures `marked.use({ breaks: true })`
+        // so every single `\n` becomes a real `<br>`; without an equivalent here, a CommonMark soft
+        // break rendered as a literal, invisible-once-collapsed newline character instead.
+        let messages = vec![Message::user("line one\nline two")];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(html.contains("line one<br"), "{html}");
+        assert!(html.contains("line two"), "{html}");
+        // A real paragraph break (blank-line-separated) must still become two `<p>`s, not `<br>`s.
+        let messages = vec![Message::user("para one\n\npara two")];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(html.matches("<p>").count() >= 2, "{html}");
+    }
+
+    #[test]
     fn drops_a_javascript_scheme_link_but_keeps_an_http_one() {
         let messages = vec![Message::user(
             "[click me](javascript:alert(1)) and [safe](https://example.com)",
@@ -1234,6 +1562,16 @@ mod tests {
             "an unsafe URL scheme must never reach a live href: {html}"
         );
         assert!(html.contains("href=\"https://example.com\""));
+    }
+
+    #[test]
+    fn allows_tel_and_ftp_scheme_links_matching_pis_own_allow_list() {
+        let messages = vec![Message::user(
+            "[call](tel:+15555550100) and [file](ftp://example.com/f.txt)",
+        )];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(html.contains("href=\"tel:+15555550100\""), "{html}");
+        assert!(html.contains("href=\"ftp://example.com/f.txt\""), "{html}");
     }
 
     #[test]
@@ -1536,7 +1874,10 @@ mod tests {
             "Refactored the auth module and fixed three bugs."
         ))];
         let html = render_html(&meta(), &messages, &[], None);
-        assert!(html.contains("class=\"summary-marker compaction\""), "{html}");
+        assert!(
+            html.contains("class=\"summary-marker compaction\""),
+            "{html}"
+        );
         assert!(html.contains(">Compaction<"), "{html}");
         assert!(html.contains("Refactored the auth module"));
         assert!(
@@ -1576,6 +1917,99 @@ mod tests {
         ))];
         let html = render_html(&meta(), &messages, &[], None);
         assert!(!html.contains("class=\"summary-marker"));
+        assert!(html.contains("not the real shape"));
+    }
+
+    #[test]
+    fn compaction_marker_renders_tokens_before_when_embedded_in_the_summary_body() {
+        // Task #45: `agent_core::compaction::apply_summary` embeds a pre-compaction token count in the
+        // marker text; this proves the export-side rendering surfaces it, matching pi's own
+        // `entry.tokensBefore` note.
+        let messages = vec![Message::user(format!(
+            "{}\n\nCompacted from 12345 tokens\n\n{}",
+            agent_core::compaction::SUMMARY_MARKER,
+            "Refactored the auth module and fixed three bugs."
+        ))];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(html.contains("Compacted from 12,345 tokens"), "{html}");
+        assert!(html.contains("Refactored the auth module"));
+        assert!(
+            !html.contains("Compacted from 12345 tokens\n\n"),
+            "the raw token-count line must not leak verbatim into the rendered body: {html}"
+        );
+    }
+
+    #[test]
+    fn compaction_marker_end_to_end_through_real_apply_summary() {
+        // Task #45, full round-trip: drive the actual `apply_summary` (not a hand-built marker string)
+        // and confirm export renders the token count it embeds.
+        let mut session = agent_core::Session::new();
+        session.user("do the thing");
+        agent_core::compaction::apply_summary(&mut session, 0, "Did the thing.", 42_000);
+        let html = render_html(&meta(), &session.messages, &[], None);
+        assert!(html.contains("Compacted from 42,000 tokens"), "{html}");
+        assert!(html.contains("Did the thing."));
+    }
+
+    #[test]
+    fn compaction_marker_without_an_embedded_token_count_renders_with_no_token_note() {
+        // A branch-summary marker (a different class, see `parse_summary_marker`) never carries this
+        // line at all — backward-compatible parsing for that shape.
+        let messages = vec![Message::user(format!(
+            "{}\n\n{}",
+            agent_core::compaction::SUMMARY_MARKER,
+            "Refactored the auth module."
+        ))];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(!html.contains("Compacted from"), "{html}");
+    }
+
+    #[test]
+    fn renders_a_host_bash_command_marker_as_a_distinct_block_not_plain_markdown() {
+        // pi-parity gap (fixed, Task #47): previously fell through to `render_markdown`, where
+        // multi-line output collapsed into one unreadable run-on line.
+        let messages = vec![Message::user(
+            "[Host bash command, run outside the model's own turn]\n$ ls -la\n\n\
+             file1.txt\nfile2.txt\ndrwxr-xr-x  dir",
+        )];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(html.contains("class=\"tool-call host-bash\""), "{html}");
+        assert!(html.contains("$ ls -la"));
+        assert!(html.contains("file1.txt"));
+        assert!(html.contains("file2.txt"));
+        assert!(
+            !html.contains("[Host bash command, run outside the model's own turn]"),
+            "the raw marker line must not leak verbatim: {html}"
+        );
+        assert!(
+            !html.contains("class=\"text markdown\""),
+            "must not fall through to plain markdown rendering: {html}"
+        );
+    }
+
+    #[test]
+    fn renders_a_host_bash_command_error_marker_distinctly() {
+        let messages = vec![Message::user(
+            "[Host bash command, run outside the model's own turn]\n$ false\n\n(error)\ncommand exited 1",
+        )];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(
+            html.contains("class=\"tool-call host-bash error\""),
+            "{html}"
+        );
+        assert!(html.contains("$ false"));
+        assert!(html.contains("command exited 1"));
+        assert!(
+            !html.contains("(error)\ncommand exited 1"),
+            "the literal (error) line marker must not leak verbatim into the rendered output: {html}"
+        );
+    }
+
+    #[test]
+    fn text_that_merely_resembles_a_host_bash_marker_is_not_misparsed() {
+        let messages = vec![Message::user("[Host bash command] not the real shape")];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(!html.contains("class=\"tool-call host-bash\""));
         assert!(html.contains("not the real shape"));
     }
 
@@ -1674,9 +2108,13 @@ mod tests {
         // to show yet — it must still render the rest of the stats section, just without a token line.
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("out.html");
-        let path =
-            export_html(&meta(), &[Message::user("hi")], &[], Some(target.to_str().unwrap()))
-                .unwrap();
+        let path = export_html(
+            &meta(),
+            &[Message::user("hi")],
+            &[],
+            Some(target.to_str().unwrap()),
+        )
+        .unwrap();
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(written.contains("class=\"stats\""));
         assert!(!written.contains(">Tokens<"));
@@ -1712,8 +2150,7 @@ mod tests {
                 data: serde_json::json!({"marker": "m1"}),
             },
         ];
-        let html =
-            render_html_with_entries(&meta(), &[Message::user("hi")], &[], None, &events);
+        let html = render_html_with_entries(&meta(), &[Message::user("hi")], &[], None, &events);
         assert!(html.contains("Session Events"));
         assert!(html.contains("Model changed to <code>claude-opus-4-8</code>"));
         assert!(html.contains("Thinking level changed to <code>high</code>"));
@@ -1754,5 +2191,91 @@ mod tests {
         .unwrap();
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(written.contains("Model changed to <code>gpt-5</code>"));
+    }
+
+    fn sample_tool_defs() -> Vec<ToolDef> {
+        vec![ToolDef {
+            name: "bash".to_string(),
+            description: "Run a shell command.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string", "description": "The command to run." },
+                    "cwd": { "type": "string", "description": "Working directory." }
+                },
+                "required": ["command"]
+            }),
+        }]
+    }
+
+    #[test]
+    fn render_html_full_renders_system_prompt_and_tools_sections_when_given() {
+        // pi-parity gap (fixed, Task #44): `render_html`/`render_html_with_entries` never rendered the
+        // session's system prompt or registered tools at all — pi always includes both
+        // (`export-html/index.ts:263-270`, `template.js:1405-1435`).
+        let tools = sample_tool_defs();
+        let html = render_html_full(
+            &meta(),
+            &[Message::user("hi")],
+            &[],
+            None,
+            &[],
+            Some("You are a helpful coding agent."),
+            Some(&tools),
+        );
+        assert!(html.contains("class=\"system-prompt\""), "{html}");
+        assert!(html.contains("You are a helpful coding agent."));
+        assert!(html.contains("class=\"tools-list\""), "{html}");
+        assert!(html.contains("Available Tools (1)"), "{html}");
+        assert!(html.contains("tool-item-name\">bash</span>"), "{html}");
+        assert!(html.contains("Run a shell command."));
+        assert!(html.contains("command"));
+        assert!(html.contains("cwd"));
+        assert!(html.contains("required"));
+        assert!(html.contains("optional"));
+        assert!(html.contains("Working directory."));
+    }
+
+    #[test]
+    fn render_html_full_with_none_renders_no_system_prompt_or_tools_section() {
+        // Backward compatibility: `main.rs`/`serve.rs` don't thread a live system prompt/tool registry
+        // through yet (see `render_html_full`'s own doc comment) — `None` for both must render exactly
+        // as the plainer entry points do, no empty sections.
+        let html = render_html_full(&meta(), &[Message::user("hi")], &[], None, &[], None, None);
+        assert!(!html.contains("class=\"system-prompt\""));
+        assert!(!html.contains("class=\"tools-list\""));
+    }
+
+    #[test]
+    fn render_tools_section_omits_a_tool_with_no_schema_properties() {
+        let tools = vec![ToolDef {
+            name: "ping".to_string(),
+            description: "No-op health check.".to_string(),
+            input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+        }];
+        let html = render_html_full(&meta(), &[], &[], None, &[], None, Some(&tools));
+        assert!(html.contains("tool-item-name\">ping</span>"), "{html}");
+        assert!(!html.contains("class=\"tool-params\""), "{html}");
+    }
+
+    #[test]
+    fn export_html_full_writes_system_prompt_and_tools_to_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("out.html");
+        let tools = sample_tool_defs();
+        let path = export_html_full(
+            &meta(),
+            &[Message::user("hi")],
+            &[],
+            None,
+            &[],
+            Some("System prompt text."),
+            Some(&tools),
+            Some(target.to_str().unwrap()),
+        )
+        .unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("System prompt text."));
+        assert!(written.contains("tool-item-name\">bash</span>"));
     }
 }

@@ -709,6 +709,7 @@ mod tests {
             description: "found by the caller, not by this function".into(),
             path: tmp.path().join("SKILL.md"),
             disable_model_invocation: false,
+            scope: "user",
         };
         let prompt = build_system_prompt(&PromptOptions {
             base: Some("DEFAULT IDENTITY"),
@@ -739,6 +740,7 @@ mod tests {
             description: "Explicit only".into(),
             path: tmp.path().join("SKILL.md"),
             disable_model_invocation: true,
+            scope: "user",
         };
         let prompt = build_system_prompt(&PromptOptions {
             base: Some("DEFAULT IDENTITY"),
@@ -768,6 +770,7 @@ mod tests {
             description: "would be model-visible if read were registered".into(),
             path: tmp.path().join("SKILL.md"),
             disable_model_invocation: false,
+            scope: "user",
         };
         let prompt = build_system_prompt(&PromptOptions {
             base: Some("DEFAULT IDENTITY"),

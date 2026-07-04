@@ -67,11 +67,13 @@
 //!     path (pi needs it because pi's own `fork` requires an explicit entry id; this crate's `fork`
 //!     already defaults to the same behavior when called bare).
 //!   - `{type:"get_fork_messages"}` list this session's own candidate fork points — every user-turn
-//!     entry on the active path, `{entry_id, text}` — matching pi's own same-named command (which takes
-//!     no parameters and is scoped to the current session only); feed one `entry_id` to `fork`'s
-//!     `target_id` to actually fork there. Not a preview of `fork`'s output — see `preview_fork` for
-//!     that (this crate's own extension, previously misnamed `get_fork_messages`, which broke a
-//!     pi-compatible client expecting the shape above)
+//!     entry anywhere in the tree, `{entry_id, text}` — matching pi's own same-named command (which
+//!     takes no parameters, is scoped to the current session only, and walks its own `getEntries()`'s
+//!     *every* entry ever appended, not just the active path — Track (pi-parity fix): this used to be
+//!     scoped to `active_ids()` only, so a message on a branch already navigated away from never
+//!     appeared as a candidate); feed one `entry_id` to `fork`'s `target_id` to actually fork there. Not
+//!     a preview of `fork`'s output — see `preview_fork` for that (this crate's own extension, previously
+//!     misnamed `get_fork_messages`, which broke a pi-compatible client expecting the shape above)
 //!   - `{type:"preview_fork", session_id?, upto?, target_id?, before?}` (repo mode) preview what `fork`
 //!     would produce for *any* session at an arbitrary point — no new session, no switch
 //!   - `{type:"set_session_name", title}` set the session's title → `data: {title}` (the final,
@@ -95,11 +97,18 @@
 //!     self-contained HTML file → `data: {path}`. `output_path` defaults to a timestamped
 //!     `session-<unix-seconds>.html` in the current directory; parent directories are created as
 //!     needed.
-//!   - `{type:"compact"}`                summarize the prefix now → `data: {compacted: bool}`
+//!   - `{type:"compact", custom_instructions?}` summarize the prefix now → `data: {compacted: bool,
+//!     reason?, summary?, tokens_before?, tokens_after?}` — `reason` (Task #26 pi-parity fix) is `null`
+//!     on a real compaction, else `"too_small"`/`"already_compacted"` (`agent_core::CompactOutcome`),
+//!     matching pi's own two distinct thrown errors instead of collapsing both no-op cases into the
+//!     same bare `compacted:false`
 //!   - `{type:"get_last_assistant_text"}` → `data: {text}` (the latest assistant reply)
 //!   - `{type:"get_session_stats"}`      → token/step accounting + message-type breakdown
 //!     (`user_messages`/`assistant_messages`/`tool_calls`/`tool_results`/`total_messages`)
-//!   - `{type:"get_commands"}`           → discoverable skills + prompt templates
+//!   - `{type:"get_commands"}`           → discoverable skills + prompt templates, each entry carrying
+//!     `{name, source, description, scope, path}` — `scope` (Task #39 pi-parity fix, previously
+//!     omitted) is `"user"`/`"project"`/`"temporary"` (which discovery root it actually came from),
+//!     matching pi's own `get_commands` `sourceInfo.scope`/`sourceInfo.path`
 //!   - `{type:"reload"}`                 re-run project-instruction/skill/prompt-template discovery and
 //!     re-check trust, refreshing the static half of the system prompt (the cheap date/cwd footer is
 //!     already refreshed every turn regardless)
@@ -132,7 +141,7 @@
 //!     mid-stream retry inside a single model turn (`agent_core::Agent::with_auto_retry`), and, once
 //!     that's exhausted, automatically re-invoking the *whole* `prompt` run against the same session up
 //!     to 3 more times with backoff (2/4/8s) — pi's `agent-session.ts` auto-retry. Each whole-run retry
-//!     attempt emits an unsolicited `auto_retry` frame (`{type:"auto_retry", id, command:"prompt",
+//!     attempt emits an unsolicited `auto_retry_start` frame (`{type:"auto_retry_start", id, command:"prompt",
 //!     attempt, max_attempts, delay_ms, error}`) before its backoff sleep. A sequence that made at
 //!     least one attempt ends with exactly one `auto_retry_end` frame (`{type:"auto_retry_end", id,
 //!     command:"prompt", success, attempt, final_error?}`) — `success:true` when a retried attempt
@@ -177,6 +186,24 @@
 //!     (`--exclude-tools bash` / `--no-tools`). While it runs, only `abort_bash`/`abort` (cancel it) are
 //!     accepted; everything else is rejected as busy.
 //!   - `{type:"abort_bash"}`             cancel an in-flight host `bash` command, else a no-op ack
+//!   - `{type:"login", provider}`        log into `anthropic`/`github-copilot`/`openai-codex` as a
+//!     subscription instead of a metered API key (see `crate::oauth`/`crate::auth_store`) — an
+//!     immediate `ack`, then zero or more unsolicited `login_progress` frames (a URL to open, a
+//!     device code, or narration), then a terminal `response` once the flow resolves, however long
+//!     that takes; runs as a detached background task, not inline, so every other command (including
+//!     a `login` for a *different* provider — a second one for the same provider in flight is
+//!     rejected) keeps working while it's pending
+//!   - `{type:"submit_code", code}`      only meaningful after a `login_progress{step:"manual_code"}`
+//!     (the local OAuth callback listener couldn't complete, e.g. no loopback access over SSH) →
+//!     `data: {accepted: bool}`; the originating `login` request's own `id`-correlated `response`
+//!     remains the authoritative completion signal, this only confirms the code was delivered
+//!   - `{type:"abort_login"}`            cancel an in-flight `login`, else a no-op ack
+//!   - `{type:"logout", provider}`       remove `provider`'s stored subscription credential, if any,
+//!     idempotently → `data: {provider, was_logged_in}`
+//!   - `{type:"auth_status", provider?}` read-only, never touches the network — subscription-login
+//!     status (`logged_in`/`logged_out`/`needs_reauth`, the last meaning the most recent refresh
+//!     attempt failed but the credential is still on disk) for `provider`, or every known provider
+//!     when omitted → `data: {provider, status}` or `data: {providers: [{provider, status}…]}`
 //!
 //! While a `prompt` runs, the loop keeps reading stdin so an `abort` can cancel it, or `steer` /
 //! `follow_up` (with a `message`) can queue input: a `steer` is injected mid-run at the next tool
@@ -196,12 +223,14 @@
 //! error?}`, `{type:"event", event: <AgentEvent>}`, `{type:"list_progress", id?, command, scanned,
 //! total}` — zero or more unsolicited progress updates a `list_sessions`/`list_all_sessions` scan emits
 //! while in flight, correlated to the request via the same `id` its eventual `response` carries — or
-//! `{type:"auto_retry", id?, command:"prompt", attempt, max_attempts, delay_ms, error}`, one per
+//! `{type:"auto_retry_start", id?, command:"prompt", attempt, max_attempts, delay_ms, error}`, one per
 //! whole-run auto-retry attempt (see `set_auto_retry` above), also correlated via `id` — or
 //! `{type:"auto_retry_end", id?, command:"prompt", success, attempt, final_error?}`, the terminal
 //! notice for a retry sequence that made at least one attempt — or `{type:"session_info_changed", id?,
 //! command:"set_session_name", title}`, pushed once per successful `set_session_name` (pi's own
-//! `session_info_changed`; see `set_session_name` above).
+//! `session_info_changed`; see `set_session_name` above) — or `{type:"login_progress", id?,
+//! command:"login", provider, step, url?, user_code?, verification_uri?, expires_in?, message?}`,
+//! zero or more unsolicited updates for an in-flight `login`, correlated via `id` (see `login` above).
 //!
 //! **Structural stdout guard:** every byte on stdout must be a protocol frame — a stray line (a
 //! debug `println!`, a misconfigured logger) would corrupt the NDJSON stream a remote client is
@@ -241,10 +270,19 @@ use crate::session_store::{
 };
 use crate::tools;
 
+/// How the gateway client attaches a credential to every request — either a fixed `bai_v1…`/BYO
+/// string (the ordinary case), or a live, transparently-refreshed OAuth subscription login (see
+/// `crate::auth_credential_source::OAuthCredentialSource`). Resolved once by `main.rs` (see
+/// `resolve_gateway_credential`) before `serve` even starts, same as every other `ServeConfig` field.
+pub enum GatewayCredential {
+    Static(String),
+    Oauth(std::sync::Arc<dyn agent_core::client::CredentialSource>),
+}
+
 /// Options for the headless server (mirrors `run`, plus persistence).
 pub struct ServeConfig {
     pub gateway: String,
-    pub key: String,
+    pub key: GatewayCredential,
     pub model: String,
     pub max_steps: u32,
     /// Base system prompt (agent identity). Project instructions, skills, and env are layered on top.
@@ -422,6 +460,39 @@ pub struct ShutdownSignal {
     sighup: tokio::signal::unix::Signal,
 }
 
+/// Which OS signal [`ShutdownSignal::wait`] actually observed — Task #41 (pi-parity fix): previously
+/// every trigger (SIGTERM, SIGHUP, Ctrl-C/SIGINT) was merged into one undifferentiated `()`, so `serve`/
+/// `run` always exited 0 (clean stdin-EOF path) or 1 (`run`'s cancelled-turn path), with no way to tell
+/// *which* signal (if any) actually caused a shutdown. `serve`/`run` use this to exit with the matching
+/// POSIX `128 + signal` code (see [`Self::exit_code`]) instead — matching pi's own `rpc-mode.ts`/
+/// `print-mode.ts`, which register SIGTERM/SIGHUP separately and propagate 143/129 respectively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signal {
+    /// `SIGTERM` — pi's own 143 (`128 + 15`).
+    Term,
+    /// `SIGHUP` — pi's own 129 (`128 + 1`); Unix-only (see [`ShutdownSignal`]'s own doc comment on why
+    /// this crate treats it identically to `SIGTERM`).
+    Hup,
+    /// Ctrl-C/`SIGINT` — `130` (`128 + 2`), extending the same POSIX convention pi's own two hardcoded
+    /// values derive from. pi's headless `rpc-mode.ts`/`print-mode.ts` don't register a `SIGINT` handler
+    /// of their own at all (Node's own default disposition already exits 130 for it), so this is this
+    /// crate's own explicit counterpart of that same outcome, not a divergence from it — this crate
+    /// already treats Ctrl-C as a graceful-shutdown trigger equal to SIGTERM/SIGHUP (see
+    /// [`ShutdownSignal::wait`]), so it gets the same treatment here for consistency.
+    Int,
+}
+
+impl Signal {
+    /// The POSIX `128 + signal-number` convention a shell reports for a process killed by this signal.
+    pub fn exit_code(self) -> i32 {
+        match self {
+            Self::Term => 143,
+            Self::Hup => 129,
+            Self::Int => 130,
+        }
+    }
+}
+
 impl ShutdownSignal {
     pub fn new() -> std::io::Result<Self> {
         #[cfg(unix)]
@@ -437,20 +508,21 @@ impl ShutdownSignal {
         }
     }
 
-    /// Resolves once a shutdown signal arrives. Safe to call fresh on every loop iteration — every
-    /// `Signal::recv` and `tokio::signal::ctrl_c` are re-armable, not one-shot.
-    pub async fn wait(&mut self) {
+    /// Resolves once a shutdown signal arrives, naming which one. Safe to call fresh on every loop
+    /// iteration — every `Signal::recv` and `tokio::signal::ctrl_c` are re-armable, not one-shot.
+    pub async fn wait(&mut self) -> Signal {
         #[cfg(unix)]
         {
             tokio::select! {
-                _ = self.sigterm.recv() => {}
-                _ = self.sighup.recv() => {}
-                _ = tokio::signal::ctrl_c() => {}
+                _ = self.sigterm.recv() => Signal::Term,
+                _ = self.sighup.recv() => Signal::Hup,
+                _ = tokio::signal::ctrl_c() => Signal::Int,
             }
         }
         #[cfg(not(unix))]
         {
             let _ = tokio::signal::ctrl_c().await;
+            Signal::Int
         }
     }
 }
@@ -938,6 +1010,17 @@ impl Persistence {
             .unwrap_or(&[])
     }
 
+    /// Every user-turn message anywhere in the session's tree — every branch, not just the active path
+    /// — as `(id, Message)` pairs (empty unless persistence is configured). What `get_fork_messages`
+    /// surfaces, matching pi's own whole-tree `getUserMessagesForForking` rather than only the active
+    /// path's own chain.
+    fn all_user_messages(&self) -> Vec<(String, agent_core::Message)> {
+        self.store
+            .as_ref()
+            .map(SessionStore::all_user_messages)
+            .unwrap_or_default()
+    }
+
     /// Switch the active branch to `target_id` — or, when `before` is set, to `target_id`'s own
     /// *parent* instead, which is the tree's root (before any message) when `target_id` is the very
     /// first message. That lets a client redo the first message in place (pi's own
@@ -1212,7 +1295,7 @@ pub fn cwd_is_stale(meta_cwd: &str, actual_cwd: &std::path::Path) -> bool {
 }
 
 /// Run the control loop until stdin closes.
-pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::error::Error>> {
     let mut timing = crate::timing::StartupTiming::new();
     let (mut persistence, mut session) = Persistence::open(&cfg)?;
     timing.mark("open persistence");
@@ -1320,13 +1403,27 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
 
     // Keep the transport in an `Arc` we can clone: `set_model`/`set_thinking` rebuild the `Agent` at
     // runtime (a new model id picks a new dialect), and each rebuild reuses this one HTTP client.
-    let client = GatewayClient::new(cfg.gateway.clone(), cfg.key.clone())?.with_retry(
+    let client = match &cfg.key {
+        GatewayCredential::Static(key) => GatewayClient::new(cfg.gateway.clone(), key.clone())?,
+        GatewayCredential::Oauth(source) => {
+            GatewayClient::with_credential_source(cfg.gateway.clone(), source.clone())?
+        }
+    }
+    .with_retry(
         cfg.retry_max_retries
             .unwrap_or(agent_core::client::MAX_RETRIES),
         cfg.retry_base_delay_ms
             .unwrap_or(agent_core::client::BASE_BACKOFF),
     );
     let client = Arc::new(client);
+    // Task #50: the same two operator-supplied overrides also drive the *whole-run* retry loop
+    // (`crate::retry::RunRetryPolicy`) below, not just `client`'s own pre-connect/mid-stream layer just
+    // above — previously `--retry-max-retries`/`--retry-base-delay-ms` had no effect on the `"prompt"`
+    // command's own auto-retry loop.
+    let run_retry_policy = crate::retry::RunRetryPolicy::from_overrides(
+        cfg.retry_max_retries,
+        cfg.retry_base_delay_ms,
+    );
 
     // The model, thinking budget, and auto-compaction flag are runtime-switchable; everything else
     // (transport, tools, system prompt, loop bounds, cache settings) is fixed for the process.
@@ -1434,8 +1531,11 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
     // is `None`), but `--deny-tool`/`--deny-bash-pattern`/`--deny-path` didn't, a side door around an
     // operator's own restriction for any client speaking the wire protocol directly instead of through
     // the model.
-    let bash_policy =
-        crate::policy::ToolPolicy::from_lists(&cfg.deny_tool, &cfg.deny_bash_pattern, &cfg.deny_path);
+    let bash_policy = crate::policy::ToolPolicy::from_lists(
+        &cfg.deny_tool,
+        &cfg.deny_bash_pattern,
+        &cfg.deny_path,
+    );
     // Distinguishes successive host `bash` calls in their `tool_start`/`tool_progress`/`tool_end` event
     // ids — only ever one in flight at a time (see the `bash` command arm), but a stable, incrementing
     // id per call still lets a client correlate a run's own three events without ambiguity.
@@ -1498,17 +1598,32 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
         .is_err()
     {
         let _ = writer.await;
-        return Ok(());
+        return Ok(None);
     }
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut shutdown = ShutdownSignal::new()?;
+    // Task #41 (pi-parity fix): which signal (if any) actually triggered shutdown, so the caller can
+    // exit with the matching POSIX code (`Signal::exit_code`) instead of always `0` — every graceful
+    // path previously returned bare `Ok(())` with no way to tell a clean stdin-EOF apart from a real
+    // SIGTERM/SIGHUP/Ctrl-C. Set from whichever of this function's several `shutdown.wait()` sites
+    // actually fires (there's no concurrent access to guard against — this is all one async task's own
+    // sequential control flow, just interleaved via `select!`, so a bare local suffices).
+    let mut shutdown_cause: Option<Signal> = None;
+    // At most one `login` in flight at a time, tracked here so a concurrent second `login` is
+    // rejected and `submit_code`/`abort_login` know what to reach. Shared with the detached task
+    // `login` spawns (see that arm below) — cleared back to `None` by that task itself once the
+    // flow resolves, success or failure, so a later `login` is accepted again.
+    let pending_login: Arc<std::sync::Mutex<Option<PendingLogin>>> = Arc::new(std::sync::Mutex::new(None));
     loop {
         let line = tokio::select! {
             biased;
             // Idle between commands: nothing is in flight, so a shutdown request needs no drain —
             // just stop reading and fall out to the writer join below.
-            () = shutdown.wait() => break,
+            sig = shutdown.wait() => {
+                shutdown_cause = Some(sig);
+                break;
+            }
             maybe_line = lines.next_line() => match maybe_line? {
                 Some(l) => l,
                 None => break,
@@ -1695,7 +1810,8 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                                 // A shutdown request mid-run gets the same treatment as stdin closing:
                                 // cancel and let the run unwind so the code below can persist before we
                                 // fall out of the outer loop (`!stdin_open` breaks it, further down).
-                                () = shutdown.wait() => {
+                                sig = shutdown.wait() => {
+                                    shutdown_cause = Some(sig);
                                     stdin_open = false;
                                     cancel.cancel();
                                 }
@@ -1862,10 +1978,10 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                                             }
                                             "get_commands" => {
                                                 let mut commands: Vec<Value> = skills.iter().map(|s| {
-                                                    json!({ "name": format!("skill:{}", s.name), "source": "skill", "description": s.description })
+                                                    json!({ "name": format!("skill:{}", s.name), "source": "skill", "description": s.description, "scope": s.scope, "path": s.path })
                                                 }).collect();
                                                 commands.extend(prompt_templates.iter().map(|t| {
-                                                    json!({ "name": t.name, "source": "prompt", "description": t.description })
+                                                    json!({ "name": t.name, "source": "prompt", "description": t.description, "scope": t.scope, "path": t.path })
                                                 }));
                                                 let collisions: Vec<&crate::skills::Collision> = skill_collisions.iter().chain(prompt_collisions.iter()).collect();
                                                 let _ = out_tx.send(response(cid, "get_commands", true, Some(json!({ "commands": commands, "collisions": collisions })), None));
@@ -1973,15 +2089,15 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                             if current_auto_retry
                                 && stdin_open
                                 && !cancel.is_cancelled()
-                                && retry_attempt < crate::retry::MAX_RUN_RETRIES
+                                && retry_attempt < run_retry_policy.max_retries
                                 && crate::retry::is_retryable_whole_run(e) =>
                         {
                             retry_attempt += 1;
-                            let delay = crate::retry::backoff(retry_attempt);
+                            let delay = run_retry_policy.backoff(retry_attempt);
                             let _ = out_tx.send(auto_retry_frame(
                                 id.clone(),
                                 retry_attempt,
-                                crate::retry::MAX_RUN_RETRIES,
+                                run_retry_policy.max_retries,
                                 delay.as_millis() as u64,
                                 &e.to_string(),
                             ));
@@ -2000,7 +2116,8 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                                 tokio::select! {
                                     biased;
                                     () = &mut sleep => break,
-                                    () = shutdown.wait() => {
+                                    sig = shutdown.wait() => {
+                                        shutdown_cause = Some(sig);
                                         stdin_open = false;
                                         retry_cancelled = true;
                                         break;
@@ -2486,30 +2603,23 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => emit!(response(id, "clone", false, None, Some(&e.to_string()))),
             },
             "get_fork_messages" => {
-                // pi-compatible contract: no parameters, scoped to *this* session only — every
-                // user-turn entry on the active path, as a flat `{entry_id, text}` candidate list (pi's
-                // own `getUserMessagesForForking`), for a client to build a fork-point picker from and
-                // then feed one `entry_id` to `fork`'s own `target_id`. This is a listing, not a preview
-                // of any one fork's output — see `preview_fork` for that.
-                let msg_ids = persistence.active_ids();
-                let candidates: Vec<Value> = if msg_ids.len() == session.messages.len() {
-                    session
-                        .messages
-                        .iter()
-                        .zip(msg_ids)
-                        .filter(|(m, _)| m.role == agent_core::Role::User)
-                        .filter_map(|(m, entry_id)| {
-                            user_message_text(m)
-                                .map(|text| json!({ "entry_id": entry_id, "text": text }))
-                        })
-                        .collect()
-                } else {
-                    // In-memory-only mode (no persistence configured), or some other length mismatch —
-                    // there are no stable entry ids to offer, so there is nothing a client could
-                    // meaningfully pass back to `fork`'s `target_id`. Matches `get_messages`'s own
-                    // precedent for this same mismatch: degrade gracefully, don't error.
-                    Vec::new()
-                };
+                // pi-compatible contract: no parameters, every user-turn entry across the WHOLE session
+                // tree — every branch, not just the active path — as a flat `{entry_id, text}` candidate
+                // list (pi's own `getUserMessagesForForking`), for a client to build a fork-point picker
+                // from and then feed one `entry_id` to `fork`'s own `target_id`/`fork_at_entry`. This is
+                // a listing, not a preview of any one fork's output — see `preview_fork` for that.
+                // Track (pi-parity fix): previously scoped to `persistence.active_ids()` only, so a
+                // message on a branch the session had already navigated away from (via `switch_branch`)
+                // never appeared as a fork candidate at all — empty (not an error) in pure in-memory mode,
+                // same as every other persistence-dependent listing here.
+                let candidates: Vec<Value> = persistence
+                    .all_user_messages()
+                    .iter()
+                    .filter_map(|(entry_id, m)| {
+                        user_message_text(m)
+                            .map(|text| json!({ "entry_id": entry_id, "text": text }))
+                    })
+                    .collect();
                 emit!(response(
                     id,
                     "get_fork_messages",
@@ -2559,11 +2669,28 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 let output_path = cmd.get("output_path").and_then(Value::as_str);
                 let branches = persistence.abandoned_branches();
                 let events = persistence.export_events();
-                match crate::export::export_html_with_entries(
+                // `export_html_full` (Task #44 integration): this session's actual system prompt (the
+                // same static-plus-dynamic-footer join every `prompt` sends — see `full_system`) and
+                // tool set (`build_tools(&cfg)`, the same on-demand rebuild `has_read`/`bash_tool`
+                // already call elsewhere in this function rather than keeping a long-lived registry
+                // variable around), plus `session`'s own running token totals — previously omitted
+                // entirely via the plainer `export_html_with_entries`.
+                let system_prompt = full_system(&static_system, &cwd);
+                let tool_defs = build_tools(&cfg).definitions();
+                let usage = crate::export::UsageTotals {
+                    input_tokens: session.input_tokens,
+                    output_tokens: session.output_tokens,
+                    cache_read_tokens: session.cache_read_tokens,
+                    cache_write_tokens: session.cache_write_tokens,
+                };
+                match crate::export::export_html_full(
                     &persistence.meta,
                     &session.messages,
                     &branches,
+                    Some(usage),
                     events,
+                    Some(&system_prompt),
+                    Some(&tool_defs),
                     output_path,
                 ) {
                     Ok(path) => emit!(response(
@@ -2757,7 +2884,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                     )
                     .await;
                 match result {
-                    Ok(did) => {
+                    Ok(outcome) => {
                         // `agent.compact` can itself fire a mid-compaction `CheckpointHook` call (see
                         // `agent_core::Agent::compact`'s own doc comment) — swept up here for the same
                         // reason the `prompt` handler's own inner run-loop does, right before its
@@ -2775,7 +2902,13 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                                 "compact",
                                 true,
                                 Some(json!({
-                                    "compacted": did,
+                                    "compacted": outcome.compacted(),
+                                    // Task #26 (pi-parity fix): `null` on a real compaction, else
+                                    // `"too_small"`/`"already_compacted"` — previously both no-op cases
+                                    // collapsed to the same bare `compacted:false` with no way for a
+                                    // client to tell "nothing to compact yet" apart from "already
+                                    // compacted", unlike pi's own two distinct thrown errors.
+                                    "reason": outcome.reason(),
                                     "summary": compacted_summary,
                                     "tokens_before": compacted_tokens_before,
                                     "tokens_after": compacted_tokens_after,
@@ -2815,15 +2948,30 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
             }
             "get_commands" => {
                 // Skills (read-on-demand) and prompt templates (`/name`), for client autocomplete.
+                // `scope`/`path` (Task #39 pi-parity fix — previously omitted entirely) mirror pi's own
+                // `get_commands` `sourceInfo.scope`/`sourceInfo.path`: which discovery root a command
+                // actually came from (`"user"`/`"project"`/`"temporary"`) and its on-disk location.
                 let mut commands: Vec<Value> = skills
                     .iter()
                     .map(|s| {
-                        json!({ "name": format!("skill:{}", s.name), "source": "skill", "description": s.description })
+                        json!({
+                            "name": format!("skill:{}", s.name),
+                            "source": "skill",
+                            "description": s.description,
+                            "scope": s.scope,
+                            "path": s.path,
+                        })
                     })
                     .collect();
-                commands.extend(prompt_templates.iter().map(
-                    |t| json!({ "name": t.name, "source": "prompt", "description": t.description }),
-                ));
+                commands.extend(prompt_templates.iter().map(|t| {
+                    json!({
+                        "name": t.name,
+                        "source": "prompt",
+                        "description": t.description,
+                        "scope": t.scope,
+                        "path": t.path,
+                    })
+                }));
                 // Every shadowed name (a skill or template defined at more than one path) is otherwise
                 // silently resolved with no way for a client to notice — surfaced here instead.
                 let collisions: Vec<&crate::skills::Collision> = skill_collisions
@@ -3451,7 +3599,8 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                             tokio::select! {
                                 biased;
                                 r = &mut fut => break r,
-                                () = shutdown.wait() => {
+                                sig = shutdown.wait() => {
+                                    shutdown_cause = Some(sig);
                                     branch_stdin_open = false;
                                     branch_cancel.cancel();
                                 }
@@ -3678,7 +3827,8 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                             () = cancel.cancelled() => {
                                 break Err(agent_core::ToolError::Execution("cancelled".to_string()));
                             }
-                            () = shutdown.wait() => {
+                            sig = shutdown.wait() => {
+                                shutdown_cause = Some(sig);
                                 stdin_open = false;
                                 cancel.cancel();
                             }
@@ -3785,6 +3935,196 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
                 // there is nothing to cancel — acknowledge idempotently, matching `abort`'s idle shape.
                 emit!(response(id, "abort_bash", true, None, None));
             }
+            "login" => {
+                let provider_id = cmd
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .and_then(crate::oauth::OAuthProviderId::parse);
+                match provider_id {
+                    None => {
+                        emit!(response(
+                            id,
+                            "login",
+                            false,
+                            None,
+                            Some("missing or unknown `provider`"),
+                        ));
+                    }
+                    Some(_) if lock_ignoring_poison(&pending_login).is_some() => {
+                        emit!(response(
+                            id,
+                            "login",
+                            false,
+                            None,
+                            Some(
+                                "busy: a login is already in flight; use `abort_login` to cancel it \
+                                 first"
+                            ),
+                        ));
+                    }
+                    Some(provider_id) => {
+                        emit!(ack(id.clone(), "login"));
+                        // Runs as a detached task, not inline like `prompt`'s own busy loop: unlike a
+                        // model turn, a login has nothing to do with `session`/`agent` state, so there's
+                        // no reason every *other* idle command (`list_sessions`, `logout` of a different
+                        // provider, …) should have to wait out however long a user takes to finish a
+                        // browser flow. Only a second concurrent `login` is rejected (above).
+                        let login_cancel = agent_core::CancellationToken::new();
+                        let pending_code: PendingCodeSlot = Arc::new(std::sync::Mutex::new(None));
+                        *lock_ignoring_poison(&pending_login) = Some(PendingLogin {
+                            cancel: login_cancel.clone(),
+                            pending_code: pending_code.clone(),
+                        });
+                        let out_tx_bg = out_tx.clone();
+                        let pending_login_bg = pending_login.clone();
+                        let login_id = id.clone();
+                        tokio::spawn(async move {
+                            let callbacks = ServeLoginCallbacks {
+                                out_tx: out_tx_bg.clone(),
+                                id: login_id.clone(),
+                                provider: provider_id,
+                                pending_code,
+                            };
+                            let result =
+                                crate::oauth::login(provider_id, &callbacks, &login_cancel).await;
+                            let frame = match result {
+                                Ok(credential) => {
+                                    // `AuthStore::set`'s cross-process `FileLock` can block briefly under
+                                    // contention — kept off this task's own async context the same way
+                                    // `persist_blocking` keeps session persistence off the caller's.
+                                    let saved = tokio::task::spawn_blocking(move || {
+                                        crate::auth_store::AuthStore::open_default()
+                                            .set(provider_id.store_key(), credential)
+                                    })
+                                    .await;
+                                    match saved {
+                                        Ok(Ok(())) => response(
+                                            login_id,
+                                            "login",
+                                            true,
+                                            Some(json!({
+                                                "provider": provider_id.to_string(),
+                                                "status": "logged_in",
+                                            })),
+                                            None,
+                                        ),
+                                        Ok(Err(e)) => response(
+                                            login_id,
+                                            "login",
+                                            false,
+                                            None,
+                                            Some(&format!(
+                                                "logged in but failed to save credential: {e}"
+                                            )),
+                                        ),
+                                        Err(e) => response(
+                                            login_id,
+                                            "login",
+                                            false,
+                                            None,
+                                            Some(&format!(
+                                                "logged in but failed to save credential: {e}"
+                                            )),
+                                        ),
+                                    }
+                                }
+                                Err(e) => response(login_id, "login", false, None, Some(&e.to_string())),
+                            };
+                            let _ = out_tx_bg.send(frame);
+                            *lock_ignoring_poison(&pending_login_bg) = None;
+                        });
+                    }
+                }
+            }
+            "submit_code" => {
+                let code = cmd.get("code").and_then(Value::as_str).map(str::to_string);
+                let accepted = match (code, lock_ignoring_poison(&pending_login).as_ref()) {
+                    (Some(code), Some(p)) => match lock_ignoring_poison(&p.pending_code).take() {
+                        Some(tx) => tx.send(code).is_ok(),
+                        None => false,
+                    },
+                    _ => false,
+                };
+                emit!(response(
+                    id,
+                    "submit_code",
+                    true,
+                    Some(json!({ "accepted": accepted })),
+                    None,
+                ));
+            }
+            "abort_login" => {
+                // Idempotent no-op if none is in flight — matches `abort`'s own idle-mode convention.
+                if let Some(p) = lock_ignoring_poison(&pending_login).as_ref() {
+                    p.cancel.cancel();
+                }
+                emit!(response(id, "abort_login", true, None, None));
+            }
+            "logout" => {
+                let provider_id = cmd
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .and_then(crate::oauth::OAuthProviderId::parse);
+                match provider_id {
+                    None => emit!(response(
+                        id,
+                        "logout",
+                        false,
+                        None,
+                        Some("missing or unknown `provider`"),
+                    )),
+                    Some(provider_id) => {
+                        let mut store = crate::auth_store::AuthStore::open_default();
+                        match store.remove(provider_id.store_key()) {
+                            Ok(was_logged_in) => emit!(response(
+                                id,
+                                "logout",
+                                true,
+                                Some(json!({
+                                    "provider": provider_id.to_string(),
+                                    "was_logged_in": was_logged_in,
+                                })),
+                                None,
+                            )),
+                            Err(e) => {
+                                emit!(response(id, "logout", false, None, Some(&e.to_string())))
+                            }
+                        }
+                    }
+                }
+            }
+            "auth_status" => {
+                let store = crate::auth_store::AuthStore::open_default();
+                let status_of = |pid: crate::oauth::OAuthProviderId| {
+                    let status = match store.get(pid.store_key()) {
+                        None => "logged_out",
+                        Some(stored) if stored.last_refresh_error.is_some() => "needs_reauth",
+                        Some(_) => "logged_in",
+                    };
+                    json!({ "provider": pid.to_string(), "status": status })
+                };
+                match cmd.get("provider").and_then(Value::as_str) {
+                    Some(p) => match crate::oauth::OAuthProviderId::parse(p) {
+                        Some(pid) => {
+                            emit!(response(id, "auth_status", true, Some(status_of(pid)), None))
+                        }
+                        None => emit!(response(id, "auth_status", false, None, Some("unknown `provider`"))),
+                    },
+                    None => {
+                        let providers: Vec<Value> = crate::oauth::OAuthProviderId::all()
+                            .iter()
+                            .map(|&pid| status_of(pid))
+                            .collect();
+                        emit!(response(
+                            id,
+                            "auth_status",
+                            true,
+                            Some(json!({ "providers": providers })),
+                            None,
+                        ));
+                    }
+                }
+            }
             other => {
                 emit!(response(id, other, false, None, Some("unknown command")));
             }
@@ -3793,7 +4133,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
 
     drop(out_tx);
     let _ = writer.await;
-    Ok(())
+    Ok(shutdown_cause)
 }
 
 /// Join the cached static system prompt with a freshly-computed dynamic footer (current date/cwd) —
@@ -3882,8 +4222,11 @@ fn build_agent(
     if let Some(max_tokens) = cfg.max_tokens {
         agent = agent.with_max_tokens(max_tokens);
     }
-    let policy =
-        crate::policy::ToolPolicy::from_lists(&cfg.deny_tool, &cfg.deny_bash_pattern, &cfg.deny_path);
+    let policy = crate::policy::ToolPolicy::from_lists(
+        &cfg.deny_tool,
+        &cfg.deny_bash_pattern,
+        &cfg.deny_path,
+    );
     if !policy.is_empty() {
         agent = agent.with_hooks(Arc::new(policy));
     }
@@ -4362,6 +4705,150 @@ fn should_report_scan_progress(scanned: usize, total: usize) -> bool {
     scanned <= 1 || scanned >= total || scanned % (total / 10).max(1) == 0
 }
 
+/// The manual-code-paste channel for an in-flight `login`: `ServeLoginCallbacks::prompt_text` parks a
+/// `oneshot::Sender` here and awaits its receiver; the `"submit_code"` dispatch arm (running
+/// concurrently in the same process's main idle loop — see the `"login"` arm) takes it and sends the
+/// pasted code, waking the parked `login`.
+type PendingCodeSlot = Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<String>>>>;
+
+/// Lock `m`, tolerating a poisoned mutex (a prior holder panicked mid-critical-section) by recovering
+/// its last-written contents rather than propagating the poison — matches this workspace's
+/// panic-free-production-code convention (no bare `.unwrap()` on a lock), and there's no invariant
+/// here a partial write could actually violate (the guarded value is always a plain, independently
+/// valid `Option`/replace-whole-value).
+fn lock_ignoring_poison<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Tracks the one `login` allowed in flight at a time — see `pending_login`'s own declaration.
+struct PendingLogin {
+    cancel: agent_core::CancellationToken,
+    pending_code: PendingCodeSlot,
+}
+
+/// Drives an in-flight `login` RPC command: pushes `login_progress` frames for whatever the flow
+/// needs to show (a URL, a device code, narration), and for the manual-code-paste path, parks on
+/// `pending_code` until a `"submit_code"` command (processed by the same main loop, concurrently —
+/// see the `"login"` dispatch arm) wakes it with the pasted value.
+struct ServeLoginCallbacks {
+    out_tx: mpsc::UnboundedSender<Value>,
+    id: Option<String>,
+    provider: crate::oauth::OAuthProviderId,
+    pending_code: PendingCodeSlot,
+}
+
+#[async_trait::async_trait]
+impl crate::oauth::LoginCallbacks for ServeLoginCallbacks {
+    async fn show_auth_url(&self, url: &str, _instructions: Option<&str>) {
+        let _ = self.out_tx.send(login_progress_frame(
+            self.id.clone(),
+            &self.provider.to_string(),
+            "browser",
+            Some(url),
+            None,
+            None,
+            None,
+            None,
+        ));
+    }
+
+    async fn show_device_code(&self, info: &crate::oauth::DeviceCodeInfo) {
+        let _ = self.out_tx.send(login_progress_frame(
+            self.id.clone(),
+            &self.provider.to_string(),
+            "device_code",
+            None,
+            Some(&info.user_code),
+            Some(&info.verification_uri),
+            info.expires_in.map(|d| d.as_secs()),
+            None,
+        ));
+    }
+
+    async fn progress(&self, message: &str) {
+        let _ = self.out_tx.send(login_progress_frame(
+            self.id.clone(),
+            &self.provider.to_string(),
+            "progress",
+            None,
+            None,
+            None,
+            None,
+            Some(message),
+        ));
+    }
+
+    async fn prompt_text(
+        &self,
+        _prompt: &crate::oauth::TextPrompt<'_>,
+    ) -> std::result::Result<String, crate::oauth::OAuthError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *lock_ignoring_poison(&self.pending_code) = Some(tx);
+        let _ = self.out_tx.send(login_progress_frame(
+            self.id.clone(),
+            &self.provider.to_string(),
+            "manual_code",
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        rx.await.map_err(|_| crate::oauth::OAuthError::LoginCancelled)
+    }
+
+    async fn select(
+        &self,
+        prompt: &crate::oauth::SelectPrompt<'_>,
+    ) -> std::result::Result<Option<String>, crate::oauth::OAuthError> {
+        // Headless: always take the first (recommended) option rather than interactively prompting —
+        // matches this trait's own documented contract for a non-interactive caller.
+        Ok(prompt.options.first().map(|o| o.id.clone()))
+    }
+}
+
+/// Build a `login_progress` frame — an unsolicited push update for an in-flight `login`, correlated
+/// to the eventual terminal `response` via the same `id`. `step` is `"browser"` (open `url`),
+/// `"device_code"` (show `user_code`/`verification_uri`), `"manual_code"` (the local callback
+/// listener couldn't complete — paste a code via `submit_code`), or `"progress"` (a bare narration
+/// `message`).
+#[allow(clippy::too_many_arguments)]
+fn login_progress_frame(
+    id: Option<String>,
+    provider: &str,
+    step: &str,
+    url: Option<&str>,
+    user_code: Option<&str>,
+    verification_uri: Option<&str>,
+    expires_in_secs: Option<u64>,
+    message: Option<&str>,
+) -> Value {
+    let mut m = Map::new();
+    m.insert("type".into(), json!("login_progress"));
+    if let Some(id) = id {
+        m.insert("id".into(), json!(id));
+    }
+    m.insert("command".into(), json!("login"));
+    m.insert("provider".into(), json!(provider));
+    m.insert("step".into(), json!(step));
+    if let Some(url) = url {
+        m.insert("url".into(), json!(url));
+    }
+    if let Some(user_code) = user_code {
+        m.insert("user_code".into(), json!(user_code));
+    }
+    if let Some(verification_uri) = verification_uri {
+        m.insert("verification_uri".into(), json!(verification_uri));
+    }
+    if let Some(expires_in) = expires_in_secs {
+        m.insert("expires_in".into(), json!(expires_in));
+    }
+    if let Some(message) = message {
+        m.insert("message".into(), json!(message));
+    }
+    Value::Object(m)
+}
+
 /// Build a `list_progress` frame — an unsolicited progress update for an in-flight `list_sessions`/
 /// `list_all_sessions` scan, correlated to the eventual `response` frame via the same request `id`.
 fn list_progress_frame(id: Option<String>, command: &str, scanned: usize, total: usize) -> Value {
@@ -4376,10 +4863,12 @@ fn list_progress_frame(id: Option<String>, command: &str, scanned: usize, total:
     Value::Object(m)
 }
 
-/// Build an `auto_retry` frame — an unsolicited notice that a `prompt`'s run failed with what looks
-/// like a transient error and is about to be automatically retried, correlated to the eventual
+/// Build an `auto_retry_start` frame — an unsolicited notice that a `prompt`'s run failed with what
+/// looks like a transient error and is about to be automatically retried, correlated to the eventual
 /// `response` frame via the same request `id`. Sent once per attempt, immediately before the backoff
 /// sleep (not after — a client watching for retry activity shouldn't have to infer it from a gap).
+/// Named `auto_retry_start` (not the bare `auto_retry` this crate used before) to match pi's own wire
+/// discriminator (`agent-session.ts`'s `AgentSessionEvent`), the counterpart to `auto_retry_end` below.
 fn auto_retry_frame(
     id: Option<String>,
     attempt: u32,
@@ -4388,7 +4877,7 @@ fn auto_retry_frame(
     error: &str,
 ) -> Value {
     let mut m = Map::new();
-    m.insert("type".into(), json!("auto_retry"));
+    m.insert("type".into(), json!("auto_retry_start"));
     if let Some(id) = id {
         m.insert("id".into(), json!(id));
     }

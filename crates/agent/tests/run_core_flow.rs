@@ -55,6 +55,7 @@ fn run_binary_performs_tool_round_trip() {
             "claude-test",
             "--max-steps",
             "4",
+            "--no-session-persistence",
         ])
         .current_dir(dir.path())
         .output()
@@ -106,6 +107,7 @@ fn run_binary_exits_nonzero_on_a_refusal_in_text_mode() {
             "bai_v1.test",
             "--model",
             "claude-test",
+            "--no-session-persistence",
         ])
         .stdin(Stdio::null())
         .output()
@@ -136,6 +138,7 @@ fn run_binary_a_normal_completion_in_text_mode_still_exits_zero() {
             "bai_v1.test",
             "--model",
             "claude-test",
+            "--no-session-persistence",
         ])
         .stdin(Stdio::null())
         .output()
@@ -167,6 +170,7 @@ fn run_binary_refusal_exit_code_check_is_scoped_to_text_mode() {
             "--model",
             "claude-test",
             "--json",
+            "--no-session-persistence",
         ])
         .stdin(Stdio::null())
         .output()
@@ -212,6 +216,7 @@ fn run_binary_json_mode_streams_structured_agent_events_not_text() {
             "--max-steps",
             "4",
             "--json",
+            "--no-session-persistence",
         ])
         .current_dir(dir.path())
         .stdin(Stdio::null())
@@ -300,6 +305,7 @@ fn run_binary_session_id_flag_gives_a_deterministic_id_for_an_ephemeral_run() {
             "--session-id",
             "deterministic-test-id-42",
             "--json",
+            "--no-session-persistence",
         ])
         .current_dir(dir.path())
         .stdin(Stdio::null())
@@ -347,6 +353,7 @@ fn run_binary_prints_a_live_preview_of_streamed_tool_arguments() {
             "claude-test",
             "--max-steps",
             "4",
+            "--no-session-persistence",
         ])
         .current_dir(dir.path())
         .stdin(Stdio::null())
@@ -381,6 +388,7 @@ fn run_binary_prints_startup_timings_only_when_the_env_var_is_set() {
         "bai_v1.test",
         "--model",
         "claude-test",
+        "--no-session-persistence",
     ];
 
     let off = run_cmd(bin)
@@ -406,6 +414,7 @@ fn run_binary_prints_startup_timings_only_when_the_env_var_is_set() {
             "bai_v1.test",
             "--model",
             "claude-test",
+            "--no-session-persistence",
         ])
         .env("AI_AGENT_TIMING", "1")
         .stdin(Stdio::null())
@@ -443,6 +452,7 @@ fn run_binary_sends_multiple_messages_as_sequential_turns() {
             "bai_v1.test",
             "--model",
             "claude-test",
+            "--no-session-persistence",
         ])
         .current_dir(dir.path())
         .stdin(Stdio::null())
@@ -490,6 +500,7 @@ fn run_binary_composes_an_at_file_reference_into_the_first_message() {
             "bai_v1.test",
             "--model",
             "claude-test",
+            "--no-session-persistence",
         ])
         .current_dir(dir.path())
         .stdin(Stdio::null())
@@ -540,6 +551,7 @@ fn run_binary_attaches_an_at_referenced_image_instead_of_erroring() {
             "bai_v1.test",
             "--model",
             "claude-test",
+            "--no-session-persistence",
         ])
         .current_dir(dir.path())
         .stdin(Stdio::null())
@@ -581,6 +593,7 @@ fn run_binary_reads_piped_stdin_into_the_first_message() {
             "bai_v1.test",
             "--model",
             "claude-test",
+            "--no-session-persistence",
         ])
         .current_dir(dir.path())
         .stdin(Stdio::piped())
@@ -620,6 +633,7 @@ fn run_binary_errors_when_no_task_stdin_or_file_is_given() {
             "http://127.0.0.1:1",
             "--key",
             "bai_v1.test",
+            "--no-session-persistence",
         ])
         .stdin(Stdio::null())
         .output()

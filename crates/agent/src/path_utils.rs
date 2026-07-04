@@ -20,21 +20,24 @@ pub(crate) fn resolved_path(path: &Path) -> PathBuf {
     absolutized.canonicalize().unwrap_or(absolutized)
 }
 
-/// Push `dir` onto `roots` only if its canonical form hasn't already been added (to `roots` or any
-/// other discovery root tracked in `seen`) — a root reached by two different paths (a symlink, a
+/// Push `(dir, tag)` onto `roots` only if `dir`'s canonical form hasn't already been added (to `roots`
+/// or any other discovery root tracked in `seen`) — a root reached by two different paths (a symlink, a
 /// relative-vs-absolute spelling, `cwd` itself equaling a global root in some deployment) must only be
 /// scanned once, or shared by `skills.rs`/`prompts.rs`'s discovery-root building: scanning the same real
 /// directory twice would double-count its contents and self-collide every name in it against a
 /// phantom duplicate rather than a genuine collision. Pi itself doesn't dedupe at the root-list level
 /// either (only file-level, in `skills.ts`'s own `loadSkills`/`realPathSet`); this is a Beyond-specific
-/// hardening.
-pub(crate) fn push_unique_root(
-    roots: &mut Vec<PathBuf>,
+/// hardening. `tag` rides along uninspected — `skills.rs`/`prompts.rs` both pass their own discovery-root
+/// category (`"user"`/`"project"`) here, for `Skill::scope`/`PromptTemplate::scope` (Task #39) — so each
+/// root's own scope travels with it instead of needing a second, separately-indexed data structure.
+pub(crate) fn push_unique_scoped_root<T>(
+    roots: &mut Vec<(PathBuf, T)>,
     seen: &mut HashSet<PathBuf>,
     dir: PathBuf,
+    tag: T,
 ) {
     if seen.insert(resolved_path(&dir)) {
-        roots.push(dir);
+        roots.push((dir, tag));
     }
 }
 

@@ -48,6 +48,51 @@ const WHOLE_RUN_RETRYABLE_STATUS_DIGITS: &[&str] = &["429", "500", "502", "503",
 /// out" into a hard, un-retried whole-run failure — exactly the case this whole layer exists to catch.
 const TRANSPORT_SEND_FAILURE_MARKER: &str = "error sending request for url";
 
+/// Runtime-configurable variant of the module's own const policy — `run_turn` (`main.rs`) and `serve`'s
+/// `"prompt"` auto-retry loop each build one from whichever `--retry-max-retries`/`--retry-base-delay-ms`
+/// (`AI_AGENT_RETRY_MAX_RETRIES`/`AI_AGENT_RETRY_BASE_DELAY_MS`) the operator gave — the same two flags
+/// that previously configured only `agent_core::client`'s pre-connect/mid-stream layer, leaving this
+/// whole-run layer pinned to [`MAX_RUN_RETRIES`]/[`RUN_RETRY_BASE_BACKOFF`] regardless of what the
+/// operator asked for. `max_backoff` has no CLI flag of its own (matching the two that exist today), so
+/// it stays fixed at [`RUN_RETRY_MAX_BACKOFF`] either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunRetryPolicy {
+    pub max_retries: u32,
+    pub base_backoff: std::time::Duration,
+}
+
+impl Default for RunRetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: MAX_RUN_RETRIES,
+            base_backoff: RUN_RETRY_BASE_BACKOFF,
+        }
+    }
+}
+
+impl RunRetryPolicy {
+    /// Build from the same two optional overrides `--retry-max-retries`/`--retry-base-delay-ms` already
+    /// carry through `main.rs`/`serve.rs` — `None` for either falls back to this module's own constant,
+    /// exactly like `agent_core::client`'s identical `unwrap_or(MAX_RETRIES)`/`unwrap_or(BASE_BACKOFF)`.
+    pub fn from_overrides(
+        max_retries: Option<u32>,
+        base_backoff: Option<std::time::Duration>,
+    ) -> Self {
+        Self {
+            max_retries: max_retries.unwrap_or(MAX_RUN_RETRIES),
+            base_backoff: base_backoff.unwrap_or(RUN_RETRY_BASE_BACKOFF),
+        }
+    }
+
+    /// Same exponential-backoff shape as the module-level [`backoff`], just off this policy's own
+    /// `base_backoff` instead of the fixed [`RUN_RETRY_BASE_BACKOFF`] constant.
+    pub fn backoff(&self, attempt: u32) -> std::time::Duration {
+        self.base_backoff
+            .saturating_mul(1u32 << attempt.saturating_sub(1).min(16))
+            .min(RUN_RETRY_MAX_BACKOFF)
+    }
+}
+
 /// Whether a whole run that ended in `Err` is worth automatically re-invoking from scratch — a superset
 /// of `agent_core::agent::is_retryable_mid_stream` (every mid-stream-worth-retrying error is also worth
 /// a whole-run retry) plus [`WHOLE_RUN_RETRYABLE_STATUS_DIGITS`] and
@@ -90,6 +135,36 @@ mod tests {
         assert_eq!(backoff(2), std::time::Duration::from_secs(4));
         assert_eq!(backoff(3), std::time::Duration::from_secs(8));
         assert_eq!(backoff(10), RUN_RETRY_MAX_BACKOFF);
+    }
+
+    #[test]
+    fn run_retry_policy_defaults_match_the_bare_constants() {
+        let policy = RunRetryPolicy::default();
+        assert_eq!(policy.max_retries, MAX_RUN_RETRIES);
+        assert_eq!(policy.base_backoff, RUN_RETRY_BASE_BACKOFF);
+        assert_eq!(policy.backoff(1), backoff(1));
+        assert_eq!(policy.backoff(3), backoff(3));
+    }
+
+    #[test]
+    fn run_retry_policy_from_overrides_honors_operator_supplied_values() {
+        // Task #50: `--retry-max-retries`/`--retry-base-delay-ms` must reach this whole-run layer, not
+        // just `agent_core::client`'s pre-connect/mid-stream one.
+        let policy =
+            RunRetryPolicy::from_overrides(Some(7), Some(std::time::Duration::from_millis(100)));
+        assert_eq!(policy.max_retries, 7);
+        assert_eq!(policy.base_backoff, std::time::Duration::from_millis(100));
+        assert_eq!(policy.backoff(1), std::time::Duration::from_millis(100));
+        assert_eq!(policy.backoff(2), std::time::Duration::from_millis(200));
+        // `max_backoff` has no override of its own — still caps at the fixed module constant even with
+        // a custom base.
+        assert_eq!(policy.backoff(20), RUN_RETRY_MAX_BACKOFF);
+    }
+
+    #[test]
+    fn run_retry_policy_from_overrides_falls_back_to_defaults_when_absent() {
+        let policy = RunRetryPolicy::from_overrides(None, None);
+        assert_eq!(policy, RunRetryPolicy::default());
     }
 
     #[test]

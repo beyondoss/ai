@@ -35,7 +35,7 @@ pub mod transport;
 pub mod validation;
 pub mod write_lock;
 
-pub use agent::{Agent, AgentEvent};
+pub use agent::{Agent, AgentEvent, CompactOutcome};
 pub use branch_summary::{
     BRANCH_SUMMARY_INSTRUCTION, BRANCH_SUMMARY_MARKER, branch_summary_request,
 };

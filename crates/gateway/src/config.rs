@@ -67,10 +67,27 @@ pub struct AiConfig {
 
     /// Per-provider upstream authority (`host:port`), **by provider name**. For a known provider
     /// (see `route::KNOWN_PROVIDERS`) this *overrides* its default; for an unknown name it *adds* a
-    /// new OpenAI-wire provider, then reachable at `/{name}/…` (the provider is the request's first
-    /// path segment). Empty = every known provider uses its built-in default. (The e2e harness points
+    /// new provider, then reachable at `/{name}/…` (the provider is the request's first path
+    /// segment). Empty = every known provider uses its built-in default. (The e2e harness points
     /// providers at a mock here.)
     pub provider_authorities: HashMap<String, String>,
+
+    /// Wire dialect for a **config-added** provider (a `provider_authorities` entry whose name isn't
+    /// in `route::KNOWN_PROVIDERS`), by provider name: `"openai"` or `"anthropic"` (case-insensitive;
+    /// see `Dialect::parse_config`). Has no effect on a known provider — its dialect is fixed in code.
+    /// Missing ⇒ `"openai"` (the long-standing default, kept for backward compatibility). Real pi
+    /// vendors like MiniMax, MiniMax-CN, and Kimi-Coding speak the **Anthropic** wire (`x-api-key`,
+    /// `usage.input_tokens`/`output_tokens`) — defaulting them to OpenAI-wire silently zero-bills
+    /// every request (`usage::openai_body` deserializes the mismatched shape into all-zero fields
+    /// instead of failing). An unrecognized value is a **hard boot failure**, not a silent fallback to
+    /// `"openai"` — that fallback is exactly the bug this field exists to let an operator opt out of.
+    pub provider_dialects: HashMap<String, String>,
+
+    /// Managed auth scheme for a **config-added** provider, by provider name: `"bearer"` or
+    /// `"x-api-key"` (case-insensitive, `-`/`_` ignored; see `AuthScheme::parse_config`). Has no
+    /// effect on a known provider. Missing ⇒ `"bearer"` (backward-compatible default). An unrecognized
+    /// value is a hard boot failure.
+    pub provider_auth_schemes: HashMap<String, String>,
 
     /// Upstream timeouts (seconds). Streaming responses are long, so read/idle are generous.
     pub connect_timeout_secs: u64,
@@ -179,6 +196,8 @@ impl Default for AiConfig {
             require_signing_keys: false,
             pool_keys: HashMap::new(),
             provider_authorities: HashMap::new(),
+            provider_dialects: HashMap::new(),
+            provider_auth_schemes: HashMap::new(),
             connect_timeout_secs: 10,
             // Generous: LLM streams can run for minutes; a tight read timeout would kill them.
             read_timeout_secs: 600,

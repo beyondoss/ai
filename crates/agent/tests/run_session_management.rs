@@ -1133,6 +1133,234 @@ fn run_fork_with_an_unknown_id_fails_clearly_instead_of_silently_starting_fresh(
 }
 
 #[test]
+fn run_session_flag_with_a_bare_id_reopens_the_session_in_place_same_project() {
+    // Task #24 (pi-parity fix): `--session <arg>` must resolve a bare session id (not just a literal
+    // path) against the current project's own repo first, REOPENING it in place — continuing the same
+    // session, not forking a new one the way `--fork <id>` would.
+    let repo_dir = tempfile::tempdir().unwrap();
+    let project_dir = tempfile::tempdir().unwrap();
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+
+    let (base1, _bodies1) = spawn_model_server(vec![turn_text("first answer")]);
+    let output1 = run_cmd(bin)
+        .args([
+            "run",
+            "remember the marker: bare-id-91",
+            "--gateway-url",
+            &base1,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--continue",
+            "--session-dir",
+            repo_dir.path().to_str().unwrap(),
+        ])
+        .current_dir(project_dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+    assert!(
+        output1.status.success(),
+        "first run failed.\nstderr: {}",
+        String::from_utf8_lossy(&output1.stderr)
+    );
+    let session_path = std::fs::read_dir(repo_dir.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let id = session_id_of(&session_path);
+
+    let (base2, bodies2) = spawn_model_server(vec![turn_text("second answer")]);
+    let output2 = run_cmd(bin)
+        .args([
+            "run",
+            "what was the marker?",
+            "--gateway-url",
+            &base2,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--session",
+            &id,
+            "--session-dir",
+            repo_dir.path().to_str().unwrap(),
+        ])
+        .current_dir(project_dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+    assert!(
+        output2.status.success(),
+        "--session <bare id> run failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output2.stdout),
+        String::from_utf8_lossy(&output2.stderr)
+    );
+    let bodies2 = bodies2.lock().unwrap();
+    assert!(
+        bodies2[0].contains("bare-id-91"),
+        "reopening by bare id must carry the prior transcript over: {}",
+        bodies2[0]
+    );
+
+    // Reopened in place, not forked: still exactly one file in the repo, and it's the very same one.
+    let entries: Vec<_> = std::fs::read_dir(repo_dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "must reopen the existing session in place, not fork a second file: {entries:?}"
+    );
+    assert_eq!(session_id_of(&entries[0]), id);
+}
+
+#[test]
+fn run_session_flag_with_a_bare_id_reopens_a_session_found_in_a_different_projects_directory() {
+    // Task #24: the cross-project half — an id not found in the current project's own `--session-dir`
+    // repo must fall back to searching every other project's directory under its parent, exactly like
+    // `--fork <id>` already does, and reopen (not fork) whatever it finds there.
+    let sessions_parent = tempfile::tempdir().unwrap();
+    let repo_a = sessions_parent.path().join("project-a");
+    let repo_b = sessions_parent.path().join("project-b");
+    std::fs::create_dir_all(&repo_b).unwrap();
+    let project_dir = tempfile::tempdir().unwrap();
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+
+    let (base1, _bodies1) = spawn_model_server(vec![turn_text("first answer")]);
+    let output1 = run_cmd(bin)
+        .args([
+            "run",
+            "remember the marker: cross-project-bare-id-73",
+            "--gateway-url",
+            &base1,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--continue",
+            "--session-dir",
+            repo_a.to_str().unwrap(),
+        ])
+        .current_dir(project_dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+    assert!(
+        output1.status.success(),
+        "first run failed.\nstderr: {}",
+        String::from_utf8_lossy(&output1.stderr)
+    );
+    let session_path = std::fs::read_dir(&repo_a)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let id = session_id_of(&session_path);
+
+    // `--session-dir repo_b` scopes this run's cross-project search to `repo_b`'s own parent
+    // (`sessions_parent`), which `repo_a` is a sibling of — the same convention `--fork <id>` uses.
+    let (base2, bodies2) = spawn_model_server(vec![turn_text("second answer")]);
+    let output2 = run_cmd(bin)
+        .args([
+            "run",
+            "what was the marker?",
+            "--gateway-url",
+            &base2,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--session",
+            &id,
+            "--session-dir",
+            repo_b.to_str().unwrap(),
+        ])
+        .current_dir(project_dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+    assert!(
+        output2.status.success(),
+        "--session <bare id> cross-project run failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output2.stdout),
+        String::from_utf8_lossy(&output2.stderr)
+    );
+    let bodies2 = bodies2.lock().unwrap();
+    assert!(
+        bodies2[0].contains("cross-project-bare-id-73"),
+        "reopening a cross-project session by bare id must carry its transcript over: {}",
+        bodies2[0]
+    );
+
+    // Reopened in place under `repo_a` — `repo_b` must stay empty, not gain a forked copy.
+    assert_eq!(
+        std::fs::read_dir(&repo_b).unwrap().count(),
+        0,
+        "must reopen the source session in place under repo_a, not fork a copy into repo_b"
+    );
+    let entries_a: Vec<_> = std::fs::read_dir(&repo_a)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(
+        entries_a.len(),
+        1,
+        "repo_a must still hold exactly the one original session file"
+    );
+    assert_eq!(session_id_of(&entries_a[0]), id);
+}
+
+#[test]
+fn run_session_flag_with_an_unresolvable_bare_id_fails_clearly() {
+    // Task #24: unlike a literal path (which `--session` creates fresh when absent), a bare identifier
+    // matching no session anywhere is a likely typo, not a request to start a new session named after
+    // it — must fail clearly rather than silently create a garbage file with that literal name.
+    let repo_dir = tempfile::tempdir().unwrap();
+    let project_dir = tempfile::tempdir().unwrap();
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "hello",
+            "--gateway-url",
+            "http://127.0.0.1:1",
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--session",
+            "no-such-session-id",
+            "--session-dir",
+            repo_dir.path().to_str().unwrap(),
+        ])
+        .current_dir(project_dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+    assert!(
+        !output.status.success(),
+        "must fail, not silently create a session"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no-such-session-id"),
+        "error must name the unresolved argument: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_dir(repo_dir.path()).unwrap().count(),
+        0,
+        "must not create a spurious session file for an id that resolves nowhere"
+    );
+}
+
+#[test]
 fn run_binary_session_dir_flag_redirects_the_continue_repo() {
     // Pi-parity fix: `run` had no `--session-dir` equivalent at all — `--continue` was pinned to the
     // hardcoded default `~/.claude/sessions/<encoded-cwd>/` with no override, unlike `serve`'s own

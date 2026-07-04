@@ -8,7 +8,10 @@
 // `.unwrap()` *is* the assertion — allow it under `test`, matching the binary and agent-core roots.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+pub mod auth_credential_source;
+pub mod auth_store;
 pub mod export;
+pub mod oauth;
 pub(crate) mod path_utils;
 pub mod policy;
 pub mod prompts;

@@ -119,10 +119,14 @@ impl Default for CompactionConfig {
     }
 }
 
-/// System prompt for the summarization call.
+/// System prompt for the summarization call. The trailing guardrail matches pi's own
+/// `SUMMARIZATION_SYSTEM_PROMPT` (`compaction.ts`): the rendered transcript embeds real past user
+/// questions, and without an explicit instruction not to, the model can slip into answering one of
+/// them instead of emitting the structured checkpoint format this call actually needs.
 pub const SUMMARY_SYSTEM: &str = "You compact a long agent transcript so the agent can keep working \
 with far fewer tokens but no loss of essential context. Be precise, concrete, and information-dense; \
-preserve file paths, identifiers, commands, and decisions exactly.";
+preserve file paths, identifiers, commands, and decisions exactly. Do NOT continue the conversation. \
+Do NOT respond to any questions in the conversation. ONLY output the structured summary.";
 
 /// The instruction appended after the rendered transcript in the summarization call. Matches pi's own
 /// `SUMMARIZATION_PROMPT` (`compaction.ts`) structurally: a bracketed exemplar per section (telling the
@@ -180,10 +184,13 @@ suffix.";
 /// [`previous_summary`].
 pub const SUMMARY_MARKER: &str = "[Earlier conversation compacted to save context]";
 
-/// The turn-prefix summarization call's budget, as a fraction of the history call's
-/// [`CompactionConfig::summary_max_tokens`] — a split-turn's prefix is a *partial* turn (see
-/// [`is_split_turn`]), inherently shorter than the closed-off history it's summarized alongside, so it
-/// needs proportionally less room.
+/// The turn-prefix summarization call's budget, as a fraction of [`CompactionConfig::reserve_tokens`]
+/// directly — matching pi's own `generateTurnPrefixSummary` (`Math.floor(0.5 * reserveTokens)`,
+/// `compaction.ts`), not a fraction of the history call's already-scaled
+/// [`CompactionConfig::summary_max_tokens`] (itself `0.8 * reserve_tokens`), which would instead net an
+/// effective ~0.4 * `reserve_tokens`. A split-turn's prefix is a *partial* turn (see [`is_split_turn`]),
+/// inherently shorter than the closed-off history it's summarized alongside, so it needs
+/// proportionally less room.
 pub const SPLIT_TURN_PREFIX_SCALE: f64 = 0.5;
 
 /// Tool-result content is truncated to this many characters when rendered into the summary prompt —
@@ -204,22 +211,32 @@ pub fn estimate_tokens(text: &str) -> u32 {
 
 /// Estimate one message's token cost from its blocks. `pub(crate)`: also used by
 /// [`crate::branch_summary`] to window a branch's transcript by token budget.
+///
+/// Sums raw character counts across every block first, then applies one `ceil(chars / 4)` — matching
+/// pi's own `estimateTokens` (`estimate.ts`), which sums a whole message's chars before its single
+/// division. Flooring (or ceiling) *per block* and summing the results instead systematically
+/// under-counts a message built of several short blocks (e.g. a tool call's name and its JSON input,
+/// each too short alone to clear a whole token at chars/4 floor division, but not once combined).
 pub(crate) fn estimate_message_tokens(m: &Message) -> u32 {
-    m.content
+    let chars: usize = m
+        .content
         .iter()
         .map(|b| match b {
-            ContentBlock::Text { text, .. } => estimate_tokens(text),
-            ContentBlock::Thinking { text, .. } => estimate_tokens(text),
-            ContentBlock::RedactedThinking { data } => estimate_tokens(data),
+            ContentBlock::Text { text, .. } => text.chars().count(),
+            ContentBlock::Thinking { text, .. } => text.chars().count(),
+            ContentBlock::RedactedThinking { data } => data.chars().count(),
             ContentBlock::ToolUse { name, input, .. } => {
-                estimate_tokens(name) + estimate_tokens(&input.to_string())
+                name.chars().count() + input.to_string().chars().count()
             }
-            ContentBlock::ToolResult { content, .. } => estimate_tokens(content),
-            // A flat ~1.2k-token estimate for an image (Anthropic bills vision roughly there); the
-            // exact figure depends on resolution, but the trigger only needs the right ballpark.
-            ContentBlock::Image { .. } => 1_200,
+            ContentBlock::ToolResult { content, .. } => content.chars().count(),
+            // Matches pi's flat `ESTIMATED_IMAGE_CHARS` (4800, chars/4 = 1200 tokens) for an image
+            // (Anthropic bills vision roughly there); the exact figure depends on resolution, but the
+            // trigger only needs the right ballpark, and folding it into the same char sum as every
+            // other block keeps the single ceiling division below the one true source of rounding.
+            ContentBlock::Image { .. } => 4_800,
         })
-        .sum()
+        .sum();
+    chars.div_ceil(4) as u32
 }
 
 /// Total estimated tokens across every message in `messages` — pi's own `estimateMessagesTokens`,
@@ -264,12 +281,16 @@ pub fn trailing_tokens(session: &Session) -> u32 {
 /// Whether the live prompt has crossed the compaction threshold. Uses the *last turn's* input size
 /// ([`Session::last_input_tokens`]) plus [`trailing_tokens`] (messages appended since that snapshot) —
 /// the real, current context size — not the cumulative totals.
+///
+/// Strict `>`, matching pi's own `shouldCompact` (`compaction.ts`): landing exactly on
+/// `context_window - reserve_tokens` still leaves the full reserve intact, so it isn't yet a reason to
+/// fire — only actually exceeding it is.
 pub fn should_compact(session: &Session, cfg: &CompactionConfig) -> bool {
     session.last_input_tokens > 0
         && session
             .last_input_tokens
             .saturating_add(trailing_tokens(session))
-            >= cfg.context_window.saturating_sub(cfg.reserve_tokens)
+            > cfg.context_window.saturating_sub(cfg.reserve_tokens)
 }
 
 /// A hard overflow signal, independent of [`should_compact`]'s (possibly-disabled) soft threshold: the
@@ -448,6 +469,21 @@ fn is_turn_start(m: &Message) -> bool {
 /// its `data` is opaque ciphertext the provider chose not to expose, never human-readable regardless
 /// of length.
 pub fn render_prefix(messages: &[Message]) -> String {
+    render_prefix_impl(messages, true)
+}
+
+/// Same rendering as [`render_prefix`], but drops `ToolResult` content entirely instead of rendering a
+/// truncated body — used only by [`crate::branch_summary`]. Matches pi's own `getMessageFromEntry`
+/// (`branch-summarization.ts`), which returns `undefined` for any tool-result-role entry so
+/// `prepareBranchEntries` never includes tool output in a branch summary's rendered transcript at all;
+/// unlike a from-scratch compaction summary (which stays live conversation context), a branch summary
+/// is read once on return, so tool output's terseness matters more than its (already-truncated) detail.
+/// Tool-call *names* (via `ToolUse`) still survive, same as ordinary compaction.
+pub(crate) fn render_prefix_without_tool_results(messages: &[Message]) -> String {
+    render_prefix_impl(messages, false)
+}
+
+fn render_prefix_impl(messages: &[Message], include_tool_results: bool) -> String {
     let mut out = String::new();
     for m in messages {
         for b in &m.content {
@@ -469,6 +505,9 @@ pub fn render_prefix(messages: &[Message]) -> String {
                 ContentBlock::ToolResult {
                     content, is_error, ..
                 } => {
+                    if !include_tool_results {
+                        continue;
+                    }
                     let body = truncate_chars(content, TOOL_RESULT_MAX_CHARS);
                     let tag = if *is_error {
                         "tool error"
@@ -528,8 +567,11 @@ pub fn extract_file_ops(messages: &[Message]) -> (Vec<String>, Vec<String>) {
 }
 
 /// If `prefix` begins with a prior compaction summary (a user message tagged with [`SUMMARY_MARKER`]),
-/// return the summary body (without the marker line). This is what lets compaction be *incremental*:
-/// the previous summary is fed forward as-is and updated, not re-summarized as transcript.
+/// return the summary body (without the marker line, or `apply_summary`'s leading token-count line).
+/// This is what lets compaction be *incremental*: the previous summary is fed forward as-is and
+/// updated, not re-summarized as transcript — so the token-count line (informational metadata for an
+/// exported transcript, not part of the summary itself) is stripped before it would otherwise leak into
+/// the next summarization prompt.
 pub fn previous_summary(prefix: &[Message]) -> Option<&str> {
     let first = prefix.first()?;
     if first.role != Role::User {
@@ -538,8 +580,18 @@ pub fn previous_summary(prefix: &[Message]) -> Option<&str> {
     let ContentBlock::Text { text, .. } = first.content.first()? else {
         return None;
     };
-    let body = text.strip_prefix(SUMMARY_MARKER)?;
-    Some(body.trim_start())
+    let body = text.strip_prefix(SUMMARY_MARKER)?.trim_start();
+    let body = strip_leading_tokens_before_line(body);
+    Some(body)
+}
+
+/// Strip an optional leading `"Compacted from {N} tokens\n\n"` line (see `apply_summary`) if present;
+/// otherwise returns `body` unchanged.
+fn strip_leading_tokens_before_line(body: &str) -> &str {
+    body.strip_prefix("Compacted from ")
+        .and_then(|rest| rest.split_once(" tokens\n\n"))
+        .map(|(_, rest)| rest)
+        .unwrap_or(body)
 }
 
 /// Whether `prefix` (what's about to be summarized) ends *mid-turn* — its cut point falls inside an
@@ -613,8 +665,12 @@ pub fn summary_request(
             UPDATE_INSTRUCTION
         }
         None => {
+            // Matches pi's own `generateSummary`/`generateTurnPrefixSummary`: the rendered transcript
+            // is wrapped in `<conversation>` tags, the same delimiting convention the incremental path
+            // just below already applies to its own new-activity transcript via `<new-activity>`.
+            prompt.push_str("<conversation>\n");
             prompt.push_str(&render_prefix(prefix));
-            prompt.push_str("\n\n");
+            prompt.push_str("\n</conversation>\n\n");
             if is_split_turn(prefix) {
                 SPLIT_TURN_INSTRUCTION
             } else {
@@ -674,11 +730,18 @@ pub fn format_file_operations(read_files: &[String], modified_files: &[String]) 
 
 /// Splice a summary into `session`, replacing the prefix before `first_kept` with one summary user
 /// message. Resets [`Session::last_input_tokens`] so the freshly-shrunk context doesn't immediately
-/// re-trigger the threshold (the true size is recomputed after the next turn).
-pub fn apply_summary(session: &mut Session, first_kept: usize, summary: &str) {
+/// re-trigger the threshold (the true size is recomputed after the next turn). `tokens_before` (the
+/// pre-compaction size the caller already computed) is embedded as a leading `"Compacted from {N}
+/// tokens\n\n"` line in the summary body — read back out by `export.rs`'s `parse_compaction_tokens_before`
+/// to show a token count in an exported transcript's compaction block, matching pi's own
+/// `entry.tokensBefore` (`template.js:1294-1299`). `previous_summary` strips this line back out before
+/// handing the body to an incremental re-summarization prompt.
+pub fn apply_summary(session: &mut Session, first_kept: usize, summary: &str, tokens_before: u32) {
     let kept = &session.messages[first_kept..];
     let mut new_messages = Vec::with_capacity(1 + kept.len());
-    new_messages.push(Message::user(format!("{SUMMARY_MARKER}\n\n{summary}")));
+    new_messages.push(Message::user(format!(
+        "{SUMMARY_MARKER}\n\nCompacted from {tokens_before} tokens\n\n{summary}"
+    )));
     new_messages.extend_from_slice(kept);
     session.messages = Arc::new(new_messages);
     session.last_input_tokens = 0;
@@ -715,6 +778,26 @@ mod tests {
             Message::tool_result("2", "edited", false),
             Message::assistant(vec![ContentBlock::text("done")]),
         ]
+    }
+
+    #[test]
+    fn estimate_message_tokens_ceils_once_over_the_whole_message_not_per_block() {
+        // pi-parity gap (fixed): pi's `estimateTokens` (`estimate.ts`) sums a whole message's chars
+        // before its single `Math.ceil(chars / 4)`. Flooring (the old per-block behavior, via
+        // `estimate_tokens`'s chars/4) each block separately then summing systematically under-counts a
+        // message built of several short blocks — three 3-char text blocks (9 chars total, ceil(9/4) =
+        // 3 tokens) each individually floor to 0 tokens alone (3/4 = 0), summing to 0 instead.
+        let m = Message::assistant(vec![
+            ContentBlock::text("abc"),
+            ContentBlock::text("def"),
+            ContentBlock::text("ghi"),
+        ]);
+        assert_eq!(
+            estimate_message_tokens(&m),
+            3,
+            "9 total chars across 3 blocks must ceil-divide once as a whole (ceil(9/4) = 3), not \
+             floor-divide per block and sum (0 + 0 + 0 = 0)"
+        );
     }
 
     #[test]
@@ -764,6 +847,29 @@ mod tests {
         assert!(!should_compact(&s, &cfg)); // below 1000-200
         s.last_input_tokens = 850;
         assert!(should_compact(&s, &cfg));
+    }
+
+    #[test]
+    fn should_compact_does_not_fire_exactly_at_the_threshold() {
+        // pi-parity gap (fixed): pi's `shouldCompact` fires on strict `>`, not `>=` — landing exactly
+        // on `context_window - reserve_tokens` still leaves the full reserve intact, so it isn't yet a
+        // reason to fire. One token past it must.
+        let cfg = CompactionConfig {
+            context_window: 1000,
+            reserve_tokens: 200, // threshold: 800
+            ..Default::default()
+        };
+        let mut s = Session::new();
+        s.last_input_tokens = 800;
+        assert!(
+            !should_compact(&s, &cfg),
+            "must not fire when the live prompt merely meets the threshold"
+        );
+        s.last_input_tokens = 801;
+        assert!(
+            should_compact(&s, &cfg),
+            "must fire once the live prompt actually exceeds the threshold"
+        );
     }
 
     #[test]
@@ -863,7 +969,7 @@ mod tests {
         let mut s = Session::new();
         s.messages = Arc::new(convo());
         s.last_output_tokens = 12345;
-        apply_summary(&mut s, 3, "SUMMARY");
+        apply_summary(&mut s, 3, "SUMMARY", 9999);
         assert_eq!(s.last_output_tokens, 0);
     }
 
@@ -1190,6 +1296,53 @@ mod tests {
     }
 
     #[test]
+    fn summary_request_wraps_the_fresh_transcript_in_conversation_tags() {
+        // pi-parity gap (fixed): pi's `generateSummary`/`generateTurnPrefixSummary` always wrap the
+        // rendered transcript in `<conversation>` tags — matching our own incremental-update path's
+        // `<new-activity>` wrapper for internal consistency.
+        let messages = convo();
+        let file_ops = merge_file_ops(
+            &CompactionProvenance::default(),
+            &messages,
+            CompactionReason::Threshold,
+        );
+        let req = summary_request("claude-test", &messages, 512, &file_ops, None);
+        let ContentBlock::Text { text, .. } = &req.messages[0].content[0] else {
+            panic!("expected text");
+        };
+        assert!(text.contains("<conversation>"));
+        assert!(text.contains("</conversation>"));
+        let open = text.find("<conversation>").unwrap();
+        let close = text.find("</conversation>").unwrap();
+        assert!(open < close);
+        assert!(
+            text[open..close].contains("refactor foo"),
+            "the rendered transcript must live inside the conversation tags: {text}"
+        );
+    }
+
+    #[test]
+    fn summary_request_does_not_wrap_the_incremental_update_path_in_conversation_tags() {
+        // The incremental-update path keeps its own existing `<new-activity>` wrapper unchanged —
+        // `<conversation>` is only added to the from-scratch/split-turn path.
+        let prefix = vec![
+            Message::user(format!("{SUMMARY_MARKER}\n\nPrevious summary body")),
+            Message::assistant(vec![ContentBlock::text("new work since")]),
+        ];
+        let file_ops = merge_file_ops(
+            &CompactionProvenance::default(),
+            &prefix,
+            CompactionReason::Manual,
+        );
+        let req = summary_request("claude-test", &prefix, 512, &file_ops, None);
+        let ContentBlock::Text { text, .. } = &req.messages[0].content[0] else {
+            panic!("expected text");
+        };
+        assert!(!text.contains("<conversation>"));
+        assert!(text.contains("<new-activity>"));
+    }
+
+    #[test]
     fn render_prefix_includes_a_visible_thinking_blocks_text() {
         let messages = vec![
             Message::user("why did the build fail?"),
@@ -1237,6 +1390,36 @@ mod tests {
             rendered, "",
             "a redacted-thinking-only message renders as nothing"
         );
+    }
+
+    #[test]
+    fn render_prefix_without_tool_results_drops_tool_result_content_but_keeps_tool_call_names() {
+        // pi-parity gap (fixed): pi's `getMessageFromEntry` (branch-summarization.ts) returns
+        // `undefined` for any tool-result-role entry, so a branch summary's rendered transcript never
+        // includes tool output at all — only user/assistant text, thinking, and tool-call *names*.
+        let messages = vec![
+            Message::user("try approach X"),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "1",
+                "read",
+                json!({ "path": "src/x.rs" }),
+            )]),
+            Message::tool_result("1", "SECRET FILE CONTENTS should not appear", false),
+            Message::assistant(vec![ContentBlock::text("done")]),
+        ];
+        let rendered = render_prefix_without_tool_results(&messages);
+        assert!(rendered.contains("try approach X"));
+        assert!(rendered.contains("Assistant called tool `read`"));
+        assert!(rendered.contains("done"));
+        assert!(
+            !rendered.contains("SECRET FILE CONTENTS"),
+            "tool result content must not survive: {rendered}"
+        );
+        assert!(!rendered.contains("[tool result]"));
+
+        // The ordinary renderer, by contrast, still includes it — this is a branch-summarization-only
+        // exclusion, not a change to compaction's own summarization path.
+        assert!(render_prefix(&messages).contains("SECRET FILE CONTENTS"));
     }
 
     #[test]
@@ -1474,7 +1657,7 @@ mod tests {
         s.messages = Arc::new(convo());
         s.last_input_tokens = 9999;
         let n_before = s.messages.len();
-        apply_summary(&mut s, 3, "SUMMARY");
+        apply_summary(&mut s, 3, "SUMMARY", 9999);
 
         // summary(user) + kept suffix [3..]
         assert_eq!(s.messages.len(), 1 + (n_before - 3));

@@ -67,13 +67,22 @@ circuit_breaker_reset_secs = 30
 byo_rate_limit_rps = 1000
 
 # Optional per-provider upstream authority (host:port), BY PROVIDER NAME. For a known provider this
-# overrides its built-in default; for an unknown name it ADDS a new OpenAI-wire provider, then
-# reachable at `/{name}/…` (the provider is the first path segment of the request). Known providers
-# (zero-config defaults): openai, anthropic, openrouter, fireworks, groq, deepseek, together,
-# cerebras, mistral, xai.
+# overrides its built-in default; for an unknown name it ADDS a new provider, then reachable at
+# `/{name}/…` (the provider is the first path segment of the request). Known providers (zero-config
+# defaults): openai, anthropic, openrouter, fireworks, groq, deepseek, together, cerebras, mistral, xai.
 # [provider_authorities]
 # openai = "api.openai.com:443"
 # my-self-hosted = "llm.internal:8443"
+# minimax = "api.minimax.io:443"
+
+# A config-added provider (name not in the known set above) defaults to OpenAI-wire + Bearer auth.
+# Set these, BY PROVIDER NAME, to add an Anthropic-wire vendor instead (e.g. pi's MiniMax,
+# MiniMax-CN, Kimi-Coding all speak the Anthropic Messages wire). An unrecognized value is a hard
+# boot failure, not a silent fallback — getting this wrong silently zero-bills every request.
+# [provider_dialects]
+# minimax = "anthropic"       # "openai" (default) | "anthropic"
+# [provider_auth_schemes]
+# minimax = "x-api-key"       # "bearer" (default) | "x-api-key"
 
 # Managed Beyond pool keys, BY PROVIDER NAME. Inject via SSM-backed env in production
 # (AI_POOL_KEY_OPENAI, AI_POOL_KEY_GROQ, …) rather than this file; env wins over any value here.

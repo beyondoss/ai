@@ -173,7 +173,9 @@ fn run_binary_with_no_settings_file_at_all_falls_back_to_the_built_in_default() 
     let (base, _bodies) = spawn_model_server(vec![turn_text("ok")]);
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let output = run_cmd(bin)
-        .args(["run", "hi", "--gateway-url", &base, "--key", "bai_v1.test"])
+        .args(["run", "hi", "--gateway-url", &base, "--key", "bai_v1.test",
+            "--no-session-persistence",
+        ])
         .stdin(Stdio::null())
         .output()
         .unwrap();
@@ -319,10 +321,7 @@ fn settings_default_project_trust_round_trips_across_invocations() {
         String::from_utf8_lossy(&set.stderr)
     );
     let stdout = String::from_utf8_lossy(&set.stdout);
-    assert!(
-        stdout.contains("default_project_trust: always"),
-        "{stdout}"
-    );
+    assert!(stdout.contains("default_project_trust: always"), "{stdout}");
 
     let show = Command::new(bin)
         .arg("settings")
@@ -350,7 +349,8 @@ fn settings_default_project_trust_round_trips_across_invocations() {
 }
 
 #[test]
-fn run_binary_stored_default_project_trust_always_enables_a_project_system_md_with_no_explicit_flag() {
+fn run_binary_stored_default_project_trust_always_enables_a_project_system_md_with_no_explicit_flag()
+ {
     // The consultation point itself: with neither `--trust-project` nor `--force-untrusted` passed, a
     // stored `always` policy must make the on-disk SYSTEM.md take effect exactly like `--trust-project`
     // would.

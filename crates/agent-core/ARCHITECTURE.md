@@ -99,19 +99,41 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   tool call (an error `tool_result`, or a fail-closed block for `before_tool_call`) instead of unwinding
   the whole run. Neither trait returns a `Result` a panic could be redirected through instead, so this is
   the one place that actually needs to catch the unwind.
-- **Compaction** — when the live prompt crosses `context_window − reserve` (or the provider rejects an
+- **Compaction** — when the live prompt strictly exceeds `context_window − reserve` (landing exactly on
+  the threshold still leaves the full reserve intact, so `compaction::should_compact` requires `>`, not
+  pi-mismatched `>=`) (or the provider rejects an
   overflow), [`compaction`](src/compaction.rs) summarizes the prefix via one model call and splices a
   summary in, keeping recent turns verbatim (`Agent::compact`, auto-trigger, compact-and-retry).
-  `Agent::compact`'s `custom_instructions: Option<&str>` steers what the summary emphasizes — a manual
+  `Agent::compact` returns a `CompactOutcome` (`Compacted`/`TooSmall`/`AlreadyCompacted`), not a bare
+  `bool` — pi throws two distinct errors ("Nothing to compact (session too small)" / "Already
+  compacted") for what this crate used to collapse into the same undifferentiated `false`; `serve`'s
+  `compact` RPC surfaces the distinction via a `reason` field (`CompactOutcome::reason()`), while every
+  overflow-retry call site still only branches on `CompactOutcome::compacted()` (the bare-bool question
+  they actually care about). A completed compaction embeds `"Compacted from {tokens_before} tokens\n\n"`
+  as a leading line in the spliced summary body (`compaction::apply_summary`'s new `tokens_before: u32`
+  param) — read back by `crates/agent`'s `export.rs` to show a token count in an exported transcript's
+  compaction block (matching pi's `entry.tokensBefore`), and stripped back out by `previous_summary`
+  before an incremental re-summarization prompt ever sees it (so the line can't recursively accumulate
+  turn over turn). `Agent::compact`'s `custom_instructions: Option<&str>` steers what the summary
+  emphasizes — a manual
   (client-triggered) compaction's own focus, matching pi's `compact(customInstructions)`; every
   automatic trigger passes `None`, having no client in the loop to ask. A _second_ compaction is
   incremental: a prior summary (tagged `SUMMARY_MARKER`) is fed forward and updated rather than
-  re-summarized, so early context isn't lost (and re-billed) each cycle. A cut landing mid-turn splits
+  re-summarized, so early context isn't lost (and re-billed) each cycle. The fresh (non-incremental)
+  render is wrapped in `<conversation>` tags, matching pi's `generateSummary`/`generateTurnPrefixSummary`
+  and this crate's own incremental path's pre-existing `<new-activity>` wrapper; `SUMMARY_SYSTEM` also
+  now ends with an explicit anti-continuation guardrail ("Do NOT continue the conversation. Do NOT
+  respond to any questions in the conversation.") — the rendered transcript embeds real past user
+  questions, and without it the model can slip into answering one instead of emitting the structured
+  checkpoint format the call actually needs. A cut landing mid-turn splits
   into a **closed-history** call (gets `custom_instructions`) and a **turn-prefix** call (does not —
   matches pi's own split — run *sequentially*, not concurrently: pi originally ran them via
   `Promise.all`, then fixed exactly this itself so a single-concurrency local provider doesn't reject
-  the second of two simultaneous completions; `SPLIT_TURN_PREFIX_SCALE` × the summary token budget for
-  the smaller one), merged under a "Turn Context (split turn)" header — closer to pi's two-template
+  the second of two simultaneous completions; `SPLIT_TURN_PREFIX_SCALE` × `reserve_tokens` **directly**
+  for the smaller one — matching pi's `generateTurnPrefixSummary` (`Math.floor(0.5 * reserveTokens)`),
+  not a fraction of the already-scaled `summary_max_tokens`, which would instead compound the two scale
+  factors into an effective ~0.4× `reserve_tokens`), merged under a "Turn Context (split turn)" header —
+  closer to pi's two-template
   approach than summarizing the whole prefix with one minimal-context call. `summary_max_tokens` scales
   from the model's own `max_output` rather
   than a flat constant (`agent::scaled_summary_max_tokens`) — seeded by `Agent::new` and *rescaled* by
@@ -120,7 +142,12 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   `reserve_tokens`) doesn't silently discard the model-aware value in favor of that default. The trigger
   adds `compaction::trailing_tokens` (messages appended since the last
   usage snapshot, estimated rather than assumed already reflected in `last_input_tokens`) so it doesn't
-  compare a stale, undercounted size against the window. Overflow detection
+  compare a stale, undercounted size against the window. `estimate_message_tokens` sums a whole
+  message's characters across every block first and applies one `div_ceil(4)` at the end — matching
+  pi's own `estimateTokens`, which does the same whole-message sum-then-divide — rather than the prior
+  per-block `estimate_tokens`/floor-division-then-sum, which systematically under-counted a message
+  built of several short blocks (three 3-char text blocks each floor to 0 tokens alone at chars/4, summing
+  to 0, instead of correctly ceil-dividing the combined 9 chars to 3). Overflow detection
   (`agent.rs::is_context_overflow`) is table-driven (`OVERFLOW_PATTERNS`) with a `THROTTLE_EXCLUSIONS`
   allowlist checked first, so a provider's rate-limit/service-unavailable message (which can happen to
   contain "too many tokens") is never misread as a context overflow worth compacting for. A second,
@@ -175,7 +202,12 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
 - **Vision downgrade** — a model whose `ModelCaps::supports_vision` is `false` never sees a raw image
   block: each dialect replaces a user/tool-result image with a text placeholder
   (`"(image omitted: model does not support images)"` / the tool-result variant) instead of sending
-  bytes the model can't decode.
+  bytes the model can't decode. Dispatch also injects a schema-undocumented `_model_supports_vision`
+  boolean (keyed off the active model's own `ModelCaps::supports_vision`) into every tool call's
+  `input` object right before `run`/`run_streaming` — invisible to the model (it never appears in the
+  advertised `input_schema`) and ignored by every tool except `crates/agent`'s `read`, which reads it
+  back to append a "current model doesn't support images" note when the file it read is an image; see
+  `agent.rs::tests::dispatch_tells_a_tool_whether_the_active_model_supports_vision`.
 - **Eager tool-input streaming** — every Anthropic tool definition is marked
   `eager_input_streaming: true` when `ModelCaps::supports_eager_tool_streaming` is set (true for every
   current Anthropic id); `client.rs` only sends the mutually-exclusive
@@ -202,7 +234,14 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   a tool's `write_target(input)` path acquires the registry's per-path async lock for the tool's whole
   serial run, so two `Agent`s built back-to-back (a `set_model` rebuild, or two sessions sharing one
   registry) can't race a same-path `edit`/`write` against each other. Layered on top of, not a
-  replacement for, the intra-turn write-target grouping described below. Documented limitation: this
+  replacement for, the intra-turn write-target grouping described below. `WriteLockRegistry`'s map entry
+  for a key is evicted (pi-parity fix) once its last holder releases it — the returned `WriteLockGuard`
+  checks, on drop, whether the map is the *only* remaining `Arc` reference for that key
+  (`Arc::strong_count == 1`) and removes the entry if so, race-free because the check-and-remove runs
+  while holding the same map lock every concurrent `lock()` call must also acquire to clone the `Arc`
+  (mirrors pi's `file-mutation-queue.ts`'s identity-checked `finally`-block delete). Before this fix the
+  map instead accumulated one entry per distinct path *ever* locked for the registry's whole lifetime,
+  unbounded for a long-running `serve` process. Documented limitation: this
   only serializes within one process — cross-process locking would need a filesystem advisory lock,
   out of scope until a real multi-process use case needs it.
 - **Explicit reasoning/thinking disable** — `ModelCaps::reasoning_disableable` (per exact model id, not
@@ -235,7 +274,15 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   cross-model — thinking block, e.g. from an aborted stream) follows the same empty-drops-instead-of-
   degrades rule: a block whose `thinking` text is also empty is dropped rather than downgraded to
   `{"type": "text", "text": ""}`, which Anthropic's non-empty-text requirement would just as readily
-  reject.
+  reject. `anthropic::build_body`'s own `normalize_cross_model_tool_ids` is the belt-and-suspenders
+  counterpart to the id-truncation above, applied at the point a request actually reaches the wire
+  rather than only at an explicit model-switch: any `tool_use.id`/paired `tool_result.tool_use_id` from
+  a message not stamped `model_id == req.model` gets every character outside `[a-zA-Z0-9_-]` replaced
+  with `_` and truncated to 64 chars — Anthropic's own id-shape requirement — covering a same-turn
+  multi-model fan-out, a hand-edited/externally-loaded session, or a non-Anthropic-native id shape
+  (OpenAI Responses' `"call_id|item_id"` combined form, or a non-standard OpenAI-compatible provider's
+  own 450+-char blobs) that reaches an Anthropic request some path other than `scrub_cross_model_state`
+  didn't already normalize. Matches pi's `normalizeToolCallId` (`anthropic-messages.ts:1006-1009`).
 - **Tool choice** — `ModelRequest::tool_choice` (`Auto`/`None`/`Required`/`Tool(name)`) maps to each
   dialect's vocabulary; unset emits nothing (provider default), so the common request shape is intact.
 - **Transport resilience** — `GatewayClient` retries transient failures (429/5xx/connection, honoring
@@ -319,9 +366,9 @@ Session.messages (Arc, shared) ──► ModelRequest ──► ModelTransport::
        │                                                       session.push(Message::assistant(blocks))
        │                                                              session.steps += 1; sink(TurnEnd)
        │                                                                                  │
-       │                                              stop_reason != ToolUse, or no tool_use blocks?
+       │                                                        any complete tool_use blocks present?
        │                                                              │                              │
-       │                                                             Yes                             No
+       │                                                             No                             Yes
        │                                                              │                              │
        │                                                          return Ok(())          sink(ToolStart) × N (call order)
        │                                                                                              │
@@ -341,6 +388,13 @@ Error exits (no session mutation for the failed turn):
 Recoverable (no error): a streamed tool call whose JSON args never parse keeps its `tool_use` block
 (with an empty `{}` input) and is fed back as an error `tool_result` the model can correct — the run
 continues rather than aborting.
+
+Dispatch gates on the presence of complete `tool_use` blocks alone (pi-parity fix) — never on
+`stop_reason`, which the diagram above no longer branches on. A `MaxTokens`-truncated turn that already
+emitted one or more complete tool calls before running out of room (the model calls two tools, then
+starts trailing commentary that gets cut off) used to be silently treated as "done, no tools to run"
+whenever `stop_reason != ToolUse`, dropping the calls the model actually made. See `agent.rs::tests::
+tool_call_dispatches_even_when_stop_reason_is_max_tokens`.
 ```
 
 ### Bytes to `StreamEvent` (`GatewayClient` + `dialect`)
@@ -517,9 +571,9 @@ in `benches/decode.rs` (framing is ~4× faster on coalesced chunks: ~2 allocatio
       ▼                                                                    │
 [pushed to session, steps+=1, TurnEnd sunk]                                │
       │                                                                    │
-      ├──stop_reason≠ToolUse OR no tool_use blocks──► Ok(()) [done]        │
+      ├──no complete tool_use blocks──► Ok(()) [done]                     │
       │                                                                    │
-      └──ToolUse + calls present──► [dispatch tools: grouped, bounded] ────┘
+      └──complete tool_use blocks present──► [dispatch tools: grouped, bounded] ┘
             ToolStart×N → group by write_target → buffer_unordered(≤8) → ToolEnd×N + tool_results pushed
 ```
 
@@ -531,8 +585,8 @@ in `benches/decode.rs` (framing is ~4× faster on coalesced chunks: ~2 allocatio
 | request built     | stream exhausts                               | turn assembled        | always                                                                               | `Accumulator::finish()` returns `Turn`; malformed tool args become recoverable error `tool_result`s                                                                              |
 | any await point   | `cancel` tripped                              | Err(Cancelled)        | client abort                                                                         | Stream/tool futures dropped (HTTP + subprocess killed); no `Error` event (not a fault). If nothing had streamed yet (pre-connect, or the top-of-loop check), the pending `user` turn is still closed out with an aborted assistant record — not left dangling — so a later prompt can't stack a second consecutive `user` message |
 | turn assembled    | —                                             | turn pushed           | —                                                                                    | `session.push(assistant)`, `record_usage`, `steps += 1`, `TurnEnd` sunk                                                                                                          |
-| turn pushed       | no tool_use blocks / `stop_reason != ToolUse` | done (`Ok`)           | —                                                                                    | Returns to caller; session ends on the assistant turn                                                                                                                            |
-| turn pushed       | `tool_use` blocks present, `ToolUse`          | dispatching tools     | —                                                                                    | `ToolStart` sunk per call, in call order; the `tool_use` turn is checkpointed here too — *before* any tool runs — so a crash mid-dispatch never loses the record of which calls the model asked for |
+| turn pushed       | no complete `tool_use` blocks                | done (`Ok`)           | `calls.is_empty()` — `stop_reason` is not consulted (pi-parity fix; see the turn-loop diagram above)  | Returns to caller; session ends on the assistant turn                                                                                                                            |
+| turn pushed       | complete `tool_use` blocks present            | dispatching tools     | `!calls.is_empty()`, regardless of `stop_reason` — e.g. still dispatches under `MaxTokens` if the calls themselves finished | `ToolStart` sunk per call, in call order; the `tool_use` turn is checkpointed here too — *before* any tool runs — so a crash mid-dispatch never loses the record of which calls the model asked for |
 | dispatching tools | all groups resolve (`buffer_unordered`)       | (loop top, next iter) | —                                                                                    | `ToolEnd` sunk + one `tool_results` user message pushed, in call order (carrying any tool images + mid-run steer text); checkpointed again here; ends the run early instead if every call set `terminate` |
 
 ### Per-block accumulation (`Accumulator`)
@@ -715,15 +769,16 @@ both fields `None` and never reads them.
 | `models.rs`                   | `capabilities(model) -> ModelCaps`: minimal per-model wire table (max-tokens field, long-cache, vision, thinking shape, reasoning-effort, context window), matched by id prefix; consumed by the dialects and `Agent::new`                                                                                                                                                                 |
 | `hooks.rs`                    | `AgentHooks` interception trait (`before_tool_call`/`after_tool_call`/`should_stop_after_turn`/`on_assistant_message`, all cancellation-aware) + `NoHooks` default                                                                                                                                                                                                                                                                        |
 | `steering.rs`                 | `Steering` — two shared queues of `SteeringMessage` (text + optional images): `push_steer` (mid-run, folded onto the tool-results turn) and `push`/follow-up (injected at would-stop boundaries), each with its own independent `QueueMode` (`set_steering_mode`/`set_follow_up_mode`); `pending_count` peeks the combined depth of both lanes without draining; plus `request_stop`/`take_stop_requested`, a graceful-stop flag checked at turn boundaries; `clear()` drops both lanes and the stop flag without returning them, for a caller about to swap in a different session's conversation     |
-| `write_lock.rs`               | `WriteLockRegistry` — a process-scoped, path-keyed async-mutex map (`Agent::with_write_locks`) extending same-path write exclusivity across `Agent` rebuilds (a `set_model`/`set_thinking` rebuild, or multiple sessions sharing one registry), layered on top of the per-turn write-target grouping below                                                                                |
+| `write_lock.rs`               | `WriteLockRegistry` — a process-scoped, path-keyed async-mutex map (`Agent::with_write_locks`) extending same-path write exclusivity across `Agent` rebuilds (a `set_model`/`set_thinking` rebuild, or multiple sessions sharing one registry), layered on top of the per-turn write-target grouping below; `WriteLockGuard`'s `Drop` evicts a key's entry once its refcount shows no other holder/waiter left (see the `Cross-run file-mutation exclusivity` capability above) so the map stays bounded to currently-contended paths, not every path ever locked |
 | `tool.rs`                     | `Tool` trait (`run -> ToolOutput`, optional streaming `run_streaming` + `ToolProgress` sink) + `ToolOutput { text, images, terminate }` + `ToolRegistry` (name-keyed `Arc<dyn Tool>` map, last-registration-wins, name-sorted `definitions`)                                                                                                                                               |
+| `validation.rs`               | `coerce_tool_arguments(schema, input)` — best-effort JSON-Schema-shaped type coercion (numeric string → number, `"true"`/`"false"` → bool, etc., never lossy int/float or non-canonical bool text) run on every dispatched call's args before `Tool::run`/`run_streaming` sees them (`agent.rs`'s dispatch, `.unwrap_or_else(\|_\| input.clone())` on failure — a tool that can't be coerced still reaches the tool's own, clearer validation error rather than a new failure path here); recurses into `properties`, schema-typed `additionalProperties` (a bare `true`/`false` is not a schema and is left alone), array `items` (both the tuple-per-index form and the single-schema-for-every-element form), and `allOf`/`anyOf`/`oneOf` composition (best-effort — a member that fails to coerce is skipped/falls back to the value untouched, never fails the surrounding call, unlike every other coercion path here, which is all-or-nothing per AJV's own `coerceTypes` — matches pi's `coerceWithJsonSchema`/`coerceWithUnionSchema`) |
 | `transport.rs`                | `ModelRequest` (system/tools/thinking/`reasoning_effort`/`tool_choice`/cache_key/cache_long/`user_id` — Anthropic's `metadata.user_id` abuse-detection hint, unset by default), `ReasoningEffort` + `ToolChoice` enums, `ModelTransport` trait, `EventStream` alias                                                                                                                                                                                                          |
-| `client.rs`                   | `GatewayClient`: production `ModelTransport`; retry-with-backoff (`Retry-After` delta-seconds _or_ HTTP-date), chunked-SSE byte framing into whole UTF-8 lines; sends both `session_id: <cache_key>` and `x-client-request-id: <cache_key>` for the OpenAI Responses dialect only, when a `cache_key` is set — connection-level session-affinity routing, distinct from `prompt_cache_key`'s cache-node affinity in the body, matching pi's `openai-responses.ts` (which sends both headers, not just one)                                                                                                                                                                                                                            |
-| `dialect/mod.rs`              | `Dialect` enum (model-id → wire selection), `StreamDecoder` trait, SSE line-splitting (`push_sse_line`/`decode_sse`), `clamp_max_tokens_to_context` (shared by all three dialects)                                                                                                                                                                                                        |
-| `dialect/anthropic.rs`        | `/v1/messages` body builder (three prompt-cache breakpoints, capability-gated 1h TTL, per-model thinking shape, `tool_choice`, tool-result image rewrite) + decoder (text/thinking/tool/cache-usage, reasoning-token breakout, `pause_turn`/refusal-explanation, in-band error + truncation detection)                                                                                     |
+| `client.rs`                   | `GatewayClient`: production `ModelTransport`; retry-with-backoff (`Retry-After` delta-seconds _or_ HTTP-date), chunked-SSE byte framing into whole UTF-8 lines; sends both `session_id: <cache_key>` and `x-client-request-id: <cache_key>` for the OpenAI Responses dialect only, when a `cache_key` is set — connection-level session-affinity routing, distinct from `prompt_cache_key`'s cache-node affinity in the body, matching pi's `openai-responses.ts` (which sends both headers, not just one); `needs_interleaved_thinking_beta(model)` gates the `interleaved-thinking-2025-05-14` beta header on the model's own thinking *shape* alone (any non-`Adaptive` model, `Adaptive` skipped since it interleaves by default) — pi-parity fix: previously also required *this turn's own* `req.thinking.is_some()`, so a request with thinking off mid-session dropped the header even though a `Budget`-shape model always benefits from it being present, matching pi's own default-on `interleavedThinking ?? true` gate                                                                                                                                                                                                                            |
+| `dialect/mod.rs`              | `Dialect` enum (model-id → wire selection), `StreamDecoder` trait, SSE line-splitting (`push_sse_line`/`decode_sse`), `clamp_max_tokens_to_context` (shared by all three dialects), `ensure_non_empty_content` — pads a message's outbound copy (never the persisted session record) to a placeholder text block when it's whitespace-only/empty, *or* (pi-parity fix) when the whole message is a `Message::aborted`/`with_error` assistant turn: replaying a dangling `Thinking` block or other partial content from a cancelled/errored turn is exactly Anthropic/OpenAI's own "reasoning with nothing following it"/incomplete-turn rejection, and once one turn hits it every later turn resends the identical dangling block and fails identically — matches pi's `transform-messages.ts:186-194`, which skips such a message outright when building the next request                                                                                                                        |
+| `dialect/anthropic.rs`        | `/v1/messages` body builder (three prompt-cache breakpoints, capability-gated 1h TTL, per-model thinking shape, `tool_choice`, tool-result image rewrite, `normalize_cross_model_tool_ids` — disallowed-character/length normalization of a foreign-model tool-call id at the point a request reaches the wire) + decoder (text/thinking/tool/cache-usage, reasoning-token breakout, `pause_turn`/refusal-explanation, in-band error + truncation detection)                                                                                     |
 | `dialect/openai.rs`           | `/v1/chat/completions` body builder + decoder — real translation: flattened messages, string-encoded tool args, `image_url` data-URIs (user + fanned-out tool-result images), `max_completion_tokens` vs `max_tokens`, `reasoning_effort`, `tool_choice`, synthesized block-stop events                                                                                                    |
 | `dialect/openai_responses.rs` | `/v1/responses` body builder (flat `input` array of typed items, flat tool defs, `max_output_tokens`, `reasoning.effort` + `reasoning.summary` (`ModelRequest::reasoning_summary`, defaults to `ReasoningSummary::Auto`) + `include:["reasoning.encrypted_content"]`, `service_tier` (`ModelRequest::service_tier`, omitted unless set — a queueing/latency class, not just pricing), `store:false`) + decoder — genuine item-boundary events (`output_item.added`/`.done`), not implicit index-keyed deltas; every event carries its own true `output_index` and is emitted immediately, live, in real arrival order — no buffering, no "focus" item — since `Accumulator` natively tracks as many concurrently-open indices as the wire actually has (genuinely interleaved items, e.g. concurrent tool calls, stream live rather than one being buffered and replayed as a burst once the other closes); `function_call_arguments.done`/`output_item.done`'s own `arguments`/`content` resync (replace, not append) whatever the streamed deltas produced, so a single dropped/duplicated delta can't silently corrupt the final block; a `message`-type item's `id`/`phase` are captured off that same `output_item.done` and restamped verbatim on replay (`push_assistant_content`/`fallback_message_id`) |
-| `branch_summary.rs`           | `branch_summary_request`: the (network-free) prompt builder for summarizing an abandoned tree branch on navigation — reuses `compaction`'s `render_prefix`/`SUMMARY_SYSTEM`/`extract_file_ops` unchanged, framed by its own instruction (no incremental-update path; a branch is summarized once); `windowed_by_budget` trims the rendered tail to fit the summarization call's own context, privileging a nested compaction/branch-summary entry (a dense recap, not raw conversation) past the ordinary cutoff as long as the accumulated tail is still under 90% of budget, matching pi's `prepareBranchEntries` |
+| `branch_summary.rs`           | `branch_summary_request`: the (network-free) prompt builder for summarizing an abandoned tree branch on navigation — reuses `compaction`'s `SUMMARY_SYSTEM`/`extract_file_ops` unchanged and its `render_prefix` in spirit but not verbatim (`render_prefix_without_tool_results` drops tool-result content entirely rather than truncating it, matching pi's `getMessageFromEntry` returning `undefined` for a tool-result-role entry — a branch summary is read once on return, not carried forward as live context, so terseness matters more than detail here), rendered transcript wrapped in `<conversation>` tags (matching pi's `generateBranchSummary` and this crate's own compaction summary-request path), framed by its own instruction (no incremental-update path; a branch is summarized once), fixed `BRANCH_SUMMARY_MAX_TOKENS` (2048) output budget — matching pi's own hardcoded `generateBranchSummary` constant, deliberately independent of `CompactionConfig::summary_max_tokens`'s `reserve_tokens`-scaled budget, since a branch recap has no incremental-update path to size for; `windowed_by_budget` trims the rendered tail to fit the summarization call's own context, privileging a nested compaction/branch-summary entry (a dense recap, not raw conversation) past the ordinary cutoff as long as the accumulated tail is still under 90% of budget, matching pi's `prepareBranchEntries` |
 | `session.rs`                  | `Session`: Arc-shared copy-on-write message history + step/token counters + `last_usage_message_count`, serde round-trippable; `scrub_cross_model_state(new_model)` downgrades a non-empty signed `Thinking` block to `Text` (drops it only if empty), drops `RedactedThinking`, and truncates a combined tool-call id — all from any message not stamped with `new_model`                                                                                                                |
 | `error.rs`                    | `Error` (loop/transport, aborts the run) and `ToolError` (tool failure, becomes an error `tool_result`)                                                                                                                                                                                                                                                                                    |
 | `mock.rs`                     | `MockTransport` + `turn::{text, tool_call}` builders — scripted, no-network loop testing                                                                                                                                                                                                                                                                                                   |

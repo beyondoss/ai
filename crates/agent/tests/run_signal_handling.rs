@@ -39,6 +39,7 @@ fn run_and_signal(
             "claude-test",
             "--max-steps",
             "4",
+            "--no-session-persistence",
         ])
         .current_dir(dir)
         .stdin(Stdio::null())
@@ -105,7 +106,11 @@ fn sigterm_during_a_bash_tool_call_kills_the_whole_process_group_not_just_run_it
         stderr.contains("[cancelled]"),
         "expected a clean `[cancelled]` message, got stderr:\n{stderr}"
     );
-    assert_eq!(status.code(), Some(1), "got stderr:\n{stderr}");
+    // Task #41 (pi-parity fix): the exit code now names *which* signal actually caused the
+    // cancellation (POSIX `128 + signal`, matching pi's own `rpc-mode.ts`/`print-mode.ts` — 143 for
+    // SIGTERM) rather than the same undifferentiated `1` every shutdown-signal cancellation used to
+    // get regardless of cause.
+    assert_eq!(status.code(), Some(143), "got stderr:\n{stderr}");
 
     // Wait past when the backgrounded sleeper would have written the marker (started at ~0s, fires
     // at ~1s) — it must not exist: the whole process group, not just the direct bash child, must
@@ -130,7 +135,10 @@ fn sigint_during_a_bash_tool_call_kills_the_whole_process_group_too() {
         stderr.contains("[cancelled]"),
         "expected a clean `[cancelled]` message, got stderr:\n{stderr}"
     );
-    assert_eq!(status.code(), Some(1), "got stderr:\n{stderr}");
+    // Task #41 (pi-parity fix): `130` (POSIX `128 + 2`) — this crate's own extension of pi's
+    // 143/129 SIGTERM/SIGHUP convention to Ctrl-C, since `ShutdownSignal` already treats it as an
+    // equal graceful-shutdown trigger.
+    assert_eq!(status.code(), Some(130), "got stderr:\n{stderr}");
 
     std::thread::sleep(Duration::from_millis(1500));
     assert!(
@@ -155,7 +163,9 @@ fn sighup_during_a_bash_tool_call_kills_the_whole_process_group_too() {
         stderr.contains("[cancelled]"),
         "expected a clean `[cancelled]` message, got stderr:\n{stderr}"
     );
-    assert_eq!(status.code(), Some(1), "got stderr:\n{stderr}");
+    // Task #41 (pi-parity fix): `129` (POSIX `128 + 1`), matching pi's own `rpc-mode.ts`/
+    // `print-mode.ts` SIGHUP code exactly.
+    assert_eq!(status.code(), Some(129), "got stderr:\n{stderr}");
 
     std::thread::sleep(Duration::from_millis(1500));
     assert!(

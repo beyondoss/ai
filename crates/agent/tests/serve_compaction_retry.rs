@@ -201,6 +201,8 @@ fn serve_compact_forwards_custom_instructions_to_the_summarization_call() {
     assert_eq!(frames.last().unwrap()["success"], true, "{frames:#?}");
     let data = &frames.last().unwrap()["data"];
     assert_eq!(data["compacted"], true, "{frames:#?}");
+    // Task #26: `reason` is only populated for a no-op — `null` on a real compaction.
+    assert!(data["reason"].is_null(), "{frames:#?}");
     // Pi-parity fix: the response previously carried only `compacted: bool` — pi's own `compact`
     // returns the generated summary text and a post-compaction token estimate too.
     let summary = data["summary"]
@@ -228,6 +230,91 @@ fn serve_compact_forwards_custom_instructions_to_the_summarization_call() {
             .iter()
             .any(|b| b.contains("Additional focus: keep every detail about the auth refactor")),
         "the custom instructions must reach the summarization call: {recorded:#?}"
+    );
+}
+
+#[test]
+fn serve_compact_reports_too_small_reason_for_a_session_with_nothing_to_compact() {
+    // Task #26 (pi-parity fix): a manual `compact` on a session with no worthwhile cut point at all
+    // must report `reason: "too_small"` — pi's own "Nothing to compact (session too small)" — not the
+    // same undifferentiated `compacted: false` an "already compacted" no-op also used to produce.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    // No turns scripted at all: a real compaction would make a model call the mock has nothing queued
+    // for, failing the test loudly rather than silently passing.
+    let (base, _bodies) = spawn_model_server(vec![]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    // No `prompt` at all yet — the session is empty, well under `find_split_cut`'s minimum.
+    writeln!(stdin, "{}", json!({ "type": "compact" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "compact");
+    let data = &frames.last().unwrap()["data"];
+    assert_eq!(data["compacted"], false, "{frames:#?}");
+    assert_eq!(data["reason"], "too_small", "{frames:#?}");
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_compact_reports_already_compacted_reason_when_nothing_new_followed_the_prior_summary() {
+    // Task #26 (pi-parity fix): a manual `compact` on a session that already has a compaction summary
+    // at its head, with nothing new since that still exceeds the recent-token budget, must report
+    // `reason: "already_compacted"` — pi's own "Already compacted" — distinct from the "too_small" case
+    // above. Seeded directly (mirrors `agent_core::agent::tests::
+    // compact_is_a_no_op_on_a_clean_boundary_when_nothing_new_followed_the_prior_summary`'s exact
+    // fixture shape) rather than driven through a real first `compact` call: forcing a *real* first
+    // compaction on a small test conversation needs an artificially tiny
+    // `--compaction-keep-recent-tokens`, which then makes the post-compaction residual too small for
+    // `find_split_cut` to find a second cut point at all (landing on "too_small" instead) — the two
+    // conditions are easiest to hit independently, not chained through one process.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = {
+        use agent_core::compaction::SUMMARY_MARKER;
+        use agent_core::{ContentBlock, Message, Session};
+        use beyond_ai_agent::session_store::{SessionMeta, SessionRepo};
+
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "claude-test")).unwrap();
+        let mut seed = Session::new();
+        seed.push(Message::user(format!(
+            "{SUMMARY_MARKER}\n\nprior summary body"
+        )));
+        seed.user("second question");
+        seed.push(Message::assistant(vec![ContentBlock::text("second reply")]));
+        seed.user("third question");
+        seed.push(Message::assistant(vec![ContentBlock::text("third reply")]));
+        store.append_new(&seed.messages).unwrap();
+        store.path().to_string_lossy().into_owned()
+    };
+
+    // No turns scripted at all: this must be an early-return no-op with zero model calls, not a real
+    // compaction attempt — a network call here would fail the test loudly rather than silently pass.
+    let (base, bodies) = spawn_model_server(vec![]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "compact" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "compact");
+    let data = &frames.last().unwrap()["data"];
+    assert_eq!(data["compacted"], false, "{frames:#?}");
+    assert_eq!(data["reason"], "already_compacted", "{frames:#?}");
+
+    drop(stdin);
+    child.wait().unwrap();
+    assert_eq!(
+        bodies.lock().unwrap().len(),
+        0,
+        "an already-compacted no-op must make zero model calls"
     );
 }
 
@@ -532,7 +619,7 @@ fn serve_auto_retries_a_whole_run_after_mid_stream_retry_is_exhausted() {
 
     let auto_retry_frames: Vec<&Value> = frames
         .iter()
-        .filter(|f| f.get("type").and_then(Value::as_str) == Some("auto_retry"))
+        .filter(|f| f.get("type").and_then(Value::as_str) == Some("auto_retry_start"))
         .collect();
     assert_eq!(
         auto_retry_frames.len(),
@@ -679,7 +766,7 @@ fn serve_whole_run_retry_succeeds_on_its_second_attempt_not_its_first() {
 
     let auto_retry_frames: Vec<&Value> = frames
         .iter()
-        .filter(|f| f.get("type").and_then(Value::as_str) == Some("auto_retry"))
+        .filter(|f| f.get("type").and_then(Value::as_str) == Some("auto_retry_start"))
         .collect();
     assert_eq!(
         auto_retry_frames.len(),
@@ -756,7 +843,7 @@ fn serve_abort_retry_interrupts_a_pending_whole_run_retry_backoff() {
             continue;
         }
         let v: Value = serde_json::from_str(trimmed).unwrap();
-        if v.get("type").and_then(Value::as_str) == Some("auto_retry") {
+        if v.get("type").and_then(Value::as_str) == Some("auto_retry_start") {
             break;
         }
     }
@@ -841,7 +928,7 @@ fn serve_auto_retry_exhausts_all_attempts_and_reports_failure() {
 
     let auto_retry_frames: Vec<&Value> = frames
         .iter()
-        .filter(|f| f.get("type").and_then(Value::as_str) == Some("auto_retry"))
+        .filter(|f| f.get("type").and_then(Value::as_str) == Some("auto_retry_start"))
         .collect();
     assert_eq!(
         auto_retry_frames.len(),

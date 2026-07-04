@@ -2011,6 +2011,104 @@ fn serve_get_fork_messages_lists_user_turn_candidates_for_the_active_path() {
 }
 
 #[test]
+fn serve_get_fork_messages_spans_every_branch_not_just_the_active_path() {
+    // Task #25 (pi-parity fix): `get_fork_messages` used to build its candidate list from
+    // `persistence.active_ids()` only — once a branch was navigated away from, its own user messages
+    // silently stopped being fork candidates at all. pi's own `getUserMessagesForForking` walks
+    // `SessionManager::getEntries()` — every entry ever appended, spanning the whole tree — so a message
+    // on an abandoned branch must still show up here.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![
+        turn_text("first answer"),
+        turn_text("second answer"),
+        turn_text("forked reply"),
+    ]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "first" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "second" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_messages");
+    let messages = frames.last().unwrap()["data"]["messages"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let first_reply_id = messages[1]["id"].as_str().unwrap().to_string();
+
+    // Rewind to right after the first turn, then send a new prompt — this abandons the "second" turn's
+    // own branch (still on disk, just off the new active path) and starts a sibling branch in its place.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "switch_branch", "target_id": first_reply_id, "summarize": false })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    assert_eq!(
+        read_until_response(&mut stdout, "switch_branch")
+            .last()
+            .unwrap()["success"],
+        true
+    );
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "continue from here" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    writeln!(stdin, "{}", json!({ "type": "get_fork_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_fork_messages");
+    let response = frames.last().unwrap();
+    assert_eq!(response["success"], true, "got: {response:#?}");
+    let candidates = response["data"]["messages"].as_array().unwrap();
+    let texts: Vec<&str> = candidates
+        .iter()
+        .map(|c| c["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        texts.len(),
+        3,
+        "expected one candidate per user turn across both branches: {texts:?}"
+    );
+    assert!(
+        texts.contains(&"first"),
+        "shared prefix message missing: {texts:?}"
+    );
+    assert!(
+        texts.contains(&"second"),
+        "the abandoned branch's own user message must still be a fork candidate: {texts:?}"
+    );
+    assert!(
+        texts.contains(&"continue from here"),
+        "the new active branch's own message must also be a candidate: {texts:?}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
 fn serve_get_fork_messages_is_empty_without_persistence_configured() {
     // In pure in-memory mode there are no stable entry ids to hand back for a later `fork` `target_id`
     // — `get_fork_messages` must degrade to an empty (still successful) list, matching `get_messages`'s

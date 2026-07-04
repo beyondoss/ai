@@ -419,6 +419,76 @@ fn serve_get_commands_reports_a_cross_root_skill_collision() {
 }
 
 #[test]
+fn serve_get_commands_reports_scope_and_path_per_entry() {
+    // Task #39 (pi-parity fix): `get_commands` used to report only `{name, source, description}` per
+    // entry — pi's own real headless RPC protocol also carries `sourceInfo.scope`/`sourceInfo.path`, so
+    // a client can tell a user-global skill apart from a project-local one (and where either actually
+    // lives on disk), not just its name.
+    let home = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+
+    let user_skill_dir = home.path().join(".claude/skills/mine");
+    std::fs::create_dir_all(&user_skill_dir).unwrap();
+    std::fs::write(
+        user_skill_dir.join("SKILL.md"),
+        "---\nname: mine\ndescription: a user-global skill\n---\nBody.",
+    )
+    .unwrap();
+    let project_skill_dir = dir.path().join(".claude/skills/theirs");
+    std::fs::create_dir_all(&project_skill_dir).unwrap();
+    std::fs::write(
+        project_skill_dir.join("SKILL.md"),
+        "---\nname: theirs\ndescription: a project-local skill\n---\nBody.",
+    )
+    .unwrap();
+
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let (base, _bodies) = spawn_model_server(vec![]);
+    let mut cmd = serve_cmd(bin, &base, &session_file);
+    cmd.arg("--trust-project")
+        .current_dir(dir.path())
+        .env("HOME", home.path());
+    let mut child = cmd.spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "get_commands" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_commands");
+    let commands = frames.last().unwrap()["data"]["commands"]
+        .as_array()
+        .unwrap();
+
+    let mine = commands
+        .iter()
+        .find(|c| c["name"] == "skill:mine")
+        .unwrap_or_else(|| panic!("expected the user-global skill: {commands:#?}"));
+    assert_eq!(mine["scope"], "user", "{mine:#?}");
+    assert!(
+        mine["path"]
+            .as_str()
+            .is_some_and(|p| p.contains(&home.path().to_string_lossy().to_string())),
+        "the user skill's path must point under HOME: {mine:#?}"
+    );
+
+    let theirs = commands
+        .iter()
+        .find(|c| c["name"] == "skill:theirs")
+        .unwrap_or_else(|| panic!("expected the project-local skill: {commands:#?}"));
+    assert_eq!(theirs["scope"], "project", "{theirs:#?}");
+    assert!(
+        theirs["path"]
+            .as_str()
+            .is_some_and(|p| p.contains(&dir.path().to_string_lossy().to_string())),
+        "the project skill's path must point under the project dir: {theirs:#?}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
 fn serve_get_commands_reports_the_prompt_templates_own_description_not_its_argument_hint() {
     // A prompt template's `get_commands` entry must surface its `description:` frontmatter, not the
     // separate `argument-hint:` field — the two are deliberately distinct (a hint like "<file>" isn't

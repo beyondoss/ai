@@ -36,6 +36,7 @@ fn run_binary_expands_a_skill_invocation_in_the_first_message() {
             "--model",
             "claude-test",
             "--trust-project",
+            "--no-session-persistence",
         ])
         .current_dir(dir.path())
         .stdin(Stdio::null())
@@ -89,6 +90,7 @@ fn run_binary_force_untrusted_overrides_trust_project() {
             "claude-test",
             "--trust-project",
             "--force-untrusted",
+            "--no-session-persistence",
         ])
         .current_dir(dir.path())
         .stdin(Stdio::null())
@@ -133,6 +135,7 @@ fn run_binary_expands_a_prompt_template_in_the_first_message() {
             "--model",
             "claude-test",
             "--trust-project",
+            "--no-session-persistence",
         ])
         .current_dir(dir.path())
         .stdin(Stdio::null())
@@ -186,6 +189,7 @@ fn run_binary_no_skills_leaves_a_skill_invocation_unexpanded() {
             "claude-test",
             "--trust-project",
             "--no-skills",
+            "--no-session-persistence",
         ])
         .current_dir(dir.path())
         .stdin(Stdio::null())
@@ -243,6 +247,7 @@ fn run_binary_no_skills_still_honors_an_explicit_skill_path() {
             "--no-skills",
             "--skill",
             dir.path().join("shared-skills").to_str().unwrap(),
+            "--no-session-persistence",
         ])
         .current_dir(dir.path())
         .stdin(Stdio::null())
@@ -284,6 +289,7 @@ fn run_binary_no_context_files_skips_project_instructions() {
             "--model",
             "claude-test",
             "--no-context-files",
+            "--no-session-persistence",
         ])
         .current_dir(dir.path())
         .stdin(Stdio::null())
@@ -324,6 +330,7 @@ fn run_binary_injects_project_instructions_by_default() {
             "bai_v1.test",
             "--model",
             "claude-test",
+            "--no-session-persistence",
         ])
         .current_dir(dir.path())
         .stdin(Stdio::null())
@@ -372,6 +379,7 @@ fn run_binary_no_prompt_templates_leaves_a_template_invocation_unexpanded() {
             "claude-test",
             "--trust-project",
             "--no-prompt-templates",
+            "--no-session-persistence",
         ])
         .current_dir(dir.path())
         .stdin(Stdio::null())
@@ -426,6 +434,7 @@ fn run_binary_discovers_skills_from_an_ad_hoc_skill_path() {
             "claude-test",
             "--skill",
             dir.path().join("shared-skills").to_str().unwrap(),
+            "--no-session-persistence",
         ])
         .current_dir(dir.path())
         .stdin(Stdio::null())
@@ -442,6 +451,57 @@ fn run_binary_discovers_skills_from_an_ad_hoc_skill_path() {
     assert!(
         bodies[0].contains("AD-HOC-SKILL-MARKER-456"),
         "the ad-hoc skill's body must be expanded into the first message: {}",
+        bodies[0]
+    );
+}
+
+#[test]
+fn run_binary_ai_agent_skill_path_env_var_is_a_comma_separated_fallback_for_skill() {
+    // Task #40 (pi-parity fix): `--skill`/`--prompt-template` had no env-var fallback at all, unlike
+    // most other flags here — `AI_AGENT_SKILL_PATH` (comma-separated, matching `--tools`/
+    // `AI_AGENT_TOOLS`'s own convention) must work exactly like a repeated `--skill <path>`.
+    let dir = tempfile::tempdir().unwrap();
+    let extra_skill_dir = dir.path().join("shared-skills/greet");
+    std::fs::create_dir_all(&extra_skill_dir).unwrap();
+    std::fs::write(
+        extra_skill_dir.join("SKILL.md"),
+        "---\nname: greet\ndescription: an ad-hoc skill\n---\nENV-VAR-SKILL-MARKER-789",
+    )
+    .unwrap();
+    let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .env(
+            "AI_AGENT_SKILL_PATH",
+            dir.path().join("shared-skills").to_str().unwrap(),
+        )
+        .args([
+            "run",
+            "/skill:greet",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--no-session-persistence",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[0].contains("ENV-VAR-SKILL-MARKER-789"),
+        "AI_AGENT_SKILL_PATH must be honored exactly like --skill: {}",
         bodies[0]
     );
 }
@@ -464,6 +524,7 @@ fn run_binary_prompt_guideline_flag_reaches_the_system_prompt() {
             "claude-test",
             "--prompt-guideline",
             "Always run tests before finishing.",
+            "--no-session-persistence",
         ])
         .current_dir(dir.path())
         .stdin(Stdio::null())
@@ -505,6 +566,7 @@ fn run_binary_system_prompt_flag_replaces_the_base_prompt() {
             "claude-test",
             "--system-prompt",
             "CUSTOM-PERSONA-MARKER: you are a terse code reviewer.",
+            "--no-session-persistence",
         ])
         .current_dir(dir.path())
         .stdin(Stdio::null())
@@ -550,6 +612,7 @@ fn run_binary_append_system_prompt_flag_appends_after_the_base_prompt() {
             "claude-test",
             "--append-system-prompt",
             "APPENDED-INSTRUCTION-MARKER: always cite line numbers.",
+            "--no-session-persistence",
         ])
         .current_dir(dir.path())
         .stdin(Stdio::null())
@@ -600,6 +663,7 @@ fn run_binary_explicit_system_prompt_wins_over_a_trusted_projects_system_md() {
             "--trust-project",
             "--system-prompt",
             "EXPLICIT-FLAG-MARKER",
+            "--no-session-persistence",
         ])
         .current_dir(dir.path())
         .stdin(Stdio::null())
@@ -649,6 +713,7 @@ fn run_binary_system_prompt_flag_reads_an_existing_file_as_its_contents() {
             "claude-test",
             "--system-prompt",
             persona_path.to_str().unwrap(),
+            "--no-session-persistence",
         ])
         .current_dir(dir.path())
         .stdin(Stdio::null())
@@ -697,6 +762,7 @@ fn run_binary_append_system_prompt_flag_accumulates_across_repeated_occurrences(
             "FIRST-APPEND-MARKER",
             "--append-system-prompt",
             "SECOND-APPEND-MARKER",
+            "--no-session-persistence",
         ])
         .current_dir(dir.path())
         .stdin(Stdio::null())
@@ -739,7 +805,15 @@ fn run_binary_warns_on_stderr_when_an_untrusted_projects_gated_resources_are_ski
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let output = run_cmd(bin)
         .args([
-            "run", "hi", "--gateway-url", &base, "--key", "bai_v1.test", "--model", "claude-test",
+            "run",
+            "hi",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--no-session-persistence",
         ])
         .current_dir(dir.path())
         .stdin(Stdio::null())
