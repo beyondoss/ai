@@ -141,9 +141,11 @@ pub async fn login(
         OAuthProviderId::Anthropic => {
             anthropic::login(callbacks, cancel).await.map(OAuthCredential::Anthropic)
         }
-        OAuthProviderId::GithubCopilot => github_copilot::login(callbacks, cancel, &[])
-            .await
-            .map(OAuthCredential::GithubCopilot),
+        OAuthProviderId::GithubCopilot => {
+            github_copilot::login(callbacks, cancel, github_copilot::KNOWN_MODEL_IDS)
+                .await
+                .map(OAuthCredential::GithubCopilot)
+        }
         OAuthProviderId::OpenaiCodex => openai_codex::login(callbacks, cancel, "beyond-ai-agent")
             .await
             .map(OAuthCredential::OpenaiCodex),

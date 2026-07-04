@@ -17,7 +17,10 @@
 //!     Sent while another `prompt` is already in flight, it's rejected as busy *unless*
 //!     `streaming_behavior` is `"steer"` or `"follow_up"`, in which case `message` is queued through
 //!     the same `Steering` lane an explicit `steer`/`follow_up` command would use.
-//!   - `{type:"abort"}`                  cancel the in-flight `prompt` (if any), else a no-op ack
+//!   - `{type:"abort"}`                  cancel the in-flight `prompt` (if any), else a no-op ack —
+//!     the ack for a *mid-run* abort isn't sent until the cancelled run has actually gone idle (matches
+//!     pi's own `agent-session.ts` awaiting `waitForIdle()` first), so a client that treats the ack as
+//!     "safe to send the next command" doesn't get rejected as busy in the gap
 //!   - `{type:"abort_retry"}`            interrupt a pending whole-run auto-retry backoff (see below),
 //!     surfacing the real underlying error that triggered it rather than waiting the delay out; a
 //!     no-op ack when no retry is pending (a run is actively streaming, or none is in flight at all)
@@ -33,11 +36,13 @@
 //!     thinking_level, auto_compaction, auto_retry, steering_mode, follow_up_mode, pending_messages, …}`
 //!     — the last six are the runtime-mutable settings and current steer/follow-up queue depth
 //!     (`Steering::pending_count`), so a client can render current settings without a second round trip
-//!   - `{type:"get_messages", since?}`   → `data: {messages: [...]}` (each tagged with its tree `id`
-//!     when persistence is configured, so a client can fork from any point via `switch_branch`);
-//!     `since` (a tree id the client already has) returns only the messages appended after it — pi's
-//!     own `get_entries({since})` — an error, not a silent full re-fetch, when `since` names no known
-//!     id (or persistence isn't configured, so nothing is tagged at all)
+//!   - `{type:"get_messages", since?}`   → `data: {messages: [...], leaf_id}` (each message tagged with
+//!     its tree `id` when persistence is configured, so a client can fork from any point via
+//!     `switch_branch`; `leaf_id` is the same active-tip id `get_tree`'s own response carries — pi's own
+//!     `get_entries({since})` returns `{entries, leafId}` in one round trip too, so a client doesn't need
+//!     a second `get_tree` call just to learn the current tip); `since` (a tree id the client already
+//!     has) returns only the messages appended after it — an error, not a silent full re-fetch, when
+//!     `since` names no known id (or persistence isn't configured, so nothing is tagged at all)
 //!   - `{type:"new_session", parent_session?}` start a fresh session → `data: {session_id, parent}`
 //!     (repo mode: `parent` is `parent_session` when given, else whatever session id was active
 //!     immediately before this call — pi's own `parentSession` lineage marker, provenance only, not a
@@ -58,6 +63,12 @@
 //!   - `{type:"switch_session", session_id}` (repo mode) load another session
 //!   - `{type:"delete_session", session_id}` (repo mode) soft-delete another session (moved to
 //!     `.trash`, not the currently active one — see `Persistence::delete`'s doc comment); idempotent
+//!   - `{type:"list_trash"}` (repo mode) → `data: {trash: [{id, deleted_at, original_path}...]}` every
+//!     session sitting in `.trash/`, most-recently-deleted first — see `session_store::TrashEntry`
+//!   - `{type:"restore_session", session_id}` (repo mode) move a trashed session back to its original
+//!     location; fails clearly (not a silent overwrite) if something already occupies that path, and
+//!     reports failure (not idempotent success, unlike `delete_session`) when `session_id` isn't in
+//!     `.trash/` at all
 //!   - `{type:"fork", upto?, target_id?, before?}` (repo mode) copy a prefix into a new session, switch
 //!     to it. `target_id` (any tree entry, on or off the active path) wins over `upto` (a message-count
 //!     prefix of just the active path) when given; `before:true` excludes `target_id` itself from the
@@ -439,6 +450,66 @@ pub struct ServeConfig {
     /// distinction to the client. Empty or absent falls back to the full [`available_models`] list for
     /// cycling as well.
     pub models: Vec<String>,
+    /// A persisted, blanket project-trust policy (`agent settings --default-project-trust`) — Fix 1
+    /// (pi-parity gap): this field didn't exist at all before, so a stored policy had zero effect on
+    /// `serve` sessions even though `run` already partially honored it (`main.rs::run_task`). Consulted
+    /// by [`resolve_project_trust`] at both startup and `reload`, with the same precedence `run` now
+    /// uses: `trust_project`/`force_untrusted` win outright when set; otherwise an explicit per-path
+    /// `TrustStore` entry (`agent trust`/`agent untrust <path>`) wins next; only when neither applies
+    /// does this blanket policy take effect.
+    pub default_project_trust: Option<crate::settings::TrustPolicy>,
+}
+
+/// Resolve whether a project is trusted for this session, from already-gathered inputs — shared by
+/// `run` (`main.rs::run_task`) and `serve` (both its startup and `reload` paths) so the two binaries
+/// agree on trust for the same directory under the same settings, matching pi's own
+/// `trust-manager.ts:46-96` precedence:
+///
+/// 1. `force_untrusted` (`--force-untrusted`/`-na`) always wins outright: untrusted, full stop.
+/// 2. `trust_project` (`--trust-project`/`-a`) wins next: trusted, full stop.
+/// 3. An explicit **per-path** entry in the persisted [`crate::trust_store::TrustStore`] allowlist
+///    (`agent trust`/`agent untrust <path>`, already resolved into `trust_lookup` by the caller) — Fix 1
+///    (pi-parity bug): this used to be checked *after* the blanket policy below, so an operator's
+///    specific exception for one directory could be silently overridden by a coarser `never`/`always`
+///    default; pi's own resolution always checks the nearest explicit per-path decision before falling
+///    back to any blanket policy, in either direction (an explicit `never` policy must not override a
+///    specific `agent trust <path>`, and vice versa for `always`/an explicit `agent untrust <path>`).
+/// 4. Only when `trust_lookup` is [`crate::trust_store::Trust::Unknown`] does the persisted blanket
+///    `default_project_trust` policy apply — `always`/`never` decide outright; `ask` (or no policy at
+///    all) falls back to this crate's original heuristic: trusted whenever the project has nothing
+///    project trust actually gates (`has_gated_resources`, from
+///    `crate::trust_store::has_trust_gated_resources`). This binary is headless, so unlike pi's own
+///    interactive "trust this folder?" prompt, `ask` can't actually ask anything — see
+///    [`crate::settings::TrustPolicy::Ask`]'s own doc comment.
+///
+/// Takes `trust_lookup`/`has_gated_resources` as plain data (rather than resolving them itself from
+/// `cwd`) so the decision logic is unit-testable with no filesystem/global-trust-store state to
+/// sandbox — the same "split I/O gathering from pure decision logic" shape this crate already uses
+/// elsewhere (e.g. `resources::tz_string_offset` vs `tz_env_offset`).
+pub fn resolve_project_trust(
+    trust_project: bool,
+    force_untrusted: bool,
+    default_project_trust: Option<crate::settings::TrustPolicy>,
+    trust_lookup: crate::trust_store::Trust,
+    has_gated_resources: bool,
+) -> bool {
+    use crate::settings::TrustPolicy;
+    use crate::trust_store::Trust;
+    if force_untrusted {
+        return false;
+    }
+    if trust_project {
+        return true;
+    }
+    match trust_lookup {
+        Trust::Trusted => true,
+        Trust::Untrusted => false,
+        Trust::Unknown => match default_project_trust {
+            Some(TrustPolicy::Always) => true,
+            Some(TrustPolicy::Never) => false,
+            Some(TrustPolicy::Ask) | None => !has_gated_resources,
+        },
+    }
 }
 
 /// Waits for an OS shutdown request (SIGTERM, SIGHUP, or SIGINT/Ctrl-C) so `serve` (and `run` — see
@@ -861,6 +932,20 @@ impl Persistence {
         repo.delete(id)
     }
 
+    /// List every session sitting in this repo's `.trash/` subdirectory (repo mode only) — see
+    /// [`crate::session_store::SessionRepo::list_trash`].
+    fn list_trash(&self) -> std::io::Result<Vec<crate::session_store::TrashEntry>> {
+        let repo = self.repo.as_ref().ok_or_else(not_in_repo_mode)?;
+        repo.list_trash()
+    }
+
+    /// Restore a session by id out of `.trash/` back to its original location (repo mode only) — see
+    /// [`crate::session_store::SessionRepo::restore_session`].
+    fn restore_session(&self, id: &str) -> std::io::Result<bool> {
+        let repo = self.repo.as_ref().ok_or_else(not_in_repo_mode)?;
+        repo.restore_session(id)
+    }
+
     /// This process's own cwd's sessions, newest first (empty unless in repo mode).
     /// `on_progress(scanned, total)` is invoked once per file as the scan completes it — see
     /// [`SessionRepo::list_with_progress`](crate::session_store::SessionRepo::list_with_progress).
@@ -1030,9 +1115,22 @@ impl Persistence {
     ///
     /// When `summarize` and the branch being left behind has unsummarized activity (see
     /// `SessionStore::abandoned_by_switch`/`abandoned_to_root`), generates a summary via `agent` and
-    /// persists it *before* switching — mirroring pi's `navigateTree`. A summarization failure (a
-    /// network error, or the model returning nothing) is logged and the switch proceeds anyway: losing
-    /// the recap is far better than being unable to navigate away from a branch at all.
+    /// persists it *before* switching — mirroring pi's `navigateTree`. A client-requested abort
+    /// (`Error::Cancelled`) leaves the session completely unchanged (see the `Err` match arm below); any
+    /// *other* summarization failure (a network error, the model returning an error) is fatal to the
+    /// whole navigation too — Fix 3 (pi-parity gap): this used to log the failure and switch anyway
+    /// (`eprintln!("serve: branch summarization failed, switching anyway: ...")`), matching neither pi's
+    /// own `agent-session.ts`/`agent-harness.ts` (which treat any non-abort summarization error as fatal
+    /// to the navigation) nor this RPC's own error-handling convention elsewhere (`switch_active_with_summary`
+    /// failing to *persist* an already-generated summary, just below, still falls back to a plain switch —
+    /// a different, later failure mode this fix does not touch: the summary text already exists there,
+    /// only the durable record of it is what's missing, so blocking navigation over that would strand the
+    /// client on the old branch to save a recap it already generated once and could just regenerate).
+    /// Silently proceeding as if nothing happened gave a caller no way to know the recap never got made
+    /// and no way to retry — returning `Err` here makes the RPC dispatch's own generic `Err` handling
+    /// surface it as a normal failed response, so the client sees the failure and can choose to retry
+    /// (with `summarize:false` if it wants to switch without one) rather than silently getting a switch
+    /// it didn't ask for.
     ///
     /// `custom_instructions`, when given, steers *what* the branch recap emphasizes — the same
     /// "Additional focus" framing manual `compact` already supports — threaded straight through to
@@ -1132,8 +1230,13 @@ impl Persistence {
                                 "branch summarization cancelled",
                             ));
                         }
+                        // Fix 3: any other summarization failure is fatal to the whole navigation — the
+                        // switch does not happen, and the RPC dispatch's generic `Err` handling reports
+                        // this as a failed `switch_branch` response the client can see and retry.
                         Err(e) => {
-                            eprintln!("serve: branch summarization failed, switching anyway: {e}")
+                            return Err(std::io::Error::other(format!(
+                                "branch summarization failed: {e}"
+                            )));
                         }
                     }
                 }
@@ -1322,10 +1425,13 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
     // so a long-running `serve` process doesn't re-walk the filesystem every turn just for the date.
     let cwd = crate::session_store::canonical_cwd(&std::env::current_dir().unwrap_or_default());
     let has_gated_resources = crate::trust_store::has_trust_gated_resources(&cwd);
-    let mut project_trusted = !cfg.force_untrusted
-        && (cfg.trust_project
-            || crate::trust_store::TrustStore::open_default().is_trusted(&cwd)
-            || !has_gated_resources);
+    let mut project_trusted = resolve_project_trust(
+        cfg.trust_project,
+        cfg.force_untrusted,
+        cfg.default_project_trust,
+        crate::trust_store::TrustStore::open_default().lookup(&cwd),
+        has_gated_resources,
+    );
     // Track L32 (pi-parity fix): mirrors `main.rs`'s identical warning for `run` — an untrusted
     // project with a `SYSTEM.md`/skills/prompts on disk silently skipped all of them with no signal at
     // all that anything was there. Re-checked (not just at startup) on every `reload`, below, since
@@ -1624,9 +1730,15 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                 shutdown_cause = Some(sig);
                 break;
             }
-            maybe_line = lines.next_line() => match maybe_line? {
-                Some(l) => l,
-                None => break,
+            // A malformed-UTF-8 read error is treated the same as a clean EOF (`Ok(None)`) —
+            // matching the busy-mode read loops below, which never propagate a bare `?` here:
+            // this is the idle state the process spends most of its life in, and killing the
+            // whole long-running `serve` process over one bad byte on stdin (pi's own
+            // `StringDecoder`-based reader never throws on invalid UTF-8 either) is far more
+            // disruptive than just ending the session gracefully.
+            maybe_line = lines.next_line() => match maybe_line {
+                Ok(Some(l)) => l,
+                Ok(None) | Err(_) => break,
             },
         };
         let line = line.trim();
@@ -1638,7 +1750,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
             Err(e) => {
                 emit!(response(
                     None,
-                    "?",
+                    "parse",
                     false,
                     None,
                     Some(&format!("invalid JSON: {e}")),
@@ -1746,6 +1858,11 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                     tokens_before.store(0, Ordering::Relaxed);
                     refused.store(false, Ordering::Relaxed);
                     is_compacting.store(false, Ordering::Relaxed);
+                    // `abort` command ids received while this run is still unwinding — acked only once
+                    // the run has actually gone idle (see the flush right after `attempt_result` below,
+                    // and that ack's own doc comment for why it's deferred rather than sent the instant
+                    // `cancel.cancel()` is called).
+                    let mut pending_abort_acks: Vec<Option<String>> = Vec::new();
                     let tx = out_tx.clone();
                     let tokens_before_sink = tokens_before.clone();
                     let refused_sink = refused.clone();
@@ -1843,15 +1960,26 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                                         let c: Value = match serde_json::from_str(l) {
                                             Ok(v) => v,
                                             Err(e) => {
-                                                let _ = out_tx.send(response(None, "?", false, None, Some(&format!("invalid JSON: {e}"))));
+                                                let _ = out_tx.send(response(None, "parse", false, None, Some(&format!("invalid JSON: {e}"))));
                                                 continue;
                                             }
                                         };
                                         let cid = c.get("id").and_then(Value::as_str).map(str::to_string);
                                         match c.get("type").and_then(Value::as_str).unwrap_or("") {
+                                            // Fix 4 (pi-parity gap): the ack is *not* sent here — see
+                                            // the flush right after this busy-loop exits, below. Sending
+                                            // it immediately (the instant `cancel.cancel()` is called)
+                                            // let a client that — correctly, per this RPC's own contract
+                                            // — treats the ack as "safe to send the next command" get
+                                            // rejected as busy: this same busy-loop keeps rejecting every
+                                            // non-abort command as busy until `run` itself actually
+                                            // resolves, which can lag well behind the cancellation
+                                            // request while in-flight tool calls/HTTP streams unwind.
+                                            // Matches pi's `agent-session.ts`, which awaits
+                                            // `waitForIdle()` before acking `abort`.
                                             "abort" => {
                                                 cancel.cancel();
-                                                let _ = out_tx.send(response(cid, "abort", true, None, None));
+                                                pending_abort_acks.push(cid);
                                             }
                                             "stop_after_turn" => {
                                                 // Graceful, not a cancel: the current turn's tool calls (if
@@ -2053,6 +2181,14 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                         }
                     };
 
+                    // Fix 4: the run has now actually gone idle — `run_events_steered`'s future only
+                    // resolves once the whole run (including tool cleanup) has stopped touching
+                    // `session` — so it's safe to tell a client-issued `abort` it can now send its next
+                    // command without racing this busy-loop's own "still draining" rejection above.
+                    for cid in pending_abort_acks.drain(..) {
+                        let _ = out_tx.send(response(cid, "abort", true, None, None));
+                    }
+
                     // A checkpoint sent right as the run above ended (see `agent_core::Agent`'s final,
                     // unconditional post-run `checkpoint.checkpoint(session)`) races the `r = &mut run`
                     // arm above under `biased` select: whichever is ready first wins, so a checkpoint
@@ -2131,7 +2267,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                                             let c: Value = match serde_json::from_str(l) {
                                                 Ok(v) => v,
                                                 Err(e) => {
-                                                    let _ = out_tx.send(response(None, "?", false, None, Some(&format!("invalid JSON: {e}"))));
+                                                    let _ = out_tx.send(response(None, "parse", false, None, Some(&format!("invalid JSON: {e}"))));
                                                     continue;
                                                 }
                                             };
@@ -2359,11 +2495,16 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                         }
                     }
                 }
+                // `leaf_id`: the same active-tip id `get_tree`'s response already carries (Fix 6,
+                // pi-parity gap — pi's own `get_entries({since})` returns `{entries, leafId}` in one
+                // round trip). Without this, a client fetching the transcript still had to issue a
+                // second `get_tree` call just to learn the current tip to pass as a future
+                // `switch_branch` target.
                 emit!(response(
                     id,
                     "get_messages",
                     true,
-                    Some(json!({ "messages": messages })),
+                    Some(json!({ "messages": messages, "leaf_id": msg_ids.last() })),
                     None,
                 ));
             }
@@ -2543,6 +2684,48 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                 None => emit!(response(
                     id,
                     "delete_session",
+                    false,
+                    None,
+                    Some("missing `session_id`")
+                )),
+            },
+            // Minimal surface (Fix 7, pi-parity gap) over `delete_session`'s own `.trash/` soft-delete —
+            // nothing previously read, listed, restored from, or pruned it, so a mistaken delete was
+            // recoverable only by reaching for a shell. `list_trash` reports basic metadata
+            // (id/deleted_at/original_path — see `session_store::TrashEntry`); `restore_session` moves an
+            // entry back out. Deliberately not a full trash-management UI (no bulk purge, no age-based
+            // pruning) — a low-priority nice-to-have, not a core session-lifecycle feature.
+            "list_trash" => match persistence.list_trash() {
+                Ok(trash) => emit!(response(
+                    id,
+                    "list_trash",
+                    true,
+                    Some(json!({ "trash": trash })),
+                    None,
+                )),
+                Err(e) => emit!(response(id, "list_trash", false, None, Some(&e.to_string()))),
+            },
+            "restore_session" => match cmd.get("session_id").and_then(Value::as_str) {
+                Some(target) => match persistence.restore_session(target) {
+                    Ok(true) => emit!(response(id, "restore_session", true, None, None)),
+                    Ok(false) => emit!(response(
+                        id,
+                        "restore_session",
+                        false,
+                        None,
+                        Some(&format!("no trashed session {target}"))
+                    )),
+                    Err(e) => emit!(response(
+                        id,
+                        "restore_session",
+                        false,
+                        None,
+                        Some(&e.to_string())
+                    )),
+                },
+                None => emit!(response(
+                    id,
+                    "restore_session",
                     false,
                     None,
                     Some("missing `session_id`")
@@ -2992,10 +3175,13 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                 // `SYSTEM.md`, and skills/prompt templates may have changed on disk. The per-turn
                 // `full_system` refresh alone only ever picks up the cheap date/cwd footer.
                 let has_gated_resources = crate::trust_store::has_trust_gated_resources(&cwd);
-                project_trusted = !cfg.force_untrusted
-                    && (cfg.trust_project
-                        || crate::trust_store::TrustStore::open_default().is_trusted(&cwd)
-                        || !has_gated_resources);
+                project_trusted = resolve_project_trust(
+                    cfg.trust_project,
+                    cfg.force_untrusted,
+                    cfg.default_project_trust,
+                    crate::trust_store::TrustStore::open_default().lookup(&cwd),
+                    has_gated_resources,
+                );
                 // Track L32 (pi-parity fix): same warning as startup, above — trust may have just
                 // changed to untrusted (or gated resources may have just appeared on disk) as of this
                 // very `reload`, and an operator watching stderr deserves the same signal they'd have
@@ -3045,23 +3231,26 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                 agent.set_system(full_system(&static_system, &cwd));
                 emit!(response(id, "reload", true, None, None));
             }
-            // Rejects only an empty/whitespace-only id, not an unrecognized one: unlike pi (which talks
-            // directly to each provider and can validate against a live, authoritative registry of what
-            // it's actually configured to reach), every model id here is forwarded verbatim through the
-            // gateway (`AI_GATEWAY_URL`) — this process has no local source of truth to validate a real
-            // id against, and `available_models()` is explicitly documented as a non-exhaustive picker
-            // hint, not an allowlist (see its own doc comment). What IS a genuine, unambiguous mistake
-            // regardless of the gateway's own model set — an empty string sneaking through `Value::as_str`
-            // and getting durably recorded via `record_model_change` — is caught here, the same class of
-            // fix `set_session_name` already got (reject empty, don't pretend to validate against a list
-            // this process can't actually authoritatively check).
+            // Rejects an empty/whitespace-only id, and — Fix 10 (pi-parity feature) — resolves a
+            // partial/fuzzy id against the known-model hint list first (`resolve_model_id`, mirroring
+            // `--model`'s identical resolution in `main.rs`): a genuinely unrecognized id (no partial
+            // match at all) is still forwarded verbatim, unlike pi (which talks directly to each
+            // provider and can validate against a live, authoritative registry of what it's actually
+            // configured to reach) — this process has no local source of truth to validate a real id
+            // against, and `available_models()` is explicitly documented as a non-exhaustive picker
+            // hint, not an allowlist (see its own doc comment). An empty string sneaking through
+            // `Value::as_str` and getting durably recorded via `record_model_change` is caught here too,
+            // the same class of fix `set_session_name` already got (reject empty, don't pretend to
+            // validate against a list this process can't actually authoritatively check).
             "set_model" => match cmd
                 .get("model")
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
+                .map(|raw| resolve_model_id(raw, available_models()))
             {
-                Some(model) => {
+                Some(Ok(model)) => {
+                    let model = model.as_str();
                     // Persist the lineage marker *before* applying the switch in memory: if it fails
                     // to write, leave the live model unchanged too, rather than forking live state
                     // away from what's durably recorded (an `Err` here aborts the whole switch).
@@ -3111,6 +3300,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                         }
                     }
                 }
+                Some(Err(e)) => emit!(response(id, "set_model", false, None, Some(&e))),
                 None => emit!(response(
                     id,
                     "set_model",
@@ -3613,7 +3803,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                                         let c: Value = match serde_json::from_str(l) {
                                             Ok(v) => v,
                                             Err(e) => {
-                                                let _ = out_tx.send(response(None, "?", false, None, Some(&format!("invalid JSON: {e}"))));
+                                                let _ = out_tx.send(response(None, "parse", false, None, Some(&format!("invalid JSON: {e}"))));
                                                 continue;
                                             }
                                         };
@@ -3848,7 +4038,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                                     let c: Value = match serde_json::from_str(l) {
                                         Ok(v) => v,
                                         Err(e) => {
-                                            let _ = out_tx.send(response(None, "?", false, None, Some(&format!("invalid JSON: {e}"))));
+                                            let _ = out_tx.send(response(None, "parse", false, None, Some(&format!("invalid JSON: {e}"))));
                                             continue;
                                         }
                                     };
@@ -4332,14 +4522,72 @@ fn resolve_model_scope(patterns: &[String], catalog: &[&str]) -> Vec<ScopedModel
                     });
                 }
             }
-        } else if !resolved.iter().any(|m| m.id == base) {
-            resolved.push(ScopedModel {
-                id: base.to_string(),
-                thinking_level,
-            });
+        } else {
+            // Fix 10 (pi-parity feature): a literal, non-glob pattern that doesn't exactly match a
+            // catalog id now also gets the same partial/substring resolution `--model`/`set_model` get
+            // — e.g. `--models sonnet` resolves to `claude-sonnet-4-5` instead of cycling to the
+            // literal, almost-certainly-wrong string "sonnet". An ambiguous partial match can't fail
+            // the whole `serve` startup the way an ambiguous `--model` does (this is a background
+            // candidate-list build, not the one model actively in use) — it's warned about and kept
+            // literal instead, same graceful-degrade this crate already applies to a glob matching
+            // nothing.
+            let resolved_id = match resolve_model_id(base, catalog) {
+                Ok(id) => id,
+                Err(e) => {
+                    eprintln!("warning: --models {base:?}: {e}; using it literally");
+                    base.to_string()
+                }
+            };
+            if !resolved.iter().any(|m| m.id == resolved_id) {
+                resolved.push(ScopedModel {
+                    id: resolved_id,
+                    thinking_level,
+                });
+            }
         }
     }
     resolved
+}
+
+/// Resolve a possibly-partial `--model`/`set_model` id against the known-model hint list
+/// ([`available_models`]) — pi's own `model-resolver.ts` partial/substring matching, scoped down: this
+/// crate has no per-provider catalog to rank un-dated aliases against dated snapshots with (pi's own
+/// alias-preference rule), and — unlike pi's own `resolveCliModel`, which silently picks whichever
+/// candidate sorts first — never silently guesses on an ambiguous match. Instead mirrors
+/// `SessionRepo::find_path`'s own "ambiguous is a real error naming every candidate, not a guess"
+/// philosophy (see `session_store.rs`), applied consistently to `--model`, `set_model`, and (via
+/// `resolve_model_scope`, above) the literal entries in a `--models` scope.
+///
+/// - An exact, case-insensitive match against `catalog` resolves to the catalog's own canonical
+///   spelling (so `--model Claude-Opus-4-8` still lands on `claude-opus-4-8`).
+/// - Otherwise, every catalog id that *contains* `input` as a substring (case-insensitive) is a
+///   candidate — e.g. `opus` matches `claude-opus-4-8`. Exactly one candidate resolves to it; more than
+///   one is `Err`, naming every candidate so the caller can be specific instead of silently guessing
+///   which one was meant (e.g. `gpt` matches all of `gpt-5`/`gpt-5-mini`/`gpt-4o`/`gpt-4.1`).
+/// - No candidates at all returns `Ok(input)` unchanged — `available_models` is explicitly documented as
+///   a non-exhaustive hint, not an allowlist, so an id genuinely outside it (a brand-new model, a
+///   provider-specific id the gateway still understands) must still reach the gateway verbatim rather
+///   than being rejected outright.
+pub fn resolve_model_id(input: &str, catalog: &[&str]) -> Result<String, String> {
+    let trimmed = input.trim();
+    if let Some(exact) = catalog.iter().find(|m| m.eq_ignore_ascii_case(trimmed)) {
+        return Ok((*exact).to_string());
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let candidates: Vec<&str> = catalog
+        .iter()
+        .copied()
+        .filter(|m| m.to_ascii_lowercase().contains(&lower))
+        .collect();
+    match candidates.as_slice() {
+        [] => Ok(trimmed.to_string()),
+        [one] => Ok((*one).to_string()),
+        many => Err(format!(
+            "{trimmed:?} matches more than one known model id: {} — pass one of these exactly, or a \
+             full id outside this hint list to bypass resolution entirely",
+            many.join(", ")
+        )),
+    }
 }
 
 /// A `get_available_models` entry: enough per-model capability info (from the same
@@ -5148,6 +5396,97 @@ mod tests {
         assert_eq!(stats["context_usage"]["context_window"], expected_window);
     }
 
+    // Fix 1 (pi-parity bug): `default_project_trust` used to be checked *before* an explicit per-path
+    // `TrustStore` entry, so an operator's specific `agent trust`/`agent untrust <path>` exception could
+    // be silently overridden by a coarser blanket policy. `resolve_project_trust` is the shared
+    // precedence both `run` and `serve` now consult, taking the already-resolved `Trust` lookup as a
+    // plain parameter rather than reading the real trust store, so these tests don't need to sandbox any
+    // filesystem/global state.
+
+    #[test]
+    fn resolve_project_trust_force_untrusted_wins_over_everything() {
+        use crate::settings::TrustPolicy;
+        use crate::trust_store::Trust;
+        assert!(!resolve_project_trust(
+            true, // trust_project also set
+            true, // force_untrusted
+            Some(TrustPolicy::Always),
+            Trust::Trusted,
+            false,
+        ));
+    }
+
+    #[test]
+    fn resolve_project_trust_trust_project_wins_when_not_force_untrusted() {
+        use crate::settings::TrustPolicy;
+        use crate::trust_store::Trust;
+        assert!(resolve_project_trust(
+            true,
+            false,
+            Some(TrustPolicy::Never),
+            Trust::Untrusted,
+            true,
+        ));
+    }
+
+    #[test]
+    fn resolve_project_trust_an_explicit_trusted_entry_wins_over_a_never_policy() {
+        // The core Fix 1 regression: an operator's specific `agent trust <path>` exception must win
+        // over a coarser `never` blanket default, not be overridden by it.
+        use crate::settings::TrustPolicy;
+        use crate::trust_store::Trust;
+        assert!(resolve_project_trust(
+            false,
+            false,
+            Some(TrustPolicy::Never),
+            Trust::Trusted,
+            true,
+        ));
+    }
+
+    #[test]
+    fn resolve_project_trust_an_explicit_untrusted_entry_wins_over_an_always_policy() {
+        // The mirror case: `agent untrust <path>` must win over a blanket `always` default too.
+        use crate::settings::TrustPolicy;
+        use crate::trust_store::Trust;
+        assert!(!resolve_project_trust(
+            false,
+            false,
+            Some(TrustPolicy::Always),
+            Trust::Untrusted,
+            false,
+        ));
+    }
+
+    #[test]
+    fn resolve_project_trust_falls_back_to_the_blanket_policy_only_when_the_lookup_is_unknown() {
+        use crate::settings::TrustPolicy;
+        use crate::trust_store::Trust;
+        assert!(resolve_project_trust(
+            false,
+            false,
+            Some(TrustPolicy::Always),
+            Trust::Unknown,
+            true,
+        ));
+        assert!(!resolve_project_trust(
+            false,
+            false,
+            Some(TrustPolicy::Never),
+            Trust::Unknown,
+            false,
+        ));
+    }
+
+    #[test]
+    fn resolve_project_trust_ask_or_no_policy_falls_back_to_has_gated_resources() {
+        use crate::trust_store::Trust;
+        // No gated resources at all: nothing meaningfully differs between trusted/untrusted, so this
+        // crate's headless "ask" fallback treats it as trusted.
+        assert!(resolve_project_trust(false, false, None, Trust::Unknown, false));
+        assert!(!resolve_project_trust(false, false, None, Trust::Unknown, true));
+    }
+
     // pi-parity fix (L10): `--models` only ever accepted flat literal ids — no glob against the known
     // catalog, no `pattern:<level>` suffix to pin a scoped entry's thinking depth. `resolve_model_scope`
     // is the resolver pi calls `resolveModelScopeWithDiagnostics`.
@@ -5161,6 +5500,37 @@ mod tests {
             scoped,
             vec![ScopedModel {
                 id: "totally-custom-id".to_string(),
+                thinking_level: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn resolve_model_scope_fuzzy_resolves_a_literal_partial_match_against_the_catalog() {
+        // Fix 10: a literal, non-glob `--models` entry that partially matches exactly one catalog id
+        // now resolves to it, the same as `--model`/`set_model` — `--models sonnet` must cycle to
+        // `claude-sonnet-4-5`, not the literal, almost-certainly-wrong string "sonnet".
+        let scoped = resolve_model_scope(&["sonnet".to_string()], available_models());
+        assert_eq!(
+            scoped,
+            vec![ScopedModel {
+                id: "claude-sonnet-4-5".to_string(),
+                thinking_level: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn resolve_model_scope_an_ambiguous_literal_partial_match_warns_and_keeps_it_literal() {
+        // Unlike `--model`, an ambiguous `--models` entry must not fail the whole `serve` startup —
+        // this is a background candidate-list build, not the one model actively in use — so it falls
+        // back to the literal string (with a warning), same graceful-degrade already applied to a glob
+        // matching nothing.
+        let scoped = resolve_model_scope(&["gpt".to_string()], available_models());
+        assert_eq!(
+            scoped,
+            vec![ScopedModel {
+                id: "gpt".to_string(),
                 thinking_level: None,
             }]
         );
@@ -5263,6 +5633,61 @@ mod tests {
         );
     }
 
+    // Fix 10 (pi-parity feature): `--model`/`set_model` previously forwarded any id verbatim with no
+    // resolution at all. `resolve_model_id` ports a scoped-down version of pi's own
+    // `model-resolver.ts` partial/substring matching, but never silently guesses on an ambiguous
+    // match — mirrors `SessionRepo::find_path`'s own "list every candidate, don't guess" philosophy
+    // instead of pi's own silent-pick-first behavior.
+
+    #[test]
+    fn resolve_model_id_an_exact_match_is_returned_in_the_catalogs_own_casing() {
+        assert_eq!(
+            resolve_model_id("Claude-Opus-4-8", available_models()).unwrap(),
+            "claude-opus-4-8"
+        );
+    }
+
+    #[test]
+    fn resolve_model_id_an_unambiguous_partial_match_resolves_to_the_full_id() {
+        assert_eq!(
+            resolve_model_id("opus", available_models()).unwrap(),
+            "claude-opus-4-8"
+        );
+        assert_eq!(
+            resolve_model_id("SONNET", available_models()).unwrap(),
+            "claude-sonnet-4-5"
+        );
+    }
+
+    #[test]
+    fn resolve_model_id_an_ambiguous_partial_match_errors_naming_every_candidate() {
+        let err = resolve_model_id("gpt", available_models()).unwrap_err();
+        assert!(err.contains("gpt-5"), "got: {err}");
+        assert!(err.contains("gpt-5-mini"), "got: {err}");
+        assert!(err.contains("gpt-4o"), "got: {err}");
+        assert!(err.contains("gpt-4.1"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_model_id_no_match_at_all_is_forwarded_verbatim() {
+        // `available_models` is a hint, not an allowlist — a brand-new or provider-specific id the
+        // gateway still understands must reach it unchanged, not be rejected.
+        assert_eq!(
+            resolve_model_id("totally-custom-id", available_models()).unwrap(),
+            "totally-custom-id"
+        );
+    }
+
+    #[test]
+    fn resolve_model_id_an_exact_match_short_circuits_before_any_ambiguity_check() {
+        // "gpt-5" is itself a substring of "gpt-5-mini" too, but an exact match must win outright
+        // rather than ever reaching the ambiguous-candidates error path.
+        assert_eq!(
+            resolve_model_id("gpt-5", available_models()).unwrap(),
+            "gpt-5"
+        );
+    }
+
     #[tokio::test]
     async fn switch_branch_returns_a_clear_error_when_no_session_persistence_is_configured() {
         // B-M7 pi-parity gap: in `--no-session-persistence` (pure in-memory) mode there's no tree to
@@ -5295,6 +5720,55 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn switch_branch_propagates_a_non_cancelled_summarization_failure_instead_of_switching_anyway() {
+        // Fix 3 (pi-parity gap): a genuine (non-abort) summarization failure used to be logged and the
+        // switch proceeded anyway with no summary attached — this test pins the corrected behavior:
+        // the switch must not happen at all, and the caller must see it failed, matching pi's own
+        // `agent-session.ts`/`agent-harness.ts` (any non-abort summarization error is fatal to the whole
+        // navigation).
+        let dir = tempfile::tempdir().unwrap();
+        let (mut persistence, _session) =
+            Persistence::open_repo(dir.path(), "/w", "claude-test", None).unwrap();
+        let ids = {
+            let store = persistence.store.as_mut().unwrap();
+            let mut session = Session::new();
+            session.user("a");
+            session.user("b");
+            session.user("c");
+            session.user("d");
+            store.append_new(&session.messages).unwrap();
+            store.active_ids().to_vec()
+        };
+
+        // No scripted turns at all: the one model call `summarize_branch` makes fails outright — a
+        // stand-in for a real network error, not a client-requested abort.
+        let agent = Agent::new(
+            Arc::new(agent_core::MockTransport::new(vec![])),
+            "claude-test",
+        );
+        let cancel = CancellationToken::new();
+
+        // Switching to `ids[1]` ("b") abandons "c"/"d" (non-empty), so `summarize:true` actually
+        // attempts a summarization call rather than skipping it as a no-op.
+        let err = persistence
+            .switch_branch(&agent, &ids[1], false, true, None, &cancel)
+            .await
+            .expect_err("a genuine summarization failure must fail the whole switch");
+        assert_ne!(
+            err.kind(),
+            std::io::ErrorKind::Interrupted,
+            "must not be reported as a client-requested abort — that's a distinct, non-error outcome"
+        );
+
+        // The switch must not have happened: the active tip is still "d", not "b".
+        assert_eq!(
+            persistence.store.as_ref().unwrap().active_ids(),
+            ids.as_slice(),
+            "a failed summarization must leave the session on its original branch"
+        );
+    }
+
     #[test]
     fn set_label_and_get_label_return_a_clear_error_when_no_session_persistence_is_configured() {
         // Pi-parity audit H3: `SessionStore::set_label`/`get_label` were fully built, persisted, and
@@ -5320,6 +5794,48 @@ mod tests {
             .get_label("some-id")
             .expect_err("must fail clearly when there's no session tree to query");
         assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn list_trash_and_restore_session_return_a_clear_error_outside_repo_mode() {
+        // Fix 7: `.trash/` is a `SessionRepo`-level concept (multiple sessions sharing one directory),
+        // same as `delete`'s own repo-mode requirement — neither single-file nor in-memory-only mode has
+        // a repo directory to consult.
+        let persistence = Persistence {
+            repo: None,
+            store: None,
+            meta: SessionMeta::new("/w", "claude-test"),
+        };
+        let err = persistence
+            .list_trash()
+            .expect_err("must fail clearly outside repo mode");
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        assert!(err.to_string().contains("not in repo mode"), "got: {err}");
+
+        let err = persistence
+            .restore_session("some-id")
+            .expect_err("must fail clearly outside repo mode");
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn list_trash_and_restore_session_round_trip_through_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let (persistence, _session) =
+            Persistence::open_repo(dir.path(), "/w", "claude-test", None).unwrap();
+        let repo = persistence.repo.as_ref().unwrap();
+        let other = repo.create(SessionMeta::new("/w", "claude-test")).unwrap();
+        let other_id = other.meta().id.clone();
+
+        assert!(persistence.list_trash().unwrap().is_empty());
+        persistence.delete(&other_id).unwrap();
+        let trash = persistence.list_trash().unwrap();
+        assert_eq!(trash.len(), 1);
+        assert_eq!(trash[0].id, other_id);
+
+        assert!(persistence.restore_session(&other_id).unwrap());
+        assert!(persistence.list_trash().unwrap().is_empty());
+        assert!(!persistence.restore_session("never-existed").unwrap());
     }
 
     #[test]

@@ -189,6 +189,19 @@ pub const KNOWN_PROVIDERS: &[ProviderSpec] = &[
         dialect: Dialect::OpenAI,
         auth: AuthScheme::Bearer,
     },
+    // OpenAI Codex (ChatGPT Plus/Pro subscription backend) — reached only via a stored OpenAI-Codex
+    // OAuth credential's own bearer token, never a pool key (no `AI_POOL_KEY_OPENAI_CODEX` exists;
+    // this row only ever serves BYO traffic). Base https://chatgpt.com/backend-api, Bearer — a
+    // genuinely static host, unlike GitHub Copilot's account-specific proxy endpoint (see
+    // `agent_core::client::RouteOverride`'s doc comment for why Copilot instead bypasses the gateway
+    // entirely rather than getting a row here). Client path: /openai-codex/backend-api/codex/responses
+    // (see `packages/ai/src/api/openai-codex-responses.ts` in pi-mono, `resolveCodexUrl`).
+    ProviderSpec {
+        name: "openai-codex",
+        authority: "chatgpt.com:443",
+        dialect: Dialect::OpenAI,
+        auth: AuthScheme::Bearer,
+    },
 ];
 
 /// The default provider name for a dialect — used only for the **bare-path** request (no provider

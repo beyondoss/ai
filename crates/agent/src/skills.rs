@@ -355,8 +355,18 @@ fn discover_in_with_diagnostics(root: &Path) -> (Vec<Skill>, Vec<String>) {
     let mut out = Vec::new();
     let mut diagnostics = Vec::new();
     walk(root, &mut out, &mut diagnostics);
-    for skill in loose_root_skills(root, &mut diagnostics) {
-        out.push(skill);
+    // If `root` itself has its own accepted `SKILL.md`, `root` *is* that skill's directory — a sibling
+    // loose `.md` file next to it (a reference doc, examples, notes, …) is that skill's own supporting
+    // material, not a second, separate skill. Matches pi's `loadSkillsFromDirInternal`, which returns
+    // the instant it finds a `SKILL.md` directly in the scanned directory, never reaching the loose-file
+    // loop for that directory at all. This must only look at `root`'s *own* manifest — a `SKILL.md`
+    // found in a subdirectory of `root` (already walked above) is an unrelated, nested skill and must
+    // not suppress `root`'s own loose-file scan.
+    let root_has_own_skill = out.iter().any(|s| s.path.parent() == Some(root));
+    if !root_has_own_skill {
+        for skill in loose_root_skills(root, &mut diagnostics) {
+            out.push(skill);
+        }
     }
     (out, diagnostics)
 }
@@ -1922,6 +1932,45 @@ mod tests {
             .map(|s| s.name)
             .collect();
         assert_eq!(names, vec!["root-skill".to_string()]);
+    }
+
+    #[test]
+    fn a_skills_own_directory_does_not_leak_sibling_md_files_as_phantom_skills() {
+        // pi-parity fix: `discover_in_with_diagnostics` used to call `loose_root_skills(root, ...)`
+        // unconditionally even when `walk` had already accepted `root` itself as a skill directory
+        // (`root/SKILL.md`). The documented `--skill <path>` use case of pointing at a single skill's
+        // own directory (`some-skill/SKILL.md` plus `some-skill/reference.md`, `some-skill/examples.md`)
+        // then had those supporting docs scanned as *individual* skills too — a reference doc that
+        // happens to carry frontmatter with its own `description:` (for unrelated reasons, e.g.
+        // documenting itself) becomes a phantom extra "skill" that shouldn't exist. pi's own
+        // `loadSkillsFromDirInternal` returns the instant it finds a `SKILL.md` directly in the scanned
+        // directory, never reaching the loose-file loop for that directory at all.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("SKILL.md"),
+            "---\nname: some-skill\ndescription: the real skill\n---\nBody.",
+        )
+        .unwrap();
+        // The actual phantom-skill risk: a sibling .md file that itself has frontmatter with a
+        // `description` — without the fix, this registers as a second, bogus skill.
+        fs::write(
+            tmp.path().join("notes.md"),
+            "---\ndescription: internal notes, not a skill\n---\nSome reference material.",
+        )
+        .unwrap();
+        let (skills, diagnostics) = discover_in_with_diagnostics(tmp.path());
+        assert_eq!(
+            skills.len(),
+            1,
+            "a sibling loose .md file next to a root's own SKILL.md must not become its own skill: \
+             {skills:?}"
+        );
+        assert_eq!(skills[0].name, "some-skill");
+        assert!(
+            diagnostics.is_empty(),
+            "a sibling loose .md file must not even produce a diagnostic when root has its own \
+             SKILL.md: {diagnostics:?}"
+        );
     }
 
     #[test]

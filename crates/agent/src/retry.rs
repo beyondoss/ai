@@ -35,7 +35,7 @@ pub fn backoff(attempt: u32) -> std::time::Duration {
 /// pi's *only* layer for a plain HTTP-status failure at all, since SDK-level retry is disabled. A
 /// plain-text/HTML error page from a flaky proxy (no recognized JSON `error.type` field) wouldn't match
 /// any narrower pattern but plausibly still deserves a retry.
-const WHOLE_RUN_RETRYABLE_STATUS_DIGITS: &[&str] = &["429", "500", "502", "503", "504"];
+const WHOLE_RUN_RETRYABLE_STATUS_DIGITS: &[&str] = &["429", "500", "502", "503", "504", "524"];
 
 /// Reqwest's own literal, stable wrapper text for a pre-response send failure (`Kind::Request`'s
 /// `Display` impl) — refused/reset/timed-out-while-connecting, DNS, TLS. Found live (a real
@@ -180,6 +180,25 @@ mod tests {
         assert!(
             is_retryable_whole_run(&e),
             "whole-run layer must catch what the narrower one misses"
+        );
+    }
+
+    #[test]
+    fn whole_run_retries_a_cloudflare_524_gateway_timeout() {
+        // pi-parity: pi's whole-run classifier includes the literal "524" (Cloudflare's own gateway
+        // timeout code, distinct from the origin's own 502/503/504) alongside the other raw status
+        // digits — same rationale as the 503 case just above, ported verbatim rather than left out.
+        // Deliberately avoids the word "timeout" in the message (unlike Cloudflare's real body text)
+        // since that free-text phrase is itself independently mid-stream-retryable — this fixture
+        // isolates the raw "524" digit as the *only* retryable-looking signal, same as the 503 case.
+        let e = Error::Transport("gateway returned 524: unexpected response from upstream".into());
+        assert!(
+            !agent_core::agent::is_retryable_mid_stream(&e),
+            "mid-stream layer deliberately excludes raw status digits"
+        );
+        assert!(
+            is_retryable_whole_run(&e),
+            "whole-run layer must retry a Cloudflare 524 gateway timeout"
         );
     }
 

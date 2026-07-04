@@ -200,6 +200,31 @@ fn coerce_union(members: &[Value], value: Value) -> Value {
     value
 }
 
+/// A JSON number that arrives float-tagged (e.g. parsed from the wire as `5000.0`, distinct in
+/// `serde_json` from an int-tagged `5000`) but holds a whole-number value is re-tagged here as a
+/// proper int-tagged `Value::Number` — the same normalization [`try_coerce`] already applies to a
+/// parsed string (see its doc comment). Without this, `matches_type_raw`'s `"integer"` check happily
+/// accepts a float-tagged whole number (`v.as_f64().is_some_and(|n| n.fract() == 0.0)`), but this
+/// function's caller used to return it completely unchanged — still float-tagged — so a tool's own
+/// `.as_u64()`/`.as_i64()` extraction returns `None` regardless of the value's fractional part,
+/// either hard-erroring (`bash`'s `timeout_ms`) or silently falling back to a default with no signal
+/// to the model (`read`'s `offset`, `grep`/`find`/`ls`'s `limit`). A non-whole-number `Value::Number`
+/// (already a bare "number" match, e.g. `42.5`) is returned untouched either way.
+fn retag_whole_number(value: Value) -> Value {
+    let Value::Number(n) = &value else {
+        return value;
+    };
+    // Already int-tagged — nothing to do (also covers the "number" schema branch matching an
+    // already-correct integer).
+    if n.is_i64() || n.is_u64() {
+        return value;
+    }
+    match n.as_f64() {
+        Some(f) if f.fract() == 0.0 && f.abs() < i64::MAX as f64 => Value::Number((f as i64).into()),
+        _ => value,
+    }
+}
+
 fn coerce_value(schema: &Value, input: Value) -> Result<Value, String> {
     let value = apply_composition(schema, input);
 
@@ -226,6 +251,7 @@ fn coerce_value(schema: &Value, input: Value) -> Result<Value, String> {
             return match *t {
                 "object" => coerce_object_properties(schema, value),
                 "array" => coerce_array_items(schema, value),
+                "integer" | "number" => Ok(retag_whole_number(value)),
                 _ => Ok(value),
             };
         }
@@ -438,6 +464,37 @@ mod tests {
         assert_eq!(
             coerce_tool_arguments(&schema, input).unwrap(),
             json!({"id": "7", "extra": 42})
+        );
+    }
+
+    #[test]
+    fn a_float_tagged_whole_number_coerces_to_an_int_tagged_value_for_an_integer_schema() {
+        // pi-parity bug: a JSON number that arrives float-tagged with a whole-number value (distinct
+        // in `serde_json` from an int-tagged number of the same value) used to pass
+        // `matches_type_raw`'s `"integer"` check but then sail through `coerce_value` completely
+        // unchanged — still float-tagged — so a tool's own `.as_u64()`/`.as_i64()` extraction
+        // returned `None` regardless of the value's fractional part. `serde_json::from_str` is used
+        // here (rather than a bare Rust `5000.0` literal) to guarantee a genuinely float-tagged
+        // `Value::Number` — `serde_json::Number`'s internal representation is float-tagged whenever a
+        // number arrives with a decimal point on the wire, not by the value's own fractional-ness.
+        let float_tagged: Value = serde_json::from_str("5000.0").unwrap();
+        assert!(
+            float_tagged.as_i64().is_none() && float_tagged.as_u64().is_none(),
+            "test fixture must be genuinely float-tagged to exercise the bug: {float_tagged:?}"
+        );
+        let got = coerce_tool_arguments(&json!({"type": "integer"}), float_tagged).unwrap();
+        assert_eq!(got.as_u64(), Some(5000), "got {got:?}");
+
+        // Same bug, same fix, for a bare "number" schema (not just "integer").
+        let float_tagged: Value = serde_json::from_str("5000.0").unwrap();
+        let got = coerce_tool_arguments(&json!({"type": "number"}), float_tagged).unwrap();
+        assert_eq!(got.as_u64(), Some(5000), "got {got:?}");
+
+        // A non-whole-number float must still pass through untouched (not force-truncated).
+        let non_whole: Value = serde_json::from_str("42.5").unwrap();
+        assert_eq!(
+            coerce_tool_arguments(&json!({"type": "number"}), non_whole.clone()).unwrap(),
+            non_whole
         );
     }
 

@@ -67,6 +67,18 @@ pub struct Settings {
     /// whatever `--no-compaction` said at the *next* invocation's own startup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_enabled: Option<bool>,
+    /// Used when neither `--reasoning-effort`/`--thinking` nor `AI_AGENT_REASONING_EFFORT` is given —
+    /// pi-parity fix: `--reasoning-effort` was the only numeric/string CLI tunable with no persisted
+    /// stored-default fallback at all (unlike `default_model`/`default_gateway_url`/
+    /// `default_session_dir` above). One of `agent_core::ReasoningEffort::as_str`'s wire vocabulary
+    /// (minimal/low/medium/high/xhigh) — stored as a plain string (not the enum itself) so this crate's
+    /// settings file doesn't take a hard dependency on `agent_core`'s exact type layout, matching how
+    /// every other field here is a primitive; validated through the same `parse_reasoning_effort`
+    /// `--reasoning-effort` itself uses at both write time (`agent settings --default-reasoning-effort`)
+    /// and read time (`main.rs`'s fallback chain), so a corrupt/hand-edited value degrades to "not set"
+    /// rather than a panic or a silently-wrong effort reaching the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_reasoning_effort: Option<String>,
 }
 
 /// A persisted settings file, one per machine (not per-project — matches pi's own global settings tier;
@@ -123,6 +135,14 @@ impl SettingsStore {
     /// auto-compaction override, persisting atomically.
     pub fn set_compaction_enabled(&mut self, enabled: Option<bool>) -> std::io::Result<()> {
         self.mutate_locked(move |s| s.compaction_enabled = enabled)
+    }
+
+    /// Set (`Some`) or clear (`None`) the stored default reasoning effort, persisting atomically. Takes
+    /// the already-validated wire string (`agent_core::ReasoningEffort::as_str`'s vocabulary) — mirrors
+    /// `set_default_model`'s identical shape (a plain string, validated by the caller before it ever
+    /// reaches here).
+    pub fn set_default_reasoning_effort(&mut self, effort: Option<String>) -> std::io::Result<()> {
+        self.mutate_locked(move |s| s.default_reasoning_effort = effort)
     }
 
     /// Acquire the cross-process lock (see [`FileLock`]), re-read the store's *current* on-disk state —
@@ -263,6 +283,106 @@ pub(crate) fn config_dir_root() -> PathBuf {
 
 fn default_path() -> PathBuf {
     config_dir_root().join("settings.json")
+}
+
+/// A single model's on-disk connection override — pi-parity feature (Fix 9): pi's own
+/// `model-registry.ts` lets an operator override a model's base URL/auth/routing preferences via a
+/// `models.json`, merged over its built-in provider catalog. This crate holds no catalog of its own to
+/// merge over (a model id is forwarded verbatim through the gateway — see `agent_core::models`'s own
+/// module doc comment), so there's nothing to "merge": an override here just redirects where a matching
+/// model id's request actually goes, consulted by `main.rs::resolve_gateway_credential`. Deliberately
+/// narrower than pi's own schema — no OpenRouter-specific routing-preference surface
+/// (order/only/ignore/zdr/sort/max_price/...): a plain base-url/auth override per model id is the
+/// valuable core capability, and this crate has no OpenRouter-specific request shaping to hang routing
+/// preferences off of in the first place.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelOverride {
+    /// Send this model's requests directly here instead of the gateway's own default per-dialect
+    /// routing — bypasses the gateway entirely, using the model's usual wire path
+    /// (`agent_core::dialect::Dialect::endpoint_path`) appended to this base URL. The same
+    /// `agent_core::client::RouteOverride::Direct` mechanism already used for a GitHub-Copilot-routed
+    /// OAuth login (see `main.rs::resolve_gateway_credential`), reused here rather than duplicated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// A literal bearer token to send instead of whatever `--key`/`AI_AGENT_KEY` resolved to — e.g. a
+    /// distinct key for a self-hosted or alternate-provider endpoint. `None` falls back to `--key`/
+    /// `AI_AGENT_KEY` (empty string if neither is set — many self-hosted OpenAI-compatible servers, like
+    /// Ollama/LM Studio, ignore the `Authorization` header entirely, so this is a usable default rather
+    /// than a hard error).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+}
+
+/// On-disk shape: a flat JSON object of model id → [`ModelOverride`] (`{"my-model": {"base_url":
+/// "http://127.0.0.1:11434"}}`) — the minimal "array/map of model-id → overrides" schema this feature
+/// calls for, not pi's nested `{"providers": {...}}` structure (this crate has no provider concept of
+/// its own to nest under; see [`ModelOverride`]'s own doc comment).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ModelOverrides(std::collections::BTreeMap<String, ModelOverride>);
+
+impl ModelOverrides {
+    /// Load the default model-override file (`~/.claude/models.json`, alongside `settings.json`/
+    /// `trusted-projects.json` — see [`config_dir_root`]). A missing file is the ordinary case (no
+    /// overrides configured at all) — silent, matching [`SettingsStore::open`]'s own convention. An
+    /// existing-but-unparsable file `warn!`s and is treated as empty rather than failing the whole
+    /// `run`/`serve` invocation over a hand-edited typo — mirrors `trust_store.rs`'s identical "skip and
+    /// warn, don't silently lose data, but don't hard-fail a normal invocation either" precedent for its
+    /// own corrupt-store case.
+    pub fn open_default() -> Self {
+        Self::open(model_overrides_path())
+    }
+
+    /// Same as [`Self::open_default`], but against an arbitrary path — for tests, and for any future
+    /// caller that wants to point at a non-default location.
+    pub fn open(path: PathBuf) -> Self {
+        let contents = match fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Self::default(),
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "could not read model overrides file, treating it as empty"
+                );
+                return Self::default();
+            }
+        };
+        match serde_json::from_str(&contents) {
+            Ok(overrides) => overrides,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "model overrides file is not valid JSON, treating it as empty"
+                );
+                Self::default()
+            }
+        }
+    }
+
+    /// The override recorded for `model_id`, if any.
+    pub fn get(&self, model_id: &str) -> Option<&ModelOverride> {
+        self.0.get(model_id)
+    }
+
+    /// How many model ids have an override configured — surfaced by `agent settings` so an operator can
+    /// tell this file is actually being read (this feature's "CLI-visible" requirement) without a
+    /// dedicated dump-the-whole-file command.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether no model ids have an override configured (including "the file doesn't exist at all").
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// Where [`ModelOverrides::open_default`] reads from — a sibling of [`default_path`]'s
+/// `settings.json`/`trust_store.rs`'s `trusted-projects.json`, under the same [`config_dir_root`].
+pub fn model_overrides_path() -> PathBuf {
+    config_dir_root().join("models.json")
 }
 
 #[cfg(test)]
@@ -416,5 +536,92 @@ mod tests {
         .unwrap();
         let store = SettingsStore::open(path);
         assert_eq!(store.get().default_model.as_deref(), Some("m"));
+    }
+
+    #[test]
+    fn set_default_reasoning_effort_persists_and_reopening_sees_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut store = SettingsStore::open(path.clone());
+        assert_eq!(store.get().default_reasoning_effort, None);
+
+        store
+            .set_default_reasoning_effort(Some("high".to_string()))
+            .unwrap();
+        assert_eq!(
+            store.get().default_reasoning_effort.as_deref(),
+            Some("high")
+        );
+
+        let reopened = SettingsStore::open(path.clone());
+        assert_eq!(
+            reopened.get().default_reasoning_effort.as_deref(),
+            Some("high")
+        );
+
+        // Clearing it back to `None` must also round-trip, mirroring every other field's convention.
+        let mut store = SettingsStore::open(path.clone());
+        store.set_default_reasoning_effort(None).unwrap();
+        assert_eq!(store.get().default_reasoning_effort, None);
+        let reopened = SettingsStore::open(path);
+        assert_eq!(reopened.get().default_reasoning_effort, None);
+    }
+
+    #[test]
+    fn missing_model_overrides_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let overrides = ModelOverrides::open(dir.path().join("does-not-exist.json"));
+        assert!(overrides.is_empty());
+        assert_eq!(overrides.get("anything"), None);
+    }
+
+    #[test]
+    fn model_overrides_file_round_trips_a_base_url_and_api_key_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.json");
+        fs::write(
+            &path,
+            r#"{"my-local-model": {"base_url": "http://127.0.0.1:11434", "api_key": "local-key"}}"#,
+        )
+        .unwrap();
+
+        let overrides = ModelOverrides::open(path);
+        assert_eq!(overrides.len(), 1);
+        let over = overrides.get("my-local-model").unwrap();
+        assert_eq!(over.base_url.as_deref(), Some("http://127.0.0.1:11434"));
+        assert_eq!(over.api_key.as_deref(), Some("local-key"));
+        assert_eq!(overrides.get("some-other-model"), None);
+    }
+
+    #[test]
+    fn a_corrupt_model_overrides_file_warns_and_is_treated_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.json");
+        fs::write(&path, "not valid json at all { [ }").unwrap();
+
+        let capture = crate::tracing_test::capture(|| {
+            let overrides = ModelOverrides::open(path);
+            assert!(overrides.is_empty());
+        });
+        assert!(
+            capture
+                .messages()
+                .iter()
+                .any(|m| m.contains("model overrides")),
+            "a corrupt model overrides file must be logged, not silently swallowed: {:?}",
+            capture.messages()
+        );
+    }
+
+    #[test]
+    fn model_overrides_default_path_is_a_sibling_of_settings_json() {
+        assert_eq!(
+            model_overrides_path().file_name().unwrap(),
+            "models.json"
+        );
+        assert_eq!(
+            model_overrides_path().parent(),
+            default_path().parent()
+        );
     }
 }

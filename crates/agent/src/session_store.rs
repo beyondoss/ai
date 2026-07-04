@@ -2160,6 +2160,22 @@ fn title_or_clear(title: String) -> Option<String> {
     if title.is_empty() { None } else { Some(title) }
 }
 
+/// Basic metadata for one entry sitting in a [`SessionRepo`]'s `.trash/` subdirectory — see
+/// [`SessionRepo::list_trash`]. Deliberately minimal: enough to identify and restore an entry, not a
+/// full trash-management surface (title/preview/message-count are all still reachable by restoring the
+/// session and reading it normally).
+#[derive(Debug, Clone, Serialize)]
+pub struct TrashEntry {
+    /// The session id (the same `<id>` component [`SessionRepo::find_path`]/`path_for` key off).
+    pub id: String,
+    /// When the entry was moved into `.trash/` (its file's own mtime, Unix seconds) — `None` if the
+    /// filesystem couldn't report one.
+    pub deleted_at: Option<u64>,
+    /// Where [`SessionRepo::restore_session`] would move this entry back to — this repo's own
+    /// directory, under the file's original name (not `.trash/`'s copy).
+    pub original_path: String,
+}
+
 /// A directory of session files.
 pub struct SessionRepo {
     dir: PathBuf,
@@ -2342,6 +2358,113 @@ impl SessionRepo {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    /// List every session currently sitting in this repo's `.trash/` subdirectory (see [`Self::delete`]),
+    /// most-recently-deleted first — pi-parity gap (Fix 7): `delete` has always soft-deleted into
+    /// `.trash/`, but nothing anywhere read, listed, restored from, or pruned it, so a mistaken delete
+    /// was recoverable only by reaching for a shell. Deliberately minimal (id, when it was trashed, and
+    /// where it would be restored to) rather than a full trash-management surface — a client wanting more
+    /// (title/preview/message count) can always resolve `id` back through `--session`/`switch_session`'s
+    /// own machinery once restored.
+    ///
+    /// Returns an empty list (not an error) when `.trash/` doesn't exist yet — nothing has ever been
+    /// deleted here.
+    pub fn list_trash(&self) -> std::io::Result<Vec<TrashEntry>> {
+        let trash_dir = self.dir.join(".trash");
+        let read_dir = match fs::read_dir(&trash_dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let mut entries = Vec::new();
+        for entry in read_dir {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let Some(rest) = name.strip_suffix(".jsonl") else {
+                continue;
+            };
+            let Some((_, id)) = rest.split_once('_') else {
+                continue;
+            };
+            // Best-effort: a filesystem that can't report an mtime (rare) just leaves this `None` rather
+            // than failing the whole listing over one unreadable timestamp.
+            let deleted_at = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs());
+            entries.push(TrashEntry {
+                id: id.to_string(),
+                deleted_at,
+                original_path: self.dir.join(name).to_string_lossy().into_owned(),
+            });
+        }
+        entries.sort_by(|a, b| b.deleted_at.cmp(&a.deleted_at));
+        Ok(entries)
+    }
+
+    /// Move `id` back out of this repo's `.trash/` subdirectory to its original location (see
+    /// [`Self::delete`]/[`Self::list_trash`]). Exact-id match only (unlike `delete`'s own
+    /// prefix-fallback via `find_path`) — a client restoring an id almost always has the exact one
+    /// straight from `list_trash`'s own output, so the extra ambiguity surface isn't worth it here.
+    ///
+    /// `Ok(false)` when nothing in `.trash/` matches `id` — not found is not an error, matching
+    /// `delete`'s own idempotent convention; unlike `delete`, though, there's no meaningful "already
+    /// restored" no-op to collapse into `Ok(())`, so the caller must check this to know whether
+    /// anything actually happened. Fails clearly (rather than silently overwriting) if a session already
+    /// occupies the destination path — e.g. a new session was created with the same id after the delete.
+    pub fn restore_session(&self, id: &str) -> std::io::Result<bool> {
+        let trash_dir = self.dir.join(".trash");
+        let read_dir = match fs::read_dir(&trash_dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        let exact_suffix = format!("_{id}.jsonl");
+        let mut matched: Option<PathBuf> = None;
+        for entry in read_dir {
+            let path = entry?.path();
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(&exact_suffix))
+            {
+                matched = Some(path);
+                break;
+            }
+        }
+        let Some(path) = matched else {
+            return Ok(false);
+        };
+        // `path` was just built from a real directory entry's own file name, so this is always `Some`
+        // in practice — but production code here stays panic-free regardless (workspace lint), so a
+        // `None` (which should never happen) is a clear error instead of a panic.
+        let Some(file_name) = path.file_name() else {
+            return Err(std::io::Error::other(format!(
+                "trash entry for {id} has no file name: {}",
+                path.display()
+            )));
+        };
+        let dest = self.dir.join(file_name);
+        if dest.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "cannot restore session {id}: {} already exists",
+                    dest.display()
+                ),
+            ));
+        }
+        fs::rename(&path, &dest)?;
+        Ok(true)
     }
 
     /// Fork session `id` at `upto` messages: a new session whose transcript is the first `upto`
@@ -4906,6 +5029,81 @@ mod tests {
             "the deleted session's file should have moved into .trash: {trashed:?}"
         );
         assert_eq!(trashed[0].file_name(), original_path.file_name().unwrap());
+    }
+
+    #[test]
+    fn list_trash_is_empty_before_anything_is_deleted() {
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        repo.create(SessionMeta::new("/w", "m")).unwrap();
+        assert!(
+            repo.list_trash().unwrap().is_empty(),
+            "nothing has been deleted yet, so .trash/ doesn't even exist"
+        );
+    }
+
+    #[test]
+    fn list_trash_reports_a_deleted_session_by_id() {
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let id = store.meta().id.clone();
+
+        repo.delete(&id).unwrap();
+
+        let trash = repo.list_trash().unwrap();
+        assert_eq!(trash.len(), 1);
+        assert_eq!(trash[0].id, id);
+        assert!(trash[0].deleted_at.is_some());
+        assert!(trash[0].original_path.ends_with(&format!("_{id}.jsonl")));
+    }
+
+    #[test]
+    fn restore_session_moves_a_trashed_session_back_and_makes_it_listable_again() {
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let id = store.meta().id.clone();
+
+        repo.delete(&id).unwrap();
+        assert!(repo.list().unwrap().is_empty());
+
+        let restored = repo.restore_session(&id).unwrap();
+        assert!(restored, "restore_session must report it actually moved something");
+        assert!(
+            repo.list_trash().unwrap().is_empty(),
+            "the entry must no longer be in .trash/ once restored"
+        );
+        let listed = repo.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, id);
+    }
+
+    #[test]
+    fn restore_session_of_an_unknown_id_returns_false_not_an_error() {
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        assert!(!repo.restore_session("never-existed").unwrap());
+    }
+
+    #[test]
+    fn restore_session_fails_clearly_when_the_destination_is_already_occupied() {
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let id = store.meta().id.clone();
+        let original_path = store.path.clone();
+
+        repo.delete(&id).unwrap();
+        // Something else now occupies the original path (e.g. a new session using a colliding id is
+        // vanishingly unlikely in practice, but a hand-placed file is enough to prove the guard works).
+        fs::write(&original_path, "occupied").unwrap();
+
+        let err = repo.restore_session(&id).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        // The trashed copy must still be sitting in `.trash/` untouched — a failed restore is not a
+        // silent delete of the only remaining copy.
+        assert_eq!(repo.list_trash().unwrap().len(), 1);
     }
 
     #[test]

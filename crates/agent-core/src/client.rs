@@ -107,12 +107,60 @@ impl Drop for ApiKey {
     }
 }
 
-/// A live, ready-to-attach bearer credential for one request, plus the one bit of context header
-/// construction needs: whether this token came from an OAuth subscription login, which unlocks a
-/// provider-specific extra header set (see `send_with_retry`) — distinct from a plain static key.
+/// How a [`DirectRouting`]-carrying credential's request must reach its upstream when the default
+/// `{GatewayClient::base_url}{dialect.endpoint_path()}` composition is wrong for this provider.
+///
+/// Both GitHub Copilot and OpenAI Codex OAuth logins hand back a bearer token that's useless against
+/// the gateway's *default* provider (bare `/v1/…` always means "whichever provider the gateway's
+/// dialect default points at" — Anthropic or OpenAI direct, never Copilot/Codex): the gateway's
+/// `route.rs` `KNOWN_PROVIDERS` table is a set of **static** `(name, authority, dialect, auth)` rows,
+/// which fits Codex fine (`chatgpt.com` is a fixed host) but cannot express Copilot's endpoint at
+/// all — GitHub hands back a *different* proxy host per account/enterprise, embedded in the access
+/// token itself (`proxy-ep=…`), not knowable at gateway-boot time. So the two providers need two
+/// different fixes, both applied client-side rather than in the gateway's routing table:
+#[derive(Debug, Clone)]
+pub enum RouteOverride {
+    /// Still relayed through the gateway (`GatewayClient::base_url` unchanged) under a
+    /// `route::KNOWN_PROVIDERS` row's name as the first path segment (e.g. `"/openai-codex"`), with
+    /// `path` appended in place of the dialect's own default endpoint path — Codex's real path
+    /// (`/backend-api/codex/responses`) differs from the OpenAI-Responses dialect's usual
+    /// `/v1/responses`. Fits because Codex's host (`chatgpt.com`) is genuinely static.
+    Prefixed {
+        prefix: &'static str,
+        path: &'static str,
+    },
+    /// Bypasses the gateway entirely: `base_url` replaces `GatewayClient::base_url` outright — the
+    /// account-specific host baked into this credential's own token — with `path` in place of the
+    /// dialect's own default endpoint path (GitHub Copilot's OpenAI-wire endpoints omit the `/v1`
+    /// prefix the dialect's default path carries, e.g. `/chat/completions` not
+    /// `/v1/chat/completions` — only its Anthropic-wire endpoint matches the dialect default
+    /// verbatim). This is the same "forwarded as-is, no gateway involvement" shape the gateway's own
+    /// BYO-key concept already describes, just skipping the gateway hop too since there's no static
+    /// row that could route it there in the first place.
+    Direct { base_url: String, path: &'static str },
+}
+
+/// Extra per-request wiring a [`RouteOverride`]-carrying credential needs beyond the bearer token
+/// itself and the URL: static headers the provider requires (Codex's `chatgpt-account-id`; Copilot's
+/// fixed editor-identity headers), and/or GitHub Copilot's per-turn dynamic headers (see
+/// `copilot_initiator`/`copilot_has_images`).
+#[derive(Debug, Clone)]
+pub struct DirectRouting {
+    pub route: RouteOverride,
+    pub static_headers: Vec<(&'static str, String)>,
+    /// Attach GitHub Copilot's `X-Initiator`/`Openai-Intent`/`Copilot-Vision-Request` headers,
+    /// computed fresh per turn from this request's own messages — `false` for every other provider.
+    pub copilot_dynamic_headers: bool,
+}
+
+/// A live, ready-to-attach bearer credential for one request, plus the context header construction
+/// needs: whether this token came from an OAuth subscription login, which unlocks a provider-specific
+/// extra header set (see `send_with_retry`) — distinct from a plain static key — and, for a
+/// Copilot/Codex-sourced credential, where the request must actually go (see [`DirectRouting`]).
 pub struct Credential {
     key: ApiKey,
     is_oauth: bool,
+    direct: Option<DirectRouting>,
 }
 
 impl Credential {
@@ -120,7 +168,17 @@ impl Credential {
         Self {
             key: ApiKey::new(key),
             is_oauth,
+            direct: None,
         }
+    }
+
+    /// Tags this credential with where its request must actually go and what extra headers it needs
+    /// — used by a `CredentialSource` wrapper (e.g. `agent::main`'s per-provider OAuth resolution)
+    /// that already knows, from which OAuth provider it resolved, that the plain gateway-relative URL
+    /// this crate would otherwise build is wrong for this token. See [`RouteOverride`].
+    pub fn with_direct_routing(mut self, routing: DirectRouting) -> Self {
+        self.direct = Some(routing);
+        self
     }
 }
 
@@ -147,6 +205,7 @@ impl CredentialSource for StaticCredential {
         Ok(Credential {
             key: self.0.clone(),
             is_oauth: false,
+            direct: None,
         })
     }
 }
@@ -241,14 +300,41 @@ impl ModelTransport for GatewayClient {
             req.messages = fixed.into();
         }
         let dialect = Dialect::for_model(&req.model);
-        let url = format!("{}{}", self.base_url, dialect.endpoint_path());
-        let body = dialect.build_body(&req);
-        let http = self.http.clone();
         // Resolved fresh for this turn rather than a field snapshot — the seam that lets a
         // credential expire and be refreshed mid-process (see `CredentialSource`'s doc comment).
         // `send_with_retry`'s own internal transient-failure retries never hit 401, so one fetch per
         // `stream()` call (once per model turn) is all that's needed, not one per retry attempt.
+        // Fetched before `url` is built (rather than after, as a plain-key client would): a
+        // Copilot/Codex-sourced credential's `direct` routing (see `RouteOverride`) determines the URL
+        // itself, not just the bearer value.
         let credential = self.credential_source.credential().await?;
+        let url = match credential.direct.as_ref().map(|d| &d.route) {
+            Some(RouteOverride::Prefixed { prefix, path }) => {
+                format!("{}{prefix}{path}", self.base_url)
+            }
+            Some(RouteOverride::Direct { base_url, path }) => format!("{base_url}{path}"),
+            None => format!("{}{}", self.base_url, dialect.endpoint_path()),
+        };
+        // GitHub Copilot's per-turn dynamic headers (see `DirectRouting::copilot_dynamic_headers`'s
+        // doc comment) — computed here, before `req` is otherwise consumed, from this turn's own
+        // messages. `None` for every credential but a Copilot one.
+        let copilot_dynamic = credential
+            .direct
+            .as_ref()
+            .filter(|d| d.copilot_dynamic_headers)
+            .map(|_| (copilot_initiator(&req.messages), copilot_has_images(&req.messages)));
+        let direct_headers: Vec<(&'static str, String)> = credential
+            .direct
+            .as_ref()
+            .map(|d| d.static_headers.clone())
+            .unwrap_or_default();
+        // Anthropic's own OAuth identity-spoofing headers (`CLAUDE_CODE_BETA`/`CLAUDE_CLI_IDENTITY`
+        // etc., below) only apply to a genuine direct-to-Anthropic request — a Claude-family model
+        // routed through a Copilot credential (`direct.is_some()`) is `is_oauth` too, but must not
+        // also claim to be the Anthropic-official Claude Code client to GitHub's Copilot proxy.
+        let has_direct_override = credential.direct.is_some();
+        let body = dialect.build_body(&req);
+        let http = self.http.clone();
         let max_retries = self.max_retries;
         let base_backoff = self.base_backoff;
 
@@ -284,11 +370,16 @@ impl ModelTransport for GatewayClient {
                 credential.key.expose(),
                 &body,
                 is_anthropic,
-                credential.is_oauth,
+                // Only a genuine direct-to-Anthropic OAuth login gets Anthropic's own identity-
+                // spoofing headers — never a Copilot-routed request that merely happens to be
+                // Claude-family (see `has_direct_override`'s doc comment above).
+                credential.is_oauth && !has_direct_override,
                 needs_interleaved_beta,
                 needs_fine_grained_tool_streaming_beta,
                 session_affinity_header.as_deref(),
                 send_x_session_affinity,
+                &direct_headers,
+                copilot_dynamic,
                 max_retries,
                 base_backoff,
             )
@@ -444,9 +535,36 @@ fn anthropic_betas(
     betas
 }
 
+/// GitHub Copilot expects `X-Initiator` to say whether this turn is user-initiated or a follow-up
+/// after the assistant/a tool already spoke — matches pi's `inferCopilotInitiator`
+/// (`packages/ai/src/api/github-copilot-headers.ts`): the *last* message's role decides it, defaulting
+/// to `"user"` when there's no history at all.
+fn copilot_initiator(messages: &[crate::message::Message]) -> &'static str {
+    match messages.last() {
+        Some(m) if m.role != crate::message::Role::User => "agent",
+        _ => "user",
+    }
+}
+
+/// GitHub Copilot requires `Copilot-Vision-Request: true` on any turn carrying an image — an
+/// `Image` content block (a fresh attachment) or a `ToolResult`'s own `images` (e.g. a screenshot a
+/// tool produced) — matches pi's `hasCopilotVisionInput`. Both block shapes only ever appear on a
+/// `User`-role message in this crate's model (see `message::ContentBlock`'s own doc comment), so
+/// scanning every message's content is equivalent to pi's separate `user`/`toolResult`-role check.
+fn copilot_has_images(messages: &[crate::message::Message]) -> bool {
+    use crate::message::ContentBlock;
+    messages.iter().any(|m| {
+        m.content.iter().any(|block| match block {
+            ContentBlock::Image { .. } => true,
+            ContentBlock::ToolResult { images, .. } => !images.is_empty(),
+            _ => false,
+        })
+    })
+}
+
 /// POST the request body, retrying transient failures with exponential backoff until a successful
 /// response or the retry budget is exhausted. Honors a `Retry-After` header when the server sends one.
-// 9 arguments, all independent inputs a single call site (`GatewayClient::stream`) already has in
+// 11 arguments, all independent inputs a single call site (`GatewayClient::stream`) already has in
 // scope from `self`/the request — bundling them into a struct would just be a second place those same
 // fields live, not a reduction in what the function needs to know. Private, single-caller helper, not
 // a public API shape, so the usual "too many params signals a missing abstraction" concern doesn't
@@ -463,12 +581,31 @@ async fn send_with_retry(
     needs_fine_grained_tool_streaming_beta: bool,
     session_affinity_header: Option<&str>,
     send_x_session_affinity: bool,
+    // Static headers a `DirectRouting`-carrying credential requires (Codex's `chatgpt-account-id`;
+    // Copilot's fixed editor-identity headers) — empty for every plain gateway-routed request.
+    direct_headers: &[(&'static str, String)],
+    // GitHub Copilot's per-turn dynamic headers, precomputed in `GatewayClient::stream` from this
+    // turn's own messages: `(X-Initiator value, has an image)` — `None` for every provider but
+    // Copilot.
+    copilot_dynamic: Option<(&'static str, bool)>,
     max_retries: u32,
     base_backoff: Duration,
 ) -> Result<reqwest::Response> {
     let mut attempt = 0u32;
     loop {
         let mut builder = http.post(url).bearer_auth(api_key).json(body);
+        for (name, value) in direct_headers {
+            builder = builder.header(*name, value.as_str());
+        }
+        if let Some((initiator, has_images)) = copilot_dynamic {
+            // Matches pi's `buildCopilotDynamicHeaders` (`github-copilot-headers.ts`).
+            builder = builder
+                .header("X-Initiator", initiator)
+                .header("Openai-Intent", "conversation-edits");
+            if has_images {
+                builder = builder.header("Copilot-Vision-Request", "true");
+            }
+        }
         if let Some(session_id) = session_affinity_header {
             // pi sends `session_id` (`compat.sendSessionIdHeader`, true by default for native OpenAI)
             // and `x-client-request-id` for both OpenAI dialects, both carrying the same value. Missing
@@ -1342,6 +1479,229 @@ mod tests {
         assert!(
             !body.contains("\"content\":[]"),
             "no message should reach the wire with empty content either, got body:\n{body}"
+        );
+    }
+
+    /// A fixed [`DirectRouting`]-carrying credential — the test double proving the routing mechanism
+    /// itself (pi-parity fix: a Copilot/Codex-sourced credential previously always sent its bearer
+    /// token to a bare gateway-default path, never its real upstream).
+    struct DirectTestCredential(DirectRouting);
+
+    #[async_trait]
+    impl CredentialSource for DirectTestCredential {
+        async fn credential(&self) -> Result<Credential> {
+            Ok(Credential::new("test-oauth-token", true).with_direct_routing(self.0.clone()))
+        }
+    }
+
+    /// Proves [`RouteOverride::Prefixed`] (the OpenAI-Codex shape): the request still goes to
+    /// `GatewayClient::base_url` (through the gateway) but under the provider prefix, with Codex's
+    /// static headers attached — and critically, *not* at the dialect's own bare default path
+    /// (`/v1/responses`), which is exactly the bug this fix closes (a Codex-credentialed request
+    /// silently landing on the gateway's default OpenAI provider instead of `chatgpt.com`).
+    #[tokio::test]
+    async fn prefixed_route_override_reaches_the_gateway_under_the_provider_prefix_with_static_headers()
+     {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+            drop(stream);
+            request
+        });
+
+        let routing = DirectRouting {
+            route: RouteOverride::Prefixed {
+                prefix: "/openai-codex",
+                path: "/backend-api/codex/responses",
+            },
+            static_headers: vec![
+                ("chatgpt-account-id", "acct_123".to_string()),
+                ("originator", "beyond-ai-agent".to_string()),
+                ("OpenAI-Beta", "responses=experimental".to_string()),
+            ],
+            copilot_dynamic_headers: false,
+        };
+        let client = GatewayClient::with_credential_source(
+            format!("http://{addr}"),
+            Arc::new(DirectTestCredential(routing)),
+        )
+        .unwrap();
+        // `gpt-5-codex` is `Dialect::OpenAiResponses` — its bare default path is `/v1/responses`,
+        // which must NOT be what actually goes out.
+        let req = ModelRequest::new("gpt-5-codex", Vec::new(), 100);
+        let mut events = client.stream(req).await.unwrap();
+        while events.next().await.is_some() {}
+
+        let request = server.join().unwrap();
+        let request_line = request.lines().next().unwrap_or_default();
+        assert_eq!(
+            request_line, "POST /openai-codex/backend-api/codex/responses HTTP/1.1",
+            "expected the prefixed+path-overridden request line, got:\n{request}"
+        );
+        assert!(
+            !request.to_lowercase().contains("post /v1/responses"),
+            "must not silently fall back to the dialect's own bare default path, got:\n{request}"
+        );
+        assert!(
+            request.contains("chatgpt-account-id: acct_123"),
+            "missing chatgpt-account-id header, got:\n{request}"
+        );
+        assert!(
+            request.contains("originator: beyond-ai-agent"),
+            "missing originator header, got:\n{request}"
+        );
+        assert!(
+            request.to_lowercase().contains("openai-beta: responses=experimental"),
+            "missing OpenAI-Beta header, got:\n{request}"
+        );
+    }
+
+    /// Proves [`RouteOverride::Direct`] (the GitHub Copilot shape): the request bypasses
+    /// `GatewayClient::base_url` entirely (which here points at a closed port that would fail fast if
+    /// ever actually dialed) and lands on the credential's own account-specific host, at Copilot's
+    /// real path (`/chat/completions`, no `/v1` — distinct from the OpenAI dialect's own default
+    /// `/v1/chat/completions`), carrying both Copilot's fixed editor-identity header and its per-turn
+    /// dynamic `X-Initiator`/`Openai-Intent` headers — and, despite `is_oauth: true`, none of
+    /// Anthropic's own OAuth identity-spoofing headers (this is a Copilot host, not Anthropic's).
+    #[tokio::test]
+    async fn direct_route_override_bypasses_the_gateway_base_url_and_attaches_copilot_headers() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+            drop(stream);
+            request
+        });
+
+        let routing = DirectRouting {
+            route: RouteOverride::Direct {
+                base_url: format!("http://{addr}"),
+                path: "/chat/completions",
+            },
+            static_headers: vec![("User-Agent", "GitHubCopilotChat/0.35.0".to_string())],
+            copilot_dynamic_headers: true,
+        };
+        let client = GatewayClient::with_credential_source(
+            // A closed port: if the client ever mistakenly used this instead of the credential's own
+            // `Direct` base_url, the connection would fail fast (refused) rather than this test
+            // hanging or flaking on a slow DNS timeout.
+            "http://127.0.0.1:1".to_string(),
+            Arc::new(DirectTestCredential(routing)),
+        )
+        .unwrap();
+        // `llama-3.1-70b` is `Dialect::OpenAi` (Chat Completions) — its bare default path is
+        // `/v1/chat/completions`, which Copilot's real endpoint does not have.
+        let messages = vec![crate::message::Message::user("hi")];
+        let req = ModelRequest::new("llama-3.1-70b", messages, 100);
+        let mut events = client.stream(req).await.unwrap();
+        while events.next().await.is_some() {}
+
+        let request = server.join().unwrap();
+        let request_line = request.lines().next().unwrap_or_default();
+        assert_eq!(
+            request_line, "POST /chat/completions HTTP/1.1",
+            "expected Copilot's own path with no /v1 prefix, got:\n{request}"
+        );
+        let lower = request.to_lowercase();
+        assert!(
+            lower.contains("user-agent: githubcopilotchat"),
+            "missing Copilot's fixed editor-identity header, got:\n{request}"
+        );
+        assert!(
+            lower.contains("x-initiator: user"),
+            "missing X-Initiator (no prior assistant/tool turn ⇒ user), got:\n{request}"
+        );
+        assert!(
+            lower.contains("openai-intent: conversation-edits"),
+            "missing Openai-Intent header, got:\n{request}"
+        );
+        assert!(
+            !lower.contains("copilot-vision-request"),
+            "no image in this turn — Copilot-Vision-Request must be absent, got:\n{request}"
+        );
+        assert!(
+            !request.contains("claude-code-20250219") && !lower.contains("x-app: cli"),
+            "an is_oauth Copilot credential must not carry Anthropic's own OAuth identity-spoofing \
+             headers, got:\n{request}"
+        );
+    }
+
+    /// A Copilot turn whose last message is an assistant/tool follow-up (not a fresh user message)
+    /// gets `X-Initiator: agent`; one carrying an image gets `Copilot-Vision-Request: true` — both
+    /// computed fresh per turn from the request's own messages, matching pi's
+    /// `inferCopilotInitiator`/`hasCopilotVisionInput`.
+    #[tokio::test]
+    async fn copilot_dynamic_headers_reflect_the_turns_own_messages() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+            drop(stream);
+            request
+        });
+
+        let routing = DirectRouting {
+            route: RouteOverride::Direct {
+                base_url: format!("http://{addr}"),
+                path: "/v1/messages",
+            },
+            static_headers: Vec::new(),
+            copilot_dynamic_headers: true,
+        };
+        let client = GatewayClient::with_credential_source(
+            "http://127.0.0.1:1".to_string(),
+            Arc::new(DirectTestCredential(routing)),
+        )
+        .unwrap();
+        let messages = vec![
+            crate::message::Message::user("read this screenshot"),
+            crate::message::Message::assistant(vec![crate::message::ContentBlock::text(
+                "looking now",
+            )]),
+            crate::message::Message::user_with_images(
+                "",
+                vec![crate::message::ImageSource::base64("image/png", "QQ==")],
+            ),
+        ];
+        let req = ModelRequest::new("claude-opus-4-8", messages, 100);
+        let mut events = client.stream(req).await.unwrap();
+        while events.next().await.is_some() {}
+
+        let request = server.join().unwrap();
+        let lower = request.to_lowercase();
+        // The last message is the image-carrying user turn, so this is still user-initiated.
+        assert!(
+            lower.contains("x-initiator: user"),
+            "the last message is a fresh user turn, got:\n{request}"
+        );
+        assert!(
+            lower.contains("copilot-vision-request: true"),
+            "an Image content block in this turn must set Copilot-Vision-Request, got:\n{request}"
         );
     }
 }

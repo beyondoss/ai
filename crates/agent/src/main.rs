@@ -163,40 +163,197 @@ fn parse_reasoning_effort(s: &str) -> Result<agent_core::ReasoningEffort, String
 /// If both a direct Anthropic credential and a Copilot credential (whose `available_model_ids`
 /// includes `model`) are stored, the direct credential wins — checked first below, preferring the
 /// more specific, directly-authenticated relationship over a proxy.
+/// Adapts a plain OAuth [`agent_core::client::CredentialSource`] (bearer token + `is_oauth`, from
+/// `OAuthCredentialSource`) with routing info the source itself has no way to compute — GitHub
+/// Copilot's account-specific proxy host, or OpenAI Codex's distinct backend path/headers — neither
+/// of which the gateway's static `KNOWN_PROVIDERS` table can express as a row the way it does for
+/// Anthropic/OpenAI direct (see `agent_core::client::RouteOverride`'s doc comment). `routing` is
+/// computed once here, from whichever credential is on disk *now* — the same granularity
+/// `GatewayClient::base_url` itself already resolves at construction, not fresh per turn — rather
+/// than re-derived from the live, possibly-just-refreshed token on every request; the two pieces of
+/// data this stands in for (Copilot's `proxy-ep` host, Codex's account id) are properties of the
+/// *account*, not of any one token, so they don't change across an in-process refresh of the same
+/// login.
+struct DirectRoutedCredentialSource {
+    inner: Arc<dyn agent_core::client::CredentialSource>,
+    routing: agent_core::client::DirectRouting,
+}
+
+#[async_trait::async_trait]
+impl agent_core::client::CredentialSource for DirectRoutedCredentialSource {
+    async fn credential(&self) -> agent_core::Result<agent_core::client::Credential> {
+        let credential = self.inner.credential().await?;
+        Ok(credential.with_direct_routing(self.routing.clone()))
+    }
+}
+
+/// A [`agent_core::client::CredentialSource`] for a `models.json` `base_url` override (Fix 9 —
+/// pi-parity feature: pi's own `model-registry.ts` custom-model/override support). Unlike
+/// [`DirectRoutedCredentialSource`] above (which wraps an existing OAuth source and only adds routing),
+/// this *is* the credential: a fixed bearer token — the override's own `api_key`, else whatever
+/// `--key`/`AI_AGENT_KEY` resolved to, else empty (many self-hosted OpenAI-compatible servers, like
+/// Ollama/LM Studio, ignore the `Authorization` header entirely) — plus the same [`agent_core::client::
+/// DirectRouting`] mechanism reused, not duplicated, to send the request straight to the override's
+/// `base_url`, bypassing the gateway outright.
+struct StaticDirectCredentialSource {
+    bearer: String,
+    routing: agent_core::client::DirectRouting,
+}
+
+#[async_trait::async_trait]
+impl agent_core::client::CredentialSource for StaticDirectCredentialSource {
+    async fn credential(&self) -> agent_core::Result<agent_core::client::Credential> {
+        Ok(
+            agent_core::client::Credential::new(self.bearer.clone(), false)
+                .with_direct_routing(self.routing.clone()),
+        )
+    }
+}
+
+/// OpenAI's own approved identity string for this tool's OAuth grant (`build_authorize_url` in
+/// `oauth/openai_codex.rs` already sends this as the `originator` query param at login time) — reused
+/// verbatim here so a live Codex inference request presents the same identity the account authorized,
+/// rather than a second, inconsistent one.
+const CODEX_ORIGINATOR: &str = "beyond-ai-agent";
+
+/// GitHub Copilot's fixed editor-identity headers, required on every live inference request (not just
+/// the OAuth/model-management calls) — see `GITHUB_COPILOT_MODELS`' own per-model `headers` field in
+/// pi-mono (`packages/ai/src/providers/github-copilot.models.ts`). Duplicated from the private
+/// constants of the same values in `oauth::github_copilot` (`COPILOT_USER_AGENT` et al.) rather than
+/// exported from there: those are login/refresh-flow internals, and this crate's own convention
+/// (`auth_store.rs`'s `FileLock`, `Secret`) is to duplicate a small, self-contained constant rather
+/// than widen another module's private surface for one call site.
+const COPILOT_STATIC_HEADERS: [(&str, &str); 4] = [
+    ("User-Agent", "GitHubCopilotChat/0.35.0"),
+    ("Editor-Version", "vscode/1.107.0"),
+    ("Editor-Plugin-Version", "copilot-chat/0.35.0"),
+    ("Copilot-Integration-Id", "vscode-chat"),
+];
+
+/// GitHub Copilot's real endpoint path per dialect — **not** the dialect's own default
+/// `endpoint_path()`: Copilot's OpenAI-wire endpoints omit the `/v1` prefix pi's official SDKs bake
+/// into their default `baseURL` (so the SDK's own `/chat/completions`/`/responses` relative paths land
+/// bare on Copilot's host), while its Anthropic-wire endpoint matches the dialect default verbatim
+/// (the Anthropic SDK's default `baseURL` carries no version segment, so it *always* appends
+/// `/v1/messages` itself). See `packages/ai/src/api/{anthropic-messages,openai-completions,
+/// openai-responses}.ts` in pi-mono (each sets `baseURL: model.baseUrl` on the vendor SDK, which then
+/// appends its own fixed relative path).
+fn copilot_endpoint_path(dialect: agent_core::dialect::Dialect) -> &'static str {
+    match dialect {
+        agent_core::dialect::Dialect::Anthropic => "/v1/messages",
+        agent_core::dialect::Dialect::OpenAi => "/chat/completions",
+        agent_core::dialect::Dialect::OpenAiResponses => "/responses",
+    }
+}
+
 fn resolve_gateway_credential(
     key: Option<String>,
     model: &str,
 ) -> Result<serve::GatewayCredential, String> {
+    // Fix 9 (pi-parity feature): a `models.json` override naming a `base_url` for this exact model id
+    // wins outright, regardless of whether `--key`/`AI_AGENT_KEY` was also given — the override
+    // redirects *where* the request goes (a locally-hosted or alternate-provider endpoint, entirely
+    // bypassing the gateway), which is orthogonal to *how* it authenticates. Reuses the same
+    // `DirectRouting`/`RouteOverride::Direct` mechanism the GitHub-Copilot OAuth routing below already
+    // relies on, rather than duplicating it — see `settings::ModelOverride`'s own doc comment for the
+    // on-disk schema.
+    if let Some(over) = beyond_ai_agent::settings::ModelOverrides::open_default().get(model) {
+        if let Some(base_url) = over.base_url.clone() {
+            let dialect = agent_core::dialect::Dialect::for_model(model);
+            let bearer = over
+                .api_key
+                .clone()
+                .or_else(|| key.clone())
+                .unwrap_or_default();
+            let routing = agent_core::client::DirectRouting {
+                route: agent_core::client::RouteOverride::Direct {
+                    base_url,
+                    path: dialect.endpoint_path(),
+                },
+                static_headers: Vec::new(),
+                copilot_dynamic_headers: false,
+            };
+            return Ok(serve::GatewayCredential::Oauth(Arc::new(
+                StaticDirectCredentialSource { bearer, routing },
+            )));
+        }
+    }
+
     if let Some(key) = key {
         return Ok(serve::GatewayCredential::Static(key));
     }
 
     let store = beyond_ai_agent::auth_store::AuthStore::open_default();
     let oauth_source = |provider: beyond_ai_agent::oauth::OAuthProviderId| {
-        serve::GatewayCredential::Oauth(Arc::new(
-            beyond_ai_agent::auth_credential_source::OAuthCredentialSource::new(
-                provider,
-                beyond_ai_agent::auth_store::default_path(),
-            ),
-        ))
+        Arc::new(beyond_ai_agent::auth_credential_source::OAuthCredentialSource::new(
+            provider,
+            beyond_ai_agent::auth_store::default_path(),
+        )) as Arc<dyn agent_core::client::CredentialSource>
     };
 
     if agent_core::dialect::Dialect::for_model(model) == agent_core::dialect::Dialect::Anthropic
         && store.get("anthropic").is_some()
     {
-        return Ok(oauth_source(beyond_ai_agent::oauth::OAuthProviderId::Anthropic));
+        return Ok(serve::GatewayCredential::Oauth(oauth_source(
+            beyond_ai_agent::oauth::OAuthProviderId::Anthropic,
+        )));
     }
-    if model.contains("codex") && store.get("openai-codex").is_some() {
-        return Ok(oauth_source(
-            beyond_ai_agent::oauth::OAuthProviderId::OpenaiCodex,
-        ));
+    if model.contains("codex") {
+        if let Some(stored) = store.get("openai-codex") {
+            if let beyond_ai_agent::oauth::OAuthCredential::OpenaiCodex(c) = &stored.credential {
+                // Still relayed through the gateway (a new `KNOWN_PROVIDERS` row: `chatgpt.com` is a
+                // genuinely static host) under the `/openai-codex` prefix, with the account id this
+                // backend requires attached as a static header — see `RouteOverride::Prefixed`.
+                let routing = agent_core::client::DirectRouting {
+                    route: agent_core::client::RouteOverride::Prefixed {
+                        prefix: "/openai-codex",
+                        path: "/backend-api/codex/responses",
+                    },
+                    static_headers: vec![
+                        ("chatgpt-account-id", c.account_id.clone()),
+                        ("originator", CODEX_ORIGINATOR.to_string()),
+                        ("OpenAI-Beta", "responses=experimental".to_string()),
+                    ],
+                    copilot_dynamic_headers: false,
+                };
+                return Ok(serve::GatewayCredential::Oauth(Arc::new(
+                    DirectRoutedCredentialSource {
+                        inner: oauth_source(beyond_ai_agent::oauth::OAuthProviderId::OpenaiCodex),
+                        routing,
+                    },
+                )));
+            }
+        }
     }
     if let Some(stored) = store.get("github-copilot") {
         if let beyond_ai_agent::oauth::OAuthCredential::GithubCopilot(c) = &stored.credential {
             if c.available_model_ids.iter().any(|m| m == model) {
-                return Ok(oauth_source(
-                    beyond_ai_agent::oauth::OAuthProviderId::GithubCopilot,
-                ));
+                // Bypasses the gateway entirely: GitHub hands back a *different* proxy host per
+                // account/enterprise, embedded in the access token itself (`proxy-ep=…`) — not a
+                // static host the gateway's `KNOWN_PROVIDERS` table could ever hold as a row. See
+                // `RouteOverride::Direct`.
+                let dialect = agent_core::dialect::Dialect::for_model(model);
+                let base_url = beyond_ai_agent::oauth::github_copilot::base_url_from_token(
+                    Some(c.access.as_str()),
+                    c.enterprise_url.as_deref(),
+                );
+                let routing = agent_core::client::DirectRouting {
+                    route: agent_core::client::RouteOverride::Direct {
+                        base_url,
+                        path: copilot_endpoint_path(dialect),
+                    },
+                    static_headers: COPILOT_STATIC_HEADERS
+                        .iter()
+                        .map(|(name, value)| (*name, value.to_string()))
+                        .collect(),
+                    copilot_dynamic_headers: true,
+                };
+                return Ok(serve::GatewayCredential::Oauth(Arc::new(
+                    DirectRoutedCredentialSource {
+                        inner: oauth_source(beyond_ai_agent::oauth::OAuthProviderId::GithubCopilot),
+                        routing,
+                    },
+                )));
             }
         }
     }
@@ -341,8 +498,11 @@ enum Command {
         /// Reasoning effort for models driven by an effort level rather than a token budget (OpenAI
         /// reasoning models via `reasoning_effort`; Anthropic adaptive-thinking models via
         /// `output_config.effort`). One of minimal/low/medium/high/xhigh. Ignored by models that take
-        /// neither shape. `serve`'s identical flag.
-        #[arg(long, value_parser = parse_reasoning_effort)]
+        /// neither shape. Falls back to `AI_AGENT_REASONING_EFFORT`, then the stored
+        /// `agent settings --default-reasoning-effort` default (Fix 2 — pi-parity gap: previously the
+        /// only numeric/string CLI tunable with no persisted-default fallback at all), before finally
+        /// leaving it unset. `serve`'s identical flag.
+        #[arg(long, env = "AI_AGENT_REASONING_EFFORT", value_parser = parse_reasoning_effort)]
         reasoning_effort: Option<agent_core::ReasoningEffort>,
         /// Sampling temperature. Omitted (leaving the provider default) unless set. Silently ignored by
         /// Anthropic while `--thinking` is set (Anthropic forbids the two together). `serve`'s identical
@@ -642,8 +802,10 @@ enum Command {
         /// Reasoning effort for models driven by an effort level rather than a token budget (OpenAI
         /// reasoning models via `reasoning_effort`; Anthropic adaptive-thinking models via
         /// `output_config.effort`). One of minimal/low/medium/high/xhigh. Ignored by models that take
-        /// neither shape.
-        #[arg(long, value_parser = parse_reasoning_effort)]
+        /// neither shape. Falls back to `AI_AGENT_REASONING_EFFORT`, then the stored
+        /// `agent settings --default-reasoning-effort` default, before finally leaving it unset. `run`'s
+        /// identical flag.
+        #[arg(long, env = "AI_AGENT_REASONING_EFFORT", value_parser = parse_reasoning_effort)]
         reasoning_effort: Option<agent_core::ReasoningEffort>,
         /// Sampling temperature. Omitted (leaving the provider default) unless set. Silently ignored by
         /// Anthropic while `--thinking` is set (Anthropic forbids the two together). `run`'s identical
@@ -883,6 +1045,15 @@ enum Command {
         /// Clear the stored default project-trust policy.
         #[arg(long, default_value_t = false)]
         clear_default_project_trust: bool,
+        /// Set the stored default reasoning effort — one of minimal/low/medium/high/xhigh (used when
+        /// neither `--reasoning-effort` nor `AI_AGENT_REASONING_EFFORT` is given). Fix 2 (pi-parity
+        /// gap): previously the only numeric/string CLI tunable with no persisted-default surface at
+        /// all, unlike `--model`/`--gateway-url`/`--session-dir` above.
+        #[arg(long, value_parser = parse_reasoning_effort)]
+        default_reasoning_effort: Option<agent_core::ReasoningEffort>,
+        /// Clear the stored default reasoning effort.
+        #[arg(long, default_value_t = false)]
+        clear_default_reasoning_effort: bool,
     },
     /// Render an existing session's `.jsonl` file as a self-contained HTML transcript and exit — pure
     /// offline rendering of what's already on disk, no gateway/key/model involved at all (unlike `run
@@ -1284,10 +1455,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let resolved_model = model
                 .or_else(|| stored_settings.get().default_model.clone())
                 .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+            // Fix 10 (pi-parity feature): `run`'s identical resolution — see that call site's doc
+            // comment for why this must happen before `resolve_gateway_credential` below.
+            let resolved_model = serve::resolve_model_id(&resolved_model, serve::available_models())
+                .map_err(|e| format!("--model {resolved_model:?}: {e}"))?;
             // The one further fallback tier below `--key`/`AI_AGENT_KEY`: an inferred, stored OAuth
             // subscription login for whichever provider `resolved_model` implies. See
             // `resolve_gateway_credential`'s own doc comment.
             let key = resolve_gateway_credential(key, &resolved_model)?;
+            // Fix 2 (pi-parity gap): `run`'s identical stored-default fallback for `--reasoning-effort`
+            // — see that call site's doc comment.
+            let reasoning_effort = reasoning_effort.or_else(|| {
+                stored_settings
+                    .get()
+                    .default_reasoning_effort
+                    .as_deref()
+                    .and_then(|s| parse_reasoning_effort(s).ok())
+            });
             let resolved_session_dir = session_dir.or_else(|| {
                 // Only synthesize a stored default when *neither* explicit flag was given —
                 // `Persistence::open` checks `session_dir` before `session_file`, so filling in a
@@ -1342,6 +1526,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 extra_skill_paths,
                 extra_prompt_template_paths,
                 name,
+                // Fix 1 (pi-parity gap): previously never threaded into `serve` at all, so a persisted
+                // `agent settings --default-project-trust` policy had zero effect on serve sessions even
+                // though `run` above already partially honored it — see `serve::resolve_project_trust`,
+                // the shared precedence both now consult.
+                default_project_trust: stored_settings.get().default_project_trust,
             })
             .await?;
             // `serve` reads stdin via `tokio::io::stdin()`, which parks a dedicated blocking OS
@@ -1498,6 +1687,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             clear_session_dir,
             default_project_trust,
             clear_default_project_trust,
+            default_reasoning_effort,
+            clear_default_reasoning_effort,
         } => {
             let mut store = beyond_ai_agent::settings::SettingsStore::open_default();
             let any_write = model.is_some()
@@ -1507,7 +1698,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 || session_dir.is_some()
                 || clear_session_dir
                 || default_project_trust.is_some()
-                || clear_default_project_trust;
+                || clear_default_project_trust
+                || default_reasoning_effort.is_some()
+                || clear_default_reasoning_effort;
             if model.is_some() || clear_model {
                 store.set_default_model(model)?;
             }
@@ -1519,6 +1712,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             if default_project_trust.is_some() || clear_default_project_trust {
                 store.set_default_project_trust(default_project_trust)?;
+            }
+            if default_reasoning_effort.is_some() || clear_default_reasoning_effort {
+                store.set_default_reasoning_effort(
+                    default_reasoning_effort.map(|e| e.as_str().to_string()),
+                )?;
             }
             if any_write {
                 println!("updated settings:");
@@ -1545,6 +1743,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     None => "(not set)",
                 }
             );
+            println!(
+                "default_reasoning_effort: {}",
+                s.default_reasoning_effort.as_deref().unwrap_or("(not set)")
+            );
+            // Fix 9's "CLI-visible" requirement: this file is entirely hand-edited (like pi's own
+            // `models.json`), with no `--set`/`--clear` flags of its own here — just enough surface so
+            // an operator debugging "why is this model still hitting the gateway" can confirm the file
+            // is actually being read, and how many overrides it currently holds, without a dedicated
+            // dump-the-whole-file command.
+            let overrides = beyond_ai_agent::settings::ModelOverrides::open_default();
+            let overrides_path = beyond_ai_agent::settings::model_overrides_path();
+            if overrides.is_empty() {
+                println!(
+                    "model_overrides: {} (not present or empty)",
+                    overrides_path.display()
+                );
+            } else {
+                println!(
+                    "model_overrides: {} ({} model id(s) overridden)",
+                    overrides_path.display(),
+                    overrides.len()
+                );
+            }
         }
         Command::Export { session, output } => {
             let (store, sess) =
@@ -2032,6 +2253,17 @@ async fn run_task(
     let gateway = gateway_url
         .or_else(|| stored_settings.get().default_gateway_url.clone())
         .unwrap_or_else(|| DEFAULT_GATEWAY.to_string());
+    // Fix 2 (pi-parity gap): `--reasoning-effort` previously had no persisted stored-default fallback at
+    // all, unlike `default_model`/`default_gateway_url`/`default_session_dir` — same precedence tier
+    // (explicit flag, already resolved against `AI_AGENT_REASONING_EFFORT` by clap, then this stored
+    // setting, then finally left unset).
+    let reasoning_effort = reasoning_effort.or_else(|| {
+        stored_settings
+            .get()
+            .default_reasoning_effort
+            .as_deref()
+            .and_then(|s| parse_reasoning_effort(s).ok())
+    });
     // Whether the operator explicitly passed `--model`, as opposed to `run` falling back to a stored
     // default or `DEFAULT_MODEL` — the distinction a reopened `--session`/`--continue` needs below to
     // know whether to keep going on the model the session was actually last driven on instead of
@@ -2043,30 +2275,34 @@ async fn run_task(
     let model = model
         .or_else(|| stored_settings.get().default_model.clone())
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+    // Fix 10 (pi-parity feature): resolve a partial/fuzzy `--model` id against the known-model hint list
+    // before it's used for anything else — dialect inference, OAuth-provider inference, and the model
+    // itself all key off the *resolved* id, so this must happen before `resolve_gateway_credential`
+    // below. An ambiguous partial match fails the whole invocation clearly (naming every candidate)
+    // rather than guessing; a genuinely unrecognized id (no partial match at all) is forwarded
+    // unchanged — see `serve::resolve_model_id`'s own doc comment.
+    let model = serve::resolve_model_id(&model, serve::available_models())
+        .map_err(|e| format!("--model {model:?}: {e}"))?;
     let key = resolve_gateway_credential(key, &model)?;
 
     // Computed once and reused below (rather than called again inside the warning check) — it's a
     // filesystem walk (`has_trust_gated_resources`'s own doc comment), not free.
     let has_gated_resources = beyond_ai_agent::trust_store::has_trust_gated_resources(&cwd);
-    // `--trust-project`/`--force-untrusted` always win outright when explicitly given — a persisted
-    // `agent settings --default-project-trust` policy (pi-parity fix) is consulted only in their
-    // absence, same precedence tier as `default_model`/`default_gateway_url` above (an explicit
-    // per-run flag over a stored global default over this crate's own built-in behavior).
-    let project_trusted = if force_untrusted {
-        false
-    } else if trust_project {
-        true
-    } else {
-        use beyond_ai_agent::settings::TrustPolicy;
-        match stored_settings.get().default_project_trust {
-            Some(TrustPolicy::Always) => true,
-            Some(TrustPolicy::Never) => false,
-            Some(TrustPolicy::Ask) | None => {
-                beyond_ai_agent::trust_store::TrustStore::open_default().is_trusted(&cwd)
-                    || !has_gated_resources
-            }
-        }
-    };
+    // `--trust-project`/`--force-untrusted` always win outright when explicitly given; failing that, an
+    // explicit per-path `TrustStore` entry (`agent trust`/`agent untrust <path>`) wins next; only when
+    // neither applies does a persisted `agent settings --default-project-trust` policy take effect —
+    // Fix 1 (pi-parity bug): this used to check the blanket policy *before* the per-path entry, so an
+    // operator's specific exception for one directory could be silently overridden by a coarser
+    // `never`/`always` default. `serve::resolve_project_trust` is the one shared implementation of this
+    // precedence — `run` and `serve` must agree on trust for the same directory under the same
+    // settings, so it isn't duplicated here.
+    let project_trusted = serve::resolve_project_trust(
+        trust_project,
+        force_untrusted,
+        stored_settings.get().default_project_trust,
+        beyond_ai_agent::trust_store::TrustStore::open_default().lookup(&cwd),
+        has_gated_resources,
+    );
     // pi-parity fix: an untrusted project with a `SYSTEM.md`/skills/prompts on disk silently skipped all
     // of them with no signal at all that anything was there — an operator debugging "why isn't my
     // SYSTEM.md taking effect" had nothing to go on. One line, matching this function's existing
@@ -2546,6 +2782,27 @@ mod tests {
     use super::*;
     use agent_core::Error;
     use agent_core::mock::{MockTransport, turn};
+
+    #[test]
+    fn copilot_endpoint_path_strips_v1_for_openai_wire_dialects_but_not_anthropic() {
+        // pi-parity fix: GitHub Copilot's OpenAI-wire endpoints omit the `/v1` prefix the dialect's
+        // own default `endpoint_path()` carries (pi's own SDKs set `baseURL: model.baseUrl` with no
+        // `/v1` in it, then the vendor SDK appends its fixed relative path) — only the Anthropic-wire
+        // endpoint matches the dialect default verbatim (the Anthropic SDK's default `baseURL` has no
+        // version segment at all, so it always appends `/v1/messages` itself).
+        assert_eq!(
+            copilot_endpoint_path(agent_core::dialect::Dialect::Anthropic),
+            "/v1/messages"
+        );
+        assert_eq!(
+            copilot_endpoint_path(agent_core::dialect::Dialect::OpenAi),
+            "/chat/completions"
+        );
+        assert_eq!(
+            copilot_endpoint_path(agent_core::dialect::Dialect::OpenAiResponses),
+            "/responses"
+        );
+    }
 
     #[test]
     fn resolve_prompt_input_reads_an_existing_files_contents() {

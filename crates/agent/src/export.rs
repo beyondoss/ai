@@ -2,24 +2,28 @@
 //! sharing or reviewing a conversation outside the control protocol (no client, no server, just a
 //! browser). Deliberately plain: one static page, inline CSS, no external assets or **client-side**
 //! JS, so the file is portable and viewable offline exactly as generated — `<details>`/`<summary>`
-//! (native HTML, no script) is used for the one genuinely interactive piece, branch navigation (see
-//! [`render_branches_diverging_at`]), so that stays true even though the page isn't purely static
-//! reading order anymore. Message text is rendered as markdown (`render_markdown`, via
-//! `pulldown-cmark`) — server-side, at export time, rather than pi's own approach of vendoring
-//! `marked`/`highlight.js` and running them client-side inside the exported file. Deliberately
-//! **not** paired with a real syntax-highlighting crate (e.g. `syntect`): that bundles several MB of
-//! syntax/theme data and would slow every build of this CLI, including `run`/`serve`, which never
-//! touch export, for a nice-to-have that fenced code blocks already get a useful approximation of via
-//! plain `<pre><code class="language-x">` (language-tagged, monospaced, just not token-colored) —
-//! except a `diff`-tagged block, or any tool-result content shaped like a unified diff, which does get
-//! real per-line +/- coloring (`diff_html`/`looks_like_diff`), since that needs no language-specific
-//! lexer at all. Every built-in tool call (`edit`/`write`/`bash`/`read`/`grep`/`find`/`ls`, and the
-//! Beyond platform tools `fork`/`sync`/`logs`) gets a dedicated renderer (`render_tool_call`) instead
-//! of raw pretty-printed JSON — `edit` in particular reuses the diff-coloring machinery to show its
-//! before/after as a real (if not line-diffed) diff. Only a genuinely unrecognized tool name (a
+//! (native HTML, no script) is used for every interactive piece: branch navigation (see
+//! [`render_branches_diverging_at`]), the collapsed-by-default system-prompt/tools sections, and a long
+//! tool result collapsed past a per-tool line threshold (see [`render_tool_result_content`]) — so the
+//! page stays purely static (no JS) even though it isn't purely static *reading order* anymore. Message
+//! text is rendered as markdown (`render_markdown`, via `pulldown-cmark`) — server-side, at export time,
+//! rather than pi's own approach of vendoring `marked`/`highlight.js` and running them client-side inside
+//! the exported file. Deliberately **not** paired with a real syntax-highlighting crate (e.g. `syntect`):
+//! that bundles several MB of syntax/theme data and would slow every build of this CLI, including `run`/
+//! `serve`, which never touch export, for a nice-to-have that fenced code blocks and file-shaped tool
+//! results already get a useful approximation of via plain `<pre><code class="language-x">`
+//! (language-tagged — from a fenced block's own info string, or from a `read`/`write`/`edit` call's
+//! `path` extension, see [`language_from_path`] — monospaced, just not token-colored) — except a
+//! `diff`-tagged block, or any tool-result content shaped like a unified diff, which does get real
+//! per-line +/- coloring (`diff_html`/`looks_like_diff`), since that needs no language-specific lexer at
+//! all. Every built-in tool call (`edit`/`write`/`bash`/`read`/`grep`/`find`/`ls`, and the Beyond
+//! platform tools `fork`/`sync`/`logs`) gets a dedicated renderer (`render_tool_call`) instead of raw
+//! pretty-printed JSON — `edit` in particular reuses the diff-coloring machinery, over a real
+//! line-level diff (`diff_lines`), to show its before/after. Only a genuinely unrecognized tool name (a
 //! third-party extension, or a future built-in not yet taught this module) falls back to generic JSON,
 //! which reads fine for the rare case that needs it.
 
+use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -125,6 +129,11 @@ fn render_html_inner(
     render_system_prompt_section(&mut out, system_prompt);
     render_tools_section(&mut out, tools);
     out.push_str("<main>\n");
+    // Built once, up front, from every message this export will ever render (the main transcript plus
+    // every abandoned branch) — see [`index_tool_calls`]'s own doc comment for why a `ToolResult` block
+    // needs this at all (pi-parity Fix 2: language-tagging a tool result's `<pre>` from the originating
+    // call's own `path` argument).
+    let index = index_tool_calls(messages, branches);
     // Every branch is rendered *inline*, immediately after the message it actually diverged from
     // (`shared` is a message-count prefix — the branch shares `messages[..shared]` with the active
     // path) — a real tree laid out in reading order, rather than one flat "other branches" dump
@@ -132,10 +141,10 @@ fn render_html_inner(
     // (forked before the very first message) render before the loop starts. Numbered in the order
     // they appear so a reader can refer to "branch 2" unambiguously even though they're scattered
     // through the page rather than listed together.
-    let mut branch_number = render_branches_diverging_at(&mut out, branches, 0, 1);
+    let mut branch_number = render_branches_diverging_at(&mut out, branches, 0, 1, &index);
     for (i, message) in messages.iter().enumerate() {
-        render_message(&mut out, message);
-        branch_number = render_branches_diverging_at(&mut out, branches, i + 1, branch_number);
+        render_message(&mut out, message, &index);
+        branch_number = render_branches_diverging_at(&mut out, branches, i + 1, branch_number, &index);
     }
     render_events_section(&mut out, events);
     out.push_str("</main>\n");
@@ -281,6 +290,7 @@ fn render_branches_diverging_at(
     branches: &[(usize, Vec<Message>)],
     at: usize,
     next_number: usize,
+    index: &ToolCallIndex<'_>,
 ) -> usize {
     let mut n = next_number;
     for (shared, branch_messages) in branches.iter().filter(|(shared, _)| *shared == at) {
@@ -296,12 +306,43 @@ fn render_branches_diverging_at(
             branch_messages.len() - shared
         ));
         for message in &branch_messages[*shared..] {
-            render_message(out, message);
+            render_message(out, message, index);
         }
         out.push_str("</div>\n</details>\n");
         n += 1;
     }
     n
+}
+
+/// Map from a [`ContentBlock::ToolUse`] block's `id` to its `(name, input)` — built once (see
+/// [`index_tool_calls`]) from every message an export will render, so a [`ContentBlock::ToolResult`]
+/// block (which carries only `tool_use_id`, never the tool's own name/arguments) can look up which tool
+/// actually produced it. Used today for exactly one thing: tagging a `read`/`write`/`edit` result's
+/// `<pre>` with a `language-{ext}` class derived from that tool's own `path` argument (pi-parity Fix 2,
+/// see [`render_tool_result_content`]) — a plain lookup table, not a general "tool call log", so it's
+/// fine that a call with no matching result (or vice versa) just misses.
+type ToolCallIndex<'a> = HashMap<&'a str, (&'a str, &'a serde_json::Value)>;
+
+/// Build a [`ToolCallIndex`] from every [`ContentBlock::ToolUse`] block in `messages` and every
+/// abandoned `branches` message — the union of everything [`render_html_inner`] will actually render,
+/// so a tool result anywhere in the document (main transcript or an inline branch) can be traced back to
+/// the call that produced it regardless of which of the two it lives in.
+fn index_tool_calls<'a>(
+    messages: &'a [Message],
+    branches: &'a [(usize, Vec<Message>)],
+) -> ToolCallIndex<'a> {
+    let mut index = ToolCallIndex::new();
+    let all_messages = messages
+        .iter()
+        .chain(branches.iter().flat_map(|(_, branch)| branch.iter()));
+    for message in all_messages {
+        for block in &message.content {
+            if let ContentBlock::ToolUse { id, name, input, .. } = block {
+                index.insert(id.as_str(), (name.as_str(), input));
+            }
+        }
+    }
+    index
 }
 
 /// Cumulative token totals for the exported header's stats section — the same running counters
@@ -327,6 +368,13 @@ struct MessageStats {
     /// Distinct `model_id`s actually seen on an assistant turn (sorted), so a session that switched
     /// models mid-run shows every model actually used, not just the one it started with.
     models: Vec<String>,
+    /// How many messages are a compaction recap (see [`parse_summary_marker`]) — pi-parity Fix 5: pi's
+    /// header always folds this into its "Messages" summary line when present (`template.js:1352-1381`,
+    /// e.g. "N compactions"), previously silently dropped here even though the recap itself already
+    /// renders as its own distinct block in the transcript body ([`render_summary_marker`]).
+    compactions: usize,
+    /// Same as `compactions`, for a branch-summary recap (the other [`parse_summary_marker`] class).
+    branch_summaries: usize,
 }
 
 impl MessageStats {
@@ -335,6 +383,8 @@ impl MessageStats {
         let mut assistant_messages = 0;
         let mut tool_calls = 0;
         let mut models: Vec<String> = Vec::new();
+        let mut compactions = 0;
+        let mut branch_summaries = 0;
         for m in messages {
             match m.role {
                 Role::User => {
@@ -346,6 +396,19 @@ impl MessageStats {
                         .any(|b| !matches!(b, ContentBlock::ToolResult { .. }))
                     {
                         user_messages += 1;
+                    }
+                    // A compaction/branch-summary recap is itself a plain `Role::User` text block (see
+                    // `parse_summary_marker`'s own doc comment) — still counted above as an ordinary user
+                    // message (that behavior predates this fix and stays unchanged), just *also* tallied
+                    // here so the header can surface how many of the session's messages are one of these.
+                    for block in &m.content {
+                        if let ContentBlock::Text { text, .. } = block {
+                            match parse_summary_marker(text) {
+                                Some(("compaction", ..)) => compactions += 1,
+                                Some(("branch-summary", ..)) => branch_summaries += 1,
+                                _ => {}
+                            }
+                        }
                     }
                 }
                 Role::Assistant => {
@@ -370,6 +433,8 @@ impl MessageStats {
             assistant_messages,
             tool_calls,
             models,
+            compactions,
+            branch_summaries,
         }
     }
 }
@@ -392,14 +457,20 @@ fn render_stats_section(
         stats.models.join(", ")
     };
     push_stat(out, "Models", &models);
-    push_stat(
-        out,
-        "Messages",
-        &format!(
-            "{} user, {} assistant",
-            stats.user_messages, stats.assistant_messages
-        ),
-    );
+    // pi-parity Fix 5: fold compaction/branch-summary counts into this same line, matching pi's own
+    // `msgParts` (`template.js:1352-1381`) — appended only when present, so an ordinary session with
+    // neither renders exactly the plain "N user, N assistant" line it always has.
+    let mut message_parts = vec![
+        format!("{} user", stats.user_messages),
+        format!("{} assistant", stats.assistant_messages),
+    ];
+    if stats.compactions > 0 {
+        message_parts.push(format!("{} compactions", stats.compactions));
+    }
+    if stats.branch_summaries > 0 {
+        message_parts.push(format!("{} branch summaries", stats.branch_summaries));
+    }
+    push_stat(out, "Messages", &message_parts.join(", "));
     push_stat(out, "Tool calls", &stats.tool_calls.to_string());
     if let Some(u) = usage {
         push_stat(
@@ -499,6 +570,10 @@ color: #bbb; user-select: none; }\n\
 .tool-param-required { color: #f0908f; font-size: 0.75rem; }\n\
 .tool-param-optional { color: #7ee2a8; font-size: 0.75rem; }\n\
 .tool-param-desc { color: #999; font-size: 0.8rem; margin-left: 0.25rem; }\n\
+.collapsible-output summary { cursor: pointer; font-size: 0.8rem; color: #999; user-select: none; \
+margin-bottom: 0.25rem; }\n\
+.collapsible-output summary:hover { color: #ddd; }\n\
+.collapsible-output pre { margin-top: 0; }\n\
 </style>\n";
 
 fn role_label(role: Role) -> &'static str {
@@ -517,14 +592,14 @@ fn role_class(role: Role) -> &'static str {
     }
 }
 
-fn render_message(out: &mut String, message: &Message) {
+fn render_message(out: &mut String, message: &Message, index: &ToolCallIndex<'_>) {
     out.push_str(&format!(
         "<div class=\"message {}\">\n<div class=\"role-label\">{}</div>\n",
         role_class(message.role),
         role_label(message.role)
     ));
     for block in &message.content {
-        render_block(out, block);
+        render_block(out, block, index);
     }
     // A turn stopped by an abort or a transport failure typically has empty/partial `content` (see
     // `Message::aborted`/`Message::error_message`'s doc comments) — without these, the message div above
@@ -543,7 +618,7 @@ fn render_message(out: &mut String, message: &Message) {
     out.push_str("</div>\n");
 }
 
-fn render_block(out: &mut String, block: &ContentBlock) {
+fn render_block(out: &mut String, block: &ContentBlock, index: &ToolCallIndex<'_>) {
     match block {
         ContentBlock::Text { text, .. } => {
             // A host-run bash command (`serve.rs`'s `bash` RPC command, run from the idle loop rather
@@ -589,6 +664,7 @@ fn render_block(out: &mut String, block: &ContentBlock) {
         }
         ContentBlock::ToolUse { name, input, .. } => render_tool_call(out, name, input),
         ContentBlock::ToolResult {
+            tool_use_id,
             content,
             is_error,
             images,
@@ -603,15 +679,8 @@ fn render_block(out: &mut String, block: &ContentBlock) {
             out.push_str(&format!(
                 "<div class=\"{class}\"><div class=\"tool-title\">{title}</div>\n"
             ));
-            // A tool result verbatim — not markdown (it's raw command/file output, and interpreting a
-            // `#`-prefixed shell comment or a `-`-prefixed line as markdown would misrender it) —
-            // except a unified diff, which gets the same per-line +/- coloring `render_markdown` gives
-            // a fenced ```diff block.
-            if looks_like_diff(content) {
-                out.push_str(&diff_html(content));
-            } else {
-                out.push_str(&format!("<pre>{}</pre>", html_escape(content)));
-            }
+            let tool_info = index.get(tool_use_id.as_str()).copied();
+            render_tool_result_content(out, content, tool_info);
             for image in images {
                 render_image(out, &image.media_type, &image.data);
             }
@@ -619,6 +688,141 @@ fn render_block(out: &mut String, block: &ContentBlock) {
         }
         ContentBlock::Image { source } => render_image(out, &source.media_type, &source.data),
     }
+}
+
+/// Render a tool result's raw content — verbatim, not markdown (it's raw command/file output, and
+/// interpreting a `#`-prefixed shell comment or a `-`-prefixed line as markdown would misrender it) —
+/// except a unified diff, which gets [`diff_html`]'s per-line +/- coloring, same as a fenced
+/// ` ```diff ` block in message text.
+///
+/// Three additive pi-parity fixes live here:
+/// - **Fix 2** (language tagging): when `tool_info` (the originating call's `(name, input)`, looked up
+///   by `tool_use_id` — see [`index_tool_calls`]) is a `read`/`write`/`edit` call with a recognized
+///   `path` extension, the `<pre>` is tagged `<code class="language-{ext}">` (pi's own
+///   `getLanguageFromPath`, `template.js:823-834`) — ready for a future client-side highlighter without
+///   adding one now.
+/// - **Fix 3** (collapse affordance): past a per-tool line-count threshold
+///   (see [`tool_result_line_threshold`], matching pi's own `formatExpandableOutput` thresholds,
+///   `template.js:848-902`), the block is collapsed by default behind a `<details>`/`<summary>` — the
+///   same zero-client-JS pattern already used for the system-prompt/tools/branch sections.
+/// - **Fix 4** (control-byte defense): C0 control bytes (a stray raw ANSI escape, etc. — see
+///   [`strip_control_chars`]) are stripped before escaping, so they can't garble the rendered page. Not
+///   a full ANSI-to-styled-HTML converter (out of scope) — just cheap belt-and-suspenders, since
+///   `html_escape` itself only escapes `&<>"'`.
+fn render_tool_result_content(
+    out: &mut String,
+    content: &str,
+    tool_info: Option<(&str, &serde_json::Value)>,
+) {
+    let cleaned = strip_control_chars(content);
+    let body = if looks_like_diff(&cleaned) {
+        diff_html(&cleaned)
+    } else {
+        let lang = tool_info.and_then(|(name, input)| language_class_for_tool_result(name, input));
+        match lang {
+            Some(lang) => format!(
+                "<pre><code class=\"language-{lang}\">{}</code></pre>\n",
+                html_escape(&cleaned)
+            ),
+            None => format!("<pre>{}</pre>", html_escape(&cleaned)),
+        }
+    };
+    let threshold = tool_info
+        .map(|(name, _)| tool_result_line_threshold(name))
+        .unwrap_or(DEFAULT_TOOL_RESULT_LINE_THRESHOLD);
+    let line_count = cleaned.lines().count();
+    if line_count > threshold {
+        out.push_str(&format!(
+            "<details class=\"collapsible-output\"><summary>{line_count} lines (click to expand)\
+             </summary>\n{body}</details>\n"
+        ));
+    } else {
+        out.push_str(&body);
+    }
+}
+
+/// Per-tool line-count threshold past which [`render_tool_result_content`] collapses a result behind
+/// `<details>` — matching pi's own per-tool thresholds (`template.js:848-902`: `bash` calls
+/// `formatExpandableOutput(output, 5)`, `read` calls it with `10`; everything else, including `ls`,
+/// falls back to [`DEFAULT_TOOL_RESULT_LINE_THRESHOLD`], which happens to equal pi's own `ls` threshold
+/// of `20` too).
+fn tool_result_line_threshold(tool_name: &str) -> usize {
+    match tool_name {
+        "bash" => 5,
+        "read" => 10,
+        _ => DEFAULT_TOOL_RESULT_LINE_THRESHOLD,
+    }
+}
+
+/// The collapse threshold for a tool result with no associated call in the [`ToolCallIndex`] (a
+/// tool-result-only test fixture, or a session missing its originating `ToolUse` for some other reason)
+/// and for every tool that isn't specially thresholded in [`tool_result_line_threshold`] — pi's own `ls`
+/// threshold (`template.js:902`).
+const DEFAULT_TOOL_RESULT_LINE_THRESHOLD: usize = 20;
+
+/// Derive a `language-{ext}` tag for a tool result's content from the originating call's own `path`
+/// argument — only for the three tools whose result content is actually file/text content in that
+/// path's language (`read`/`write`/`edit`); everything else (`bash` output, `grep` matches, `ls`
+/// listings, ...) isn't meaningfully one source language, so gets no tag, matching pi's own call sites
+/// for `getLanguageFromPath` (`template.js:962`, `981`).
+fn language_class_for_tool_result(
+    tool_name: &str,
+    input: &serde_json::Value,
+) -> Option<&'static str> {
+    if !matches!(tool_name, "read" | "write" | "edit") {
+        return None;
+    }
+    let path = input.get("path").and_then(serde_json::Value::as_str)?;
+    language_from_path(path)
+}
+
+/// Map a file path's extension to a `language-{x}` tag — pi's own `getLanguageFromPath`
+/// (`template.js:823-834`), byte-for-byte the same extension table (including its one quirk: a path
+/// with no `.` at all, e.g. `Dockerfile`, is treated as if its *whole* name were the extension, same as
+/// JS's `filePath.split('.').pop()` on a dot-less string). Not an exhaustive list — an unrecognized or
+/// absent extension renders untagged, same as today, just without the new class.
+fn language_from_path(path: &str) -> Option<&'static str> {
+    let ext = path.rsplit('.').next()?.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "ts" | "tsx" => "typescript",
+        "js" | "jsx" => "javascript",
+        "py" => "python",
+        "rb" => "ruby",
+        "rs" => "rust",
+        "go" => "go",
+        "java" => "java",
+        "c" => "c",
+        "cpp" => "cpp",
+        "h" => "c",
+        "hpp" => "cpp",
+        "cs" => "csharp",
+        "php" => "php",
+        "sh" | "bash" | "zsh" => "bash",
+        "sql" => "sql",
+        "html" => "html",
+        "css" => "css",
+        "scss" => "scss",
+        "json" => "json",
+        "yaml" | "yml" => "yaml",
+        "xml" => "xml",
+        "md" => "markdown",
+        "dockerfile" => "dockerfile",
+        _ => return None,
+    })
+}
+
+/// Strip C0 control characters (`0x00`-`0x1F`, excluding tab `\t` and newline `\n`) and DEL (`0x7F`)
+/// from tool-result text before it's escaped/rendered — pi-parity Fix 4. [`html_escape`] only escapes
+/// `&<>"'`, so a stray raw control byte (most plausibly an ANSI escape sequence a tool emitted) would
+/// otherwise pass straight through into the page, garbling it (though never executing anything — this
+/// is a rendering-quality fix, not a security one). Beyond's only tool that could currently emit ANSI
+/// color (`bash`) already strips it at capture time, so this is cheap belt-and-suspenders for the rare
+/// case something else doesn't, not a fix for a live gap. Deliberately *not* an ANSI-to-styled-HTML
+/// converter — that's a much bigger feature, out of scope here.
+fn strip_control_chars(text: &str) -> String {
+    text.chars()
+        .filter(|&c| !matches!(c, '\u{0}'..='\u{8}' | '\u{b}'..='\u{1f}' | '\u{7f}'))
+        .collect()
 }
 
 /// Dispatch a tool call to a renderer that understands its specific argument shape, falling back to
@@ -673,30 +877,136 @@ fn render_edit_call(out: &mut String, input: &serde_json::Value) {
     out.push_str("</div>\n");
 }
 
-/// Render an old/new string pair with the same per-line `+`/`-` coloring [`diff_html`] gives a real
-/// unified diff — every line of `old` colored as removed, every line of `new` as added. Not a real
-/// line-level diff (no common-prefix/suffix detection — that's a bigger algorithm than this static,
-/// no-JS export needs), just old-then-new, clearly colored.
+/// One line-level diff operation — see [`diff_lines`].
+enum LineDiffOp<'a> {
+    /// A line present, unchanged, in both `old` and `new` — rendered with no color at all.
+    Equal(&'a str),
+    /// A line only in `old` — rendered `-`-prefixed, red.
+    Delete(&'a str),
+    /// A line only in `new` — rendered `+`-prefixed, green.
+    Insert(&'a str),
+}
+
+/// Render an old/new string pair as a real line-level diff (pi-parity Fix 1) — unchanged lines render
+/// plain, only the lines that actually differ get `+`/`-` colored, instead of the old behavior of
+/// solid-coloring the *entire* old block red and the entire new block green (so a one-line change deep
+/// inside a 200-line block used to render as 400 colored lines). See [`diff_lines`] for how the actual
+/// line-level diff is computed.
 fn diff_pair_html(old: &str, new: &str) -> String {
     let mut out = String::from("<pre><code class=\"language-diff\">");
-    for line in old.lines() {
-        out.push_str(&format!(
-            "<span class=\"diff-del\">-{}</span>\n",
-            html_escape(line)
-        ));
-    }
-    for line in new.lines() {
-        out.push_str(&format!(
-            "<span class=\"diff-add\">+{}</span>\n",
-            html_escape(line)
-        ));
+    for op in diff_lines(old, new) {
+        match op {
+            LineDiffOp::Equal(line) => {
+                out.push_str(&html_escape(line));
+                out.push('\n');
+            }
+            LineDiffOp::Delete(line) => {
+                out.push_str(&format!(
+                    "<span class=\"diff-del\">-{}</span>\n",
+                    html_escape(line)
+                ));
+            }
+            LineDiffOp::Insert(line) => {
+                out.push_str(&format!(
+                    "<span class=\"diff-add\">+{}</span>\n",
+                    html_escape(line)
+                ));
+            }
+        }
     }
     out.push_str("</code></pre>\n");
     out
 }
 
-/// Render a `write` call: the target path as the title, full content in a plain `<pre>` (not
-/// markdown — it's raw file content).
+/// Compute a real line-level diff between `old` and `new` (pi-parity Fix 1) — pi delegates this to the
+/// `diff` npm package's `diffLines` (`edit-diff.ts:385`); no equivalent crate is already a dependency of
+/// this workspace (checked `Cargo.lock` — nothing named `similar`/`diff`/`imara-diff`/`dissimilar`
+/// exists, transitively or otherwise), and this is render-time-only, bounded content (a single `edit`
+/// call's before/after text, not an arbitrarily large corpus), so a small hand-rolled diff is
+/// appropriate rather than reaching for a new dependency.
+///
+/// A common prefix and suffix (lines identical between `old` and `new` at the very start/end) are
+/// trimmed off *before* running the actual O(n*m) LCS table in [`lcs_diff`] — the overwhelming majority
+/// of a real edit's old/new pair is unchanged context around one small changed region, so this keeps the
+/// expensive part of the algorithm scoped to just the lines that actually differ, not the whole
+/// (typically much larger) surrounding text.
+fn diff_lines<'a>(old: &'a str, new: &'a str) -> Vec<LineDiffOp<'a>> {
+    let old_lines: Vec<&str> = old.lines().collect();
+    let new_lines: Vec<&str> = new.lines().collect();
+
+    let mut prefix = 0;
+    while prefix < old_lines.len()
+        && prefix < new_lines.len()
+        && old_lines[prefix] == new_lines[prefix]
+    {
+        prefix += 1;
+    }
+    let mut suffix = 0;
+    while suffix < old_lines.len() - prefix
+        && suffix < new_lines.len() - prefix
+        && old_lines[old_lines.len() - 1 - suffix] == new_lines[new_lines.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+
+    let mut ops: Vec<LineDiffOp<'a>> = Vec::with_capacity(old_lines.len() + new_lines.len());
+    ops.extend(old_lines[..prefix].iter().copied().map(LineDiffOp::Equal));
+    ops.extend(lcs_diff(
+        &old_lines[prefix..old_lines.len() - suffix],
+        &new_lines[prefix..new_lines.len() - suffix],
+    ));
+    ops.extend(
+        old_lines[old_lines.len() - suffix..]
+            .iter()
+            .copied()
+            .map(LineDiffOp::Equal),
+    );
+    ops
+}
+
+/// A classic LCS (longest-common-subsequence) line diff over `old`/`new` — the textbook
+/// dynamic-programming table (`dp[i][j]` = length of the LCS of `old[i..]`/`new[j..]`), backtracked from
+/// `(0, 0)` to produce an edit script. `O(len(old) * len(new))` time and space, which is why
+/// [`diff_lines`] trims the common prefix/suffix first rather than calling this directly on the whole
+/// old/new pair.
+fn lcs_diff<'a>(old: &[&'a str], new: &[&'a str]) -> Vec<LineDiffOp<'a>> {
+    let n = old.len();
+    let m = new.len();
+    let mut dp = vec![vec![0u32; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[i][j] = if old[i] == new[j] {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+    let mut ops = Vec::new();
+    let mut i = 0;
+    let mut j = 0;
+    while i < n && j < m {
+        if old[i] == new[j] {
+            ops.push(LineDiffOp::Equal(old[i]));
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            ops.push(LineDiffOp::Delete(old[i]));
+            i += 1;
+        } else {
+            ops.push(LineDiffOp::Insert(new[j]));
+            j += 1;
+        }
+    }
+    ops.extend(old[i..].iter().copied().map(LineDiffOp::Delete));
+    ops.extend(new[j..].iter().copied().map(LineDiffOp::Insert));
+    ops
+}
+
+/// Render a `write` call: the target path as the title, full content in a `<pre>` (not markdown — it's
+/// raw file content) — pi-parity Fix 2: tagged `<code class="language-{ext}">` from the write's own
+/// `path` argument when the extension is recognized (see [`language_from_path`]), same as pi's own
+/// `write.ts` tagging its content preview the same way.
 fn render_write_call(out: &mut String, input: &serde_json::Value) {
     let path = input.get("path").and_then(serde_json::Value::as_str);
     let content = input.get("content").and_then(serde_json::Value::as_str);
@@ -708,7 +1018,13 @@ fn render_write_call(out: &mut String, input: &serde_json::Value) {
         "<div class=\"tool-call\"><div class=\"tool-title\">{title}</div>\n"
     ));
     if let Some(content) = content {
-        out.push_str(&format!("<pre>{}</pre>", html_escape(content)));
+        match path.and_then(language_from_path) {
+            Some(lang) => out.push_str(&format!(
+                "<pre><code class=\"language-{lang}\">{}</code></pre>",
+                html_escape(content)
+            )),
+            None => out.push_str(&format!("<pre>{}</pre>", html_escape(content))),
+        }
     }
     out.push_str("</div>\n");
 }
@@ -2277,5 +2593,197 @@ mod tests {
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(written.contains("System prompt text."));
         assert!(written.contains("tool-item-name\">bash</span>"));
+    }
+
+    // ---- pi-parity fixes: real line diff, tool-result language tagging, collapse affordance,
+    // control-byte stripping, and compaction/branch-summary stats counts. ----
+
+    #[test]
+    fn edit_call_renders_a_real_line_level_diff_not_solid_colored_blocks() {
+        // Fix 1: a single changed line inside a larger unchanged block must render as a real diff
+        // (unchanged lines uncolored, only the actually-changed line(s) diff-colored) instead of the
+        // old behavior of solid-coloring the *entire* old text red and the entire new text green.
+        let old = "line one\nline two\nline three\nline four\nline five";
+        let new = "line one\nline two\nCHANGED\nline four\nline five";
+        let messages = vec![Message::assistant(vec![ContentBlock::ToolUse {
+            id: "1".into(),
+            name: "edit".into(),
+            input: serde_json::json!({
+                "path": "src/lib.rs",
+                "old_string": old,
+                "new_string": new,
+            }),
+            thought_signature: None,
+        }])];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(html.contains("class=\"diff-del\">-line three"), "{html}");
+        assert!(html.contains("class=\"diff-add\">+CHANGED"), "{html}");
+        // The unchanged surrounding lines must not themselves be diff-colored.
+        assert!(!html.contains("diff-del\">-line one"), "{html}");
+        assert!(!html.contains("diff-add\">+line one"), "{html}");
+        assert!(!html.contains("diff-del\">-line five"), "{html}");
+        assert!(!html.contains("diff-add\">+line five"), "{html}");
+        // They still appear, just as plain, uncolored context.
+        assert!(html.contains("line one"), "{html}");
+        assert!(html.contains("line five"), "{html}");
+    }
+
+    #[test]
+    fn edit_call_with_no_overlap_still_diffs_as_a_full_delete_then_insert() {
+        // The degenerate case (nothing in common) must still behave like the old bulk-colored
+        // rendering: every old line removed, every new line added, in that order.
+        let messages = vec![Message::assistant(vec![ContentBlock::ToolUse {
+            id: "1".into(),
+            name: "edit".into(),
+            input: serde_json::json!({
+                "path": "src/lib.rs",
+                "old_string": "let x = 1;",
+                "new_string": "let x = 2;",
+            }),
+            thought_signature: None,
+        }])];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(html.contains("class=\"diff-del\">-let x = 1;"));
+        assert!(html.contains("class=\"diff-add\">+let x = 2;"));
+    }
+
+    #[test]
+    fn read_tool_result_gets_a_language_class_matching_its_paths_extension() {
+        // Fix 2: a `ToolResult` block itself carries no path — this proves the language tag is
+        // correctly derived by tracing back to the *originating* `read` call's own `path` argument
+        // (see `index_tool_calls`/`ToolCallIndex`).
+        let messages = vec![
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "1".into(),
+                name: "read".into(),
+                input: serde_json::json!({ "path": "src/main.rs" }),
+                thought_signature: None,
+            }]),
+            Message::tool_result("1", "fn main() {}\n", false),
+        ];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(
+            html.contains("<pre><code class=\"language-rust\">"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn a_tool_result_with_no_associated_call_or_unrecognized_extension_gets_no_language_class() {
+        // No preceding `ToolUse` at all (a bare tool-result fixture, as several existing tests use) —
+        // must still render, just untagged, not panic on a missing index entry.
+        let messages = vec![Message::tool_result("1", "plain output", false)];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(html.contains("<pre>plain output</pre>"), "{html}");
+        assert!(!html.contains("<code class=\"language-"), "{html}");
+    }
+
+    #[test]
+    fn write_call_content_gets_a_language_class_from_its_own_path() {
+        let messages = vec![Message::assistant(vec![ContentBlock::ToolUse {
+            id: "1".into(),
+            name: "write".into(),
+            input: serde_json::json!({ "path": "notes.md", "content": "# Title" }),
+            thought_signature: None,
+        }])];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(
+            html.contains("<pre><code class=\"language-markdown\">"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn a_long_tool_result_is_collapsed_behind_a_details_element() {
+        // Fix 3: past a per-tool line threshold, a tool result collapses by default behind
+        // `<details>`/`<summary>` — the same zero-client-JS pattern already used for branches/the
+        // system-prompt section — instead of always rendering fully expanded.
+        let long_output: String = (1..=30).map(|i| format!("line {i}\n")).collect();
+        let messages = vec![Message::tool_result("1", long_output, false)];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(html.contains("class=\"collapsible-output\""), "{html}");
+        assert!(html.contains("30 lines (click to expand)"), "{html}");
+        assert!(html.contains("line 1\n"), "{html}");
+        assert!(html.contains("line 30"), "{html}");
+    }
+
+    #[test]
+    fn a_short_tool_result_is_not_collapsed() {
+        let messages = vec![Message::tool_result("1", "one line of output", false)];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(!html.contains("class=\"collapsible-output\""), "{html}");
+    }
+
+    #[test]
+    fn a_bash_result_collapses_past_five_lines_matching_pis_own_lower_threshold() {
+        let messages = vec![
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({ "command": "seq 6" }),
+                thought_signature: None,
+            }]),
+            Message::tool_result("1", "1\n2\n3\n4\n5\n6", false),
+        ];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(html.contains("class=\"collapsible-output\""), "{html}");
+        assert!(html.contains("6 lines (click to expand)"), "{html}");
+    }
+
+    #[test]
+    fn strips_c0_control_bytes_from_tool_result_content() {
+        // Fix 4: a stray raw control byte (e.g. an ANSI escape, 0x1b) must not pass through literally
+        // into the rendered page — `html_escape` alone only escapes `&<>"'`.
+        let content = "before\u{1b}[31mred\u{1b}[0mafter";
+        let messages = vec![Message::tool_result("1", content, false)];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(!html.contains('\u{1b}'), "{html}");
+        assert!(html.contains("before"));
+        assert!(html.contains("red"));
+        assert!(html.contains("after"));
+    }
+
+    #[test]
+    fn keeps_tabs_and_newlines_when_stripping_control_bytes_from_tool_result_content() {
+        let content = "line one\tindented\nline two";
+        let messages = vec![Message::tool_result("1", content, false)];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(html.contains("line one\tindented"), "{html}");
+        assert!(html.contains("line two"), "{html}");
+    }
+
+    #[test]
+    fn stats_section_folds_a_compaction_count_into_the_messages_line() {
+        // Fix 5: pi's header always folds compaction/branch-summary counts into its "Messages"
+        // summary line when present (`template.js:1352-1381`, e.g. "N compactions").
+        let messages = vec![Message::user(format!(
+            "{}\n\n{}",
+            agent_core::compaction::SUMMARY_MARKER,
+            "Refactored the auth module."
+        ))];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(html.contains("1 compactions"), "{html}");
+    }
+
+    #[test]
+    fn stats_section_folds_a_branch_summary_count_into_the_messages_line() {
+        let messages = vec![Message::user(format!(
+            "{}\n\n{}",
+            agent_core::BRANCH_SUMMARY_MARKER,
+            "Explored using a cache; reverted."
+        ))];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(html.contains("1 branch summaries"), "{html}");
+    }
+
+    #[test]
+    fn stats_section_omits_compaction_and_branch_summary_counts_when_there_are_none() {
+        // The CSS in `STYLE` always mentions `.summary-marker.compaction` regardless of content, so
+        // this checks for the actual stat phrasing (`"N compactions"`/`"N branch summaries"`), not a
+        // bare substring match against "compaction" anywhere in the document.
+        let html = render_html(&meta(), &[Message::user("hi")], &[], None);
+        assert!(!html.contains("compactions"), "{html}");
+        assert!(!html.contains("branch summaries"), "{html}");
+        assert!(html.contains("1 user, 0 assistant"), "{html}");
     }
 }

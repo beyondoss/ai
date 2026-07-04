@@ -1479,3 +1479,30 @@ fn serve_rejects_a_path_traversal_session_id_and_persists_nothing() {
         "nothing must be persisted when --session-id is rejected"
     );
 }
+
+#[test]
+fn invalid_utf8_on_stdin_while_idle_ends_the_session_gracefully_instead_of_crashing() {
+    // pi-parity fix: the idle-mode stdin read used to propagate a bare `?` on a UTF-8 decode
+    // error, killing the whole long-running `serve` process instead of just ending the session
+    // — the busy-mode read loops elsewhere in this file already treat a read error as a graceful
+    // stdin-close (`Ok(None) | Err(_) => { stdin_open = false; cancel.cancel(); }`); the idle loop
+    // now matches that pattern.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    // A lone 0xFF byte is never valid UTF-8 in any position — `AsyncBufReadExt::lines()` surfaces
+    // this as an `io::Error` (`InvalidData`) rather than a decoded `String`.
+    stdin.write_all(&[0xFF, b'\n']).unwrap();
+    stdin.flush().unwrap();
+    drop(stdin);
+
+    let status = child.wait().unwrap();
+    assert!(
+        status.success(),
+        "invalid UTF-8 on stdin must end the session gracefully, not crash: {status:?}"
+    );
+}

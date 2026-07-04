@@ -246,6 +246,13 @@ pub struct Agent {
     /// caller that only ever persists once a full run completes (or doesn't persist at all) pays
     /// nothing extra.
     checkpoint: Arc<dyn CheckpointHook>,
+    /// Independent input-token reserve for [`Self::summarize_branch`]'s own summarization call —
+    /// `None` (the default) falls back to `self.compaction.reserve_tokens`, today's exact behavior.
+    /// `Some(tokens)` sizes a branch recap's budget off this instead, without disturbing the live
+    /// conversation's own compaction reserve — pi exposes the same independent knob
+    /// (`branch-summarization.ts:62-63`, default 16384) rather than reusing its compaction settings
+    /// wholesale. See [`Self::with_branch_summary_reserve_tokens`].
+    branch_summary_reserve_tokens: Option<u32>,
 }
 
 /// The summarization call's own output budget, scaled from the model's real ceiling rather than a
@@ -292,6 +299,7 @@ impl Agent {
             cache_long: false,
             write_locks: Arc::new(crate::write_lock::WriteLockRegistry::new()),
             checkpoint: Arc::new(NoCheckpoint),
+            branch_summary_reserve_tokens: None,
         }
     }
 
@@ -373,6 +381,17 @@ impl Agent {
     /// Convenience: set just the model's context window, leaving the other compaction defaults.
     pub fn with_context_window(mut self, context_window: u32) -> Self {
         self.compaction.context_window = context_window;
+        self
+    }
+
+    /// Size [`Self::summarize_branch`]'s own input-token budget off `reserve_tokens` instead of
+    /// falling back to [`Self::with_compaction`]'s `reserve_tokens` — a pure additive capability: a
+    /// caller who never touches this keeps today's exact behavior (the live conversation's own
+    /// compaction reserve reused wholesale for a one-off branch recap too), while a caller who wants
+    /// the two tuned independently (matching pi's own separate `reserveTokens` for branch
+    /// summarization) now can.
+    pub fn with_branch_summary_reserve_tokens(mut self, reserve_tokens: u32) -> Self {
+        self.branch_summary_reserve_tokens = Some(reserve_tokens);
         self
     }
 
@@ -603,17 +622,20 @@ impl Agent {
         // `nextTurnSnapshot` awareness).
         let mut current_model = self.model.clone();
         let mut current_thinking = self.thinking;
-        // Not mutated by a mid-run switch — `ModelSwitch` only ever carries a model/thinking override
-        // (see its own doc comment on why this is deliberately narrower than pi's full snapshot); a
-        // plain `let` still reads uniformly alongside the two shadows above that *do* change.
-        let current_reasoning_effort = self.reasoning_effort;
+        // Mutated by a mid-run switch that carries a `thinking_level` override (see below) —
+        // `ModelSwitch` used to only ever carry a model/raw-thinking-budget override, but now also
+        // covers reasoning effort, so this can no longer stay a plain, never-touched shadow.
+        let mut current_reasoning_effort = self.reasoning_effort;
         loop {
             if cancel.is_cancelled() {
                 close_out_pending_cancellation(session, &current_model);
                 // Matches pi's `agent-harness.ts` `abort()`: a message queued via `push`/`push_steer`
                 // shortly before (or during) cancellation must not silently ride into whatever
-                // unrelated run reuses this same `Steering` handle next.
-                steering.clear();
+                // unrelated run reuses this same `Steering` handle next. Deliberately the narrower,
+                // run-scoped clear — not `clear()` — so a message queued via `push_next_turn` still
+                // survives into whatever prompt comes next, aborted or not (see `clear_run_scoped`'s
+                // own doc comment).
+                steering.clear_run_scoped();
                 return Err(Error::Cancelled);
             }
             // A pending mid-run model switch (`Steering::request_model_switch`, pi's `prepareNextTurn`
@@ -621,12 +643,27 @@ impl Agent {
             // next request is built, never mid-turn.
             if let Some(switch) = steering.take_model_switch() {
                 current_model = switch.model.clone();
+                // Applied first, against the model this same switch just selected, so a level
+                // translates correctly even when the switch changes both at once: `Some(Off)`
+                // explicitly disables thinking/reasoning, `Some(level)` sets a new depth via the same
+                // `models::thinking_for_level` translation `serve.rs`'s `set_model`/`cycle_model` RPC
+                // handlers use for an idle-time switch. `None` leaves both shadows exactly as they
+                // were (including whatever an *earlier* switch this run already applied).
+                if let Some(level) = switch.thinking_level {
+                    let caps = crate::models::capabilities(&current_model);
+                    let (thinking, effort) = crate::models::thinking_for_level(&caps, level);
+                    current_thinking = thinking;
+                    current_reasoning_effort = effort;
+                }
+                // A raw thinking-budget override, if also given, wins over the level's own translated
+                // budget — a caller after an exact token count, not a portable level, still gets
+                // exactly that number.
                 if let Some(budget) = switch.thinking {
                     current_thinking = Some(budget);
                 }
                 sink(AgentEvent::ModelSwitched {
                     model: switch.model,
-                    thinking: switch.thinking,
+                    thinking: current_thinking,
                 });
             }
             if steps_this_call >= self.max_steps {
@@ -705,7 +742,7 @@ impl Agent {
                 // sibling paths give a mid-stream abort.
                 Err(Error::Cancelled) => {
                     close_out_pending_cancellation(session, &current_model);
-                    steering.clear();
+                    steering.clear_run_scoped();
                     return Err(Error::Cancelled);
                 }
                 // The provider rejected the request for exceeding its context window. Compact once and
@@ -848,7 +885,7 @@ impl Agent {
             // run retry exclusion, `serve.rs`'s `abort` RPC response shape) stay correct. No `AgentEnd`
             // here, matching those same sibling paths — one is only ever emitted on an `Ok(())` return.
             if turn.stop_reason == StopReason::Aborted {
-                steering.clear();
+                steering.clear_run_scoped();
                 return Err(Error::Cancelled);
             }
 
@@ -1064,184 +1101,256 @@ impl Agent {
             }
             let this = self;
             let malformed = &malformed;
-            // Read-only reborrow, shared across every concurrently-dispatched call's hook invocations:
-            // by this point the requesting assistant turn (this batch's own `tool_use` blocks) is
-            // already `session.messages.last()` (the pre-dispatch checkpoint above established that
-            // same invariant), so a hook can see the call it's gating in its full conversational
-            // context — pi's `BeforeToolCallContext`/`AfterToolCallContext` carry the same
+            // Read-only reborrow, shared across every hook invocation below: by this point the
+            // requesting assistant turn (this batch's own `tool_use` blocks) is already
+            // `session.messages.last()` (the pre-dispatch checkpoint above established that same
+            // invariant), so a hook can see the call it's gating in its full conversational context —
+            // pi's `BeforeToolCallContext`/`AfterToolCallContext` carry the same
             // (`assistantMessage`/`context`). `session` itself isn't mutated again until every call in
             // this batch has finished (`session.push(Message::tool_results(..))` below), so this shared
             // borrow's lifetime never actually overlaps a mutation.
             let session_ref: &Session = session;
-            // Per-turn progress channel: every call gets a `ToolProgress` cloning `prog_tx`; the drain
-            // loop below forwards each update to `sink` as it arrives. `futures`' mpsc keeps this
-            // executor-agnostic (no tokio in the library).
-            let (prog_tx, mut prog_rx) =
-                futures::channel::mpsc::unbounded::<crate::tool::ToolUpdate>();
-            let prog_tx = &prog_tx;
             let cancel_ref = &cancel;
-            let group_runs = groups.into_values().map(|(target, indices)| {
-                let calls = &calls;
-                let prog_tx = prog_tx.clone();
-                let cancel = cancel_ref.clone();
-                let write_locks = this.write_locks.clone();
-                async move {
-                    // Held for the group's whole serial run: extends the intra-turn grouping above
-                    // across turn and session boundaries, so a concurrently-running turn (or a
-                    // different session sharing this `Agent`'s registry) touching the same path really
-                    // waits, not just calls within this one turn.
-                    let _write_guard = match &target {
-                        Some(path) => Some(write_locks.lock(path).await),
-                        None => None,
-                    };
-                    let mut out = Vec::with_capacity(indices.len());
-                    for i in indices {
-                        let (id, name, input) = &calls[i];
-                        // Per call: (text, images, is_error, terminate). Hooks rewrite the *text* and
-                        // error flag; images and the terminate hint pass through untouched.
-                        let result: ToolCallResult =
-                            if let Some(raw) = malformed.get(id) {
-                                // The model streamed a tool call whose argument fragments never formed
-                                // valid JSON. Feed that back as an error result the model can correct
-                                // next turn rather than aborting the whole run on one malformed call.
-                                (
-                                    format!(
-                                        "tool call arguments were not valid JSON and could not be parsed: {raw}"
-                                    ),
+
+            // Phase 1 — gate every call sequentially, in call order, before any call's actual
+            // execution begins: the malformed-args check and the `before_tool_call` hook both run
+            // here, one call fully resolved before the next call's gate even starts. Matches pi's
+            // `prepareToolCall`, resolved in a plain sequential loop ahead of
+            // `executeToolCallsParallel`'s `Promise.all` (agent-loop.ts:451-516; the
+            // `ToolExecutionMode` doc comment at types.ts:34-41 states the same contract). Without
+            // this, a later-declared call's gate could run concurrently with an earlier-approved
+            // call's own tool already executing — a permission hook reasoning about "what's already
+            // running" (a concurrency-aware policy, a rate limiter) would see a half-approved batch
+            // instead of a fully-gated one. Only the execution + `after_tool_call` phase below this
+            // one actually parallelizes.
+            //
+            // `outcomes[i]` ends up `Some(Immediate(result))` for a call fully resolved without ever
+            // running (malformed streamed args, or a hook block), `Some(Ready(coerced))` for a call
+            // that cleared its gate and is ready to actually run in phase 2, or `None` only if
+            // cancellation cut this loop short before reaching it.
+            #[derive(Clone)]
+            enum GateOutcome {
+                Immediate(ToolCallResult),
+                Ready(Value),
+            }
+            let mut outcomes: Vec<Option<GateOutcome>> = vec![None; calls.len()];
+            let mut gate_cancelled = false;
+            for (i, (id, name, input)) in calls.iter().enumerate() {
+                if cancel_ref.is_cancelled() {
+                    gate_cancelled = true;
+                    break;
+                }
+                if let Some(raw) = malformed.get(id) {
+                    // The model streamed a tool call whose argument fragments never formed valid
+                    // JSON. Feed that back as an error result the model can correct next turn rather
+                    // than aborting the whole run on one malformed call.
+                    outcomes[i] = Some(GateOutcome::Immediate((
+                        format!(
+                            "tool call arguments were not valid JSON and could not be parsed: {raw}"
+                        ),
+                        Vec::new(),
+                        true,
+                        false,
+                    )));
+                    continue;
+                }
+                if let Some(reason) = match catch_tool_panic(
+                    this.hooks.before_tool_call(name, input, session_ref, cancel_ref),
+                )
+                .await
+                {
+                    // A panicking permission hook fails closed: better to block the call than to
+                    // silently treat a crashed check as "allowed".
+                    Ok(reason) => reason,
+                    Err(panic_msg) => Some(panic_msg),
+                } {
+                    // A hook blocked the call (e.g. a permission policy). Feed the reason back as an
+                    // error result instead of running the tool.
+                    outcomes[i] = Some(GateOutcome::Immediate((
+                        format!("tool call blocked: {reason}"),
+                        Vec::new(),
+                        true,
+                        false,
+                    )));
+                    continue;
+                }
+                // Best-effort pi-parity coercion (`validation.rs`, matches pi's AJV-backed
+                // `validateToolArguments`): a provider that stringified a primitive the model emitted
+                // as genuinely typed (`{"count":"42"}` instead of `{"count":42}`) would otherwise fail
+                // the tool's own `as_i64()`/`as_bool()` extraction with a confusing "missing field"
+                // error. Falls back to the raw input unchanged on any coercion failure — a genuinely
+                // malformed call still surfaces through the tool's own existing, clearer validation
+                // error rather than a new failure path.
+                let coerced = match this.tools.get(name) {
+                    Some(tool) => {
+                        let mut c = crate::validation::coerce_tool_arguments(
+                            &tool.input_schema(),
+                            input.clone(),
+                        )
+                        .unwrap_or_else(|_| input.clone());
+                        // Task #36 (pi-parity): lets `read` append a "current model doesn't support
+                        // images" note when it reads an image file — schema-undocumented, so it's
+                        // invisible to the model and ignored by every other tool.
+                        if let Some(obj) = c.as_object_mut() {
+                            obj.insert(
+                                "_model_supports_vision".to_string(),
+                                crate::models::capabilities(&this.model)
+                                    .supports_vision
+                                    .into(),
+                            );
+                        }
+                        c
+                    }
+                    None => input.clone(),
+                };
+                outcomes[i] = Some(GateOutcome::Ready(coerced));
+            }
+            let outcomes = Arc::new(outcomes);
+
+            // `None` until that call's group finishes (or phase 1 above resolved it directly); a slot
+            // left `None` after dispatch means cancellation aborted it before it ran, and
+            // `repair_cancelled_dispatch` needs to tell that apart from a real (possibly empty) result
+            // to synthesize a matching error `tool_result` for it.
+            let mut results: Vec<Option<ToolCallResult>> = vec![None; calls.len()];
+            // Phase 2 — actually execute every gated call, grouped and bounded exactly as before:
+            // skipped entirely when phase 1 above was itself cut short by cancellation (nothing gated
+            // means nothing left to execute).
+            let mut cancelled_mid_dispatch = gate_cancelled;
+            if !gate_cancelled {
+                // Per-turn progress channel: every call gets a `ToolProgress` cloning `prog_tx`; the
+                // drain loop below forwards each update to `sink` as it arrives. `futures`' mpsc keeps
+                // this executor-agnostic (no tokio in the library).
+                let (prog_tx, mut prog_rx) =
+                    futures::channel::mpsc::unbounded::<crate::tool::ToolUpdate>();
+                let prog_tx = &prog_tx;
+                let group_runs = groups.into_values().map(|(target, indices)| {
+                    let calls = &calls;
+                    let prog_tx = prog_tx.clone();
+                    let cancel = cancel_ref.clone();
+                    let write_locks = this.write_locks.clone();
+                    let outcomes = outcomes.clone();
+                    async move {
+                        // Held for the group's whole serial run: extends the intra-turn grouping above
+                        // across turn and session boundaries, so a concurrently-running turn (or a
+                        // different session sharing this `Agent`'s registry) touching the same path
+                        // really waits, not just calls within this one turn.
+                        let _write_guard = match &target {
+                            Some(path) => Some(write_locks.lock(path).await),
+                            None => None,
+                        };
+                        let mut out = Vec::with_capacity(indices.len());
+                        for i in indices {
+                            let (id, name, input) = &calls[i];
+                            // Per call: (text, images, is_error, terminate). Hooks rewrite the *text*
+                            // and error flag; images and the terminate hint pass through untouched.
+                            // The gate/coercion decision itself was already made, sequentially and in
+                            // call order, by phase 1 above — this only ever runs the tool (or replays
+                            // an already-immediate outcome) and the `after_tool_call` rewrite.
+                            let result: ToolCallResult = match outcomes[i].clone() {
+                                Some(GateOutcome::Immediate(result)) => result,
+                                Some(GateOutcome::Ready(coerced)) => {
+                                    let progress = crate::tool::ToolProgress::new(
+                                        prog_tx.clone(),
+                                        id.clone(),
+                                        name.clone(),
+                                        cancel.clone(),
+                                    );
+                                    let (text, images, is_error, terminate) =
+                                        match this.tools.get(name) {
+                                            Some(tool) => {
+                                                match catch_tool_panic(
+                                                    tool.run_streaming(coerced, &progress),
+                                                )
+                                                .await
+                                                {
+                                                    Ok(Ok(o)) => {
+                                                        (o.text, o.images, false, o.terminate)
+                                                    }
+                                                    Ok(Err(e)) => {
+                                                        (e.to_string(), Vec::new(), true, false)
+                                                    }
+                                                    Err(panic_msg) => {
+                                                        (panic_msg, Vec::new(), true, false)
+                                                    }
+                                                }
+                                            }
+                                            None => (
+                                                format!("unknown tool: {name}"),
+                                                Vec::new(),
+                                                true,
+                                                false,
+                                            ),
+                                        };
+                                    // Let a hook rewrite the result text/images (redact, cap,
+                                    // reclassify) before it's fed back to the model. A panicking hook
+                                    // here just keeps the tool's own original (text, images, is_error)
+                                    // — losing a real, already-obtained result to a broken *rewrite*
+                                    // attempt would be strictly worse than ignoring the rewrite.
+                                    let (text, images, is_error) = match catch_tool_panic(
+                                        this.hooks.after_tool_call(
+                                            name,
+                                            input,
+                                            text.clone(),
+                                            images.clone(),
+                                            is_error,
+                                            session_ref,
+                                            &cancel,
+                                        ),
+                                    )
+                                    .await
+                                    {
+                                        Ok(rewritten) => rewritten,
+                                        Err(_) => (text, images, is_error),
+                                    };
+                                    (text, images, is_error, terminate)
+                                }
+                                // Only reachable if cancellation cut phase 1's sequential gate loop
+                                // short before reaching this call — but that path sets
+                                // `gate_cancelled` and skips this whole execution phase, so this arm
+                                // never actually runs in practice. Kept so the match stays exhaustive
+                                // without an `.unwrap()`.
+                                None => (
+                                    "cancelled: tool call aborted before it finished".to_string(),
                                     Vec::new(),
                                     true,
                                     false,
-                                )
-                            } else if let Some(reason) = match catch_tool_panic(
-                                this.hooks.before_tool_call(name, input, session_ref, &cancel),
-                            )
-                            .await
-                            {
-                                // A panicking permission hook fails closed: better to block the call
-                                // than to silently treat a crashed check as "allowed".
-                                Ok(reason) => reason,
-                                Err(panic_msg) => Some(panic_msg),
-                            } {
-                                // A hook blocked the call (e.g. a permission policy). Feed the reason
-                                // back as an error result instead of running the tool.
-                                (format!("tool call blocked: {reason}"), Vec::new(), true, false)
-                            } else {
-                                let progress = crate::tool::ToolProgress::new(
-                                    prog_tx.clone(),
-                                    id.clone(),
-                                    name.clone(),
-                                    cancel.clone(),
-                                );
-                                let (text, images, is_error, terminate) =
-                                    match this.tools.get(name) {
-                                        Some(tool) => {
-                                            // Best-effort pi-parity coercion (`validation.rs`, matches
-                                            // pi's AJV-backed `validateToolArguments`): a provider that
-                                            // stringified a primitive the model emitted as genuinely
-                                            // typed (`{"count":"42"}` instead of `{"count":42}`) would
-                                            // otherwise fail the tool's own `as_i64()`/`as_bool()`
-                                            // extraction with a confusing "missing field" error. Falls
-                                            // back to the raw input unchanged on any coercion failure —
-                                            // a genuinely malformed call still surfaces through the
-                                            // tool's own existing, clearer validation error rather than
-                                            // a new failure path.
-                                            let mut coerced = crate::validation::coerce_tool_arguments(
-                                                &tool.input_schema(),
-                                                input.clone(),
-                                            )
-                                            .unwrap_or_else(|_| input.clone());
-                                            // Task #36 (pi-parity): lets `read` append a "current model
-                                            // doesn't support images" note when it reads an image file —
-                                            // schema-undocumented, so it's invisible to the model and
-                                            // ignored by every other tool.
-                                            if let Some(obj) = coerced.as_object_mut() {
-                                                obj.insert(
-                                                    "_model_supports_vision".to_string(),
-                                                    crate::models::capabilities(&this.model)
-                                                        .supports_vision
-                                                        .into(),
-                                                );
-                                            }
-                                            match catch_tool_panic(
-                                                tool.run_streaming(coerced, &progress),
-                                            )
-                                            .await
-                                            {
-                                                Ok(Ok(o)) => (o.text, o.images, false, o.terminate),
-                                                Ok(Err(e)) => {
-                                                    (e.to_string(), Vec::new(), true, false)
-                                                }
-                                                Err(panic_msg) => {
-                                                    (panic_msg, Vec::new(), true, false)
-                                                }
-                                            }
-                                        }
-                                        None => {
-                                            (format!("unknown tool: {name}"), Vec::new(), true, false)
-                                        }
-                                    };
-                                // Let a hook rewrite the result text/images (redact, cap, reclassify)
-                                // before it's fed back to the model. A panicking hook here just keeps
-                                // the tool's own original (text, images, is_error) — losing a real,
-                                // already-obtained result to a broken *rewrite* attempt would be
-                                // strictly worse than ignoring the rewrite.
-                                let (text, images, is_error) = match catch_tool_panic(
-                                    this.hooks.after_tool_call(
-                                        name,
-                                        input,
-                                        text.clone(),
-                                        images.clone(),
-                                        is_error,
-                                        session_ref,
-                                        &cancel,
-                                    ),
-                                )
-                                .await
-                                {
-                                    Ok(rewritten) => rewritten,
-                                    Err(_) => (text, images, is_error),
-                                };
-                                (text, images, is_error, terminate)
+                                ),
                             };
-                        // Sent the instant this call's own result is known — not batched until every
-                        // group in the turn finishes — so a client watching the event stream sees each
-                        // tool's completion as it actually happens, not all-at-once after the slowest
-                        // concurrently-dispatched call joins.
-                        prog_tx
-                            .unbounded_send(crate::tool::ToolUpdate::End {
-                                id: id.clone(),
-                                name: name.clone(),
-                                result: result.0.clone(),
-                                is_error: result.2,
-                            })
-                            .ok();
-                        out.push((i, result));
+                            // Sent the instant this call's own result is known — not batched until
+                            // every group in the turn finishes — so a client watching the event stream
+                            // sees each tool's completion as it actually happens, not all-at-once
+                            // after the slowest concurrently-dispatched call joins.
+                            prog_tx
+                                .unbounded_send(crate::tool::ToolUpdate::End {
+                                    id: id.clone(),
+                                    name: name.clone(),
+                                    result: result.0.clone(),
+                                    is_error: result.2,
+                                })
+                                .ok();
+                            out.push((i, result));
+                        }
+                        out
                     }
-                    out
-                }
-            });
-            // `None` until that call's group finishes; a slot left `None` means cancellation aborted
-            // dispatch before it ran, and `repair_cancelled_dispatch` needs to tell that apart from a
-            // real (possibly empty) result to synthesize a matching error `tool_result` for it.
-            let mut results: Vec<Option<ToolCallResult>> = vec![None; calls.len()];
-            // Bound how many groups run at once. `buffer_unordered` is safe here because each group
-            // yields its results tagged with their original call index `i`; cross-group completion
-            // order never reaches the transcript, which is rebuilt in call order below. `exclusive_turn`
-            // caps this at 1 instead — with only ever one group in flight, a `bash` call (or anything
-            // else `conservative_exclusive`) can't race a same-turn `edit`/`write` group it has no path
-            // to be grouped against; which group runs first still doesn't matter for the transcript,
-            // same as the concurrent case. `self.sequential_tools` caps it at 1 too, host-selected
-            // rather than inferred from the calls themselves — e.g. a deterministic-repro debugging
-            // session, or a host policy that never wants two tool calls actually overlapping.
-            //
-            // Race the whole dispatch against cancellation: a tripped token drops `drain`, which drops
-            // every in-flight tool future — aborting a hung `bash` (its `kill_on_drop` child dies) and
-            // any other long-running tool — and returns promptly instead of waiting them all out. The
-            // block scopes `drain`'s `&mut results` borrow so the transcript below can consume them;
-            // `cancelled_mid_dispatch` is only *acted on* after the block ends and that borrow is
-            // fully released (repairing the transcript needs to move `results` out).
-            let mut cancelled_mid_dispatch = false;
-            {
+                });
+                // Bound how many groups run at once. `buffer_unordered` is safe here because each
+                // group yields its results tagged with their original call index `i`; cross-group
+                // completion order never reaches the transcript, which is rebuilt in call order below.
+                // `exclusive_turn` caps this at 1 instead — with only ever one group in flight, a
+                // `bash` call (or anything else `conservative_exclusive`) can't race a same-turn
+                // `edit`/`write` group it has no path to be grouped against; which group runs first
+                // still doesn't matter for the transcript, same as the concurrent case.
+                // `self.sequential_tools` caps it at 1 too, host-selected rather than inferred from the
+                // calls themselves — e.g. a deterministic-repro debugging session, or a host policy
+                // that never wants two tool calls actually overlapping.
+                //
+                // Race the whole execution phase against cancellation: a tripped token drops `drain`,
+                // which drops every in-flight tool future — aborting a hung `bash` (its
+                // `kill_on_drop` child dies) and any other long-running tool — and returns promptly
+                // instead of waiting them all out. The block scopes `drain`'s `&mut results` borrow so
+                // the transcript below can consume them; `cancelled_mid_dispatch` is only *acted on*
+                // after the block ends and that borrow is fully released (repairing the transcript
+                // needs to move `results` out).
                 let concurrency = if self.sequential_tools || exclusive_turn {
                     1
                 } else {
@@ -1284,13 +1393,13 @@ impl Agent {
                 }
             }
             if cancelled_mid_dispatch {
-                // Cancelled mid-dispatch: the assistant message (with its `ToolUse` blocks) is already
-                // committed above, but the tool-results message below never will be. Left as-is, the
-                // session would end on an orphaned `tool_use` with no matching `tool_result` — a shape
-                // both Anthropic and OpenAI reject on resume. Repair it before propagating the
-                // cancellation.
+                // Cancelled mid-gate or mid-dispatch: the assistant message (with its `ToolUse`
+                // blocks) is already committed above, but the tool-results message below never will
+                // be. Left as-is, the session would end on an orphaned `tool_use` with no matching
+                // `tool_result` — a shape both Anthropic and OpenAI reject on resume. Repair it before
+                // propagating the cancellation.
                 repair_cancelled_dispatch(session, &calls, results);
-                steering.clear();
+                steering.clear_run_scoped();
                 return Err(Error::Cancelled);
             }
             // `ToolEnd` for each call was already emitted live, from within `group_runs`, the instant
@@ -1781,13 +1890,16 @@ impl Agent {
         cancel: &CancellationToken,
         custom_instructions: Option<&str>,
     ) -> Result<String> {
-        // Same input budget compaction sizes its own summarization calls against — the model's context
-        // window minus its reserved headroom — so an abandoned branch's rendered transcript can't
-        // overflow the summarization call's own window any more than a compaction summary's can.
-        let input_token_budget = self
-            .compaction
-            .context_window
-            .saturating_sub(self.compaction.reserve_tokens);
+        // The same shape of input budget compaction sizes its own summarization calls against — the
+        // model's context window minus a reserved headroom — so an abandoned branch's rendered
+        // transcript can't overflow the summarization call's own window any more than a compaction
+        // summary's can. The reserve itself, though, is `branch_summary_reserve_tokens` when a caller
+        // set one (independent of the live conversation's own compaction reserve — see that field's
+        // doc comment), falling back to `compaction.reserve_tokens` otherwise, today's exact behavior.
+        let reserve_tokens = self
+            .branch_summary_reserve_tokens
+            .unwrap_or(self.compaction.reserve_tokens);
+        let input_token_budget = self.compaction.context_window.saturating_sub(reserve_tokens);
         // `replace_instructions` is always `false` here: `summarize_branch`'s own signature has no
         // caller-facing way to request it yet (no `switch_branch` RPC field threads it down) — see
         // `branch_summary_request`'s own doc comment for the option itself.
@@ -4773,6 +4885,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn before_tool_call_runs_in_call_order_even_for_independent_concurrent_calls() {
+        // pi-parity fix: `before_tool_call` used to be invoked from *inside* each write-target
+        // group's own async block, and groups were dispatched via `HashMap` iteration order (not
+        // call order) — for a turn batching several independent (different-target) calls, a later
+        // call's gate could run before, or concurrently with, an earlier call's. pi's
+        // `prepareToolCall` always resolves every call sequentially, in call order, before any call's
+        // actual execution begins (`executeToolCallsParallel`, agent-loop.ts:451-516) — a
+        // concurrency-aware permission hook (a rate limiter, a policy reasoning about "what's already
+        // running") depends on that same guarantee. Registers tools in a deliberately scrambled order
+        // so a `HashMap`-iteration-order bug wouldn't accidentally happen to match call order anyway.
+        struct RecordingHook {
+            order: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+        #[async_trait]
+        impl AgentHooks for RecordingHook {
+            async fn before_tool_call(
+                &self,
+                name: &str,
+                _input: &Value,
+                _session: &Session,
+                _cancel: &CancellationToken,
+            ) -> Option<String> {
+                self.order.lock().unwrap().push(name.to_string());
+                None
+            }
+        }
+        struct NamedEchoTool(&'static str);
+        #[async_trait]
+        impl Tool for NamedEchoTool {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn description(&self) -> &str {
+                "echoes its own name immediately"
+            }
+            fn input_schema(&self) -> Value {
+                json!({ "type": "object" })
+            }
+            async fn run(
+                &self,
+                _: Value,
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+                Ok(self.0.into())
+            }
+        }
+
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut tools = ToolRegistry::new();
+        for name in ["e", "b", "d", "a", "c"] {
+            tools.register(Arc::new(NamedEchoTool(name)));
+        }
+
+        // Five independent (no `write_target`, so each is its own group) calls, well under
+        // `MAX_CONCURRENT_TOOL_GROUPS`, requested in this exact order.
+        let call_order = ["a", "b", "c", "d", "e"];
+        let mut scripted_turn = vec![StreamEvent::MessageStart];
+        for (i, name) in call_order.iter().enumerate() {
+            scripted_turn.push(StreamEvent::ToolUseStart {
+                index: 0,
+                id: format!("t{i}"),
+                name: name.to_string(),
+            });
+            scripted_turn.push(StreamEvent::ContentBlockStop { index: 0 });
+        }
+        scripted_turn.push(StreamEvent::MessageStop {
+            stop_reason: StopReason::ToolUse,
+        });
+
+        let mock = Arc::new(MockTransport::new(vec![scripted_turn, turn::text("done")]));
+        let agent = Agent::new(mock, "claude-opus-4-8")
+            .with_tools(tools)
+            .with_hooks(Arc::new(RecordingHook {
+                order: order.clone(),
+            }));
+        let mut session = Session::new();
+        session.user("go");
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        assert_eq!(
+            *order.lock().unwrap(),
+            call_order
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+            "before_tool_call must fire in call order, not HashMap-grouping order"
+        );
+    }
+
+    #[tokio::test]
     async fn with_sequential_tools_forces_one_group_in_flight_at_a_time() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
@@ -5983,6 +6184,72 @@ mod tests {
         let requests = mock.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].reasoning_effort, Some(ReasoningEffort::High));
+    }
+
+    #[tokio::test]
+    async fn summarize_branch_reserve_tokens_can_be_overridden_independently_of_compaction() {
+        // pi-parity gap: `summarize_branch` always sized its own input budget off
+        // `compaction.reserve_tokens` — pi exposes an independent `reserveTokens` setting for branch
+        // summarization instead (`branch-summarization.ts:62-63`, default 16384). A host tuning
+        // compaction's reserve for the *live* conversation shouldn't be forced to accept the same
+        // number for a one-off branch recap too.
+        let branch: Vec<Message> = (0..6)
+            .map(|i| {
+                if i % 2 == 0 {
+                    Message::user("hi")
+                } else {
+                    Message::assistant(vec![ContentBlock::text("ok")])
+                }
+            })
+            .collect();
+        let cancel = CancellationToken::new();
+
+        // A tiny context window with the (large) default `reserve_tokens` leaves a budget of 0 —
+        // `windowed_by_budget` then keeps only the single most recent message, noting the rest as
+        // omitted.
+        let mock_default = Arc::new(MockTransport::new(vec![turn::text("recap")]));
+        let agent_default =
+            Agent::new(mock_default.clone(), "claude-opus-4-8").with_context_window(50);
+        agent_default
+            .summarize_branch(&branch, &cancel, None)
+            .await
+            .unwrap();
+        let requests = mock_default.requests();
+        let ContentBlock::Text {
+            text: default_text, ..
+        } = &requests[0].messages[0].content[0]
+        else {
+            panic!("expected text");
+        };
+        assert!(
+            default_text.contains("earlier message(s) from this branch omitted"),
+            "the default (large) reserve should leave no budget for this tiny context window: \
+             {default_text}"
+        );
+
+        // Overriding just the branch-summary reserve to 0 (independent of compaction's own,
+        // untouched, default) frees up the whole context window as budget — comfortably enough for
+        // these few tiny messages that nothing gets windowed out.
+        let mock_override = Arc::new(MockTransport::new(vec![turn::text("recap")]));
+        let agent_override = Agent::new(mock_override.clone(), "claude-opus-4-8")
+            .with_context_window(50)
+            .with_branch_summary_reserve_tokens(0);
+        agent_override
+            .summarize_branch(&branch, &cancel, None)
+            .await
+            .unwrap();
+        let requests = mock_override.requests();
+        let ContentBlock::Text {
+            text: override_text,
+            ..
+        } = &requests[0].messages[0].content[0]
+        else {
+            panic!("expected text");
+        };
+        assert!(
+            !override_text.contains("earlier message(s) from this branch omitted"),
+            "an overridden, smaller reserve must free up more budget, not less: {override_text}"
+        );
     }
 
     #[tokio::test]
@@ -7682,10 +7949,11 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_clears_queued_steer_and_follow_up_messages() {
-        // pi-parity gap: pi's `agent-harness.ts` `abort()` unconditionally clears both queues so a
+        // pi-parity gap: pi's `agent-harness.ts` `abort()` clears the steer/follow-up queues so a
         // message queued right before (or during) cancellation doesn't silently ride into whatever
-        // unrelated run reuses the same `Steering` handle next. `Steering::clear()` existed already but
-        // `agent.rs` never called it on any of its cancellation exit paths.
+        // unrelated run reuses the same `Steering` handle next. `agent.rs` used to never call
+        // `Steering::clear()` (or its narrower successor, `clear_run_scoped()`) on any of its
+        // cancellation exit paths at all.
         let agent = Agent::new(Arc::new(MockTransport::new(vec![])), "claude-opus-4-8");
         let mut session = Session::new();
         session.user("go");
@@ -7705,6 +7973,81 @@ mod tests {
             steering.pending_count(),
             0,
             "both lanes must be cleared once a run ends via cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_does_not_clear_a_queued_next_turn_message() {
+        // pi-parity fix: cancellation must use the narrower `clear_run_scoped()`, not the general
+        // `clear()` — mirroring pi's `AgentHarness.abort()` (`agent-harness.ts:970-997`), which
+        // explicitly clears only `steerQueue`/`followUpQueue`, leaving `nextTurnQueue` untouched. A
+        // message queued via `push_next_turn` is meant to survive into whatever prompt comes next,
+        // aborted or not — a run ending in cancellation must not silently drop it.
+        //
+        // The next-turn lane is drained exactly once, right at the very start of
+        // `run_events_steered` (folded onto this run's own first turn) — so to actually exercise
+        // "does cancellation clear it," the message has to be queued *after* that point, mid-run,
+        // simulating one meant for whatever run comes *after* this one. A hung tool gives cancellation
+        // something to interrupt mid-dispatch, well past that initial drain.
+        struct HangTool;
+        #[async_trait]
+        impl Tool for HangTool {
+            fn name(&self) -> &str {
+                "hang"
+            }
+            fn description(&self) -> &str {
+                "never returns"
+            }
+            fn input_schema(&self) -> Value {
+                json!({ "type": "object" })
+            }
+            async fn run(
+                &self,
+                _: Value,
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+                futures::future::pending::<()>().await;
+                unreachable!()
+            }
+        }
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(HangTool));
+        let (agent, _mock) = agent_with(
+            vec![turn::tool_call("t", "hang", "{}"), turn::text("done")],
+            tools,
+        );
+        let mut session = Session::new();
+        session.user("go");
+
+        let steering = Steering::new();
+        steering.push("a follow-up queued before cancelling");
+        steering.push_steer("a steer queued before cancelling");
+
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        let switch_steering = steering.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            switch_steering.push_next_turn("must survive cancellation");
+            trigger.cancel();
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            agent.run_events_steered(&mut session, |_| {}, cancel, steering.clone()),
+        )
+        .await
+        .expect("cancellation must abort the hung tool, not hang the run");
+        assert!(matches!(result, Err(Error::Cancelled)));
+
+        assert_eq!(
+            steering.pending_count(),
+            1,
+            "the steer/follow-up lanes must be cleared but the next-turn lane must survive"
+        );
+        assert_eq!(
+            steering.drain_next_turn(),
+            vec!["must survive cancellation".to_string()],
+            "the next-turn message itself must be exactly what was queued before cancellation"
         );
     }
 
@@ -8132,6 +8475,142 @@ mod tests {
                     if model == "claude-cheap" && *thinking == Some(256)
             )),
             "a ModelSwitched event must fire so a client can observe the change: {events:#?}"
+        );
+    }
+
+    struct SleepyTool;
+    #[async_trait]
+    impl Tool for SleepyTool {
+        fn name(&self) -> &str {
+            "sleepy"
+        }
+        fn description(&self) -> &str {
+            "sleeps briefly"
+        }
+        fn input_schema(&self) -> Value {
+            json!({ "type": "object" })
+        }
+        async fn run(
+            &self,
+            _: Value,
+        ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            Ok("slept".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_mid_run_model_switch_can_change_reasoning_effort_via_thinking_level() {
+        use std::time::Duration;
+
+        // pi-parity gap: `ModelSwitch` used to have no way to change reasoning effort/thinking depth
+        // at all — only a raw thinking-*budget* override. `request_model_switch_with_thinking_level`
+        // reuses the same `models::thinking_for_level` translation `serve.rs`'s own
+        // `set_model`/`cycle_model` RPC handlers already call for an idle-time switch, so a mid-run
+        // one computes an identical `(thinking_budget, reasoning_effort)` pair.
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(SleepyTool));
+        let mock = Arc::new(MockTransport::new(vec![
+            turn::tool_call("t1", "sleepy", "{}"),
+            turn::text("done"),
+        ]));
+        // claude-opus-4-8 is an adaptive-thinking model: a level translates into *both* a thinking
+        // budget and a reasoning effort.
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8")
+            .with_tools(tools)
+            .with_max_steps(8);
+        let mut session = Session::new();
+        session.user("go");
+        let steering = Steering::new();
+
+        let switch_steering = steering.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            switch_steering.request_model_switch_with_thinking_level(
+                "claude-opus-4-8",
+                None,
+                Some(crate::models::ThinkingLevel::High),
+            );
+        });
+
+        agent
+            .run_events_steered(&mut session, |_| {}, CancellationToken::new(), steering)
+            .await
+            .unwrap();
+
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 2);
+        let caps = crate::models::capabilities("claude-opus-4-8");
+        let (expected_thinking, expected_effort) =
+            crate::models::thinking_for_level(&caps, crate::models::ThinkingLevel::High);
+        assert_eq!(
+            requests[0].reasoning_effort, None,
+            "the turn already in flight when the switch was requested must be unaffected"
+        );
+        assert_eq!(
+            requests[1].thinking.map(|t| t.budget_tokens),
+            expected_thinking,
+            "the next turn's thinking budget must match the switched-to level's translation"
+        );
+        assert_eq!(
+            requests[1].reasoning_effort, expected_effort,
+            "the next turn's reasoning effort must match the switched-to level's translation"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mid_run_model_switch_can_explicitly_turn_off_thinking() {
+        use std::time::Duration;
+
+        // `Some(ThinkingLevel::Off)` must **explicitly** disable thinking/reasoning — distinct from
+        // `None`, which leaves it exactly as currently configured. Starts the run with a real
+        // thinking budget/reasoning effort already active so "off" is an observable change, not a
+        // no-op.
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(SleepyTool));
+        let mock = Arc::new(MockTransport::new(vec![
+            turn::tool_call("t1", "sleepy", "{}"),
+            turn::text("done"),
+        ]));
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8")
+            .with_tools(tools)
+            .with_max_steps(8)
+            .with_thinking(4096)
+            .with_reasoning_effort(ReasoningEffort::High);
+        let mut session = Session::new();
+        session.user("go");
+        let steering = Steering::new();
+
+        let switch_steering = steering.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            switch_steering.request_model_switch_with_thinking_level(
+                "claude-opus-4-8",
+                None,
+                Some(crate::models::ThinkingLevel::Off),
+            );
+        });
+
+        agent
+            .run_events_steered(&mut session, |_| {}, CancellationToken::new(), steering)
+            .await
+            .unwrap();
+
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].thinking.as_ref().map(|t| t.budget_tokens),
+            Some(4096),
+            "the first turn must still carry the originally configured thinking budget"
+        );
+        assert_eq!(requests[0].reasoning_effort, Some(ReasoningEffort::High));
+        assert!(
+            requests[1].thinking.is_none(),
+            "an explicit Off switch must clear the thinking budget on the next turn"
+        );
+        assert!(
+            requests[1].reasoning_effort.is_none(),
+            "an explicit Off switch must clear reasoning effort on the next turn"
         );
     }
 

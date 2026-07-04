@@ -24,6 +24,41 @@ const COPILOT_INTEGRATION_ID: &str = "vscode-chat";
 const COPILOT_API_VERSION: &str = "2026-06-01";
 const EARLY_REFRESH_BUFFER_MS: i64 = 5 * 60 * 1000;
 
+/// Every model id GitHub Copilot may require an explicit per-model "enable" policy call for before
+/// it's usable from this account — ported from pi's `GITHUB_COPILOT_MODELS` catalog
+/// (`packages/ai/src/providers/github-copilot.models.ts`). Only the ids matter for the login-time
+/// enable fan-out (`enable_models`); none of that catalog's other per-model metadata (pricing,
+/// context window, headers, …) has a use here. Not consulted for anything past login — actual
+/// model *availability* always comes from `fetch_available_models`'s live `/models` response, never
+/// from this static list.
+pub const KNOWN_MODEL_IDS: &[&str] = &[
+    "claude-fable-5",
+    "claude-haiku-4.5",
+    "claude-opus-4.5",
+    "claude-opus-4.6",
+    "claude-opus-4.7",
+    "claude-opus-4.8",
+    "claude-sonnet-4",
+    "claude-sonnet-4.5",
+    "claude-sonnet-4.6",
+    "claude-sonnet-5",
+    "gemini-2.5-pro",
+    "gemini-3-flash-preview",
+    "gemini-3.1-pro-preview",
+    "gemini-3.5-flash",
+    "gpt-4.1",
+    "gpt-5-mini",
+    "gpt-5.2",
+    "gpt-5.2-codex",
+    "gpt-5.3-codex",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.4-nano",
+    "gpt-5.5",
+    "kimi-k2.7-code",
+    "mai-code-1-flash-picker",
+];
+
 #[derive(Debug, Clone)]
 pub struct GithubCopilotCredential {
     pub access: String,
@@ -193,13 +228,38 @@ async fn poll_access_token_once(
         url: url.to_string(),
         source,
     })?;
+    parse_poll_response(&body)
+}
+
+/// Parse GitHub's device-token poll response body into a [`DevicePollStep`] — split out from
+/// [`poll_access_token_once`] purely so the `slow_down`/`interval` handling is unit-testable without
+/// a live HTTP server.
+///
+/// GitHub's `slow_down` response reports its own required minimum poll interval in an `interval`
+/// field (seconds) — the same field the initial device-code response carries. A client that only
+/// tracks its own locally-incremented interval can fall behind that requirement under clock drift
+/// (WSL/VM guests), keep polling too early, and re-trigger `slow_down` on every subsequent attempt
+/// until the whole login times out. When present (and sane — a finite positive number of seconds),
+/// it's threaded through as [`DevicePollStep::SlowDownWithInterval`] so the shared poll loop
+/// (`device_code::poll_device_code`) can prefer it outright over the local +5s increment.
+fn parse_poll_response(body: &serde_json::Value) -> Result<DevicePollStep<String>> {
     if let Some(token) = body.get("access_token").and_then(|v| v.as_str()) {
         return Ok(DevicePollStep::Complete(token.to_string()));
     }
     let error = body.get("error").and_then(|v| v.as_str()).unwrap_or_default();
     match error {
         "authorization_pending" => Ok(DevicePollStep::Pending),
-        "slow_down" => Ok(DevicePollStep::SlowDown),
+        "slow_down" => {
+            let server_interval = body
+                .get("interval")
+                .and_then(|v| v.as_u64())
+                .filter(|&seconds| seconds > 0)
+                .map(Duration::from_secs);
+            Ok(match server_interval {
+                Some(server_interval) => DevicePollStep::SlowDownWithInterval(server_interval),
+                None => DevicePollStep::SlowDown,
+            })
+        }
         other => {
             let description = body
                 .get("error_description")
@@ -392,6 +452,75 @@ async fn enable_models(http: &Client, base_url: &str, token: &str, model_ids: &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn known_model_ids_is_non_empty_and_has_no_duplicates() {
+        assert!(!KNOWN_MODEL_IDS.is_empty());
+        let mut sorted = KNOWN_MODEL_IDS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            KNOWN_MODEL_IDS.len(),
+            "KNOWN_MODEL_IDS must not contain duplicate ids"
+        );
+    }
+
+    #[test]
+    fn parse_poll_response_returns_complete_when_an_access_token_is_present() {
+        let body = serde_json::json!({ "access_token": "ghu_abc123" });
+        let step = parse_poll_response(&body).unwrap();
+        assert!(matches!(step, DevicePollStep::Complete(token) if token == "ghu_abc123"));
+    }
+
+    #[test]
+    fn parse_poll_response_returns_pending_on_authorization_pending() {
+        let body = serde_json::json!({ "error": "authorization_pending" });
+        let step = parse_poll_response(&body).unwrap();
+        assert!(matches!(step, DevicePollStep::Pending));
+    }
+
+    #[test]
+    fn parse_poll_response_returns_plain_slow_down_when_no_interval_is_given() {
+        let body = serde_json::json!({ "error": "slow_down" });
+        let step = parse_poll_response(&body).unwrap();
+        assert!(matches!(step, DevicePollStep::SlowDown));
+    }
+
+    #[test]
+    fn parse_poll_response_carries_the_servers_interval_when_slow_down_names_one() {
+        // A server interval (7s) larger than the local +5s increment would ever produce on its own
+        // — the whole point of threading this through is that this larger, server-named value must
+        // be what the poll loop actually uses.
+        let body = serde_json::json!({ "error": "slow_down", "interval": 7 });
+        let step = parse_poll_response(&body).unwrap();
+        match step {
+            DevicePollStep::SlowDownWithInterval(interval) => {
+                assert_eq!(interval, Duration::from_secs(7));
+            }
+            _ => panic!("expected SlowDownWithInterval"),
+        }
+    }
+
+    #[test]
+    fn parse_poll_response_ignores_a_zero_interval_and_falls_back_to_plain_slow_down() {
+        let body = serde_json::json!({ "error": "slow_down", "interval": 0 });
+        let step = parse_poll_response(&body).unwrap();
+        assert!(matches!(step, DevicePollStep::SlowDown));
+    }
+
+    #[test]
+    fn parse_poll_response_fails_on_an_unrecognized_error_with_its_description() {
+        let body = serde_json::json!({ "error": "access_denied", "error_description": "user said no" });
+        let err = parse_poll_response(&body).unwrap_err();
+        match err {
+            OAuthError::DeviceFlowFailed(msg) => {
+                assert!(msg.contains("access_denied"));
+                assert!(msg.contains("user said no"));
+            }
+            other => panic!("expected DeviceFlowFailed, got {other:?}"),
+        }
+    }
 
     #[test]
     fn base_url_extracts_proxy_ep_and_rewrites_proxy_prefix_to_api() {

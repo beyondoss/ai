@@ -359,6 +359,12 @@ const USER_IMAGE_PLACEHOLDER: &str = "(image omitted: model does not support ima
 /// Same idea, for a tool result's images specifically — a distinct string so a transcript reader can
 /// tell which shape produced it.
 const TOOL_IMAGE_PLACEHOLDER: &str = "(tool image omitted: model does not support images)";
+/// Default text for a vision-capable tool result that carries images but no text at all — matching
+/// pi's `convertContentBlocks` (`anthropic-messages.ts`), which unshifts this exact string as a text
+/// block before the image blocks rather than sending a content array with no text part. Distinct from
+/// [`TOOL_IMAGE_PLACEHOLDER`]/[`USER_IMAGE_PLACEHOLDER`] above: those two stand in for an image the
+/// model can't see at all (vision unsupported); this one accompanies a real image the model *can* see.
+const TOOL_RESULT_IMAGE_ONLY_TEXT: &str = "(see attached image)";
 
 /// Replace image content with a text placeholder when `supports_vision` is `false` — sending an image
 /// to a model that doesn't accept one would otherwise 400 the whole turn instead of degrading
@@ -455,6 +461,11 @@ fn encode_tool_result_images(messages: &mut Value) {
             let mut parts: Vec<Value> = Vec::new();
             if !text.is_empty() {
                 parts.push(json!({ "type": "text", "text": text }));
+            } else {
+                // Images with no accompanying text: default to pi's own placeholder rather than
+                // sending a content array whose first (and only, until the loop below) block is an
+                // image with nothing labeling it.
+                parts.push(json!({ "type": "text", "text": TOOL_RESULT_IMAGE_ONLY_TEXT }));
             }
             // A serialized `ImageSource` is exactly Anthropic's `source` object (`type:"base64"`, …).
             for source in images {
@@ -1354,10 +1365,13 @@ data: {"type":"message_stop"}
     }
 
     #[test]
-    fn a_tool_result_with_only_an_image_and_no_text_omits_the_empty_text_block() {
+    fn a_tool_result_with_only_an_image_and_no_text_gets_the_see_attached_image_placeholder() {
         // A-L8 pi-parity test gap (fixed, `packages/ai/test/image-tool-result.test.ts`): a tool that
         // returns only an image (no text) — a screenshot tool, say — must not pad the wire content
-        // array with a spurious empty `{"type":"text","text":""}` block ahead of the real image.
+        // array with a spurious empty `{"type":"text","text":""}` block ahead of the real image, but
+        // it must also not omit the text block entirely — pi's own `convertContentBlocks`
+        // (`anthropic-messages.ts`) unshifts a `"(see attached image)"` text block ahead of the image
+        // in exactly this case, so a transcript/UI reader always has *some* text to show.
         use crate::message::ImageSource;
         let req = ModelRequest::new(
             "claude-opus-4-8",
@@ -1375,11 +1389,15 @@ data: {"type":"message_stop"}
             .unwrap();
         assert_eq!(
             content.len(),
-            1,
-            "expected only the image block: {content:#?}"
+            2,
+            "expected the placeholder text block, then the image block: {content:#?}"
         );
-        assert_eq!(content[0]["type"], "image");
-        assert_eq!(content[0]["source"]["data"], "AAAA");
+        assert_eq!(
+            content[0],
+            json!({ "type": "text", "text": "(see attached image)" })
+        );
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["data"], "AAAA");
     }
 
     #[test]

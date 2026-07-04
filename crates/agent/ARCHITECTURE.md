@@ -49,16 +49,19 @@ The harness layers several capabilities over the bare tools + loop:
   reason. `--force-untrusted` still wins over this fast path — an operator's explicit "treat this run as
   untrusted" request is checked first, regardless of whether there's anything to gate.
 - **Persisted settings** ([`settings`](src/settings.rs)) — pi's own `SettingsManager`, scoped way down:
-  a small on-disk store (`~/.claude/settings.json`) for exactly three stored defaults —
-  `default_model`/`default_gateway_url`/`default_session_dir` — consulted as the last fallback in
-  `run_task`/`Command::Serve` after an explicit `--flag` or its `AI_AGENT_*`/`AI_GATEWAY_URL`
-  environment variable, before this crate's own built-in default (`DEFAULT_MODEL`/`DEFAULT_GATEWAY`/
-  `default_session_dir(cwd)`). Managed out-of-band via `agent settings [--model/--gateway-url/
-  --session-dir <val>] [--clear-model/--clear-gateway-url/--clear-session-dir]` — the same
-  managed-out-of-band convention `agent trust`/`agent untrust` already use for `trust_store.rs` — not
-  through any `run`/`serve` RPC surface, since both are one-shot/headless processes with no live session
-  that would need to *change* a stored default mid-run the way pi's long-lived TUI does. `SettingsStore`
-  reuses `trust_store.rs`'s exact on-disk pattern (its own small, duplicated `FileLock`: atomic
+  a small on-disk store (`~/.claude/settings.json`) for `default_model`/`default_gateway_url`/
+  `default_session_dir`/`default_project_trust`/`compaction_enabled`/`default_reasoning_effort` —
+  consulted as the last fallback in `run_task`/`Command::Serve` after an explicit `--flag` or its
+  `AI_AGENT_*`/`AI_GATEWAY_URL` environment variable, before this crate's own built-in default
+  (`DEFAULT_MODEL`/`DEFAULT_GATEWAY`/`default_session_dir(cwd)`/left unset for the reasoning-effort
+  case, since there's no built-in default effort to fall back to). Managed out-of-band via
+  `agent settings [--model/--gateway-url/--session-dir/--default-project-trust/
+  --default-reasoning-effort <val>] [--clear-model/--clear-gateway-url/--clear-session-dir/
+  --clear-default-project-trust/--clear-default-reasoning-effort]` — the same managed-out-of-band
+  convention `agent trust`/`agent untrust` already use for `trust_store.rs` — not through any
+  `run`/`serve` RPC surface, since both are one-shot/headless processes with no live session that would
+  need to *change* a stored default mid-run the way pi's long-lived TUI does. `SettingsStore` reuses
+  `trust_store.rs`'s exact on-disk pattern (its own small, duplicated `FileLock`: atomic
   lockfile-creation cross-process locking with stale-lock reclaim, atomic writes via
   `tools::write_atomic`, re-read-under-lock-before-mutate to survive two concurrent writers changing
   different fields) rather than sharing code with it — each store is small and self-contained, with no
@@ -69,6 +72,42 @@ The harness layers several capabilities over the bare tools + loop:
   actually requested. Deliberately narrower than pi's own settings file, which also covers TUI-only
   concerns (theme, terminal rendering, keybindings, external editor integration, telemetry) with no
   analog in a headless binary that has no interactive UI of its own.
+
+  **`default_project_trust` precedence** (`serve::resolve_project_trust`, shared by `run` and `serve`) —
+  `--force-untrusted`/`--trust-project` win outright when given; otherwise an explicit **per-path**
+  `TrustStore` entry (`agent trust`/`agent untrust <path>`) wins next; only when that lookup is
+  `Trust::Unknown` does this stored blanket policy (`always`/`never`/`ask`) apply. This used to be
+  inverted — the blanket policy was checked *before* the per-path entry, and `serve` didn't consult the
+  stored policy at all — so an operator's specific `agent trust <path>` exception could be silently
+  overridden by a coarser `never` default, and a `serve` session ignored the setting entirely regardless.
+
+  **Model overrides** (`settings::ModelOverride`/`ModelOverrides`, `~/.claude/models.json`, a sibling of
+  `settings.json`) — a minimal on-disk map of model id → `{base_url, api_key}`, pi's own
+  `model-registry.ts` custom-model/override support scoped way down: no per-model capability overrides
+  (an id this crate doesn't recognize already gets sane defaults from `agent_core::models::
+  ModelCaps::unknown()`, so there's nothing to add there), and no OpenRouter-specific routing-preference
+  surface (order/only/ignore/zdr) — this crate has no OpenRouter-specific request shaping to hang that
+  off of. A `base_url` override wins outright in `main.rs::resolve_gateway_credential`, regardless of
+  whether `--key`/`AI_AGENT_KEY` was also given (routing and auth are orthogonal), bypassing the gateway
+  entirely via the same `agent_core::client::DirectRouting`/`RouteOverride::Direct` mechanism the
+  GitHub-Copilot OAuth routing already uses — the bearer sent is the override's own `api_key`, else
+  `--key`/`AI_AGENT_KEY`, else empty (many self-hosted OpenAI-compatible servers ignore the
+  `Authorization` header entirely). A corrupt/unparsable file warns and is treated as empty, matching
+  `trust_store.rs`'s identical precedent, rather than hard-failing a normal invocation. Surfaced via
+  `agent settings`'s printout (path + override count) — read-only; the file itself is hand-edited, like
+  pi's own `models.json`, not managed through CLI flags.
+
+  **Model-id resolution** (`serve::resolve_model_id`) — `--model`, `set_model`, and (via
+  `resolve_model_scope`) a literal `--models` entry all resolve a partial/fuzzy id against the known-model
+  hint list (`serve::available_models`) before falling back to forwarding it verbatim: an exact,
+  case-insensitive match wins outright; otherwise every catalog id *containing* the input as a substring
+  is a candidate (e.g. `opus` → `claude-opus-4-8`); exactly one candidate resolves to it, more than one is
+  an error naming every candidate (mirroring `SessionRepo::find_path`'s own "list every candidate, don't
+  guess" philosophy rather than pi's own `model-resolver.ts`, which silently picks whichever sorts first),
+  and no candidates at all falls through unchanged (`available_models` is a hint, not an allowlist — the
+  gateway forwards any id verbatim). `--model`/`set_model` fail outright on an ambiguous match; a
+  `--models` entry instead warns and keeps the literal, since that's a background candidate-list build,
+  not the one model actively driving the session.
 
   **Deliberately not implemented: version-check/changelog-surfacing on upgrade.** pi has two decoupled
   mechanisms here (`version-check.ts`'s `getLatestPiRelease()` — a real network call to pi's own hosted
@@ -251,17 +290,26 @@ The harness layers several capabilities over the bare tools + loop:
   it forkable. `before: bool` excludes the target entry itself from the copied prefix (fork right before
   it) instead of including it (the default). Every `create`/`fork`/`fork_at_entry` writes its file
   immediately (the header, then — since `fork`/`fork_at_entry` both call `rewrite` — the copied prefix
-  in the same call), unlike pi's `createBranchedSession`, which defers the actual file write until an
-  assistant message lands, specifically to avoid littering the session directory with a fork that gets
-  abandoned after one user message. This is a deliberate, accepted divergence, not an oversight: pi's
+  in the same call). Fix 8 (doc-accuracy correction): this used to be framed here as a divergence
+  specifically about *forks* getting abandoned after one message, but pi's actual scope is broader — its
+  real `session-manager.ts:934-968,850-875` (the engine behind the shipped pi CLI, not the newer
+  `packages/agent/src/harness/session/` layer) defers the on-disk write for **any** fresh session,
+  forked or not: `newSession()` marks the in-memory entry list `flushed = false` and `_persist()` only
+  actually opens/writes the file once the first *assistant* message lands (checked via
+  `fileEntries.some(e => e.type === "message" && e.message.role === "assistant")`) — so even a plain,
+  non-forked `run`/`serve` invocation that never gets a reply leaves no file behind at all on pi's side.
+  This module's `SessionStore::create` (used by every fresh session, fork or not) fsyncs a real header
+  file immediately regardless. Still a deliberate, accepted divergence, not an oversight: pi's
   deferred-write path exists to paper over its own append-per-entry write model (a fresh, unflushed file
-  would otherwise leave a truncated, header-only session behind); this module's `rewrite` already writes
-  the whole prefix in one atomic temp-file-then-rename call, so there's no truncated-file risk to guard
-  against, and the minimum-effective-abstraction cost of threading a "created but not yet flushed" state
-  through `SessionStore` (and every caller that currently assumes `create`/`fork` leaves a real file on
-  disk) isn't worth paying for a cosmetic directory-listing concern. If `list`/`list_sessions` noise from
-  abandoned single-message forks ever becomes a real operational problem, revisit — until then this is
-  pinned as current, intended behavior (see `session_store::tests` for the pinning test).
+  would otherwise leave a truncated, header-only session behind, for *any* session type, not just a
+  fork); this module's `rewrite` already writes the whole prefix in one atomic temp-file-then-rename
+  call, so there's no truncated-file risk to guard against, and the minimum-effective-abstraction cost of
+  threading a "created but not yet flushed" state through `SessionStore` (and every caller that currently
+  assumes `create`/`fork` leaves a real file on disk) isn't worth paying for a cosmetic
+  directory-listing concern. If `list`/`list_sessions` noise from abandoned single-message sessions
+  (forked or fresh) ever becomes a real operational problem, revisit — until then this is pinned as
+  current, intended behavior (see `session_store::tests` for the pinning test). This is a
+  documentation-accuracy fix only — `SessionStore::create`'s actual behavior is unchanged.
 - **Branch-local model/thinking-level** — `set_model`/`cycle_model`/`set_reasoning_effort`/
   `cycle_thinking_level` each append an O(1) `Entry::ModelChange`/`Entry::ThinkingLevelChange` record
   anchored to the *current tip* (`SessionStore::record_model_change`/`record_thinking_level_change`) —
@@ -324,7 +372,14 @@ The harness layers several capabilities over the bare tools + loop:
   of how many sessions exist, deterministically by `scanned`'s value so it stays stable despite the
   concurrent scan)/`switch_session`/`delete_session`(soft-delete-to-`.trash`, idempotent; refuses the
   currently active session rather than moving its file out from under the in-memory `Session` a client
-  is still using — no RPC surface reached `SessionRepo::delete` before this; both, along with `fork`'s
+  is still using — no RPC surface reached `SessionRepo::delete` before this)/`list_trash`(repo mode;
+  `{trash: [{id, deleted_at, original_path}...]}`, most-recently-deleted first — `.trash/` has always
+  existed as `delete_session`'s soft-delete destination, but nothing previously read, listed, restored
+  from, or pruned it)/`restore_session`(move a trashed session back to its original location; fails
+  clearly, not a silent overwrite, if something already occupies that path; reports failure, not
+  idempotent success like `delete_session`, when the id isn't in `.trash/` at all — both kept
+  deliberately minimal, a low-priority nice-to-have rather than a full trash-management UI); both
+  `delete_session`/`switch_session`, along with `fork`'s
   own `target_id` and `--fork`'s CLI resolution, accept a `session_id` that's either a full id or a
   *unique* prefix of one — `SessionRepo::find_path` tries an exact match first, then a prefix scan; an
   ambiguous prefix (matching more than one session) is an error naming every candidate rather than pi's
@@ -384,9 +439,15 @@ The harness layers several capabilities over the bare tools + loop:
   `set_auto_retry`(toggle `agent_core::Agent::with_auto_retry` — off surfaces an otherwise-retried
   mid-stream failure on the first attempt, for debugging a flaky connection)
   (rebuild the `Agent` for subsequent prompts) / `get_available_models`, `list_branches`/`get_tree`/`switch_branch`
-  (navigate the session's tree, optionally summarizing the abandoned branch first — `get_messages` tags
+  (navigate the session's tree, optionally summarizing the abandoned branch first — a summarization
+  failure other than a client-requested abort (`Error::Cancelled`) fails the whole switch rather than
+  logging it and switching anyway, matching pi's own `agent-session.ts`/`agent-harness.ts`, which treat
+  any non-abort summarization error as fatal to the navigation; `get_messages` tags
   each message with its tree `id` so a client can name any point as a `switch_branch` target, not only a
-  branch's leaf; `get_messages`'s optional `since` — a tree id the client already has — returns only
+  branch's leaf, and its response also carries `leaf_id` — the same active-tip id `get_tree`'s own
+  response already does, matching pi's own `get_entries({since})` returning `{entries, leafId}` in one
+  round trip so a client doesn't need a second `get_tree` call just to learn the current tip;
+  `get_messages`'s optional `since` — a tree id the client already has — returns only
   what was appended after it, pi's own `get_entries({since})`, so a polling client doesn't have to
   re-transfer the whole transcript every time; an unmatched `since` is an error, not a silent full
   re-fetch), and `bash`/`abort_bash` (run a host shell command directly, independent of the
@@ -395,6 +456,11 @@ The harness layers several capabilities over the bare tools + loop:
   drain queued steering); a `prompt` sent while another is in flight can carry
   `streaming_behavior: "steer"|"follow_up"` to be accepted and queued instead of rejected as busy. A
   `prompt` runs concurrently with stdin so `abort`/`stop_after_turn`/`steer`/`follow_up` land mid-turn.
+  A mid-run `abort`'s own success ack is deliberately *not* sent the instant the cancellation is
+  requested — it's held until the cancelled run has actually finished unwinding (the same busy-loop
+  keeps rejecting every other command as busy until then), matching pi's own `agent-session.ts` awaiting
+  `waitForIdle()` first; sending it earlier let a client that treats the ack as "safe to send the next
+  command" (a reasonable reading of the contract) get rejected as busy in the gap.
 - **Whole-run auto-retry** — once `agent_core`'s own mid-stream retry (inside one model turn) is
   exhausted, a `prompt` that still ends in a transient-looking `Err`
   (`retry::is_retryable_whole_run` — a superset of `agent_core::agent::is_retryable_mid_stream`, plus
@@ -1232,7 +1298,7 @@ container/VM — not by this crate restricting its own tools.
 | `src/auth_credential_source.rs` | `OAuthCredentialSource` — the one `agent_core::client::CredentialSource` implementation this crate ships: an in-memory fast path for a still-valid cached token, else `spawn_blocking`s into `AuthStore::refreshed` (bridging its one async sub-step, the provider's token-endpoint call, back in via `Handle::current().block_on`) — kept off the tokio worker thread the same way `serve.rs`'s `persist_blocking` keeps a blocking session write off it |
 | `src/oauth/`           | The three providers' OAuth protocol flows — `anthropic.rs` (PKCE + local callback, port `53692`, the `state = verifier` quirk), `github_copilot.rs` (device-code, Copilot-internal-token re-derivation, model-availability discovery), `openai_codex.rs` (user-selectable browser PKCE / custom device-code, JWT-claim account-id extraction) — plus shared `pkce.rs`/`device_code.rs`/`callback_server.rs`/`callbacks.rs` (the `LoginCallbacks` trait a CLI or `serve` implements) /`error.rs`. Lives in `agent`, not `agent_core`: a second, direct-to-provider network surface `agent_core`'s own doc comment explicitly disclaims owning, and device-code polling/the local callback listener both need a live tokio runtime as a real (non-dev) dependency, which `agent_core` deliberately doesn't have. See "OAuth / Subscription-Credential Authentication" above for the full picture. |
 | `src/path_utils.rs`    | Shared path-normalization helpers, extracted from `trust_store.rs` once `skills.rs`/`prompts.rs` needed the identical logic: `absolutize`/`lexically_normalize` (pure, no filesystem access beyond reading the cwd — work even for a path that doesn't exist yet) and `resolved_path` (canonicalize on top of that, falling back to the absolutized-and-normalized form on failure); `push_unique_scoped_root` — push a `(discovery root, scope tag)` pair onto a `Vec<(PathBuf, T)>` only if the root's canonical form hasn't already been seen (tracked in a caller-owned `HashSet`), so a root reached by two different paths (a symlink, a relative-vs-absolute spelling, `cwd` itself equaling a global root) is scanned only once — used by `skills.rs`/`prompts.rs` to keep a real directory reached twice from double-counting its contents and self-colliding every name in it against a phantom duplicate, and to carry each root's own `"user"`/`"project"` scope tag (Task #39) alongside it without a second parallel structure; pi doesn't dedupe at the root-list level either (only file-level, in `skills.ts`'s own `realPathSet`) — a Beyond-specific hardening                                                                                                                                                                            |
-| `src/settings.rs`      | `SettingsStore` — persisted `default_model`/`default_gateway_url`/`default_session_dir` (`~/.claude/settings.json`), consulted by `run_task`/`Command::Serve` as the last fallback before this crate's own built-in default; managed via `agent settings`, mirroring `trust_store.rs`'s own out-of-band management convention and reusing its exact on-disk pattern (own small `FileLock`, atomic writes, re-read-under-lock-before-mutate) without sharing code with it                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `src/settings.rs`      | `SettingsStore` — persisted `default_model`/`default_gateway_url`/`default_session_dir`/`default_project_trust`/`compaction_enabled`/`default_reasoning_effort` (`~/.claude/settings.json`), consulted by `run_task`/`Command::Serve` as the last fallback before this crate's own built-in default; managed via `agent settings`, mirroring `trust_store.rs`'s own out-of-band management convention and reusing its exact on-disk pattern (own small `FileLock`, atomic writes, re-read-under-lock-before-mutate) without sharing code with it. Also `ModelOverride`/`ModelOverrides` — a read-only, hand-edited `~/.claude/models.json` (model id → `{base_url, api_key}`), consulted by `main.rs::resolve_gateway_credential`                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `src/session_store.rs` | JSONL `SessionStore` (fsync'd append/atomic-rewrite/mid-file-corruption recovery, header metadata + durable `Entry::Compaction` provenance, version-migration guard, collision-safe ids; `create` initializes an existing but zero-byte file in place — `touch`'d ahead of time, or left over from a crash before the header write landed — rather than hard-failing, while still refusing (`AlreadyExists`) a genuinely non-empty one; `run`/`serve`'s own `--session <path>` open-vs-create decision checks file *content*, not just existence, so this path actually gets exercised) + multi-session `SessionRepo` (list-with-metadata, soft-delete-to-`.trash`, fork + read-only fork preview, `resume_or_create` — reopen the most recent session matching a `cwd` or make a fresh one, shared by `serve`'s startup reattach and `run --continue`; `fork_from_path` forks an arbitrary source session that need not live in `self.dir` at all, stamping the *target* project's own `cwd` rather than the source's — the primitive `fork_by_arg` (module-level, not a `SessionRepo` method: it may need to open a *second* repo for the source) builds `run --fork <path|id>`/`--session-dir` on top of, resolving a path-like argument directly or an id by trying `target.fork` first (itself exact-then-unique-prefix aware — see `find_path` below — so this alone covers a prefix resolving within the current project; an ambiguous prefix errors immediately here rather than widening to a cross-project search that could reinterpret it against a different candidate set) and, only on a genuine not-found, falling back to `find_session_path_under(sessions_root, id)` — a filename-only scan across every immediate subdirectory (also exact-then-unique-prefix aware), *not* a re-derivation of the source's directory from its own recorded `cwd`, since a caller-supplied `--session-dir` need not follow the `encode_cwd` naming convention at all); `find_path` (private, backing `open_id`/`delete`/`fork`/`fork_at_entry`) tries an exact filename match first, then a unique-prefix match over each file's own id component — pi's own convenience for a shortened id (`resolveSessionPath`), but an ambiguous prefix is an `InvalidInput` error naming every candidate id rather than pi's silent most-recent-wins pick; `fork`/`fork_at_entry` record the *resolved* source's own `meta.id` as the new session's `parent`, not the caller's raw (possibly-truncated) argument; `default_session_dir`/`sessions_root`/`encode_cwd`/`canonical_cwd` — the `~/.claude/sessions/<encoded-cwd>/` convention (and its shared root, for cross-project search) and the symlink/trailing-separator-safe form every recorded `cwd` is passed through first, likewise shared; tree-shaped history (`id`/`parent_id` per message, `Leaf`/`BranchSummary`/`Compaction`/`ModelChange`/`ThinkingLevelChange`/`TitleChange` entries, `switch_active_with_summary`/`list_branches`/`tree`/`abandoned_by_switch`/`abandoned_branches`(every non-active leaf's full root-to-leaf message chain, plus how much of it is shared with the active path — for HTML export), legacy migration, off-branch-preserving compaction); `set_title` — an O(1) `TitleChange` append, not a rewrite, whole-session-scoped (most-recent-wins across the whole file) unlike the branch-scoped model/thinking-level changes, sanitizing `\r`/`\n` to a single collapsed space and treating a sanitizes-to-empty title as clearing it (`None`) rather than persisting a blank string, at both the write path and the two read-reconstruction paths (`open`'s tree build, `read_listing`'s cheap scan); `SessionMeta::to_listing_json` — the derived listing fields (`updated_at`/`message_count`/`preview`/`search_text`) are `#[serde(skip)]` on the struct itself, so this is the only path that actually surfaces them as JSON |
 | `src/resources.rs`     | System-prompt assembly split into `build_static_system_prompt` (on-disk `SYSTEM.md` override + additive `APPEND_SYSTEM.md`, one-file-per-dir `AGENTS.md`>`CLAUDE.md` discovery, skill injection from an already-discovered `PromptOptions::skills` slice — the caller's job, not this function's, since every real caller already discovers skills separately for its own purposes and re-discovering here too would walk the same directories twice — expensive, cached) and `dynamic_footer` (local date/cwd — cheap, refreshed every turn); `build_system_prompt` composes both for a one-shot caller                                                                                                                   |
 | `src/skills.rs`        | Recursive skill discovery (`SKILL.md` frontmatter up to `MAX_DEPTH` — 8 — levels deep per root, a Beyond-specific bound pi's own unbounded walk doesn't have, `disable-model-invocation`, `/skill:` lookup — expands into a `<skill name=".." location="..">` tag with the frontmatter stripped, not the raw file) across `~/.claude/skills`+`<cwd>/.claude/skills` and the vendor-neutral `~/.agents/skills`+every `.agents/skills` between `cwd` and the enclosing git-repo root (`collect_ancestor_agents_skill_dirs`/`find_git_repo_root` — `.agents/skills` never recognizes the loose-root-`.md`-file shape `.claude/skills` does) + `<available_skills>` rendering + `discover_with_diagnostics` (name-collision reporting; `.claude/skills` wins over `.agents/skills`, and the `.agents/skills` level closest to `cwd` wins over one further up; every discovery root, standard or `--skill` extra, is deduped by canonical path via `path_utils::push_unique_scoped_root` before it's ever walked, so the same real directory reached twice can't double-count its skills into a phantom self-collision); `project_trusted` gates only the project-local roots, the user-global roots are always scanned; `validate_skill_name`/`validate_skill_description` — non-fatal, `warn!`-logged shape/length checks (a bad `name`, or a `description` past 1024 chars) that never block discovery                |
@@ -1351,7 +1417,10 @@ new piece of substance: double-checked-locked refresh (the lock is held across t
 including the network call, so two concurrent processes sharing a credential can't both consume a
 single-use refresh token) that preserves the credential bit-for-bit and records
 `last_refresh_error` on failure, rather than deleting it — a transient failure must never cost the
-user their login. The file is created at `0600` on first write, atomically, not via a later `chmod`.
+user their login. The file is created at `0600` atomically on first write, and every subsequent write
+re-asserts `0600` via an explicit `chmod` afterward — `write_atomic` only ever *preserves* whatever
+permission bits the file already had, so this is what self-heals a mode ever loosened out-of-band
+between writes, matching pi's own unconditional `chmodSync` after every `auth-storage.ts` write.
 
 **CLI**: `agent login <provider>` (blocks in-terminal, prints a URL/device-code, races a manual-paste
 fallback against the local callback listener), `agent logout <provider>`, `agent auth-status

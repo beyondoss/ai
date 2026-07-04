@@ -30,6 +30,13 @@ pub struct Usage {
 /// OpenAI `usage` block (chat/completions). `prompt`/`completion` map to in/out; cached input rides
 /// in `prompt_tokens_details.cached_tokens`; reasoning in `completion_tokens_details.reasoning_tokens`.
 /// No cache-write concept on the OpenAI wire.
+///
+/// DeepSeek's wire never populates `prompt_tokens_details.cached_tokens` — it reports cache hits via
+/// its own flat, top-level `prompt_cache_hit_tokens` field instead (DeepSeek API docs). Both providers
+/// are OpenAI-dialect and `looks_anthropic_shaped` doesn't catch this (DeepSeek's body has no
+/// Anthropic-style keys either), so without a fallback every DeepSeek cache hit silently bills as a
+/// full-price cache miss. `prompt_tokens_details.cached_tokens` wins when present (even `Some(0)`);
+/// `prompt_cache_hit_tokens` is only consulted when it's entirely absent — see `From<OpenAiUsage>`.
 #[derive(Deserialize, Default)]
 struct OpenAiUsage {
     #[serde(default)]
@@ -40,6 +47,12 @@ struct OpenAiUsage {
     prompt_tokens_details: OpenAiPromptDetails,
     #[serde(default)]
     completion_tokens_details: OpenAiCompletionDetails,
+    /// DeepSeek's flat, top-level cache-hit-token count — the fallback when
+    /// `prompt_tokens_details.cached_tokens` is absent. `Option` (not a bare `u64` defaulting to 0) so
+    /// "field absent" is distinguishable from "field present and zero", matching how
+    /// `OpenAiPromptDetails::cached_tokens` itself distinguishes the two cases.
+    #[serde(default)]
+    prompt_cache_hit_tokens: Option<u64>,
     /// Anthropic's characteristic field names — **never billed from**, only checked by
     /// [`Self::looks_anthropic_shaped`] to catch a dialect-misconfigured provider (a config-added
     /// Anthropic-wire vendor left at the default OpenAI dialect): a real OpenAI chat/completions
@@ -53,8 +66,11 @@ struct OpenAiUsage {
 
 #[derive(Deserialize, Default)]
 struct OpenAiPromptDetails {
+    /// `Option` so an absent `prompt_tokens_details` (or an absent `cached_tokens` within it — a
+    /// DeepSeek response) is distinguishable from an explicit zero, letting
+    /// `From<OpenAiUsage>` fall back to `prompt_cache_hit_tokens` only when this is truly missing.
     #[serde(default)]
-    cached_tokens: u64,
+    cached_tokens: Option<u64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -76,7 +92,15 @@ impl From<OpenAiUsage> for Usage {
         Usage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
-            cache_read_tokens: u.prompt_tokens_details.cached_tokens,
+            // `prompt_tokens_details.cached_tokens` (real OpenAI, and OpenAI-compatible providers that
+            // populate it) wins when present; DeepSeek's flat `prompt_cache_hit_tokens` is the fallback
+            // for when it's entirely absent. Mirrors pi's
+            // `rawUsage.prompt_tokens_details?.cached_tokens ?? rawUsage.prompt_cache_hit_tokens ?? 0`.
+            cache_read_tokens: u
+                .prompt_tokens_details
+                .cached_tokens
+                .or(u.prompt_cache_hit_tokens)
+                .unwrap_or(0),
             cache_write_tokens: 0,
             reasoning_tokens: u.completion_tokens_details.reasoning_tokens,
         }
@@ -310,6 +334,40 @@ mod tests {
                 reasoning_tokens: None,
             }
         );
+    }
+
+    #[test]
+    fn deepseek_flat_cache_hit_tokens_fallback() {
+        // DeepSeek's wire never populates `prompt_tokens_details.cached_tokens` — cache hits ride in
+        // a flat, top-level `prompt_cache_hit_tokens` field instead (DeepSeek API docs). Before this
+        // fix, `OpenAiUsage` only ever read the nested field, so every DeepSeek cache hit silently
+        // billed as a full-price cache miss (zero `cache_read_tokens`) with no parse error tripped —
+        // the body has no `prompt_tokens_details` at all, and isn't Anthropic-shaped either, so
+        // nothing flagged the mismatch.
+        let body = br#"{"usage":{"prompt_tokens":100,"completion_tokens":50,
+            "prompt_cache_hit_tokens":64}}"#;
+        assert_eq!(
+            openai_body(body).unwrap(),
+            Usage {
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_read_tokens: 64,
+                cache_write_tokens: 0,
+                reasoning_tokens: None,
+            }
+        );
+
+        // The same shape arriving as the terminal SSE usage chunk (DeepSeek's streaming wire).
+        let sse = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":50,\
+                    \"prompt_cache_hit_tokens\":64}}\n\n";
+        assert_eq!(openai_stream(sse).unwrap().cache_read_tokens, 64);
+
+        // `prompt_tokens_details.cached_tokens`, when present, still wins over the flat DeepSeek
+        // field — the nested field is the primary source; the flat one is only a fallback for when
+        // it's entirely absent.
+        let both = br#"{"usage":{"prompt_tokens":100,"completion_tokens":50,
+            "prompt_tokens_details":{"cached_tokens":10},"prompt_cache_hit_tokens":64}}"#;
+        assert_eq!(openai_body(both).unwrap().cache_read_tokens, 10);
     }
 
     #[test]

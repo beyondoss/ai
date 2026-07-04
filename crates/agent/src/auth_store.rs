@@ -389,7 +389,34 @@ fn write_store_file(path: &Path, credentials: &BTreeMap<String, StoredCredential
     let path_str = path
         .to_str()
         .ok_or_else(|| io::Error::other(format!("non-UTF-8 path: {}", path.display())))?;
-    crate::tools::write_atomic(path_str, body.as_bytes())
+    crate::tools::write_atomic(path_str, body.as_bytes())?;
+    // Belt-and-suspenders, on top of the atomic-at-creation `0600` above: `write_atomic` only ever
+    // *preserves* whatever permission bits the file already had (it copies an existing file's mode
+    // onto its replacement temp file before the rename), it never asserts one — so a file whose
+    // permissions were loosened out-of-band (a stray `chmod`, a restore from a backup, a filesystem
+    // that doesn't honor the original mode, …) would otherwise stay that way forever. Re-assert
+    // `0600` unconditionally after every single write, not just at creation, so it self-heals on the
+    // very next write. Mirrors pi's `auth-storage.ts`, which calls `chmodSync(this.authPath, 0o600)`
+    // unconditionally after every write for the same reason.
+    set_private(path)
+}
+
+/// Unconditionally re-assert `0600` permissions on an already-written file (Unix only — a no-op
+/// elsewhere, matching this file's other Unix-only permission handling). Distinct from
+/// [`create_private`]: that one sets the mode atomically *at creation*; this one self-heals it on
+/// every subsequent write, closing the gap `write_atomic`'s copy-forward-existing-bits behavior
+/// leaves open.
+fn set_private(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 /// Create an empty file at `path` with `0600` permissions set atomically at creation (Unix), not via
@@ -545,6 +572,29 @@ mod tests {
         let mut store = AuthStore::open(path.clone());
         store.set("anthropic", anthropic_cred("a", 1)).unwrap();
 
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "got mode {mode:o}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_write_self_heals_permissions_loosened_out_of_band_since_the_last_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let mut store = AuthStore::open(path.clone());
+        store.set("anthropic", anthropic_cred("a", 1)).unwrap();
+
+        // Simulate the file's permissions having been loosened by something outside this store
+        // (a stray `chmod`, a restore from a backup, …) between two writes.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "precondition: permissions were loosened out-of-band");
+
+        // Any subsequent write — not just creation — must re-assert 0600, self-healing the drift
+        // rather than propagating the loosened mode forward via `write_atomic`'s copy-forward
+        // behavior.
+        store.set("github-copilot", anthropic_cred("b", 2)).unwrap();
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "got mode {mode:o}");
     }

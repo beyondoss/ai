@@ -43,6 +43,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::message::ImageSource;
+use crate::models::ThinkingLevel;
 
 /// A queued steer/follow-up message: text plus optional image attachments — the same shape a fresh
 /// `prompt` accepts (`serve.rs`'s own `images` field), so a message routed through `steer`/`follow_up`
@@ -123,8 +124,20 @@ pub enum QueueMode {
 pub struct ModelSwitch {
     pub model: String,
     /// `None` leaves the thinking budget as currently configured on the `Agent`; `Some(budget)` sets a
-    /// new one for every subsequent turn of this run.
+    /// new *raw* token budget for every subsequent turn of this run. Applied on top of
+    /// [`Self::thinking_level`] when both are given — see
+    /// [`Steering::request_model_switch_with_thinking_level`]'s doc comment for the exact order.
     pub thinking: Option<u32>,
+    /// A tri-stated, portable reasoning-effort/thinking-depth override — `None` leaves it as currently
+    /// configured (untouched by this switch at all), `Some(ThinkingLevel::Off)` **explicitly** disables
+    /// thinking/reasoning (distinct from `None`'s "don't touch it"), `Some(level)` requests a new depth.
+    /// Translated into whichever of the run's thinking budget / reasoning effort this (possibly also
+    /// just-switched) model's shape actually wants via [`crate::models::thinking_for_level`] — the same
+    /// translation `serve.rs`'s `set_model`/`cycle_model` RPC handlers already call for an idle-time
+    /// switch, reused here rather than inventing a second, divergent path for a mid-run one. Mirrors
+    /// pi's `nextTurnSnapshot.thinkingLevel` (`agent-loop.ts:220-238`), itself a full tri-state
+    /// `ThinkingLevel` (`undefined`/`"off"`/a concrete level, `types.ts:129-136,289`).
+    pub thinking_level: Option<ThinkingLevel>,
 }
 
 /// A cloneable handle to the shared steering queues. Clones share the same two lanes (and the stop
@@ -267,10 +280,34 @@ impl Steering {
     /// conversation, so a message queued for the *old* session's next turn can't leak into the newly
     /// switched-to one. Also clears any pending stop request, for the same reason: a graceful-stop
     /// request aimed at the old session's run must not cut short a different session's next one.
+    ///
+    /// For a run that's ending via **cancellation** rather than a session swap, use
+    /// [`clear_run_scoped`](Self::clear_run_scoped) instead — this method also drops the next-turn
+    /// lane, which a mere cancellation must not do (see that method's doc comment for why).
     pub fn clear(&self) {
         lock(&self.steer).clear();
         lock(&self.follow_up).clear();
         lock(&self.next_turn).clear();
+        self.stop_requested.store(false, Ordering::Relaxed);
+        *lock_switch(&self.model_switch) = None;
+    }
+
+    /// Drop the steer and follow-up lanes, plus any pending stop request and mid-run model switch —
+    /// but, unlike [`clear`](Self::clear), leave the **next-turn** lane untouched. For a run that's
+    /// ending because of *cancellation*, not because a different session is about to take over (see
+    /// [`clear`](Self::clear) for that case).
+    ///
+    /// Mirrors pi's `AgentHarness.abort()` (`agent-harness.ts:970-997`), which explicitly clears only
+    /// `steerQueue`/`followUpQueue` — `nextTurnQueue` is deliberately left alone, because a message
+    /// queued via `nextTurn()` is meant to survive into whatever prompt comes next, aborted or not, not
+    /// be silently dropped by the very cancellation it was queued to outlive. Used by every
+    /// cancellation exit path in [`crate::Agent::run_events_steered`]; a genuine session swap
+    /// (`new_session`/`switch_session`/`fork`/`switch_branch`) still wants the stronger [`clear`](
+    /// Self::clear), since a message queued for the *old* session's next turn must not leak into a
+    /// newly switched-to one either.
+    pub fn clear_run_scoped(&self) {
+        lock(&self.steer).clear();
+        lock(&self.follow_up).clear();
         self.stop_requested.store(false, Ordering::Relaxed);
         *lock_switch(&self.model_switch) = None;
     }
@@ -292,9 +329,28 @@ impl Steering {
     /// checked. A second call before the first is observed replaces it outright (only the most recent
     /// request matters — there's no queue of switches to apply in sequence).
     pub fn request_model_switch(&self, model: impl Into<String>, thinking: Option<u32>) {
+        self.request_model_switch_with_thinking_level(model, thinking, None);
+    }
+
+    /// Like [`request_model_switch`](Self::request_model_switch), but can also change the run's
+    /// reasoning effort / thinking depth via a portable [`ThinkingLevel`] — see
+    /// [`ModelSwitch::thinking_level`]'s doc comment for the tri-state semantics (no-change vs.
+    /// explicitly-off vs. a specific level) and how it composes with a raw `thinking` budget when both
+    /// are given (the level is applied first, translated via `models::thinking_for_level`; a `Some`
+    /// `thinking` then overrides just the numeric budget on top, for a caller after an exact token
+    /// count rather than a portable level). A second call before the first is observed replaces it
+    /// outright, same as [`request_model_switch`](Self::request_model_switch) — there's no queue of
+    /// switches to apply in sequence.
+    pub fn request_model_switch_with_thinking_level(
+        &self,
+        model: impl Into<String>,
+        thinking: Option<u32>,
+        thinking_level: Option<ThinkingLevel>,
+    ) {
         *lock_switch(&self.model_switch) = Some(ModelSwitch {
             model: model.into(),
             thinking,
+            thinking_level,
         });
     }
 
@@ -539,6 +595,7 @@ mod tests {
             Some(ModelSwitch {
                 model: "claude-cheap".to_string(),
                 thinking: Some(512),
+                thinking_level: None,
             })
         );
         assert!(
@@ -557,6 +614,7 @@ mod tests {
             Some(ModelSwitch {
                 model: "claude-expensive".to_string(),
                 thinking: Some(1024),
+                thinking_level: None,
             }),
             "only the most recent request should apply — no queue of switches"
         );
@@ -583,6 +641,7 @@ mod tests {
             Some(ModelSwitch {
                 model: "claude-cheap".to_string(),
                 thinking: Some(256),
+                thinking_level: None,
             })
         );
     }
@@ -655,5 +714,73 @@ mod tests {
         let b = a.clone();
         a.push_next_turn("x");
         assert_eq!(b.drain_next_turn(), vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn clear_run_scoped_drops_steer_and_follow_up_and_stop_and_switch_but_not_next_turn() {
+        // pi-parity fix: `Agent::run_events_steered`'s cancellation exit paths must not drop a
+        // message queued via `push_next_turn` — mirrors pi's `AgentHarness.abort()`, which clears
+        // only `steerQueue`/`followUpQueue`. The general-purpose `clear()` (for a genuine session
+        // swap) is deliberately still stronger and drops all three lanes — see its own test below.
+        let s = Steering::new();
+        s.push("follow");
+        s.push_steer("steer");
+        s.push_next_turn("must survive");
+        s.request_stop();
+        s.request_model_switch("claude-cheap", Some(256));
+
+        s.clear_run_scoped();
+
+        assert_eq!(s.drain_at_stop(), Vec::<String>::new(), "follow-up must be dropped");
+        assert_eq!(s.drain_steer(), Vec::<String>::new(), "steer must be dropped");
+        assert!(!s.take_stop_requested(), "the stop request must be dropped");
+        assert!(s.take_model_switch().is_none(), "the model switch must be dropped");
+        assert_eq!(
+            s.drain_next_turn(),
+            vec!["must survive".to_string()],
+            "the next-turn lane must survive a run-scoped clear"
+        );
+    }
+
+    #[test]
+    fn clear_still_drops_the_next_turn_lane_for_a_genuine_session_swap() {
+        // The stronger, general-purpose `clear()` is unchanged: a caller swapping sessions
+        // (`new_session`/`switch_session`/`fork`/`switch_branch`) must not let a message queued for
+        // the *old* session's next turn bleed into the newly switched-to one.
+        let s = Steering::new();
+        s.push_next_turn("stale");
+        s.clear();
+        assert_eq!(s.drain_next_turn(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn request_model_switch_with_thinking_level_sets_the_tri_stated_field() {
+        let s = Steering::new();
+        s.request_model_switch_with_thinking_level(
+            "claude-cheap",
+            None,
+            Some(ThinkingLevel::Off),
+        );
+        assert_eq!(
+            s.take_model_switch(),
+            Some(ModelSwitch {
+                model: "claude-cheap".to_string(),
+                thinking: None,
+                thinking_level: Some(ThinkingLevel::Off),
+            })
+        );
+    }
+
+    #[test]
+    fn request_model_switch_leaves_thinking_level_unset() {
+        // The plain two-arg `request_model_switch` (every existing caller) must keep meaning
+        // "don't touch reasoning effort/thinking depth at all" — not silently turn it off.
+        let s = Steering::new();
+        s.request_model_switch("claude-cheap", Some(512));
+        assert_eq!(
+            s.take_model_switch().unwrap().thinking_level,
+            None,
+            "the plain two-arg request must not implicitly set a thinking-level override"
+        );
     }
 }

@@ -61,9 +61,13 @@ const REQUEST_ID_HEADER: &str = "x-beyond-request-id";
 /// cosmetic on OpenRouter's side (their own cost/usage categorization), no effect on the request
 /// or response. Static — this doesn't need to be configurable, just present. Only OpenRouter is in
 /// `KNOWN_PROVIDERS` among the providers pi attributes to (NVIDIA NIM, Cloudflare, Vercel AI
-/// Gateway aren't routed providers here), so this is the one case worth porting.
+/// Gateway aren't routed providers here), so this is the one case worth porting. Header names match
+/// pi's current OpenRouter-specific set (`packages/coding-agent/src/core/provider-attribution.ts`):
+/// `HTTP-Referer`, `X-OpenRouter-Title` (NOT the generic `X-Title` pi used for the now-removed Vercel
+/// AI Gateway route), and `X-OpenRouter-Categories`.
 const OPENROUTER_REFERER: &str = "https://beyond.build";
 const OPENROUTER_TITLE: &str = "Beyond Gateway";
+const OPENROUTER_CATEGORY: &str = "cli-agent";
 
 /// Reject requests whose declared Content-Length exceeds this. The body itself is **not** buffered
 /// (it streams straight through); this is purely an abuse guard checked up front via the header.
@@ -245,7 +249,8 @@ fn apply_provider_attribution(
 ) -> Result<()> {
     if provider_name == "openrouter" {
         upstream_request.insert_header("HTTP-Referer", OPENROUTER_REFERER)?;
-        upstream_request.insert_header("X-Title", OPENROUTER_TITLE)?;
+        upstream_request.insert_header("X-OpenRouter-Title", OPENROUTER_TITLE)?;
+        upstream_request.insert_header("X-OpenRouter-Categories", OPENROUTER_CATEGORY)?;
     }
     Ok(())
 }
@@ -1156,8 +1161,15 @@ mod tests {
             OPENROUTER_REFERER
         );
         assert_eq!(
-            openrouter_req.headers.get("X-Title").unwrap(),
+            openrouter_req.headers.get("X-OpenRouter-Title").unwrap(),
             OPENROUTER_TITLE
+        );
+        assert_eq!(
+            openrouter_req
+                .headers
+                .get("X-OpenRouter-Categories")
+                .unwrap(),
+            OPENROUTER_CATEGORY
         );
 
         for other in ["openai", "anthropic", "fireworks", "groq"] {
@@ -1173,8 +1185,12 @@ mod tests {
                 "{other} should not get HTTP-Referer"
             );
             assert!(
-                req.headers.get("X-Title").is_none(),
-                "{other} should not get X-Title"
+                req.headers.get("X-OpenRouter-Title").is_none(),
+                "{other} should not get X-OpenRouter-Title"
+            );
+            assert!(
+                req.headers.get("X-OpenRouter-Categories").is_none(),
+                "{other} should not get X-OpenRouter-Categories"
             );
         }
     }

@@ -91,6 +91,12 @@ fn text_of(blocks: &[ContentBlock]) -> String {
 const USER_IMAGE_PLACEHOLDER: &str = "(image omitted: model does not support images)";
 /// Same idea, for a tool result's image output specifically.
 const TOOL_IMAGE_PLACEHOLDER: &str = "(tool image omitted: model does not support images)";
+/// Default text for a vision-capable tool result that carries images but no text at all — matching
+/// pi's `convertMessages` (`openai-completions.ts`), which sends this exact string as the `tool`
+/// message's `content` instead of an empty string in that case. Distinct from
+/// [`TOOL_IMAGE_PLACEHOLDER`]/[`USER_IMAGE_PLACEHOLDER`] above: those two stand in for an image the
+/// model can't see at all (vision unsupported); this one accompanies a real image the model *can* see.
+const TOOL_RESULT_IMAGE_ONLY_TEXT: &str = "(see attached image)";
 
 /// Build an OpenAI user-message `content` from a turn's text and image blocks (tool results are
 /// emitted separately). Returns a plain string when there are no images — OpenAI's common case — and
@@ -208,7 +214,17 @@ pub fn build_body(req: &ModelRequest) -> Value {
                         ..
                     } = b
                     {
-                        messages.push(json!({ "role": "tool", "tool_call_id": tool_use_id, "content": content }));
+                        // An image-only result (no text) still needs *some* string in `content` — the
+                        // Chat Completions `tool` role requires a string, and pi's own
+                        // `convertMessages` defaults to this exact placeholder rather than sending an
+                        // empty one, so a transcript/UI reader always has something to show alongside
+                        // the image that fans out to the trailing `user` message below.
+                        let tool_text: &str = if content.is_empty() && !images.is_empty() {
+                            TOOL_RESULT_IMAGE_ONLY_TEXT
+                        } else {
+                            content.as_str()
+                        };
+                        messages.push(json!({ "role": "tool", "tool_call_id": tool_use_id, "content": tool_text }));
                         pending_images.extend(images.iter().map(|src| (tool_use_id.as_str(), src)));
                     }
                 }
@@ -1083,9 +1099,11 @@ mod tests {
     #[test]
     fn a_tool_result_with_only_an_image_and_no_text_still_fans_the_image_out() {
         // A-L8 pi-parity test gap (fixed, `packages/ai/test/image-tool-result.test.ts`): a tool
-        // returning only an image (no text) must still produce a usable `tool` message (empty string
-        // content — OpenAI's Chat Completions `tool` role requires a string, even an empty one, not
-        // `null`/absent) followed by the image-carrying user message.
+        // returning only an image (no text) must still produce a usable `tool` message — pi's own
+        // `convertMessages` (`openai-completions.ts`) defaults the `content` string to
+        // `"(see attached image)"` rather than an empty one in this case (Chat Completions' `tool`
+        // role requires *some* string, and an empty one leaves nothing for a transcript/UI reader to
+        // show) — followed by the image-carrying user message.
         use crate::message::ImageSource;
         let req = ModelRequest::new(
             "gpt-4o",
@@ -1099,7 +1117,7 @@ mod tests {
         );
         let body = build_body(&req);
         assert_eq!(body["messages"][0]["role"], "tool");
-        assert_eq!(body["messages"][0]["content"], "");
+        assert_eq!(body["messages"][0]["content"], "(see attached image)");
         assert_eq!(body["messages"][1]["role"], "user");
         let user_content = body["messages"][1]["content"].as_array().unwrap();
         assert_eq!(
