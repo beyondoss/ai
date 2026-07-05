@@ -141,7 +141,7 @@ fn read_file(bencher: Bencher) {
         .unwrap();
     bencher.bench_local(|| {
         let out = rt
-            .block_on(read::Read.run(serde_json::json!({ "path": path, "limit": READ_LINES })))
+            .block_on(read::Read::default().run(serde_json::json!({ "path": path, "limit": READ_LINES })))
             .unwrap();
         black_box(out.text.len());
     });

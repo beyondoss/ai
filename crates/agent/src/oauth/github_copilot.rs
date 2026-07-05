@@ -5,8 +5,11 @@
 //! `enterprise_url` — the same field `refresh()`/`base_url_from_token()` already accepted for a
 //! credential that had one recorded some other way (e.g. hand-edited into `auth.json`) before this fix.
 
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
+use agent_core::client::{Credential, CredentialSource, DirectRouting, RouteOverride};
 use futures::future::join_all;
 use reqwest::{Client, RequestBuilder};
 use serde::Deserialize;
@@ -397,6 +400,82 @@ fn extract_proxy_ep(token: &str) -> Option<String> {
         .find_map(|part| part.trim().strip_prefix("proxy-ep=").map(str::to_string))
 }
 
+/// GitHub Copilot's real endpoint path per dialect — **not** the dialect's own default
+/// `endpoint_path()`: Copilot's OpenAI-wire endpoints omit the `/v1` prefix pi's official SDKs bake
+/// into their default `baseURL` (so the SDK's own `/chat/completions`/`/responses` relative paths land
+/// bare on Copilot's host), while its Anthropic-wire endpoint matches the dialect default verbatim
+/// (the Anthropic SDK's default `baseURL` carries no version segment, so it *always* appends
+/// `/v1/messages` itself). See `packages/ai/src/api/{anthropic-messages,openai-completions,
+/// openai-responses}.ts` in pi-mono (each sets `baseURL: model.baseUrl` on the vendor SDK, which then
+/// appends its own fixed relative path).
+pub fn copilot_endpoint_path(dialect: agent_core::dialect::Dialect) -> &'static str {
+    match dialect {
+        agent_core::dialect::Dialect::Anthropic => "/v1/messages",
+        agent_core::dialect::Dialect::OpenAi => "/chat/completions",
+        agent_core::dialect::Dialect::OpenAiResponses => "/responses",
+    }
+}
+
+/// GitHub Copilot's [`CredentialSource`] wrapper. Unlike OpenAI Codex's fully-static routing
+/// (`crate::gateway_credential`'s private `DirectRoutedCredentialSource`, whose `chatgpt-account-id`
+/// claim never changes across a refresh of the same login), Copilot's proxy host is embedded in the
+/// access token itself (`proxy-ep=…`) and CAN change across a refresh — GitHub migrating an account to
+/// a different Copilot proxy pool mid-session is a real, previously observed occurrence. `base_url`
+/// is therefore re-derived via [`base_url_from_token`] fresh on every [`credential`](Self::credential)
+/// call, from whichever access token is CURRENTLY stored on disk — re-read directly from `store_path`
+/// rather than through `inner`'s own opaque [`Credential`] (which never exposes a constructed
+/// credential's plaintext token to any caller outside `agent_core::client` by design — see that
+/// type's own doc comment) — instead of a value computed once at construction and frozen for this
+/// source's lifetime.
+pub struct CopilotRoutedCredentialSource {
+    pub inner: Arc<dyn CredentialSource>,
+    /// Same `auth.json` path `inner`'s own `OAuthCredentialSource` refreshes against — re-read here,
+    /// after `inner.credential()` returns, so the routing this call computes reflects whatever that
+    /// refresh (if any) just persisted, not whatever was on disk before it ran.
+    pub store_path: PathBuf,
+    /// GitHub Enterprise domain, if any — an account-level property that doesn't change across a
+    /// token refresh, unlike `proxy-ep`, so (unlike `base_url`) this one *is* fine to fix at
+    /// construction.
+    pub enterprise_url: Option<String>,
+    pub path: &'static str,
+}
+
+impl CopilotRoutedCredentialSource {
+    /// The routing this call should use, derived from whichever `github-copilot` access token is
+    /// CURRENTLY on disk. Factored out from `credential()` so it's independently testable without
+    /// needing to see inside `agent_core::client::Credential`'s deliberately opaque internals.
+    fn current_routing(&self) -> DirectRouting {
+        let access = crate::auth_store::AuthStore::open(self.store_path.clone())
+            .get("github-copilot")
+            .and_then(|stored| match &stored.credential {
+                crate::oauth::OAuthCredential::GithubCopilot(c) => Some(c.access.clone()),
+                _ => None,
+            });
+        DirectRouting {
+            route: RouteOverride::Direct {
+                base_url: base_url_from_token(access.as_deref(), self.enterprise_url.as_deref()),
+                path: self.path,
+            },
+            static_headers: vec![
+                ("User-Agent", COPILOT_USER_AGENT.to_string()),
+                ("Editor-Version", COPILOT_EDITOR_VERSION.to_string()),
+                ("Editor-Plugin-Version", COPILOT_EDITOR_PLUGIN_VERSION.to_string()),
+                ("Copilot-Integration-Id", COPILOT_INTEGRATION_ID.to_string()),
+            ],
+            copilot_dynamic_headers: true,
+            auth_header: None,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CredentialSource for CopilotRoutedCredentialSource {
+    async fn credential(&self) -> agent_core::Result<Credential> {
+        let credential = self.inner.credential().await?;
+        Ok(credential.with_direct_routing(self.current_routing()))
+    }
+}
+
 #[derive(Deserialize)]
 struct ModelsResponse {
     data: Vec<ModelEntry>,
@@ -609,6 +688,27 @@ mod tests {
     }
 
     #[test]
+    fn copilot_endpoint_path_strips_v1_for_openai_wire_dialects_but_not_anthropic() {
+        // pi-parity fix: GitHub Copilot's OpenAI-wire endpoints omit the `/v1` prefix the dialect's
+        // own default `endpoint_path()` carries (pi's own SDKs set `baseURL: model.baseUrl` with no
+        // `/v1` in it, then the vendor SDK appends its fixed relative path) — only the Anthropic-wire
+        // endpoint matches the dialect default verbatim (the Anthropic SDK's default `baseURL` has no
+        // version segment at all, so it always appends `/v1/messages` itself).
+        assert_eq!(
+            copilot_endpoint_path(agent_core::dialect::Dialect::Anthropic),
+            "/v1/messages"
+        );
+        assert_eq!(
+            copilot_endpoint_path(agent_core::dialect::Dialect::OpenAi),
+            "/chat/completions"
+        );
+        assert_eq!(
+            copilot_endpoint_path(agent_core::dialect::Dialect::OpenAiResponses),
+            "/responses"
+        );
+    }
+
+    #[test]
     fn resolve_login_domain_a_blank_answer_defaults_to_github_com_with_no_stored_enterprise_url() {
         let (enterprise_url, domain) = resolve_login_domain("").unwrap();
         assert_eq!(enterprise_url, None);
@@ -730,5 +830,95 @@ mod tests {
     #[test]
     fn tool_calls_false_is_not_selectable() {
         assert!(!is_model_selectable(&entry(true, None, Some(false))));
+    }
+
+    struct DummyInner;
+
+    #[async_trait::async_trait]
+    impl CredentialSource for DummyInner {
+        async fn credential(&self) -> agent_core::Result<Credential> {
+            Ok(Credential::new("dummy-bearer", true))
+        }
+    }
+
+    fn stored_copilot_credential(access: &str) -> crate::oauth::OAuthCredential {
+        crate::oauth::OAuthCredential::GithubCopilot(GithubCopilotCredential {
+            access: access.to_string(),
+            refresh: "refresh-token".to_string(),
+            expires_at_ms: 4_000_000_000_000,
+            enterprise_url: None,
+            available_model_ids: vec!["gpt-5-codex".to_string()],
+        })
+    }
+
+    fn direct_base_url(routing: &DirectRouting) -> &str {
+        match &routing.route {
+            RouteOverride::Direct { base_url, .. } => base_url,
+            other => panic!("expected a Direct route, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn copilot_routed_credential_source_rederives_base_url_from_the_current_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("auth.json");
+        crate::auth_store::AuthStore::open(store_path.clone())
+            .set(
+                "github-copilot",
+                stored_copilot_credential("tid=abc;proxy-ep=proxy.pool-a.githubcopilot.com;exp=123"),
+            )
+            .unwrap();
+
+        let source = CopilotRoutedCredentialSource {
+            inner: Arc::new(DummyInner),
+            store_path: store_path.clone(),
+            enterprise_url: None,
+            path: "/chat/completions",
+        };
+
+        assert_eq!(
+            direct_base_url(&source.current_routing()),
+            "https://api.pool-a.githubcopilot.com"
+        );
+
+        // Simulate a live refresh migrating the account to a different Copilot proxy pool — the same
+        // thing `AuthStore::refreshed` does by writing a fresh access token back to `store_path`, a
+        // real, previously observed occurrence this crate must not silently misroute after.
+        crate::auth_store::AuthStore::open(store_path.clone())
+            .set(
+                "github-copilot",
+                stored_copilot_credential("tid=abc;proxy-ep=proxy.pool-b.githubcopilot.com;exp=456"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            direct_base_url(&source.current_routing()),
+            "https://api.pool-b.githubcopilot.com",
+            "must reflect the new proxy-ep claim on the second call, not the one frozen at construction"
+        );
+    }
+
+    #[tokio::test]
+    async fn copilot_routed_credential_source_credential_call_succeeds_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("auth.json");
+        crate::auth_store::AuthStore::open(store_path.clone())
+            .set(
+                "github-copilot",
+                stored_copilot_credential("tid=abc;proxy-ep=proxy.pool-a.githubcopilot.com;exp=123"),
+            )
+            .unwrap();
+
+        let source = CopilotRoutedCredentialSource {
+            inner: Arc::new(DummyInner),
+            store_path,
+            enterprise_url: None,
+            path: "/chat/completions",
+        };
+
+        // `Credential`'s fields are private (see `agent_core::client::Credential`'s own doc comment);
+        // the only externally observable proof available here is that the wrapper's own plumbing
+        // (calling `inner`, re-reading the store, building the routing) completes without error.
+        source.credential().await.unwrap();
     }
 }

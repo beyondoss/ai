@@ -133,4 +133,28 @@ pub mod turn {
             },
         ]
     }
+
+    /// A turn that completes one tool call and *then* ends with `StopReason::Refusal` — the real wire
+    /// shape a refusal explanation arriving as trailing content after a `tool_use` block already closed
+    /// decodes to (Anthropic's own decoder handles exactly this; OpenAI's `content_filter` maps to the
+    /// same stop reason). Proves dispatch doesn't run tools the model was ultimately blocked from
+    /// continuing, unlike [`tool_call`], whose batch is always meant to run.
+    pub fn refusal_after_tool_call(id: &str, name: &str, args_json: &str) -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::MessageStart,
+            StreamEvent::ToolUseStart {
+                index: 0,
+                id: id.to_string(),
+                name: name.to_string(),
+            },
+            StreamEvent::InputJsonDelta {
+                index: 0,
+                partial_json: args_json.to_string(),
+            },
+            StreamEvent::ContentBlockStop { index: 0 },
+            StreamEvent::MessageStop {
+                stop_reason: StopReason::Refusal,
+            },
+        ]
+    }
 }

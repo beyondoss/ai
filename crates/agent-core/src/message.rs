@@ -173,6 +173,19 @@ pub struct Message {
     /// ever seeing the running sum.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<TokenUsage>,
+    /// Why the model ended the turn that produced this message — pi's `AssistantMessage.stopReason`
+    /// (`types.ts:393`), a required field there since a persisted assistant message's own terminal
+    /// state must be re-derivable at any later point (a fresh process, a reloaded session) purely
+    /// from data at rest, not only from an in-flight run's own local state. `Some` on an assistant
+    /// turn produced by a real model call, `None` on every `user`/tool-result turn, on a synthetic
+    /// closing record with no real model call behind it ([`Message::error`]'s bare case), and on a
+    /// message persisted before this field existed. [`crate::compaction::is_hard_overflow`]'s
+    /// `MaxTokens` check falls back to reading this off the session's last assistant message when a
+    /// fresh run starts, so a hard-overflow turn a *prior* run/process left behind is still
+    /// detected — matching pi's own `isContextOverflow`, re-evaluated fresh from the persisted
+    /// message on every `prompt()` call rather than trusted only within the run that produced it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<StopReason>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -189,6 +202,7 @@ impl Message {
             error_message: None,
             aborted: false,
             usage: None,
+            stop_reason: None,
         }
     }
 
@@ -201,6 +215,7 @@ impl Message {
             error_message: None,
             aborted: false,
             usage: None,
+            stop_reason: None,
         }
     }
 
@@ -218,6 +233,7 @@ impl Message {
             error_message: Some(message.into()),
             aborted: false,
             usage: None,
+            stop_reason: None,
         }
     }
 
@@ -239,6 +255,7 @@ impl Message {
             error_message: None,
             aborted: false,
             usage: None,
+            stop_reason: None,
         }
     }
 
@@ -260,6 +277,7 @@ impl Message {
             error_message: None,
             aborted: false,
             usage: None,
+            stop_reason: None,
         }
     }
 
@@ -275,6 +293,7 @@ impl Message {
             error_message: None,
             aborted: false,
             usage: None,
+            stop_reason: None,
         }
     }
 
@@ -296,6 +315,14 @@ impl Message {
     /// [`with_model_id`](Self::with_model_id), the same way `Agent::run_events_steered` stamps both.
     pub fn with_usage(mut self, usage: TokenUsage) -> Self {
         self.usage = Some(usage);
+        self
+    }
+
+    /// Stamp why the model ended this assistant turn — see the [`stop_reason`](Self::stop_reason)
+    /// field doc. Used right after `Message::assistant` alongside [`with_model_id`](Self::with_model_id)/
+    /// [`with_usage`](Self::with_usage), the same way `Agent::run_events_steered` stamps all three.
+    pub fn with_stop_reason(mut self, stop_reason: StopReason) -> Self {
+        self.stop_reason = Some(stop_reason);
         self
     }
 
@@ -527,5 +554,33 @@ mod tests {
             serde_json::to_value(&ev).unwrap()["type"],
             "input_json_delta"
         );
+    }
+
+    #[test]
+    fn stop_reason_round_trips_and_is_omitted_when_absent() {
+        let with_stop_reason = Message::assistant(vec![ContentBlock::text("cut off")])
+            .with_stop_reason(StopReason::MaxTokens);
+        let wire = serde_json::to_value(&with_stop_reason).unwrap();
+        assert_eq!(wire["stop_reason"], "max_tokens");
+        let back: Message = serde_json::from_value(wire).unwrap();
+        assert_eq!(back, with_stop_reason);
+
+        // A `user`/tool-result turn (or any message that never called `with_stop_reason`) omits the
+        // field entirely on the wire, not `null` — an existing on-disk session round-trips unchanged.
+        let user_wire = serde_json::to_value(Message::user("hi")).unwrap();
+        assert!(user_wire.get("stop_reason").is_none());
+    }
+
+    #[test]
+    fn stop_reason_defaults_to_none_on_a_message_persisted_before_the_field_existed() {
+        // A session written before this field existed has no `stop_reason` key at all — must still
+        // deserialize, defaulting to `None` (not a deserialize error), matching every other field added
+        // to `Message` after the fact (`model_id`, `error_message`, `aborted`, `usage`).
+        let wire = json!({
+            "role": "assistant",
+            "content": [{ "type": "text", "text": "an old message" }],
+        });
+        let back: Message = serde_json::from_value(wire).unwrap();
+        assert_eq!(back.stop_reason, None);
     }
 }

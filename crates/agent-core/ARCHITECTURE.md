@@ -28,7 +28,14 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   next task or redirect a busy agent between tool turns without waiting for it to stop. A **refusal**
   (`StopReason::Refusal`) is a distinct terminal condition: the run ends immediately without draining
   either lane, since injecting a new turn right after a refusal would likely just be refused again — the
-  queue is left intact for whatever run reads the same `Steering` handle next. How much of a lane one
+  queue is left intact for whatever run reads the same `Steering` handle next. Checked unconditionally,
+  before `calls` is even collected (pi-parity fix) — a turn that streamed one or more complete `tool_use`
+  blocks *before* the model was cut off with a refusal (a real wire shape: a refusal explanation arriving
+  as trailing content after a tool call already closed; OpenAI's `content_filter` maps to this same stop
+  reason) used to have a non-empty `calls`, since the old check lived only inside the tool-less
+  `calls.is_empty()` branch — dispatching tools the model was ultimately blocked from continuing. Matches
+  pi's `agent-loop.ts`, which returns unconditionally on an "error"/"aborted" stop before ever looking at
+  `message.content` for tool calls, dialect-agnostic. How much of a lane one
   drain call consumes is `QueueMode`, one **independent** setting per lane (`Steering::set_steering_mode`/
   `steering_mode` for the steer lane, `set_follow_up_mode`/`follow_up_mode` for the follow-up-plus-
   stranded-steer stop-boundary drain — matching pi's own separate `steeringMode`/`followUpMode`, not one
@@ -87,7 +94,13 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
 - **Hooks** — `AgentHooks` (`with_hooks`) gates (`before_tool_call` → block reason), rewrites
   (`after_tool_call`), can end a run early (`should_stop_after_turn`, see the `Graceful stop` bullet
   above), and can rewrite the model's own generated content (`on_assistant_message`) — the permission/
-  redaction/stop-decision seam. `after_tool_call` sees (and can rewrite) a tool's `images: Vec<ImageSource>`
+  redaction/stop-decision seam. `before_tool_call` receives the *coerced* input (pi-parity fix — matches
+  pi's `prepareToolCall`, which calls `validateToolArguments` before `config.beforeToolCall`), not the
+  model's raw, possibly stringified wire arguments: `coerce_tool_arguments` now runs in both dispatch
+  paths (the default gate-the-batch loop and Task #28's fully-interleaved
+  `run_tool_calls_interleaved`) *before* the hook is called, not just before the tool itself runs, so a
+  permission hook sees the same typed value (`"42"` → `42`) `Tool::run_streaming` is about to receive.
+  `after_tool_call` sees (and can rewrite) a tool's `images: Vec<ImageSource>`
   alongside its text — not just the text, which used to be all a redaction hook could see or touch, so an
   image a tool returned (a screenshot `read` pulled off disk, say) passed through completely invisibly to
   any hook wanting to redact/replace it. Kept as parallel `(text, images)` fields rather than pi's own
@@ -185,7 +198,14 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   lands where the live prompt plus the next turn's full output budget would meet it (the window, not
   `max_tokens`, is plausibly the real constraint), the run compacts anyway — disabling proactive
   compaction is a preference about timing with headroom to spare, not license to keep sending requests
-  already guaranteed to overflow. Complementary and proactive, shared across **all three dialects**:
+  already guaranteed to overflow. The `MaxTokens` branch's `stop_reason` is sourced from
+  `Message::stop_reason` (pi-parity fix — pi's own `AssistantMessage.stopReason`/`usage`, required
+  fields there, read fresh by `isContextOverflow` on every `prompt()` call): `Message` persists the stop reason that
+  produced it, and `run_events_steered` seeds its per-call `last_stop_reason` local from the session's
+  own last assistant message rather than hardcoding `EndTurn`, so a `MaxTokens` turn a *prior* run (or
+  process, after a session reload) left behind is still visible to the very first top-of-loop check of
+  a brand new call — matching pi's own re-derive-fresh-every-time behavior instead of trusting only an
+  in-flight run's local state. Complementary and proactive, shared across **all three dialects**:
   `dialect::clamp_max_tokens_to_context` estimates the live prompt from `req.messages`/`req.system`
   directly and clamps the *request's own* `max_tokens` down to whatever headroom is left under
   `context_window` (minus a margin absorbing estimation slop) — so a long-running session doesn't keep
@@ -228,28 +248,50 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   tool-streaming). The dialects and `Agent::new` consult it, so adding a model rarely needs new
   request-shape plumbing. Coverage extends past Anthropic/native-OpenAI ids to the third-party
   OpenAI-wire families the gateway actually routes to — DeepSeek, Z.ai/GLM, Moonshot/Kimi, Qwen,
-  MiniMax, xAI, Groq, Cerebras, Together, and a generic vendor/model-shaped fallback (OpenRouter, or any
-  uncatalogued addition) — matched by id prefix/substring rather than an exhaustive per-exact-id table
-  the way the native Anthropic/OpenAI branches are (those providers' catalogues are large and change
-  often; a reasonably-accurate family default closes the truncation/no-thinking gap without needing to
-  track every id). `ModelCaps::openai_reasoning_format` (an `OpenAiReasoningFormat`, only read by
-  `dialect::openai::build_body`) selects which of these families' real reasoning-toggle shape to emit —
-  `Standard`'s bare `reasoning_effort` string (o-series, gpt-5, xAI, Groq, Cerebras, and anything
-  unrecognized), or a third-party shape (`DeepSeek`'s/`Zai`'s nested `thinking:{}` toggle,
-  `Together`'s/`OpenRouter`'s nested `reasoning:{}` object) — mirroring pi's own
-  `compat.thinkingFormat` tag. Several of these families (Kimi; GLM below 5.2) have a real on/off toggle
-  but no graduated effort vocabulary at all (`reasoning_effort: false`); `models::has_reasoning_mechanism`
-  (consulted by `available_thinking_levels`/`clamp_thinking_level`/`thinking_for_level`) treats
+  MiniMax, xAI, Groq, Cerebras, Together, Mistral, and a generic vendor/model-shaped fallback
+  (OpenRouter, or any uncatalogued addition) — matched by id prefix/substring rather than an exhaustive
+  per-exact-id table the way the native Anthropic/OpenAI branches are (those providers' catalogues are
+  large and change often; a reasonably-accurate family default closes the truncation/no-thinking gap
+  without needing to track every id). Mistral is the one exception: its ~30-id catalogue has enough
+  per-id variance (and no shared prefix across its codestral/devstral/ministral/magistral/pixtral/
+  open-mistral/open-mixtral sub-families) that it's matched id-for-id instead — see
+  `models::is_mistral_model` (also shared with `dialect::openai`'s Mistral tool-call-id reshaping,
+  below) and `models::is_deepseek_model` (narrower than `OpenAiReasoningFormat::DeepSeek`, which
+  Moonshot/Kimi shares too; used by DeepSeek's own assistant-replay quirk, below). `ModelCaps::openai_reasoning_format`
+  (an `OpenAiReasoningFormat`, only read by `dialect::openai::build_body`) selects which of these
+  families' real reasoning-toggle shape to emit — `Standard`'s bare `reasoning_effort` string (o-series,
+  gpt-5, xAI, Groq, Cerebras, Mistral, and anything unrecognized), or a third-party shape (`DeepSeek`'s/
+  `Zai`'s nested `thinking:{}` toggle, `Together`'s/`OpenRouter`'s nested `reasoning:{}` object) —
+  mirroring pi's own `compat.thinkingFormat` tag. Several of these families (Kimi; GLM below 5.2) have a
+  real on/off toggle but no graduated effort vocabulary at all (`reasoning_effort: false`);
+  `models::has_reasoning_mechanism` (consulted by
+  `available_thinking_levels`/`clamp_thinking_level`/`thinking_for_level`) treats
   `openai_reasoning_format != Standard` as its own "has a mechanism" signal so such a model isn't
-  reported as `Off`-locked. A model id genuinely reachable through more than one host (a
-  Together-hosted "deepseek-ai/deepseek-r1" also matching the native-DeepSeek prefix, say) can still
-  land on the wrong sub-branch — a known limitation of a table keyed on model id alone, with no
-  route/provider context to disambiguate by. MiniMax is a special case: pi serves it over the Anthropic
-  wire, but this crate's `Dialect::for_model` only recognizes a `claude`/`anthropic`-named id as
-  Anthropic, so a `minimax-*` request is routed through the OpenAI Chat Completions dialect regardless
-  — its capability entry fixes the context/output-ceiling numbers `Agent::new` reads either way, but
-  doesn't attempt an OpenAI-shaped reasoning toggle a real MiniMax endpoint wouldn't understand; fixing
-  the underlying dialect-routing gap is `dialect/mod.rs`'s call, not this table's.
+  reported as `Off`-locked. Once a level clears `clamp_reasoning_effort`, `models::reasoning_wire_override(model,
+  effort)` gets one more say over *how it's spelled* on the wire before `dialect::openai`'s
+  `apply_reasoning_wire` falls back to the effort's own literal name — mirroring pi's per-model
+  `thinkingLevelMap` remaps (DeepSeek's `xhigh` → `"max"`; GLM-5.2's `low`/`medium`/`high` → `"high"`
+  and `xhigh` → `"max"`; Groq's one qwen id's `high` → `"default"`; every Mistral reasoning id's any
+  active level → `"high"`, matching its real API's bare `"none"|"high"` vocabulary). Deliberately a
+  standalone lookup, not a `ModelCaps` field — `ModelCaps::adaptive_xhigh_effort_wire` already covers
+  the analogous single-value need on the Anthropic adaptive shape, but a per-model *map* would need
+  touching every one of this table's ~25 `ModelCaps` struct-literal construction sites for a table only
+  four families use. A model id genuinely reachable through more than one host (a Together-hosted
+  "deepseek-ai/deepseek-r1" also matching the native-DeepSeek prefix, say) can still land on the wrong
+  sub-branch — a known limitation of a table keyed on model id alone, with no route/provider context to
+  disambiguate by. That same limitation caps `models::is_non_standard_store_provider` (which providers
+  withhold `store:false` — see `dialect/openai.rs` below): it recognizes DeepSeek/Zai/Kimi/Grok/
+  Together-Qwen/Cerebras-native by id, but can't recognize NVIDIA/Cloudflare/Ant-Ling at all (no id
+  shape of their own). MiniMax is a special case: pi serves it over the Anthropic wire, but this crate's
+  `Dialect::for_model` only recognizes a `claude`/`anthropic`-named id as Anthropic, so a `minimax-*`
+  request is routed through the OpenAI Chat Completions dialect regardless — its capability entry fixes
+  the context/output-ceiling numbers `Agent::new` reads either way, but doesn't attempt an OpenAI-shaped
+  reasoning toggle a real MiniMax endpoint wouldn't understand; fixing the underlying dialect-routing
+  gap is `dialect/mod.rs`'s call, not this table's. Mistral has the identical dialect-routing gap for a
+  different reason (it has no bespoke wire client in this crate at all, unlike pi's own
+  `mistral-conversations.ts`): every Mistral id is routed through the generic Chat Completions dialect,
+  which can approximate its reasoning toggle (via `reasoning_wire_override`, above) and its
+  tool-call-id shape (below) but not its real `promptMode` field.
 - **Thinking-budget overrides** — [`models::budget_for_effort_with_override`](src/models.rs) is the
   same fixed effort→token-budget ladder [`models::budget_for_effort`] uses (itself unchanged, and still
   the only path `thinking_for_level` calls), but takes an optional
@@ -476,11 +518,18 @@ Recoverable (no error): a streamed tool call whose JSON args never parse keeps i
 continues rather than aborting.
 
 Dispatch gates on the presence of complete `tool_use` blocks alone (pi-parity fix) — never on
-`stop_reason`, which the diagram above no longer branches on. A `MaxTokens`-truncated turn that already
-emitted one or more complete tool calls before running out of room (the model calls two tools, then
-starts trailing commentary that gets cut off) used to be silently treated as "done, no tools to run"
-whenever `stop_reason != ToolUse`, dropping the calls the model actually made. See `agent.rs::tests::
-tool_call_dispatches_even_when_stop_reason_is_max_tokens`.
+`stop_reason` for any *other* value, which the diagram above no longer branches on. A `MaxTokens`-
+truncated turn that already emitted one or more complete tool calls before running out of room (the
+model calls two tools, then starts trailing commentary that gets cut off) used to be silently treated
+as "done, no tools to run" whenever `stop_reason != ToolUse`, dropping the calls the model actually
+made. See `agent.rs::tests::tool_call_dispatches_even_when_stop_reason_is_max_tokens`. The one
+exception is `StopReason::Refusal`, checked unconditionally *before* `calls` is even collected (a
+separate pi-parity fix — a refusal blocking dispatch is dialect-agnostic, matching pi's own
+unconditional "error"/"aborted" return in `agent-loop.ts` ahead of any look at `message.content`): a
+turn that streamed one or more complete `tool_use` blocks before being cut off with a refusal must not
+dispatch them, since checking `calls.is_empty()` first would see a non-empty batch and run tools the
+model was ultimately blocked from continuing. See `agent.rs::tests::
+refusal_blocks_dispatch_even_when_a_tool_call_already_streamed`.
 ```
 
 ### Bytes to `StreamEvent` (`GatewayClient` + `dialect`)
@@ -594,15 +643,19 @@ two guards, so concurrency never costs correctness:
   debugging session, or a host policy that never wants two tool calls actually overlapping) — matching
   pi's own `AgentOptions.toolExecution: "sequential" | "parallel"`.
 
-This default split is always **gate the whole batch, then execute** — every call's `before_tool_call`
-resolves, in call order, before any call's actual tool execution begins (`Agent::run_events_steered`'s
-phase 1/phase 2, matching pi's `prepareToolCall` loop ahead of `executeToolCallsParallel`'s
-`Promise.all`). Phase 1 re-checks cancellation twice per call, not once: at the top of its loop
-iteration, *and* again right after that call's own `before_tool_call` hook returns (and after arg
-coercion) — a slow permission-check hook can observe cancellation firing mid-await, and without the
-second check a single-call (or last-in-batch) turn had no *later* iteration to catch it, so the call
-was marked ready and phase 2 dispatched it for real despite the run already having been cancelled
-(pi-parity fix). A per-tool override changes this default entirely: any call in the batch naming a tool
+This default split is always **gate the whole batch, then execute** — every call's argument coercion
+runs, then its `before_tool_call` resolves, in call order, before any call's actual tool execution
+begins (`Agent::run_events_steered`'s phase 1/phase 2, matching pi's `prepareToolCall` loop ahead of
+`executeToolCallsParallel`'s `Promise.all`). Coercion runs *before* the hook, not just before the tool
+itself (pi-parity fix — matches pi's own `prepareToolCall`, which calls `validateToolArguments` ahead
+of `config.beforeToolCall`): a permission hook must see the same coerced/typed arguments the tool is
+about to run with, not the model's raw, possibly stringified wire values. Phase 1 re-checks
+cancellation twice per call, not once: at the top of its loop iteration, *and* again right after that
+call's own `before_tool_call` hook returns — a slow permission-check hook can observe cancellation
+firing mid-await, and without the second check a single-call (or last-in-batch) turn had no *later*
+iteration to catch it, so the call was marked ready and phase 2 dispatched it for real despite the run
+already having been cancelled (pi-parity fix). A per-tool override changes this default entirely: any
+call in the batch naming a tool
 whose `Tool::execution_mode()` returns `Some(ToolExecutionMode::Sequential)` routes the turn's *whole*
 batch through `Agent::run_tool_calls_interleaved` instead — a fully-interleaved
 gate→execute→finalize-per-call path (pi's `executeToolCallsSequential`) where call 1 is completely
@@ -869,7 +922,7 @@ both fields `None` and never reads them.
 | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `lib.rs`                      | Crate root: module list, public re-exports, and the crate-wide `#![cfg_attr(test, allow(...))]` panic-free gate                                                                                                                                                                                                                                                                            |
 | `agent.rs`                    | `Agent` config + `run`/`run_cancellable`/`run_events`/`run_events_cancellable`/`run_events_steered` loop, `Accumulator`, concurrent tool dispatch (threading text/images/`terminate`), tool-driven termination, mid-run + stop-boundary steering, `with_reasoning_effort`, model-aware `new` defaults, hooks, auto-compaction + overflow retry                                                               |
-| `message.rs`                  | `Role`/`ContentBlock`(+ `Thinking`/`RedactedThinking`/`Image`; `ToolResult` carries optional `images`; `Text` carries optional `id`/`phase`, OpenAI Responses' replay metadata)/`Message`(+ `usage: Option<TokenUsage>`, the per-turn figure stamped on an assistant message)/`ToolDef`/`StopReason`(+ `Refusal`)/`StreamEvent`/`TokenUsage`(+ `reasoning_tokens`) — the internal model                                                                                                                                                                 |
+| `message.rs`                  | `Role`/`ContentBlock`(+ `Thinking`/`RedactedThinking`/`Image`; `ToolResult` carries optional `images`; `Text` carries optional `id`/`phase`, OpenAI Responses' replay metadata)/`Message`(+ `usage: Option<TokenUsage>`, the per-turn figure stamped on an assistant message; + `stop_reason: Option<StopReason>`, why that turn ended, persisted so it survives across runs/processes)/`ToolDef`/`StopReason`(+ `Refusal`)/`StreamEvent`/`TokenUsage`(+ `reasoning_tokens`) — the internal model                                                                                                                                                                 |
 | `compaction.rs`               | Context compaction: trigger, cut-point search, summary-prompt build (`summary_request` takes an optional `custom_instructions`, appended as "Additional focus: …" — a manual compaction's client-supplied steering, matching pi's `generateSummary`; never applied to the split-turn prefix call, matching pi's `generateTurnPrefixSummary` not accepting one at all), file-op extraction, and incremental update (`previous_summary`/`SUMMARY_MARKER` fold-forward) — the network-free half of `Agent::compact`                                                                                                                                                                             |
 | `models.rs`                   | `capabilities(model) -> ModelCaps`: minimal per-model wire table (max-tokens field, long-cache, vision, thinking shape, reasoning-effort, context window), matched by id prefix; consumed by the dialects and `Agent::new`                                                                                                                                                                 |
 | `hooks.rs`                    | `AgentHooks` interception trait (`before_tool_call`/`after_tool_call`/`should_stop_after_turn`/`on_assistant_message`/`before_provider_request`/`after_provider_response`, all cancellation-aware where a run is in flight) + `NoHooks` default                                                                                                                                                                                                                                                                        |
@@ -877,12 +930,12 @@ both fields `None` and never reads them.
 | `write_lock.rs`               | `WriteLockRegistry` — a process-scoped, path-keyed async-mutex map (`Agent::with_write_locks`) extending same-path write exclusivity across `Agent` rebuilds (a `set_model`/`set_thinking` rebuild, or multiple sessions sharing one registry), layered on top of the per-turn write-target grouping below; `WriteLockGuard`'s `Drop` evicts a key's entry once its refcount shows no other holder/waiter left (see the `Cross-run file-mutation exclusivity` capability above) so the map stays bounded to currently-contended paths, not every path ever locked |
 | `tool.rs`                     | `Tool` trait (`run -> ToolOutput`, optional streaming `run_streaming` + `ToolProgress` sink, optional `execution_mode() -> Option<ToolExecutionMode>` — `Some(Sequential)` routes a turn's whole batch through `Agent::run_tool_calls_interleaved`) + `ToolOutput { text, images, terminate }` + `ToolRegistry` (name-keyed `Arc<dyn Tool>` map, last-registration-wins, name-sorted `definitions`)                                                                                                                                               |
 | `validation.rs`               | `coerce_tool_arguments(schema, input)` — best-effort JSON-Schema-shaped type coercion (numeric string → number, `"true"`/`"false"` → bool, etc., never lossy int/float or non-canonical bool text) run on every dispatched call's args before `Tool::run`/`run_streaming` sees them (`agent.rs`'s dispatch, `.unwrap_or_else(\|_\| input.clone())` on failure — a tool that can't be coerced still reaches the tool's own, clearer validation error rather than a new failure path here); recurses into `properties`, schema-typed `additionalProperties` (a bare `true`/`false` is not a schema and is left alone), array `items` (both the tuple-per-index form and the single-schema-for-every-element form), and `allOf`/`anyOf`/`oneOf` composition (best-effort — a member that fails to coerce is skipped/falls back to the value untouched, never fails the surrounding call, unlike every other coercion path here, which is all-or-nothing per AJV's own `coerceTypes` — matches pi's `coerceWithJsonSchema`/`coerceWithUnionSchema`) |
-| `transport.rs`                | `ModelRequest` (system/tools/thinking/`reasoning_effort`/`tool_choice`/cache_key/cache_long/`user_id` — Anthropic's `metadata.user_id` abuse-detection hint, unset by default), `ReasoningEffort` + `ToolChoice` enums, `ModelTransport` trait, `EventStream` alias. `tools` is fixed for a given *request*, but not necessarily the whole *run* it belongs to — see `Mid-run tool-set switching` above                                                                                                                                                                                                          |
+| `transport.rs`                | `ModelRequest` (system/tools/thinking/`reasoning_effort`/`tool_choice`/cache_key/cache_long/`user_id` — Anthropic's `metadata.user_id` abuse-detection hint, unset by default; `is_azure`/`is_copilot`, both `false` by default — ready plumbing points for whichever layer resolves routing to flip on, not fully wired through yet; only `dialect/openai_responses.rs` currently reads them), `ReasoningEffort` + `ToolChoice` enums, `ModelTransport` trait, `EventStream` alias. `tools` is fixed for a given *request*, but not necessarily the whole *run* it belongs to — see `Mid-run tool-set switching` above                                                                                                                                                                                                          |
 | `client.rs`                   | `GatewayClient`: production `ModelTransport`; retry-with-backoff (`Retry-After` delta-seconds _or_ HTTP-date, `MAX_BACKOFF` 60s default, `with_max_backoff` override, `is_retryable_status` matching 429/5xx/524/408/409), chunked-SSE byte framing into whole UTF-8 lines; `with_extra_headers`/`with_hooks` (see `Transport resilience`/`Provider request/response hooks` above); sends both `session_id: <cache_key>` and `x-client-request-id: <cache_key>` for the OpenAI Responses dialect only, when a `cache_key` is set — connection-level session-affinity routing, distinct from `prompt_cache_key`'s cache-node affinity in the body, matching pi's `openai-responses.ts` (which sends both headers, not just one); `needs_interleaved_thinking_beta(model)` gates the `interleaved-thinking-2025-05-14` beta header on the model's own thinking *shape* alone (any non-`Adaptive` model, `Adaptive` skipped since it interleaves by default) — pi-parity fix: previously also required *this turn's own* `req.thinking.is_some()`, so a request with thinking off mid-session dropped the header even though a `Budget`-shape model always benefits from it being present, matching pi's own default-on `interleavedThinking ?? true` gate                                                                                                                                                                                                                            |
 | `dialect/mod.rs`              | `Dialect` enum (model-id → wire selection), `StreamDecoder` trait, SSE line-splitting (`push_sse_line`/`decode_sse`), `clamp_max_tokens_to_context` (shared by all three dialects), `ensure_non_empty_content` — pads a message's outbound copy (never the persisted session record) to a placeholder text block when it's whitespace-only/empty, *or* (pi-parity fix) when the whole message is a `Message::aborted`/`with_error` assistant turn: replaying a dangling `Thinking` block or other partial content from a cancelled/errored turn is exactly Anthropic/OpenAI's own "reasoning with nothing following it"/incomplete-turn rejection, and once one turn hits it every later turn resends the identical dangling block and fails identically — matches pi's `transform-messages.ts:186-194`, which skips such a message outright when building the next request                                                                                                                        |
 | `dialect/anthropic.rs`        | `/v1/messages` body builder (three prompt-cache breakpoints, capability-gated 1h TTL, per-model thinking shape, `tool_choice`, tool-result image rewrite, `normalize_cross_model_tool_ids` — disallowed-character/length normalization of a foreign-model tool-call id at the point a request reaches the wire) + decoder (text/thinking/tool/cache-usage, reasoning-token breakout, `pause_turn`/refusal-explanation, in-band error + truncation detection)                                                                                     |
-| `dialect/openai.rs`           | `/v1/chat/completions` body builder + decoder — real translation: flattened messages, string-encoded tool args, `image_url` data-URIs (user + fanned-out tool-result images), `max_completion_tokens` vs `max_tokens`, `reasoning_effort`, `tool_choice`, synthesized block-stop events                                                                                                    |
-| `dialect/openai_responses.rs` | `/v1/responses` body builder (flat `input` array of typed items, flat tool defs, `max_output_tokens`, `reasoning.effort` + `reasoning.summary` (`ModelRequest::reasoning_summary`, defaults to `ReasoningSummary::Auto`) + `include:["reasoning.encrypted_content"]`, `service_tier` (`ModelRequest::service_tier`, omitted unless set — a queueing/latency class, not just pricing), `store:false`) + decoder — genuine item-boundary events (`output_item.added`/`.done`), not implicit index-keyed deltas; every event carries its own true `output_index` and is emitted immediately, live, in real arrival order — no buffering, no "focus" item — since `Accumulator` natively tracks as many concurrently-open indices as the wire actually has (genuinely interleaved items, e.g. concurrent tool calls, stream live rather than one being buffered and replayed as a burst once the other closes); `function_call_arguments.done`/`output_item.done`'s own `arguments`/`content` resync (replace, not append) whatever the streamed deltas produced, so a single dropped/duplicated delta can't silently corrupt the final block; a `message`-type item's `id`/`phase` are captured off that same `output_item.done` and restamped verbatim on replay (`push_assistant_content`/`fallback_message_id`) |
+| `dialect/openai.rs`           | `/v1/chat/completions` body builder + decoder — real translation: flattened messages, string-encoded tool args, `image_url` data-URIs (user + fanned-out tool-result images), `max_completion_tokens` vs `max_tokens`, `reasoning_effort`, `tool_choice`, synthesized block-stop events. System-prompt role is `"developer"`/`"system"` per `dialect::openai_responses::instruction_role` (shared, not duplicated); `store:false` sent except for `models::is_non_standard_store_provider`'s denylist; Mistral ids get their `tool_calls[].id`/`tool_call_id` reshaped to exactly 9 alphanumeric characters (`MistralToolCallIdNormalizer`, request-scoped) since Mistral's real API rejects any other shape; `finish_reason:"end"` is a "stop" synonym; DeepSeek assistant replay backfills an empty `reasoning_content` when a turn carried no thinking                                                                                                    |
+| `dialect/openai_responses.rs` | `/v1/responses` body builder (flat `input` array of typed items, flat tool defs, `max_output_tokens`, `reasoning.effort` + `reasoning.summary` (`ModelRequest::reasoning_summary`, defaults to `ReasoningSummary::Auto`) + `include:["reasoning.encrypted_content"]`, `service_tier` (`ModelRequest::service_tier`, omitted unless set — a queueing/latency class, not just pricing), `store:false`; the explicit `reasoning:{"effort":"none"}` disable is withheld when `ModelRequest::is_copilot` (GitHub Copilot-hosted gpt-5.x ids have no "off" wire shape at all, unlike the same id direct from OpenAI); `prompt_cache_retention` is withheld entirely when `ModelRequest::is_azure` (pi's Azure dialect never sends it)) + decoder — genuine item-boundary events (`output_item.added`/`.done`), not implicit index-keyed deltas; every event carries its own true `output_index` and is emitted immediately, live, in real arrival order — no buffering, no "focus" item — since `Accumulator` natively tracks as many concurrently-open indices as the wire actually has (genuinely interleaved items, e.g. concurrent tool calls, stream live rather than one being buffered and replayed as a burst once the other closes); `function_call_arguments.done`/`output_item.done`'s own `arguments`/`content` resync (replace, not append) whatever the streamed deltas produced, so a single dropped/duplicated delta can't silently corrupt the final block; a `message`-type item's `id`/`phase` are captured off that same `output_item.done` and restamped verbatim on replay (`push_assistant_content`/`fallback_message_id`) |
 | `branch_summary.rs`           | `branch_summary_request`: the (network-free) prompt builder for summarizing an abandoned tree branch on navigation — reuses `compaction`'s `SUMMARY_SYSTEM`/`extract_file_ops` unchanged and its `render_prefix` in spirit but not verbatim (`render_prefix_without_tool_results` drops tool-result content entirely rather than truncating it, matching pi's `getMessageFromEntry` returning `undefined` for a tool-result-role entry — a branch summary is read once on return, not carried forward as live context, so terseness matters more than detail here), rendered transcript wrapped in `<conversation>` tags (matching pi's `generateBranchSummary` and this crate's own compaction summary-request path), framed by its own instruction (no incremental-update path; a branch is summarized once), fixed `BRANCH_SUMMARY_MAX_TOKENS` (2048) output budget — matching pi's own hardcoded `generateBranchSummary` constant, deliberately independent of `CompactionConfig::summary_max_tokens`'s `reserve_tokens`-scaled budget, since a branch recap has no incremental-update path to size for; `windowed_by_budget` trims the rendered tail to fit the summarization call's own context, privileging a nested compaction/branch-summary entry (a dense recap, not raw conversation) past the ordinary cutoff as long as the accumulated tail is still under 90% of budget, matching pi's `prepareBranchEntries` |
 | `session.rs`                  | `Session`: Arc-shared copy-on-write message history + step/token counters + `last_usage_message_count`, serde round-trippable; `scrub_cross_model_state(new_model)` downgrades a non-empty signed `Thinking` block to `Text` (drops it only if empty), drops `RedactedThinking`, and truncates a combined tool-call id — all from any message not stamped with `new_model`                                                                                                                |
 | `error.rs`                    | `Error` (loop/transport, aborts the run) and `ToolError` (tool failure, becomes an error `tool_result`)                                                                                                                                                                                                                                                                                    |

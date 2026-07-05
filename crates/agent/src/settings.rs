@@ -92,6 +92,16 @@ pub struct Settings {
     /// only mutation surface here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_images: Option<bool>,
+    /// A persisted, cross-session override for whether `read` downscales/re-encodes an oversized image
+    /// to fit the inline size budget — Task #4 (pi-parity feature): pi's own `ImageSettings.autoResize`
+    /// (default `true`). `Some(false)` behaves as if `--no-image-auto-resize` were always passed;
+    /// `Some(true)`/`None` leave the built-in default (resize enabled) in effect — mirrors
+    /// `block_images`'s identical tri-state convention just above, just inverted (this one defaults to
+    /// *on*, `block_images` defaults to *off*). Set via `agent settings --image-auto-resize`/
+    /// `--clear-image-auto-resize`: like `block_images`, `run` has no long-lived session to toggle this
+    /// from, so the CLI is the only mutation surface here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_auto_resize: Option<bool>,
     /// Persisted per-reasoning-effort thinking-token-budget overrides — Task #36 (pi-parity feature):
     /// Round 1 added `agent_core::models::budget_for_effort_with_override`, letting a caller tune the
     /// effort-to-token-budget ladder itself rather than only picking an effort level (pi's own model
@@ -175,6 +185,12 @@ impl SettingsStore {
     /// Set (`Some`) or clear (`None`) the persisted `--block-images` default, persisting atomically.
     pub fn set_block_images(&mut self, block_images: Option<bool>) -> std::io::Result<()> {
         self.mutate_locked(move |s| s.block_images = block_images)
+    }
+
+    /// Set (`Some`) or clear (`None`) the persisted `--no-image-auto-resize` default, persisting
+    /// atomically.
+    pub fn set_image_auto_resize(&mut self, image_auto_resize: Option<bool>) -> std::io::Result<()> {
+        self.mutate_locked(move |s| s.image_auto_resize = image_auto_resize)
     }
 
     /// Set (`Some(tokens)`) or clear (`None`) the persisted thinking-token-budget override for one
@@ -430,8 +446,11 @@ impl ModelOverride {
     }
 
     /// Resolve every configured header value through [`resolve_config_value`], dropping any entry that
-    /// fails to resolve (an unset env var, a failing `!command`) rather than sending a literal `$VAR`/
-    /// `!command` string as a header value.
+    /// fails to resolve (an unset env var, a failing `!command`) or resolves to an empty string (a `$VAR`
+    /// set but empty, or a literal `""`) rather than sending a literal `$VAR`/`!command` string, or an
+    /// empty value, as a header — same empty-string guard as
+    /// [`Self::resolved_api_key_with_env`], just dropping the entry outright instead of falling back
+    /// (there's no per-header fallback value to fall back to).
     pub fn resolved_headers(&self) -> std::collections::HashMap<String, String> {
         self.resolved_headers_with_env(None)
     }
@@ -445,7 +464,11 @@ impl ModelOverride {
     ) -> std::collections::HashMap<String, String> {
         self.headers
             .iter()
-            .filter_map(|(k, v)| resolve_config_value(v, env_overrides).map(|v| (k.clone(), v)))
+            .filter_map(|(k, v)| {
+                resolve_config_value(v, env_overrides)
+                    .filter(|v| !v.is_empty())
+                    .map(|v| (k.clone(), v))
+            })
             .collect()
     }
 }
@@ -903,6 +926,25 @@ mod tests {
     }
 
     #[test]
+    fn set_image_auto_resize_persists_and_reopening_sees_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut store = SettingsStore::open(path.clone());
+        assert_eq!(store.get().image_auto_resize, None);
+
+        store.set_image_auto_resize(Some(false)).unwrap();
+        assert_eq!(store.get().image_auto_resize, Some(false));
+        let reopened = SettingsStore::open(path.clone());
+        assert_eq!(reopened.get().image_auto_resize, Some(false));
+
+        let mut store = SettingsStore::open(path.clone());
+        store.set_image_auto_resize(None).unwrap();
+        assert_eq!(store.get().image_auto_resize, None);
+        let reopened = SettingsStore::open(path);
+        assert_eq!(reopened.get().image_auto_resize, None);
+    }
+
+    #[test]
     fn set_thinking_budget_override_persists_a_single_entry_and_reopening_sees_it() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
@@ -1063,6 +1105,24 @@ mod tests {
 
         let resolved = over.resolved_headers_with_env(Some(&std::collections::HashMap::new()));
         assert_eq!(resolved.get("X-Missing"), None);
+        assert_eq!(resolved.get("X-Present").map(String::as_str), Some("literal"));
+    }
+
+    #[test]
+    fn resolved_headers_drops_an_entry_that_resolves_to_an_empty_string() {
+        // Fix 4 (pi-parity gap): a header value resolving to `""` — e.g. a `$VAR` reference that's set
+        // but empty — must be dropped like an unresolvable one, not sent as a literal empty-value
+        // header. Mirrors `resolved_api_key_with_env`'s identical `.filter(|v| !v.is_empty())` guard.
+        let mut over = ModelOverride::default();
+        over.headers
+            .insert("X-Empty".to_string(), "$EMPTY_VAR".to_string());
+        over.headers
+            .insert("X-Present".to_string(), "literal".to_string());
+        let mut env = std::collections::HashMap::new();
+        env.insert("EMPTY_VAR".to_string(), String::new());
+
+        let resolved = over.resolved_headers_with_env(Some(&env));
+        assert_eq!(resolved.get("X-Empty"), None, "got: {resolved:?}");
         assert_eq!(resolved.get("X-Present").map(String::as_str), Some("literal"));
     }
 

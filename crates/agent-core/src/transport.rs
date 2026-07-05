@@ -221,6 +221,23 @@ pub struct ModelRequest {
     /// `openai-responses.ts` — a caller asking for a fixed temperature on a reasoning model that
     /// rejects it is a caller error, same as pi's.
     pub temperature: Option<f64>,
+    /// Whether this request is being routed to Azure OpenAI specifically, rather than native OpenAI or
+    /// another OpenAI-Responses-compatible host. Only the OpenAI Responses dialect reads this (pi's
+    /// `azure-openai-responses.ts` never calls `resolveCacheRetention`/`getPromptCacheRetention` at
+    /// all — unlike the direct `openai-responses.ts` dialect, it never sends `prompt_cache_retention`).
+    /// `false` by default: routing is resolved downstream of where a [`ModelRequest`] is built. Set by
+    /// `GatewayClient::stream` once the credential is resolved, from the same `auth_header ==
+    /// Some("api-key")` signal `client::DirectRouting::auth_header` already uses to distinguish Azure's
+    /// wire shape (see that method's doc comment) — not a second, independent detection path.
+    pub is_azure: bool,
+    /// Whether this request is being routed through a GitHub Copilot OAuth credential. Only the OpenAI
+    /// Responses dialect reads this: Copilot-hosted gpt-5.x ids set `thinkingLevelMap: {"off": null}`
+    /// in pi's own catalogue (`github-copilot.models.ts`) — no explicit reasoning-disable signal at
+    /// all — even though the *same* ids routed directly through OpenAI do have one
+    /// (`ModelCaps::reasoning_disableable`, keyed purely by id, can't tell the two routes apart).
+    /// `false` by default; set by `GatewayClient::stream` from the same `via_copilot`
+    /// (`DirectRouting::copilot_dynamic_headers`) signal already used to pick the dialect itself.
+    pub is_copilot: bool,
 }
 
 impl ModelRequest {
@@ -246,6 +263,8 @@ impl ModelRequest {
             reasoning_summary: None,
             service_tier: None,
             temperature: None,
+            is_azure: false,
+            is_copilot: false,
         }
     }
 
@@ -337,6 +356,20 @@ impl ModelRequest {
     /// gating (Anthropic omits it while thinking is enabled).
     pub fn with_temperature(mut self, temperature: f64) -> Self {
         self.temperature = Some(temperature);
+        self
+    }
+
+    /// Builder-style: mark this request as Azure-OpenAI-routed. See [`is_azure`](Self::is_azure)'s own
+    /// doc comment for what this does (and doesn't yet) wire up.
+    pub fn with_azure(mut self, is_azure: bool) -> Self {
+        self.is_azure = is_azure;
+        self
+    }
+
+    /// Builder-style: mark this request as routed through a GitHub Copilot OAuth credential. See
+    /// [`is_copilot`](Self::is_copilot)'s own doc comment for what this does (and doesn't yet) wire up.
+    pub fn with_copilot(mut self, is_copilot: bool) -> Self {
+        self.is_copilot = is_copilot;
         self
     }
 }

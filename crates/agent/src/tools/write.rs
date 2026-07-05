@@ -44,6 +44,17 @@ impl Tool for Write {
             .get("content")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing `content`".into()))?;
+        // `write_atomic` replaces the file via `rename(2)`, which only consults the *containing
+        // directory's* write permission — the target file's own mode bits are never checked, so a
+        // `chmod 444` file was silently overwritten. pi's `fs.writeFile` opens the existing path
+        // directly, so the OS itself enforces the file's own write-permission bit (EACCES). Same
+        // pre-check `edit.rs` already makes (see its own doc comment) before doing any work.
+        let writable = std::fs::metadata(path)
+            .map(|m| !m.permissions().readonly())
+            .unwrap_or(true); // a metadata read failing here is surfaced by the write attempt below
+        if !writable {
+            return Err(ToolError::Execution(format!("{path} is not writable")));
+        }
         if let Some(parent) = std::path::Path::new(path).parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent).map_err(|e| {
@@ -106,6 +117,41 @@ mod tests {
             .unwrap();
         let normalized = Write.write_target(&json!({ "path": at_prefixed })).unwrap();
         assert_eq!(plain, normalized);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn rejects_a_read_only_file_leaving_its_content_unchanged() {
+        // pi-parity gap (fixed): unlike `edit`, `write` had no writability pre-check at all —
+        // `write_atomic`'s `rename(2)`-based swap only consults the containing directory's write
+        // permission, never the target file's own mode bits, so a `chmod 444` file was silently
+        // overwritten. pi's `fs.writeFile` opens the existing path directly, so the OS enforces the
+        // file's own write bit; this proves the same refusal `edit.rs` already has.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("locked.txt");
+        std::fs::write(&path, "original").unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        let err = Write
+            .run(json!({ "path": path.to_str().unwrap(), "content": "new" }))
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::Execution(msg) => assert!(msg.contains("not writable"), "got: {msg}"),
+            other => panic!("expected Execution(\"... not writable\"), got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "original",
+            "a refused write must leave the file's content unchanged"
+        );
+
+        // Restore write permission (owner-only, not world-writable) so the tempfile crate can clean
+        // up the file on drop.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
 
     #[tokio::test]

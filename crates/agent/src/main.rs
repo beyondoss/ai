@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agent_core::{Agent, GatewayClient, Session, StreamEvent, Tool};
+use beyond_ai_agent::gateway_credential::{GatewayCredential, resolve_gateway_credential};
 use beyond_ai_agent::policy::ToolPolicy;
 use beyond_ai_agent::session_store::{
     SessionMeta, SessionRepo, SessionStore, canonical_cwd, default_session_dir, fork_by_arg,
@@ -163,231 +164,6 @@ fn resolve_thinking_budget_overrides(
     (!map.is_empty()).then_some(map)
 }
 
-/// The one further fallback tier below `--key`/`AI_AGENT_KEY`: an inferred, stored OAuth
-/// subscription login for whichever provider `model` implies. Consulted only when no explicit
-/// key/env var was given — an explicit `--key`/`AI_AGENT_KEY` always wins outright, unchanged.
-///
-/// Inference is deliberately non-uniform across providers — a bare model id is unambiguous for some,
-/// not others:
-/// - Anthropic: any Claude-dialect model id ([`agent_core::dialect::Dialect::for_model`]'s own rule)
-///   — there's only one possible account for a Claude request, safe to infer unconditionally.
-/// - OpenAI Codex: a model id containing `"codex"` — this crate has no ChatGPT-Codex model catalog of
-///   its own to consult, so a name heuristic is as precise as it gets today.
-/// - GitHub Copilot: *not* inferred by model-id prefix at all — Copilot's model set is dynamic,
-///   discovered at login time and recorded in the stored credential's own `available_model_ids`, so
-///   it's matched only if `model` actually appears there.
-///
-/// If both a direct Anthropic credential and a Copilot credential (whose `available_model_ids`
-/// includes `model`) are stored, the direct credential wins — checked first below, preferring the
-/// more specific, directly-authenticated relationship over a proxy.
-/// Adapts a plain OAuth [`agent_core::client::CredentialSource`] (bearer token + `is_oauth`, from
-/// `OAuthCredentialSource`) with routing info the source itself has no way to compute — GitHub
-/// Copilot's account-specific proxy host, or OpenAI Codex's distinct backend path/headers — neither
-/// of which the gateway's static `KNOWN_PROVIDERS` table can express as a row the way it does for
-/// Anthropic/OpenAI direct (see `agent_core::client::RouteOverride`'s doc comment). `routing` is
-/// computed once here, from whichever credential is on disk *now* — the same granularity
-/// `GatewayClient::base_url` itself already resolves at construction, not fresh per turn — rather
-/// than re-derived from the live, possibly-just-refreshed token on every request; the two pieces of
-/// data this stands in for (Copilot's `proxy-ep` host, Codex's account id) are properties of the
-/// *account*, not of any one token, so they don't change across an in-process refresh of the same
-/// login.
-struct DirectRoutedCredentialSource {
-    inner: Arc<dyn agent_core::client::CredentialSource>,
-    routing: agent_core::client::DirectRouting,
-}
-
-#[async_trait::async_trait]
-impl agent_core::client::CredentialSource for DirectRoutedCredentialSource {
-    async fn credential(&self) -> agent_core::Result<agent_core::client::Credential> {
-        let credential = self.inner.credential().await?;
-        Ok(credential.with_direct_routing(self.routing.clone()))
-    }
-}
-
-/// A [`agent_core::client::CredentialSource`] for a `models.json` `base_url` override (Fix 9 —
-/// pi-parity feature: pi's own `model-registry.ts` custom-model/override support). Unlike
-/// [`DirectRoutedCredentialSource`] above (which wraps an existing OAuth source and only adds routing),
-/// this *is* the credential: a fixed bearer token — the override's own `api_key`, else whatever
-/// `--key`/`AI_AGENT_KEY` resolved to, else empty (many self-hosted OpenAI-compatible servers, like
-/// Ollama/LM Studio, ignore the `Authorization` header entirely) — plus the same [`agent_core::client::
-/// DirectRouting`] mechanism reused, not duplicated, to send the request straight to the override's
-/// `base_url`, bypassing the gateway outright.
-struct StaticDirectCredentialSource {
-    bearer: String,
-    routing: agent_core::client::DirectRouting,
-}
-
-#[async_trait::async_trait]
-impl agent_core::client::CredentialSource for StaticDirectCredentialSource {
-    async fn credential(&self) -> agent_core::Result<agent_core::client::Credential> {
-        Ok(
-            agent_core::client::Credential::new(self.bearer.clone(), false)
-                .with_direct_routing(self.routing.clone()),
-        )
-    }
-}
-
-/// OpenAI's own approved identity string for this tool's OAuth grant (`build_authorize_url` in
-/// `oauth/openai_codex.rs` already sends this as the `originator` query param at login time) — reused
-/// verbatim here so a live Codex inference request presents the same identity the account authorized,
-/// rather than a second, inconsistent one.
-const CODEX_ORIGINATOR: &str = "beyond-ai-agent";
-
-/// GitHub Copilot's fixed editor-identity headers, required on every live inference request (not just
-/// the OAuth/model-management calls) — see `GITHUB_COPILOT_MODELS`' own per-model `headers` field in
-/// pi-mono (`packages/ai/src/providers/github-copilot.models.ts`). Duplicated from the private
-/// constants of the same values in `oauth::github_copilot` (`COPILOT_USER_AGENT` et al.) rather than
-/// exported from there: those are login/refresh-flow internals, and this crate's own convention
-/// (`auth_store.rs`'s `FileLock`, `Secret`) is to duplicate a small, self-contained constant rather
-/// than widen another module's private surface for one call site.
-const COPILOT_STATIC_HEADERS: [(&str, &str); 4] = [
-    ("User-Agent", "GitHubCopilotChat/0.35.0"),
-    ("Editor-Version", "vscode/1.107.0"),
-    ("Editor-Plugin-Version", "copilot-chat/0.35.0"),
-    ("Copilot-Integration-Id", "vscode-chat"),
-];
-
-/// GitHub Copilot's real endpoint path per dialect — **not** the dialect's own default
-/// `endpoint_path()`: Copilot's OpenAI-wire endpoints omit the `/v1` prefix pi's official SDKs bake
-/// into their default `baseURL` (so the SDK's own `/chat/completions`/`/responses` relative paths land
-/// bare on Copilot's host), while its Anthropic-wire endpoint matches the dialect default verbatim
-/// (the Anthropic SDK's default `baseURL` carries no version segment, so it *always* appends
-/// `/v1/messages` itself). See `packages/ai/src/api/{anthropic-messages,openai-completions,
-/// openai-responses}.ts` in pi-mono (each sets `baseURL: model.baseUrl` on the vendor SDK, which then
-/// appends its own fixed relative path).
-fn copilot_endpoint_path(dialect: agent_core::dialect::Dialect) -> &'static str {
-    match dialect {
-        agent_core::dialect::Dialect::Anthropic => "/v1/messages",
-        agent_core::dialect::Dialect::OpenAi => "/chat/completions",
-        agent_core::dialect::Dialect::OpenAiResponses => "/responses",
-    }
-}
-
-fn resolve_gateway_credential(
-    key: Option<String>,
-    model: &str,
-) -> Result<serve::GatewayCredential, String> {
-    // Fix 9 (pi-parity feature): a `models.json` override naming a `base_url` for this exact model id
-    // wins outright, regardless of whether `--key`/`AI_AGENT_KEY` was also given — the override
-    // redirects *where* the request goes (a locally-hosted or alternate-provider endpoint, entirely
-    // bypassing the gateway), which is orthogonal to *how* it authenticates. Reuses the same
-    // `DirectRouting`/`RouteOverride::Direct` mechanism the GitHub-Copilot OAuth routing below already
-    // relies on, rather than duplicating it — see `settings::ModelOverride`'s own doc comment for the
-    // on-disk schema.
-    if let Some(over) = beyond_ai_agent::settings::ModelOverrides::open_default().get(model) {
-        if let Some(base_url) = over.base_url.clone() {
-            let dialect = agent_core::dialect::Dialect::for_model(model);
-            // Task #11 (pi-parity feature): resolved through `!command`/`$VAR`/literal syntax (see
-            // `ModelOverride::resolved_api_key`'s own doc comment) rather than used as a raw literal —
-            // lets an operator avoid storing a plaintext secret in `models.json`.
-            let bearer = over.resolved_api_key(key.as_deref());
-            let routing = agent_core::client::DirectRouting {
-                route: agent_core::client::RouteOverride::Direct {
-                    base_url,
-                    path: dialect.endpoint_path(),
-                },
-                static_headers: Vec::new(),
-                copilot_dynamic_headers: false,
-                // Task #8 (pi-parity: Azure OpenAI routing support) — an operator-configured
-                // `auth_header` (e.g. `"api-key"` for Azure) sends `bearer` through that named header
-                // and omits `Authorization` entirely, instead of leaking a Bearer-shaped credential
-                // (or, worse, a silent fallback to the gateway's own virtual key) to an endpoint that
-                // doesn't want it.
-                auth_header: over.auth_header.clone(),
-            };
-            return Ok(serve::GatewayCredential::Oauth(Arc::new(
-                StaticDirectCredentialSource { bearer, routing },
-            )));
-        }
-    }
-
-    if let Some(key) = key {
-        return Ok(serve::GatewayCredential::Static(key));
-    }
-
-    let store = beyond_ai_agent::auth_store::AuthStore::open_default();
-    let oauth_source = |provider: beyond_ai_agent::oauth::OAuthProviderId| {
-        Arc::new(beyond_ai_agent::auth_credential_source::OAuthCredentialSource::new(
-            provider,
-            beyond_ai_agent::auth_store::default_path(),
-        )) as Arc<dyn agent_core::client::CredentialSource>
-    };
-
-    if agent_core::dialect::Dialect::for_model(model) == agent_core::dialect::Dialect::Anthropic
-        && store.get("anthropic").is_some()
-    {
-        return Ok(serve::GatewayCredential::Oauth(oauth_source(
-            beyond_ai_agent::oauth::OAuthProviderId::Anthropic,
-        )));
-    }
-    if model.contains("codex") {
-        if let Some(stored) = store.get("openai-codex") {
-            if let beyond_ai_agent::oauth::OAuthCredential::OpenaiCodex(c) = &stored.credential {
-                // Still relayed through the gateway (a new `KNOWN_PROVIDERS` row: `chatgpt.com` is a
-                // genuinely static host) under the `/openai-codex` prefix, with the account id this
-                // backend requires attached as a static header — see `RouteOverride::Prefixed`.
-                let routing = agent_core::client::DirectRouting {
-                    route: agent_core::client::RouteOverride::Prefixed {
-                        prefix: "/openai-codex",
-                        path: "/backend-api/codex/responses",
-                    },
-                    static_headers: vec![
-                        ("chatgpt-account-id", c.account_id.clone()),
-                        ("originator", CODEX_ORIGINATOR.to_string()),
-                        ("OpenAI-Beta", "responses=experimental".to_string()),
-                    ],
-                    copilot_dynamic_headers: false,
-                    auth_header: None,
-                };
-                return Ok(serve::GatewayCredential::Oauth(Arc::new(
-                    DirectRoutedCredentialSource {
-                        inner: oauth_source(beyond_ai_agent::oauth::OAuthProviderId::OpenaiCodex),
-                        routing,
-                    },
-                )));
-            }
-        }
-    }
-    if let Some(stored) = store.get("github-copilot") {
-        if let beyond_ai_agent::oauth::OAuthCredential::GithubCopilot(c) = &stored.credential {
-            if c.available_model_ids.iter().any(|m| m == model) {
-                // Bypasses the gateway entirely: GitHub hands back a *different* proxy host per
-                // account/enterprise, embedded in the access token itself (`proxy-ep=…`) — not a
-                // static host the gateway's `KNOWN_PROVIDERS` table could ever hold as a row. See
-                // `RouteOverride::Direct`.
-                let dialect = agent_core::dialect::Dialect::for_model(model);
-                let base_url = beyond_ai_agent::oauth::github_copilot::base_url_from_token(
-                    Some(c.access.as_str()),
-                    c.enterprise_url.as_deref(),
-                );
-                let routing = agent_core::client::DirectRouting {
-                    route: agent_core::client::RouteOverride::Direct {
-                        base_url,
-                        path: copilot_endpoint_path(dialect),
-                    },
-                    static_headers: COPILOT_STATIC_HEADERS
-                        .iter()
-                        .map(|(name, value)| (*name, value.to_string()))
-                        .collect(),
-                    copilot_dynamic_headers: true,
-                    auth_header: None,
-                };
-                return Ok(serve::GatewayCredential::Oauth(Arc::new(
-                    DirectRoutedCredentialSource {
-                        inner: oauth_source(beyond_ai_agent::oauth::OAuthProviderId::GithubCopilot),
-                        routing,
-                    },
-                )));
-            }
-        }
-    }
-
-    Err(format!(
-        "no gateway key: pass --key or set AI_AGENT_KEY (a bai_v1… virtual key), or run `agent login \
-         <provider>` to use a subscription for model {model:?}"
-    ))
-}
-
 /// The extra per-request headers a `models.json` override configures for this model id, if any (Task
 /// #11 pi-parity feature) — resolved via `settings::ModelOverride::resolved_headers` and merged onto
 /// the gateway client via `GatewayClient::with_extra_headers`. A separate lookup from
@@ -529,18 +305,20 @@ enum Command {
         /// invocation (several `tasks` sent as sequential turns) can.
         #[arg(long, default_value_t = false)]
         cache_long: bool,
-        /// Enable extended thinking with this token budget (must be below the per-turn max tokens).
-        /// `serve`'s identical flag; unlike `serve`, `run` has no thinking-level cycling, so this is
-        /// applied as-is with no per-model default derivation when omitted.
+        /// Enable extended thinking with this token budget (must be below the per-turn max tokens). A
+        /// raw token count, not pi's own `--thinking <level>` (off/minimal/low/medium/high/xhigh) — see
+        /// `--reasoning-effort` for that portable level instead. `serve`'s identical flag; unlike
+        /// `serve`, `run` has no thinking-level cycling, so this is applied as-is with no per-model
+        /// default derivation when omitted.
         #[arg(long)]
         thinking: Option<u32>,
         /// Reasoning effort for models driven by an effort level rather than a token budget (OpenAI
         /// reasoning models via `reasoning_effort`; Anthropic adaptive-thinking models via
-        /// `output_config.effort`). One of minimal/low/medium/high/xhigh. Ignored by models that take
-        /// neither shape. Falls back to `AI_AGENT_REASONING_EFFORT`, then the stored
-        /// `agent settings --default-reasoning-effort` default (Fix 2 — pi-parity gap: previously the
-        /// only numeric/string CLI tunable with no persisted-default fallback at all), before finally
-        /// leaving it unset. `serve`'s identical flag.
+        /// `output_config.effort`). One of minimal/low/medium/high/xhigh — see `--thinking` for a raw
+        /// token-budget override instead. Ignored by models that take neither shape. Falls back to
+        /// `AI_AGENT_REASONING_EFFORT`, then the stored `agent settings --default-reasoning-effort`
+        /// default (Fix 2 — pi-parity gap: previously the only numeric/string CLI tunable with no
+        /// persisted-default fallback at all), before finally leaving it unset. `serve`'s identical flag.
         #[arg(long, env = "AI_AGENT_REASONING_EFFORT", value_parser = parse_reasoning_effort)]
         reasoning_effort: Option<agent_core::ReasoningEffort>,
         /// Sampling temperature. Omitted (leaving the provider default) unless set. Silently ignored by
@@ -616,6 +394,14 @@ enum Command {
         /// pi-parity feature).
         #[arg(long, env = "AI_AGENT_BLOCK_IMAGES", default_value_t = false)]
         block_images: bool,
+        /// Skip `read`'s resize/downscale path for an oversized image entirely, shipping its
+        /// normalized (format-converted, if needed) bytes as-is regardless of size or pixel
+        /// dimensions — pi's `ImageSettings.autoResize` (default enabled) inverted, matching this
+        /// codebase's `--no-x` convention for negating an on-by-default behavior (`--no-compaction`,
+        /// `--no-skills`, ...). Falls back to the persisted `agent settings --image-auto-resize`
+        /// default when not explicitly given (Task #4, pi-parity feature).
+        #[arg(long, env = "AI_AGENT_NO_IMAGE_AUTO_RESIZE", default_value_t = false)]
+        no_image_auto_resize: bool,
         /// Default `bash` command timeout (ms) when the model omits `timeout_ms`. Defaults to 1,800,000
         /// (30 minutes). `serve`'s identical flag.
         #[arg(long, env = "AI_AGENT_BASH_TIMEOUT_MS")]
@@ -851,15 +637,17 @@ enum Command {
         /// Use the 1-hour prompt-cache TTL (vs 5 minutes); helps when turns are spaced out.
         #[arg(long, default_value_t = false)]
         cache_long: bool,
-        /// Enable extended thinking with this token budget (must be below the per-turn max tokens).
+        /// Enable extended thinking with this token budget (must be below the per-turn max tokens). A
+        /// raw token count, not pi's own `--thinking <level>` (off/minimal/low/medium/high/xhigh) — see
+        /// `--reasoning-effort` for that portable level instead.
         #[arg(long)]
         thinking: Option<u32>,
         /// Reasoning effort for models driven by an effort level rather than a token budget (OpenAI
         /// reasoning models via `reasoning_effort`; Anthropic adaptive-thinking models via
-        /// `output_config.effort`). One of minimal/low/medium/high/xhigh. Ignored by models that take
-        /// neither shape. Falls back to `AI_AGENT_REASONING_EFFORT`, then the stored
-        /// `agent settings --default-reasoning-effort` default, before finally leaving it unset. `run`'s
-        /// identical flag.
+        /// `output_config.effort`). One of minimal/low/medium/high/xhigh — see `--thinking` for a raw
+        /// token-budget override instead. Ignored by models that take neither shape. Falls back to
+        /// `AI_AGENT_REASONING_EFFORT`, then the stored `agent settings --default-reasoning-effort`
+        /// default, before finally leaving it unset. `run`'s identical flag.
         #[arg(long, env = "AI_AGENT_REASONING_EFFORT", value_parser = parse_reasoning_effort)]
         reasoning_effort: Option<agent_core::ReasoningEffort>,
         /// Sampling temperature. Omitted (leaving the provider default) unless set. Silently ignored by
@@ -1118,6 +906,15 @@ enum Command {
         /// (images allowed).
         #[arg(long, default_value_t = false)]
         clear_block_images: bool,
+        /// Set the stored default for image auto-resize (used when `--no-image-auto-resize` isn't
+        /// explicitly passed on a given `run` invocation) — Task #4 (pi-parity feature). `false`
+        /// behaves as if `--no-image-auto-resize` were always given.
+        #[arg(long)]
+        image_auto_resize: Option<bool>,
+        /// Clear the stored default for image auto-resize, reverting to `run`'s own built-in default
+        /// (resize enabled).
+        #[arg(long, default_value_t = false)]
+        clear_image_auto_resize: bool,
         /// Set a persisted thinking-token-budget override for one reasoning-effort level —
         /// `<effort>=<tokens>` (e.g. `high=40000`), one of minimal/low/medium/high/xhigh — Task #36
         /// (pi-parity feature). Repeatable; consulted by `run` in place of the built-in
@@ -1383,6 +1180,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             retry_base_delay_ms,
             idle_timeout_ms,
             block_images,
+            no_image_auto_resize,
             bash_timeout_ms,
             bash_shell_path,
             bash_command_prefix,
@@ -1432,6 +1230,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 retry_base_delay_ms,
                 idle_timeout_ms,
                 block_images,
+                no_image_auto_resize,
                 bash_timeout_ms,
                 bash_shell_path,
                 bash_command_prefix,
@@ -1565,18 +1364,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Captured before either variable is shadowed by its own fallback resolution below. Same
             // convention as `run_task`'s identical `model_explicit`, just below in this file.
             let model_explicit = model.is_some();
-            let reasoning_effort_explicit = reasoning_effort.is_some();
+            let mut reasoning_effort_explicit = reasoning_effort.is_some();
             let resolved_model = model
                 .or_else(|| stored_settings.get().default_model.clone())
                 .unwrap_or_else(|| DEFAULT_MODEL.to_string());
             // Fix 10 (pi-parity feature): `run`'s identical resolution — see that call site's doc
             // comment for why this must happen before `resolve_gateway_credential` below.
-            let resolved_model = serve::resolve_model_id(&resolved_model, serve::available_models())
-                .map_err(|e| format!("--model {resolved_model:?}: {e}"))?;
-            // The one further fallback tier below `--key`/`AI_AGENT_KEY`: an inferred, stored OAuth
-            // subscription login for whichever provider `resolved_model` implies. See
-            // `resolve_gateway_credential`'s own doc comment.
-            let key = resolve_gateway_credential(key, &resolved_model)?;
+            let (resolved_model, model_thinking_level) =
+                serve::resolve_model_id(&resolved_model, serve::available_models())
+                    .map_err(|e| format!("--model {resolved_model:?}: {e}"))?;
+            // Unlike `run_task` below, `serve`'s `key` is NOT resolved into a `GatewayCredential` here:
+            // `resolve_gateway_credential` is keyed on the model, and this process's *actual* starting
+            // model isn't final yet — a reattached `--session`/`--continue` session may still override
+            // `resolved_model` with its own last-recorded one (`ServeConfig::model_explicit`'s anti-bleed
+            // check, applied inside `serve()`), and `set_model`/`cycle_model` can change it again at any
+            // point after that. `serve()` itself calls `resolve_gateway_credential` — fresh, keyed off
+            // whichever model is actually active — at startup and again on every runtime model switch
+            // (see `serve::build_gateway_client`), so only the raw `--key`/`AI_AGENT_KEY` value is passed
+            // through here, unresolved.
+            // Fix 2 (pi-parity gap): a `:<level>` suffix on `--model` (e.g. `--model sonnet:high`) sets
+            // the reasoning effort for this invocation exactly as if `--reasoning-effort` had been
+            // passed directly — but only when the operator didn't already pass that flag explicitly,
+            // which always wins outright. Counts as explicit from here on: the anti-bleed check above
+            // this block's own doc comment mentions must prefer this operator-requested depth over a
+            // reattached session's last-recorded one, same as an explicit `--reasoning-effort` would.
+            let mut reasoning_effort = reasoning_effort;
+            if !reasoning_effort_explicit {
+                if let Some(level) = model_thinking_level {
+                    reasoning_effort = level.reasoning_effort();
+                    reasoning_effort_explicit = true;
+                }
+            }
             // Fix 2 (pi-parity gap): `run`'s identical stored-default fallback for `--reasoning-effort`
             // — see that call site's doc comment.
             let reasoning_effort = reasoning_effort.or_else(|| {
@@ -1807,6 +1625,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             clear_default_reasoning_effort,
             block_images,
             clear_block_images,
+            image_auto_resize,
+            clear_image_auto_resize,
             thinking_budget,
             clear_thinking_budget,
         } => {
@@ -1823,6 +1643,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 || clear_default_reasoning_effort
                 || block_images.is_some()
                 || clear_block_images
+                || image_auto_resize.is_some()
+                || clear_image_auto_resize
                 || !thinking_budget.is_empty()
                 || !clear_thinking_budget.is_empty();
             if model.is_some() || clear_model {
@@ -1844,6 +1666,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             if block_images.is_some() || clear_block_images {
                 store.set_block_images(if clear_block_images { None } else { block_images })?;
+            }
+            if image_auto_resize.is_some() || clear_image_auto_resize {
+                store.set_image_auto_resize(if clear_image_auto_resize {
+                    None
+                } else {
+                    image_auto_resize
+                })?;
             }
             for kv in &thinking_budget {
                 let (effort, tokens) = kv
@@ -1898,6 +1727,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     None => "(not set)",
                 }
             );
+            println!(
+                "image_auto_resize: {}",
+                match s.image_auto_resize {
+                    Some(true) => "true",
+                    Some(false) => "false",
+                    None => "(not set)",
+                }
+            );
             match &s.thinking_budget_overrides {
                 Some(overrides) if !overrides.is_empty() => {
                     let rendered = overrides
@@ -1940,15 +1777,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // there's no live `Agent`/`ToolRegistry` here to pull either from — and the session file
             // itself records neither the exact system prompt text nor which `--tools`/`--exclude-tools`
             // filter (if any) a past run used, so reconstructing either would mean fabricating data
-            // that may not match what actually ran. `usage: None` for the same reason `sess`'s own
-            // token counters are never persisted/restored across a process restart (only
-            // `last_input_tokens` is, for compaction — see `SessionStore::open`) — a bare zero would
-            // misrepresent unknown as "no usage at all".
+            // that may not match what actually ran. Usage totals are different: Fix 6 (pi-parity gap):
+            // `sess`'s own running token counters (`input_tokens`/etc.) are never persisted/restored
+            // across a process restart, but they're fully reconstructable by summing each message's own
+            // `usage` (`serve::message_export_usage_totals` — the same computation `serve`'s
+            // `export_html` RPC and `run --export` derive their own totals from, one layer up), which
+            // *is* right here in `sess.messages` — previously this passed `usage: None` unconditionally,
+            // the one of the three export entry points that silently omitted the line instead.
             let path = beyond_ai_agent::export::export_html_full(
                 store.meta(),
                 &sess.messages,
                 &branches,
-                None,
+                Some(beyond_ai_agent::serve::message_export_usage_totals(&sess)),
                 store.export_events(),
                 None,
                 None,
@@ -2069,7 +1909,7 @@ async fn read_file_refs_with_home(
         }
         if looks_like_image(&path) {
             let path_str = path.to_string_lossy().into_owned();
-            let out = tools::read::Read
+            let out = tools::read::Read::default()
                 .run(serde_json::json!({ "path": path_str }))
                 .await
                 .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
@@ -2398,6 +2238,7 @@ async fn run_task(
     retry_base_delay_ms: Option<u64>,
     idle_timeout_ms: Option<u64>,
     block_images: bool,
+    no_image_auto_resize: bool,
     bash_timeout_ms: Option<u64>,
     bash_shell_path: Option<String>,
     bash_command_prefix: Option<String>,
@@ -2482,22 +2323,18 @@ async fn run_task(
     let gateway = gateway_url
         .or_else(|| stored_settings.get().default_gateway_url.clone())
         .unwrap_or_else(|| DEFAULT_GATEWAY.to_string());
-    // Fix 2 (pi-parity gap): `--reasoning-effort` previously had no persisted stored-default fallback at
-    // all, unlike `default_model`/`default_gateway_url`/`default_session_dir` — same precedence tier
-    // (explicit flag, already resolved against `AI_AGENT_REASONING_EFFORT` by clap, then this stored
-    // setting, then finally left unset).
-    let reasoning_effort = reasoning_effort.or_else(|| {
-        stored_settings
-            .get()
-            .default_reasoning_effort
-            .as_deref()
-            .and_then(|s| parse_reasoning_effort(s).ok())
-    });
     // Task #26 (pi-parity feature): an explicit `--block-images` always wins; otherwise fall back to a
     // persisted `agent settings --block-images` default before finally defaulting to images allowed —
     // same "explicit flag, then stored setting, then built-in default" precedence every other
     // `stored_settings`-backed fallback here follows.
     let block_images = block_images || stored_settings.get().block_images.unwrap_or(false);
+    // Task #4 (pi-parity feature): same "explicit flag, then stored setting, then built-in default"
+    // precedence as `block_images` above, adapted for a negating `--no-x` flag: an explicit
+    // `--no-image-auto-resize` always forces it off; otherwise fall back to the persisted
+    // `agent settings --image-auto-resize` default; otherwise resize stays on (pi's own
+    // `ImageSettings.autoResize` default).
+    let image_auto_resize =
+        !no_image_auto_resize && stored_settings.get().image_auto_resize.unwrap_or(true);
     // Whether the operator explicitly passed `--model`, as opposed to `run` falling back to a stored
     // default or `DEFAULT_MODEL` — the distinction a reopened `--session`/`--continue` needs below to
     // know whether to keep going on the model the session was actually last driven on instead of
@@ -2514,10 +2351,33 @@ async fn run_task(
     // itself all key off the *resolved* id, so this must happen before `resolve_gateway_credential`
     // below. An ambiguous partial match fails the whole invocation clearly (naming every candidate)
     // rather than guessing; a genuinely unrecognized id (no partial match at all) is forwarded
-    // unchanged — see `serve::resolve_model_id`'s own doc comment.
-    let model = serve::resolve_model_id(&model, serve::available_models())
+    // unchanged — see `serve::resolve_model_id`'s own doc comment. Fix 2 (pi-parity gap): `model` may
+    // also carry a trailing `:<level>` suffix (e.g. `sonnet:high`, pi's own `--model
+    // <pattern>:<thinking-level>` shorthand) — `resolve_model_id` returns it separately, applied to
+    // `reasoning_effort` just below.
+    let (model, model_thinking_level) = serve::resolve_model_id(&model, serve::available_models())
         .map_err(|e| format!("--model {model:?}: {e}"))?;
     let key = resolve_gateway_credential(key, &model)?;
+    // Fix 2 (pi-parity gap): `--reasoning-effort` previously had no persisted stored-default fallback at
+    // all, unlike `default_model`/`default_gateway_url`/`default_session_dir`. Precedence, in order: an
+    // explicit `--reasoning-effort` flag; else a `--model <pattern>:<level>` suffix (this invocation's
+    // own model-scoped request, same standing as the flag itself — see `model_thinking_level` above; a
+    // `:off` suffix resolves no `ReasoningEffort` here, same as `--reasoning-effort` itself having no
+    // "off" value); else the stored setting; else — Fix 1 (pi-parity gap) — pi's own "medium" default
+    // (`DEFAULT_THINKING_LEVEL`, `packages/coding-agent/src/core/defaults.ts`) whenever the model
+    // supports reasoning at all, so a bare invocation with no flags doesn't silently wire-disable
+    // thinking the way leaving this `None` does (see `serve::default_reasoning_effort_for_model`'s own
+    // doc comment) — finally `None` for a model with no reasoning mechanism to default at all.
+    let reasoning_effort = reasoning_effort
+        .or_else(|| model_thinking_level.and_then(|l| l.reasoning_effort()))
+        .or_else(|| {
+            stored_settings
+                .get()
+                .default_reasoning_effort
+                .as_deref()
+                .and_then(|s| parse_reasoning_effort(s).ok())
+        })
+        .or_else(|| serve::default_reasoning_effort_for_model(&model));
 
     // Computed once and reused below (rather than called again inside the warning check) — it's a
     // filesystem walk (`has_trust_gated_resources`'s own doc comment), not free.
@@ -2571,10 +2431,11 @@ async fn run_task(
         beyond_ai_agent::prompts::discover(&cwd, project_trusted, &extra_prompt_template_paths)
     };
     timing.mark("discover skills/prompt templates");
-    let mut registry = tools::default_registry_with_prefix(
+    let mut registry = tools::default_registry_with_prefix_and_image_auto_resize(
         bash_timeout_ms,
         bash_shell_path.as_deref(),
         bash_command_prefix.as_deref(),
+        image_auto_resize,
     );
     tools::apply_filter(
         &mut registry,
@@ -2790,10 +2651,8 @@ async fn run_task(
     timing.print();
 
     let mut client = match key {
-        serve::GatewayCredential::Static(key) => GatewayClient::new(gateway, key)?,
-        serve::GatewayCredential::Oauth(source) => {
-            GatewayClient::with_credential_source(gateway, source)?
-        }
+        GatewayCredential::Static(key) => GatewayClient::new(gateway, key)?,
+        GatewayCredential::Oauth(source) => GatewayClient::with_credential_source(gateway, source)?,
     }
     .with_retry(
         retry_max_retries.unwrap_or(agent_core::client::MAX_RETRIES),
@@ -3058,27 +2917,6 @@ mod tests {
     use agent_core::mock::{MockTransport, turn};
 
     #[test]
-    fn copilot_endpoint_path_strips_v1_for_openai_wire_dialects_but_not_anthropic() {
-        // pi-parity fix: GitHub Copilot's OpenAI-wire endpoints omit the `/v1` prefix the dialect's
-        // own default `endpoint_path()` carries (pi's own SDKs set `baseURL: model.baseUrl` with no
-        // `/v1` in it, then the vendor SDK appends its fixed relative path) — only the Anthropic-wire
-        // endpoint matches the dialect default verbatim (the Anthropic SDK's default `baseURL` has no
-        // version segment at all, so it always appends `/v1/messages` itself).
-        assert_eq!(
-            copilot_endpoint_path(agent_core::dialect::Dialect::Anthropic),
-            "/v1/messages"
-        );
-        assert_eq!(
-            copilot_endpoint_path(agent_core::dialect::Dialect::OpenAi),
-            "/chat/completions"
-        );
-        assert_eq!(
-            copilot_endpoint_path(agent_core::dialect::Dialect::OpenAiResponses),
-            "/responses"
-        );
-    }
-
-    #[test]
     fn resolve_prompt_input_reads_an_existing_files_contents() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("prompt.txt");
@@ -3106,6 +2944,32 @@ mod tests {
             resolve_prompt_input(dir.path().to_str().unwrap()),
             dir.path().to_str().unwrap()
         );
+    }
+
+    #[test]
+    fn thinking_and_reasoning_effort_help_text_cross_reference_each_other() {
+        // Fix 3 (pi-parity, low priority): beyond's `--thinking` (a raw token-budget override) and
+        // pi's own `--thinking <level>` (off/minimal/low/medium/high/xhigh) share a name but mean
+        // different things — beyond's portable-level equivalent is `--reasoning-effort`. No behavior
+        // change here, just making the naming collision self-explanatory in `--help`.
+        use clap::CommandFactory;
+        let help = Cli::command().render_long_help().to_string();
+        for sub in ["run", "serve"] {
+            let mut cmd = Cli::command()
+                .get_subcommands()
+                .find(|c| c.get_name() == sub)
+                .unwrap_or_else(|| panic!("no {sub} subcommand in: {help}"))
+                .clone();
+            let sub_help = cmd.render_long_help().to_string();
+            assert!(
+                sub_help.contains("see `--reasoning-effort`"),
+                "{sub} --thinking help must reference --reasoning-effort: {sub_help}"
+            );
+            assert!(
+                sub_help.contains("see `--thinking`"),
+                "{sub} --reasoning-effort help must reference --thinking: {sub_help}"
+            );
+        }
     }
 
     #[test]

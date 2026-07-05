@@ -11,6 +11,71 @@ use common::{
 use serde_json::{Value, json};
 
 #[test]
+fn serve_get_session_stats_reports_the_same_field_set_idle_or_mid_turn() {
+    // Fix 8 (pi-parity gap): the busy-mode arm used to send the raw `LiveStats::snapshot()` verbatim
+    // (only steps/token counters/pending_tool_ids), dropping session_id/session_file and the whole
+    // message-type breakdown/context_usage entirely; the idle arm never carried session_id/session_file
+    // either. Values may differ (busy fields not derivable mid-run are `null`), but the *set* of top-level
+    // keys must not.
+    use std::collections::BTreeSet;
+    use std::time::Duration;
+
+    fn keys(v: &Value) -> BTreeSet<String> {
+        v.as_object()
+            .unwrap_or_else(|| panic!("expected an object: {v:#?}"))
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![
+        turn_tool_use("toolu_shape", "bash", &json!({ "command": "sleep 0.5" }).to_string()),
+        turn_text("done"),
+    ]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "get_session_stats", "id": "idle" })).unwrap();
+    stdin.flush().unwrap();
+    let idle_frames = read_until_response(&mut stdout, "get_session_stats");
+    let idle_keys = keys(&idle_frames.last().unwrap()["data"]);
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "go" })).unwrap();
+    stdin.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(150)); // mid the tool call's own `sleep 0.5`
+    writeln!(stdin, "{}", json!({ "type": "get_session_stats", "id": "busy" })).unwrap();
+    stdin.flush().unwrap();
+
+    let frames = read_until_response(&mut stdout, "prompt");
+    drop(stdin);
+    child.wait().unwrap();
+
+    let busy_resp = frames
+        .iter()
+        .find(|f| f["command"] == "get_session_stats" && f["id"] == "busy")
+        .unwrap_or_else(|| panic!("no busy get_session_stats response: {frames:#?}"));
+    assert_eq!(busy_resp["success"], true, "{busy_resp:#?}");
+    let busy_keys = keys(&busy_resp["data"]);
+
+    assert_eq!(
+        idle_keys, busy_keys,
+        "get_session_stats must report the same field set idle or mid-turn"
+    );
+    assert!(
+        busy_resp["data"]["session_id"].is_string(),
+        "got: {busy_resp:#?}"
+    );
+    assert!(
+        busy_resp["data"]["context_usage"].is_null(),
+        "not derivable mid-run, but must still be present: {busy_resp:#?}"
+    );
+}
+
+#[test]
 fn serve_get_state_and_get_session_stats_answer_live_during_a_prompt() {
     use std::time::Duration;
 
@@ -136,12 +201,14 @@ fn serve_get_state_reports_runtime_settings_and_queue_depth() {
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
-    // Defaults, nothing queued yet.
+    // Defaults, nothing queued yet. Fix 1 (pi-parity gap): `claude-test` (this test's model, via
+    // `serve_cmd`) supports reasoning, so a fresh process with no `--reasoning-effort` now starts at
+    // pi's own "medium" default rather than "off".
     writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
     stdin.flush().unwrap();
     let frames = read_until_response(&mut stdout, "get_state");
     let data = &frames.last().unwrap()["data"];
-    assert_eq!(data["thinking_level"], "off", "{data:#?}");
+    assert_eq!(data["thinking_level"], "medium", "{data:#?}");
     assert_eq!(data["auto_compaction"], true, "{data:#?}");
     assert_eq!(data["auto_retry"], true, "{data:#?}");
     assert_eq!(data["steering_mode"], "one_at_a_time", "{data:#?}");
@@ -177,6 +244,66 @@ fn serve_get_state_reports_runtime_settings_and_queue_depth() {
         data["pending_messages"], 2,
         "two queued follow-ups: {data:#?}"
     );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_steer_and_follow_up_expose_the_actual_queued_text_not_just_a_count() {
+    // Fix 5 (pi-parity gap): `pending_messages`/a bare `{success:true}` ack told a client *how many*
+    // messages were queued but never *what* — pi's own `queue_update` event carries the real
+    // `steering`/`followUp` string arrays. No new unsolicited event here (see `steering.rs`'s own
+    // module doc for why that's a deliberate gap); instead the content rides along on the `steer`/
+    // `follow_up` handlers' own ack, and on `get_state`, both proven here.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "follow_up", "message": "do the next thing" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "follow_up");
+    let data = &frames.last().unwrap()["data"];
+    assert_eq!(
+        data["follow_up_queue"],
+        json!(["do the next thing"]),
+        "the ack itself must carry the queued text, not just success:true: {data:#?}"
+    );
+    assert_eq!(data["steer_queue"], json!([]), "got: {data:#?}");
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "steer", "message": "actually, redirect" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "steer");
+    let data = &frames.last().unwrap()["data"];
+    assert_eq!(data["steer_queue"], json!(["actually, redirect"]), "got: {data:#?}");
+    assert_eq!(
+        data["follow_up_queue"],
+        json!(["do the next thing"]),
+        "the steer ack must also report the still-queued follow-up: {data:#?}"
+    );
+
+    // A third-party client that didn't push anything itself must still see the same content via
+    // `get_state` — not just the pusher, via its own ack.
+    writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_state");
+    let data = &frames.last().unwrap()["data"];
+    assert_eq!(data["steer_queue"], json!(["actually, redirect"]), "got: {data:#?}");
+    assert_eq!(data["follow_up_queue"], json!(["do the next thing"]), "got: {data:#?}");
 
     drop(stdin);
     child.wait().unwrap();

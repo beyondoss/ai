@@ -364,13 +364,17 @@ enum Entry {
         parent_id: Option<String>,
         level: String,
     },
-    /// A session rename — see [`SessionStore::set_title`]. Unlike `ModelChange`/`ThinkingLevelChange`,
-    /// this isn't anchored/branch-scoped: a rename applies to the whole session regardless of which
-    /// branch is active, so the most recent one *anywhere in the file* wins (matching pi's own
-    /// `session_info` entries) rather than being looked up per tree point. `id`/`parent_id` still chain
-    /// like every other entry, purely for on-disk provenance/ordering — neither is consulted when
-    /// resolving the effective title. Replaces the old behavior of rewriting the whole file (with every
-    /// message in it) just to update the header's `title` field.
+    /// A session rename — see [`SessionStore::set_title`]. For the *live* session's own displayed
+    /// title (`meta.title`), this isn't anchored/branch-scoped the way `ModelChange`/`ThinkingLevelChange`
+    /// are: a rename applies to the whole session regardless of which branch is active, so the most
+    /// recent one *anywhere in the file* wins (matching pi's own `session_info` entries) rather than
+    /// being looked up per tree point. `parent_id` still chains like every other entry, purely for
+    /// on-disk provenance/ordering, for that whole-file resolution — but (pass 15 pi-parity fix) it *is*
+    /// separately consulted, anchor-keyed exactly like `ModelChange`/`ThinkingLevelChange`, by
+    /// [`SessionStore::title_at_or_root`] — what a fork's own header resolves its title from, so a
+    /// rename recorded past the fork point (on any branch) doesn't leak into a branch that never
+    /// actually had that name. Replaces the old behavior of rewriting the whole file (with every message
+    /// in it) just to update the header's `title` field.
     TitleChange {
         id: String,
         parent_id: Option<String>,
@@ -665,6 +669,16 @@ pub struct SessionStore {
     /// Same idea as `model_changes`, for the portable thinking level (see [`Entry::ThinkingLevelChange`]/
     /// [`Self::record_thinking_level_change`]/[`Self::thinking_level_at`]).
     level_changes: HashMap<Option<String>, String>,
+    /// The title in effect immediately after each message id (`None` = before the session's first
+    /// message) — the last [`Entry::TitleChange`] anchored there, if any, keyed the same way as
+    /// `model_changes`/`level_changes`. `Some(None)` records an explicit clear (a rename that sanitized
+    /// to empty) actually in effect at that anchor, distinct from no entry at all ("nothing ever
+    /// recorded reaching this point"). Unlike `model_changes`/`level_changes`, this is consulted only
+    /// for [`SessionRepo::fork`]/`fork_from_path`/`fork_at_entry_prefix`'s path-scoped resolution (pass
+    /// 15 pi-parity fix, [`Self::title_at_or_root`]) — the *live* session's own displayed title
+    /// (`meta.title`, restored by [`Self::open`]) still resolves whole-file-latest, matching pi's own
+    /// `getSessionName` scanning every entry regardless of branch.
+    title_changes: HashMap<Option<String>, Option<String>>,
     /// The label currently set on each target id, by that id — the last (by file order)
     /// [`Entry::Label`] seen for it, with a `label: None` entry removing it from this map entirely
     /// (last-write-wins). See [`Self::set_label`]/[`Self::get_label`].
@@ -733,6 +747,7 @@ impl SessionStore {
             branch_summary_details: HashMap::new(),
             model_changes: HashMap::new(),
             level_changes: HashMap::new(),
+            title_changes: HashMap::new(),
             labels: HashMap::new(),
             compactions: HashMap::new(),
             events: Vec::new(),
@@ -756,6 +771,7 @@ impl SessionStore {
         let mut branch_summary_details: HashMap<String, BranchSummaryDetails> = HashMap::new();
         let mut model_changes: HashMap<Option<String>, String> = HashMap::new();
         let mut level_changes: HashMap<Option<String>, String> = HashMap::new();
+        let mut title_changes: HashMap<Option<String>, Option<String>> = HashMap::new();
         let mut labels: HashMap<String, String> = HashMap::new();
         let mut compactions: HashMap<String, CompactionRecord> = HashMap::new();
         let mut events: Vec<ExportEvent> = Vec::new();
@@ -917,13 +933,21 @@ impl SessionStore {
                     events.push(ExportEvent::ThinkingLevelChange(level.clone()));
                     level_changes.insert(parent_id, level);
                 }
-                // Whole-session-scoped, not anchored to `parent_id` — the most recent one in file order
-                // wins, regardless of tree position. `meta` is always `Some` by the time a `TitleChange`
-                // is read, since the header entry is always first.
-                Ok(Entry::TitleChange { title, .. }) => {
+                // `meta.title` (the live session's own displayed title) is whole-session-scoped, not
+                // anchored to `parent_id` — the most recent one in file order wins, regardless of tree
+                // position, matching pi's own `getSessionName` scanning every entry regardless of
+                // branch. `meta` is always `Some` by the time a `TitleChange` is read, since the header
+                // entry is always first.
+                //
+                // `title_changes` (pass 15 pi-parity fix) *is* keyed by `parent_id`, same as
+                // `model_changes`/`level_changes` — consulted separately by `title_at_or_root` for a
+                // fork's own path-scoped resolution (see that method's doc comment).
+                Ok(Entry::TitleChange { parent_id, title, .. }) => {
+                    let resolved = title_or_clear(title);
                     if let Some(m) = &mut meta {
-                        m.title = title_or_clear(title);
+                        m.title = resolved.clone();
                     }
+                    title_changes.insert(parent_id, resolved);
                 }
                 // Never redirects `tip` — a pure lookup record keyed directly by `target_id` (unlike
                 // `model_changes`/`level_changes`, which are keyed by *anchor* and apply to descendants;
@@ -1034,6 +1058,7 @@ impl SessionStore {
                 branch_summary_details,
                 model_changes,
                 level_changes,
+                title_changes,
                 labels,
                 compactions,
                 events,
@@ -1364,28 +1389,40 @@ impl SessionStore {
         // just silently vanished. Carried forward instead, in its original relative position.
         let kept_suffix_ids: Vec<String> = self.active[folded_ids.len()..].to_vec();
 
-        // Resolve the model/thinking-level effective at the old tip being folded away, before it's
-        // gone. A change anchored exactly at the tip takes effect for whatever comes *next* (see
+        // Resolve the model/thinking-level/title effective at the old tip being folded away, before
+        // it's gone. A change anchored exactly at the tip takes effect for whatever comes *next* (see
         // `record_model_change`'s anchor semantics), so check that anchor first, then fall back to
         // `change_at`'s ancestor walk (which deliberately excludes the query id's own anchor — the
         // opposite of what's wanted here). The new active path built below starts a fresh, detached
         // chain, so `path_from_root` from any of its ids can never reach back into `model_changes`/
-        // `level_changes` entries anchored on the now-folded chain — without re-anchoring the
-        // already-resolved value onto the new chain's `None` baseline (the same mechanism a change
-        // recorded before the session's very first message already uses), a model/thinking-level
-        // switch made before this compaction becomes permanently unrecoverable.
+        // `level_changes`/`title_changes` entries anchored on the now-folded chain — without
+        // re-anchoring the already-resolved value onto the new chain's `None` baseline (the same
+        // mechanism a change recorded before the session's very first message already uses), a
+        // model/thinking-level switch (or, pass 15 pi-parity fix, a title resolved for a later fork) made
+        // before this compaction becomes permanently unrecoverable.
         let old_tip = self.active.last().cloned();
         let effective_model = old_tip.as_deref().and_then(|tip| {
             self.model_changes
                 .get(&Some(tip.to_string()))
                 .cloned()
-                .or_else(|| change_at(&self.nodes, &self.model_changes, tip).map(str::to_string))
+                .or_else(|| change_at(&self.nodes, &self.model_changes, tip).cloned())
         });
         let effective_level = old_tip.as_deref().and_then(|tip| {
             self.level_changes
                 .get(&Some(tip.to_string()))
                 .cloned()
-                .or_else(|| change_at(&self.nodes, &self.level_changes, tip).map(str::to_string))
+                .or_else(|| change_at(&self.nodes, &self.level_changes, tip).cloned())
+        });
+        // Outer `Option` here means "something was recorded reaching this point" (mirroring
+        // `effective_model`/`effective_level`'s own terseness discipline just below — nothing written
+        // when nothing changed); the inner `Option<String>` is the title itself, `None` recording an
+        // explicit clear that must survive the re-anchor exactly like a real title would, rather than
+        // silently falling back to whatever rename preceded it on the folded chain.
+        let effective_title: Option<Option<String>> = old_tip.as_deref().and_then(|tip| {
+            self.title_changes
+                .get(&Some(tip.to_string()))
+                .cloned()
+                .or_else(|| change_at(&self.nodes, &self.title_changes, tip).cloned())
         });
 
         let mut new_nodes: Vec<(String, Node)> =
@@ -1493,6 +1530,20 @@ impl SessionStore {
                 },
             )?;
         }
+        // Same re-anchoring, for a resolved title (pass 15 pi-parity fix) — including an explicit
+        // clear (`None`, written as an empty string per `title_or_clear`'s own round-trip), which must
+        // survive the re-anchor exactly like a real title would rather than reverting to whatever
+        // earlier rename preceded it on the folded chain.
+        if let Some(title) = &effective_title {
+            write_line(
+                &mut buf,
+                &Entry::TitleChange {
+                    id: new_id(),
+                    parent_id: None,
+                    title: title.clone().unwrap_or_default(),
+                },
+            )?;
+        }
         for (id, node) in &new_nodes {
             // `new_nodes` can now hold either shape: a real message, or a custom entry (Track C-M2)
             // carried forward from the kept suffix — round-tripped through its own original `Entry`
@@ -1549,6 +1600,12 @@ impl SessionStore {
             self.events
                 .push(ExportEvent::ThinkingLevelChange(level.clone()));
             self.level_changes.insert(None, level);
+        }
+        // No `ExportEvent` push here — `TitleChange` never participates in that stream even on the
+        // ordinary `set_title` path (see its doc comment), so re-anchoring one during compaction stays
+        // consistent with that.
+        if let Some(title) = effective_title {
+            self.title_changes.insert(None, title);
         }
         Ok(())
     }
@@ -2111,12 +2168,12 @@ impl SessionStore {
     /// branch. `None` means no change was ever recorded reaching this point — the caller should keep
     /// whatever model is already active (there's nothing branch-specific to restore).
     pub fn model_at(&self, target_id: &str) -> Option<&str> {
-        change_at(&self.nodes, &self.model_changes, target_id)
+        change_at(&self.nodes, &self.model_changes, target_id).map(String::as_str)
     }
 
     /// Same idea as [`Self::model_at`], for the portable thinking level.
     pub fn thinking_level_at(&self, target_id: &str) -> Option<&str> {
-        change_at(&self.nodes, &self.level_changes, target_id)
+        change_at(&self.nodes, &self.level_changes, target_id).map(String::as_str)
     }
 
     /// The model recorded as active at the tree's own root (before any message) — the base case every
@@ -2149,6 +2206,23 @@ impl SessionStore {
             .unwrap_or(&self.meta.model)
     }
 
+    /// The title in effect at `target_id` (or, when `None`, at the tree's own root) — the title
+    /// analogue of [`Self::model_at_or_created`], for the same fork-header use (pass 15 pi-parity fix).
+    /// Unlike model/thinking-level, there's no "session's own creation-time value" to fall back to: a
+    /// title only ever exists because some [`Entry::TitleChange`] recorded one, so a fork landing at a
+    /// point that never saw a rename on its own path — or whose most recent rename on that path
+    /// explicitly cleared the title — simply gets no title at all (`None`), rather than inheriting
+    /// `src.meta.title`'s whole-file-latest value the way this used to work. Matches pi's own
+    /// `createBranchedSession`/`getEntriesToFork`, which only ever copy `session_info` entries
+    /// physically present on the path being forked — a rename recorded on a different branch, or after
+    /// the fork point, was never on that path to begin with.
+    fn title_at_or_root(&self, target_id: Option<&str>) -> Option<&str> {
+        target_id
+            .and_then(|id| change_at(&self.nodes, &self.title_changes, id))
+            .or_else(|| self.title_changes.get(&None))
+            .and_then(|title| title.as_deref())
+    }
+
     /// Set (and persist) the session title — an O(1) append (see [`Entry::TitleChange`]'s doc
     /// comment), not a rewrite of the whole file. A rename used to cost a full rewrite (every message
     /// in the session) just to update the header's `title` field; renaming a long session is now as
@@ -2159,15 +2233,24 @@ impl SessionStore {
     /// corrupt a terminal display. A title that sanitizes to empty explicitly clears the session's
     /// title (mirrors pi's `session_info` handling — "empty names explicitly clear the session title")
     /// rather than persisting a blank string that would render as an empty-but-present title.
+    ///
+    /// Also records the anchor-keyed `title_changes` entry (pass 15 pi-parity fix) that
+    /// [`Self::title_at_or_root`] later resolves a fork's own title from — without this, a fork or
+    /// compaction run against this same still-open store (rather than a freshly reopened one) would see
+    /// an empty `title_changes` and never find this rename, exactly the gap `record_model_change`/
+    /// `record_thinking_level_change` already close for `model_changes`/`level_changes`.
     pub fn set_title(&mut self, title: impl Into<String>) -> std::io::Result<()> {
         let title = sanitize_title(&title.into());
+        let anchor = self.active.last().cloned();
         let entry = Entry::TitleChange {
             id: new_id(),
-            parent_id: self.active.last().cloned(),
+            parent_id: anchor.clone(),
             title: title.clone(),
         };
         append_line(&self.path, &entry)?;
-        self.meta.title = title_or_clear(title);
+        let resolved = title_or_clear(title);
+        self.meta.title = resolved.clone();
+        self.title_changes.insert(anchor, resolved);
         Ok(())
     }
 
@@ -2577,7 +2660,11 @@ impl SessionRepo {
         // a unique prefix, blindly echoing `id` back would persist the *prefix* as `parent` instead of
         // the real full id it resolved to.
         meta.parent = Some(src.meta.id.clone());
-        meta.title = src.meta.title.clone();
+        // Pass 15 (pi-parity fix): the title actually in effect at that same copied prefix's own last
+        // message — not `src.meta.title` (the source's whole-file-latest rename, blindly copied here
+        // previously) — see `title_at_or_root`'s own doc comment for why that matters once a rename has
+        // happened anywhere relative to the fork point.
+        meta.title = src.title_at_or_root(target_id).map(str::to_string);
 
         let mut store = self.create(meta)?;
         let prefix: Vec<Message> = src_session.messages[..upto].to_vec();
@@ -2610,7 +2697,8 @@ impl SessionRepo {
         let model = src.model_at_or_created(target_id).to_string();
         let mut meta = SessionMeta::new(target_cwd.to_string(), model);
         meta.parent = Some(src.meta.id.clone());
-        meta.title = src.meta.title.clone();
+        // Pass 15 (pi-parity fix): same reasoning as `fork`'s identical resolution just above.
+        meta.title = src.title_at_or_root(target_id).map(str::to_string);
 
         let mut store = self.create(meta)?;
         let prefix: Vec<Message> = src_session.messages[..upto].to_vec();
@@ -2729,7 +2817,11 @@ impl SessionRepo {
         // The source's own resolved id, not the caller's raw `id` argument — see `fork`'s identical fix
         // for why: `open_id` now accepts a unique prefix, so `id` itself may not be the real full id.
         meta.parent = Some(src.meta.id.clone());
-        meta.title = src.meta.title.clone();
+        // Pass 15 (pi-parity fix): same reasoning as `fork`'s identical resolution — the title actually
+        // in effect at the resolved fork point, not `src.meta.title`'s whole-file-latest rename.
+        meta.title = src
+            .title_at_or_root(path.last().map(String::as_str))
+            .map(str::to_string);
 
         // Labels are looked up against the *full* path (including any custom entry's id) — a label
         // whose target is a custom entry that then gets filtered out below simply won't be found in
@@ -3417,17 +3509,17 @@ fn append_line(path: &Path, entry: &Entry) -> std::io::Result<()> {
 /// only matters for a hypothetical future caller querying arbitrarily deep into a branch that grew
 /// after a restore — accepted as a documented edge case rather than the fuller (and here unwarranted)
 /// fix of threading these changes through the same per-branch chain messages use.
-fn change_at<'a>(
+fn change_at<'a, V>(
     nodes: &HashMap<String, Node>,
-    changes: &'a HashMap<Option<String>, String>,
+    changes: &'a HashMap<Option<String>, V>,
     target_id: &str,
-) -> Option<&'a str> {
-    let mut last = changes.get(&None).map(String::as_str);
+) -> Option<&'a V> {
+    let mut last = changes.get(&None);
     let path = path_from_root(nodes, Some(target_id));
     let ancestors = path.len().saturating_sub(1); // exclude target_id itself
     for id in &path[..ancestors] {
         if let Some(v) = changes.get(&Some(id.clone())) {
-            last = Some(v.as_str());
+            last = Some(v);
         }
     }
     last
@@ -6365,6 +6457,97 @@ mod tests {
     }
 
     #[test]
+    fn fork_does_not_inherit_a_rename_that_happened_after_the_fork_point() {
+        // Pass 15 pi-parity fix, the title analogue of the Task #18 fix just above:
+        // `SessionRepo::fork`/`fork_at_entry`/`fork_from_path` used to copy `src.meta.title` verbatim
+        // into the new session's own header — always the whole-file *latest* rename, regardless of how
+        // much later it happened relative to the fork point (`Entry::TitleChange` is whole-session-
+        // scoped by design for a *live* session's own displayed title — see that variant's doc comment —
+        // but a fork must resolve path-scoped instead, the same way it already does for
+        // `model`/`thinking_level`).
+        //
+        // Exact repro from the audit: two messages, then a rename (doesn't move the tip), then fork
+        // from message 1 — the new session must NOT carry "Renamed" forward, since that name was chosen
+        // for a completely different, later conversation this branch never actually had.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("first");
+        store.append_new(&session.messages).unwrap();
+        session.user("second");
+        store.append_new(&session.messages).unwrap();
+        store.set_title("Renamed").unwrap();
+        assert_eq!(store.meta().title.as_deref(), Some("Renamed"));
+
+        let session_id = store.meta().id.clone();
+        let (forked, _) = repo.fork(&session_id, 1).unwrap();
+        assert_eq!(
+            forked.meta().title, None,
+            "a fork from before the rename must not inherit a title chosen for a later conversation"
+        );
+    }
+
+    #[test]
+    fn fork_inherits_the_title_in_effect_at_the_fork_point_not_a_later_rename() {
+        // The path-scoped resolution isn't just "always omit the title" — a rename that *was* actually
+        // in effect at the fork point must still carry forward, exactly like `model`/`thinking_level`.
+        //
+        // "second" is a *child* of the first rename's anchor ("first"), so it's the point that
+        // actually observes "Early Name" — same "anchored-at, not before" contract
+        // `fork_resolves_the_updated_model_via_the_tree_not_the_sessions_stale_meta` already exercises
+        // for model: forking exactly at "second" (the second rename's own anchor) must NOT yet observe
+        // "Renamed Later" either, only whatever was already in effect reaching that point.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("first");
+        store.append_new(&session.messages).unwrap();
+        store.set_title("Early Name").unwrap(); // anchored at "first"
+        session.user("second"); // "first"'s child — observes "Early Name"
+        store.append_new(&session.messages).unwrap();
+        store.set_title("Renamed Later").unwrap(); // anchored at "second", not yet observed by "second" itself
+        session.user("third");
+        store.append_new(&session.messages).unwrap();
+
+        let session_id = store.meta().id.clone();
+        let (forked, _) = repo.fork(&session_id, 2).unwrap();
+        assert_eq!(
+            forked.meta().title.as_deref(),
+            Some("Early Name"),
+            "a fork must inherit whatever rename was actually in effect at the fork point, not a \
+             later one"
+        );
+    }
+
+    #[test]
+    fn fork_at_entry_resolves_title_path_scoped_not_whole_file_latest() {
+        // `fork_at_entry_prefix` computes its own path (possibly off the active branch entirely, and
+        // via a different resolution than `fork`'s `upto` count) — a rename recorded after the target
+        // entry must not leak into a fork targeting an earlier point on the same chain.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("a");
+        store.append_new(&session.messages).unwrap();
+        let ids = store.active_ids().to_vec();
+
+        session.user("b");
+        store.append_new(&session.messages).unwrap();
+        store.set_title("Renamed After B").unwrap(); // whole-file-latest, but only ever in effect after "b"
+
+        let session_id = store.meta().id.clone();
+        let (forked, _) = repo.fork_at_entry(&session_id, &ids[0], false).unwrap();
+        assert_eq!(
+            forked.meta().title, None,
+            "forking at a point that predates every rename on its own path must not inherit one made \
+             later on the same chain"
+        );
+    }
+
+    #[test]
     fn switch_active_rejects_unknown_id() {
         let dir = tmpdir();
         let repo = SessionRepo::open(dir.path()).unwrap();
@@ -7786,6 +7969,41 @@ mod tests {
         let reopened_tip = reopened.active_ids().last().unwrap().clone();
         assert_eq!(reopened.model_at(&reopened_tip), Some("gpt-5"));
         assert_eq!(reopened.thinking_level_at(&reopened_tip), Some("high"));
+    }
+
+    #[test]
+    fn rewrite_compacted_preserves_a_title_resolvable_by_a_later_fork() {
+        // Same "detached new chain" gap as
+        // `rewrite_compacted_preserves_the_model_and_thinking_level_active_at_the_old_tip`, now also
+        // closed for `title_changes` (pass 15 pi-parity fix): a rename set before a compaction must
+        // still be resolvable by a fork landing after it — `title_at_or_root` has no public accessor of
+        // its own, so this drives it through its only real consumer, `fork`.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let id = store.meta().id.clone();
+        let mut session = Session::new();
+        session.user("one");
+        store.append_new(&session.messages).unwrap();
+        store.set_title("Pre-Compaction Name").unwrap();
+        session.user("two");
+        session.user("three");
+        store.append_new(&session.messages).unwrap();
+
+        let compacted_messages = vec![Message::user(format!(
+            "{}\n\nrecap",
+            agent_core::compaction::SUMMARY_MARKER
+        ))];
+        store
+            .rewrite_compacted(&compacted_messages, CompactionMeta { tokens_before: 999 })
+            .unwrap();
+
+        let (forked, _) = repo.fork(&id, usize::MAX).unwrap();
+        assert_eq!(
+            forked.meta().title.as_deref(),
+            Some("Pre-Compaction Name"),
+            "a title set before a compaction must remain resolvable by a fork landing after it"
+        );
     }
 
     #[test]

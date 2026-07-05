@@ -4,15 +4,80 @@
 //! `tool_use`/`tool_result`), so the request mapping is nearly an identity and the SSE decoder is a
 //! direct translation of Anthropic's `content_block_*` / `message_*` events.
 
+use std::sync::Arc;
+
 use serde_json::{Map, Value, json};
 
 use super::StreamDecoder;
 use crate::error::{Error, Result};
-use crate::message::{StopReason, StreamEvent, TokenUsage};
+use crate::message::{StopReason, StreamEvent, TokenUsage, ToolDef};
 use crate::transport::{ModelRequest, ToolChoice};
 
+/// Anthropic's OAuth-gated (Claude Pro/Max subscription) endpoint expects to see exactly Claude Code's
+/// own request shape, not just its headers (see `CLAUDE_CODE_BETA`'s doc comment in `client.rs` for why
+/// presenting this tool as Claude Code is a deliberate, user-confirmed choice — applied here to the
+/// body, not a separate decision). Two parts to that shape, both gated on the same `is_oauth` flag
+/// threaded in from `client.rs`: the system prompt is prefixed with Claude Code's own identity sentence
+/// ([`CLAUDE_CODE_IDENTITY`]), and every tool name — advertised in `tools`, replayed in assistant
+/// history, and decoded back out of a live `tool_use` block — is round-tripped through Claude Code's
+/// canonical casing. Mirrors pi's `buildParams`/`convertTools`/`convertMessages`/`fromClaudeCodeName`
+/// (`anthropic-messages.ts:916-931, 949-955, 1111, 592-598`).
+const CLAUDE_CODE_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+/// Claude Code's own canonical tool-name casing — pi's `claudeCodeTools` table
+/// (`anthropic-messages.ts:72-91`; source: https://cchistory.mariozechner.at/data/prompts-2.1.11.md).
+/// A short, hand-maintained list rather than a generated one: it only needs to match Claude Code's own
+/// naming closely enough that Anthropic's OAuth-gated endpoint recognizes the request shape, not to
+/// track Claude Code's tool set exactly — a name with no case-insensitive match here passes through
+/// unchanged.
+const CLAUDE_CODE_TOOLS: &[&str] = &[
+    "Read",
+    "Write",
+    "Edit",
+    "Bash",
+    "Grep",
+    "Glob",
+    "AskUserQuestion",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "KillShell",
+    "NotebookEdit",
+    "Skill",
+    "Task",
+    "TaskOutput",
+    "TodoWrite",
+    "WebFetch",
+    "WebSearch",
+];
+
+/// Canonicalize `name` to Claude Code's own casing when it matches one of [`CLAUDE_CODE_TOOLS`]
+/// case-insensitively, otherwise leave it untouched. Mirrors pi's `toClaudeCodeName`.
+fn to_claude_code_name(name: &str) -> String {
+    CLAUDE_CODE_TOOLS
+        .iter()
+        .find(|cc| cc.eq_ignore_ascii_case(name))
+        .map(|cc| cc.to_string())
+        .unwrap_or_else(|| name.to_string())
+}
+
+/// Reverse of [`to_claude_code_name`]: given a name the model just produced in a live `tool_use` block
+/// (under OAuth, potentially Claude Code's canonical casing rather than ours), find the real advertised
+/// tool whose name matches case-insensitively and use its real casing. Falls back to the incoming name
+/// verbatim if nothing advertised matches (a tool this turn never offered — pass it through rather than
+/// guess). Mirrors pi's `fromClaudeCodeName`.
+fn from_claude_code_name(name: &str, tools: &[ToolDef]) -> String {
+    tools
+        .iter()
+        .find(|t| t.name.eq_ignore_ascii_case(name))
+        .map(|t| t.name.clone())
+        .unwrap_or_else(|| name.to_string())
+}
+
 /// Build the streaming request body. `system` is hoisted to a top-level field (Anthropic keeps it
-/// out of `messages`); `messages` and `tools` serialize straight from the internal model.
+/// out of `messages`); `messages` and `tools` serialize straight from the internal model. `is_oauth`
+/// selects Claude Code's own identity/tool-naming shape (see [`CLAUDE_CODE_IDENTITY`]'s doc comment) —
+/// threaded in from `client.rs`, which already knows whether this credential is a genuine
+/// direct-to-Anthropic OAuth login.
 ///
 /// Three prompt-cache breakpoints are stamped in. An agent loop re-sends an ever-growing prefix —
 /// tools, then system, then the whole prior conversation — on every turn; without caching each turn
@@ -22,7 +87,7 @@ use crate::transport::{ModelRequest, ToolChoice};
 /// anchor that survives Anthropic's ~20-block breakpoint lookback on tool-heavy turns), and roll a
 /// third onto the last message to capture the conversation so far. The TTL is 5 min, or 1 hour when
 /// `cache_long` is set (see [`cache_control`]).
-pub fn build_body(req: &ModelRequest) -> Value {
+pub fn build_body(req: &ModelRequest, is_oauth: bool) -> Value {
     let caps = crate::models::capabilities(&req.model);
     let mut map = Map::new();
     map.insert("model".into(), Value::String(req.model.clone()));
@@ -53,24 +118,36 @@ pub fn build_body(req: &ModelRequest) -> Value {
     downgrade_unsigned_thinking(&mut messages);
     downgrade_unsupported_images(&mut messages, caps.supports_vision);
     encode_tool_result_images(&mut messages);
+    if is_oauth {
+        // Replayed assistant tool_use blocks in history need the same canonical casing the live model
+        // just saw advertised in `tools` below — the stored name is always our own real one (this
+        // dialect's `Decoder` already reverses it back via `from_claude_code_name` at decode time), so
+        // this is a pure forward rename, never conditional on which turn produced the block. Mirrors
+        // pi's `convertMessages` (`anthropic-messages.ts:1111`).
+        canonicalize_tool_use_names(&mut messages);
+    }
     if let Some(cc) = &cc {
         mark_last_block(&mut messages, cc);
     }
     map.insert("messages".into(), messages);
 
-    if let Some(system) = &req.system {
-        // System as a single cached text block — a *dedicated* third breakpoint. Anthropic's
-        // breakpoint lookback only walks back ~20 content blocks; on a tool-heavy turn (N tool_use +
-        // N tool_result blocks) the rolling message breakpoint can fall outside that window, so this
-        // stable anchor keeps the (large, fixed) system prompt a cache read. `no_cache` drops the
-        // breakpoint but keeps the system block itself (still needed on the wire either way).
-        map.insert(
-            "system".into(),
-            match &cc {
-                Some(cc) => json!([{ "type": "text", "text": system, "cache_control": cc }]),
-                None => json!([{ "type": "text", "text": system }]),
-            },
-        );
+    // System as a single cached text block — a *dedicated* third breakpoint. Anthropic's breakpoint
+    // lookback only walks back ~20 content blocks; on a tool-heavy turn (N tool_use + N tool_result
+    // blocks) the rolling message breakpoint can fall outside that window, so this stable anchor keeps
+    // the (large, fixed) system prompt a cache read. `no_cache` drops the breakpoint but keeps the
+    // system block itself (still needed on the wire either way).
+    if is_oauth {
+        // Anthropic's OAuth-gated endpoint requires this exact identity sentence as the *first* system
+        // block — the real system prompt, if any, is appended as a second block, never substituted for
+        // it. Both blocks get the same cache breakpoint pi stamps on each (`anthropic-messages.ts:
+        // 916-931`), not just the last one.
+        let mut system = vec![system_block(CLAUDE_CODE_IDENTITY, &cc)];
+        if let Some(prompt) = &req.system {
+            system.push(system_block(prompt, &cc));
+        }
+        map.insert("system".into(), Value::Array(system));
+    } else if let Some(system) = &req.system {
+        map.insert("system".into(), Value::Array(vec![system_block(system, &cc)]));
     }
     // Anthropic forbids `temperature` alongside extended thinking (thinking requires an implicit
     // temperature of 1) — matches pi's own `!options?.thinkingEnabled` gate (`anthropic-messages.ts`).
@@ -126,6 +203,9 @@ pub fn build_body(req: &ModelRequest) -> Value {
         // at the front of the cache order, so this entry stays warm even when the rolling message
         // breakpoint is rewritten each turn. Requires stable tool ordering — see `definitions()`.
         let mut tools = serde_json::to_value(req.tools.as_ref()).unwrap_or(Value::Null);
+        if is_oauth {
+            canonicalize_tool_names(&mut tools);
+        }
         if caps.supports_eager_tool_streaming {
             mark_eager_tool_streaming(&mut tools);
         }
@@ -165,6 +245,52 @@ fn cache_control(long: bool) -> Value {
         json!({ "type": "ephemeral", "ttl": "1h" })
     } else {
         json!({ "type": "ephemeral" })
+    }
+}
+
+/// A single Anthropic system-prompt text block, with `cache_control` stamped on when `cc` is set.
+fn system_block(text: &str, cc: &Option<Value>) -> Value {
+    match cc {
+        Some(cc) => json!({ "type": "text", "text": text, "cache_control": cc }),
+        None => json!({ "type": "text", "text": text }),
+    }
+}
+
+/// Canonicalize every advertised tool's `name` to Claude Code's own casing — pi's `convertTools`
+/// (`anthropic-messages.ts:949-955, 1200`). Only called when `is_oauth`.
+fn canonicalize_tool_names(tools: &mut Value) {
+    if let Some(list) = tools.as_array_mut() {
+        for tool in list.iter_mut().filter_map(Value::as_object_mut) {
+            if let Some(name) = tool.get("name").and_then(Value::as_str) {
+                let canonical = to_claude_code_name(name);
+                tool.insert("name".into(), Value::String(canonical));
+            }
+        }
+    }
+}
+
+/// Canonicalize every `tool_use` block's `name` in the message history to Claude Code's own casing —
+/// see [`build_body`]'s `is_oauth` branch for why this is always a forward rename.
+fn canonicalize_tool_use_names(messages: &mut Value) {
+    let Some(msgs) = messages.as_array_mut() else {
+        return;
+    };
+    for m in msgs {
+        let Some(content) = m.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for block in content.iter_mut() {
+            let Some(obj) = block.as_object_mut() else {
+                continue;
+            };
+            if obj.get("type").and_then(Value::as_str) != Some("tool_use") {
+                continue;
+            }
+            if let Some(name) = obj.get("name").and_then(Value::as_str) {
+                let canonical = to_claude_code_name(name);
+                obj.insert("name".into(), Value::String(canonical));
+            }
+        }
     }
 }
 
@@ -552,13 +678,30 @@ const REFUSAL_EXPLANATION_INDEX: usize = usize::MAX;
 /// Decodes Anthropic SSE. Tracks token usage (input + cache reads/writes from `message_start`,
 /// output from `message_delta`) and the stop reason, emitting a single `Usage` + `MessageStop` at
 /// `message_stop`. `saw_start`/`saw_stop` let `finish` reject a stream truncated before its terminal
-/// `message_stop`.
+/// `message_stop`. `is_oauth`/`tools` are only needed to reverse a live `tool_use` block's name back
+/// out of Claude Code's canonical casing (see [`from_claude_code_name`]) — `Default` (used directly by
+/// the bench harness, which never exercises OAuth) leaves `is_oauth` `false`, a no-op for that reversal.
 #[derive(Default)]
 pub struct Decoder {
     usage: TokenUsage,
     stop_reason: StopReason,
     saw_start: bool,
     saw_stop: bool,
+    is_oauth: bool,
+    tools: Arc<[ToolDef]>,
+}
+
+impl Decoder {
+    /// A decoder for an OAuth (`is_oauth`) or plain request, given the tool list this same turn
+    /// advertised (via `build_body`) — needed only to reverse `from_claude_code_name` on a live
+    /// `tool_use` block when `is_oauth`.
+    pub fn new(is_oauth: bool, tools: Arc<[ToolDef]>) -> Self {
+        Self {
+            is_oauth,
+            tools,
+            ..Self::default()
+        }
+    }
 }
 
 impl StreamDecoder for Decoder {
@@ -587,7 +730,15 @@ impl StreamDecoder for Decoder {
                 match block.and_then(|b| b.get("type")).and_then(Value::as_str) {
                     Some("tool_use") => {
                         let id = str_at(block, "id").to_string();
-                        let name = str_at(block, "name").to_string();
+                        let raw_name = str_at(block, "name");
+                        // Reverse Claude Code's canonical casing back to our own real tool name — the
+                        // OAuth-shaped mirror of `canonicalize_tool_names`' forward rename in
+                        // `build_body`. A no-op for a non-OAuth decoder (`is_oauth: false`).
+                        let name = if self.is_oauth {
+                            from_claude_code_name(raw_name, &self.tools)
+                        } else {
+                            raw_name.to_string()
+                        };
                         vec![StreamEvent::ToolUseStart { index, id, name }]
                     }
                     // A redacted-thinking block is fully delivered here (no deltas follow): its opaque
@@ -778,7 +929,7 @@ mod tests {
                 description: "read a file".into(),
                 input_schema: json!({ "type": "object" }),
             }]);
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         assert_eq!(body["model"], "claude-opus-4-8");
         assert_eq!(body["stream"], true);
         // System is a cached text-block array (a dedicated breakpoint), not a bare string.
@@ -797,14 +948,14 @@ mod tests {
         // see `build_body_omits_temperature_for_a_model_that_rejects_it_outright` below).
         let req = ModelRequest::new("claude-sonnet-4-5", vec![Message::user("hi")], 256)
             .with_temperature(0.4);
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         assert_eq!(body["temperature"], 0.4);
     }
 
     #[test]
     fn build_body_omits_temperature_when_unset() {
         let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 256);
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         assert!(body.get("temperature").is_none());
     }
 
@@ -817,7 +968,7 @@ mod tests {
         let req = ModelRequest::new("claude-opus-4-6", vec![Message::user("hi")], 4096)
             .with_temperature(0.9)
             .with_thinking(1024);
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         assert!(
             body.get("temperature").is_none(),
             "got: {:#?}",
@@ -835,7 +986,7 @@ mod tests {
         // `temperature` is explicitly requested — both must still not produce a `temperature` field.
         let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 256)
             .with_temperature(0.7);
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         assert_eq!(body["thinking"]["type"], "disabled");
         assert!(
             body.get("temperature").is_none(),
@@ -849,7 +1000,7 @@ mod tests {
         // Same gate, the sibling id pi also marks `supportsTemperature: false` for.
         let req = ModelRequest::new("claude-opus-4-7", vec![Message::user("hi")], 256)
             .with_temperature(0.7);
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         assert!(
             body.get("temperature").is_none(),
             "got: {:#?}",
@@ -871,7 +1022,7 @@ mod tests {
             ],
             256,
         );
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         for m in body["messages"].as_array().unwrap() {
             assert!(
                 m.get("model_id").is_none(),
@@ -898,7 +1049,7 @@ mod tests {
             ],
             256,
         );
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         for m in body["messages"].as_array().unwrap() {
             assert!(
                 m.get("error_message").is_none(),
@@ -926,7 +1077,7 @@ mod tests {
                     input_schema: json!({ "type": "object" }),
                 },
             ]);
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         assert_eq!(body["tools"][0]["eager_input_streaming"], true);
         assert_eq!(body["tools"][1]["eager_input_streaming"], true);
     }
@@ -953,7 +1104,7 @@ mod tests {
                 input_schema: json!({ "type": "object" }),
             },
         ]);
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         // Anchor breakpoint on the last (only the last) tool definition.
         assert!(body["tools"][0].get("cache_control").is_none());
         assert_eq!(body["tools"][1]["cache_control"]["type"], "ephemeral");
@@ -986,7 +1137,7 @@ mod tests {
             input_schema: json!({ "type": "object" }),
         }])
         .with_no_cache(true);
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         assert!(body["tools"][0].get("cache_control").is_none());
         assert!(
             body["messages"][1]["content"][0]
@@ -1004,18 +1155,18 @@ mod tests {
         // claude-fable-5) → an explicit `{"type":"disabled"}`, not silent reliance on whatever
         // Anthropic's own undocumented default does when the field is omitted.
         let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 256);
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         assert_eq!(body["thinking"]["type"], "disabled");
 
         // claude-fable-5 has no "off" wire shape at all (pi: `thinkingLevelMap: {"off": null}") — the
         // `thinking` field must stay omitted entirely, not sent as `{"type":"disabled"}`.
         let req = ModelRequest::new("claude-fable-5", vec![Message::user("hi")], 256);
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         assert!(body.get("thinking").is_none());
 
         // Legacy gen-3 models have no thinking support at all — same "field omitted" expectation.
         let req = ModelRequest::new("claude-3-5-sonnet-20241022", vec![Message::user("hi")], 256);
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         assert!(body.get("thinking").is_none());
     }
 
@@ -1030,7 +1181,7 @@ mod tests {
             )],
             256,
         );
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         let content = &body["messages"][0]["content"];
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[1]["type"], "image");
@@ -1054,7 +1205,7 @@ mod tests {
             ],
             256,
         );
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         assert_eq!(body["messages"][1]["content"][0]["type"], "tool_use");
         assert_eq!(body["messages"][1]["content"][0]["id"], "toolu_1");
         assert_eq!(body["messages"][2]["content"][0]["type"], "tool_result");
@@ -1083,7 +1234,7 @@ mod tests {
             ],
             256,
         );
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         assert_eq!(body["messages"][1]["content"][0]["id"], "call_1_weird_id");
         assert_eq!(
             body["messages"][2]["content"][0]["tool_use_id"],
@@ -1110,7 +1261,7 @@ mod tests {
             ],
             256,
         );
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         let expected = "x".repeat(64);
         assert_eq!(body["messages"][1]["content"][0]["id"], expected);
         assert_eq!(body["messages"][2]["content"][0]["tool_use_id"], expected);
@@ -1136,7 +1287,7 @@ mod tests {
             ],
             256,
         );
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         assert_eq!(body["messages"][1]["content"][0]["id"], "toolu 1");
         assert_eq!(body["messages"][2]["content"][0]["tool_use_id"], "toolu 1");
     }
@@ -1337,7 +1488,7 @@ data: {"type":"message_stop"}
                 input_schema: json!({ "type": "object" }),
             }])
             .with_cache_long(true);
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         assert_eq!(body["system"][0]["cache_control"]["ttl"], "1h");
         assert_eq!(body["tools"][0]["cache_control"]["ttl"], "1h");
         assert_eq!(
@@ -1359,7 +1510,7 @@ data: {"type":"message_stop"}
             }])],
             256,
         );
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         let content = &body["messages"][0]["content"][0]["content"];
         // The string content was rewritten into an array: text block, then image block.
         assert_eq!(
@@ -1393,7 +1544,7 @@ data: {"type":"message_stop"}
             }])],
             256,
         );
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         let content = body["messages"][0]["content"][0]["content"]
             .as_array()
             .unwrap();
@@ -1433,7 +1584,7 @@ data: {"type":"message_stop"}
             ],
             256,
         );
-        let body = build_body(&req);
+        let body = build_body(&req, false);
 
         // User-turn image → one placeholder text block, no image block.
         let user_content = &body["messages"][0]["content"];
@@ -1466,7 +1617,7 @@ data: {"type":"message_stop"}
             )],
             256,
         );
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         assert_eq!(body["messages"][0]["content"][1]["type"], "image");
     }
 
@@ -1506,11 +1657,12 @@ data: {"type":"message_stop"}
                 error_message: None,
                 aborted: false,
                 usage: None,
+                stop_reason: None,
             }],
             256,
         )
         .with_no_cache(true);
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         let content = body["messages"][0]["content"].as_array().unwrap();
         let placeholder = json!({ "type": "text", "text": USER_IMAGE_PLACEHOLDER });
         assert_eq!(
@@ -1533,7 +1685,7 @@ data: {"type":"message_stop"}
         let req = ModelRequest::new("some-unknown-model", vec![Message::user("hi")], 256)
             .with_system("sys")
             .with_cache_long(true);
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         assert!(
             body["system"][0]["cache_control"].get("ttl").is_none(),
             "unsupported model must not receive the 1h TTL"
@@ -1546,7 +1698,7 @@ data: {"type":"message_stop"}
         // claude-opus-4-5 predates the adaptive requirement — still the `Budget`/`enabled` shape.
         let req = ModelRequest::new("claude-opus-4-5", vec![Message::user("hi")], 8192)
             .with_thinking(4096);
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["thinking"]["budget_tokens"], 4096);
         assert_eq!(body["thinking"]["display"], "summarized");
@@ -1561,7 +1713,7 @@ data: {"type":"message_stop"}
         let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 8192)
             .with_thinking(4096)
             .with_reasoning_effort(crate::transport::ReasoningEffort::High);
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         assert_eq!(body["thinking"]["type"], "adaptive");
         assert_eq!(body["thinking"]["display"], "summarized");
         assert!(body["thinking"].get("budget_tokens").is_none());
@@ -1577,7 +1729,7 @@ data: {"type":"message_stop"}
             .with_thinking(4096)
             .with_thinking_display(crate::transport::ThinkingDisplay::Omitted)
             .with_reasoning_effort(crate::transport::ReasoningEffort::High);
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         assert_eq!(body["thinking"]["type"], "adaptive");
         assert_eq!(body["thinking"]["display"], "omitted");
 
@@ -1585,7 +1737,7 @@ data: {"type":"message_stop"}
         let req = ModelRequest::new("claude-opus-4-5", vec![Message::user("hi")], 8192)
             .with_thinking(4096)
             .with_thinking_display(crate::transport::ThinkingDisplay::Omitted);
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["thinking"]["display"], "omitted");
     }
@@ -1605,20 +1757,20 @@ data: {"type":"message_stop"}
         let req = ModelRequest::new("claude-opus-4-6", vec![Message::user("hi")], 8192)
             .with_thinking(4096)
             .with_reasoning_effort(crate::transport::ReasoningEffort::XHigh);
-        assert_eq!(build_body(&req)["output_config"]["effort"], "max");
+        assert_eq!(build_body(&req, false)["output_config"]["effort"], "max");
 
         // sonnet-4-6 has no xhigh wire value at all — must degrade to "high", not send "xhigh" and get
         // rejected by Anthropic.
         let req = ModelRequest::new("claude-sonnet-4-6", vec![Message::user("hi")], 8192)
             .with_thinking(4096)
             .with_reasoning_effort(crate::transport::ReasoningEffort::XHigh);
-        assert_eq!(build_body(&req)["output_config"]["effort"], "high");
+        assert_eq!(build_body(&req, false)["output_config"]["effort"], "high");
 
         // No adaptive model has a "minimal" wire tier — always collapses to "low".
         let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 8192)
             .with_thinking(4096)
             .with_reasoning_effort(crate::transport::ReasoningEffort::Minimal);
-        assert_eq!(build_body(&req)["output_config"]["effort"], "low");
+        assert_eq!(build_body(&req, false)["output_config"]["effort"], "low");
     }
 
     #[test]
@@ -1640,7 +1792,7 @@ data: {"type":"message_stop"}
             ],
             8192,
         );
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         let block = &body["messages"][1]["content"][0];
         assert_eq!(block["type"], "thinking");
         assert_eq!(block["thinking"], "let me reason");
@@ -1667,7 +1819,7 @@ data: {"type":"message_stop"}
             ],
             8192,
         );
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         let block = &body["messages"][1]["content"][0];
         assert_eq!(block["type"], "text");
         assert_eq!(block["text"], "half-formed reasoning");
@@ -1697,7 +1849,7 @@ data: {"type":"message_stop"}
             ],
             8192,
         );
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         let content = body["messages"][1]["content"].as_array().unwrap();
         assert_eq!(content.len(), 1, "{content:?}");
         assert_eq!(content[0]["type"], "text");
@@ -1735,7 +1887,7 @@ data: {"type":"message_stop"}
             ],
             8192,
         );
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         let content = body["messages"][1]["content"].as_array().unwrap();
         assert_eq!(content.len(), 1, "{content:?}");
         assert_eq!(content[0]["type"], "text");
@@ -1913,13 +2065,14 @@ data: {"type":"message_stop"}
         // Unset → no `tool_choice` on the wire (the default request shape is untouched).
         let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 64)
             .with_tools(tools.clone());
-        assert!(build_body(&req).get("tool_choice").is_none());
+        assert!(build_body(&req, false).get("tool_choice").is_none());
 
         // Each variant maps to Anthropic's vocabulary (`any` for required; `{type:"tool",name}`).
         let body = build_body(
             &ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 64)
                 .with_tools(tools.clone())
                 .with_tool_choice(ToolChoice::Auto),
+            false,
         );
         assert_eq!(body["tool_choice"], json!({ "type": "auto" }));
 
@@ -1927,6 +2080,7 @@ data: {"type":"message_stop"}
             &ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 64)
                 .with_tools(tools.clone())
                 .with_tool_choice(ToolChoice::None),
+            false,
         );
         assert_eq!(body["tool_choice"], json!({ "type": "none" }));
 
@@ -1934,6 +2088,7 @@ data: {"type":"message_stop"}
             &ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 64)
                 .with_tools(tools.clone())
                 .with_tool_choice(ToolChoice::Required),
+            false,
         );
         assert_eq!(body["tool_choice"], json!({ "type": "any" }));
 
@@ -1941,6 +2096,7 @@ data: {"type":"message_stop"}
             &ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 64)
                 .with_tools(tools)
                 .with_tool_choice(ToolChoice::Tool("read".into())),
+            false,
         );
         assert_eq!(
             body["tool_choice"],
@@ -1951,11 +2107,11 @@ data: {"type":"message_stop"}
     #[test]
     fn user_id_is_sent_as_metadata_user_id_when_present_and_omitted_otherwise() {
         let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 64);
-        assert!(build_body(&req).get("metadata").is_none());
+        assert!(build_body(&req, false).get("metadata").is_none());
 
         let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 64)
             .with_user_id("hashed-user-abc123");
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         assert_eq!(body["metadata"], json!({ "user_id": "hashed-user-abc123" }));
     }
 
@@ -2195,7 +2351,7 @@ data: {"type":"message_stop"}
         // headroom — less than the request's own (artificially large, to force the clamp) max_tokens.
         let big_text = "x".repeat(600_000);
         let req = ModelRequest::new("claude-3-5-sonnet", vec![Message::user(big_text)], 50_000);
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         assert_eq!(
             body["max_tokens"], 45_904,
             "max_tokens must be clamped down to the actual remaining context headroom, not sent as \
@@ -2208,7 +2364,7 @@ data: {"type":"message_stop"}
         // The clamp must never *raise* max_tokens, and must not needlessly reduce it either — a short
         // prompt has ample headroom, so the request's own ceiling should reach the wire untouched.
         let req = ModelRequest::new("claude-3-5-sonnet", vec![Message::user("hi")], 8_192);
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         assert_eq!(body["max_tokens"], 8_192);
     }
 
@@ -2222,7 +2378,7 @@ data: {"type":"message_stop"}
         let huge_text = "x".repeat(796_000); // ~199_000 estimated tokens
         let req = ModelRequest::new("claude-opus-4-5", vec![Message::user(huge_text)], 50_000)
             .with_thinking(10_000);
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         let max_tokens = body["max_tokens"].as_u64().unwrap();
         assert!(
             max_tokens > 10_000,
@@ -2232,6 +2388,198 @@ data: {"type":"message_stop"}
         assert_eq!(
             max_tokens, 10_001,
             "expected the exact thinking-budget-plus-one floor"
+        );
+    }
+
+    #[test]
+    fn oauth_build_body_substitutes_claude_code_identity_and_appends_the_real_system_prompt() {
+        // pi-parity: an OAuth (Claude Pro/Max) request MUST present Claude Code's own identity as the
+        // first system block (`anthropic-messages.ts:916-931`) — the caller's real system prompt is
+        // appended as a *second* block, never substituted for it, and both get the same cache
+        // breakpoint.
+        let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 256)
+            .with_system("be a helpful assistant");
+        let body = build_body(&req, true);
+        assert_eq!(body["system"][0]["type"], "text");
+        assert_eq!(
+            body["system"][0]["text"],
+            "You are Claude Code, Anthropic's official CLI for Claude."
+        );
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(body["system"][1]["text"], "be a helpful assistant");
+        assert_eq!(body["system"][1]["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            body["system"].as_array().unwrap().len(),
+            2,
+            "no third block: got {:#?}",
+            body["system"]
+        );
+    }
+
+    #[test]
+    fn oauth_build_body_sends_only_the_identity_block_when_no_real_system_prompt_is_set() {
+        let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 256);
+        let body = build_body(&req, true);
+        assert_eq!(
+            body["system"].as_array().unwrap().len(),
+            1,
+            "got: {:#?}",
+            body["system"]
+        );
+        assert_eq!(
+            body["system"][0]["text"],
+            "You are Claude Code, Anthropic's official CLI for Claude."
+        );
+    }
+
+    #[test]
+    fn non_oauth_build_body_never_substitutes_the_claude_code_identity() {
+        let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 256)
+            .with_system("be brief");
+        let body = build_body(&req, false);
+        assert_eq!(body["system"][0]["text"], "be brief");
+        assert_eq!(body["system"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn oauth_build_body_canonicalizes_advertised_tool_names_to_claude_code_casing() {
+        // pi's `claudeCodeTools` table (`anthropic-messages.ts:72-91`): our own lowercase `bash`
+        // canonicalizes to Claude Code's `Bash`; a name with no match (`get_weather`) passes through.
+        let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 256).with_tools(
+            vec![
+                ToolDef {
+                    name: "bash".into(),
+                    description: "run a shell command".into(),
+                    input_schema: json!({ "type": "object" }),
+                },
+                ToolDef {
+                    name: "get_weather".into(),
+                    description: "look up the weather".into(),
+                    input_schema: json!({ "type": "object" }),
+                },
+            ],
+        );
+        let body = build_body(&req, true);
+        assert_eq!(body["tools"][0]["name"], "Bash");
+        assert_eq!(body["tools"][1]["name"], "get_weather");
+    }
+
+    #[test]
+    fn non_oauth_build_body_never_renames_tools() {
+        let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 256).with_tools(
+            vec![ToolDef {
+                name: "bash".into(),
+                description: "run a shell command".into(),
+                input_schema: json!({ "type": "object" }),
+            }],
+        );
+        let body = build_body(&req, false);
+        assert_eq!(body["tools"][0]["name"], "bash");
+    }
+
+    #[test]
+    fn oauth_build_body_canonicalizes_replayed_assistant_tool_use_names_in_history() {
+        // A tool_use block already sitting in history (produced on some earlier turn, always stored
+        // under our own real name — see `canonicalize_tool_use_names`'s doc comment) must be renamed
+        // to Claude Code's casing on replay, matching pi's `convertMessages` (`anthropic-messages.ts:
+        // 1111`), exactly like a freshly advertised tool definition.
+        let req = ModelRequest::new(
+            "claude-opus-4-8",
+            vec![
+                Message::user("run ls"),
+                Message::assistant(vec![ContentBlock::tool_use(
+                    "toolu_1",
+                    "bash",
+                    json!({ "cmd": "ls" }),
+                )]),
+                Message::tool_result("toolu_1", "ok", false),
+            ],
+            256,
+        );
+        let body = build_body(&req, true);
+        assert_eq!(body["messages"][1]["content"][0]["name"], "Bash");
+    }
+
+    #[test]
+    fn a_full_oauth_round_trip_canonicalizes_the_tool_name_out_and_reverses_it_back_in() {
+        // The end-to-end contract this pi-parity fix restores: a tool advertised under our own real
+        // name goes out renamed to Claude Code's canonical casing, and a live `tool_use` block the model
+        // streams back under that same canonical casing is decoded back to our own real name — so
+        // nothing above this dialect (the agent loop, tool dispatch) ever sees Claude Code's naming.
+        let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 256).with_tools(
+            vec![ToolDef {
+                name: "bash".into(),
+                description: "run a shell command".into(),
+                input_schema: json!({ "type": "object" }),
+            }],
+        );
+        let body = build_body(&req, true);
+        assert_eq!(body["tools"][0]["name"], "Bash");
+
+        let mut dec = Decoder::new(true, req.tools.clone());
+        const SSE: &str = r#"
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}}
+"#;
+        let events = decode_sse(&mut dec, SSE).unwrap();
+        assert_eq!(
+            events,
+            vec![StreamEvent::ToolUseStart {
+                index: 0,
+                id: "toolu_1".into(),
+                name: "bash".into(),
+            }],
+            "the live tool_use block's Claude-Code-cased name must decode back to our own real name"
+        );
+    }
+
+    #[test]
+    fn a_non_oauth_decoder_never_reverses_tool_use_names() {
+        let tools: Arc<[ToolDef]> = Arc::from(vec![ToolDef {
+            name: "bash".into(),
+            description: "run a shell command".into(),
+            input_schema: json!({ "type": "object" }),
+        }]);
+        let mut dec = Decoder::new(false, tools);
+        const SSE: &str = r#"
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}}
+"#;
+        let events = decode_sse(&mut dec, SSE).unwrap();
+        assert_eq!(
+            events,
+            vec![StreamEvent::ToolUseStart {
+                index: 0,
+                id: "toolu_1".into(),
+                name: "Bash".into(),
+            }],
+            "a non-OAuth decoder must pass the wire name through untouched"
+        );
+    }
+
+    #[test]
+    fn a_tool_use_name_with_no_advertised_match_passes_through_unchanged_even_under_oauth() {
+        // `from_claude_code_name` only reverses a name it can match against the tools this turn
+        // actually advertised — a name for a tool this turn never offered has nothing to reverse to,
+        // so it must reach the loop as the model sent it rather than being silently dropped or altered.
+        let tools: Arc<[ToolDef]> = Arc::from(vec![ToolDef {
+            name: "bash".into(),
+            description: "run a shell command".into(),
+            input_schema: json!({ "type": "object" }),
+        }]);
+        let mut dec = Decoder::new(true, tools);
+        const SSE: &str = r#"
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"Read","input":{}}}
+"#;
+        let events = decode_sse(&mut dec, SSE).unwrap();
+        assert_eq!(
+            events,
+            vec![StreamEvent::ToolUseStart {
+                index: 0,
+                id: "toolu_1".into(),
+                name: "Read".into(),
+            }]
         );
     }
 }

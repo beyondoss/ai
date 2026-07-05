@@ -97,8 +97,10 @@ const MAX_ITEM_ID_LEN: usize = 64;
 /// pairing needs (the same foreign `item_id` always collapses to the same digest). `DefaultHasher` is
 /// keyed with fixed (not per-process-random) state, so this is deterministic across calls and process
 /// restarts alike — required here since the digest, once computed, is persisted as part of the
-/// session's `ToolUse.id`/`ToolResult.tool_use_id` pairing rather than recomputed later.
-fn short_hash(s: &str) -> String {
+/// session's `ToolUse.id`/`ToolResult.tool_use_id` pairing rather than recomputed later. `pub(super)`:
+/// shared with `dialect::openai`'s Mistral tool-call-id reshaping, which needs an identical
+/// deterministic digest for its own hash-fallback case.
+pub(super) fn short_hash(s: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     s.hash(&mut hasher);
@@ -174,8 +176,10 @@ pub(crate) fn call_id_only(id: &str) -> String {
 }
 
 /// The system/developer-prompt role: `"developer"` for reasoning models (matching pi, which prefers
-/// it whenever the model supports it), `"system"` otherwise.
-fn instruction_role(caps: &crate::models::ModelCaps) -> &'static str {
+/// it whenever the model supports it), `"system"` otherwise. `pub(super)`: shared with
+/// `dialect::openai::build_body`, which needs the identical gating for the Chat Completions dialect's
+/// system-prompt role (pi's `useDeveloperRole = model.reasoning && compat.supportsDeveloperRole`).
+pub(super) fn instruction_role(caps: &crate::models::ModelCaps) -> &'static str {
     if caps.reasoning_effort {
         "developer"
     } else {
@@ -468,7 +472,14 @@ pub fn build_body(req: &ModelRequest) -> Value {
                 json!({ "effort": effort.as_str(), "summary": summary.as_str() }),
             );
             map.insert("include".into(), json!(["reasoning.encrypted_content"]));
-        } else if caps.reasoning_disableable {
+        } else if caps.reasoning_disableable && !req.is_copilot {
+            // GitHub Copilot-hosted gpt-5.x ids set `thinkingLevelMap: {"off": null}` in pi's own
+            // catalogue (`github-copilot.models.ts`) — no explicit "off" wire shape at all — even
+            // though `ModelCaps::reasoning_disableable` (keyed purely by id) reports the *same* id as
+            // disable-capable when reached via native OpenAI directly. Mirrors pi's own gate
+            // (`model.provider !== "github-copilot" && model.thinkingLevelMap?.off !== null`,
+            // `openai-responses.ts`). See `ModelRequest::is_copilot`'s own doc comment: nothing sets it
+            // to `true` yet — this is the consuming half of that plumbing point.
             map.insert("reasoning".into(), json!({ "effort": "none" }));
         }
     }
@@ -488,7 +499,11 @@ pub fn build_body(req: &ModelRequest) -> Value {
             );
         }
     }
-    if req.cache_long && caps.supports_long_cache && !req.no_cache {
+    // pi's `azure-openai-responses.ts` never calls `resolveCacheRetention`/`getPromptCacheRetention` at
+    // all — only the direct `openai-responses.ts` dialect opts into the 24h retention tier. See
+    // `ModelRequest::is_azure`'s own doc comment: nothing sets it to `true` yet — this is the consuming
+    // half of that plumbing point.
+    if req.cache_long && caps.supports_long_cache && !req.no_cache && !req.is_azure {
         map.insert("prompt_cache_retention".into(), json!("24h"));
     }
 
@@ -1393,6 +1408,7 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
                 error_message: None,
                 aborted: false,
                 usage: None,
+                stop_reason: None,
             }],
             64,
         );
@@ -1443,6 +1459,46 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
     fn cache_long_emits_24h_retention_when_supported() {
         let req = ModelRequest::new("gpt-4o", vec![Message::user("hi")], 64).with_cache_long(true);
         assert_eq!(build_body(&req)["prompt_cache_retention"], "24h");
+    }
+
+    #[test]
+    fn azure_routed_requests_never_get_prompt_cache_retention() {
+        // pi-parity (pass 15): pi's `azure-openai-responses.ts` never calls
+        // `resolveCacheRetention`/`getPromptCacheRetention` at all — only the direct
+        // `openai-responses.ts` dialect opts into the 24h tier. `ModelRequest::is_azure` is wired up by
+        // `GatewayClient::stream` (see its own doc comment); `client.rs`'s
+        // `direct_route_with_custom_auth_header_sends_bare_key_and_omits_authorization`-style tests
+        // cover the end-to-end path, this test covers the dialect-side gate directly.
+        let req = ModelRequest::new("gpt-4o", vec![Message::user("hi")], 64)
+            .with_cache_long(true)
+            .with_azure(true);
+        assert!(
+            build_body(&req).get("prompt_cache_retention").is_none(),
+            "got: {:#?}",
+            build_body(&req).get("prompt_cache_retention")
+        );
+        // Non-Azure requests are unaffected — same assertion as `cache_long_emits_24h_retention_when_supported`.
+        let req = ModelRequest::new("gpt-4o", vec![Message::user("hi")], 64).with_cache_long(true);
+        assert_eq!(build_body(&req)["prompt_cache_retention"], "24h");
+    }
+
+    #[test]
+    fn copilot_routed_gpt5_ids_never_get_an_explicit_reasoning_disable() {
+        // pi-parity (pass 15): Copilot-hosted gpt-5.x ids set `thinkingLevelMap: {"off": null}` in
+        // pi's own catalogue (`github-copilot.models.ts`) — no explicit "off" wire shape — even though
+        // the identical id routed directly through OpenAI does have one. `ModelCaps` is keyed purely by
+        // id and can't tell the two routes apart; `ModelRequest::is_copilot` is wired up by
+        // `GatewayClient::stream` (see its own doc comment) from the same `via_copilot` signal used for
+        // dialect selection — this test covers the dialect-side gate directly.
+        let req = ModelRequest::new("gpt-5.2", vec![Message::user("hi")], 64).with_copilot(true);
+        assert!(
+            build_body(&req).get("reasoning").is_none(),
+            "got: {:#?}",
+            build_body(&req).get("reasoning")
+        );
+        // Direct OpenAI routing (the default) is unaffected — still gets the explicit "none".
+        let req = ModelRequest::new("gpt-5.2", vec![Message::user("hi")], 64);
+        assert_eq!(build_body(&req)["reasoning"]["effort"], "none");
     }
 
     #[test]

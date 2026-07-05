@@ -307,11 +307,57 @@ deliberately do not bolt on a partial implementation (e.g. accepting only unsign
 signing with a fixed clock skew) — a SigV4 gateway that's subtly wrong fails silently at the provider
 with a cryptic signature-mismatch 403, which is worse than not supporting the mode at all.
 
-**The supported path for Bedrock today is `AWS_BEARER_TOKEN_BEDROCK` mode** — Bedrock also accepts a
-plain long-lived bearer token (no signing), which is exactly the `Bearer`/`XApiKey` shape this gateway
-already handles as a config-added provider (see `provider_authorities`/`provider_dialects` in
-Configuration). An operator wiring up Bedrock through this gateway should provision that token, not
-the classic SigV4 credential chain.
+**`AWS_BEARER_TOKEN_BEDROCK` mode solves the auth half only — it does not make Bedrock a working
+route.** Bedrock also accepts a plain long-lived bearer token (no signing), which is exactly the
+`Bearer`/`XApiKey` shape this gateway already handles as a config-added provider (see
+`provider_authorities`/`provider_dialects` in Configuration), so a bearer-token credential *authenticates*
+cleanly. But authenticating is not the same as completing a turn: there is zero Bedrock Converse/
+Converse-Stream **wire-format** code anywhere in this gateway or in `agent-core`'s dialects (`grep -ri
+bedrock` across both turns up only prose and error-message pattern-matching, never a request/response
+shape). Bedrock's request body isn't Anthropic's `/v1/messages` shape and its response isn't SSE — it's
+AWS's own binary `application/vnd.amazon.eventstream` framing, which this gateway's usage extractor and
+every agent-core dialect decoder assume is never what arrives. Configuring `provider_dialects.bedrock =
+"anthropic"` today would relay a request the provider rejects (wrong body shape) or, if that were
+somehow fixed client-side, a response this stack can't parse at all (wrong stream framing) — an operator
+following this doc's bearer-token instructions alone gets a route that passes auth and then fails to
+complete a turn, not a working Bedrock integration. Full support needs both the SigV4 signing infra
+described above (for the default credential chain) *and* a dedicated Bedrock wire dialect (Converse-API
+request mapping, event-stream response decoding) — neither exists, and building the latter without the
+former only covers Bedrock's less common auth mode. Out of proportion for this pass; revisit as a
+dedicated feature if Bedrock support is ever prioritized.
+
+### Why OpenAI Codex traffic only ever goes over HTTP+SSE, never WebSocket
+
+pi's own Codex client (`openai-codex-responses.ts`) defaults `transport` to `"auto"`, which *prefers* a
+persistent WebSocket connection and only falls back to HTTP+SSE on a connection-limit error or a
+transport failure — pi treats WebSocket as its primary, tested path, not a fallback. Beyond's agent-core
+client only ever speaks HTTP+SSE to Codex (`GatewayClient::send_with_retry`); there is no WebSocket
+transport at all.
+
+This was evaluated and deliberately deferred, not overlooked. Two independent reasons, either one
+sufficient on its own:
+
+- **Client-side**: pi's WebSocket path is a substantial subsystem (~1000+ lines in
+  `openai-codex-responses.ts` alone) — per-session connection caching and reuse, reconnect/continuation
+  state across turns, a connection-limit-reached retry loop, its own header construction and binary/text
+  frame parsing for the Responses event stream, and a proxy-aware `WebSocket` constructor shim. It would
+  also be a new runtime dependency (a WebSocket client crate) agent-core doesn't currently have, and a
+  materially different request/response lifecycle than the current one-shot-per-turn `send_with_retry`
+  path (a long-lived, session-scoped connection instead of a fresh request per turn). Disproportionate
+  next to the HTTP+SSE path already working and covered by tests.
+- **Gateway-side**: Codex traffic that goes through this gateway at all uses `RouteOverride::Prefixed`
+  (the `/openai-codex` `KNOWN_PROVIDERS` row) — still relayed through Pingora, not bypassed like
+  Copilot's `RouteOverride::Direct`. This gateway has no WebSocket-upgrade proxying (no `Connection:
+  Upgrade`/`101 Switching Protocols` handling anywhere in `src/`); it is an HTTP request/response (and
+  SSE-response) relay only. A client-side WebSocket transport for Codex could not be relayed through this
+  gateway as-is — it would have to bypass the gateway entirely (a Copilot-style `Direct` route straight
+  to `chatgpt.com`'s WebSocket endpoint), sidestepping this gateway's pooling, metering, and rate-limiting
+  for that traffic, which is a real behavior change beyond just "add a transport option."
+
+Net: HTTP+SSE is a real, working, tested path (pi's own fallback, not a hack), and building the
+WebSocket path properly requires both a nontrivial client-side subsystem and a gateway-side proxying
+capability that doesn't exist. Revisit if Codex's HTTP+SSE path is ever observed to hit the
+connection-limit ceiling pi's WebSocket path exists to avoid.
 
 ### Why pricing is absent from the gateway
 

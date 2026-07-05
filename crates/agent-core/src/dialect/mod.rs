@@ -7,13 +7,17 @@
 //! Selection is by model id: Claude speaks Anthropic (`/v1/messages`); every native OpenAI id (see
 //! [`crate::models::ApiKind`]) speaks the Responses API (`/v1/responses`); everything else (every
 //! third-party OpenAI-compatible provider) speaks Chat Completions (`/v1/chat/completions`), the
-//! lingua franca for the gateway's other providers.
+//! lingua franca for the gateway's other providers. [`Dialect::for_model_via_copilot`] overrides this
+//! for the handful of ids GitHub Copilot's own proxy wants on a different wire than the same id gets
+//! natively (see [`COPILOT_FORCES_CHAT_COMPLETIONS`]).
+
+use std::sync::Arc;
 
 use serde_json::Value;
 
 use crate::agent::repair_json;
 use crate::error::{Error, Result};
-use crate::message::{ContentBlock, Message, Role, StreamEvent};
+use crate::message::{ContentBlock, Message, Role, StreamEvent, ToolDef};
 use crate::models::{ApiKind, ModelCaps};
 use crate::transport::ModelRequest;
 
@@ -29,6 +33,16 @@ pub enum Dialect {
     OpenAiResponses,
 }
 
+/// Model ids GitHub Copilot's own proxy insists on Chat Completions for, even though the same id
+/// natively classifies as `ApiKind::Responses` (`models::capabilities`) — see
+/// [`Dialect::for_model_via_copilot`]'s doc comment. Currently just `gpt-4.1`: pi's
+/// `github-copilot.models.ts` sets `api: "openai-completions"` for the Copilot-hosted id, vs
+/// `openai.models.ts`'s `api: "openai-responses"` for the same id natively — Copilot's proxy wants the
+/// older wire shape for this one model specifically (Copilot's own gpt-5.x family is
+/// `"openai-responses"` there too). A short exception list is all this needs, not a second capability
+/// table — extend it if Copilot ever adds another id with the same native/Copilot split.
+const COPILOT_FORCES_CHAT_COMPLETIONS: &[&str] = &["gpt-4.1"];
+
 impl Dialect {
     /// Pick the dialect for a model id. Claude → Anthropic; a native OpenAI id (per the capability
     /// table's [`ApiKind`]) → the Responses API; everything else → Chat Completions.
@@ -42,6 +56,19 @@ impl Dialect {
         }
     }
 
+    /// Same selection as [`Dialect::for_model`], but additionally consults whether this request is
+    /// being proxied through GitHub Copilot's own endpoint (`via_copilot`) rather than sent to a
+    /// provider natively — Copilot's proxy wants a different wire shape than the native provider for at
+    /// least one id (see [`COPILOT_FORCES_CHAT_COMPLETIONS`]). Every other id/route combination
+    /// resolves identically to `for_model`; a non-Copilot caller should keep calling `for_model`
+    /// directly rather than thread `via_copilot: false` through everywhere.
+    pub fn for_model_via_copilot(model: &str, via_copilot: bool) -> Self {
+        if via_copilot && COPILOT_FORCES_CHAT_COMPLETIONS.contains(&model) {
+            return Dialect::OpenAi;
+        }
+        Self::for_model(model)
+    }
+
     /// The gateway path this dialect POSTs to. Bare `/v1*` so the gateway's default-provider routing
     /// (OpenAI on `/v1`, Anthropic on `/v1/messages`) applies; a `bai_v1` key picks the real provider.
     pub fn endpoint_path(&self) -> &'static str {
@@ -52,19 +79,23 @@ impl Dialect {
         }
     }
 
-    /// Build the JSON body for a streaming completion request.
-    pub fn build_body(&self, req: &ModelRequest) -> Value {
+    /// Build the JSON body for a streaming completion request. `is_oauth` only affects the Anthropic
+    /// dialect (Claude Code's identity/tool-naming shape — see `anthropic::build_body`'s doc comment);
+    /// every other dialect ignores it.
+    pub fn build_body(&self, req: &ModelRequest, is_oauth: bool) -> Value {
         match self {
-            Dialect::Anthropic => anthropic::build_body(req),
+            Dialect::Anthropic => anthropic::build_body(req, is_oauth),
             Dialect::OpenAi => openai::build_body(req),
             Dialect::OpenAiResponses => openai_responses::build_body(req),
         }
     }
 
-    /// A fresh streaming decoder for this dialect.
-    pub fn decoder(&self) -> Box<dyn StreamDecoder> {
+    /// A fresh streaming decoder for this dialect. `is_oauth`/`tools` are only consulted by the
+    /// Anthropic dialect, to reverse a live `tool_use` block's name back out of Claude Code's canonical
+    /// casing (see `anthropic::Decoder::new`); every other dialect ignores them.
+    pub fn decoder(&self, is_oauth: bool, tools: Arc<[ToolDef]>) -> Box<dyn StreamDecoder> {
         match self {
-            Dialect::Anthropic => Box::<anthropic::Decoder>::default(),
+            Dialect::Anthropic => Box::new(anthropic::Decoder::new(is_oauth, tools)),
             Dialect::OpenAi => Box::<openai::Decoder>::default(),
             Dialect::OpenAiResponses => Box::<openai_responses::Decoder>::default(),
         }
@@ -565,6 +596,31 @@ mod tests {
         // Third-party OpenAI-compatible ids stay on Chat Completions.
         assert_eq!(Dialect::for_model("llama-3.1-70b"), Dialect::OpenAi);
         assert_eq!(Dialect::for_model("anthropic/claude"), Dialect::Anthropic);
+    }
+
+    #[test]
+    fn copilot_routing_forces_gpt_4_1_onto_chat_completions() {
+        // pi-parity: `github-copilot.models.ts` sets `api: "openai-completions"` for the Copilot-hosted
+        // `gpt-4.1`, vs `openai.models.ts`'s `api: "openai-responses"` for the same id natively.
+        assert_eq!(
+            Dialect::for_model_via_copilot("gpt-4.1", true),
+            Dialect::OpenAi
+        );
+        // Native (non-Copilot) routing keeps the Responses classification unchanged.
+        assert_eq!(
+            Dialect::for_model_via_copilot("gpt-4.1", false),
+            Dialect::OpenAiResponses
+        );
+        // Copilot routing for every other id matches `for_model` unchanged — Copilot's own gpt-5.x
+        // family is `"openai-responses"` there too, and Claude ids are never affected.
+        assert_eq!(
+            Dialect::for_model_via_copilot("gpt-5-mini", true),
+            Dialect::OpenAiResponses
+        );
+        assert_eq!(
+            Dialect::for_model_via_copilot("claude-opus-4-8", true),
+            Dialect::Anthropic
+        );
     }
 
     #[test]

@@ -366,6 +366,89 @@ fn export_subcommand_renders_an_existing_session_file_with_no_gateway_or_key() {
     );
 }
 
+/// Extracts the rendered `Tokens` stat's value (e.g. `"12 in, 7 out, 0 cache read, 0 cache write"`)
+/// from an exported transcript's HTML, or `None` if the stats section omitted that line entirely.
+fn tokens_stat_value(html: &str) -> Option<String> {
+    let marker = r#"<span class="stat-label">Tokens</span><span class="stat-value">"#;
+    let start = html.find(marker)? + marker.len();
+    let end = html[start..].find("</span>")? + start;
+    Some(html[start..end].to_string())
+}
+
+#[test]
+fn export_subcommand_usage_totals_match_run_exports_for_the_same_session() {
+    // Fix 6 (pi-parity gap): the standalone `export` subcommand used to pass `usage: None`
+    // unconditionally — the one of the three export entry points (alongside `serve`'s `export_html`
+    // RPC and `run --export`) that silently omitted the stats section's `Tokens` line, even though
+    // `sess.messages` (already in scope after `SessionStore::open`) carries everything needed to
+    // reconstruct it, no live `Agent` required.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl");
+    let run_export_path = dir.path().join("run-export.html");
+
+    let (base, _bodies) = spawn_model_server(vec![turn_text("the answer is 42")]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let setup = run_cmd(bin)
+        .args([
+            "run",
+            "what is the answer?",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--session",
+            session_file.to_str().unwrap(),
+            "--export",
+            run_export_path.to_str().unwrap(),
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+    assert!(
+        setup.status.success(),
+        "setup run failed.\nstderr: {}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+    assert!(session_file.exists());
+
+    let run_export_html =
+        std::fs::read_to_string(&run_export_path).expect("run --export file must exist");
+    let run_export_tokens =
+        tokens_stat_value(&run_export_html).expect("run --export must report usage totals");
+    // Sanity check: the mock turn's own usage must actually be reflected, not just present — a
+    // blank/zeroed line would make the cross-path equality assertion below vacuous.
+    assert_eq!(run_export_tokens, "12 in, 6 out, 0 cache read, 0 cache write");
+
+    let standalone_export_path = dir.path().join("standalone-export.html");
+    let output = Command::new(bin)
+        .args([
+            "export",
+            session_file.to_str().unwrap(),
+            standalone_export_path.to_str().unwrap(),
+        ])
+        .env("HOME", dir.path())
+        .output()
+        .expect("spawn binary");
+    assert!(
+        output.status.success(),
+        "export subcommand failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let standalone_html =
+        std::fs::read_to_string(&standalone_export_path).expect("exported file must exist");
+    let standalone_tokens = tokens_stat_value(&standalone_html)
+        .expect("the standalone export must now report usage totals too");
+
+    assert_eq!(
+        standalone_tokens, run_export_tokens,
+        "the standalone export's usage totals must match run --export's for the same session"
+    );
+}
+
 #[test]
 fn run_binary_thinking_flag_reaches_the_wire_request() {
     // pi-parity fix (M12): `--thinking` existed on `serve` but not `run` — there was no way to enable
@@ -406,8 +489,12 @@ fn run_binary_thinking_flag_reaches_the_wire_request() {
 }
 
 #[test]
-fn run_binary_temperature_flag_reaches_the_wire_request() {
-    // Pi-parity gap: none of the three dialects exposed a temperature knob at all.
+fn run_binary_with_no_reasoning_flags_defaults_to_medium_thinking_on_a_reasoning_capable_model() {
+    // Fix 1 (pi-parity gap): pi's own `DEFAULT_THINKING_LEVEL` is "medium" whenever the model supports
+    // reasoning at all (`defaults.ts`) — a bare invocation with neither `--reasoning-effort` nor
+    // `--thinking` previously left reasoning off entirely instead of picking this default.
+    // `claude-test` resolves to `ThinkingShape::Budget`, so "medium" derives an 8192-token budget
+    // (`agent_core::models::budget_for_effort`).
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
@@ -421,6 +508,172 @@ fn run_binary_temperature_flag_reaches_the_wire_request() {
             "bai_v1.test",
             "--model",
             "claude-test",
+            "--no-session-persistence",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[0].contains(r#""budget_tokens":8192"#),
+        "zero reasoning flags must default to medium (an 8192-token budget for this model): {}",
+        bodies[0]
+    );
+}
+
+#[test]
+fn run_binary_explicit_reasoning_effort_flag_wins_over_the_medium_default() {
+    // Fix 1 (pi-parity gap): an explicit `--reasoning-effort` must still be respected outright rather
+    // than the new "medium" default silently overriding it.
+    let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "hi",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--reasoning-effort",
+            "xhigh",
+            "--no-session-persistence",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[0].contains(r#""budget_tokens":31999"#),
+        "--reasoning-effort xhigh must be respected instead of the medium default: {}",
+        bodies[0]
+    );
+}
+
+#[test]
+fn run_binary_with_no_reasoning_flags_sets_no_reasoning_effort_on_a_model_with_no_reasoning_mechanism()
+ {
+    // Fix 1 (pi-parity gap): the medium default only applies when the model actually supports
+    // reasoning at all — `claude-3-5-sonnet-20241022` has no thinking/reasoning mechanism
+    // (`models.rs::capabilities`), so it must reach the wire with no `thinking` field whatsoever, not a
+    // spuriously-defaulted one.
+    let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "hi",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-3-5-sonnet-20241022",
+            "--no-session-persistence",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        !bodies[0].contains(r#""thinking""#),
+        "a model with no reasoning mechanism must get no thinking field at all: {}",
+        bodies[0]
+    );
+}
+
+#[test]
+fn run_binary_model_flag_colon_suffix_resolves_the_id_and_sets_reasoning_effort() {
+    // Fix 2 (pi-parity gap): `--model <pattern>:<thinking-level>` (pi's own `model-resolver.ts::
+    // parseModelPattern`, help text example `pi --model sonnet:high`) previously only worked for
+    // `--models`; a bare `--model` ignored the suffix as part of a (then-unresolvable) literal id.
+    // "sonnet" resolves to "claude-sonnet-4-5" (Budget-shape, 64_000 max output), so "high" derives a
+    // 16384-token budget with no separate `--reasoning-effort` needed.
+    let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "hi",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "sonnet:high",
+            "--no-session-persistence",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[0].contains(r#""model":"claude-sonnet-4-5""#),
+        "--model sonnet:high must resolve the id to claude-sonnet-4-5: {}",
+        bodies[0]
+    );
+    assert!(
+        bodies[0].contains(r#""budget_tokens":16384"#),
+        "--model sonnet:high must set reasoning effort to high (a 16384-token budget): {}",
+        bodies[0]
+    );
+}
+
+#[test]
+fn run_binary_temperature_flag_reaches_the_wire_request() {
+    // Pi-parity gap: none of the three dialects exposed a temperature knob at all.
+    //
+    // A legacy gen-3 id, not `claude-test`: Anthropic forbids `temperature` alongside extended
+    // thinking, and Fix 1 (pi-parity gap) now defaults reasoning-capable models like `claude-test` to
+    // "medium" thinking when neither `--reasoning-effort` nor `--thinking` is given, which would
+    // silently drop `temperature` from the wire here. `claude-3-5-sonnet-20241022` has no
+    // thinking/reasoning mechanism at all (`models.rs::capabilities`), so it's unaffected either way.
+    let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "hi",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-3-5-sonnet-20241022",
             "--temperature",
             "0.25",
             "--no-session-persistence",

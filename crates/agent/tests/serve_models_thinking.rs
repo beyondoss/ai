@@ -238,6 +238,45 @@ fn serve_set_model_and_cycle_model_responses_carry_capability_info() {
 }
 
 #[test]
+fn serve_set_model_colon_suffix_resolves_the_id_and_sets_reasoning_effort() {
+    // Fix 2 (pi-parity gap): `set_model`'s `model` may carry a `:<level>` suffix (the same shorthand
+    // `--model`/`--models` already support) to switch model and reasoning effort in one round trip,
+    // winning outright over whatever level was already active.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_model", "model": "opus:low" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "set_model");
+    let data = &frames.last().unwrap()["data"];
+    assert_eq!(data["model"], "claude-opus-4-8", "got: {data:#?}");
+    assert_eq!(data["reasoning_effort"], "low", "got: {data:#?}");
+
+    writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_state");
+    assert_eq!(
+        frames.last().unwrap()["data"]["thinking_level"],
+        "low",
+        "get_state must reflect the colon-suffix level too, not just the set_model response"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
 fn serve_cycle_model_scoped_by_the_models_flag_cycles_only_the_scope_but_lists_the_full_catalog() {
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
@@ -507,19 +546,21 @@ fn serve_cycle_thinking_level_advances_through_the_ladder_and_wraps() {
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
-    // Starting Off, each cycle advances one rung on the portable Off/Minimal/Low/Medium/High ladder,
-    // wrapping back to Off. `claude-test` (this test's model) resolves to `ThinkingShape::Budget` with
-    // a 32_000 max_output, so `reasoning_effort` stays null throughout (that dialect arm never reads
-    // it) and `thinking` is the level's derived, clamped budget. No `XHigh` rung: pi's
-    // `thinkingLevelMap` only offers `xhigh` on the four gen6+ Adaptive-shape model ids, not the
-    // generic Budget-shape branch `claude-test` falls into (see `models.rs`'s
-    // `supports_xhigh_reasoning`).
+    // Fix 1 (pi-parity gap): a fresh session with no `--reasoning-effort` now starts at "medium"
+    // (pi's own `DEFAULT_THINKING_LEVEL`), not "off" — `claude-test` (this test's model) supports
+    // reasoning, so `serve::default_reasoning_effort_for_model` applies. Each cycle advances one rung
+    // on the portable Off/Minimal/Low/Medium/High ladder from that starting point, wrapping.
+    // `claude-test` resolves to `ThinkingShape::Budget` with a 32_000 max_output, so
+    // `reasoning_effort` stays null throughout (that dialect arm never reads it) and `thinking` is the
+    // level's derived, clamped budget. No `XHigh` rung: pi's `thinkingLevelMap` only offers `xhigh` on
+    // the four gen6+ Adaptive-shape model ids, not the generic Budget-shape branch `claude-test` falls
+    // into (see `models.rs`'s `supports_xhigh_reasoning`).
     let expected = [
+        ("high", json!(16384)),
+        ("off", Value::Null),
         ("minimal", json!(1024)),
         ("low", json!(2048)),
         ("medium", json!(8192)),
-        ("high", json!(24000)),
-        ("off", Value::Null),
     ];
     for (level, thinking) in expected {
         writeln!(stdin, "{}", json!({ "type": "cycle_thinking_level" })).unwrap();
@@ -558,7 +599,7 @@ fn serve_set_reasoning_effort_sets_the_portable_level_directly() {
     let data = &frames.last().unwrap()["data"];
     assert_eq!(frames.last().unwrap()["success"], true, "got: {data:#?}");
     assert_eq!(data["level"], "high");
-    assert_eq!(data["thinking"], 24000);
+    assert_eq!(data["thinking"], 16384);
 
     // A subsequent cycle starts from "high" — the top rung `claude-test` (Budget-shape) supports, no
     // `xhigh` — wrapping back to "off", proving `set_reasoning_effort` really did move
@@ -643,6 +684,10 @@ fn serve_starts_clamped_not_off_for_a_model_that_cannot_disable_reasoning() {
     // explicitly disable (`gpt-5-codex`: `reasoning_disableable == false`) must never start at the
     // stored level `Off` — that would silently omit the `reasoning` field from every request and let
     // the provider apply its own hidden default effort, with the operator believing reasoning is off.
+    // Fix 1 (pi-parity gap) layers on top: a fresh session with no `--reasoning-effort` now starts at
+    // pi's own "medium" default rather than `Off` in the first place, so the clamp here has nothing to
+    // bump for `gpt-5-codex` specifically — its floor (`min_reasoning_effort: Minimal`) is already
+    // below "medium" — but the level still isn't `Off`, which is the property this test guards.
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
@@ -659,9 +704,9 @@ fn serve_starts_clamped_not_off_for_a_model_that_cannot_disable_reasoning() {
     let frames = read_until_response(&mut stdout, "get_state");
     let data = &frames.last().unwrap()["data"];
     assert_eq!(
-        data["thinking_level"], "minimal",
-        "gpt-5-codex's floor is minimal; a fresh session with no --reasoning-effort must start \
-         there, not at off: got {data:#?}"
+        data["thinking_level"], "medium",
+        "a fresh session with no --reasoning-effort must start at pi's own \"medium\" default, not \
+         at off: got {data:#?}"
     );
 
     drop(stdin);
@@ -675,10 +720,25 @@ fn serve_set_model_reclamps_off_when_switching_onto_a_non_disableable_model() {
     let (base, _bodies) = spawn_model_server(vec![]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    // `claude-test` is disable-capable, so the session starts at a legal "off".
+    // `claude-test` is disable-capable, so "off" is a legal level for it — but Fix 1 (pi-parity gap)
+    // means a fresh session no longer *starts* there (see `serve_starts_clamped_not_off_...` and
+    // `serve_cycle_thinking_level_advances_...` for that default). Forced explicitly here via
+    // `set_reasoning_effort` so this test still exercises what it's actually about: `set_model`
+    // re-clamping a stored *illegal* level (`Off`, on a model that can't disable reasoning) up to the
+    // new model's own floor, not silently carrying it across the switch.
     let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_reasoning_effort", "effort": Value::Null })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "set_reasoning_effort");
+    assert_eq!(frames.last().unwrap()["data"]["level"], "off");
 
     writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
     stdin.flush().unwrap();
@@ -729,8 +789,9 @@ fn serve_cycle_thinking_level_never_gets_stuck_for_a_model_without_xhigh_or_off(
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
-    // Starts clamped at "minimal" (see the dedicated startup-clamp test above).
-    let expected = ["low", "medium", "high", "minimal", "low", "medium", "high"];
+    // Fix 1 (pi-parity gap): starts at "medium" now, not "minimal" (see the dedicated startup test
+    // above) — gpt-5-codex's floor (minimal) is already below "medium", so nothing clamps it further.
+    let expected = ["high", "minimal", "low", "medium", "high", "minimal", "low"];
     for level in expected {
         writeln!(stdin, "{}", json!({ "type": "cycle_thinking_level" })).unwrap();
         stdin.flush().unwrap();

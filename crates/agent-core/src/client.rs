@@ -361,15 +361,20 @@ impl ModelTransport for GatewayClient {
         {
             req.messages = fixed.into();
         }
-        let dialect = Dialect::for_model(&req.model);
         // Resolved fresh for this turn rather than a field snapshot — the seam that lets a
         // credential expire and be refreshed mid-process (see `CredentialSource`'s doc comment).
         // `send_with_retry`'s own internal transient-failure retries never hit 401, so one fetch per
         // `stream()` call (once per model turn) is all that's needed, not one per retry attempt.
-        // Fetched before `url` is built (rather than after, as a plain-key client would): a
-        // Copilot/Codex-sourced credential's `direct` routing (see `RouteOverride`) determines the URL
-        // itself, not just the bearer value.
+        // Fetched before the dialect is picked (as well as before `url` is built): GitHub Copilot's
+        // proxy wants a different wire shape than a model's native classification for at least one id
+        // (see `Dialect::for_model_via_copilot`'s doc comment), so dialect selection itself needs to
+        // know whether this credential is Copilot-routed.
         let credential = self.credential_source.credential().await?;
+        let via_copilot = credential
+            .direct
+            .as_ref()
+            .is_some_and(|d| d.copilot_dynamic_headers);
+        let dialect = Dialect::for_model_via_copilot(&req.model, via_copilot);
         let url = match credential.direct.as_ref().map(|d| &d.route) {
             Some(RouteOverride::Prefixed { prefix, path }) => {
                 format!("{}{prefix}{path}", self.base_url)
@@ -394,12 +399,22 @@ impl ModelTransport for GatewayClient {
         // every route but one that explicitly opts out of `Authorization: Bearer` (Azure OpenAI's
         // `api-key`, Task #8).
         let auth_header = credential.direct.as_ref().and_then(|d| d.auth_header.clone());
+        // Distinguishes Copilot- and Azure-routed requests for dialect-body branches that need to
+        // know (gpt-5.x reasoning-disable suppression, Azure's prompt_cache_retention suppression) —
+        // reuses the same signals already computed above rather than adding a third detection path.
+        req.is_copilot = via_copilot;
+        req.is_azure = auth_header.as_deref() == Some("api-key");
         // Anthropic's own OAuth identity-spoofing headers (`CLAUDE_CODE_BETA`/`CLAUDE_CLI_IDENTITY`
-        // etc., below) only apply to a genuine direct-to-Anthropic request — a Claude-family model
-        // routed through a Copilot credential (`direct.is_some()`) is `is_oauth` too, but must not
-        // also claim to be the Anthropic-official Claude Code client to GitHub's Copilot proxy.
+        // etc., below) and body shape (Claude Code's identity system prompt, canonical tool-name
+        // casing — `dialect::anthropic::build_body`) only apply to a genuine direct-to-Anthropic
+        // request — a Claude-family model routed through a Copilot credential (`direct.is_some()`) is
+        // `credential.is_oauth` too, but must not also claim to be the Anthropic-official Claude Code
+        // client to GitHub's Copilot proxy. Computed once and fed to both the request body and the
+        // decoder (reversing tool_use names back) so the two halves of the round-trip always agree.
         let has_direct_override = credential.direct.is_some();
-        let body = dialect.build_body(&req);
+        let is_oauth = credential.is_oauth && !has_direct_override;
+        let body = dialect.build_body(&req, is_oauth);
+        let tools_for_decoder = req.tools.clone();
         let http = self.http.clone();
         let max_retries = self.max_retries;
         let base_backoff = self.base_backoff;
@@ -439,10 +454,7 @@ impl ModelTransport for GatewayClient {
                 credential.key.expose(),
                 &body,
                 is_anthropic,
-                // Only a genuine direct-to-Anthropic OAuth login gets Anthropic's own identity-
-                // spoofing headers — never a Copilot-routed request that merely happens to be
-                // Claude-family (see `has_direct_override`'s doc comment above).
-                credential.is_oauth && !has_direct_override,
+                is_oauth,
                 needs_interleaved_beta,
                 needs_fine_grained_tool_streaming_beta,
                 session_affinity_header.as_deref(),
@@ -484,7 +496,7 @@ impl ModelTransport for GatewayClient {
             // belonging to one logical event (see `SseEventBuffer`'s doc comment) — real
             // Anthropic/OpenAI never split an event across lines, but a spec-conformant intermediary
             // could, and the SSE spec's own event boundary is a blank line, not a per-`data:`-line one.
-            let mut decoder = dialect.decoder();
+            let mut decoder = dialect.decoder(is_oauth, tools_for_decoder);
             let mut framer = LineFramer::new();
             let mut sse_buf = SseEventBuffer::new();
             let mut bytes = resp.bytes_stream();
@@ -731,6 +743,12 @@ async fn send_with_retry(
         }
         if is_anthropic {
             builder = builder.header("anthropic-version", ANTHROPIC_VERSION);
+            // pi's `anthropic-messages.ts` sends this header in all three of its `createClient`
+            // branches (Copilot Bearer auth, OAuth, and plain API-key/header-owned auth) —
+            // unconditional here too, not gated on `is_oauth` alone, to match exactly. Believed benign
+            // under a headless `reqwest` client with no browser fingerprint to trigger whatever
+            // server-side check this header suppresses.
+            builder = builder.header("anthropic-dangerous-direct-browser-access", "true");
             // OAuth betas lead the list — matches pi's own exact ordering
             // (`claude-code-20250219,oauth-2025-04-20,[...]`).
             let mut betas = Vec::new();
@@ -752,7 +770,6 @@ async fn send_with_retry(
                 // Claude Code client — see `CLAUDE_CODE_BETA`'s doc comment for why sending these is
                 // a deliberate, confirmed choice, not an oversight.
                 builder = builder
-                    .header("anthropic-dangerous-direct-browser-access", "true")
                     .header("user-agent", CLAUDE_CLI_IDENTITY)
                     .header("x-app", "cli");
             }
@@ -1256,8 +1273,12 @@ mod tests {
         assert!(!request.contains("claude-code-20250219"), "got:\n{request}");
         assert!(!request.contains("oauth-2025-04-20"), "got:\n{request}");
         assert!(!request.contains("x-app:"), "got:\n{request}");
+        assert!(!request.contains("user-agent: claude-cli/"), "got:\n{request}");
+        // pi sends this header in every Anthropic auth branch, including plain API-key auth
+        // (`anthropic-messages.ts`'s `createClient`) — present here too, unlike the OAuth-only
+        // identity headers asserted absent above.
         assert!(
-            !request.contains("anthropic-dangerous-direct-browser-access"),
+            request.contains("anthropic-dangerous-direct-browser-access: true"),
             "got:\n{request}"
         );
     }
@@ -1935,6 +1956,247 @@ mod tests {
             !request.contains("claude-code-20250219") && !lower.contains("x-app: cli"),
             "an is_oauth Copilot credential must not carry Anthropic's own OAuth identity-spoofing \
              headers, got:\n{request}"
+        );
+    }
+
+    /// A Claude-family model routed through a Copilot credential is `is_anthropic` but not
+    /// `is_oauth` (see `has_direct_override`'s doc comment in `stream()`): it must still get
+    /// `anthropic-dangerous-direct-browser-access` (pi sends that header in every Anthropic auth
+    /// branch, Copilot included — Task 3, pi-parity), but none of Anthropic's own OAuth-only identity
+    /// headers, which would misrepresent this as a direct-to-Anthropic Claude Code request instead of
+    /// a Copilot-proxied one.
+    #[tokio::test]
+    async fn a_copilot_routed_claude_model_gets_the_browser_access_header_but_not_claude_code_identity()
+     {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+            drop(stream);
+            request
+        });
+
+        let routing = DirectRouting {
+            route: RouteOverride::Direct {
+                base_url: format!("http://{addr}"),
+                path: "/v1/messages",
+            },
+            static_headers: vec![("User-Agent", "GitHubCopilotChat/0.35.0".to_string())],
+            copilot_dynamic_headers: true,
+            auth_header: None,
+        };
+        let client = GatewayClient::with_credential_source(
+            "http://127.0.0.1:1".to_string(),
+            Arc::new(DirectTestCredential(routing)),
+        )
+        .unwrap();
+        let req = ModelRequest::new("claude-opus-4-8", vec![crate::message::Message::user("hi")], 100);
+        let mut events = client.stream(req).await.unwrap();
+        while events.next().await.is_some() {}
+
+        let request = server.join().unwrap();
+        let lower = request.to_lowercase();
+        assert!(
+            lower.contains("anthropic-dangerous-direct-browser-access: true"),
+            "got:\n{request}"
+        );
+        assert!(
+            !request.contains("claude-code-20250219") && !lower.contains("oauth-2025-04-20"),
+            "got:\n{request}"
+        );
+        assert!(!lower.contains("x-app: cli"), "got:\n{request}");
+        assert!(!lower.contains("user-agent: claude-cli/"), "got:\n{request}");
+    }
+
+    /// pi-parity (Task 2): `gpt-4.1` is `ApiKind::Responses` natively (`models::capabilities`), but
+    /// GitHub Copilot's own proxy wants the older Chat Completions wire for that exact id
+    /// (`github-copilot.models.ts`: `api: "openai-completions"`, vs `openai.models.ts`'s
+    /// `"openai-responses"` for the same id natively). A Copilot-routed request for it must build a
+    /// Chat Completions body (`"messages"`), never a Responses body (`"input"`).
+    #[tokio::test]
+    async fn a_copilot_routed_gpt_4_1_builds_a_chat_completions_body_not_a_responses_body() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+            drop(stream);
+            request
+        });
+
+        let routing = DirectRouting {
+            route: RouteOverride::Direct {
+                base_url: format!("http://{addr}"),
+                path: "/chat/completions",
+            },
+            static_headers: vec![("User-Agent", "GitHubCopilotChat/0.35.0".to_string())],
+            copilot_dynamic_headers: true,
+            auth_header: None,
+        };
+        let client = GatewayClient::with_credential_source(
+            "http://127.0.0.1:1".to_string(),
+            Arc::new(DirectTestCredential(routing)),
+        )
+        .unwrap();
+        let req = ModelRequest::new("gpt-4.1", vec![crate::message::Message::user("hi")], 100);
+        let mut events = client.stream(req).await.unwrap();
+        while events.next().await.is_some() {}
+
+        let request = server.join().unwrap();
+        assert_eq!(
+            request.lines().next().unwrap_or_default(),
+            "POST /chat/completions HTTP/1.1",
+            "expected Copilot's own Chat Completions path, got:\n{request}"
+        );
+        assert!(
+            request.contains("\"messages\":"),
+            "expected a Chat Completions body shape, got:\n{request}"
+        );
+        assert!(
+            !request.contains("\"input\":"),
+            "must not build a Responses body shape for a Copilot-routed gpt-4.1, got:\n{request}"
+        );
+    }
+
+    /// A non-Copilot request for the same id must be unaffected: `gpt-4.1` still resolves to the
+    /// Responses dialect when reached through any route but Copilot's.
+    #[tokio::test]
+    async fn a_non_copilot_gpt_4_1_still_builds_a_responses_body() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+            drop(stream);
+            request
+        });
+
+        let client = GatewayClient::new(format!("http://{addr}"), "test-key").unwrap();
+        let req = ModelRequest::new("gpt-4.1", vec![crate::message::Message::user("hi")], 100);
+        let mut events = client.stream(req).await.unwrap();
+        while events.next().await.is_some() {}
+
+        let request = server.join().unwrap();
+        assert!(
+            request.contains("\"input\":"),
+            "expected the native Responses body shape, got:\n{request}"
+        );
+    }
+
+    /// pi-parity (pass 15): proves `GatewayClient::stream` actually sets [`ModelRequest::is_copilot`]
+    /// on the live request — the dialect-side gate (`copilot_routed_gpt5_ids_never_get_an_explicit_
+    /// reasoning_disable` in `dialect/openai_responses.rs`) only proves the body-building half; this
+    /// proves the wiring from a real Copilot-routed credential through to that flag.
+    #[tokio::test]
+    async fn copilot_routed_gpt5_2_omits_the_explicit_reasoning_disable_end_to_end() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+            drop(stream);
+            request
+        });
+
+        let routing = DirectRouting {
+            route: RouteOverride::Direct {
+                base_url: format!("http://{addr}"),
+                path: "/responses",
+            },
+            static_headers: Vec::new(),
+            copilot_dynamic_headers: true,
+            auth_header: None,
+        };
+        let client = GatewayClient::with_credential_source(
+            "http://127.0.0.1:1".to_string(),
+            Arc::new(DirectTestCredential(routing)),
+        )
+        .unwrap();
+        let req = ModelRequest::new("gpt-5.2", vec![crate::message::Message::user("hi")], 100);
+        let mut events = client.stream(req).await.unwrap();
+        while events.next().await.is_some() {}
+
+        let request = server.join().unwrap();
+        assert!(
+            !request.contains("\"reasoning\":{\"effort\":\"none\"}"),
+            "Copilot-routed gpt-5.2 must not get an explicit reasoning-disable, got:\n{request}"
+        );
+    }
+
+    /// pi-parity (pass 15): proves `GatewayClient::stream` actually sets [`ModelRequest::is_azure`] on
+    /// the live request from the same `auth_header == "api-key"` signal
+    /// `direct_route_with_custom_auth_header_sends_bare_key_and_omits_authorization` already exercises
+    /// for the header shape — this proves it also suppresses `prompt_cache_retention` end to end.
+    #[tokio::test]
+    async fn azure_routed_request_omits_prompt_cache_retention_end_to_end() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+            drop(stream);
+            request
+        });
+
+        let routing = DirectRouting {
+            route: RouteOverride::Direct {
+                base_url: format!("http://{addr}/openai/v1"),
+                path: "/responses",
+            },
+            static_headers: Vec::new(),
+            copilot_dynamic_headers: false,
+            auth_header: Some("api-key".to_string()),
+        };
+        let client = GatewayClient::with_credential_source(
+            "http://127.0.0.1:1".to_string(),
+            Arc::new(DirectTestCredential(routing)),
+        )
+        .unwrap();
+        let req = ModelRequest::new("gpt-4o", vec![crate::message::Message::user("hi")], 100)
+            .with_cache_long(true);
+        let mut events = client.stream(req).await.unwrap();
+        while events.next().await.is_some() {}
+
+        let request = server.join().unwrap();
+        assert!(
+            !request.contains("prompt_cache_retention"),
+            "Azure-routed request with --cache-long must not send prompt_cache_retention, got:\n{request}"
         );
     }
 

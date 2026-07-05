@@ -55,7 +55,33 @@ const MAX_OUTPUT_BYTES: usize = super::output::DEFAULT_MAX_BYTES;
 const NON_VISION_IMAGE_NOTE: &str =
     "[Current model does not support images. The image will be omitted from this request.]";
 
-pub struct Read;
+pub struct Read {
+    /// Whether an oversized image is downscaled/re-encoded to fit the inline size budget before being
+    /// sent to the model — pi's `ImageSettings.autoResize` (default `true`). `false` (`agent run
+    /// --no-image-auto-resize`/`agent settings --image-auto-resize false`) skips [`resize_image`]
+    /// entirely and ships the normalized (format-converted, if a BMP) bytes as-is regardless of size,
+    /// matching pi's `processImage`, which never calls `resizeImage` in that case either. Set once at
+    /// registry-construction time (see `default_registry_with_prefix_and_image_auto_resize` in
+    /// `tools/mod.rs`) rather than per-call — mirrors how `bash`'s own tunables (`default_timeout_ms`,
+    /// `shell_path`) are configured.
+    image_auto_resize: bool,
+}
+
+impl Default for Read {
+    fn default() -> Self {
+        Self {
+            image_auto_resize: true,
+        }
+    }
+}
+
+impl Read {
+    /// Builder-style: gate the resize/downscale path on `enabled` — see the field's own doc comment.
+    pub fn with_image_auto_resize(mut self, enabled: bool) -> Self {
+        self.image_auto_resize = enabled;
+        self
+    }
+}
 
 /// If `path` doesn't exist as given, try a small set of Unicode-normalization fallbacks pi's `read`
 /// tool also tries (`resolveReadPath`), in order: NFD-decomposed form, straight-to-curly-quote
@@ -197,9 +223,11 @@ impl Tool for Read {
             // specifically so it doesn't stall the event loop, keep it off this async runtime's worker
             // threads too (same pattern as `grep`/`find`'s own blocking walks).
             let path_for_task = path.clone();
-            let result = tokio::task::spawn_blocking(move || read_image(&path_for_task, format))
-                .await
-                .map_err(|e| ToolError::Execution(format!("image read task failed: {e}")))?;
+            let auto_resize = self.image_auto_resize;
+            let result =
+                tokio::task::spawn_blocking(move || read_image(&path_for_task, format, auto_resize))
+                    .await
+                    .map_err(|e| ToolError::Execution(format!("image read task failed: {e}")))?;
             match result {
                 Ok(mut out) => {
                     if !supports_vision {
@@ -550,15 +578,37 @@ fn convert_to_png(bytes: &[u8], format: image::ImageFormat) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// pi's `conversionHint` (`image-process.ts`) — appended to the read text whenever [`read_image`] had
+/// to normalize a BMP into a supported format before it could be sent to the model, so the transcript
+/// states *why* the returned media type/bytes differ from the file's real, on-disk format. The model
+/// still receives a correctly-converted image either way — this is purely a transcript/explanation gap
+/// otherwise. `to` is the *actual* media type finally sent, which can differ from the immediate
+/// post-BMP-conversion PNG when the resize path later re-encodes further to JPEG to fit the byte
+/// budget — matching pi's own `conversionHint(normalized.convertedFrom, <final mime type>)` exactly.
+fn bmp_conversion_note(converted_from_bmp: bool, to: &str) -> String {
+    if converted_from_bmp {
+        format!(" [Image converted from image/bmp to {to}.]")
+    } else {
+        String::new()
+    }
+}
+
 /// Read an image file and return it as a base64 [`ImageSource`] attachment (plus a short text note), so
 /// the multimodal model can actually see it. `ext_format` is only the fallback used when magic-byte
 /// sniffing can't identify the real format (a truncated or corrupt header); the sniffed format is
 /// preferred whenever it succeeds. An image that already fits [`MAX_IMAGE_BASE64_BYTES`] is sent as its
-/// original bytes, unmodified; an oversized one is downscaled/re-encoded by [`resize_image`]. If even
-/// that can't fit the budget, or a BMP fails to convert to a supported format, this returns `Ok` with a
-/// text-only "[Image omitted: …]" result rather than an `Err` — matching pi's `processImage`, which
-/// treats both as a normal (if disappointing) outcome for the model to see, not a failed tool call.
-fn read_image(path: &str, ext_format: image::ImageFormat) -> Result<ToolOutput, ToolError> {
+/// original bytes, unmodified; an oversized one is downscaled/re-encoded by [`resize_image`] — unless
+/// `auto_resize` is `false` (pi's `ImageSettings.autoResize`), in which case the resize path is skipped
+/// entirely and the normalized bytes ship as-is regardless of size, matching pi's `processImage`, which
+/// never calls `resizeImage` in that case either. If the resize path is taken but still can't fit the
+/// budget, or a BMP fails to convert to a supported format, this returns `Ok` with a text-only "[Image
+/// omitted: …]" result rather than an `Err` — matching pi's `processImage`, which treats both as a
+/// normal (if disappointing) outcome for the model to see, not a failed tool call.
+fn read_image(
+    path: &str,
+    ext_format: image::ImageFormat,
+    auto_resize: bool,
+) -> Result<ToolOutput, ToolError> {
     let bytes =
         std::fs::read(path).map_err(|e| ToolError::Execution(format!("read {path}: {e}")))?;
     let format = image::guess_format(&bytes).unwrap_or(ext_format);
@@ -568,9 +618,9 @@ fn read_image(path: &str, ext_format: image::ImageFormat) -> Result<ToolOutput, 
     // before it can reach the model — rather than sending a media type the provider will 400 on. A
     // failed conversion falls through with the original bytes/format; the caller still gets a
     // best-effort attachment rather than a hard error over a format quirk.
-    let (bytes, format) = if format == image::ImageFormat::Bmp {
+    let (bytes, format, converted_from_bmp) = if format == image::ImageFormat::Bmp {
         match convert_to_png(&bytes, format) {
-            Some(png) => (png, image::ImageFormat::Png),
+            Some(png) => (png, image::ImageFormat::Png, true),
             // pi: `image-process.ts`'s `processImage`, when `normalizeImage` fails — a text-only,
             // *successful* result (`ok: false` with a message, not a thrown/rejected error), so the
             // model sees an explanation rather than the tool call itself reading as failed. `read.ts`
@@ -583,9 +633,24 @@ fn read_image(path: &str, ext_format: image::ImageFormat) -> Result<ToolOutput, 
             }
         }
     } else {
-        (bytes, format)
+        (bytes, format, false)
     };
     let media_type = media_type_of(format);
+
+    if !auto_resize {
+        // pi: `image-process.ts`'s `processImage`, `autoResizeImages === false` branch — `resizeImage`
+        // (and the decode-validation that lives inside it, further down) is never called at all; the
+        // normalized bytes ship as-is, whatever their size or pixel dimensions.
+        let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        return Ok(ToolOutput::image(
+            format!(
+                "Read image {path} ({media_type}, {} bytes).{}",
+                bytes.len(),
+                bmp_conversion_note(converted_from_bmp, media_type)
+            ),
+            ImageSource::base64(media_type, data),
+        ));
+    }
 
     if base64_len(bytes.len()) <= MAX_IMAGE_BASE64_BYTES as usize {
         // Magic-byte sniffing only confirms the file *starts like* an image; a truncated download, a
@@ -611,7 +676,11 @@ fn read_image(path: &str, ext_format: image::ImageFormat) -> Result<ToolOutput, 
         if decoded.width() <= MAX_IMAGE_DIMENSION && decoded.height() <= MAX_IMAGE_DIMENSION {
             let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
             return Ok(ToolOutput::image(
-                format!("Read image {path} ({media_type}, {} bytes).", bytes.len()),
+                format!(
+                    "Read image {path} ({media_type}, {} bytes).{}",
+                    bytes.len(),
+                    bmp_conversion_note(converted_from_bmp, media_type)
+                ),
                 ImageSource::base64(media_type, data),
             ));
         }
@@ -640,8 +709,9 @@ fn read_image(path: &str, ext_format: image::ImageFormat) -> Result<ToolOutput, 
                 format!(
                     "Read image {path} ({media_type}, {} bytes); resized from {orig_w}x{orig_h} to \
                      {new_w}x{new_h} ({resized_media_type}) to fit within the inline size budget. \
-                     Multiply coordinates by {scale:.2} to map to the original image.",
-                    bytes.len()
+                     Multiply coordinates by {scale:.2} to map to the original image.{}",
+                    bytes.len(),
+                    bmp_conversion_note(converted_from_bmp, resized_media_type)
                 ),
                 ImageSource::base64(resized_media_type, resized.base64_data),
             ))
@@ -789,7 +859,7 @@ mod tests {
     #[tokio::test]
     async fn reads_with_line_numbers() {
         let f = tmp_file("alpha\nbeta\ngamma\n");
-        let out = Read
+        let out = Read::default()
             .run(json!({ "path": f.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -801,7 +871,7 @@ mod tests {
     #[tokio::test]
     async fn offset_past_eof_is_an_error() {
         let f = tmp_file("a\nb\nc\n");
-        let err = Read
+        let err = Read::default()
             .run(json!({ "path": f.path().to_str().unwrap(), "offset": 99 }))
             .await
             .unwrap_err();
@@ -817,11 +887,11 @@ mod tests {
         let with_trailing = tmp_file("a\nb\nc\n");
         let without_trailing = tmp_file("a\nb\nc");
 
-        let err_with = Read
+        let err_with = Read::default()
             .run(json!({ "path": with_trailing.path().to_str().unwrap(), "offset": 99 }))
             .await
             .unwrap_err();
-        let err_without = Read
+        let err_without = Read::default()
             .run(json!({ "path": without_trailing.path().to_str().unwrap(), "offset": 99 }))
             .await
             .unwrap_err();
@@ -840,7 +910,7 @@ mod tests {
     #[tokio::test]
     async fn truncation_reports_next_offset() {
         let f = tmp_file("a\nb\nc\nd\ne\n");
-        let out = Read
+        let out = Read::default()
             .run(json!({ "path": f.path().to_str().unwrap(), "limit": 2 }))
             .await
             .unwrap()
@@ -861,7 +931,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let f = tmp_file(&format!("{body}\n"));
-        let out = Read
+        let out = Read::default()
             .run(json!({ "path": f.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -878,7 +948,7 @@ mod tests {
     #[tokio::test]
     async fn honors_offset_and_limit() {
         let f = tmp_file("a\nb\nc\nd\ne\n");
-        let out = Read
+        let out = Read::default()
             .run(json!({ "path": f.path().to_str().unwrap(), "offset": 2, "limit": 2 }))
             .await
             .unwrap()
@@ -890,7 +960,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_file_is_execution_error() {
-        let err = Read
+        let err = Read::default()
             .run(json!({ "path": "/no/such/file/xyz" }))
             .await
             .unwrap_err();
@@ -907,7 +977,7 @@ mod tests {
         std::fs::write(dir.path().join(nfd_name), "content").unwrap();
 
         let nfc_path = dir.path().join("caf\u{e9}.txt"); // NFC: precomposed é
-        let out = Read
+        let out = Read::default()
             .run(json!({ "path": nfc_path.to_str().unwrap() }))
             .await
             .unwrap()
@@ -925,7 +995,7 @@ mod tests {
         std::fs::write(dir.path().join(curly_name), "content").unwrap();
 
         let straight_path = dir.path().join("don't.txt"); // U+0027 straight apostrophe
-        let out = Read
+        let out = Read::default()
             .run(json!({ "path": straight_path.to_str().unwrap() }))
             .await
             .unwrap()
@@ -937,7 +1007,7 @@ mod tests {
     async fn a_genuinely_missing_file_still_errors_after_exhausting_fallbacks() {
         // None of the Unicode-normalization fallbacks should turn a truly nonexistent file into a
         // false positive.
-        let err = Read
+        let err = Read::default()
             .run(json!({ "path": "/no/such/file/xyz-caf\u{e9}-don't.txt" }))
             .await
             .unwrap_err();
@@ -950,7 +1020,7 @@ mod tests {
         // (needs no `$HOME` mutation — see `expand_tilde`'s own direct unit tests for that half).
         let f = tmp_file("alpha\n");
         let at_prefixed = format!("@{}", f.path().to_str().unwrap());
-        let out = Read.run(json!({ "path": at_prefixed })).await.unwrap().text;
+        let out = Read::default().run(json!({ "path": at_prefixed })).await.unwrap().text;
         assert!(out.contains("alpha"));
     }
 
@@ -963,7 +1033,7 @@ mod tests {
         let line = "x".repeat(100); // + line number prefix + newline, comfortably short per line
         let lines: Vec<String> = (0..1200).map(|_| line.clone()).collect(); // ~120KB of body
         let f = tmp_file(&format!("{}\n", lines.join("\n")));
-        let out = Read
+        let out = Read::default()
             .run(json!({ "path": f.path().to_str().unwrap(), "limit": 100_000 }))
             .await
             .unwrap()
@@ -986,7 +1056,7 @@ mod tests {
         // clipped (with a marker) and the file's line structure is still tracked past it.
         let huge = "x".repeat(MAX_LINE_BYTES * 4);
         let f = tmp_file(&format!("{huge}\nnext\n"));
-        let out = Read
+        let out = Read::default()
             .run(json!({ "path": f.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -1010,7 +1080,7 @@ mod tests {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         f.write_all(b"good line\n\xff\xfe not valid utf-8\nlast\n")
             .unwrap();
-        let out = Read
+        let out = Read::default()
             .run(json!({ "path": f.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -1031,7 +1101,7 @@ mod tests {
         // non-UTF-8, and must not trigger the same warning as genuinely invalid bytes.
         let huge = "é".repeat(MAX_LINE_BYTES); // 2-byte UTF-8 char, so the byte cap can split one
         let f = tmp_file(&format!("{huge}\n"));
-        let out = Read
+        let out = Read::default()
             .run(json!({ "path": f.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -1102,7 +1172,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("shot.png");
         std::fs::write(&path, &png_bytes).unwrap();
-        let out = Read
+        let out = Read::default()
             .run(json!({ "path": path.to_str().unwrap() }))
             .await
             .unwrap();
@@ -1129,7 +1199,7 @@ mod tests {
         let path = dir.path().join("corrupt.png");
         // The real 8-byte PNG signature, but nothing resembling an actual PNG chunk stream after it.
         std::fs::write(&path, [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]).unwrap();
-        let err = Read
+        let err = Read::default()
             .run(json!({ "path": path.to_str().unwrap() }))
             .await
             .unwrap_err();
@@ -1149,7 +1219,7 @@ mod tests {
         let path = dir.path().join("not-an-image.png");
         std::fs::write(&path, "definitely not a png").unwrap();
 
-        let out = Read
+        let out = Read::default()
             .run(json!({ "path": path.to_str().unwrap() }))
             .await
             .unwrap();
@@ -1258,7 +1328,7 @@ mod tests {
         let path = dir.path().join("animated.png");
         std::fs::write(&path, &apng_bytes).unwrap();
 
-        let out = Read
+        let out = Read::default()
             .run(json!({ "path": path.to_str().unwrap() }))
             .await
             .unwrap();
@@ -1294,7 +1364,7 @@ mod tests {
             "fixture must fit the byte budget as-is, so only the dimension check can catch it"
         );
 
-        let out = Read
+        let out = Read::default()
             .run(json!({ "path": path.to_str().unwrap() }))
             .await
             .unwrap();
@@ -1327,7 +1397,7 @@ mod tests {
             .save_with_format(&path, image::ImageFormat::Png)
             .unwrap();
 
-        let out = Read
+        let out = Read::default()
             .run(json!({ "path": path.to_str().unwrap() }))
             .await
             .unwrap();
@@ -1369,7 +1439,7 @@ mod tests {
             "fixture must actually exceed the budget pre-resize"
         );
 
-        let out = Read
+        let out = Read::default()
             .run(json!({ "path": path.to_str().unwrap() }))
             .await
             .unwrap();
@@ -1400,6 +1470,14 @@ mod tests {
             out.text.contains("Multiply coordinates by")
                 && out.text.contains("to map to the original image"),
             "the resize note must state the coordinate-scale multiplier: {}",
+            out.text
+        );
+        // The BMP-to-PNG conversion hint must appear on the resize path too, not just the fast path
+        // `small_bmp_is_converted_to_png_not_sent_as_bmp` covers.
+        assert!(
+            out.text
+                .contains("[Image converted from image/bmp to image/png.]"),
+            "the BMP-to-PNG conversion must be noted even when the resize path is also taken: {}",
             out.text
         );
     }
@@ -1435,7 +1513,7 @@ mod tests {
             }
         });
 
-        let out = Read
+        let out = Read::default()
             .run(json!({ "path": path.to_str().unwrap() }))
             .await
             .unwrap();
@@ -1465,7 +1543,7 @@ mod tests {
             "fixture must fit the budget as-is, so the resize path never engages"
         );
 
-        let out = Read
+        let out = Read::default()
             .run(json!({ "path": path.to_str().unwrap() }))
             .await
             .unwrap();
@@ -1484,6 +1562,126 @@ mod tests {
         );
         let round_tripped = image::load_from_memory(&decoded).unwrap().to_rgb8();
         assert_eq!(round_tripped.get_pixel(0, 0), &image::Rgb([10, 20, 30]));
+        // pi-parity gap (fixed): pi's `image-process.ts` appends a "[Image converted from image/bmp
+        // to image/png.]" hint to the tool result's text whenever a BMP had to be normalized — the
+        // model still receives a correctly-converted image either way, but the transcript previously
+        // never explained why the reported media_type/bytes differ from the file's real, on-disk BMP.
+        assert!(
+            out.text
+                .contains("[Image converted from image/bmp to image/png.]"),
+            "the BMP-to-PNG conversion must be noted in the text: {}",
+            out.text
+        );
+    }
+
+    /// A noise-filled PNG comfortably past both `MAX_IMAGE_DIMENSION` and `MAX_IMAGE_BASE64_BYTES` —
+    /// PNG can't compress incompressible noise, so this genuinely forces the resize path (or, with
+    /// auto-resize off, would exceed both budgets) rather than accidentally fitting as-is.
+    fn oversized_noise_png() -> Vec<u8> {
+        let width = MAX_IMAGE_DIMENSION + 800;
+        let height = 600;
+        let img = image::RgbImage::from_fn(width, height, |x, y| {
+            let h = (x.wrapping_mul(2654435761) ^ y.wrapping_mul(40503)).wrapping_add(0x9e3779b9);
+            image::Rgb([(h & 0xff) as u8, ((h >> 8) & 0xff) as u8, ((h >> 16) & 0xff) as u8])
+        });
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .unwrap();
+        bytes
+    }
+
+    #[tokio::test]
+    async fn default_read_still_downscales_an_oversized_image_auto_resize_on_by_default() {
+        // pi-parity feature (Task #4): `image_auto_resize` defaults to `true` (pi's own
+        // `ImageSettings.autoResize` default) — existing behavior must be unchanged for a plain
+        // `Read::default()`, the construction every registry/CLI path already used before this field
+        // existed.
+        let png_bytes = oversized_noise_png();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized.png");
+        std::fs::write(&path, &png_bytes).unwrap();
+
+        let out = Read::default()
+            .run(json!({ "path": path.to_str().unwrap() }))
+            .await
+            .unwrap();
+        assert_eq!(out.images.len(), 1);
+        let decoded = image::load_from_memory(
+            &base64::engine::general_purpose::STANDARD
+                .decode(&out.images[0].data)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            decoded.width() <= MAX_IMAGE_DIMENSION,
+            "auto-resize-on must still downscale an oversized image: got width {}",
+            decoded.width()
+        );
+        assert!(out.text.contains("resized from"), "got: {}", out.text);
+    }
+
+    #[tokio::test]
+    async fn image_auto_resize_off_ships_an_oversized_image_without_downscaling_it() {
+        // pi-parity feature (Task #4): pi's `ImageSettings.autoResize` (`processImage`'s
+        // `autoResizeImages === false` branch) skips `resizeImage` entirely when disabled — an
+        // oversized image must pass through unresized, dimensions and all, rather than being
+        // downscaled/re-encoded to fit the inline budget.
+        let png_bytes = oversized_noise_png();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized.png");
+        std::fs::write(&path, &png_bytes).unwrap();
+
+        let out = Read::default()
+            .with_image_auto_resize(false)
+            .run(json!({ "path": path.to_str().unwrap() }))
+            .await
+            .unwrap();
+        assert_eq!(out.images.len(), 1);
+        let decoded_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&out.images[0].data)
+            .unwrap();
+        assert_eq!(
+            decoded_bytes, png_bytes,
+            "with auto-resize off, the original (post-normalization) bytes must ship unmodified"
+        );
+        let decoded = image::load_from_memory(&decoded_bytes).unwrap();
+        assert!(
+            decoded.width() > MAX_IMAGE_DIMENSION,
+            "the image must not be downscaled when auto-resize is off: got width {}",
+            decoded.width()
+        );
+        assert!(
+            !out.text.contains("resized from"),
+            "no resize note when auto-resize is off: {}",
+            out.text
+        );
+    }
+
+    #[tokio::test]
+    async fn image_auto_resize_off_still_converts_a_bmp_and_notes_it() {
+        // The BMP-to-PNG normalization (and its hint) is independent of auto-resize — pi's
+        // `normalizeImage` always runs before the `autoResizeImages` check.
+        let img = image::RgbImage::from_pixel(4, 4, image::Rgb([10, 20, 30]));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small.bmp");
+        image::DynamicImage::ImageRgb8(img)
+            .save_with_format(&path, image::ImageFormat::Bmp)
+            .unwrap();
+
+        let out = Read::default()
+            .with_image_auto_resize(false)
+            .run(json!({ "path": path.to_str().unwrap() }))
+            .await
+            .unwrap();
+        assert_eq!(out.images.len(), 1);
+        assert_eq!(out.images[0].media_type, "image/png");
+        assert!(
+            out.text
+                .contains("[Image converted from image/bmp to image/png.]"),
+            "got: {}",
+            out.text
+        );
     }
 
     #[tokio::test]
@@ -1503,7 +1701,7 @@ mod tests {
         let path = dir.path().join("actually_a_png.jpg");
         std::fs::write(&path, &png_bytes).unwrap();
 
-        let out = Read
+        let out = Read::default()
             .run(json!({ "path": path.to_str().unwrap() }))
             .await
             .unwrap();
@@ -1533,7 +1731,7 @@ mod tests {
         let path = dir.path().join("clipboard-image-temp");
         std::fs::write(&path, &png_bytes).unwrap();
 
-        let out = Read
+        let out = Read::default()
             .run(json!({ "path": path.to_str().unwrap() }))
             .await
             .unwrap();
@@ -1809,7 +2007,7 @@ mod tests {
         let path = dir.path().join("oversized_corrupt.png");
         std::fs::write(&path, &bytes).unwrap();
 
-        let out = Read
+        let out = Read::default()
             .run(json!({ "path": path.to_str().unwrap() }))
             .await
             .expect("resize_image returning None must not surface as a tool Err");
@@ -1948,7 +2146,7 @@ mod tests {
         let path = dir.path().join("not-really-jpeg.dat"); // no image extension, so only sniffing decides
         std::fs::write(&path, [0xFF, 0xD8, 0xFF, 0xF7, b'h', b'i']).unwrap();
 
-        let out = Read
+        let out = Read::default()
             .run(json!({ "path": path.to_str().unwrap() }))
             .await
             .unwrap();
@@ -1973,7 +2171,7 @@ mod tests {
         let path = dir.path().join("corrupt.bmp");
         std::fs::write(&path, &bytes).unwrap();
 
-        let out = Read
+        let out = Read::default()
             .run(json!({ "path": path.to_str().unwrap() }))
             .await
             .expect("a BMP that fails to convert to PNG must not surface as a tool Err");
@@ -2000,7 +2198,7 @@ mod tests {
             "BM this file just happens to start with the letters B and M, nothing more.\n";
         std::fs::write(&path, content).unwrap();
 
-        let out = Read
+        let out = Read::default()
             .run(json!({ "path": path.to_str().unwrap() }))
             .await
             .unwrap();
@@ -2023,7 +2221,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let f = tmp_file(&format!("{body}\n"));
-        let out = Read
+        let out = Read::default()
             .run(json!({ "path": f.path().to_str().unwrap(), "limit": 5000 }))
             .await
             .unwrap()
@@ -2058,7 +2256,7 @@ mod tests {
         let path = dir.path().join("shot.png");
         std::fs::write(&path, &png_bytes).unwrap();
 
-        let out = Read
+        let out = Read::default()
             .run(json!({ "path": path.to_str().unwrap(), "_model_supports_vision": false }))
             .await
             .unwrap();
@@ -2089,7 +2287,7 @@ mod tests {
         let path = dir.path().join("shot2.png");
         std::fs::write(&path, &png_bytes).unwrap();
 
-        let out = Read
+        let out = Read::default()
             .run(json!({ "path": path.to_str().unwrap() }))
             .await
             .unwrap();
@@ -2110,7 +2308,7 @@ mod tests {
         let path = dir.path().join("corrupt2.bmp");
         std::fs::write(&path, &bytes).unwrap();
 
-        let out = Read
+        let out = Read::default()
             .run(json!({ "path": path.to_str().unwrap(), "_model_supports_vision": false }))
             .await
             .unwrap();

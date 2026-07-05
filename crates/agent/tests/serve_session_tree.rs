@@ -1489,8 +1489,10 @@ fn serve_switch_branch_before_restores_the_model_at_the_resolved_parent_not_the_
 fn serve_switch_branch_resets_thinking_level_instead_of_bleeding_a_sibling_branchs_setting() {
     // Track L4: a `set_reasoning_effort` recorded on one branch must not silently keep applying after
     // switching to a point that never had it — that point genuinely never had a level recorded, so it
-    // must resolve to the *process's own starting level* (here, the default "off"), not whatever the
-    // global runtime setting happens to still be from the branch just abandoned.
+    // must resolve to the *process's own starting level* (here, the default "medium" — Fix 1,
+    // pi-parity gap: `claude-test` supports reasoning, so a fresh process now starts there rather than
+    // "off" — see `serve_starts_clamped_not_off_for_a_model_that_cannot_disable_reasoning`), not
+    // whatever the global runtime setting happens to still be from the branch just abandoned.
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
 
@@ -1535,7 +1537,7 @@ fn serve_switch_branch_resets_thinking_level_instead_of_bleeding_a_sibling_branc
     let resp = frames.last().unwrap();
     assert_eq!(resp["success"], true, "got: {resp:#?}");
     assert_eq!(
-        resp["data"]["reasoning_effort"], "off",
+        resp["data"]["reasoning_effort"], "medium",
         "switching to a point with no recorded level change must reset to the process's own \
          starting level, not bleed the abandoned branch's \"high\": {resp:#?}"
     );
@@ -1544,7 +1546,7 @@ fn serve_switch_branch_resets_thinking_level_instead_of_bleeding_a_sibling_branc
     writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
     stdin.flush().unwrap();
     let frames = read_until_response(&mut stdout, "get_state");
-    assert_eq!(frames.last().unwrap()["data"]["thinking_level"], "off");
+    assert_eq!(frames.last().unwrap()["data"]["thinking_level"], "medium");
 
     drop(stdin);
     child.wait().unwrap();

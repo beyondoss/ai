@@ -665,9 +665,22 @@ impl Agent {
         // resume past by simply calling `run`/`run_events_steered` again with a fresh budget, rather
         // than a permanent dead end once the session's lifetime total crosses it once.
         let mut steps_this_call: u32 = 0;
-        // The previous turn's stop reason, read by `is_hard_overflow`'s `MaxTokens` check — `EndTurn`
-        // (a value that check never matches) until the first turn actually completes.
-        let mut last_stop_reason = StopReason::EndTurn;
+        // The previous turn's stop reason, read by `is_hard_overflow`'s `MaxTokens` check. Re-derived
+        // from `session`'s own last assistant message rather than hardcoded to `EndTurn` (pi-parity fix
+        // — matches pi's own `isContextOverflow`, re-evaluated fresh from the persisted
+        // `AssistantMessage.stopReason` on every `prompt()` call): a `MaxTokens` turn a *prior*
+        // run/process left as the session's last assistant message — nothing in this call has produced
+        // a turn yet — must still be visible to the very first top-of-loop hard-overflow check below,
+        // not just to a run that happens to still be in flight when it fires. `EndTurn` (a value that
+        // check never matches) when there's no assistant message yet, or the last one predates this
+        // field.
+        let mut last_stop_reason = session
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Assistant)
+            .and_then(|m| m.stop_reason)
+            .unwrap_or_default();
         // Mutable, per-call shadows of the `Agent`'s own model/thinking/reasoning-effort — `self` is
         // borrowed immutably for the whole call, so a mid-run switch (see below) can't touch `self`
         // directly; every read of "what model/thinking is this run using right now" goes through these
@@ -937,7 +950,8 @@ impl Agent {
             }
             let mut assistant_message = Message::assistant(blocks)
                 .with_model_id(&current_model)
-                .with_usage(turn.usage);
+                .with_usage(turn.usage)
+                .with_stop_reason(turn.stop_reason);
             if turn.stop_reason == StopReason::Aborted {
                 assistant_message = assistant_message.with_aborted();
             }
@@ -976,6 +990,25 @@ impl Agent {
             if turn.stop_reason == StopReason::Aborted {
                 steering.clear_run_scoped();
                 return Err(Error::Cancelled);
+            }
+
+            // A refusal blocks dispatch unconditionally — checked here, before `calls` is even
+            // collected, so a turn that streamed one or more complete `tool_use` blocks *before* the
+            // model was cut off with a refusal (a real Anthropic wire shape: a refusal explanation
+            // arriving as trailing content after a tool call already closed; OpenAI's `content_filter`
+            // maps to this same stop reason too) never dispatches those calls. Matches pi's
+            // `agent-loop.ts`, which returns unconditionally on an "error"/"aborted" stop reason before
+            // it ever looks at `message.content` for tool calls, dialect-agnostic. Draining queued
+            // steer/follow-up messages here would inject a new user turn right after the model just
+            // declined to engage with the current one, which it would likely refuse again — end the run
+            // immediately instead, leaving the queue untouched (the same persistent `Steering` handle a
+            // later `prompt` call reads from — see `serve.rs`).
+            if turn.stop_reason == StopReason::Refusal {
+                self.checkpoint.checkpoint(session).await;
+                sink(AgentEvent::AgentEnd {
+                    steps: session.steps,
+                });
+                return Ok(());
             }
 
             // Collect the tool calls the assistant just made.
@@ -1056,25 +1089,14 @@ impl Agent {
                     }
                 }
                 // The assistant's tool-less reply is committed above (`session.push(assistant_message)`)
-                // regardless of how this branch resolves from here — a refusal, a graceful stop, or an
-                // ordinary end with nothing left to inject — so it's a valid, resumable checkpoint (see
-                // `CheckpointHook`) exactly like a tool round-trip's own pre-dispatch checkpoint just
-                // below this branch. Previously only the tool-calling half of a turn ever reached a
-                // checkpoint; a plain conversational reply (the model's *most* common shape) never did,
-                // silently relying on a caller's own post-run persist to ever see it recorded.
+                // regardless of how this branch resolves from here — a graceful stop or an ordinary end
+                // with nothing left to inject (a refusal already returned above, before `calls` was even
+                // collected) — so it's a valid, resumable checkpoint (see `CheckpointHook`) exactly like
+                // a tool round-trip's own pre-dispatch checkpoint just below this branch. Previously only
+                // the tool-calling half of a turn ever reached a checkpoint; a plain conversational reply
+                // (the model's *most* common shape) never did, silently relying on a caller's own
+                // post-run persist to ever see it recorded.
                 self.checkpoint.checkpoint(session).await;
-                // A refusal is a distinct terminal condition, not an ordinary stop: draining queued
-                // steer/follow-up messages here would inject a new user turn right after the model
-                // just declined to engage with the current one, which the model would likely refuse
-                // again. End the run immediately instead, leaving the queue untouched — nothing is
-                // lost, since it's the same persistent `Steering` handle a later `prompt` call reads
-                // from (see `serve.rs`).
-                if turn.stop_reason == StopReason::Refusal {
-                    sink(AgentEvent::AgentEnd {
-                        steps: session.steps,
-                    });
-                    return Ok(());
-                }
                 // A pending graceful-stop request wins over draining follow-up/steer messages, exactly
                 // as it wins over continuing tool-call turns below — the queue is left untouched (same
                 // rationale as the refusal case above) so nothing queued for "next time" is lost. A
@@ -1264,33 +1286,17 @@ impl Agent {
                         )));
                         continue;
                     }
-                    if let Some(reason) = match catch_tool_panic(
-                        this.hooks.before_tool_call(name, input, session_ref, cancel_ref),
-                    )
-                    .await
-                    {
-                        // A panicking permission hook fails closed: better to block the call than to
-                        // silently treat a crashed check as "allowed".
-                        Ok(reason) => reason,
-                        Err(panic_msg) => Some(panic_msg),
-                    } {
-                        // A hook blocked the call (e.g. a permission policy). Feed the reason back as an
-                        // error result instead of running the tool.
-                        outcomes[i] = Some(GateOutcome::Immediate((
-                            format!("tool call blocked: {reason}"),
-                            Vec::new(),
-                            true,
-                            false,
-                        )));
-                        continue;
-                    }
                     // Best-effort pi-parity coercion (`validation.rs`, matches pi's AJV-backed
                     // `validateToolArguments`): a provider that stringified a primitive the model emitted
                     // as genuinely typed (`{"count":"42"}` instead of `{"count":42}`) would otherwise fail
                     // the tool's own `as_i64()`/`as_bool()` extraction with a confusing "missing field"
                     // error. Falls back to the raw input unchanged on any coercion failure — a genuinely
                     // malformed call still surfaces through the tool's own existing, clearer validation
-                    // error rather than a new failure path.
+                    // error rather than a new failure path. Run *before* `before_tool_call` (pi-parity
+                    // fix — matches pi's `prepareToolCall`, which calls `validateToolArguments` before
+                    // `config.beforeToolCall`): a permission hook must see the same coerced/typed
+                    // arguments the tool itself is about to run with, not the model's raw, possibly
+                    // stringified wire values.
                     let coerced = match current_tools.get(name) {
                         Some(tool) => {
                             let mut c = crate::validation::coerce_tool_arguments(
@@ -1315,22 +1321,33 @@ impl Agent {
                         }
                         None => input.clone(),
                     };
+                    if let Some(reason) = match catch_tool_panic(
+                        this.hooks.before_tool_call(name, &coerced, session_ref, cancel_ref),
+                    )
+                    .await
+                    {
+                        // A panicking permission hook fails closed: better to block the call than to
+                        // silently treat a crashed check as "allowed".
+                        Ok(reason) => reason,
+                        Err(panic_msg) => Some(panic_msg),
+                    } {
+                        // A hook blocked the call (e.g. a permission policy). Feed the reason back as an
+                        // error result instead of running the tool.
+                        outcomes[i] = Some(GateOutcome::Immediate((
+                            format!("tool call blocked: {reason}"),
+                            Vec::new(),
+                            true,
+                            false,
+                        )));
+                        continue;
+                    }
                     // Task #3 (pi-parity, high-severity): re-check cancellation *after* `before_tool_call`
-                    // returned (and after coercion) — not just at the top of this loop iteration. A slow
-                    // permission-check hook can observe cancellation firing mid-await; without this second
-                    // check, a single-call (or last-in-batch) turn had no *later* iteration to catch it, so
-                    // the call was marked `Ready` and phase 2 dispatched it for real despite the run having
-                    // already been cancelled. Treated exactly like a cancellation caught at the top of the
-                    // loop: `outcomes[i]` stays `None` and `gate_cancelled` skips phase 2 entirely, so
-                    // `repair_cancelled_dispatch` below synthesizes the same cancelled error result it
-                    // already does for any other call cut short mid-gate.
-                    // Task #3 (pi-parity, high-severity): re-check cancellation *after* `before_tool_call`
-                    // returned (and after coercion) — not just at the top of this loop iteration. A slow
-                    // permission-check hook can observe cancellation firing mid-await; without this second
-                    // check, a single-call (or last-in-batch) turn had no *later* iteration to catch it, so
-                    // the call was marked `Ready` and phase 2 dispatched it for real despite the run having
-                    // already been cancelled. Treated exactly like a cancellation caught at the top of the
-                    // loop: `outcomes[i]` stays `None` and `gate_cancelled` skips phase 2 entirely, so
+                    // returned — not just at the top of this loop iteration. A slow permission-check hook
+                    // can observe cancellation firing mid-await; without this second check, a single-call
+                    // (or last-in-batch) turn had no *later* iteration to catch it, so the call was marked
+                    // `Ready` and phase 2 dispatched it for real despite the run having already been
+                    // cancelled. Treated exactly like a cancellation caught at the top of the loop:
+                    // `outcomes[i]` stays `None` and `gate_cancelled` skips phase 2 entirely, so
                     // `repair_cancelled_dispatch` below synthesizes the same cancelled error result it
                     // already does for any other call cut short mid-gate.
                     if cancel_ref.is_cancelled() {
@@ -1675,24 +1692,10 @@ impl Agent {
                 ));
                 continue;
             }
-            let blocked = match catch_tool_panic(
-                self.hooks.before_tool_call(name, input, session, cancel),
-            )
-            .await
-            {
-                Ok(reason) => reason,
-                Err(panic_msg) => Some(panic_msg),
-            };
-            if let Some(reason) = blocked {
-                results[i] = Some((format!("tool call blocked: {reason}"), Vec::new(), true, false));
-                continue;
-            }
-            // Same Task #3 fix as the default gate loop: re-check cancellation after the hook
-            // returns, before this call is actually dispatched.
-            if cancel.is_cancelled() {
-                cancelled_mid_dispatch = true;
-                break;
-            }
+            // Same pi-parity coercion as the default gate loop, run *before* `before_tool_call` (matches
+            // pi's `prepareToolCall`, which calls `validateToolArguments` before `config.beforeToolCall`)
+            // so a permission hook sees the same coerced/typed arguments the tool is about to run with,
+            // not the model's raw, possibly stringified wire values.
             let coerced = match tools.get(name) {
                 Some(tool) => {
                     let mut c = crate::validation::coerce_tool_arguments(
@@ -1712,6 +1715,24 @@ impl Agent {
                 }
                 None => input.clone(),
             };
+            let blocked = match catch_tool_panic(
+                self.hooks.before_tool_call(name, &coerced, session, cancel),
+            )
+            .await
+            {
+                Ok(reason) => reason,
+                Err(panic_msg) => Some(panic_msg),
+            };
+            if let Some(reason) = blocked {
+                results[i] = Some((format!("tool call blocked: {reason}"), Vec::new(), true, false));
+                continue;
+            }
+            // Same Task #3 fix as the default gate loop: re-check cancellation after the hook
+            // returns, before this call is actually dispatched.
+            if cancel.is_cancelled() {
+                cancelled_mid_dispatch = true;
+                break;
+            }
             let target = tools.get(name).and_then(|t| t.write_target(&coerced));
             let _write_guard = match &target {
                 Some(path) => Some(self.write_locks.lock(path).await),
@@ -1846,12 +1867,25 @@ impl Agent {
     /// gone — leaving only an empty placeholder in history.
     async fn run_turn_once(
         &self,
-        req: ModelRequest,
+        mut req: ModelRequest,
         emit: &mut dyn FnMut(StreamEvent),
         cancel: &CancellationToken,
         partial_out: &mut Option<Turn>,
     ) -> Result<Turn> {
         *partial_out = None;
+        // The request-side half of the before/after-provider-request pair (see
+        // `AgentHooks::before_provider_request`'s own doc comment) — called once per attempt, including
+        // every mid-stream retry (`run_turn` calls this fresh each time), immediately before the
+        // request reaches the transport. A panicking hook discards its own (possibly partial) mutation
+        // and falls back to the request exactly as it was, the same "fails open" convention
+        // `on_assistant_message` already uses.
+        let before_hook = req.clone();
+        if catch_tool_panic(self.hooks.before_provider_request(&mut req))
+            .await
+            .is_err()
+        {
+            req = before_hook;
+        }
         let cancelled = cancel.cancelled();
         futures::pin_mut!(cancelled);
         let mut stream = {
@@ -6373,6 +6407,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hard_overflow_survives_a_persisted_stop_reason_from_a_prior_run() {
+        // pi-parity fix: `last_stop_reason` used to be a local variable hardcoded to
+        // `StopReason::EndTurn` at the top of every fresh `run_events`/`run_events_steered` call, so
+        // `is_hard_overflow`'s `MaxTokens` branch could only ever fire within the *same* in-flight run
+        // that produced the `MaxTokens` turn — a `MaxTokens` stop persisted by a prior run (or process,
+        // after a session reload) was invisible to a brand new call. Matches pi's own `prompt()`
+        // (`_findLastAssistantMessage` + `_checkCompaction`, re-derived fresh on every prompt from the
+        // persisted `AssistantMessage.stopReason`) and its `pre-prompt-compaction-no-continue.test.ts`
+        // regression: a `MaxTokens`-stopped assistant message appended directly — not produced by a
+        // live run — must still be detected and compacted by the very next fresh call.
+        let mut session = Session::new();
+        session.user("original task");
+        session.push(
+            Message::assistant(vec![ContentBlock::text("first reply")])
+                .with_model_id("claude-opus-4-8")
+                .with_usage(TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    ..Default::default()
+                })
+                .with_stop_reason(StopReason::EndTurn),
+        );
+        session.user("second question");
+        // The persisted turn from "a prior run/process" — constructed directly, matching pi's own
+        // regression test, rather than produced by driving a live turn through the loop.
+        session.push(
+            Message::assistant(vec![ContentBlock::text(
+                "this got cut off in a prior run/process",
+            )])
+            .with_model_id("claude-opus-4-8")
+            .with_usage(TokenUsage {
+                input_tokens: 50,
+                output_tokens: 100,
+                ..Default::default()
+            })
+            .with_stop_reason(StopReason::MaxTokens),
+        );
+        // Mirrors what a real prior run's `record_usage` would have left behind — the state a
+        // session-load/deserialize restores, not something this call's own (not-yet-started) turn
+        // produced.
+        session.last_input_tokens = 50;
+        session.last_usage_message_count = session.messages.len();
+        session.last_output_tokens = 100;
+        session.user("next prompt");
+
+        let mock = Arc::new(MockTransport::new(vec![
+            turn::text("## Goal\nsummary of earlier work"),
+            turn::text("answered next prompt"),
+        ]));
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8").with_compaction(CompactionConfig {
+            context_window: 100,
+            reserve_tokens: 10,
+            keep_recent_tokens: 1,
+            summary_max_tokens: 256,
+            enabled: false,
+        });
+
+        let mut reason_seen = None;
+        agent
+            .run_events(&mut session, |ev| {
+                if let AgentEvent::Compacted { reason, .. } = ev {
+                    reason_seen = Some(reason);
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            reason_seen,
+            Some(CompactionReason::Overflow),
+            "a MaxTokens stop_reason persisted from a prior run must still force a hard-overflow \
+             compaction on the very next fresh call, not just within the run that produced it"
+        );
+        assert_eq!(
+            mock.calls(),
+            2,
+            "the forced summarization call, then the real next turn"
+        );
+    }
+
+    #[tokio::test]
     async fn a_silently_truncated_turn_compacts_and_retries_instead_of_returning_a_cut_off_answer()
     {
         // pi-parity gap: a turn that completes successfully (no transport error) but gets cut off by
@@ -7504,6 +7619,155 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn before_tool_call_hook_sees_coerced_arguments_not_the_models_raw_stringified_ones() {
+        use crate::hooks::AgentHooks;
+        // pi-parity fix: `before_tool_call` used to be called with the model's raw, pre-coercion
+        // `input` — `coerce_tool_arguments` only ran afterward, right before the tool itself executed.
+        // Matches pi's `prepareToolCall`, which calls `validateToolArguments` (type coercion + schema
+        // validation) *before* `config.beforeToolCall`: a permission hook must see the same typed
+        // arguments the tool is about to run with, not a stringified primitive the model happened to
+        // stream on the wire (`"42"` instead of `42`).
+        struct CountsTool;
+        #[async_trait]
+        impl Tool for CountsTool {
+            fn name(&self) -> &str {
+                "counter"
+            }
+            fn description(&self) -> &str {
+                "takes a numeric count"
+            }
+            fn input_schema(&self) -> Value {
+                json!({
+                    "type": "object",
+                    "properties": { "count": { "type": "integer" } },
+                    "required": ["count"],
+                })
+            }
+            async fn run(
+                &self,
+                input: Value,
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+                Ok(input["count"].to_string().into())
+            }
+        }
+
+        struct CapturesHookInput(Arc<std::sync::Mutex<Option<Value>>>);
+        #[async_trait]
+        impl AgentHooks for CapturesHookInput {
+            async fn before_tool_call(
+                &self,
+                _name: &str,
+                input: &Value,
+                _session: &Session,
+                _cancel: &CancellationToken,
+            ) -> Option<String> {
+                *self.0.lock().unwrap() = Some(input.clone());
+                None
+            }
+        }
+
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(CountsTool));
+        let mock = Arc::new(MockTransport::new(vec![
+            turn::tool_call("t", "counter", r#"{"count":"42"}"#),
+            turn::text("done"),
+        ]));
+        let agent = Agent::new(mock, "claude-opus-4-8")
+            .with_tools(tools)
+            .with_hooks(Arc::new(CapturesHookInput(captured.clone())));
+        let mut session = Session::new();
+        session.user("go");
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        let seen = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the hook must have been called");
+        assert_eq!(
+            seen["count"],
+            json!(42),
+            "the hook must see the schema-coerced numeric value, not the model's raw stringified \
+             \"42\": {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn before_tool_call_hook_sees_coerced_arguments_on_the_sequential_execution_path_too() {
+        use crate::hooks::AgentHooks;
+        // Same pi-parity fix as the default gate loop just above, but for Task #28's fully-interleaved
+        // gate→execute→finalize-per-call path (`run_tool_calls_interleaved`) — it has its own,
+        // independent `before_tool_call` call site that needed the identical reordering.
+        struct SequentialCountsTool;
+        #[async_trait]
+        impl Tool for SequentialCountsTool {
+            fn name(&self) -> &str {
+                "counter"
+            }
+            fn description(&self) -> &str {
+                "takes a numeric count, sequential execution"
+            }
+            fn input_schema(&self) -> Value {
+                json!({
+                    "type": "object",
+                    "properties": { "count": { "type": "integer" } },
+                    "required": ["count"],
+                })
+            }
+            async fn run(
+                &self,
+                input: Value,
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+                Ok(input["count"].to_string().into())
+            }
+            fn execution_mode(&self) -> Option<crate::tool::ToolExecutionMode> {
+                Some(crate::tool::ToolExecutionMode::Sequential)
+            }
+        }
+
+        struct CapturesHookInput(Arc<std::sync::Mutex<Option<Value>>>);
+        #[async_trait]
+        impl AgentHooks for CapturesHookInput {
+            async fn before_tool_call(
+                &self,
+                _name: &str,
+                input: &Value,
+                _session: &Session,
+                _cancel: &CancellationToken,
+            ) -> Option<String> {
+                *self.0.lock().unwrap() = Some(input.clone());
+                None
+            }
+        }
+
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(SequentialCountsTool));
+        let mock = Arc::new(MockTransport::new(vec![
+            turn::tool_call("t", "counter", r#"{"count":"7"}"#),
+            turn::text("done"),
+        ]));
+        let agent = Agent::new(mock, "claude-opus-4-8")
+            .with_tools(tools)
+            .with_hooks(Arc::new(CapturesHookInput(captured.clone())));
+        let mut session = Session::new();
+        session.user("go");
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        let seen = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the hook must have been called");
+        assert_eq!(
+            seen["count"],
+            json!(7),
+            "the sequential-execution-path hook must also see the coerced numeric value: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn steering_injects_a_follow_up_and_continues() {
         // The model ends its turn after the first reply; a steering message queued before the run is
         // injected at that stop boundary, driving a second turn.
@@ -7665,6 +7929,77 @@ mod tests {
         assert_eq!(session.messages.len(), 2);
         // The queued message survives, untouched, for a later `prompt` call to pick up.
         assert!(!steering.is_empty());
+    }
+
+    #[tokio::test]
+    async fn refusal_blocks_dispatch_even_when_a_tool_call_already_streamed() {
+        // pi-parity fix: the `StopReason::Refusal` short-circuit used to live *inside* the
+        // `calls.is_empty()` branch only — a turn that streamed a complete `tool_use` block and then
+        // ended with `Refusal` (a real Anthropic/OpenAI wire shape: a refusal explanation arriving as
+        // trailing content after a tool_use block already closed) had a non-empty `calls`, so dispatch
+        // ran the tool the model was ultimately blocked from continuing. Matches pi's `agent-loop.ts`,
+        // which returns unconditionally on an "error"/"aborted" stop before ever looking at
+        // `message.content` for tool calls, dialect-agnostic.
+        struct PanicsIfCalled;
+        #[async_trait]
+        impl Tool for PanicsIfCalled {
+            fn name(&self) -> &str {
+                "echo"
+            }
+            fn description(&self) -> &str {
+                "must never actually run in this test"
+            }
+            fn input_schema(&self) -> Value {
+                json!({ "type": "object" })
+            }
+            async fn run(
+                &self,
+                _input: Value,
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+                panic!("a refused turn's tool call must never be dispatched");
+            }
+        }
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(PanicsIfCalled));
+        let (agent, mock) = agent_with(
+            vec![turn::refusal_after_tool_call(
+                "tu_1",
+                "echo",
+                r#"{"text":"hi"}"#,
+            )],
+            tools,
+        );
+        let mut session = Session::new();
+        session.user("do something disallowed");
+
+        let mut tool_started = false;
+        agent
+            .run_events(&mut session, |ev| {
+                if let AgentEvent::ToolStart { .. } = ev {
+                    tool_started = true;
+                }
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            !tool_started,
+            "no ToolStart event must fire for a call the model was refused mid-stream"
+        );
+        assert_eq!(
+            mock.calls(),
+            1,
+            "the run must end after the refusal, not dispatch tools or continue to another turn"
+        );
+        // user + assistant(tool_use, refused) only — no tool_result turn was ever appended.
+        assert_eq!(session.messages.len(), 2);
+        assert!(
+            session.messages[1]
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse { .. })),
+            "the refused tool_use block is still committed to the transcript, just never dispatched"
+        );
     }
 
     #[tokio::test]
@@ -9724,5 +10059,66 @@ mod tests {
             panic!("expected a text block");
         };
         assert_eq!(text, "the real answer");
+    }
+
+    struct InjectsHeaderNote;
+    #[async_trait]
+    impl AgentHooks for InjectsHeaderNote {
+        async fn before_provider_request(&self, req: &mut crate::transport::ModelRequest) {
+            req.system = Some(format!(
+                "{} [patched]",
+                req.system.clone().unwrap_or_default()
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn before_provider_request_hook_actually_runs_against_the_real_request() {
+        // `hooks.rs`'s own unit test only proves the hook trait's default no-op/override mechanics in
+        // isolation — this proves it's actually wired into the live loop (`run_turn_once`), by
+        // inspecting what `MockTransport` really received.
+        let mock = Arc::new(MockTransport::new(vec![turn::text("ok")]));
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8")
+            .with_system("base prompt")
+            .with_hooks(Arc::new(InjectsHeaderNote));
+        let mut session = Session::new();
+        session.user("go");
+
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        let sent = mock.requests();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].system.as_deref(), Some("base prompt [patched]"));
+    }
+
+    struct PanicsOnBeforeProviderRequest;
+    #[async_trait]
+    impl AgentHooks for PanicsOnBeforeProviderRequest {
+        async fn before_provider_request(&self, _req: &mut crate::transport::ModelRequest) {
+            panic!("boom: before_provider_request always panics");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicking_before_provider_request_hook_keeps_the_original_request() {
+        let mock = Arc::new(MockTransport::new(vec![turn::text("ok")]));
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8")
+            .with_system("base prompt")
+            .with_hooks(Arc::new(PanicsOnBeforeProviderRequest));
+        let mut session = Session::new();
+        session.user("go");
+
+        agent
+            .run(&mut session, |_| {})
+            .await
+            .expect("a panicking hook must not crash the run");
+
+        let sent = mock.requests();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].system.as_deref(),
+            Some("base prompt"),
+            "a panicking hook must fail open to the request exactly as it was"
+        );
     }
 }

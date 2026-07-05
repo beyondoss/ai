@@ -1427,21 +1427,36 @@ struct HostBashBlock<'a> {
     command: &'a str,
     is_error: bool,
     output: &'a str,
+    /// Whether this was recorded with `exclude_from_context: true` (Fix 9, pi-parity gap) — still
+    /// rendered here (this crate's own "what's visible in history" path never gates on the flag, only
+    /// the separate "what's sent to the model" transform does — see `serve.rs::ServeHooks`), just
+    /// annotated so the exported transcript doesn't silently look identical to a command the model did
+    /// see.
+    excluded_from_context: bool,
 }
 
-/// The exact literal prefix `serve.rs` tags a host-run bash command with (`~serve.rs:3765`), immediately
-/// followed by the command itself.
+/// The exact literal prefix `serve.rs` tags a host-run bash command with (`~serve.rs:HOST_BASH_LABEL`),
+/// immediately followed by the command itself.
 const HOST_BASH_MARKER_PREFIX: &str = "[Host bash command, run outside the model's own turn]\n$ ";
+/// The `exclude_from_context: true` counterpart to [`HOST_BASH_MARKER_PREFIX`]
+/// (`~serve.rs:HOST_BASH_EXCLUDED_LABEL`) — Fix 9, pi-parity gap: previously such a command was never
+/// recorded at all, so there was no marker shape for this case to recognize.
+const HOST_BASH_EXCLUDED_MARKER_PREFIX: &str =
+    "[Host bash command, excluded from model context]\n$ ";
 
-/// Detect and split apart `serve.rs`'s host-bash-command marker: the fixed prefix, the command up to
-/// the first `\n\n`, then either the result text directly or (if the command errored) a literal
-/// `"(error)\n"` immediately before it. Anything that doesn't fit this exact shape isn't a host-bash
-/// marker at all — returns `None`, and the caller falls through to ordinary text rendering (mirrors
+/// Detect and split apart `serve.rs`'s host-bash-command marker: the fixed prefix (either shape — see
+/// [`HOST_BASH_MARKER_PREFIX`]/[`HOST_BASH_EXCLUDED_MARKER_PREFIX`]), the command up to the first
+/// `\n\n`, then either the result text directly or (if the command errored) a literal `"(error)\n"`
+/// immediately before it. Anything that doesn't fit either exact shape isn't a host-bash marker at all
+/// — returns `None`, and the caller falls through to ordinary text rendering (mirrors
 /// [`parse_summary_marker`]/[`parse_skill_block`]'s same exact-shape-or-not-at-all precedent). Not
 /// robust to a `command` that itself contains a blank line (an embedded `\n\n`) — splits at the first
 /// one, same simplifying assumption `parse_skill_block` makes for its own body boundary.
 fn parse_host_bash_marker(text: &str) -> Option<HostBashBlock<'_>> {
-    let rest = text.strip_prefix(HOST_BASH_MARKER_PREFIX)?;
+    let (rest, excluded_from_context) = match text.strip_prefix(HOST_BASH_MARKER_PREFIX) {
+        Some(rest) => (rest, false),
+        None => (text.strip_prefix(HOST_BASH_EXCLUDED_MARKER_PREFIX)?, true),
+    };
     let (command, rest) = rest.split_once("\n\n")?;
     let (is_error, output) = match rest.strip_prefix("(error)\n") {
         Some(o) => (true, o),
@@ -1451,6 +1466,7 @@ fn parse_host_bash_marker(text: &str) -> Option<HostBashBlock<'_>> {
         command,
         is_error,
         output,
+        excluded_from_context,
     })
 }
 
@@ -1459,16 +1475,21 @@ fn parse_host_bash_marker(text: &str) -> Option<HostBashBlock<'_>> {
 /// styling) followed by the raw result in a `<pre>` (never markdown — it's command output, not prose),
 /// instead of falling through to `render_markdown`, where multi-line output used to collapse into one
 /// unreadable run-on line. `is_error` gets its own CSS class, matching pi's own success/error coloring
-/// for its dedicated `bashExecution` role (`template.js:1273-1285`).
+/// for its dedicated `bashExecution` role (`template.js:1273-1285`). `excluded_from_context` (Fix 9,
+/// pi-parity gap) gets its own note in the title — still visible here, just never sent to the model.
 fn render_host_bash_marker(out: &mut String, block: &HostBashBlock) {
     let class = if block.is_error {
         "tool-call host-bash error"
     } else {
         "tool-call host-bash"
     };
+    let title = if block.excluded_from_context {
+        "Host bash command (run outside the model's own turn, hidden from the model)"
+    } else {
+        "Host bash command (run outside the model's own turn)"
+    };
     out.push_str(&format!(
-        "<div class=\"{class}\"><div class=\"tool-title\">Host bash command (run outside the model's \
-         own turn)</div>\n"
+        "<div class=\"{class}\"><div class=\"tool-title\">{title}</div>\n"
     ));
     out.push_str(&format!(
         "<pre class=\"bash-command\">$ {}</pre>",
@@ -2352,6 +2373,34 @@ mod tests {
         assert!(
             !html.contains("(error)\ncommand exited 1"),
             "the literal (error) line marker must not leak verbatim into the rendered output: {html}"
+        );
+    }
+
+    #[test]
+    fn renders_an_exclude_from_context_host_bash_marker_as_its_own_annotated_block() {
+        // Fix 9 (pi-parity gap): an `exclude_from_context: true` host-bash record is now always
+        // present in `session.messages` (previously skipped entirely), and must render with the same
+        // dedicated block a non-excluded one gets — not fall through to plain markdown — just annotated
+        // so the exported transcript doesn't look identical to a command the model actually saw.
+        let messages = vec![Message::user(
+            "[Host bash command, excluded from model context]\n$ printf secret-diagnostic\n\n\
+             secret-diagnostic",
+        )];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(html.contains("class=\"tool-call host-bash\""), "{html}");
+        assert!(html.contains("$ printf secret-diagnostic"));
+        assert!(html.contains("secret-diagnostic"));
+        assert!(
+            html.contains("hidden from the model"),
+            "the excluded variant must be annotated distinctly from the ordinary one: {html}"
+        );
+        assert!(
+            !html.contains("[Host bash command, excluded from model context]"),
+            "the raw marker line must not leak verbatim: {html}"
+        );
+        assert!(
+            !html.contains("class=\"text markdown\""),
+            "must not fall through to plain markdown rendering: {html}"
         );
     }
 

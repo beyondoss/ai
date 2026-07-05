@@ -48,13 +48,14 @@ impl FindJob {
     }
 }
 
-/// Walk the tree and collect matching paths, sorted lexicographically. Returns the paths, whether the
-/// result was truncated (by `limit` or the hard cap), and, when the walk hit at least one unreadable
-/// path (permission denied, a broken symlink, …), the first such error's message — matching real `fd`,
-/// which exits non-zero and reports the real error text the moment it can't read *any* path in the
-/// tree, rather than silently treating it as "not found here."
-pub fn search(job: &FindJob) -> (Vec<PathBuf>, bool, Option<String>) {
-    let mut paths: Vec<PathBuf> = Vec::new();
+/// Walk the tree and collect matching paths (paired with whether each is a directory), sorted
+/// lexicographically by path. Returns the paths, whether the result was truncated (by `limit` or the
+/// hard cap), and, when the walk hit at least one unreadable path (permission denied, a broken
+/// symlink, …), the first such error's message — matching real `fd`, which exits non-zero and reports
+/// the real error text the moment it can't read *any* path in the tree, rather than silently treating
+/// it as "not found here."
+pub fn search(job: &FindJob) -> (Vec<(PathBuf, bool)>, bool, Option<String>) {
+    let mut paths: Vec<(PathBuf, bool)> = Vec::new();
     let mut first_error: Option<String> = None;
     // `hidden(false)` includes dotfiles (like ripgrep --hidden); .gitignore is respected by default.
     // `require_git(false)` keeps that respect even outside an actual git repository (e.g. a plain
@@ -95,7 +96,14 @@ pub fn search(job: &FindJob) -> (Vec<PathBuf>, bool, Option<String>) {
             path.to_string_lossy().into_owned()
         };
         if job.matcher.is_match(candidate.as_str()) {
-            paths.push(path.to_path_buf());
+            // `entry.file_type()` is the type already cached from the directory read that produced
+            // this entry — cheaper than a fresh `stat`, and matches real `fd`'s own default of
+            // appending "/" to a directory match (pi's `find` tool post-processes `fd`'s output as-is,
+            // so this reproduces the same signal fd already provides). Missing only for stdin's own
+            // synthetic entry (`-`), which never appears in a filesystem walk — `unwrap_or(false)` is
+            // unreachable in practice, not a meaningful default choice.
+            let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
+            paths.push((path.to_path_buf(), is_dir));
         }
     }
 
@@ -199,10 +207,19 @@ impl Tool for Find {
         // Write straight into `out` instead of allocating a `format!` temp String per path — same fix
         // as `read`/`ls`/`grep`'s formatting loops. `writeln!` into a `String` can't fail, so the
         // `Result` is discarded. Paths are reported relative to the search root (matching pi), not the
-        // full path straight from the walk entry — see `format_path`'s doc comment.
+        // full path straight from the walk entry — see `format_path`'s doc comment. A directory match
+        // gets a trailing "/" (matching real `fd`'s own default, which pi's `find` tool relies on
+        // as-is) — since `find` deliberately matches both files and directories, the model otherwise
+        // has no way to tell "src/components" is a directory vs. an extension-less file without an
+        // extra `ls`/`bash` call.
         let mut out = String::new();
-        for path in &paths {
-            let _ = writeln!(out, "{}", format_path(path, &root));
+        for (path, is_dir) in &paths {
+            let rendered = format_path(path, &root);
+            if *is_dir {
+                let _ = writeln!(out, "{rendered}/");
+            } else {
+                let _ = writeln!(out, "{rendered}");
+            }
         }
         // The byte cap is checked *before* the result-count marker, and takes priority when both would
         // otherwise fire — see `cap_listing_bytes`'s doc comment.
@@ -357,6 +374,37 @@ mod tests {
         assert!(
             out.contains("node_modules"),
             "directory-name searches must return the directory: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_directory_match_gets_a_trailing_slash_but_a_file_match_does_not() {
+        // pi-parity gap (fixed): `find` deliberately matches both files and directories, but every
+        // match rendered through plain `format_path` with no suffix — the model had no way to tell a
+        // hit like "src/components" was a directory vs. an extension-less file without an extra
+        // `ls`/`bash` call. Real `fd` (which pi's own `find` tool post-processes the output of)
+        // appends "/" to a directory match by default; this pins the same behavior for both a
+        // directory and a file matched by the same basename-only pattern.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("somedir")).unwrap();
+        std::fs::write(dir.path().join("somefile.txt"), "").unwrap();
+        let out = Find
+            .run(json!({ "pattern": "some*", "path": dir.path().to_str().unwrap() }))
+            .await
+            .unwrap()
+            .text;
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(
+            lines.contains(&"somedir/"),
+            "a directory match must carry a trailing slash: {out}"
+        );
+        assert!(
+            !lines.contains(&"somedir"),
+            "a directory match must not also appear without the trailing slash: {out}"
+        );
+        assert!(
+            lines.contains(&"somefile.txt"),
+            "a file match must not carry a trailing slash: {out}"
         );
     }
 

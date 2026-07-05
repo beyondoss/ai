@@ -208,10 +208,19 @@ fn serve_bash_records_its_result_into_session_context_by_default() {
 }
 
 #[test]
-fn serve_bash_exclude_from_context_keeps_the_session_untouched() {
+fn serve_bash_exclude_from_context_is_recorded_but_hidden_from_the_model() {
+    // Fix 9 (pi-parity gap, HIGH PRIORITY — silent data loss): `exclude_from_context: true` used to
+    // skip *recording* the command/output entirely — it never showed up in `session.messages`,
+    // persisted storage, or an `export`, unlike pi's own two-layer split: `recordBashResult`
+    // (`agent-session.ts`) unconditionally records into history; `excludeFromContext` is consulted only
+    // later, by the separate `convertToLlm` transform (`messages.ts`) that builds what's actually sent
+    // to the model. Proves all four: present in `session.messages` (`get_messages`), present in the
+    // persisted `.jsonl`, present in an HTML export — but absent from the next turn's actual wire
+    // request.
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
-    let (base, _bodies) = spawn_model_server(vec![]);
+    let marker = "should-not-reach-the-model-but-must-be-recorded";
+    let (base, bodies) = spawn_model_server(vec![turn_text("ack")]);
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
     let mut stdin = child.stdin.take().unwrap();
@@ -222,7 +231,7 @@ fn serve_bash_exclude_from_context_keeps_the_session_untouched() {
         "{}",
         json!({
             "type": "bash",
-            "command": "printf should-not-reach-context",
+            "command": format!("printf {marker}"),
             "exclude_from_context": true,
         })
     )
@@ -230,19 +239,59 @@ fn serve_bash_exclude_from_context_keeps_the_session_untouched() {
     stdin.flush().unwrap();
     let frames = read_until_response(&mut stdout, "bash");
     let resp = frames.last().unwrap();
-    assert_eq!(resp["data"]["result"], "should-not-reach-context");
+    assert_eq!(resp["data"]["result"], marker);
 
+    // 1. Present in session.messages, via get_messages.
     writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
     stdin.flush().unwrap();
     let frames = read_until_response(&mut stdout, "get_messages");
     let dump = frames.last().unwrap()["data"]["messages"].to_string();
     assert!(
-        !dump.contains("should-not-reach-context"),
-        "exclude_from_context: true must keep the session untouched: {dump}"
+        dump.contains(marker),
+        "exclude_from_context must NOT skip recording into session.messages: {dump}"
     );
+
+    // 2. Absent from the next real turn's actual wire request to the model.
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "go" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+    {
+        let bodies = bodies.lock().unwrap();
+        assert!(
+            !bodies[0].contains(marker),
+            "exclude_from_context must keep the command/output out of what's sent to the model: {}",
+            bodies[0]
+        );
+    }
 
     drop(stdin);
     child.wait().unwrap();
+
+    // 3. Present in persisted storage on disk.
+    let persisted = std::fs::read_to_string(&session_file).unwrap();
+    assert!(
+        persisted.contains(marker),
+        "exclude_from_context must still persist to disk: {persisted}"
+    );
+
+    // 4. Present in export.rs's rendered output.
+    let export_path = dir.path().join("transcript.html");
+    let output = std::process::Command::new(bin)
+        .args(["export", &session_file, export_path.to_str().unwrap()])
+        .env("HOME", dir.path())
+        .output()
+        .expect("spawn binary");
+    assert!(
+        output.status.success(),
+        "export subcommand failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let html = std::fs::read_to_string(&export_path).unwrap();
+    assert!(
+        html.contains(marker),
+        "exclude_from_context must still render in an html export: {html}"
+    );
 }
 
 #[test]
@@ -567,6 +616,69 @@ fn serve_abort_bash_returns_the_partial_output_streamed_before_cancellation() {
         result_text.to_lowercase().contains("cancel"),
         "cancellation result should still say it was cancelled: {result_text:?}"
     );
+    // Fix 7 (pi-parity gap): pi's own structured `BashResult{cancelled, exitCode, ...}` alongside the
+    // text, not flattened into it as the only signal.
+    assert_eq!(
+        resp["data"]["cancelled"], true,
+        "the terminal response must carry a structured cancelled field, not just embed it in the text: {frames:#?}"
+    );
+    assert!(
+        resp["data"]["exit_code"].is_null(),
+        "a cancelled run has no exit code: {frames:#?}"
+    );
+}
+
+#[test]
+fn serve_bash_terminal_response_carries_structured_exit_code_and_truncation_fields() {
+    // Fix 7 (pi-parity gap): a non-zero exit and a truncated/full-output-path result must reach the
+    // terminal RPC response as their own structured fields, not only ever as a status line embedded in
+    // `result`'s text (exit code) or on an interim `tool_progress` event a polling-only client never
+    // sees (truncation/full_output_path).
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "bash", "command": "exit 7" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "bash");
+    let resp = frames.last().unwrap();
+    assert_eq!(resp["data"]["is_error"], true, "got: {resp:#?}");
+    assert_eq!(resp["data"]["exit_code"], 7, "got: {resp:#?}");
+    assert_eq!(resp["data"]["cancelled"], false, "got: {resp:#?}");
+    assert_eq!(resp["data"]["truncated"], false, "got: {resp:#?}");
+    assert!(resp["data"]["full_output_path"].is_null(), "got: {resp:#?}");
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "bash", "command": "yes | head -c 200000" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "bash");
+    let resp = frames.last().unwrap();
+    assert_eq!(resp["data"]["is_error"], false, "got: {resp:#?}");
+    assert_eq!(resp["data"]["exit_code"], 0, "got: {resp:#?}");
+    assert_eq!(
+        resp["data"]["truncated"], true,
+        "200KB of output must trip truncation: {resp:#?}"
+    );
+    assert!(
+        resp["data"]["full_output_path"].as_str().is_some(),
+        "a truncated result must report where the full output was saved: {resp:#?}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
 }
 
 #[test]

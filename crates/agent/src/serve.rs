@@ -34,11 +34,14 @@
 //!     A no-op ack (pointing the client at `set_model` instead) when no `prompt` is in flight.
 //!   - `{type:"get_state"}`              → `data: {session_id, model, steps, message_count, title, cwd,
 //!     git_branch, thinking_level, auto_compaction, auto_retry, steering_mode, follow_up_mode,
-//!     pending_messages, …}` — the middle six are the runtime-mutable settings and current steer/
-//!     follow-up queue depth (`Steering::pending_count`), so a client can render current settings without
-//!     a second round trip. `cwd`/`git_branch` (Task #25, pi-parity fix) matter more here than for pi:
-//!     a headless RPC client may have no shared filesystem with this process at all, so `get_state` is
-//!     its only way to learn which directory (and branch) the agent's tools are actually operating
+//!     pending_messages, steer_queue, follow_up_queue, …}` — the middle eight are the runtime-mutable
+//!     settings and current steer/follow-up queue state, so a client can render current settings
+//!     without a second round trip. `pending_messages` is the bare depth (`Steering::pending_count`);
+//!     `steer_queue`/`follow_up_queue` (Fix 5, pi-parity gap) are each lane's actual queued message
+//!     text (`Steering::steer_texts`/`follow_up_texts`) — previously a client could see *how much* was
+//!     queued but never *what*. `cwd`/`git_branch` (Task #25, pi-parity fix) matter more here than for
+//!     pi: a headless RPC client may have no shared filesystem with this process at all, so `get_state`
+//!     is its only way to learn which directory (and branch) the agent's tools are actually operating
 //!     against. `git_branch` is a lazily-resolved, best-effort `git symbolic-ref --short HEAD` — `null`
 //!     (never a failed call) outside a git repo, on detached `HEAD`, or if the lookup fails for any
 //!     other reason.
@@ -137,7 +140,10 @@
 //!     empty/whitespace-only — the one mistake this process can catch on its own; an
 //!     unrecognized-but-well-formed id is *not* rejected (every id is forwarded verbatim through the
 //!     gateway, with no local registry here to validate a real one against — `available_models()` is a
-//!     non-exhaustive picker hint, not an allowlist)
+//!     non-exhaustive picker hint, not an allowlist). `model` may carry a trailing `:<level>` suffix
+//!     (Fix 2, pi-parity gap — e.g. `"sonnet:high"`, pi's own `--model <pattern>:<thinking-level>`
+//!     shorthand) to set the reasoning effort in the same call, winning over whatever level was
+//!     already active
 //!   - `{type:"set_thinking", budget}`   set/clear an explicit raw thinking-budget override (integer,
 //!     or `null` to disable it and defer back to the portable level below) → `data: {thinking}`
 //!   - `{type:"set_reasoning_effort", effort}` set the portable thinking-depth level directly — one of
@@ -200,11 +206,16 @@
 //!     currently active
 //!   - `{type:"bash", command, cwd?, timeout_ms?, exclude_from_context?}` run a shell command directly
 //!     — independent of the model's own tool-call loop — streaming `tool_progress`/`tool_end` events
-//!     exactly like a model-invoked `bash` call. Recorded into the session as a plain informational
-//!     message by default (so the model sees it on its next turn — pi's `recordBashResult`), unless
-//!     `exclude_from_context: true`. Rejected if `bash` isn't registered for this process
-//!     (`--exclude-tools bash` / `--no-tools`). While it runs, only `abort_bash`/`abort` (cancel it) are
-//!     accepted; everything else is rejected as busy.
+//!     exactly like a model-invoked `bash` call, then a terminal `response` whose `data` carries
+//!     `{result, is_error, exit_code, cancelled, truncated, full_output_path}` (Fix 7, pi-parity gap: the
+//!     last four previously only ever reached a client via the interim `tool_progress` event, or embedded
+//!     as a status line inside `result` itself — pi's own structured `BashResult`). Always recorded as a
+//!     plain informational message in the session/persisted storage/an eventual `export` (pi's
+//!     `recordBashResult`); `exclude_from_context: true` (Fix 9, pi-parity gap: previously this instead
+//!     skipped recording entirely, losing the command/output outright) hides it from the model on its
+//!     *next* turn only, mirroring pi's separate `convertToLlm` transform. Rejected if `bash` isn't
+//!     registered for this process (`--exclude-tools bash` / `--no-tools`). While it runs, only
+//!     `abort_bash`/`abort` (cancel it) are accepted; everything else is rejected as busy.
 //!   - `{type:"abort_bash"}`             cancel an in-flight host `bash` command, else a no-op ack
 //!   - `{type:"login", provider}`        log into `anthropic`/`github-copilot`/`openai-codex` as a
 //!     subscription instead of a metered API key (see `crate::oauth`/`crate::auth_store`) — an
@@ -284,25 +295,26 @@ use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
+use crate::gateway_credential::{GatewayCredential, resolve_gateway_credential};
 use crate::session_store::{
     BranchInfo, BranchSummaryDetails, CompactionMeta, SessionMeta, SessionRepo, SessionStore,
     search_sessions,
 };
 use crate::tools;
 
-/// How the gateway client attaches a credential to every request — either a fixed `bai_v1…`/BYO
-/// string (the ordinary case), or a live, transparently-refreshed OAuth subscription login (see
-/// `crate::auth_credential_source::OAuthCredentialSource`). Resolved once by `main.rs` (see
-/// `resolve_gateway_credential`) before `serve` even starts, same as every other `ServeConfig` field.
-pub enum GatewayCredential {
-    Static(String),
-    Oauth(std::sync::Arc<dyn agent_core::client::CredentialSource>),
-}
-
 /// Options for the headless server (mirrors `run`, plus persistence).
 pub struct ServeConfig {
     pub gateway: String,
-    pub key: GatewayCredential,
+    /// The raw `--key`/`AI_AGENT_KEY` value, if the operator gave one explicitly. Deliberately *not*
+    /// pre-resolved into a [`GatewayCredential`] by `main.rs` before `serve` starts, unlike every other
+    /// `ServeConfig` field: [`resolve_gateway_credential`] is keyed on the model, and this process's
+    /// active model isn't fixed for its lifetime — a reattached `--session`/`--continue` session may
+    /// override `model` with its own last-recorded one before the first turn even runs, and
+    /// `set_model`/`cycle_model`/`switch_session`/`fork`/`clone`/`switch_branch` can all change it again
+    /// at any point afterward. `crate::serve::build_gateway_client` calls `resolve_gateway_credential`
+    /// fresh with this value every time the active model is (re)determined, rather than resolving once
+    /// here and freezing whichever provider happened to be active at that moment.
+    pub key: Option<String>,
     pub model: String,
     /// Whether the operator explicitly passed `--model` for *this* invocation, as opposed to `model`
     /// having fallen back to a stored `agent settings` default or this crate's own built-in default
@@ -1667,21 +1679,6 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
         });
     timing.mark("build static system prompt");
 
-    // Keep the transport in an `Arc` we can clone: `set_model`/`set_thinking` rebuild the `Agent` at
-    // runtime (a new model id picks a new dialect), and each rebuild reuses this one HTTP client.
-    let client = match &cfg.key {
-        GatewayCredential::Static(key) => GatewayClient::new(cfg.gateway.clone(), key.clone())?,
-        GatewayCredential::Oauth(source) => {
-            GatewayClient::with_credential_source(cfg.gateway.clone(), source.clone())?
-        }
-    }
-    .with_retry(
-        cfg.retry_max_retries
-            .unwrap_or(agent_core::client::MAX_RETRIES),
-        cfg.retry_base_delay_ms
-            .unwrap_or(agent_core::client::BASE_BACKOFF),
-    );
-    let client = Arc::new(client);
     // Task #50: the same two operator-supplied overrides also drive the *whole-run* retry loop
     // (`crate::retry::RunRetryPolicy`) below, not just `client`'s own pre-connect/mid-stream layer just
     // above — previously `--retry-max-retries`/`--retry-base-delay-ms` had no effect on the `"prompt"`
@@ -1710,8 +1707,16 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
     // matching `--model`/`--reasoning-effort` being independent flags — an explicit `--model` with no
     // `--reasoning-effort` must still pick up the session's own last thinking level, not the process's
     // bare `Off` default, and vice versa.
+    // Fix 1 (pi-parity gap): `cfg.reasoning_effort` is `None` both when the operator explicitly
+    // requested no reasoning effort be set and when they simply never passed `--reasoning-effort`/had
+    // no stored default — previously both collapsed to a bare `ThinkingLevel::Off` here, so a bare
+    // `serve`/`run` invocation with no flags on a reasoning-capable model wire-disabled thinking
+    // outright instead of picking any default depth. `default_reasoning_effort_for_model` supplies pi's
+    // own "medium" default in that case (see its own doc comment); a model with no reasoning mechanism
+    // at all still falls through to `Off`, same as before.
     let cfg_level = cfg
         .reasoning_effort
+        .or_else(|| default_reasoning_effort_for_model(&cfg.model))
         .map(agent_core::ThinkingLevel::from)
         .unwrap_or(agent_core::ThinkingLevel::Off);
     let (session_model, session_level) = persistence.model_and_level_at_active(cfg_level);
@@ -1789,6 +1794,13 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
         mpsc::unbounded_channel::<Arc<Vec<agent_core::Message>>>();
     let checkpoint: Arc<dyn agent_core::CheckpointHook> =
         Arc::new(ChannelCheckpoint(checkpoint_tx));
+    // Resolved *here*, against `current_model` (the actual starting model, after the anti-bleed
+    // session-restore check above may have overridden `cfg.model`) rather than earlier against
+    // `cfg.model` directly — a credential/routing resolved for the wrong (pre-restore) model would
+    // silently misroute the very first turn. Kept in an `Arc` we can clone into `build_agent`, and
+    // swapped out (not just the `Agent` rebuilt) by `set_model`/`cycle_model` and any other command
+    // that changes `current_model` at runtime — see `build_gateway_client`'s own doc comment.
+    let mut client = Arc::new(build_gateway_client(&cfg, &current_model)?);
     let mut agent = build_agent(
         client.clone(),
         &full_system(&static_system, &cwd),
@@ -2218,7 +2230,12 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                                                         } else {
                                                             steering.push(m);
                                                         }
-                                                        let _ = out_tx.send(response(cid, cmd, true, None, None));
+                                                        // Fix 5 (pi-parity gap): the pushing client
+                                                        // learns what's actually queued from its own
+                                                        // ack, same round trip — see `queue_content`'s
+                                                        // own doc comment for why this doesn't also
+                                                        // need a separate unsolicited event.
+                                                        let _ = out_tx.send(response(cid, cmd, true, Some(queue_content(&steering)), None));
                                                     }
                                                     None => {
                                                         let _ = out_tx.send(response(cid, cmd, false, None, Some("missing `message`")));
@@ -2243,7 +2260,12 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                                                             parse_images(c.get("images")),
                                                         );
                                                         steering.push_steer(m);
-                                                        let _ = out_tx.send(response(cid, "prompt", true, Some(json!({ "queued_as": "steer" })), None));
+                                                        // Fix 5 (pi-parity gap): same queue-content
+                                                        // visibility the dedicated `steer`/`follow_up`
+                                                        // commands' own acks now carry.
+                                                        let mut data = queue_content(&steering);
+                                                        data["queued_as"] = json!("steer");
+                                                        let _ = out_tx.send(response(cid, "prompt", true, Some(data), None));
                                                     }
                                                     (Some("follow_up"), Some(m)) => {
                                                         let m = expand_message(m, &skills, &prompt_templates);
@@ -2252,7 +2274,9 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                                                             parse_images(c.get("images")),
                                                         );
                                                         steering.push(m);
-                                                        let _ = out_tx.send(response(cid, "prompt", true, Some(json!({ "queued_as": "follow_up" })), None));
+                                                        let mut data = queue_content(&steering);
+                                                        data["queued_as"] = json!("follow_up");
+                                                        let _ = out_tx.send(response(cid, "prompt", true, Some(data), None));
                                                     }
                                                     _ => {
                                                         let _ = out_tx.send(response(cid, "prompt", false, None, Some("busy: a prompt is running; only `abort`/`steer`/`follow_up`, or a `prompt` with `streaming_behavior: \"steer\"|\"follow_up\"`, are accepted")));
@@ -2272,12 +2296,11 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                                             "get_state" => {
                                                 let mut data = live_stats.snapshot();
                                                 if let Value::Object(m) = &mut data {
-                                                    m.insert("session_id".into(), json!(persistence.session_id()));
+                                                    insert_session_identity(m, &persistence);
                                                     m.insert("model".into(), json!(current_model));
                                                     m.insert("message_count".into(), Value::Null);
                                                     m.insert("title".into(), json!(persistence.meta.title));
                                                     m.insert("cwd_stale".into(), json!(cwd_is_stale(&persistence.meta.cwd, &cwd)));
-                                                    m.insert("session_file".into(), json!(persistence.session_file().map(|p| p.display().to_string())));
                                                     // Task #25 (pi-parity fix): same fields, same reasoning, as the idle `get_state` arm below.
                                                     m.insert("cwd".into(), json!(cwd.display().to_string()));
                                                     m.insert("git_branch".into(), json!(git_branch(&cwd).await));
@@ -2290,7 +2313,33 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                                                 let _ = out_tx.send(response(cid, "get_state", true, Some(data), None));
                                             }
                                             "get_session_stats" => {
-                                                let _ = out_tx.send(response(cid, "get_session_stats", true, Some(live_stats.snapshot()), None));
+                                                // Fix 8 (pi-parity gap): previously the raw
+                                                // `LiveStats::snapshot()` verbatim — dropping
+                                                // session_id/session_file (this process's own live
+                                                // sources, same as `get_state`'s busy arm just above)
+                                                // and user_messages/assistant_messages/tool_calls/
+                                                // tool_results/total_messages/context_usage (genuinely
+                                                // unavailable mid-run: `&session` is exclusively
+                                                // borrowed by the in-flight turn, the same reason
+                                                // `get_state`'s own `message_count` is `null` here) —
+                                                // present as `null` rather than silently absent, so a
+                                                // client sees the same field *set* idle or busy, values
+                                                // aside.
+                                                let mut data = live_stats.snapshot();
+                                                if let Value::Object(m) = &mut data {
+                                                    insert_session_identity(m, &persistence);
+                                                    for field in [
+                                                        "context_usage",
+                                                        "user_messages",
+                                                        "assistant_messages",
+                                                        "tool_calls",
+                                                        "tool_results",
+                                                        "total_messages",
+                                                    ] {
+                                                        m.insert(field.to_string(), Value::Null);
+                                                    }
+                                                }
+                                                let _ = out_tx.send(response(cid, "get_session_stats", true, Some(data), None));
                                             }
                                             "get_commands" => {
                                                 let mut commands: Vec<Value> = skills.iter().map(|s| {
@@ -2561,7 +2610,8 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                         } else {
                             steering.push(m);
                         }
-                        emit!(response(id, cmd_type, true, None, None));
+                        // Fix 5 (pi-parity gap): see `queue_content`'s own doc comment.
+                        emit!(response(id, cmd_type, true, Some(queue_content(&steering)), None));
                     }
                     None => emit!(response(
                         id,
@@ -2607,17 +2657,13 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
             "get_state" => {
                 let mut data = session_stats(&session, &current_model);
                 if let Value::Object(m) = &mut data {
-                    m.insert("session_id".into(), json!(persistence.session_id()));
+                    insert_session_identity(m, &persistence);
                     m.insert("model".into(), json!(current_model));
                     m.insert("message_count".into(), json!(session.messages.len()));
                     m.insert("title".into(), json!(persistence.meta.title));
                     m.insert(
                         "cwd_stale".into(),
                         json!(cwd_is_stale(&persistence.meta.cwd, &cwd)),
-                    );
-                    m.insert(
-                        "session_file".into(),
-                        json!(persistence.session_file().map(|p| p.display().to_string())),
                     );
                     // Task #25 (pi-parity fix): the directory (and, best-effort, branch) the agent's
                     // tools are actually operating against — the live process `cwd`, not
@@ -2812,6 +2858,18 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                         let mut rebuild_needed = false;
                         if restored_model != current_model {
                             session.scrub_cross_model_state(&restored_model);
+                            // The restored model can be on a different OAuth provider than whatever was
+                            // active before this switch — best-effort, matching this restore path's existing
+                            // "recorded state wins" philosophy: a failure here leaves `client` on the previous
+                            // (now-wrong-for-`current_model`) credential rather than aborting the whole switch,
+                            // so the next `prompt` surfaces its own clear transport-level error instead.
+                            match build_gateway_client(&cfg, &restored_model) {
+                                Ok(new_client) => client = Arc::new(new_client),
+                                Err(e) => eprintln!(
+                                    "serve: could not resolve a gateway credential for restored model {restored_model:?}: \
+                                     {e} — keeping the previous client"
+                                ),
+                            }
                             current_model = restored_model;
                             rebuild_needed = true;
                         }
@@ -2957,6 +3015,18 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                         let mut rebuild_needed = false;
                         if restored_model != current_model {
                             session.scrub_cross_model_state(&restored_model);
+                            // The restored model can be on a different OAuth provider than whatever was
+                            // active before this switch — best-effort, matching this restore path's existing
+                            // "recorded state wins" philosophy: a failure here leaves `client` on the previous
+                            // (now-wrong-for-`current_model`) credential rather than aborting the whole switch,
+                            // so the next `prompt` surfaces its own clear transport-level error instead.
+                            match build_gateway_client(&cfg, &restored_model) {
+                                Ok(new_client) => client = Arc::new(new_client),
+                                Err(e) => eprintln!(
+                                    "serve: could not resolve a gateway credential for restored model {restored_model:?}: \
+                                     {e} — keeping the previous client"
+                                ),
+                            }
                             current_model = restored_model;
                             rebuild_needed = true;
                         }
@@ -3014,6 +3084,18 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                     let mut rebuild_needed = false;
                     if restored_model != current_model {
                         session.scrub_cross_model_state(&restored_model);
+                        // The restored model can be on a different OAuth provider than whatever was
+                        // active before this switch — best-effort, matching this restore path's existing
+                        // "recorded state wins" philosophy: a failure here leaves `client` on the previous
+                        // (now-wrong-for-`current_model`) credential rather than aborting the whole switch,
+                        // so the next `prompt` surfaces its own clear transport-level error instead.
+                        match build_gateway_client(&cfg, &restored_model) {
+                            Ok(new_client) => client = Arc::new(new_client),
+                            Err(e) => eprintln!(
+                                "serve: could not resolve a gateway credential for restored model {restored_model:?}: \
+                                 {e} — keeping the previous client"
+                            ),
+                        }
                         current_model = restored_model;
                         rebuild_needed = true;
                     }
@@ -3388,11 +3470,21 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                 ));
             }
             "get_session_stats" => {
+                // Fix 8 (pi-parity gap): backfills session_id/session_file (mirroring get_state's own
+                // idle arm, above) and pending_tool_ids (mirroring get_state's own "nothing pending
+                // while idle" convention) — previously omitted, unlike the busy-mode arm's
+                // `LiveStats::snapshot()`-derived `pending_tool_ids`, so idle and busy reported
+                // different field sets for the same command.
+                let mut data = session_stats(&session, &current_model);
+                if let Value::Object(m) = &mut data {
+                    insert_session_identity(m, &persistence);
+                    m.insert("pending_tool_ids".into(), json!(Vec::<String>::new()));
+                }
                 emit!(response(
                     id,
                     "get_session_stats",
                     true,
-                    Some(session_stats(&session, &current_model)),
+                    Some(data),
                     None
                 ));
             }
@@ -3508,7 +3600,10 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
             // hint, not an allowlist (see its own doc comment). An empty string sneaking through
             // `Value::as_str` and getting durably recorded via `record_model_change` is caught here too,
             // the same class of fix `set_session_name` already got (reject empty, don't pretend to
-            // validate against a list this process can't actually authoritatively check).
+            // validate against a list this process can't actually authoritatively check). `model` may
+            // also carry a `:<level>` suffix (Fix 2, pi-parity gap — e.g. `"sonnet:high"`); when present,
+            // `resolve_model_id` returns it alongside the resolved id and it wins outright over whatever
+            // level was already active.
             "set_model" => match cmd
                 .get("model")
                 .and_then(Value::as_str)
@@ -3516,55 +3611,82 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                 .filter(|s| !s.is_empty())
                 .map(|raw| resolve_model_id(raw, available_models()))
             {
-                Some(Ok(model)) => {
+                Some(Ok((model, thinking_level))) => {
                     let model = model.as_str();
-                    // Persist the lineage marker *before* applying the switch in memory: if it fails
-                    // to write, leave the live model unchanged too, rather than forking live state
-                    // away from what's durably recorded (an `Err` here aborts the whole switch).
-                    let record_result = if model != current_model {
-                        persistence.record_model_change(model)
+                    // Re-derive the gateway credential/routing for `model` before touching any other
+                    // state — a switch can cross OAuth providers (or `models.json` overrides), and
+                    // this must fail closed (leaving `current_model`/the persisted lineage untouched)
+                    // rather than silently keep using whichever client happened to be active before.
+                    // Skipped when `model` is already the active one, for the same reason
+                    // `record_result` below skips a redundant persist: a no-op `set_model <current>`
+                    // shouldn't discard `OAuthCredentialSource`'s in-memory token cache for nothing.
+                    let new_client = if model == current_model {
+                        Ok(None)
                     } else {
-                        Ok(())
+                        build_gateway_client(&cfg, model).map(|c| Some(Arc::new(c)))
                     };
-                    match record_result {
-                        Ok(()) => {
-                            // A signed thinking block is only valid for replay to the model that
-                            // produced it, and a combined OpenAI-Responses tool-call id only means
-                            // anything back to that same model — scrub both from any message not
-                            // already stamped with the model we're switching to.
-                            session.scrub_cross_model_state(model);
-                            current_model = model.to_string();
-                            // Re-clamp the *existing* level against the *new* model: e.g. a session
-                            // sitting at `Off` on a disable-capable model must not silently carry that
-                            // `Off` over to a model that can't actually disable reasoning.
-                            current_level = agent_core::clamp_thinking_level(
-                                &agent_core::capabilities(&current_model),
-                                current_level,
-                            );
-                            agent = build_agent(
-                                client.clone(),
-                                &full_system(&static_system, &cwd),
-                                &cfg,
-                                &current_model,
-                                current_thinking,
-                                current_level,
-                                current_auto_compaction,
-                                current_auto_retry,
-                                persistence.session_id(),
-                                &write_locks,
-                                &checkpoint,
-                            );
-                            emit!(response(
-                                id,
-                                "set_model",
-                                true,
-                                Some(model_switch_response(&current_model, current_level)),
-                                None,
-                            ));
+                    match new_client {
+                        Ok(new_client) => {
+                            // Persist the lineage marker *before* applying the switch in memory: if it
+                            // fails to write, leave the live model unchanged too, rather than forking
+                            // live state away from what's durably recorded (an `Err` here aborts the
+                            // whole switch).
+                            let record_result = if model != current_model {
+                                persistence.record_model_change(model)
+                            } else {
+                                Ok(())
+                            };
+                            match record_result {
+                                Ok(()) => {
+                                    // A signed thinking block is only valid for replay to the model
+                                    // that produced it, and a combined OpenAI-Responses tool-call id
+                                    // only means anything back to that same model — scrub both from
+                                    // any message not already stamped with the model we're switching
+                                    // to.
+                                    session.scrub_cross_model_state(model);
+                                    current_model = model.to_string();
+                                    // Fix 2 (pi-parity gap): a `:<level>` suffix on `model` (e.g.
+                                    // `sonnet:high`) wins outright over whatever level was already
+                                    // active — the operator explicitly asked for this depth on the new
+                                    // model. No suffix falls back to re-clamping the *existing* level
+                                    // against the *new* model instead, same as before this fix: e.g. a
+                                    // session sitting at `Off` on a disable-capable model must not
+                                    // silently carry that `Off` over to a model that can't actually
+                                    // disable reasoning.
+                                    current_level = agent_core::clamp_thinking_level(
+                                        &agent_core::capabilities(&current_model),
+                                        thinking_level.unwrap_or(current_level),
+                                    );
+                                    if let Some(new_client) = new_client {
+                                        client = new_client;
+                                    }
+                                    agent = build_agent(
+                                        client.clone(),
+                                        &full_system(&static_system, &cwd),
+                                        &cfg,
+                                        &current_model,
+                                        current_thinking,
+                                        current_level,
+                                        current_auto_compaction,
+                                        current_auto_retry,
+                                        persistence.session_id(),
+                                        &write_locks,
+                                        &checkpoint,
+                                    );
+                                    emit!(response(
+                                        id,
+                                        "set_model",
+                                        true,
+                                        Some(model_switch_response(&current_model, current_level)),
+                                        None,
+                                    ));
+                                }
+                                Err(e) => {
+                                    emit!(response(id, "set_model", false, None, Some(&e.to_string())))
+                                }
+                            }
                         }
-                        Err(e) => {
-                            emit!(response(id, "set_model", false, None, Some(&e.to_string())))
-                        }
+                        Err(e) => emit!(response(id, "set_model", false, None, Some(&e))),
                     }
                 }
                 Some(Err(e)) => emit!(response(id, "set_model", false, None, Some(&e))),
@@ -3732,53 +3854,70 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                     .iter()
                     .find(|m| m.id == next_model)
                     .and_then(|m| m.thinking_level);
-                let record_result = if next_model != current_model {
-                    persistence.record_model_change(&next_model)
+                // See `set_model`'s identical re-derivation for why this must happen before anything
+                // else, and why it's skipped when `next_model` (wrapping back around) is already the
+                // active one.
+                let new_client = if next_model == current_model {
+                    Ok(None)
                 } else {
-                    Ok(())
+                    build_gateway_client(&cfg, &next_model).map(|c| Some(Arc::new(c)))
                 };
-                match record_result {
-                    Ok(()) => {
-                        session.scrub_cross_model_state(&next_model);
-                        current_model = next_model;
-                        if let Some(level) = pinned_level {
-                            // Same staleness hazard `cycle_thinking_level` already guards against:
-                            // a stale raw-budget override must not silently outlive the level it
-                            // was pinned over.
-                            current_thinking = None;
-                            current_level = level;
+                match new_client {
+                    Ok(new_client) => {
+                        let record_result = if next_model != current_model {
+                            persistence.record_model_change(&next_model)
+                        } else {
+                            Ok(())
+                        };
+                        match record_result {
+                            Ok(()) => {
+                                session.scrub_cross_model_state(&next_model);
+                                current_model = next_model;
+                                if let Some(level) = pinned_level {
+                                    // Same staleness hazard `cycle_thinking_level` already guards
+                                    // against: a stale raw-budget override must not silently outlive
+                                    // the level it was pinned over.
+                                    current_thinking = None;
+                                    current_level = level;
+                                }
+                                // See `set_model`'s identical re-clamp for why this can't be skipped.
+                                current_level = agent_core::clamp_thinking_level(
+                                    &agent_core::capabilities(&current_model),
+                                    current_level,
+                                );
+                                if let Some(new_client) = new_client {
+                                    client = new_client;
+                                }
+                                agent = build_agent(
+                                    client.clone(),
+                                    &full_system(&static_system, &cwd),
+                                    &cfg,
+                                    &current_model,
+                                    current_thinking,
+                                    current_level,
+                                    current_auto_compaction,
+                                    current_auto_retry,
+                                    persistence.session_id(),
+                                    &write_locks,
+                                    &checkpoint,
+                                );
+                                let mut resp_data =
+                                    model_switch_response(&current_model, current_level);
+                                if let Value::Object(map) = &mut resp_data {
+                                    map.insert("scoped".to_string(), json!(!cfg.models.is_empty()));
+                                }
+                                emit!(response(id, "cycle_model", true, Some(resp_data), None));
+                            }
+                            Err(e) => emit!(response(
+                                id,
+                                "cycle_model",
+                                false,
+                                None,
+                                Some(&e.to_string())
+                            )),
                         }
-                        // See `set_model`'s identical re-clamp for why this can't be skipped.
-                        current_level = agent_core::clamp_thinking_level(
-                            &agent_core::capabilities(&current_model),
-                            current_level,
-                        );
-                        agent = build_agent(
-                            client.clone(),
-                            &full_system(&static_system, &cwd),
-                            &cfg,
-                            &current_model,
-                            current_thinking,
-                            current_level,
-                            current_auto_compaction,
-                            current_auto_retry,
-                            persistence.session_id(),
-                            &write_locks,
-                            &checkpoint,
-                        );
-                        let mut resp_data = model_switch_response(&current_model, current_level);
-                        if let Value::Object(map) = &mut resp_data {
-                            map.insert("scoped".to_string(), json!(!cfg.models.is_empty()));
-                        }
-                        emit!(response(id, "cycle_model", true, Some(resp_data), None));
                     }
-                    Err(e) => emit!(response(
-                        id,
-                        "cycle_model",
-                        false,
-                        None,
-                        Some(&e.to_string())
-                    )),
+                    Err(e) => emit!(response(id, "cycle_model", false, None, Some(&e))),
                 }
             }
             "cycle_thinking_level" => {
@@ -4136,6 +4275,18 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                             let mut rebuild_needed = false;
                             if restored_model != current_model {
                                 session.scrub_cross_model_state(&restored_model);
+                                // The restored model can be on a different OAuth provider than whatever was
+                                // active before this switch — best-effort, matching this restore path's existing
+                                // "recorded state wins" philosophy: a failure here leaves `client` on the previous
+                                // (now-wrong-for-`current_model`) credential rather than aborting the whole switch,
+                                // so the next `prompt` surfaces its own clear transport-level error instead.
+                                match build_gateway_client(&cfg, &restored_model) {
+                                    Ok(new_client) => client = Arc::new(new_client),
+                                    Err(e) => eprintln!(
+                                        "serve: could not resolve a gateway credential for restored model {restored_model:?}: \
+                                         {e} — keeping the previous client"
+                                    ),
+                                }
                                 current_model = restored_model;
                                 rebuild_needed = true;
                             }
@@ -4242,10 +4393,15 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                     emit!(response(id, "bash", false, None, Some(&reason)));
                     continue;
                 }
-                // Recorded into session context by default — pi's `recordBashResult`, opted out of via
-                // `excludeFromContext` — so a diagnostic command run outside the model's own turn is
-                // still visible to it on the *next* turn. Previously this command never touched
-                // `session` at all: the calling client saw the result, but the model never did.
+                // Always recorded into `session`/persisted storage/`export.rs`'s rendered output — pi's
+                // `recordBashResult` (`agent-session.ts`) unconditionally records too. `exclude_from_context`
+                // (Fix 9, pi-parity gap: previously misdescribed here as gating *recording* itself, and
+                // implemented that way too — see the `session.push`/`persist` call below, now unconditional)
+                // instead gates only the separate transform that builds what's actually sent to the model
+                // on its *next* turn (`ServeHooks::before_provider_request`) — pi's identical two-layer split
+                // (`recordBashResult` vs. `convertToLlm`, `messages.ts`). So a diagnostic command run outside
+                // the model's own turn is always visible in history; only whether the model itself sees it
+                // next turn is what this flag controls.
                 let exclude_from_context = cmd
                     .get("exclude_from_context")
                     .and_then(Value::as_bool)
@@ -4275,6 +4431,13 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                     cancel.clone(),
                 );
                 let mut stdin_open = true;
+                // Fix 7 (pi-parity gap): `tools::bash`'s own `truncation_details` (the `{truncation,
+                // full_output_path}` payload — see that module's doc comment) only ever streams on an
+                // interim `ToolUpdate::Progress`, never on the terminal outcome — captured here so the
+                // response built below can carry it as its own structured field instead of only ever
+                // reaching a client via a progress event that a client polling just for the final
+                // result never sees at all.
+                let mut last_bash_details: Option<Value> = None;
                 let outcome = {
                     let run = tool.run_streaming(input, &progress);
                     tokio::pin!(run);
@@ -4302,6 +4465,9 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                             }
                             update = prog_rx.next() => {
                                 if let Some(ToolUpdate::Progress { id, name, snapshot, details }) = update {
+                                    if details.is_some() {
+                                        last_bash_details = details.clone();
+                                    }
                                     if let Some(frame) = event_frame(AgentEvent::ToolProgress { id, name, snapshot, details }) {
                                         let _ = out_tx.send(frame);
                                     }
@@ -4348,6 +4514,9 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                         details,
                     } = update
                     {
+                        if details.is_some() {
+                            last_bash_details = details.clone();
+                        }
                         if let Some(frame) = event_frame(AgentEvent::ToolProgress {
                             id,
                             name,
@@ -4363,6 +4532,24 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                     Ok(output) => (output.text, false),
                     Err(e) => (e.to_string(), true),
                 };
+                // Fix 7 (pi-parity gap): pi's own `BashResult{output, exitCode, cancelled, truncated,
+                // fullOutputPath}` (`bash-executor.ts`) alongside the text, not flattened into it — see
+                // `bash_exit_code_from_status_line`/`bash_result_was_cancelled`'s own doc comments for
+                // how each is recovered from what `tools::bash` already reports (its own status-line
+                // text, and the last progress `details` captured above).
+                let exit_code = bash_exit_code_from_status_line(&result_text, is_error);
+                let cancelled = bash_result_was_cancelled(&result_text, is_error);
+                let truncated = last_bash_details
+                    .as_ref()
+                    .and_then(|d| d.get("truncation"))
+                    .and_then(|t| t.get("truncated"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let full_output_path = last_bash_details
+                    .as_ref()
+                    .and_then(|d| d.get("full_output_path"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 if let Some(frame) = event_frame(AgentEvent::ToolEnd {
                     id: call_id,
                     name: "bash".to_string(),
@@ -4378,20 +4565,43 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                 // is in flight, and this command is only reachable from the idle loop to begin with), so
                 // there's no tool_use/tool_result ordering to protect against, unlike pi's own
                 // stream-in-flight deferral.
-                if !exclude_from_context {
-                    session.push(agent_core::Message::user(format!(
-                        "[Host bash command, run outside the model's own turn]\n$ {command}\n\n{}{result_text}",
-                        if is_error { "(error)\n" } else { "" }
-                    )));
-                    if let Err(e) = persistence.persist(&session, None) {
-                        eprintln!("serve: failed to persist host bash result: {e}");
-                    }
+                //
+                // Fix 9 (pi-parity gap): always pushed and persisted now, regardless of
+                // `exclude_from_context` — pi's own `recordBashResult` (`agent-session.ts`) unconditionally
+                // records into `agent.state.messages` too; `excludeFromContext` is consulted only later, in
+                // the separate `convertToLlm` transform that builds what's actually sent to the model
+                // (`messages.ts`). This used to skip recording entirely when the flag was set, losing the
+                // command/output outright instead of merely hiding it from the model — it never showed up
+                // in `session.messages`, persisted storage, or `export.rs`'s rendered output either.
+                // `HOST_BASH_EXCLUDED_LABEL` is this crate's stand-in for pi's dedicated
+                // `BashExecutionMessage.excludeFromContext` field (`agent_core::Message` has no such field —
+                // see the label's own doc comment); `ServeHooks::before_provider_request`, installed on
+                // every `build_agent` agent, is the "what's actually sent to the model" transform that
+                // consults it.
+                let label = if exclude_from_context {
+                    HOST_BASH_EXCLUDED_LABEL
+                } else {
+                    HOST_BASH_LABEL
+                };
+                session.push(agent_core::Message::user(format!(
+                    "{label}\n$ {command}\n\n{}{result_text}",
+                    if is_error { "(error)\n" } else { "" }
+                )));
+                if let Err(e) = persistence.persist(&session, None) {
+                    eprintln!("serve: failed to persist host bash result: {e}");
                 }
                 emit!(response(
                     id,
                     "bash",
                     true,
-                    Some(json!({ "result": result_text, "is_error": is_error })),
+                    Some(json!({
+                        "result": result_text,
+                        "is_error": is_error,
+                        "exit_code": exit_code,
+                        "cancelled": cancelled,
+                        "truncated": truncated,
+                        "full_output_path": full_output_path,
+                    })),
                     None,
                 ));
                 if !stdin_open {
@@ -4612,6 +4822,34 @@ fn full_system(static_system: &str, cwd: &std::path::Path) -> String {
     format!("{static_system}{}", crate::resources::dynamic_footer(cwd))
 }
 
+/// Resolve `model`'s gateway credential/routing ([`resolve_gateway_credential`]) and build a
+/// ready-to-use [`GatewayClient`] for it, applying the process's fixed retry policy. Called once at
+/// `serve` startup and again every time the active model changes at runtime (`set_model`,
+/// `cycle_model`, and `switch_session`/`fork`/`clone`/`switch_branch` restoring a session's own
+/// recorded model) — never cached across a model switch, since the resolved provider/routing can be
+/// completely different from one model to the next (an OAuth login resolved for an Anthropic model has
+/// no bearing on a GitHub Copilot one). This is the fix for the credential/routing having previously
+/// been resolved exactly once, before `serve` even started, and then silently reused — stale provider,
+/// stale routing — by every later model switch for the rest of the process's life.
+fn build_gateway_client(cfg: &ServeConfig, model: &str) -> Result<GatewayClient, String> {
+    let credential = resolve_gateway_credential(cfg.key.clone(), model)?;
+    let client = match credential {
+        GatewayCredential::Static(key) => {
+            GatewayClient::new(cfg.gateway.clone(), key).map_err(|e| e.to_string())?
+        }
+        GatewayCredential::Oauth(source) => {
+            GatewayClient::with_credential_source(cfg.gateway.clone(), source).map_err(|e| e.to_string())?
+        }
+    }
+    .with_retry(
+        cfg.retry_max_retries
+            .unwrap_or(agent_core::client::MAX_RETRIES),
+        cfg.retry_base_delay_ms
+            .unwrap_or(agent_core::client::BASE_BACKOFF),
+    );
+    Ok(client)
+}
+
 /// Build the [`Agent`] for the current model + thinking budget + auto-compaction/auto-retry flags.
 /// Called once at startup and again on every `set_model`/`set_thinking`/`cycle_model`/
 /// `cycle_thinking_level`/`set_auto_compaction`/`set_auto_retry`, so a client can re-tune the run
@@ -4695,10 +4933,71 @@ fn build_agent(
         &cfg.deny_bash_pattern,
         &cfg.deny_path,
     );
-    if !policy.is_empty() {
-        agent = agent.with_hooks(Arc::new(policy));
-    }
+    // Fix 9 (pi-parity gap): always installed now — unlike the bare `ToolPolicy` this used to install
+    // only when non-empty, `ServeHooks::before_provider_request` (the `bash` RPC's
+    // `exclude_from_context` filter) is needed unconditionally, and `Agent::with_hooks` only ever holds
+    // one hook object. See `ServeHooks`'s own doc comment.
+    agent = agent.with_hooks(Arc::new(ServeHooks { policy }));
     agent
+}
+
+/// The one [`AgentHooks`] implementation `build_agent` installs — composes the optional
+/// `--deny-tool`/`--deny-bash-pattern`/`--deny-path` gate ([`crate::policy::ToolPolicy`]) with
+/// [`before_provider_request`](AgentHooks::before_provider_request)'s own, unconditional job: filtering
+/// [`HOST_BASH_EXCLUDED_LABEL`]-tagged messages out of the outgoing model request (Fix 9, pi-parity
+/// gap). `session.messages`/persisted storage/`export.rs`'s rendered output all still carry the
+/// message unchanged — only the wire payload a turn actually sends omits it, mirroring pi's
+/// `convertToLlm` (`packages/coding-agent/src/core/messages.ts`), which performs the identical
+/// late-and-separate filter rather than gating what `recordBashResult` commits to history in the first
+/// place.
+struct ServeHooks {
+    policy: crate::policy::ToolPolicy,
+}
+
+#[async_trait::async_trait]
+impl AgentHooks for ServeHooks {
+    async fn before_tool_call(
+        &self,
+        name: &str,
+        input: &Value,
+        session: &Session,
+        cancel: &CancellationToken,
+    ) -> Option<String> {
+        self.policy.before_tool_call(name, input, session, cancel).await
+    }
+
+    async fn before_provider_request(&self, req: &mut agent_core::transport::ModelRequest) {
+        if !req.messages.iter().any(is_excluded_from_model_context) {
+            return;
+        }
+        let kept: Vec<agent_core::Message> = req
+            .messages
+            .iter()
+            .filter(|m| !is_excluded_from_model_context(m))
+            .cloned()
+            .collect();
+        req.messages = std::sync::Arc::new(kept);
+    }
+}
+
+/// Text prefix stamped on a host `bash` RPC result recorded with `exclude_from_context: true` — this
+/// crate's stand-in for pi's dedicated `BashExecutionMessage.excludeFromContext` field
+/// (`packages/coding-agent/src/core/messages.ts`): `agent_core::Message` is wire-shaped 1:1 (see its own
+/// module doc comment), with no side channel for a per-message "hide from the model, but not from
+/// history" flag the way pi's own richer `AgentMessage` union has. The label is never user-influenced —
+/// it precedes `$ {command}` entirely, so a command's own text (or its output) can't forge it — and is
+/// consulted only by [`ServeHooks::before_provider_request`], the one place this crate's own "what's
+/// actually sent to the model" transform lives.
+const HOST_BASH_EXCLUDED_LABEL: &str = "[Host bash command, excluded from model context]";
+/// The ordinary (not excluded) counterpart to [`HOST_BASH_EXCLUDED_LABEL`] — unchanged from before Fix 9.
+const HOST_BASH_LABEL: &str = "[Host bash command, run outside the model's own turn]";
+
+/// Whether `m` is a [`HOST_BASH_EXCLUDED_LABEL`]-tagged message — see that constant's own doc comment.
+fn is_excluded_from_model_context(m: &agent_core::Message) -> bool {
+    m.role == agent_core::Role::User
+        && m.content.iter().any(|c| {
+            matches!(c, agent_core::ContentBlock::Text { text, .. } if text.starts_with(HOST_BASH_EXCLUDED_LABEL))
+        })
 }
 
 /// The tool registry after `--tools`/`--exclude-tools`/`--no-tools` filtering — shared by every
@@ -4718,6 +5017,28 @@ fn build_tools(cfg: &ServeConfig) -> agent_core::ToolRegistry {
         cfg.no_tools,
     );
     registry
+}
+
+/// The `--reasoning-effort` default (Fix 1, pi-parity gap) both `main.rs`'s plain `run` path and this
+/// module's own `serve` startup fall back to when the operator passed neither an explicit
+/// `--reasoning-effort` flag nor a stored `agent settings --default-reasoning-effort` override: pi's own
+/// `DEFAULT_THINKING_LEVEL` ("medium", `packages/coding-agent/src/core/defaults.ts`) applies whenever
+/// `model` supports reasoning/thinking at all — a bare `pi "task"` invocation runs with medium
+/// adaptive-thinking effort on pi's own default model, not with thinking disabled outright. Previously
+/// this crate left the effort `None` in that case, which — for a model whose thinking mechanism can be
+/// explicitly disabled (`reasoning_disableable`) — wire-sends an explicit `{"type":"disabled"}"`/
+/// `{"effort":"none"}` rather than picking any default depth at all.
+///
+/// `None` for a model with no thinking/reasoning mechanism whatsoever (`reasoning_effort`/`thinking`
+/// capability both absent) — nothing to default there. Deliberately a CLI/serve-layer default, not new
+/// `agent_core` plumbing: `agent_core::Agent::new`/`with_reasoning_effort` are unchanged, still doing
+/// exactly nothing when the caller never calls the latter — this only changes what `main.rs`/`serve`
+/// pass in when the operator didn't specify anything themselves.
+pub fn default_reasoning_effort_for_model(model: &str) -> Option<agent_core::ReasoningEffort> {
+    let caps = agent_core::capabilities(model);
+    let supports_reasoning =
+        caps.thinking != agent_core::models::ThinkingShape::None || caps.reasoning_effort;
+    supports_reasoning.then_some(agent_core::ReasoningEffort::Medium)
 }
 
 /// A small, non-exhaustive list of model ids the [`capabilities`](agent_core::capabilities) table
@@ -4766,6 +5087,27 @@ struct ScopedModel {
 /// A glob that matches nothing is dropped silently — pi's own resolver only ever warns, never
 /// hard-fails, and cycling still works from whatever else resolved. A duplicate id keeps the first
 /// occurrence's pin, same as pi's `modelsAreEqual` dedup.
+///
+/// Splits a trailing `:<level>` suffix (one of `agent_core::ThinkingLevel::parse`'s vocabulary) off
+/// `pattern`, shared by [`resolve_model_scope`] (a `--models` entry) and [`resolve_model_id`] (a bare
+/// `--model`/`set_model` id) — Fix 2 (pi-parity gap): `resolve_model_id` previously had no colon-suffix
+/// handling at all, unlike pi's own `model-resolver.ts::parseModelPattern`, which applies it to
+/// `--model`/`--provider` too (its own help text example: `pi --model sonnet:high`). A suffix that isn't
+/// a valid level is left attached to `pattern` untouched — the whole string is then resolved (or kept
+/// literal) as one id, same as if no colon were present at all.
+fn split_thinking_level_suffix(pattern: &str) -> (&str, Option<agent_core::ThinkingLevel>) {
+    match pattern.rfind(':') {
+        Some(idx) => {
+            let suffix = &pattern[idx + 1..];
+            match agent_core::ThinkingLevel::parse(suffix) {
+                Some(level) => (&pattern[..idx], Some(level)),
+                None => (pattern, None),
+            }
+        }
+        None => (pattern, None),
+    }
+}
+
 fn resolve_model_scope(patterns: &[String], catalog: &[&str]) -> Vec<ScopedModel> {
     let mut resolved: Vec<ScopedModel> = Vec::new();
     for raw in patterns {
@@ -4773,16 +5115,7 @@ fn resolve_model_scope(patterns: &[String], catalog: &[&str]) -> Vec<ScopedModel
         if pattern.is_empty() {
             continue;
         }
-        let (base, thinking_level) = match pattern.rfind(':') {
-            Some(idx) => {
-                let suffix = &pattern[idx + 1..];
-                match agent_core::ThinkingLevel::parse(suffix) {
-                    Some(level) => (&pattern[..idx], Some(level)),
-                    None => (pattern, None),
-                }
-            }
-            None => (pattern, None),
-        };
+        let (base, thinking_level) = split_thinking_level_suffix(pattern);
         let is_glob = base.chars().any(|c| matches!(c, '*' | '?' | '['));
         if is_glob {
             let matcher = match globset::GlobBuilder::new(base)
@@ -4809,7 +5142,7 @@ fn resolve_model_scope(patterns: &[String], catalog: &[&str]) -> Vec<ScopedModel
             // candidate-list build, not the one model actively in use) — it's warned about and kept
             // literal instead, same graceful-degrade this crate already applies to a glob matching
             // nothing.
-            let resolved_id = match resolve_model_id(base, catalog) {
+            let resolved_id = match resolve_model_id_base(base, catalog) {
                 Ok(id) => id,
                 Err(e) => {
                     eprintln!("warning: --models {base:?}: {e}; using it literally");
@@ -4846,7 +5179,27 @@ fn resolve_model_scope(patterns: &[String], catalog: &[&str]) -> Vec<ScopedModel
 ///   a non-exhaustive hint, not an allowlist, so an id genuinely outside it (a brand-new model, a
 ///   provider-specific id the gateway still understands) must still reach the gateway verbatim rather
 ///   than being rejected outright.
-pub fn resolve_model_id(input: &str, catalog: &[&str]) -> Result<String, String> {
+///
+/// Fix 2 (pi-parity gap): `input` may also carry a trailing `:<level>` suffix (e.g. `sonnet:high`,
+/// pi's own `--model <pattern>:<thinking-level>` shorthand) — split off via
+/// [`split_thinking_level_suffix`] *before* resolution, so both `--model`'s own startup resolution and
+/// the `set_model` RPC handler get it for free, the same way [`resolve_model_scope`]'s `--models`
+/// entries already do. The returned level is the caller's to apply (setting the corresponding
+/// reasoning effort); a suffix that isn't a valid level is left attached to the id itself, and resolved
+/// (or kept literal) as one string, exactly as if no colon were present.
+pub fn resolve_model_id(
+    input: &str,
+    catalog: &[&str],
+) -> Result<(String, Option<agent_core::ThinkingLevel>), String> {
+    let (base, thinking_level) = split_thinking_level_suffix(input.trim());
+    resolve_model_id_base(base, catalog).map(|id| (id, thinking_level))
+}
+
+/// [`resolve_model_id`]'s resolution, without the colon-suffix split — the id-only lookup
+/// [`resolve_model_scope`]'s own literal-pattern branch calls directly (it already extracted any
+/// `:<level>` suffix itself, via the same [`split_thinking_level_suffix`] helper, so re-splitting here
+/// would be a no-op at best and a double-strip of a legitimately colon-containing id at worst).
+fn resolve_model_id_base(input: &str, catalog: &[&str]) -> Result<String, String> {
     let trimmed = input.trim();
     if let Some(exact) = catalog.iter().find(|m| m.eq_ignore_ascii_case(trimmed)) {
         return Ok((*exact).to_string());
@@ -5076,6 +5429,24 @@ fn message_usage_totals(session: &Session) -> MessageUsageTotals {
     totals
 }
 
+/// [`message_usage_totals`], reshaped into [`crate::export::UsageTotals`] — Fix 6 (pi-parity gap): the
+/// standalone `export` subcommand (`main.rs`) has no live `Agent`/`Session` with running counters to
+/// pull from (a freshly `SessionStore::open`ed session never restores those — see
+/// `message_usage_totals`'s own doc comment for why), but it does have `sess.messages` right there,
+/// from which this is fully reconstructable — no live agent needed. Previously that entry point passed
+/// `usage: None` unconditionally, the one of the three export entry points (alongside `serve`'s
+/// `export_html` RPC and `run --export`, both of which already report real totals from a live
+/// `Session`'s running counters) that silently omitted the stats section's usage line entirely.
+pub fn message_export_usage_totals(session: &Session) -> crate::export::UsageTotals {
+    let totals = message_usage_totals(session);
+    crate::export::UsageTotals {
+        input_tokens: totals.input_tokens,
+        output_tokens: totals.output_tokens,
+        cache_read_tokens: totals.cache_read_tokens,
+        cache_write_tokens: totals.cache_write_tokens,
+    }
+}
+
 /// pi's `userMessages`/`assistantMessages`/`toolCalls`/`toolResults` (`getSessionStats`) — a client
 /// wanting these previously had to fetch `get_messages` and count client-side.
 ///
@@ -5132,11 +5503,32 @@ fn message_type_breakdown(session: &Session) -> MessageTypeBreakdown {
     breakdown
 }
 
+/// Insert `session_id`/`session_file` into `m` — the on-disk identity every `get_state`/
+/// `get_session_stats` response carries, idle or busy (Fix 8, pi-parity gap: `get_session_stats`
+/// previously omitted both in its idle response, and its entire busy response, unlike `get_state`'s own
+/// sibling arms, which already backfilled them from these same two sources). Shared so the two RPC
+/// types can't drift out of shape with each other again.
+fn insert_session_identity(m: &mut Map<String, Value>, persistence: &Persistence) {
+    m.insert("session_id".into(), json!(persistence.session_id()));
+    m.insert(
+        "session_file".into(),
+        json!(persistence.session_file().map(|p| p.display().to_string())),
+    );
+}
+
 /// The runtime-mutable settings and queue depth `get_state` reports — pi's `get_state` carries the
 /// same shape (`thinkingLevel`/`autoCompactionEnabled`/`steeringMode`/`followUpMode`/
 /// `pendingMessageCount`), so a client can render current settings and "N queued" without a second
 /// round trip. Answerable from the process's own mutable state, not `&Session`, so — like
 /// `session_stats` — it's available even mid-run (see the `prompt` arm's read-only-command handling).
+///
+/// Fix 5 (pi-parity gap): `steer_queue`/`follow_up_queue` carry the queued lanes' actual message text
+/// (`Steering::steer_texts`/`follow_up_texts`), not just `pending_messages`' bare count — previously a
+/// client had no way to see *what* was queued short of guessing from its own prior `steer`/`follow_up`
+/// calls, unlike pi's own `queue_update` event (`steering`/`followUp` string arrays). No unsolicited
+/// push-time event is added alongside it (that gap is deliberate — see `steering.rs`'s own module doc
+/// comment); instead every place this function's result already lands (`get_state`, and the `steer`/
+/// `follow_up` handlers' own ack responses, below) picks the content up for free.
 fn runtime_settings(
     current_level: agent_core::ThinkingLevel,
     current_auto_compaction: bool,
@@ -5156,7 +5548,55 @@ fn runtime_settings(
             agent_core::QueueMode::All => "all",
         },
         "pending_messages": steering.pending_count(),
+        "steer_queue": steering.steer_texts(),
+        "follow_up_queue": steering.follow_up_texts(),
     })
+}
+
+/// `{steer_queue, follow_up_queue}` alone — the same pair [`runtime_settings`] carries, factored out
+/// so the `steer`/`follow_up` handlers' own ack responses (Fix 5, pi-parity gap) can attach it without
+/// pulling in that function's wider signature (`thinking_level`/`auto_compaction`/… — irrelevant to a
+/// bare queue push/ack).
+fn queue_content(steering: &agent_core::Steering) -> Value {
+    json!({
+        "steer_queue": steering.steer_texts(),
+        "follow_up_queue": steering.follow_up_texts(),
+    })
+}
+
+/// Recover the exit code the host `bash` RPC command's terminal response reports (Fix 7, pi-parity
+/// gap) — `tools::bash` never returns one structurally; a non-zero exit is folded into `result_text`
+/// itself as a trailing `"Command exited with code <N>"` status line (`tools::bash::append_status`),
+/// the only place it's recorded at all. `Some(0)` for an ordinary success: `tools::bash` itself treats
+/// exit `0` and "no code reported" (`result.code: None`) as the identical `Ok` outcome, so neither is
+/// distinguishable from the other here either. `None` for a cancelled/timed-out run — pi's own
+/// `BashResult.exitCode` is `undefined` for both (see `bash_result_was_cancelled`), matching the
+/// dedicated "cancelled" status text `tools::bash` appends instead of an exit-code one for either case.
+fn bash_exit_code_from_status_line(result_text: &str, is_error: bool) -> Option<i64> {
+    if !is_error {
+        return Some(0);
+    }
+    let marker = "Command exited with code ";
+    let start = result_text.rfind(marker)? + marker.len();
+    result_text[start..]
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .filter(|digits| !digits.is_empty())
+        .and_then(|digits| digits.parse().ok())
+}
+
+/// Whether the host `bash` RPC command's result represents a cancelled or timed-out run rather than an
+/// ordinary completion (Fix 7, pi-parity gap) — pi's own `BashResult.cancelled` conflates both under one
+/// signal (`executeBashWithOperations`'s `options?.signal?.aborted` fires for either). Recovered from
+/// `tools::bash`'s own status-line text (`append_status`'s `"Command cancelled"`/`"Command timed out
+/// after <N> seconds"`), or this RPC handler's own fallback synthetic `"cancelled"` error for a tool
+/// that isn't internally cancellation-aware (see the `bash` handler's own `select!` comment on why, in
+/// practice, `tools::bash` always wins that race first).
+fn bash_result_was_cancelled(result_text: &str, is_error: bool) -> bool {
+    is_error
+        && (result_text.contains("Command cancelled")
+            || result_text.contains("Command timed out after")
+            || result_text == "cancelled")
 }
 
 /// A live mirror of [`Session`]'s token/step counters, updated from the event sink as a `prompt` runs —
@@ -5626,6 +6066,7 @@ mod tests {
             error_message: None,
             aborted: false,
             usage: None,
+            stop_reason: None,
         });
         session.push(agent_core::Message::assistant(vec![
             agent_core::ContentBlock::text("done reading both files"),
@@ -5664,6 +6105,7 @@ mod tests {
             error_message: None,
             aborted: false,
             usage: None,
+            stop_reason: None,
         });
 
         let stats = session_stats(&session, "claude-opus-4-8");
@@ -6105,6 +6547,36 @@ mod tests {
         );
     }
 
+    // Fix 1 (pi-parity gap): a bare invocation with no `--reasoning-effort` previously left the
+    // effort/level `None`/`Off`, wire-disabling reasoning outright for a model that can explicitly
+    // disable it, instead of picking pi's own "medium" default.
+
+    #[test]
+    fn default_reasoning_effort_for_model_is_medium_on_the_built_in_default_model() {
+        assert_eq!(
+            default_reasoning_effort_for_model("claude-opus-4-8"),
+            Some(agent_core::ReasoningEffort::Medium)
+        );
+    }
+
+    #[test]
+    fn default_reasoning_effort_for_model_is_medium_for_any_reasoning_capable_model() {
+        // Budget-shape (extended thinking, not an OpenAI `reasoning_effort` toggle) counts too.
+        assert_eq!(
+            default_reasoning_effort_for_model("claude-test"),
+            Some(agent_core::ReasoningEffort::Medium)
+        );
+    }
+
+    #[test]
+    fn default_reasoning_effort_for_model_is_none_for_a_model_with_no_reasoning_mechanism_at_all() {
+        assert_eq!(
+            default_reasoning_effort_for_model("claude-3-5-sonnet-20241022"),
+            None
+        );
+        assert_eq!(default_reasoning_effort_for_model("gpt-4o"), None);
+    }
+
     // Fix 10 (pi-parity feature): `--model`/`set_model` previously forwarded any id verbatim with no
     // resolution at all. `resolve_model_id` ports a scoped-down version of pi's own
     // `model-resolver.ts` partial/substring matching, but never silently guesses on an ambiguous
@@ -6114,7 +6586,7 @@ mod tests {
     #[test]
     fn resolve_model_id_an_exact_match_is_returned_in_the_catalogs_own_casing() {
         assert_eq!(
-            resolve_model_id("Claude-Opus-4-8", available_models()).unwrap(),
+            resolve_model_id("Claude-Opus-4-8", available_models()).unwrap().0,
             "claude-opus-4-8"
         );
     }
@@ -6122,11 +6594,11 @@ mod tests {
     #[test]
     fn resolve_model_id_an_unambiguous_partial_match_resolves_to_the_full_id() {
         assert_eq!(
-            resolve_model_id("opus", available_models()).unwrap(),
+            resolve_model_id("opus", available_models()).unwrap().0,
             "claude-opus-4-8"
         );
         assert_eq!(
-            resolve_model_id("SONNET", available_models()).unwrap(),
+            resolve_model_id("SONNET", available_models()).unwrap().0,
             "claude-sonnet-4-5"
         );
     }
@@ -6145,7 +6617,9 @@ mod tests {
         // `available_models` is a hint, not an allowlist — a brand-new or provider-specific id the
         // gateway still understands must reach it unchanged, not be rejected.
         assert_eq!(
-            resolve_model_id("totally-custom-id", available_models()).unwrap(),
+            resolve_model_id("totally-custom-id", available_models())
+                .unwrap()
+                .0,
             "totally-custom-id"
         );
     }
@@ -6155,9 +6629,36 @@ mod tests {
         // "gpt-5" is itself a substring of "gpt-5-mini" too, but an exact match must win outright
         // rather than ever reaching the ambiguous-candidates error path.
         assert_eq!(
-            resolve_model_id("gpt-5", available_models()).unwrap(),
+            resolve_model_id("gpt-5", available_models()).unwrap().0,
             "gpt-5"
         );
+    }
+
+    #[test]
+    fn resolve_model_id_a_colon_level_suffix_resolves_the_id_and_returns_the_level() {
+        // Fix 2 (pi-parity gap): `--model sonnet:high` must resolve to the sonnet model id *and*
+        // report `high` as the level to apply — pi's own `--model <pattern>:<thinking-level>`
+        // shorthand, previously only honored by `--models`/`resolve_model_scope`.
+        let (id, level) = resolve_model_id("sonnet:high", available_models()).unwrap();
+        assert_eq!(id, "claude-sonnet-4-5");
+        assert_eq!(level, Some(agent_core::ThinkingLevel::High));
+    }
+
+    #[test]
+    fn resolve_model_id_no_colon_suffix_returns_no_level() {
+        let (id, level) = resolve_model_id("opus", available_models()).unwrap();
+        assert_eq!(id, "claude-opus-4-8");
+        assert_eq!(level, None);
+    }
+
+    #[test]
+    fn resolve_model_id_an_invalid_colon_suffix_is_kept_as_part_of_the_literal_id() {
+        // Matches `resolve_model_scope`'s identical treatment of an invalid suffix: not a valid
+        // thinking level, so it's left attached and the whole string is resolved (or kept literal) as
+        // one id rather than silently dropped.
+        let (id, level) = resolve_model_id("totally-custom-id:notalevel", available_models()).unwrap();
+        assert_eq!(id, "totally-custom-id:notalevel");
+        assert_eq!(level, None);
     }
 
     #[tokio::test]

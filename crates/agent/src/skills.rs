@@ -529,13 +529,29 @@ fn walk(root: &Path, out: &mut Vec<Skill>, diagnostics: &mut Vec<String>) {
 /// Loose `*.md` files directly under `root` (not `SKILL.md`, which [`walk`] already handles, and not
 /// nested in a subdirectory — only the root's immediate children) — pi's second skill shape, for one
 /// small enough not to need its own directory and resources.
+///
+/// Gitignore-aware and dotfile-skipping via the same `ignore` crate [`walk`] already uses (rather than
+/// a bare `fs::read_dir`, which has no notion of either) — pi's own `collectSkillEntries`/
+/// `loadSkillsFromDirInternal` skip a loose root `.md` file that starts with `.` or matches a
+/// `.gitignore`/`.ignore`/`.fdignore` pattern before ever reaching the loose-file recognition branch, and
+/// a bare `fs::read_dir` here previously bypassed both checks entirely — a dotfile or gitignored `.md`
+/// placed directly at the skills root leaked straight into `<available_skills>` (pi-parity fix).
 fn loose_root_skills(root: &Path, diagnostics: &mut Vec<String>) -> Vec<Skill> {
-    let Ok(entries) = fs::read_dir(root) else {
-        return Vec::new();
-    };
+    let paths: Vec<PathBuf> = ignore::WalkBuilder::new(root)
+        .max_depth(Some(1))
+        .follow_links(true)
+        .add_custom_ignore_filename(".fdignore")
+        .require_git(false)
+        .git_global(false)
+        .git_exclude(false)
+        .filter_entry(|entry| entry.file_name() != "node_modules")
+        .build()
+        .flatten() // missing/unreadable/inaccessible entries are the normal case, not an error
+        .filter(|entry| entry.depth() > 0 && entry.file_type().is_some_and(|t| t.is_file()))
+        .map(ignore::DirEntry::into_path)
+        .collect();
     let mut out = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for path in paths {
         if path.extension().and_then(|e| e.to_str()) != Some("md") {
             continue;
         }
@@ -829,6 +845,11 @@ pub fn expand_if_skill_invocation(message: &str, skills: &[Skill]) -> String {
 /// Skills flagged `disable-model-invocation` are omitted here (the model must not auto-select them);
 /// they stay reachable via [`find_by_name`] for an explicit `/skill:name` invocation.
 ///
+/// Each entry is a nested `<skill><name>…</name><description>…</description><location>…</location>
+/// </skill>`, matching the public Agent Skills spec pi's own `formatSkillsForPrompt`/
+/// `formatSkillsForSystemPrompt` emit (`https://agentskills.io/integrate-skills`) — not a flat bullet
+/// line of this crate's own invention.
+///
 /// Returns `""` — no wrapper at all, not an empty `<available_skills>…</available_skills>` shell — when
 /// every skill is `disable-model-invocation` (or `skills` is empty): pi's own
 /// `formatSkillsForPrompt`/`formatSkillsForSystemPrompt` do the same (pi-parity fix, M1). An empty
@@ -856,12 +877,17 @@ pub fn format_available(skills: &[Skill]) -> String {
          or the loose skill file's own directory) and use that absolute path in tool commands.\n",
     );
     for s in visible {
+        out.push_str("  <skill>\n");
+        out.push_str(&format!("    <name>{}</name>\n", xml_escape(&s.name)));
         out.push_str(&format!(
-            "- {} — {} (read: {})\n",
-            xml_escape(&s.name),
-            xml_escape(&s.description),
+            "    <description>{}</description>\n",
+            xml_escape(&s.description)
+        ));
+        out.push_str(&format!(
+            "    <location>{}</location>\n",
             xml_escape(&s.path.display().to_string())
         ));
+        out.push_str("  </skill>\n");
     }
     out.push_str("</available_skills>");
     out
@@ -1935,6 +1961,55 @@ mod tests {
     }
 
     #[test]
+    fn a_dotfile_loose_skill_is_not_discovered() {
+        // Regression guard, mirroring prompts.rs's `a_dotfile_template_is_not_discovered`:
+        // `loose_root_skills` used to do a bare `fs::read_dir` with no dotfile check at all, unlike
+        // `walk`'s `ignore::WalkBuilder` (default `hidden: true` skips dotfiles) — a `.draft.md` placed
+        // directly at the skills root leaked straight into `<available_skills>`.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join(".draft.md"),
+            "---\nname: draft\ndescription: a work-in-progress skill\n---\n",
+        )
+        .unwrap();
+        let skills = discover_in(tmp.path());
+        assert!(
+            !skills.iter().any(|s| s.name == "draft" || s.name == ".draft"),
+            "a dotfile loose skill must not be discovered: {skills:?}"
+        );
+    }
+
+    #[test]
+    fn a_gitignore_entry_hides_a_matching_loose_skill() {
+        // Regression guard, mirroring prompts.rs's `a_gitignore_entry_hides_a_matching_prompt_template`:
+        // `loose_root_skills` had no ignore-crate usage at all, unlike `walk` — a
+        // `.claude/skills/.gitignore` entry that pi would honor (`package-manager.ts`'s
+        // `ig.ignores(relPath)` check) was silently ignored here, leaking a gitignored loose skill into
+        // `<available_skills>`.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join(".gitignore"), "secret-*.md\n").unwrap();
+        fs::write(
+            tmp.path().join("secret-notes.md"),
+            "---\nname: secret\ndescription: should not surface\n---\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("real.md"),
+            "---\nname: real\ndescription: a real loose skill\n---\n",
+        )
+        .unwrap();
+        let skills = discover_in(tmp.path());
+        assert!(
+            !skills.iter().any(|s| s.name == "secret"),
+            "a gitignored loose skill must not be discovered: {skills:?}"
+        );
+        assert!(
+            skills.iter().any(|s| s.name == "real"),
+            "a non-ignored loose skill in the same directory must still be discovered: {skills:?}"
+        );
+    }
+
+    #[test]
     fn a_skills_own_directory_does_not_leak_sibling_md_files_as_phantom_skills() {
         // pi-parity fix: `discover_in_with_diagnostics` used to call `loose_root_skills(root, ...)`
         // unconditionally even when `walk` had already accepted `root` itself as a skill directory
@@ -2068,7 +2143,10 @@ mod tests {
     }
 
     #[test]
-    fn format_lists_name_description_and_path() {
+    fn format_lists_name_description_and_location_as_nested_xml() {
+        // pi-parity fix: pi's `formatSkillsForPrompt`/`formatSkillsForSystemPrompt` render each skill
+        // as a nested `<skill>` per the public Agent Skills spec, not a flat bullet line of this
+        // crate's own invention.
         let skills = vec![Skill {
             name: "lint".into(),
             description: "Run the linter".into(),
@@ -2078,8 +2156,12 @@ mod tests {
         }];
         let rendered = format_available(&skills);
         assert!(rendered.contains("<available_skills>"));
-        assert!(rendered.contains("lint — Run the linter"));
-        assert!(rendered.contains("/x/.claude/skills/lint/SKILL.md"));
+        assert!(rendered.contains("<skill>"));
+        assert!(rendered.contains("<name>lint</name>"));
+        assert!(rendered.contains("<description>Run the linter</description>"));
+        assert!(rendered.contains("<location>/x/.claude/skills/lint/SKILL.md</location>"));
+        assert!(rendered.contains("</skill>"));
+        assert!(rendered.trim_end().ends_with("</available_skills>"));
         // The model needs to be told how to resolve a relative path a skill file references, or it
         // may hand a tool a path relative to the wrong directory.
         assert!(rendered.contains("resolve it against the skill directory"));
@@ -2122,8 +2204,8 @@ mod tests {
             },
         ];
         let rendered = format_available(&skills);
-        assert!(rendered.contains("visible"));
-        assert!(!rendered.contains("hidden — Hidden"));
+        assert!(rendered.contains("<name>visible</name>"));
+        assert!(!rendered.contains("<name>hidden</name>"));
     }
 
     #[test]

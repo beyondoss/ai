@@ -123,6 +123,11 @@ pub fn expand_tilde(path: &str, home: Option<&str>) -> String {
 /// sibling (same directory) so the rename stays on one filesystem. A bare `std::fs::write` truncates
 /// in place and would leave a partial file if the process died between truncation and the last byte.
 ///
+/// If `path` is itself a symlink, the write goes through it to the real target instead — see
+/// [`resolve_symlink_target`]'s doc comment for why. Everything below (the temp file, its permission
+/// bits, the final `rename`) operates on the *resolved* path in that case, so the outer symlink itself
+/// is left completely alone.
+///
 /// The temp file's name carries an unpredictable suffix ([`temp_suffix`]) and is opened with
 /// `create_new` rather than plain `create`: a deterministic `.foo.tmp` name would let anything able to
 /// plant a symlink in the same directory (another tool call, a prior turn) redirect this write to an
@@ -141,6 +146,8 @@ pub(crate) fn write_atomic(path: &str, content: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
 
     let p = std::path::Path::new(path);
+    let resolved = resolve_symlink_target(p);
+    let p = resolved.as_deref().unwrap_or(p);
     let name = match p.file_name() {
         Some(name) => name,
         None => return Err(std::io::Error::other(format!("invalid path: {path}"))),
@@ -171,6 +178,40 @@ pub(crate) fn write_atomic(path: &str, content: &[u8]) -> std::io::Result<()> {
             let _ = std::fs::remove_file(&tmp); // don't leave the temp behind on failure
             Err(e)
         }
+    }
+}
+
+/// Resolve `path` to its real target when it's a symlink, so [`write_atomic`] writes through it
+/// instead of replacing the link — pi's `write`/`read` tools are built on Node's `fs.writeFile`/
+/// `fs.readFile`, which open the given path directly and so *follow* a trailing symlink to its real
+/// target. `write_atomic`'s own `rename(2)`-based swap does not: `rename(2)` never follows a trailing
+/// symlink at its destination, it replaces the directory entry itself — so writing straight to `path`
+/// when it's a symlink silently severs the link (planting a disconnected regular file at the link's
+/// own path) while leaving the real target completely untouched. A symlink managed by a dotfile
+/// manager (stow, chezmoi) or shared across a monorepo is exactly the case this breaks.
+///
+/// Returns `None` when `path` isn't a symlink at all — including "doesn't exist yet", `write`'s
+/// ordinary new-file case — so the caller's existing direct-write behavior is unchanged in every case
+/// but an actual symlink.
+///
+/// Prefers `canonicalize` (resolves the whole chain, including a relative target, against its real
+/// parent directory — a symlink can point through another symlink) and falls back to a single
+/// `read_link` hop, manually joined against the link's own parent when the target is relative, for a
+/// dangling symlink (a target that doesn't exist yet, which `canonicalize` refuses to resolve at all) —
+/// still better than silently destroying the link in that case.
+fn resolve_symlink_target(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_symlink() {
+        return None;
+    }
+    if let Ok(real) = std::fs::canonicalize(path) {
+        return Some(real);
+    }
+    let target = std::fs::read_link(path).ok()?;
+    if target.is_absolute() {
+        Some(target)
+    } else {
+        Some(path.parent().unwrap_or_else(|| std::path::Path::new(".")).join(target))
     }
 }
 
@@ -250,14 +291,36 @@ pub fn default_registry_with(
 /// shell invocation (`--bash-command-prefix`/`AI_AGENT_BASH_COMMAND_PREFIX`, matching pi's own
 /// `shellCommandPrefix` setting) — split out as its own function rather than a third parameter on the
 /// widely-called `default_registry_with` so every existing two-argument call site (tests included) stays
-/// unchanged.
+/// unchanged. `read`'s image auto-resize defaults on (see
+/// [`default_registry_with_prefix_and_image_auto_resize`] for a caller that needs to turn it off).
 pub fn default_registry_with_prefix(
     bash_timeout_ms: Option<u64>,
     bash_shell_path: Option<&str>,
     bash_command_prefix: Option<&str>,
 ) -> ToolRegistry {
+    default_registry_with_prefix_and_image_auto_resize(
+        bash_timeout_ms,
+        bash_shell_path,
+        bash_command_prefix,
+        true,
+    )
+}
+
+/// Like [`default_registry_with_prefix`], additionally gating `read`'s image resize/downscale path on
+/// `image_auto_resize` (pi's `ImageSettings.autoResize`, `--no-image-auto-resize`/
+/// `agent settings --image-auto-resize`) — split out as its own function, rather than a fourth
+/// parameter on `default_registry_with_prefix` itself, so that function's existing call sites are
+/// unaffected by this addition.
+pub fn default_registry_with_prefix_and_image_auto_resize(
+    bash_timeout_ms: Option<u64>,
+    bash_shell_path: Option<&str>,
+    bash_command_prefix: Option<&str>,
+    image_auto_resize: bool,
+) -> ToolRegistry {
     let mut reg = ToolRegistry::new();
-    reg.register(Arc::new(read::Read));
+    reg.register(Arc::new(
+        read::Read::default().with_image_auto_resize(image_auto_resize),
+    ));
     reg.register(Arc::new(write::Write));
     reg.register(Arc::new(edit::Edit));
     reg.register(Arc::new(ls::Ls));
@@ -458,6 +521,43 @@ mod tests {
         assert!(!decoy.exists(), "write_atomic followed the planted symlink");
         assert_eq!(std::fs::read_link(&planted).unwrap(), decoy);
         assert_eq!(std::fs::read(&target).unwrap(), b"new content");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_atomic_writes_through_a_symlink_leaving_it_intact() {
+        // Empirically verified bug (pi-parity pass 15): `rename(2)` never follows a trailing symlink
+        // at its destination — it replaces the directory entry itself — so writing straight to a
+        // symlinked path silently severed the link (a fresh regular file landed at the link's own
+        // path) while the real target went untouched. pi's `write`/`read` tools are built on Node's
+        // `fs.writeFile`/`fs.readFile`, which open the path directly and so *do* follow a trailing
+        // symlink — this proves `write_atomic` now matches that: the real target's content changes,
+        // and the outer path is still a genuine symlink afterward.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.txt");
+        std::fs::write(&real, b"original").unwrap();
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        write_atomic(link.to_str().unwrap(), b"updated via the symlink").unwrap();
+
+        assert_eq!(
+            std::fs::read(&real).unwrap(),
+            b"updated via the symlink",
+            "the real target's content must change"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the outer path must still be a symlink afterward, not replaced by a regular file"
+        );
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            real,
+            "the symlink must still point at the same real target"
+        );
     }
 
     #[test]

@@ -174,18 +174,105 @@ fn has_tool_history(messages: &[Message]) -> bool {
     })
 }
 
+/// Mistral's real API validates `tool_call_id`/tool-call `id` strictly: exactly
+/// [`MISTRAL_TOOL_CALL_ID_LEN`] alphanumeric characters, rejecting the longer/differently-charset ids
+/// this crate's other tool-call sources produce (an Anthropic-originated id carried over by
+/// `set_model`, a prior OpenAI-Responses turn's combined `call_id|item_id`, etc). Mirrors pi's
+/// `deriveMistralToolCallId`/`createMistralToolCallIdNormalizer`
+/// (`packages/ai/src/api/mistral-conversations.ts`): strip non-alphanumeric characters first; if
+/// what's left is already exactly the right length, keep it verbatim; otherwise (too short, too long,
+/// or colliding with a *different* original id already mapped to the same candidate) hash it down to a
+/// deterministic alphanumeric string of the right length instead, salting the hash by a retry count so
+/// a collision re-derives a fresh candidate rather than looping forever.
+const MISTRAL_TOOL_CALL_ID_LEN: usize = 9;
+
+/// Reshapes tool-call ids to Mistral's 9-alphanumeric-character shape, consistently within one request:
+/// the same original id always reshapes to the same candidate (so an assistant turn's `tool_calls[].id`
+/// and its paired `tool`-role message's `tool_call_id` keep referring to the same call), and two
+/// *different* original ids never collide on the same candidate. Scoped to one [`build_body`] call — a
+/// fresh instance per request, matching pi's own per-stream-call closure — rather than persisted across
+/// turns, since a stable derivation only needs to hold for the span of one outgoing request.
+#[derive(Default)]
+struct MistralToolCallIdNormalizer {
+    by_id: HashMap<String, String>,
+    by_candidate: HashMap<String, String>,
+}
+
+impl MistralToolCallIdNormalizer {
+    fn normalize(&mut self, id: &str) -> String {
+        if let Some(existing) = self.by_id.get(id) {
+            return existing.clone();
+        }
+        let mut attempt: u32 = 0;
+        loop {
+            let candidate = Self::derive(id, attempt);
+            match self.by_candidate.get(&candidate) {
+                Some(owner) if owner != id => attempt += 1,
+                _ => {
+                    self.by_id.insert(id.to_string(), candidate.clone());
+                    self.by_candidate.insert(candidate.clone(), id.to_string());
+                    return candidate;
+                }
+            }
+        }
+    }
+
+    fn derive(id: &str, attempt: u32) -> String {
+        let normalized: String = id.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+        if attempt == 0 && normalized.chars().count() == MISTRAL_TOOL_CALL_ID_LEN {
+            return normalized;
+        }
+        let seed_base = if normalized.is_empty() {
+            id.to_string()
+        } else {
+            normalized
+        };
+        let seed = if attempt == 0 {
+            seed_base
+        } else {
+            format!("{seed_base}:{attempt}")
+        };
+        // `short_hash` already returns a lowercase-hex (hence alphanumeric) string; the filter below is
+        // a defensive no-op that mirrors pi's own belt-and-suspenders `.replace(/[^a-zA-Z0-9]/g, "")`
+        // after its own hash step.
+        super::openai_responses::short_hash(&seed)
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .take(MISTRAL_TOOL_CALL_ID_LEN)
+            .collect()
+    }
+}
+
+/// Reshape `id` through `normalizer` when this request targets a Mistral model (`normalizer` is `Some`
+/// only then); every other model's ids pass through untouched.
+fn normalize_mistral_tool_id(normalizer: &mut Option<MistralToolCallIdNormalizer>, id: &str) -> String {
+    match normalizer {
+        Some(n) => n.normalize(id),
+        None => id.to_string(),
+    }
+}
+
 /// Build the streaming request body, translating the internal messages into OpenAI's flat shape.
 pub fn build_body(req: &ModelRequest) -> Value {
     let caps = crate::models::capabilities(&req.model);
+    // pi's `useDeveloperRole = model.reasoning && compat.supportsDeveloperRole` — reuses the OpenAI
+    // Responses dialect's identical gating (`super::openai_responses::instruction_role`) rather than a
+    // second, drifting copy of the same one-line rule.
+    let instruction_role = super::openai_responses::instruction_role(&caps);
+    // Mistral's real API rejects a `tool_call_id` that isn't exactly 9 alphanumeric characters — only
+    // built (and only ever `Some`) when this request actually targets a Mistral model, so every other
+    // provider's ids pass through `normalize_mistral_tool_id` untouched.
+    let mut mistral_ids = crate::models::is_mistral_model(&req.model)
+        .then(MistralToolCallIdNormalizer::default);
     let mut messages: Vec<Value> = Vec::new();
     if let Some(system) = &req.system {
-        messages.push(json!({ "role": "system", "content": system }));
+        messages.push(json!({ "role": instruction_role, "content": system }));
     }
 
     for m in req.messages.iter() {
         match m.role {
             Role::System => {
-                messages.push(json!({ "role": "system", "content": text_of(&m.content) }))
+                messages.push(json!({ "role": instruction_role, "content": text_of(&m.content) }))
             }
             Role::User => {
                 // Text + image blocks form the user message (a multimodal parts array when any image
@@ -224,7 +311,10 @@ pub fn build_body(req: &ModelRequest) -> Value {
                         } else {
                             content.as_str()
                         };
-                        messages.push(json!({ "role": "tool", "tool_call_id": tool_use_id, "content": tool_text }));
+                        let tool_call_id = normalize_mistral_tool_id(&mut mistral_ids, tool_use_id);
+                        messages.push(json!({ "role": "tool", "tool_call_id": tool_call_id, "content": tool_text }));
+                        // The image-attribution label below is human-readable text for the model, not
+                        // a validated wire id — kept as the original id, not the Mistral-reshaped one.
                         pending_images.extend(images.iter().map(|src| (tool_use_id.as_str(), src)));
                     }
                 }
@@ -274,7 +364,7 @@ pub fn build_body(req: &ModelRequest) -> Value {
                     .iter()
                     .filter_map(|b| match b {
                         ContentBlock::ToolUse { id, name, input, .. } => Some(json!({
-                            "id": id,
+                            "id": normalize_mistral_tool_id(&mut mistral_ids, id),
                             "type": "function",
                             "function": {
                                 "name": name,
@@ -302,6 +392,14 @@ pub fn build_body(req: &ModelRequest) -> Value {
                 // that one field.
                 if let Some((field, text)) = assistant_reasoning(&m.content) {
                     msg.insert(field.to_string(), json!(text));
+                } else if caps.reasoning_effort && crate::models::is_deepseek_model(&req.model) {
+                    // DeepSeek specifically (pi: `compat.requiresReasoningContentOnAssistantMessages`,
+                    // `isDeepSeek`) force-sets an empty `reasoning_content` on replay when this turn
+                    // produced no visible thinking, rather than omitting the field entirely — mirrors
+                    // pi's `openai-completions.ts::convertMessages` unconditionally for this one
+                    // family. The mechanism isn't otherwise documented upstream; ported to match pi's
+                    // behavior exactly regardless.
+                    msg.insert("reasoning_content".to_string(), json!(""));
                 }
                 // Replay each tool call's Gemini-style opaque reasoning-continuity data (see
                 // `ContentBlock::ToolUse`'s doc comment and `Decoder`'s `reasoning_details` handling)
@@ -335,10 +433,17 @@ pub fn build_body(req: &ModelRequest) -> Value {
     // exact wire shape is family-specific (see `apply_reasoning_wire`'s own doc comment) — most take a
     // bare `reasoning_effort` string, several third-party providers want a nested `thinking`/`reasoning`
     // object instead.
-    apply_reasoning_wire(&mut map, &caps, req.reasoning_effort);
+    apply_reasoning_wire(&mut map, &caps, req.reasoning_effort, &req.model);
     map.insert("stream".into(), json!(true));
     // Ask for a trailing usage chunk so token accounting works on the streaming path.
     map.insert("stream_options".into(), json!({ "include_usage": true }));
+    // This harness is stateless — every turn resends the full history — so nothing should be retained
+    // server-side. Matches pi's `supportsStore = !isNonStandard`/`params.store = false`
+    // (`openai-completions.ts`): withheld only for the denylist of providers that reject or don't
+    // understand the field at all (see `is_non_standard_store_provider`'s own doc comment).
+    if !crate::models::is_non_standard_store_provider(&req.model) {
+        map.insert("store".into(), json!(false));
+    }
     // Sent unconditionally when set — matches pi's own unconditional `openai-completions.ts` (a
     // reasoning model that rejects a custom temperature is a caller error, same as pi's).
     if let Some(temperature) = req.temperature {
@@ -434,10 +539,16 @@ fn apply_reasoning_wire(
     map: &mut Map<String, Value>,
     caps: &crate::models::ModelCaps,
     requested: Option<crate::transport::ReasoningEffort>,
+    model: &str,
 ) {
     use crate::models::OpenAiReasoningFormat as Fmt;
+    // Most models emit the clamped effort's own literal name; a handful (DeepSeek, GLM-5.2, Groq's
+    // qwen id, every Mistral reasoning id) remap it per pi's own per-model `thinkingLevelMap` — see
+    // `reasoning_wire_override`'s own doc comment for why that's a standalone lookup rather than a new
+    // `ModelCaps` field.
     let wire_str = |e: crate::transport::ReasoningEffort| -> &'static str {
-        crate::models::clamp_reasoning_effort(caps, e).as_str()
+        let clamped = crate::models::clamp_reasoning_effort(caps, e);
+        crate::models::reasoning_wire_override(model, clamped).unwrap_or_else(|| clamped.as_str())
     };
     match caps.openai_reasoning_format {
         Fmt::Standard => {
@@ -503,7 +614,9 @@ fn tool_choice(choice: &ToolChoice) -> Value {
 
 fn map_finish_reason(s: Option<&str>) -> StopReason {
     match s {
-        Some("stop") => StopReason::EndTurn,
+        // "end" is another provider's spelling of a clean stop — pi's `openai-completions.ts` maps
+        // both "stop" and "end" to `stopReason: "stop"`.
+        Some("stop") | Some("end") => StopReason::EndTurn,
         Some("tool_calls") | Some("function_call") => StopReason::ToolUse,
         Some("length") => StopReason::MaxTokens,
         // A safety-filtered completion is not a clean stop — collapsing it into `Other` (which the
@@ -691,10 +804,14 @@ impl StreamDecoder for Decoder {
             .filter(|u| !u.is_null())
             .or_else(|| choice.and_then(|c| c.get("usage")).filter(|u| !u.is_null()));
         if let Some(usage) = usage {
+            // DeepSeek reports its cache hit count at the top-level `prompt_cache_hit_tokens` instead
+            // of the standard nested `prompt_tokens_details.cached_tokens` — matches pi's own fallback
+            // order (`openai-completions.ts::parseChunkUsage`).
             let cached = usage
                 .get("prompt_tokens_details")
                 .and_then(|d| d.get("cached_tokens"))
                 .and_then(Value::as_u64)
+                .or_else(|| usage.get("prompt_cache_hit_tokens").and_then(Value::as_u64))
                 .unwrap_or(0) as u32;
             // OpenAI itself never emits `cache_write_tokens` (no such wire concept), but
             // OpenRouter-compatible providers can — separate from `cached_tokens` (cache *reads*).
@@ -799,10 +916,13 @@ impl StreamDecoder for Decoder {
             for tc in calls {
                 let func = tc.get("function");
                 let index = tc.get("index").and_then(Value::as_i64);
+                // Mistral (via `mistral-conversations.ts`'s own guard, `toolCall.id && toolCall.id !==
+                // "null"`) can send the literal string `"null"` instead of omitting `id` outright —
+                // treated identically to an empty/absent id, never carried through as a real one.
                 let id = tc
                     .get("id")
                     .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty());
+                    .filter(|s| !s.is_empty() && *s != "null");
                 let name = func.and_then(|f| f.get("name")).and_then(Value::as_str);
                 let args = func
                     .and_then(|f| f.get("arguments"))
@@ -823,6 +943,20 @@ impl StreamDecoder for Decoder {
                         // something safe to guess at — dropped below instead.
                         (index.is_none() && id.is_none() && self.open_tools.len() == 1).then_some(0)
                     });
+                // pi-parity investigation (pass 15): pi's `ensureToolCallBlock` opens a brand-new block
+                // unconditionally, even on a delta with *neither* `index` nor `id` and zero calls
+                // currently open (which this decoder instead drops, below, via the `None if
+                // index.is_some() || id.is_some()` guard). Checked every provider currently in this
+                // crate's capability table and pi's own streaming test fixtures
+                // (`packages/ai/test/openai-completions-tool-choice.test.ts` and siblings) for a
+                // real-world delta shaped that way; every one — including Kimi/Moonshot's own
+                // id-mutating stream, the interleaved-parallel-calls fixture, and Mistral's
+                // `mistral-conversations.ts` (a distinct wire shape and decoder pi never routes through
+                // this shared one) — always sends at least an `index` on the opening chunk of a tool
+                // call. Left as-is rather than forcing pi's unconditional-open behavior speculatively:
+                // doing so would mean a stream that opens with neither field ever again (of which no
+                // observed provider does) silently starts a call keyed on nothing, rather than the
+                // current, at least legible, "dropped with a warning" outcome.
 
                 let slot = match existing {
                     Some(pos) => {
@@ -1519,6 +1653,7 @@ mod tests {
                 error_message: None,
                 aborted: false,
                 usage: None,
+                stop_reason: None,
             }],
             64,
         );
@@ -2353,6 +2488,330 @@ data: [DONE]
         // Off by default.
         let req = ModelRequest::new("gpt-4o", vec![Message::user("hi")], 64);
         assert!(build_body(&req).get("prompt_cache_retention").is_none());
+    }
+
+    // ---- Mistral tool-call-id reshaping (pi-parity pass 15) ----
+
+    #[test]
+    fn mistral_tool_call_ids_are_reshaped_to_nine_alphanumeric_chars() {
+        let req = ModelRequest::new(
+            "mistral-large-latest",
+            vec![
+                Message::user("weather?"),
+                Message::assistant(vec![ContentBlock::tool_use(
+                    "call_1",
+                    "get_weather",
+                    json!({ "city": "SF" }),
+                )]),
+                Message::tool_result("call_1", "72F", false),
+            ],
+            64,
+        );
+        let body = build_body(&req);
+        let assistant_id = body["messages"][1]["tool_calls"][0]["id"].as_str().unwrap();
+        let tool_call_id = body["messages"][2]["tool_call_id"].as_str().unwrap();
+        assert_eq!(
+            assistant_id, tool_call_id,
+            "the assistant's tool_calls[].id and its paired tool message's tool_call_id must reshape \
+             to the identical candidate"
+        );
+        assert_eq!(assistant_id.len(), 9, "got: {assistant_id}");
+        assert!(
+            assistant_id.chars().all(|c| c.is_ascii_alphanumeric()),
+            "got: {assistant_id}"
+        );
+        assert_ne!(assistant_id, "call_1", "the original id must actually be reshaped");
+    }
+
+    #[test]
+    fn mistral_tool_call_id_already_nine_alphanumeric_chars_passes_through_verbatim() {
+        let req = ModelRequest::new(
+            "mistral-small-latest",
+            vec![
+                Message::user("go"),
+                Message::assistant(vec![ContentBlock::tool_use("abc123def", "noop", json!({}))]),
+            ],
+            64,
+        );
+        let body = build_body(&req);
+        assert_eq!(body["messages"][1]["tool_calls"][0]["id"], "abc123def");
+    }
+
+    #[test]
+    fn non_mistral_models_never_reshape_tool_call_ids() {
+        let req = ModelRequest::new(
+            "gpt-4o",
+            vec![
+                Message::user("weather?"),
+                Message::assistant(vec![ContentBlock::tool_use(
+                    "call_1",
+                    "get_weather",
+                    json!({ "city": "SF" }),
+                )]),
+                Message::tool_result("call_1", "72F", false),
+            ],
+            64,
+        );
+        let body = build_body(&req);
+        assert_eq!(body["messages"][1]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(body["messages"][2]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn mistral_tool_call_id_reshaping_keeps_distinct_ids_distinct() {
+        let req = ModelRequest::new(
+            "mistral-large-latest",
+            vec![
+                Message::user("go"),
+                Message::assistant(vec![
+                    ContentBlock::tool_use("call_1", "a", json!({})),
+                    ContentBlock::tool_use("call_2", "b", json!({})),
+                ]),
+                Message::tool_results(vec![
+                    ContentBlock::ToolResult {
+                        tool_use_id: "call_1".into(),
+                        content: "1".into(),
+                        is_error: false,
+                        images: vec![],
+                    },
+                    ContentBlock::ToolResult {
+                        tool_use_id: "call_2".into(),
+                        content: "2".into(),
+                        is_error: false,
+                        images: vec![],
+                    },
+                ]),
+            ],
+            64,
+        );
+        let body = build_body(&req);
+        let id1 = body["messages"][1]["tool_calls"][0]["id"].as_str().unwrap();
+        let id2 = body["messages"][1]["tool_calls"][1]["id"].as_str().unwrap();
+        assert_ne!(
+            id1, id2,
+            "distinct original ids must not collide on the same reshaped candidate"
+        );
+        assert_eq!(body["messages"][2]["tool_call_id"], id1);
+        assert_eq!(body["messages"][3]["tool_call_id"], id2);
+    }
+
+    #[test]
+    fn a_literal_null_string_tool_call_id_is_treated_as_absent_not_a_real_id() {
+        // Mistral can send the literal string "null" instead of omitting `id` outright
+        // (`mistral-conversations.ts`'s own guard: `toolCall.id && toolCall.id !== "null"`).
+        const NULL_ID: &str = r#"
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"null","type":"function","function":{"name":"get_weather","arguments":"{}"}}]},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, NULL_ID).unwrap();
+        let id = events.iter().find_map(|e| match e {
+            StreamEvent::ToolUseStart { id, .. } => Some(id.as_str()),
+            _ => None,
+        });
+        assert_eq!(
+            id,
+            Some(""),
+            "the literal \"null\" string must never be carried through as a real id"
+        );
+    }
+
+    // ---- Per-model reasoning-effort wire remap (pi-parity pass 15) ----
+
+    #[test]
+    fn per_model_reasoning_wire_overrides_are_applied_in_the_wire_body() {
+        use crate::transport::ReasoningEffort;
+        // DeepSeek: xhigh remaps to "max" on the wire (previously sent the literal "xhigh").
+        let body = build_body(
+            &ModelRequest::new("deepseek-v4-pro", vec![Message::user("hi")], 64)
+                .with_reasoning_effort(ReasoningEffort::XHigh),
+        );
+        assert_eq!(body["reasoning_effort"], "max");
+
+        // GLM-5.2: low/medium/high all collapse to "high"; xhigh remaps to "max".
+        let body = build_body(
+            &ModelRequest::new("glm-5.2", vec![Message::user("hi")], 64)
+                .with_reasoning_effort(ReasoningEffort::Low),
+        );
+        assert_eq!(body["reasoning_effort"], "high");
+        let body = build_body(
+            &ModelRequest::new("glm-5.2", vec![Message::user("hi")], 64)
+                .with_reasoning_effort(ReasoningEffort::XHigh),
+        );
+        assert_eq!(body["reasoning_effort"], "max");
+
+        // Groq's one qwen id: "high" remaps to "default".
+        let body = build_body(
+            &ModelRequest::new("qwen/qwen3-32b", vec![Message::user("hi")], 64)
+                .with_reasoning_effort(ReasoningEffort::High),
+        );
+        assert_eq!(body["reasoning_effort"], "default");
+
+        // Mistral: every active level collapses to "high" (no per-model vocabulary of its own).
+        let body = build_body(
+            &ModelRequest::new("mistral-small-2603", vec![Message::user("hi")], 64)
+                .with_reasoning_effort(ReasoningEffort::Medium),
+        );
+        assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    // ---- DeepSeek usage/replay quirks (pi-parity pass 15) ----
+
+    #[test]
+    fn deepseek_cache_read_falls_back_to_top_level_prompt_cache_hit_tokens() {
+        const DEEPSEEK_USAGE: &str = r#"
+data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":20,"prompt_cache_hit_tokens":900}}
+
+data: [DONE]
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, DEEPSEEK_USAGE).unwrap();
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::Usage(u) => Some(*u),
+                _ => None,
+            })
+            .expect("a usage event");
+        assert_eq!(usage.cache_read_tokens, 900);
+        assert_eq!(usage.input_tokens, 100); // 1000 prompt - 900 cached
+    }
+
+    #[test]
+    fn nested_prompt_tokens_details_wins_over_the_deepseek_top_level_fallback() {
+        // When both are present, the standard nested field is authoritative.
+        const BOTH: &str = r#"
+data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":500},"prompt_cache_hit_tokens":900}}
+
+data: [DONE]
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, BOTH).unwrap();
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::Usage(u) => Some(*u),
+                _ => None,
+            })
+            .expect("a usage event");
+        assert_eq!(usage.cache_read_tokens, 500);
+    }
+
+    #[test]
+    fn deepseek_reasoning_content_backfilled_empty_when_the_turn_produced_no_thinking() {
+        // "Mechanism unverified" per the audit — pi force-sets `reasoning_content: ""` on replay when
+        // DeepSeek's `model.reasoning` is on but a given turn produced no visible thinking, rather than
+        // omitting the field. Ported to match pi's unconditional behavior for this one family exactly.
+        let req = ModelRequest::new(
+            "deepseek-v4-pro",
+            vec![
+                Message::user("hi"),
+                Message::assistant(vec![ContentBlock::text("answer, no thinking")]),
+            ],
+            64,
+        );
+        let body = build_body(&req);
+        assert_eq!(body["messages"][1]["reasoning_content"], "");
+
+        // A turn that DID carry thinking keeps its real captured text — never overwritten to "".
+        let req = ModelRequest::new(
+            "deepseek-v4-pro",
+            vec![
+                Message::user("hi"),
+                Message::assistant(vec![
+                    ContentBlock::Thinking {
+                        text: "step one".into(),
+                        signature: "reasoning_content".into(),
+                    },
+                    ContentBlock::text("answer"),
+                ]),
+            ],
+            64,
+        );
+        let body = build_body(&req);
+        assert_eq!(body["messages"][1]["reasoning_content"], "step one");
+
+        // A non-DeepSeek reasoning model never gets this backfill.
+        let req = ModelRequest::new(
+            "o3-mini",
+            vec![
+                Message::user("hi"),
+                Message::assistant(vec![ContentBlock::text("answer")]),
+            ],
+            64,
+        );
+        let body = build_body(&req);
+        assert!(body["messages"][1].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn end_finish_reason_maps_to_a_clean_stop() {
+        // Some providers spell a clean stop "end" instead of "stop" — pi's `openai-completions.ts`
+        // maps both to `stopReason: "stop"`.
+        const END_STOP: &str = r#"
+data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"end"}]}
+
+data: [DONE]
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, END_STOP).unwrap();
+        assert_eq!(
+            events.last(),
+            Some(&StreamEvent::MessageStop {
+                stop_reason: StopReason::EndTurn
+            })
+        );
+    }
+
+    // ---- `store` / developer-role emission (pi-parity pass 15) ----
+
+    #[test]
+    fn store_false_is_emitted_except_for_non_standard_providers() {
+        for id in [
+            "gpt-4o",
+            "some-vendor/some-model",
+            "qwen/qwen3-32b",
+            "mistral-large-latest",
+        ] {
+            let body = build_body(&ModelRequest::new(id, vec![Message::user("hi")], 64));
+            assert_eq!(body["store"], false, "{id}");
+        }
+        for id in [
+            "deepseek-v4-pro",
+            "glm-4.7",
+            "kimi-k2-thinking",
+            "grok-4.3",
+            "qwen/qwen3.6-plus",
+            "gpt-oss-120b",
+        ] {
+            let body = build_body(&ModelRequest::new(id, vec![Message::user("hi")], 64));
+            assert!(body.get("store").is_none(), "{id}: got {body:#?}");
+        }
+    }
+
+    #[test]
+    fn developer_role_used_for_a_reasoning_models_system_prompt() {
+        let req =
+            ModelRequest::new("o3-mini", vec![Message::user("hi")], 64).with_system("be terse");
+        assert_eq!(build_body(&req)["messages"][0]["role"], "developer");
+
+        // A non-reasoning model keeps "system".
+        let req =
+            ModelRequest::new("gpt-4o", vec![Message::user("hi")], 64).with_system("be terse");
+        assert_eq!(build_body(&req)["messages"][0]["role"], "system");
     }
 
     #[test]

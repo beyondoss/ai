@@ -179,6 +179,75 @@ fn gpt5_supports_xhigh(m: &str) -> bool {
         || m.starts_with("gpt-5.5")
 }
 
+/// Every id in pi's Mistral catalogue (`packages/ai/src/providers/mistral.models.ts`) starts with one
+/// of these — there's no single common prefix for the whole provider the way there is for e.g.
+/// DeepSeek: codestral/devstral/ministral/magistral/mistral itself/pixtral/open-mistral/open-mixtral are
+/// all separate id families under this one native `KNOWN_PROVIDERS` gateway route
+/// (`crates/gateway/src/route.rs`). `m` must already be lowercased (every caller below goes through
+/// [`is_mistral_model`], the public, self-lowercasing wrapper).
+const MISTRAL_ID_PREFIXES: &[&str] = &[
+    "mistral",
+    "codestral",
+    "devstral",
+    "ministral",
+    "magistral",
+    "pixtral",
+    "open-mistral",
+    "open-mixtral",
+    "labs-devstral",
+];
+
+fn is_mistral_id(m: &str) -> bool {
+    MISTRAL_ID_PREFIXES.iter().any(|p| m.starts_with(p))
+}
+
+/// Whether `model` is a Mistral id. Shared between this table's Mistral `capabilities()` branch and
+/// `dialect::openai`'s Mistral-specific tool-call-id reshaping (Mistral's real API rejects a
+/// `tool_call_id` that isn't exactly 9 alphanumeric characters) — both need the identical "is this a
+/// Mistral model" check, so it lives here once rather than being duplicated per call site.
+pub fn is_mistral_model(model: &str) -> bool {
+    is_mistral_id(&model.to_ascii_lowercase())
+}
+
+/// Whether `model` is a DeepSeek id — `dialect::openai::build_body`'s assistant-replay path needs this
+/// specifically (not the broader `OpenAiReasoningFormat::DeepSeek` shape, which Moonshot/Kimi shares
+/// too) to backfill an empty `reasoning_content` on replay, matching pi's `compat
+/// .requiresReasoningContentOnAssistantMessages` (`isDeepSeek`, `openai-completions.ts::detectCompat`) —
+/// a DeepSeek-only quirk, not shared with any other family tagged with the same wire *shape*.
+pub fn is_deepseek_model(model: &str) -> bool {
+    model.to_ascii_lowercase().starts_with("deepseek")
+}
+
+/// Every current id belonging to a provider pi's `openai-completions.ts::detectCompat` marks
+/// `isNonStandard` (hence `supportsStore: false` — the provider rejects or simply doesn't understand
+/// OpenAI's `store` extension field): DeepSeek, Z.ai/GLM, Moonshot/Kimi, xAI/Grok, Together-hosted
+/// Qwen, and Cerebras's native (unprefixed) id set. `false` — meaning `store: false` gets sent — for
+/// everything else, including native OpenAI-via-Chat-Completions, OpenRouter, Groq, Fireworks, Mistral,
+/// and any uncatalogued id, matching pi's own default.
+///
+/// pi's real exclusion list also covers NVIDIA, Cloudflare (Workers AI and AI Gateway), and Ant-Ling —
+/// none of which have an id shape of their own this table could recognize (they're reached via
+/// arbitrary vendor-native ids through a NIM/gateway proxy, not a fixed prefix), the same known
+/// limitation already documented at this table's own "Third-party OpenAI-compatible providers" section
+/// header: a route/provider-level distinction with no matching id-level signature can't be told apart
+/// from a generic third-party id by name alone.
+pub fn is_non_standard_store_provider(model: &str) -> bool {
+    const CEREBRAS_NATIVE: &[&str] = &[
+        "gpt-oss-120b",
+        "gpt-oss-20b",
+        "gpt-oss-safeguard-20b",
+        "gemma-4-31b",
+        "zai-glm-4.7",
+    ];
+    let m = model.to_ascii_lowercase();
+    m.starts_with("deepseek")
+        || m.starts_with("glm")
+        || m.starts_with("kimi")
+        || m.starts_with("grok")
+        || (m.starts_with("qwen") && m != "qwen/qwen3-32b")
+        || CEREBRAS_NATIVE.contains(&m.as_str())
+}
+
 /// Resolve a model id to its [`ModelCaps`]. Matching is by id prefix (most-specific first); unknown
 /// ids fall back to [`ModelCaps::unknown`] (logged, since a silent conservative fallback can otherwise
 /// mask a model we should have taught this table about).
@@ -602,6 +671,75 @@ pub fn capabilities(model: &str) -> ModelCaps {
         };
     }
 
+    // Mistral: a native `KNOWN_PROVIDERS` gateway route (`crates/gateway/src/route.rs`) whose 30-id
+    // catalogue (`packages/ai/src/providers/mistral.models.ts`) has no shared prefix and enough per-id
+    // variance (bare "mistral-large-2411" is 131_072/16_384 while "mistral-large-2512" two generations
+    // later is 262_144/262_144) that a family-level default would still misreport several ids by a wide
+    // margin — so this is ported id-for-id, not bucketed, matched via `is_mistral_id` above. This
+    // codebase has no bespoke Mistral wire client (pi's own `mistral-conversations.ts` speaks a
+    // different, non-OpenAI-shaped API); every Mistral id is routed through the generic OpenAI Chat
+    // Completions dialect instead — see `dialect::openai::build_body`'s Mistral-specific tool-call-id
+    // reshaping and `reasoning_wire_override` below for the two wire-shape adjustments that gap needs.
+    if is_mistral_id(&m) {
+        let (context_window, max_output, reasoning_effort, supports_vision) = match m.as_str() {
+            "codestral-latest" => (256_000, 4_096, false, false),
+            "devstral-2512" => (262_144, 262_144, false, false),
+            "devstral-latest" => (262_144, 262_144, false, false),
+            "devstral-medium-2507" => (128_000, 128_000, false, false),
+            "devstral-medium-latest" => (262_144, 262_144, false, false),
+            "devstral-small-2505" => (128_000, 128_000, false, false),
+            "devstral-small-2507" => (128_000, 128_000, false, false),
+            "labs-devstral-small-2512" => (256_000, 256_000, false, true),
+            "magistral-medium-latest" => (128_000, 16_384, true, false),
+            "magistral-small" => (128_000, 128_000, true, false),
+            "ministral-3b-latest" => (128_000, 128_000, false, false),
+            "ministral-8b-latest" => (128_000, 128_000, false, false),
+            "mistral-large-2411" => (131_072, 16_384, false, false),
+            "mistral-large-2512" => (262_144, 262_144, false, true),
+            "mistral-large-latest" => (262_144, 262_144, false, true),
+            "mistral-medium-2505" => (131_072, 131_072, false, true),
+            "mistral-medium-2508" => (262_144, 262_144, false, true),
+            "mistral-medium-2604" => (262_144, 262_144, true, true),
+            "mistral-medium-3.5" => (262_144, 262_144, true, true),
+            "mistral-medium-latest" => (262_144, 262_144, false, true),
+            "mistral-nemo" => (128_000, 128_000, false, false),
+            "mistral-small-2506" => (128_000, 16_384, false, true),
+            "mistral-small-2603" => (256_000, 256_000, true, true),
+            "mistral-small-latest" => (256_000, 256_000, true, true),
+            "open-mistral-7b" => (8_000, 8_000, false, false),
+            "open-mistral-nemo" => (128_000, 128_000, false, false),
+            "open-mixtral-8x22b" => (64_000, 64_000, false, false),
+            "open-mixtral-8x7b" => (32_000, 32_000, false, false),
+            "pixtral-12b" => (128_000, 128_000, false, true),
+            "pixtral-large-latest" => (128_000, 128_000, false, true),
+            // A future/uncatalogued Mistral id this exact-match table doesn't recognize yet: a
+            // reasonable family-wide default (128k/128k, no reasoning, no vision) rather than falling
+            // all the way through to `unknown()`'s flatter 4096-token ceiling.
+            _ => (128_000, 128_000, false, false),
+        };
+        return ModelCaps {
+            context_window,
+            max_output,
+            max_tokens_field: MaxTokensField::MaxTokens,
+            // Not in pi's Together/Cloudflare/NVIDIA/Ant-Ling `supportsLongCacheRetention` denylist.
+            supports_long_cache: true,
+            supports_vision,
+            supports_temperature: true,
+            thinking: ThinkingShape::None,
+            reasoning_effort,
+            // No Mistral id nulls "off" in pi's catalogue (none carry a `thinkingLevelMap` at all) —
+            // every reasoning-capable id can be told to turn reasoning off.
+            reasoning_disableable: reasoning_effort,
+            supports_eager_tool_streaming: false,
+            api: ApiKind::ChatCompletions,
+            min_reasoning_effort: RE::Minimal,
+            // No Mistral id defines an "xhigh" wire value at all.
+            supports_xhigh_reasoning: false,
+            adaptive_xhigh_effort_wire: "xhigh", // unread: Mistral never uses Adaptive shape.
+            openai_reasoning_format: OpenAiReasoningFormat::Standard,
+        };
+    }
+
     // Z.ai/GLM: `compat.thinkingFormat: "zai"` — a `thinking:{enabled/disabled}` toggle sent
     // unconditionally, with a `reasoning_effort` string only from GLM-5.2 onward
     // (`supportsReasoningEffort` is `false` on every earlier id in pi's catalogue). `glm-5v*` is the
@@ -628,7 +766,14 @@ pub fn capabilities(model: &str) -> ModelCaps {
             reasoning_disableable: true,
             supports_eager_tool_streaming: false,
             api: ApiKind::ChatCompletions,
-            min_reasoning_effort: RE::Minimal,
+            // glm-5.2+ nulls "minimal" out of its `thinkingLevelMap` (excluded entirely, not just
+            // remapped) — every earlier GLM id has no reasoning vocabulary at all, so this floor is
+            // unread for them regardless.
+            min_reasoning_effort: if m.starts_with("glm-5.2") {
+                RE::Low
+            } else {
+                RE::Minimal
+            },
             supports_xhigh_reasoning: reasoning_effort,
             adaptive_xhigh_effort_wire: "max",
             openai_reasoning_format: OpenAiReasoningFormat::Zai,
@@ -897,6 +1042,65 @@ pub fn capabilities(model: &str) -> ModelCaps {
     ModelCaps::unknown()
 }
 
+/// Per-model reasoning-effort wire-string remap for the OpenAI Chat-Completions dialect's third-party
+/// reasoning-toggle shapes (`dialect::openai::apply_reasoning_wire`) — mirrors pi's per-model
+/// `thinkingLevelMap` (`packages/ai/src/providers/*.models.ts`), which several providers use to spell a
+/// given portable [`crate::transport::ReasoningEffort`] rung differently on the wire than that rung's
+/// own name. [`ModelCaps::adaptive_xhigh_effort_wire`] already exists for the identical need on the
+/// Anthropic adaptive-thinking shape, but it's a single xhigh-only string — insufficient here, where a
+/// model can remap several rungs at once (GLM-5.2 remaps three: low, medium, and xhigh) — so this is a
+/// standalone lookup instead of a new `ModelCaps` field, which would need touching every one of this
+/// file's ~25 existing `ModelCaps` struct-literal construction sites for a table only four families
+/// actually use.
+///
+/// `effort` is the *already-clamped* [`crate::transport::ReasoningEffort`] ([`clamp_reasoning_effort`]'s
+/// output) — this function only remaps how an already-legal level is spelled on the wire, never decides
+/// whether a level is legal in the first place (that's still `min_reasoning_effort`/
+/// `supports_xhigh_reasoning`). `None` — the overwhelming common case — leaves the caller to fall back
+/// to the clamped effort's own literal name, unchanged from before this function existed.
+pub fn reasoning_wire_override(
+    model: &str,
+    effort: crate::transport::ReasoningEffort,
+) -> Option<&'static str> {
+    use crate::transport::ReasoningEffort as RE;
+    let m = model.to_ascii_lowercase();
+    // DeepSeek: `thinkingLevelMap` nulls minimal/low/medium (already reflected in
+    // `min_reasoning_effort: High`, so only High/XHigh can ever reach here); xhigh alone remaps, to
+    // "max".
+    if m.starts_with("deepseek") {
+        return (effort == RE::XHigh).then_some("max");
+    }
+    // GLM-5.2+: low/medium/high all collapse to the literal "high", and xhigh remaps to "max". Every
+    // earlier GLM id has no reasoning_effort vocabulary at all (`caps.reasoning_effort == false`), so
+    // `apply_reasoning_wire` never calls this for them regardless.
+    if m.starts_with("glm-5.2") {
+        return match effort {
+            RE::Low | RE::Medium | RE::High => Some("high"),
+            RE::XHigh => Some("max"),
+            // Excluded by `min_reasoning_effort: Low` above — never actually reaches here.
+            RE::Minimal => None,
+        };
+    }
+    // Groq's one qwen id: the only level it ever accepts (`min_reasoning_effort: High`,
+    // `supports_xhigh_reasoning: false` clamp everything else away first) remaps from "high" to
+    // "default".
+    if m == "qwen/qwen3-32b" {
+        return (effort == RE::High).then_some("default");
+    }
+    // Mistral reasoning-capable ids: pi's own client (`mistral-conversations.ts::mapReasoningEffort`)
+    // has no per-level vocabulary for any Mistral id at all — none carry a `thinkingLevelMap` — so
+    // every active level falls back to that function's own hardcoded default, "high", literally
+    // regardless of which portable level was requested; only "off" ever omits the field. Mirrored here
+    // rather than sending "minimal"/"low"/etc, which Mistral's real `reasoning_effort` wire vocabulary
+    // (a bare `"none" | "high"` enum) doesn't recognize at all. Only ever reached when
+    // `caps.reasoning_effort` is already true for the id (the caller's own gate), so no non-reasoning
+    // Mistral id (e.g. "mistral-large-latest") ever hits this branch.
+    if is_mistral_id(&m) {
+        return Some("high");
+    }
+    None
+}
+
 /// A portable thinking-depth level, independent of which wire mechanism the active model actually uses
 /// — an Anthropic token budget (`ThinkingShape::Budget`), an Anthropic adaptive effort
 /// (`ThinkingShape::Adaptive`), or an OpenAI `reasoning_effort` parameter. A client (or
@@ -990,7 +1194,8 @@ fn default_budget_for_effort(effort: crate::transport::ReasoningEffort) -> u32 {
         RE::Minimal => 1_024,
         RE::Low => 2_048,
         RE::Medium => 8_192,
-        RE::High => 24_000,
+        // pi: `packages/ai/src/api/simple-options.ts`'s `defaultBudgets.high` is 16384, not 24000.
+        RE::High => 16_384,
         RE::XHigh => 32_000,
     }
 }
@@ -1617,7 +1822,7 @@ mod tests {
         let caps = capabilities("claude-opus-4-5");
         assert_eq!(caps.thinking, ThinkingShape::Budget);
         let (thinking, effort) = thinking_for_level(&caps, ThinkingLevel::High);
-        assert_eq!(thinking, Some(24_000));
+        assert_eq!(thinking, Some(16_384), "pi's defaultBudgets.high is 16384, not 24000");
         assert_eq!(
             effort, None,
             "a Budget-shape model's dialect never reads reasoning_effort"
@@ -2179,5 +2384,171 @@ mod tests {
             budget_for_effort_with_override(RE::Medium, 100_000, None),
             budget_for_effort(RE::Medium, 100_000)
         );
+    }
+
+    // ---- Mistral (pi-parity pass 15: this whole family used to fall through to `unknown()`) ----
+
+    #[test]
+    fn mistral_ids_get_real_capabilities_not_the_unknown_default() {
+        // The CRITICAL bug this closes: every Mistral model id used to resolve to
+        // `ModelCaps::unknown()` — 128k context, a 4096-token output ceiling regardless of the
+        // model's real (often much larger) one, vision silently disabled on every vision-capable id,
+        // and no reasoning/thinking wire support at all.
+        let devstral = capabilities("devstral-2512");
+        assert_eq!(devstral.context_window, 262_144);
+        assert_eq!(devstral.max_output, 262_144);
+        assert!(!devstral.reasoning_effort);
+        assert!(!devstral.supports_vision);
+
+        let large_2512 = capabilities("mistral-large-2512");
+        assert_eq!(large_2512.context_window, 262_144);
+        assert!(large_2512.supports_vision, "mistral-large-2512 gained vision");
+        // The "-2411" predecessor is text-only and much smaller — a family-level default would have
+        // misreported one of these by a wide margin.
+        let large_2411 = capabilities("mistral-large-2411");
+        assert_eq!(large_2411.context_window, 131_072);
+        assert_eq!(large_2411.max_output, 16_384);
+        assert!(!large_2411.supports_vision);
+
+        assert!(capabilities("pixtral-12b").supports_vision);
+        assert!(capabilities("pixtral-large-latest").supports_vision);
+        assert!(!capabilities("open-mistral-7b").supports_vision);
+        assert_eq!(capabilities("open-mistral-7b").context_window, 8_000);
+    }
+
+    #[test]
+    fn mistral_reasoning_capable_ids_get_a_thinking_mechanism() {
+        // pixtral/mistral-medium-*/mistral-small-2603+ used to silently have no thinking mechanism at
+        // all (`reasoning_effort: false`, `openai_reasoning_format: Standard` with nothing to drive
+        // it) — `--thinking high` was a silent no-op.
+        for id in [
+            "magistral-medium-latest",
+            "magistral-small",
+            "mistral-medium-2604",
+            "mistral-medium-3.5",
+            "mistral-small-2603",
+            "mistral-small-latest",
+        ] {
+            let c = capabilities(id);
+            assert!(c.reasoning_effort, "{id} should gain a thinking mechanism");
+            assert_eq!(c.openai_reasoning_format, OpenAiReasoningFormat::Standard, "{id}");
+            assert!(c.reasoning_disableable, "{id}: off is always legal (no id nulls it)");
+            assert!(!c.supports_xhigh_reasoning, "{id}: no Mistral id defines xhigh");
+        }
+        // "mistral-medium-latest" is (per pi's live catalogue) an alias still pointing at a
+        // non-reasoning snapshot, unlike its "-2604"/"-3.5" siblings.
+        assert!(!capabilities("mistral-medium-latest").reasoning_effort);
+        assert!(!capabilities("mistral-large-latest").reasoning_effort);
+    }
+
+    #[test]
+    fn is_mistral_model_matches_every_current_family_prefix() {
+        for id in [
+            "codestral-latest",
+            "devstral-2512",
+            "ministral-3b-latest",
+            "magistral-small",
+            "mistral-large-latest",
+            "pixtral-12b",
+            "open-mistral-7b",
+            "open-mixtral-8x22b",
+            "labs-devstral-small-2512",
+            "MISTRAL-SMALL-LATEST", // case-insensitive
+        ] {
+            assert!(is_mistral_model(id), "{id} should be recognized as Mistral");
+        }
+        for id in ["gpt-4o", "claude-opus-4-8", "deepseek-v4-pro", "some-vendor/model"] {
+            assert!(!is_mistral_model(id), "{id} should not be recognized as Mistral");
+        }
+    }
+
+    #[test]
+    fn is_deepseek_model_is_narrower_than_the_shared_deepseek_wire_shape() {
+        assert!(is_deepseek_model("deepseek-v4-pro"));
+        assert!(is_deepseek_model("DeepSeek-V4-Flash"));
+        // Kimi/Moonshot shares `OpenAiReasoningFormat::DeepSeek`'s wire *shape* but is a different
+        // provider — `is_deepseek_model` must not conflate the two.
+        assert!(!is_deepseek_model("kimi-k2-thinking"));
+        assert!(!is_deepseek_model("gpt-4o"));
+    }
+
+    // ---- Per-model reasoning-effort wire remap (pi-parity pass 15) ----
+
+    #[test]
+    fn reasoning_wire_override_remaps_deepseek_xhigh_to_max() {
+        use crate::transport::ReasoningEffort as RE;
+        assert_eq!(reasoning_wire_override("deepseek-v4-pro", RE::XHigh), Some("max"));
+        // High is a literal passthrough — no override.
+        assert_eq!(reasoning_wire_override("deepseek-v4-pro", RE::High), None);
+    }
+
+    #[test]
+    fn reasoning_wire_override_remaps_glm_5_2_low_medium_and_xhigh() {
+        use crate::transport::ReasoningEffort as RE;
+        for (effort, wire) in [(RE::Low, "high"), (RE::Medium, "high"), (RE::High, "high")] {
+            assert_eq!(reasoning_wire_override("glm-5.2", effort), Some(wire), "{effort:?}");
+        }
+        assert_eq!(reasoning_wire_override("glm-5.2", RE::XHigh), Some("max"));
+        // Minimal is excluded by the model's own floor (`min_reasoning_effort: Low`) before this
+        // function would ever see it in practice; confirm that floor directly.
+        assert_eq!(capabilities("glm-5.2").min_reasoning_effort, RE::Low);
+        assert_eq!(capabilities("glm-4.7").min_reasoning_effort, RE::Minimal);
+    }
+
+    #[test]
+    fn reasoning_wire_override_remaps_groq_qwen_high_to_default() {
+        use crate::transport::ReasoningEffort as RE;
+        assert_eq!(reasoning_wire_override("qwen/qwen3-32b", RE::High), Some("default"));
+        // A different qwen host (Together-shaped) isn't this one exact Groq id — no override.
+        assert_eq!(reasoning_wire_override("qwen/qwen3.6-plus", RE::High), None);
+    }
+
+    #[test]
+    fn reasoning_wire_override_sends_high_for_every_mistral_reasoning_id() {
+        use crate::transport::ReasoningEffort as RE;
+        // Mistral's real reasoning_effort vocabulary is a bare "none"|"high" enum with no per-level
+        // map at all — every active level collapses to "high" on the wire, matching
+        // `mapReasoningEffort`'s literal fallback in pi's own Mistral client.
+        for effort in [RE::Minimal, RE::Low, RE::Medium, RE::High, RE::XHigh] {
+            assert_eq!(
+                reasoning_wire_override("mistral-small-2603", effort),
+                Some("high"),
+                "{effort:?}"
+            );
+        }
+        // A non-reasoning Mistral id is never routed here by the caller, but the function itself is
+        // still harmless if it somehow were.
+        assert_eq!(
+            reasoning_wire_override("mistral-large-latest", RE::High),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn reasoning_wire_override_is_none_for_every_other_family() {
+        use crate::transport::ReasoningEffort as RE;
+        for id in ["o3", "gpt-5.2", "claude-opus-4-8", "grok-4.3", "kimi-k2-thinking"] {
+            assert_eq!(reasoning_wire_override(id, RE::High), None, "{id}");
+        }
+    }
+
+    #[test]
+    fn is_non_standard_store_provider_matches_pis_denylist_where_the_id_alone_can_tell() {
+        for id in [
+            "deepseek-v4-pro",
+            "glm-5.2",
+            "kimi-k2-thinking",
+            "grok-4.3",
+            "qwen/qwen3.6-plus",
+            "gpt-oss-120b",
+            "zai-glm-4.7",
+        ] {
+            assert!(is_non_standard_store_provider(id), "{id} should be non-standard");
+        }
+        // The one Groq-hosted qwen exception is standard (Groq isn't in pi's denylist).
+        assert!(!is_non_standard_store_provider("qwen/qwen3-32b"));
+        for id in ["gpt-4o", "claude-opus-4-8", "mistral-large-latest", "some-vendor/model"] {
+            assert!(!is_non_standard_store_provider(id), "{id} should be standard");
+        }
     }
 }

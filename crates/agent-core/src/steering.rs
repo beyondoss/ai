@@ -223,6 +223,25 @@ impl Steering {
         lock(&self.steer).len() + lock(&self.follow_up).len() + lock(&self.next_turn).len()
     }
 
+    /// The steer lane's queued message text, oldest first — Fix 5 (pi-parity gap): [`pending_count`]
+    /// alone told a client *how many* messages were queued but never *what*, unlike pi's own
+    /// `AgentSessionEvent.queue_update` (`agent-session.ts`), which carries the actual `steering`/
+    /// `followUp` string arrays. A peek, not a drain, like [`pending_count`](Self::pending_count) —
+    /// calling this doesn't consume anything. Text only, matching `pending_count`'s own "depth, not
+    /// attachments" scope — a caller that also needs image attachments has no lighter-weight source for
+    /// those than draining the lane outright, which this deliberately doesn't do.
+    pub fn steer_texts(&self) -> Vec<String> {
+        lock(&self.steer).iter().map(|m| m.text.clone()).collect()
+    }
+
+    /// [`steer_texts`](Self::steer_texts), for the follow-up lane.
+    pub fn follow_up_texts(&self) -> Vec<String> {
+        lock(&self.follow_up)
+            .iter()
+            .map(|m| m.text.clone())
+            .collect()
+    }
+
     /// Set how much of the steer lane a single [`drain_steer`](Self::drain_steer) consumes (see
     /// [`QueueMode`]). Takes effect on the next drain — a call already past its `drain_steer` this turn
     /// is unaffected. Independent of [`set_follow_up_mode`](Self::set_follow_up_mode).
@@ -431,6 +450,25 @@ mod tests {
         assert_eq!(s.drain_steer(), vec!["steer".to_string()]);
         assert_eq!(s.drain_at_stop(), vec!["follow".to_string()]);
         assert!(s.is_empty());
+    }
+
+    #[test]
+    fn steer_texts_and_follow_up_texts_report_content_not_just_a_count() {
+        // Fix 5 (pi-parity gap): a client needs to see *what* is queued, not just how many messages.
+        let s = Steering::new();
+        assert_eq!(s.steer_texts(), Vec::<String>::new());
+        assert_eq!(s.follow_up_texts(), Vec::<String>::new());
+
+        s.push_steer("steer-1");
+        s.push_steer("steer-2");
+        s.push("follow-1");
+        assert_eq!(s.steer_texts(), vec!["steer-1", "steer-2"]);
+        assert_eq!(s.follow_up_texts(), vec!["follow-1"]);
+
+        // A peek, not a drain — the messages are still there afterward, and still drain correctly.
+        assert_eq!(s.steer_texts(), vec!["steer-1", "steer-2"]);
+        assert_eq!(s.drain_steer(), vec!["steer-1".to_string()]);
+        assert_eq!(s.steer_texts(), vec!["steer-2"]);
     }
 
     #[test]
