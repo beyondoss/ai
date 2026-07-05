@@ -93,6 +93,23 @@ impl Read {
 /// the error message names what the caller actually typed). Deliberately skips pi's macOS-specific
 /// AM/PM narrow-no-break-space screenshot variant — that's Finder-clipboard-naming-specific and this
 /// agent targets Linux, where it can never fire.
+///
+/// Each candidate's `exists()` check here is a *selection* probe, not a redundant pre-check
+/// immediately shadowed by an open a line later: the winning candidate's path string is threaded
+/// through several more steps in `Read::run` (image-format sniffing, the image-vs-text branch, offset/
+/// limit line-range handling, error messages) before anything actually opens the file, and — unlike a
+/// simple "does this one file exist" gate — there's no single `open()` whose own error could stand in
+/// for these checks, since the job is picking *which* of up to four distinct paths to commit to.
+/// Collapsing that selection onto `open()`'s error would need every one of `run`'s several separate
+/// re-opens (sniff, image decode, the streaming text read) to renegotiate which candidate "won" instead
+/// of trusting one already-resolved path string, for no real gain.
+///
+/// This does leave a TOCTOU window: a symlink swapped between a candidate's `exists()` here and its
+/// later `File::open` elsewhere in `run` could change what actually gets read. That's accepted, not
+/// overlooked — this crate has no path-sandbox/confinement in any file tool by deliberate design (the
+/// agent already runs with the operator's own ambient privileges, and `bash` is an unrestricted shell
+/// tool in the same tool set), so there is no privilege boundary here for a symlink swap to cross: an
+/// attacker who can win that race can already just name the target path directly.
 fn resolve_read_path(path: &str) -> String {
     use unicode_normalization::UnicodeNormalization;
 

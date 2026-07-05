@@ -30,11 +30,25 @@ const TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// never races the real expiry.
 const EARLY_REFRESH_BUFFER_MS: i64 = 5 * 60 * 1000;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AnthropicCredential {
     pub access: String,
     pub refresh: String,
     pub expires_at_ms: i64,
+}
+
+/// Hand-written, not derived: `access`/`refresh` are live OAuth bearer tokens — a derived `Debug`
+/// would print them verbatim into any future `tracing::debug!(?credential)` or error-context wrap.
+/// Matches `auth_store.rs`'s `Secret::fmt` redaction convention (the on-disk representation), just
+/// applied to this in-memory struct's own fields instead.
+impl std::fmt::Debug for AnthropicCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnthropicCredential")
+            .field("access", &"<redacted>")
+            .field("refresh", &"<redacted>")
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish()
+    }
 }
 
 /// Bind address for the local callback listener — overridable for a remote/container setup where
@@ -328,5 +342,19 @@ mod tests {
         })
         .unwrap();
         assert!(cred.expires_at_ms <= now_ms());
+    }
+
+    #[test]
+    fn debug_redacts_the_access_and_refresh_tokens_but_keeps_expires_at_ms() {
+        let cred = AnthropicCredential {
+            access: "sk-live-access-secret".to_string(),
+            refresh: "sk-live-refresh-secret".to_string(),
+            expires_at_ms: 123456,
+        };
+        let debug = format!("{cred:?}");
+        assert!(!debug.contains("sk-live-access-secret"));
+        assert!(!debug.contains("sk-live-refresh-secret"));
+        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains("123456"));
     }
 }

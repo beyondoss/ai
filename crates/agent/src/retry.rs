@@ -14,14 +14,59 @@ pub const MAX_RUN_RETRIES: u32 = 3;
 pub const RUN_RETRY_BASE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
 pub const RUN_RETRY_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Exponential backoff for a whole-run retry: `RUN_RETRY_BASE_BACKOFF · 2^(attempt-1)`, capped at
-/// `RUN_RETRY_MAX_BACKOFF`. `attempt` is 1-based. Coarser than `agent_core`'s own `mid_stream_backoff`
-/// (250ms base/5s cap) — this gates a whole extra model turn's worth of retry, not a resumed stream, so
-/// pi's slower 2/4/8s cadence is the better fit.
+/// Exponential backoff for a whole-run retry: `RUN_RETRY_BASE_BACKOFF · 2^(attempt-1)` (± [`jitter`]),
+/// capped at `RUN_RETRY_MAX_BACKOFF`. `attempt` is 1-based. Coarser than `agent_core`'s own
+/// `mid_stream_backoff` (250ms base/5s cap) — this gates a whole extra model turn's worth of retry, not
+/// a resumed stream, so pi's slower 2/4/8s cadence is the better fit.
 pub fn backoff(attempt: u32) -> std::time::Duration {
-    RUN_RETRY_BASE_BACKOFF
-        .saturating_mul(1u32 << attempt.saturating_sub(1).min(16))
-        .min(RUN_RETRY_MAX_BACKOFF)
+    let exp = RUN_RETRY_BASE_BACKOFF.saturating_mul(1u32 << attempt.saturating_sub(1).min(16));
+    jitter(exp, attempt).min(RUN_RETRY_MAX_BACKOFF)
+}
+
+/// Safety-audit fix (low severity): applies +/-20% jitter to a computed exponential-backoff duration so
+/// that a fleet of concurrent agent processes hitting the same transient failure (503/429) don't retry
+/// in perfect lockstep against an already-degraded backend (thundering herd). Applied to the *uncapped*
+/// exponential value, before the caller's own `.min(RUN_RETRY_MAX_BACKOFF)` — a saturated attempt (well
+/// past the cap) still collapses to exactly the cap after jitter, same as before jitter existed, since
+/// even a -20% jittered value there is still far above the cap. That's an accepted, documented
+/// trade-off rather than an oversight: jitter's effect is on the non-saturated attempts that matter in
+/// practice ([`MAX_RUN_RETRIES`] is only 3 by default, so the cap is rarely even reached), and keeping
+/// `RUN_RETRY_MAX_BACKOFF` a true, never-exceeded ceiling is simpler to reason about for callers than a
+/// "usually-a-cap-but-up-to-20%-over" one.
+///
+/// No `rand` crate is a direct (or even workspace) dependency anywhere in this repo — it only ever
+/// shows up transitively (checked both this crate's `Cargo.toml` and the workspace root's) — so this
+/// reuses the same zero-dependency salt-plus-counter trick `session_store::new_id`/
+/// `tools::mod::temp_suffix` already use for "just need per-process/per-call variance, not
+/// cryptographic quality": a `RandomState`-seeded salt (draws OS entropy once, fixed for the rest of
+/// the process's life) plus a monotonic per-call counter, hashed together with `DefaultHasher` (fixed
+/// key, so the *only* source of variance is the salt/counter/attempt inputs, not the hasher itself) and
+/// mapped onto `[0.8, 1.2]`. Salt gives cross-process variance (two fleet processes at the same attempt
+/// number don't jitter identically); the counter gives cross-call variance (the *same* attempt number,
+/// computed twice in one process, doesn't jitter identically either — see
+/// `backoff_jitter_varies_across_calls` below).
+fn jitter(d: std::time::Duration, attempt: u32) -> std::time::Duration {
+    use std::collections::hash_map::{DefaultHasher, RandomState};
+    use std::hash::{BuildHasher, Hash, Hasher};
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SALT: OnceLock<u64> = OnceLock::new();
+    let salt = *SALT.get_or_init(|| RandomState::new().hash_one(0xB0FF0Fu64));
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+
+    let mut hasher = DefaultHasher::new();
+    salt.hash(&mut hasher);
+    seq.hash(&mut hasher);
+    attempt.hash(&mut hasher);
+    let hashed = hasher.finish();
+
+    // Map the hash's top 32 bits onto [0.8, 1.2] (+/-20%, symmetric around the unjittered value).
+    let unit = (hashed >> 32) as f64 / u32::MAX as f64; // [0, 1]
+    let factor = 0.8 + unit * 0.4;
+    d.mul_f64(factor)
 }
 
 /// Raw HTTP status-code digit patterns worth retrying at the whole-run level specifically — a
@@ -84,12 +129,13 @@ impl RunRetryPolicy {
         }
     }
 
-    /// Same exponential-backoff shape as the module-level [`backoff`], just off this policy's own
-    /// `base_backoff` instead of the fixed [`RUN_RETRY_BASE_BACKOFF`] constant.
+    /// Same exponential-backoff-plus-jitter shape as the module-level [`backoff`], just off this
+    /// policy's own `base_backoff` instead of the fixed [`RUN_RETRY_BASE_BACKOFF`] constant.
     pub fn backoff(&self, attempt: u32) -> std::time::Duration {
-        self.base_backoff
-            .saturating_mul(1u32 << attempt.saturating_sub(1).min(16))
-            .min(RUN_RETRY_MAX_BACKOFF)
+        let exp = self
+            .base_backoff
+            .saturating_mul(1u32 << attempt.saturating_sub(1).min(16));
+        jitter(exp, attempt).min(RUN_RETRY_MAX_BACKOFF)
     }
 }
 
@@ -129,12 +175,62 @@ mod tests {
     use super::*;
     use agent_core::Error;
 
+    /// Asserts `actual` falls within the +/-20% jitter band around `nominal` (the unjittered
+    /// exponential value), inclusive. Used everywhere a test previously asserted an exact backoff
+    /// value — jitter means the exact value is no longer deterministic, only its range is.
+    fn assert_within_jitter(actual: std::time::Duration, nominal: std::time::Duration) {
+        let lo = nominal.mul_f64(0.8);
+        let hi = nominal.mul_f64(1.2);
+        assert!(
+            actual >= lo && actual <= hi,
+            "expected {actual:?} within +/-20% of {nominal:?} (i.e. [{lo:?}, {hi:?}])"
+        );
+    }
+
     #[test]
     fn backoff_doubles_then_caps() {
-        assert_eq!(backoff(1), std::time::Duration::from_secs(2));
-        assert_eq!(backoff(2), std::time::Duration::from_secs(4));
-        assert_eq!(backoff(3), std::time::Duration::from_secs(8));
+        assert_within_jitter(backoff(1), std::time::Duration::from_secs(2));
+        assert_within_jitter(backoff(2), std::time::Duration::from_secs(4));
+        assert_within_jitter(backoff(3), std::time::Duration::from_secs(8));
+        // Attempt 10's unjittered value (2s · 2^9 = 1024s) is so far past the cap that even a -20%
+        // jittered value is still far above it, so this stays an exact assertion — see `jitter`'s doc
+        // comment on why a saturated attempt isn't expected to show variance.
         assert_eq!(backoff(10), RUN_RETRY_MAX_BACKOFF);
+    }
+
+    #[test]
+    fn backoff_jitter_varies_across_calls_but_stays_in_range() {
+        // Safety-audit fix: proves jitter is actually applied, not just structurally present — the
+        // same attempt number, computed repeatedly, must not always produce the identical duration
+        // (the pre-fix thundering-herd bug), while every value still lands within the documented
+        // +/-20% band around the unjittered exponential value.
+        let nominal = std::time::Duration::from_secs(4); // attempt 2's unjittered value.
+        let samples: Vec<_> = (0..50).map(|_| backoff(2)).collect();
+        for &s in &samples {
+            assert_within_jitter(s, nominal);
+        }
+        assert!(
+            samples.windows(2).any(|w| w[0] != w[1]),
+            "expected varying backoff durations across repeated calls for the same attempt, got \
+             identical values every time: {samples:?}"
+        );
+    }
+
+    #[test]
+    fn run_retry_policy_backoff_jitter_varies_across_calls_but_stays_in_range() {
+        // Same regression as `backoff_jitter_varies_across_calls_but_stays_in_range`, for the
+        // runtime-configurable `RunRetryPolicy` variant.
+        let policy = RunRetryPolicy::default();
+        let nominal = std::time::Duration::from_secs(4); // attempt 2's unjittered value.
+        let samples: Vec<_> = (0..50).map(|_| policy.backoff(2)).collect();
+        for &s in &samples {
+            assert_within_jitter(s, nominal);
+        }
+        assert!(
+            samples.windows(2).any(|w| w[0] != w[1]),
+            "expected varying backoff durations across repeated calls for the same attempt, got \
+             identical values every time: {samples:?}"
+        );
     }
 
     #[test]
@@ -142,8 +238,8 @@ mod tests {
         let policy = RunRetryPolicy::default();
         assert_eq!(policy.max_retries, MAX_RUN_RETRIES);
         assert_eq!(policy.base_backoff, RUN_RETRY_BASE_BACKOFF);
-        assert_eq!(policy.backoff(1), backoff(1));
-        assert_eq!(policy.backoff(3), backoff(3));
+        assert_within_jitter(policy.backoff(1), std::time::Duration::from_secs(2));
+        assert_within_jitter(policy.backoff(3), std::time::Duration::from_secs(8));
     }
 
     #[test]
@@ -154,8 +250,8 @@ mod tests {
             RunRetryPolicy::from_overrides(Some(7), Some(std::time::Duration::from_millis(100)));
         assert_eq!(policy.max_retries, 7);
         assert_eq!(policy.base_backoff, std::time::Duration::from_millis(100));
-        assert_eq!(policy.backoff(1), std::time::Duration::from_millis(100));
-        assert_eq!(policy.backoff(2), std::time::Duration::from_millis(200));
+        assert_within_jitter(policy.backoff(1), std::time::Duration::from_millis(100));
+        assert_within_jitter(policy.backoff(2), std::time::Duration::from_millis(200));
         // `max_backoff` has no override of its own — still caps at the fixed module constant even with
         // a custom base.
         assert_eq!(policy.backoff(20), RUN_RETRY_MAX_BACKOFF);

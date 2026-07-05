@@ -24,6 +24,17 @@ use unicode_normalization::UnicodeNormalization;
 /// narrow with a more specific path or `find`/`grep`.
 const DEFAULT_LIMIT: usize = 500;
 
+/// Hard ceiling on directory entries collected — and therefore `std::fs::metadata()`-stat'd, one
+/// syscall per entry, for symlink-following directory detection — before the collection loop bails.
+/// Without this, both the directory-walk work and the metadata syscall count scaled with the
+/// directory's true entry count, not with `limit`: a pathologically large directory (unusually many
+/// entries) did proportionally unbounded work up front even though only `limit` of them are ever
+/// shown, since sorting and `limit`-truncation only happen *after* every entry has been collected.
+/// Mirrors `find.rs`/`grep.rs`'s own `HARD_CAP` (same value, same "checked as entries are collected,
+/// not after" shape) — far above any sane `limit` (default 500), so an ordinary listing never notices
+/// it; only a pathological directory does.
+const HARD_CAP: usize = 10_000;
+
 /// A cheap Unicode-aware sort key: lowercase, then NFD-decompose and drop combining marks, so an
 /// accented Latin letter collates next to its unaccented form (e.g. "café" sorts next to "cafe", ahead
 /// of "cafz") instead of by raw codepoint (where "é" is U+00E9 — after "z" — so a plain codepoint
@@ -105,9 +116,20 @@ impl Tool for Ls {
             Err(e) => return Err(ToolError::Execution(format!("ls {path}: {e}"))),
         }
         let mut entries: Vec<(String, bool)> = Vec::new();
+        // Set once the collection loop below bails at `HARD_CAP` — see its doc comment. When true,
+        // `entries.len()` (and everything derived from it, like `total`) reflects only the entries
+        // actually collected, not the directory's real size.
+        let mut hard_capped = false;
         let dir =
             std::fs::read_dir(path).map_err(|e| ToolError::Execution(format!("ls {path}: {e}")))?;
         for entry in dir {
+            // Checked at the top of every iteration — same shape as `find.rs`'s own `HARD_CAP` check —
+            // so a pathologically large directory stops both walking and `metadata()`-stat'ing well
+            // before `entries` could grow unbounded, instead of only truncating after the fact.
+            if entries.len() >= HARD_CAP {
+                hard_capped = true;
+                break;
+            }
             let entry = entry.map_err(|e| ToolError::Execution(e.to_string()))?;
             let fname = entry.file_name();
             let name = fname.to_string_lossy();
@@ -160,11 +182,16 @@ impl Tool for Ls {
         // Cap the listing so a huge directory can't flood the model's context.
         let total = entries.len();
         let count_truncated = total > limit;
+        // `hard_capped` alone (without `count_truncated`) is only reachable when a caller passes a
+        // `limit` at or above `HARD_CAP` — rare, but still needs its own notice, since `total` in that
+        // case undercounts the directory's real size even though the ordinary "N more entries" marker
+        // wouldn't otherwise fire.
+        let needs_marker = count_truncated || hard_capped;
         if count_truncated {
             entries.truncate(limit);
         }
         let mut out = entries.join("\n");
-        if count_truncated {
+        if needs_marker {
             out.push('\n');
         }
         // The byte cap is checked *before* the count marker, and takes priority when both would
@@ -173,11 +200,21 @@ impl Tool for Ls {
             &mut out,
             "narrow with a subpath or use `find`/`grep` to see more",
         );
-        if !byte_capped && count_truncated {
-            out.push_str(&super::output::marker(format_args!(
-                "{} more entries; {total} total — narrow with a subpath or use `find`/`grep`",
-                total - limit
-            )));
+        if !byte_capped && needs_marker {
+            let mut notices = Vec::new();
+            if count_truncated {
+                notices.push(format!(
+                    "{} more entries; {total} total — narrow with a subpath or use `find`/`grep`",
+                    total - limit
+                ));
+            }
+            if hard_capped {
+                notices.push(format!(
+                    "directory has more than {HARD_CAP} entries; only the first {HARD_CAP} were \
+                     scanned (hard cap reached)"
+                ));
+            }
+            out.push_str(&super::output::marker(notices.join(". ")));
         }
         Ok(out.into())
     }
@@ -401,6 +438,45 @@ mod tests {
         assert!(out.contains("[7 more entries; 10 total"));
         // Three entry lines plus the truncation note.
         assert_eq!(out.lines().count(), 4);
+    }
+
+    #[tokio::test]
+    async fn hard_cap_bounds_collection_for_a_pathologically_large_directory() {
+        // Regression test for the safety-audit finding: without `HARD_CAP`, every entry got a
+        // `std::fs::metadata()` syscall (for symlink-following directory detection) and a `Vec` slot
+        // before the whole collection was ever sorted or truncated to `limit` — so a directory with
+        // an unusually large true entry count did proportionally unbounded walk-and-stat work even
+        // though only `limit` entries are ever shown. `HARD_CAP` bounds collection (and therefore
+        // `metadata()` calls) well before that point, regardless of the directory's real size.
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..(HARD_CAP + 50) {
+            std::fs::write(dir.path().join(format!("f{i:05}.txt")), "").unwrap();
+        }
+
+        let out = Ls
+            .run(json!({ "path": dir.path().to_str().unwrap() }))
+            .await
+            .unwrap()
+            .text;
+
+        // The reported total must equal HARD_CAP, not the true directory size (HARD_CAP + 50) —
+        // proving the collection loop bailed well short of the real entry count instead of collecting
+        // (and stat'ing) everything first and only truncating for display after the fact.
+        assert!(
+            out.contains(&format!("{HARD_CAP} total")),
+            "expected the reported total to be capped at HARD_CAP ({HARD_CAP}), got tail: {}",
+            &out[out.len().saturating_sub(300)..]
+        );
+        assert!(
+            !out.contains(&format!("{} total", HARD_CAP + 50)),
+            "must never report the true (uncapped) entry count: {}",
+            &out[out.len().saturating_sub(300)..]
+        );
+        assert!(
+            out.contains("hard cap"),
+            "expected an explicit hard-cap notice in the output: {}",
+            &out[out.len().saturating_sub(300)..]
+        );
     }
 
     #[tokio::test]

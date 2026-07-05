@@ -33,12 +33,29 @@ const DEVICE_CODE_TIMEOUT: Duration = Duration::from_secs(900);
 const SCOPE: &str = "openid profile email offline_access";
 const ACCOUNT_ID_CLAIM_PATH: &str = "https://api.openai.com/auth";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OpenaiCodexCredential {
     pub access: String,
     pub refresh: String,
     pub expires_at_ms: i64,
     pub account_id: String,
+}
+
+/// Hand-written, not derived: `access`/`refresh` are live OAuth bearer tokens — a derived `Debug`
+/// would print them verbatim into any future `tracing::debug!(?credential)` or error-context wrap.
+/// Matches `auth_store.rs`'s `Secret::fmt` redaction convention (the on-disk representation), just
+/// applied to this in-memory struct's own fields instead. `account_id` isn't a secret (it's a claim
+/// re-derived from the token, not the token itself — see `extract_chatgpt_account_id`'s doc comment)
+/// so it prints verbatim.
+impl std::fmt::Debug for OpenaiCodexCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenaiCodexCredential")
+            .field("access", &"<redacted>")
+            .field("refresh", &"<redacted>")
+            .field("expires_at_ms", &self.expires_at_ms)
+            .field("account_id", &self.account_id)
+            .finish()
+    }
 }
 
 fn callback_host() -> String {
@@ -552,5 +569,21 @@ mod tests {
         assert_eq!(from_number.interval, 5);
         let from_string: Wrapper = serde_json::from_str(r#"{"interval": "7"}"#).unwrap();
         assert_eq!(from_string.interval, 7);
+    }
+
+    #[test]
+    fn debug_redacts_the_access_and_refresh_tokens_but_keeps_non_secret_fields() {
+        let cred = OpenaiCodexCredential {
+            access: "sk-live-access-secret".to_string(),
+            refresh: "sk-live-refresh-secret".to_string(),
+            expires_at_ms: 123456,
+            account_id: "acct_visible".to_string(),
+        };
+        let debug = format!("{cred:?}");
+        assert!(!debug.contains("sk-live-access-secret"));
+        assert!(!debug.contains("sk-live-refresh-secret"));
+        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains("123456"));
+        assert!(debug.contains("acct_visible"));
     }
 }

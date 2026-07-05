@@ -10,6 +10,13 @@ use std::path::{Path, PathBuf};
 
 use crate::skills::Collision;
 
+/// Cap on a single prompt template file's own size, checked (via `fs::metadata`, not a read) before
+/// [`load_file`] ever calls `fs::read_to_string` on it — same reasoning as `skills.rs`'s own
+/// `MAX_SKILL_FILE_LEN`: a legitimate template is a short YAML frontmatter block plus at most a few KB
+/// of body text, so a cap this far above that only ever catches a pathological file (e.g. a data dump
+/// misnamed `.md`), not a verbose but legitimate one.
+const MAX_PROMPT_TEMPLATE_FILE_LEN: u64 = 1024 * 1024; // 1 MiB
+
 /// A discovered prompt template.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptTemplate {
@@ -117,9 +124,40 @@ fn discover_with_diagnostics_impl(
         }
     }
 
-    fn load_file(path: &Path) -> Option<(String, PathBuf, PromptTemplate)> {
+    // Both silent-drop paths — an oversized file (checked via `fs::metadata` and skipped *before* any
+    // read, see `MAX_PROMPT_TEMPLATE_FILE_LEN`) and an unreadable one — are reported through
+    // `diagnostics` (folded into the `Vec<Collision>` `discover_with_diagnostics` surfaces to a caller,
+    // wrapped as a message-only `Collision`) and `tracing::warn!`-logged at the point of detection,
+    // matching `skills::parse_skill`'s identical handling of the same two drop paths. Previously this
+    // was a bare `fs::read_to_string(path).ok()?` — a read failure (permissions, non-UTF8, …) vanished
+    // with zero diagnostic, unlike the extra-single-file-root branch below, which already warns.
+    fn load_file(
+        path: &Path,
+        diagnostics: &mut Vec<String>,
+    ) -> Option<(String, PathBuf, PromptTemplate)> {
         let name = path.file_stem().map(|s| s.to_string_lossy().into_owned())?;
-        let text = fs::read_to_string(path).ok()?;
+        if let Ok(meta) = fs::metadata(path) {
+            if meta.len() > MAX_PROMPT_TEMPLATE_FILE_LEN {
+                let message = format!(
+                    "prompt template {} exceeds {MAX_PROMPT_TEMPLATE_FILE_LEN} bytes ({} bytes) — \
+                     skipped without reading",
+                    path.display(),
+                    meta.len()
+                );
+                tracing::warn!("{message}");
+                diagnostics.push(message);
+                return None;
+            }
+        }
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(err) => {
+                let message = format!("failed to read prompt template {}: {err}", path.display());
+                tracing::warn!("{message}");
+                diagnostics.push(message);
+                return None;
+            }
+        };
         let (hint, description, body) = parse(&text);
         Some((
             name.clone(),
@@ -145,7 +183,10 @@ fn discover_with_diagnostics_impl(
     // own) — only `root`'s immediate children are considered, not an arbitrary-depth walk.
     // `git_global`/`git_exclude` are disabled for the same reason `skills.rs` disables them: pi never
     // consults a global excludes file or `.git/info/exclude`, only the three per-directory ignore files.
-    fn load_dir(root: &Path) -> Vec<(String, PathBuf, PromptTemplate)> {
+    fn load_dir(
+        root: &Path,
+        diagnostics: &mut Vec<String>,
+    ) -> Vec<(String, PathBuf, PromptTemplate)> {
         let mut out = Vec::new();
         let paths: Vec<PathBuf> = ignore::WalkBuilder::new(root)
             .max_depth(Some(1))
@@ -164,7 +205,7 @@ fn discover_with_diagnostics_impl(
             if path.extension().and_then(|e| e.to_str()) != Some("md") {
                 continue;
             }
-            if let Some(entry) = load_file(&path) {
+            if let Some(entry) = load_file(&path, diagnostics) {
                 out.push(entry);
             }
         }
@@ -188,7 +229,13 @@ fn discover_with_diagnostics_impl(
             if !seen_roots.insert(crate::path_utils::resolved_path(&root)) {
                 continue;
             }
-            extra_entries.push(load_dir(&root));
+            let mut dir_diagnostics = Vec::new();
+            extra_entries.push(load_dir(&root, &mut dir_diagnostics));
+            collisions.extend(
+                dir_diagnostics
+                    .into_iter()
+                    .map(|m| Collision::message_only("prompt", m)),
+            );
         } else if root.extension().and_then(|e| e.to_str()) == Some("md") {
             // Same reasoning as the directory case above, for a standalone `.md` file.
             if !seen_roots.insert(crate::path_utils::resolved_path(&root)) {
@@ -196,7 +243,11 @@ fn discover_with_diagnostics_impl(
             }
             // pi-parity fix (M3): pi's other `--prompt-template` shape — a single standalone `.md`
             // file, one template, no directory of its own resources.
-            match load_file(&root) {
+            // A discarded diagnostics sink: this call site already reports a `None` with its own, more
+            // specific "--prompt-template file" framing below, so `load_file`'s own diagnostic (which
+            // would otherwise duplicate it) is intentionally not folded into `collisions` — matching
+            // `skills::discover_with_diagnostics_impl`'s identical `--skill` single-file branch.
+            match load_file(&root, &mut Vec::new()) {
                 Some(entry) => extra_entries.push(vec![entry]),
                 None => {
                     let message = format!("--prompt-template file could not be read: {extra}");
@@ -215,7 +266,8 @@ fn discover_with_diagnostics_impl(
     }
 
     for (root, scope) in &standard_roots {
-        for (name, path, mut template) in load_dir(root) {
+        let mut dir_diagnostics = Vec::new();
+        for (name, path, mut template) in load_dir(root, &mut dir_diagnostics) {
             template.scope = *scope;
             // Later standard roots (project) win over earlier (user) on name collisions.
             if let Some(existing_path) = origins.get(&name) {
@@ -242,6 +294,11 @@ fn discover_with_diagnostics_impl(
                 found.push(template);
             }
         }
+        collisions.extend(
+            dir_diagnostics
+                .into_iter()
+                .map(|m| Collision::message_only("prompt", m)),
+        );
     }
     // Names claimed by a standard root — snapshotted *before* extra roots are processed, so a
     // standard-root template always wins over an extra one, but two extra roots can still shadow each
@@ -643,6 +700,73 @@ mod tests {
         assert_eq!(
             expanded,
             "Fix the bug in foo.rs and explain: foo.rs urgently"
+        );
+    }
+
+    #[test]
+    fn an_oversized_prompt_template_is_skipped_before_being_read() {
+        // A pathological template file (or thousands of small ones, in a checked-out repo) must not be
+        // fully read into memory before any validation runs — `MAX_PROMPT_TEMPLATE_FILE_LEN` is checked
+        // via `fs::metadata` *before* `fs::read_to_string` ever runs, mirroring
+        // `skills::MAX_SKILL_FILE_LEN`'s identical guard.
+        let tmp = tempfile::tempdir().unwrap();
+        let pdir = tmp.path().join(".claude/prompts");
+        fs::create_dir_all(&pdir).unwrap();
+        let oversized = "x".repeat(MAX_PROMPT_TEMPLATE_FILE_LEN as usize + 1);
+        fs::write(pdir.join("huge.md"), oversized).unwrap();
+
+        let capture = crate::tracing_test::capture(|| {
+            let (found, collisions) = discover_with_diagnostics(tmp.path(), true, &[]);
+            assert!(
+                !found.iter().any(|t| t.name == "huge"),
+                "an oversized template must not be discovered: {found:?}"
+            );
+            assert!(
+                collisions.iter().any(|c| c.to_string().contains("exceeds")),
+                "got: {collisions:?}"
+            );
+        });
+        assert!(
+            capture.messages().iter().any(|m| m.contains("exceeds")),
+            "an oversized prompt template must be logged, not silently skipped with no signal: {:?}",
+            capture.messages()
+        );
+    }
+
+    #[test]
+    fn an_unreadable_prompt_template_via_standard_roots_is_warned_not_silently_dropped() {
+        // Previously `load_file`'s bare `fs::read_to_string(path).ok()?` dropped a read failure with
+        // zero diagnostic when reached through `load_dir`'s standard-roots loop — unlike the
+        // extra-single-file-root branch a few lines above, which already `tracing::warn!`s and records
+        // a `Collision::message_only` on failure. Non-UTF8 bytes make `fs::read_to_string` fail while
+        // the file itself stays a regular file, so it isn't filtered out by `load_dir`'s own
+        // `is_file()` check before ever reaching `load_file` (a portable way to hit the `Err` branch
+        // without a chmod/permissions dance).
+        let tmp = tempfile::tempdir().unwrap();
+        let pdir = tmp.path().join(".claude/prompts");
+        fs::create_dir_all(&pdir).unwrap();
+        fs::write(pdir.join("bad.md"), [0xff, 0xfe, 0x00, 0xff]).unwrap();
+
+        let capture = crate::tracing_test::capture(|| {
+            let (found, collisions) = discover_with_diagnostics(tmp.path(), true, &[]);
+            assert!(
+                !found.iter().any(|t| t.name == "bad"),
+                "an unreadable template must not be discovered: {found:?}"
+            );
+            assert!(
+                collisions
+                    .iter()
+                    .any(|c| c.to_string().contains("failed to read")),
+                "got: {collisions:?}"
+            );
+        });
+        assert!(
+            capture
+                .messages()
+                .iter()
+                .any(|m| m.contains("failed to read")),
+            "an unreadable prompt template must be logged, not silently dropped: {:?}",
+            capture.messages()
         );
     }
 

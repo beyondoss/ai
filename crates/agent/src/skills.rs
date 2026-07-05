@@ -96,6 +96,16 @@ impl Collision {
 /// bound keeps a pathological/symlinked layout from turning discovery into an unbounded walk.
 const MAX_DEPTH: usize = 8;
 
+/// Cap on a single `SKILL.md`/loose skill `.md` file's own size, checked (via `fs::metadata`, not a
+/// read) before [`parse_skill`] ever calls `fs::read_to_string` on it. A legitimate skill manifest is a
+/// short YAML frontmatter block plus at most a few KB of instructional prose — [`MAX_SKILL_DESCRIPTION_LEN`]
+/// alone (1024 chars, just the `description:` field) already gives the expected order of magnitude for
+/// the whole file. This is two further orders of magnitude of headroom above that, generous enough that
+/// no legitimate skill ever approaches it, but nowhere near unbounded — just enough to reject a
+/// pathological file (a data dump or build artifact misnamed `SKILL.md`) before its full contents are
+/// read into memory and parsed on every discovery call, rather than after.
+const MAX_SKILL_FILE_LEN: u64 = 1024 * 1024; // 1 MiB
+
 /// Discover skills under the user (`~/.claude/skills`, `~/.agents/skills`) roots, plus the project
 /// (`<cwd>/.claude/skills`, and every `.agents/skills` between `cwd` and the enclosing git-repo root)
 /// roots when `project_trusted`. A more specific root shadows a less specific one of the same name —
@@ -568,13 +578,28 @@ fn loose_root_skills(root: &Path, diagnostics: &mut Vec<String>) -> Vec<Skill> {
 /// Parse a `SKILL.md`'s frontmatter into a [`Skill`]. Requires a non-empty `description`; falls back to
 /// the directory name for `name` if the frontmatter omits it.
 ///
-/// Both silent-drop paths — an unreadable manifest, and a missing/empty `description` — are reported
-/// through `diagnostics` (folded into the `Vec<Collision>` `discover_with_diagnostics` surfaces to a
-/// caller, each wrapped as a message-only [`Collision`] since neither has a winner/loser of its own) and
-/// `tracing::warn!`-logged at the point of detection, matching every other malformed-skill case in this
-/// file: `validate_skill_name`/`validate_skill_description`'s issues below `warn!` even when the skill is
-/// still allowed to load, so a skill that fails to load at all must not produce *less* signal than one.
+/// All three silent-drop paths — an oversized manifest (checked via `fs::metadata` and skipped
+/// *before* any read, see [`MAX_SKILL_FILE_LEN`]), an unreadable manifest, and a missing/empty
+/// `description` — are reported through `diagnostics` (folded into the `Vec<Collision>`
+/// `discover_with_diagnostics` surfaces to a caller, each wrapped as a message-only [`Collision`] since
+/// none has a winner/loser of its own) and `tracing::warn!`-logged at the point of detection, matching
+/// every other malformed-skill case in this file: `validate_skill_name`/`validate_skill_description`'s
+/// issues below `warn!` even when the skill is still allowed to load, so a skill that fails to load at
+/// all must not produce *less* signal than one.
 fn parse_skill(manifest: &Path, diagnostics: &mut Vec<String>) -> Option<Skill> {
+    if let Ok(meta) = fs::metadata(manifest) {
+        if meta.len() > MAX_SKILL_FILE_LEN {
+            let message = format!(
+                "skill manifest {} exceeds {MAX_SKILL_FILE_LEN} bytes ({} bytes) — skipped without \
+                 reading",
+                manifest.display(),
+                meta.len()
+            );
+            tracing::warn!("{message}");
+            diagnostics.push(message);
+            return None;
+        }
+    }
     let text = match fs::read_to_string(manifest) {
         Ok(text) => text,
         Err(err) => {
@@ -1704,6 +1729,37 @@ mod tests {
         let messages = capture.messages();
         assert!(
             messages.iter().any(|m| m.contains("failed to read")),
+            "got: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn oversized_manifest_is_skipped_before_being_read() {
+        // A pathological `SKILL.md` (or thousands of small ones, in a checked-out repo) must not be
+        // fully read into memory and parsed on every discovery call — `MAX_SKILL_FILE_LEN` is checked
+        // via `fs::metadata` *before* `fs::read_to_string` ever runs, the same "reject before you pay
+        // for it" shape `MAX_DEPTH` already gives the walk itself.
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("SKILL.md");
+        let oversized = "x".repeat(MAX_SKILL_FILE_LEN as usize + 1);
+        fs::write(
+            &manifest,
+            format!("---\nname: huge\ndescription: {oversized}\n---\n"),
+        )
+        .unwrap();
+        let mut diagnostics = Vec::new();
+        let capture = crate::tracing_test::capture(|| {
+            assert!(parse_skill(&manifest, &mut diagnostics).is_none());
+        });
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.contains("exceeds") && d.contains("skipped")),
+            "got: {diagnostics:?}"
+        );
+        let messages = capture.messages();
+        assert!(
+            messages.iter().any(|m| m.contains("exceeds")),
             "got: {messages:?}"
         );
     }

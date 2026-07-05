@@ -206,6 +206,8 @@ pub fn search(job: &GrepJob, threads: usize) -> (Vec<Hit>, bool, Option<String>)
                 path: Arc::from(path),
                 hits: Vec::new(),
                 matches: 0,
+                total: Arc::clone(&total),
+                stop_at,
             };
             if let Err(e) = searcher.search_path(matcher, path, &mut sink) {
                 if let Ok(mut guard) = first_error.lock() {
@@ -270,6 +272,22 @@ struct Collector {
     path: Arc<Path>,
     hits: Vec<Hit>,
     matches: usize,
+    /// The walk's shared match counter and its stop threshold — so a single match-dense file (an
+    /// unignored log dump, a minified bundle) can bail out of *its own* scan the instant the running
+    /// total would cross `stop_at`, instead of always finishing the file and only re-checking the cap
+    /// between files (`search`'s per-entry closure). Without this, one such file could be fully
+    /// scanned and every hit collected before the cap logic ever saw it — an OOM/hang vector with no
+    /// adversarial input required.
+    total: Arc<AtomicUsize>,
+    stop_at: usize,
+}
+
+impl Collector {
+    /// This file's own matches so far, added to every earlier file's already-flushed count — the same
+    /// running total `search`'s per-entry closure checks between files, just readable mid-file too.
+    fn running_total(&self) -> usize {
+        self.total.load(Ordering::Relaxed) + self.matches
+    }
 }
 
 impl Sink for Collector {
@@ -281,7 +299,7 @@ impl Sink for Collector {
         self.hits
             .push((self.path.clone(), lineno, clip(&trim_eol(&text)), true));
         self.matches += 1;
-        Ok(true)
+        Ok(self.running_total() < self.stop_at)
     }
 
     fn context(&mut self, _searcher: &Searcher, c: &SinkContext<'_>) -> std::io::Result<bool> {
@@ -289,7 +307,7 @@ impl Sink for Collector {
         let text = String::from_utf8_lossy(c.bytes());
         self.hits
             .push((self.path.clone(), lineno, clip(&trim_eol(&text)), false));
-        Ok(true)
+        Ok(self.running_total() < self.stop_at)
     }
 }
 
@@ -1129,6 +1147,40 @@ mod tests {
         assert_eq!(
             match_lines, 3,
             "at most `limit` matches must be reported: {out}"
+        );
+    }
+
+    #[test]
+    fn collector_stops_scanning_a_single_file_once_the_cap_is_reached() {
+        // Regression: `matched`/`context` must signal the searcher to stop mid-file the instant the
+        // running total would cross `stop_at`, not just rely on `search`'s per-entry closure
+        // re-checking the cap *between* files — see `Collector::running_total`'s doc comment. Before
+        // this fix, a single match-dense file (an unignored log dump, a minified bundle) was always
+        // scanned to completion regardless of the cap, an OOM/hang vector needing no adversarial input.
+        let matcher = RegexMatcherBuilder::new()
+            .line_terminator(Some(b'\n'))
+            .build("needle")
+            .unwrap();
+        let mut searcher = SearcherBuilder::new().line_number(true).build();
+        let total = Arc::new(AtomicUsize::new(0));
+        let mut sink = Collector {
+            path: Arc::from(Path::new("f.txt")),
+            hits: Vec::new(),
+            matches: 0,
+            total: Arc::clone(&total),
+            stop_at: 3,
+        };
+        // 1,000 matching lines — if the searcher scanned the whole thing, `sink.hits.len()` would be
+        // 1,000; it must instead stop the moment the 3rd match is recorded.
+        let haystack = "needle\n".repeat(1_000);
+        searcher
+            .search_slice(&matcher, haystack.as_bytes(), &mut sink)
+            .unwrap();
+        assert_eq!(
+            sink.hits.len(),
+            3,
+            "a match-dense file must stop being scanned once the cap is crossed, not run to \
+             completion"
         );
     }
 

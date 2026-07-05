@@ -63,7 +63,7 @@ pub const KNOWN_MODEL_IDS: &[&str] = &[
     "mai-code-1-flash-picker",
 ];
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GithubCopilotCredential {
     pub access: String,
     /// The long-lived GitHub device-flow token (`ghu_...`) — unchanged across refreshes; the
@@ -72,6 +72,24 @@ pub struct GithubCopilotCredential {
     pub expires_at_ms: i64,
     pub enterprise_url: Option<String>,
     pub available_model_ids: Vec<String>,
+}
+
+/// Hand-written, not derived: `access`/`refresh` are live OAuth bearer tokens (the short-lived
+/// Copilot-internal proxy token and the long-lived GitHub device-flow token, respectively) — a
+/// derived `Debug` would print them verbatim into any future `tracing::debug!(?credential)` or
+/// error-context wrap. Matches `auth_store.rs`'s `Secret::fmt` redaction convention (the on-disk
+/// representation), just applied to this in-memory struct's own fields instead. `enterprise_url`/
+/// `available_model_ids` aren't secrets, so they print verbatim.
+impl std::fmt::Debug for GithubCopilotCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GithubCopilotCredential")
+            .field("access", &"<redacted>")
+            .field("refresh", &"<redacted>")
+            .field("expires_at_ms", &self.expires_at_ms)
+            .field("enterprise_url", &self.enterprise_url)
+            .field("available_model_ids", &self.available_model_ids)
+            .finish()
+    }
 }
 
 /// Log in via GitHub's device-code flow, then exchange for a Copilot-internal token, enable every
@@ -834,6 +852,24 @@ mod tests {
     #[test]
     fn tool_calls_false_is_not_selectable() {
         assert!(!is_model_selectable(&entry(true, None, Some(false))));
+    }
+
+    #[test]
+    fn debug_redacts_the_access_and_refresh_tokens_but_keeps_non_secret_fields() {
+        let cred = GithubCopilotCredential {
+            access: "ghu_live_access_secret".to_string(),
+            refresh: "ghu_live_refresh_secret".to_string(),
+            expires_at_ms: 123456,
+            enterprise_url: Some("company.ghe.com".to_string()),
+            available_model_ids: vec!["gpt-5-codex".to_string()],
+        };
+        let debug = format!("{cred:?}");
+        assert!(!debug.contains("ghu_live_access_secret"));
+        assert!(!debug.contains("ghu_live_refresh_secret"));
+        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains("123456"));
+        assert!(debug.contains("company.ghe.com"));
+        assert!(debug.contains("gpt-5-codex"));
     }
 
     struct DummyInner;

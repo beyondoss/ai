@@ -18,6 +18,7 @@ use std::fs;
 use std::io::{IsTerminal, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent_core::{Agent, GatewayClient, Session, StreamEvent, Tool};
 use beyond_ai_agent::gateway_credential::{GatewayCredential, resolve_gateway_credential};
@@ -1456,6 +1457,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return Err("--name requires a non-empty value".into());
                 }
             }
+            // A malformed `--deny-path` glob must never silently produce a no-op policy — see
+            // `ToolPolicy::deny_path`'s doc comment for the fail-open this closes.
+            if let Err(e) = ToolPolicy::validate_deny_path_patterns(&deny_path) {
+                return Err(e.into());
+            }
             // Same filesystem-path-injection concern as `run`'s identical check (`--session-id` becomes
             // part of a persisted session's filename) — see `is_valid_session_id`'s doc comment.
             if let Some(id) = &session_id {
@@ -2424,10 +2430,11 @@ async fn run_turn(
     json: bool,
     cancel: &agent_core::CancellationToken,
     retry_policy: &beyond_ai_agent::retry::RunRetryPolicy,
+    broken_pipe: &AtomicBool,
 ) -> agent_core::Result<agent_core::StopReason> {
     let mut attempt = 0u32;
     loop {
-        let result = run_turn_once(agent, session, json, cancel).await;
+        let result = run_turn_once(agent, session, json, cancel, broken_pipe).await;
         match &result {
             Err(e)
                 if attempt < retry_policy.max_retries
@@ -2466,21 +2473,46 @@ async fn run_turn(
 /// "Broken pipe" (exit 101) instead of exiting cleanly, the moment `head` hung up. A closed read end is
 /// the normal, expected way a *nix pipeline ends a producer it's done reading from, not a bug in this
 /// process to report loudly — matches `serve.rs`'s own writer task, which already exits gracefully on a
-/// write failure instead of panicking. Exits the whole process (code 0) immediately on `BrokenPipe`,
-/// same as that write ending the run entirely — there is no remaining stdout consumer to stream
-/// anything else to, and nothing meaningful left to do with any not-yet-flushed output. Any other write
+/// write failure instead of panicking.
+///
+/// On `BrokenPipe`, sets `broken_pipe` and trips `cancel` rather than calling `process::exit`
+/// directly — this function is called from deep inside `run_turn_once`'s streaming callbacks, which
+/// run *before* `run_task`'s `persist_run_tail`; exiting right here used to skip that persist entirely,
+/// silently dropping the turn's final (possibly-partial) assistant message from the session store —
+/// exactly the loss the Ctrl-C/SIGTERM path already takes care to avoid. Tripping `cancel` instead
+/// reuses that identical, already-correct "stop the turn, then still persist" machinery
+/// (`agent_core::Agent::run_events_cancellable`'s cooperative cancellation); `run_task` checks
+/// `broken_pipe` right after its own unconditional `persist_run_tail` call and exits 0 there instead —
+/// same eventual exit code as before, just after the write that used to be skipped. Any other write
 /// error (a full disk, a redirected-to-file target that vanished) is swallowed instead, matching this
 /// callback's own prior `let _ = ...flush()` convention — exceptionally rare for a terminal/pipe fd, and
 /// not worth complicating this hot streaming path over.
-fn write_stdout_or_exit(text: &str) {
+fn write_stdout_or_exit(
+    text: &str,
+    cancel: &agent_core::CancellationToken,
+    broken_pipe: &AtomicBool,
+) {
     let mut stdout = std::io::stdout().lock();
     let result = stdout
         .write_all(text.as_bytes())
         .and_then(|()| stdout.flush());
     if let Err(e) = result {
-        if e.kind() == std::io::ErrorKind::BrokenPipe {
-            std::process::exit(0);
-        }
+        handle_stdout_write_error(&e, cancel, broken_pipe);
+    }
+}
+
+/// The reaction to a failed stdout write, split out from [`write_stdout_or_exit`] so it's testable
+/// without a real broken pipe (stdout itself isn't injectable — the split point is the error, not the
+/// write). See `write_stdout_or_exit`'s own doc comment for why a `BrokenPipe` traps into `cancel`
+/// rather than exiting on the spot.
+fn handle_stdout_write_error(
+    e: &std::io::Error,
+    cancel: &agent_core::CancellationToken,
+    broken_pipe: &AtomicBool,
+) {
+    if e.kind() == std::io::ErrorKind::BrokenPipe {
+        broken_pipe.store(true, Ordering::Relaxed);
+        cancel.cancel();
     }
 }
 
@@ -2489,6 +2521,7 @@ async fn run_turn_once(
     session: &mut Session,
     json: bool,
     cancel: &agent_core::CancellationToken,
+    broken_pipe: &AtomicBool,
 ) -> agent_core::Result<agent_core::StopReason> {
     let mut stop_reason = agent_core::StopReason::default();
     if json {
@@ -2500,8 +2533,8 @@ async fn run_turn_once(
                         stop_reason = *r;
                     }
                     if let Ok(line) = serde_json::to_string(&ev) {
-                        write_stdout_or_exit(&line);
-                        write_stdout_or_exit("\n");
+                        write_stdout_or_exit(&line, cancel, broken_pipe);
+                        write_stdout_or_exit("\n", cancel, broken_pipe);
                     }
                 },
                 cancel.clone(),
@@ -2514,17 +2547,17 @@ async fn run_turn_once(
             session,
             |ev| match ev {
                 StreamEvent::TextDelta { text, .. } => {
-                    write_stdout_or_exit(text);
+                    write_stdout_or_exit(text, cancel, broken_pipe);
                 }
                 StreamEvent::ToolUseStart { name, .. } => {
                     // No trailing newline: `InputJsonDelta` fragments print immediately after, live,
                     // on this same line — a growing preview of the call's arguments as they stream in,
                     // rather than the model appearing to hang until the whole call (and its result)
                     // land.
-                    write_stdout_or_exit(&format!("\n[tool: {name}] "));
+                    write_stdout_or_exit(&format!("\n[tool: {name}] "), cancel, broken_pipe);
                 }
                 StreamEvent::InputJsonDelta { partial_json, .. } => {
-                    write_stdout_or_exit(partial_json);
+                    write_stdout_or_exit(partial_json, cancel, broken_pipe);
                 }
                 StreamEvent::MessageStop { stop_reason: r } => {
                     stop_reason = *r;
@@ -2534,7 +2567,7 @@ async fn run_turn_once(
             cancel.clone(),
         )
         .await?;
-    write_stdout_or_exit("\n");
+    write_stdout_or_exit("\n", cancel, broken_pipe);
     Ok(stop_reason)
 }
 
@@ -2674,6 +2707,11 @@ async fn run_task(
         if n.trim().is_empty() {
             return Err("--name requires a non-empty value".into());
         }
+    }
+    // A malformed `--deny-path` glob must never silently produce a no-op policy — see
+    // `ToolPolicy::deny_path`'s doc comment for the fail-open this closes.
+    if let Err(e) = ToolPolicy::validate_deny_path_patterns(&deny_path) {
+        return Err(e.into());
     }
     // `--session-id` is embedded directly into a filename (`SessionMeta::with_id` →
     // `SessionRepo::path_for`'s `{created_at}_{id}.jsonl`) with no other sanitization — an id like
@@ -3292,6 +3330,14 @@ async fn run_task(
             shutdown_cancel.cancel();
         }
     });
+    // Set by `write_stdout_or_exit` on a broken stdout pipe (a downstream consumer that closed its
+    // read end early, e.g. `agent run --json "task" | head -1`) — trips `cancel` the same as a real
+    // shutdown signal so the turn stops cooperatively instead of `process::exit`ing from deep inside
+    // a streaming callback, which used to skip the `persist_run_tail` calls below entirely and
+    // silently drop the turn's final (possibly-partial) assistant message. Checked right after each
+    // `persist_run_tail`, below, so the exit still happens (with the same code 0 as before) but only
+    // once that write has actually landed.
+    let broken_pipe = AtomicBool::new(false);
 
     let initial_message = expand_message(&initial_message, &skills, &prompt_templates);
     if initial_images.is_empty() {
@@ -3302,7 +3348,15 @@ async fn run_task(
             initial_images,
         ));
     }
-    let turn_result = run_turn(&agent, &mut session, json, &cancel, &retry_policy).await;
+    let turn_result = run_turn(
+        &agent,
+        &mut session,
+        json,
+        &cancel,
+        &retry_policy,
+        &broken_pipe,
+    )
+    .await;
     // Persist whatever's in `session` regardless of outcome: `run_events_cancellable` mutates
     // `session` in place as it streams, so a cancelled turn still leaves behind whatever
     // assistant/tool content had already landed — the same partial-content guarantee `serve` gives
@@ -3310,11 +3364,25 @@ async fn run_task(
     // incrementally, but the turn's own tail (its final, possibly-partial assistant message) is
     // only ever captured here.
     persist_run_tail(&store, &session)?;
+    if broken_pipe.load(Ordering::Relaxed) {
+        std::process::exit(0);
+    }
     let mut stop_reason = unwrap_turn_result(turn_result, &shutdown_cause)?;
     for message in messages {
         session.user(expand_message(&message, &skills, &prompt_templates));
-        let turn_result = run_turn(&agent, &mut session, json, &cancel, &retry_policy).await;
+        let turn_result = run_turn(
+            &agent,
+            &mut session,
+            json,
+            &cancel,
+            &retry_policy,
+            &broken_pipe,
+        )
+        .await;
         persist_run_tail(&store, &session)?;
+        if broken_pipe.load(Ordering::Relaxed) {
+            std::process::exit(0);
+        }
         stop_reason = unwrap_turn_result(turn_result, &shutdown_cause)?;
     }
 
@@ -3403,6 +3471,53 @@ mod tests {
     use super::*;
     use agent_core::Error;
     use agent_core::mock::{MockTransport, turn};
+
+    #[test]
+    fn a_broken_pipe_trips_cancel_and_the_flag_instead_of_exiting_on_the_spot() {
+        // Regression: `write_stdout_or_exit` used to call `process::exit(0)` directly on a broken
+        // pipe, which — because it's invoked from deep inside `run_turn_once`'s streaming callbacks —
+        // ran *before* `run_task`'s `persist_run_tail`, silently dropping the turn's final assistant
+        // message. The fix routes a broken pipe through the same cooperative-cancellation machinery
+        // Ctrl-C/SIGTERM already use, so `run_task` can persist first and exit afterward. This exercises
+        // `handle_stdout_write_error` directly (the reaction, split out from the unavoidably real
+        // `std::io::stdout()` write in `write_stdout_or_exit`) rather than an actual broken pipe.
+        let cancel = agent_core::CancellationToken::new();
+        let broken_pipe = AtomicBool::new(false);
+        assert!(!cancel.is_cancelled());
+
+        handle_stdout_write_error(
+            &std::io::Error::from(std::io::ErrorKind::BrokenPipe),
+            &cancel,
+            &broken_pipe,
+        );
+
+        assert!(
+            broken_pipe.load(Ordering::Relaxed),
+            "a broken pipe must set the flag `run_task` checks after persisting"
+        );
+        assert!(
+            cancel.is_cancelled(),
+            "a broken pipe must trip `cancel` so the turn stops cooperatively, not via a bare exit"
+        );
+    }
+
+    #[test]
+    fn a_non_broken_pipe_write_error_does_not_trip_cancel_or_the_flag() {
+        // Any other stdout write error (full disk, redirected-to-file target vanished) is swallowed —
+        // matches the callback's own prior `let _ = ...flush()` convention — so neither `cancel` nor
+        // `broken_pipe` should be touched.
+        let cancel = agent_core::CancellationToken::new();
+        let broken_pipe = AtomicBool::new(false);
+
+        handle_stdout_write_error(
+            &std::io::Error::from(std::io::ErrorKind::Other),
+            &cancel,
+            &broken_pipe,
+        );
+
+        assert!(!broken_pipe.load(Ordering::Relaxed));
+        assert!(!cancel.is_cancelled());
+    }
 
     #[test]
     fn resolve_prompt_input_reads_an_existing_files_contents() {
@@ -3599,6 +3714,7 @@ mod tests {
             false,
             &agent_core::CancellationToken::new(),
             &beyond_ai_agent::retry::RunRetryPolicy::default(),
+            &AtomicBool::new(false),
         )
         .await
         .unwrap();
@@ -3849,6 +3965,7 @@ mod tests {
             false,
             &agent_core::CancellationToken::new(),
             &beyond_ai_agent::retry::RunRetryPolicy::default(),
+            &AtomicBool::new(false),
         )
         .await
         .expect("the whole-run retry must recover once a real turn is finally scripted");
@@ -3884,6 +4001,7 @@ mod tests {
             false,
             &agent_core::CancellationToken::new(),
             &beyond_ai_agent::retry::RunRetryPolicy::default(),
+            &AtomicBool::new(false),
         )
         .await
         .expect_err("must eventually give up, not retry forever");

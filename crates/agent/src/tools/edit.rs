@@ -69,8 +69,7 @@ impl Tool for Edit {
             ));
         }
 
-        let raw = std::fs::read_to_string(path)
-            .map_err(|e| ToolError::Execution(format!("read {path}: {e}")))?;
+        let (raw, initial_mtime) = read_with_mtime(path)?;
         // Fail fast on a read-only file before spending any match/diff work on it (fuzzy matching
         // does NFKC normalization + ambiguity resolution — real CPU work, not free) — pi's own
         // `access(path, W_OK)` pre-check, just via a metadata read instead of a syscall that doesn't
@@ -145,8 +144,7 @@ impl Tool for Edit {
         } else {
             out
         };
-        super::write_atomic(path, restored.as_bytes())
-            .map_err(|e| ToolError::Execution(format!("write {path}: {e}")))?;
+        write_if_unchanged(path, initial_mtime, restored.as_bytes())?;
         let applied = ranges.len();
         // No diff/patch attached, deliberately: pi computes both too, but only for its interactive
         // terminal's own rendering — the model gets this same bare confirmation there as well. See
@@ -158,6 +156,68 @@ impl Tool for Edit {
         )
         .into())
     }
+}
+
+/// Read `path`'s contents together with the mtime it had at that exact moment, captured from the same
+/// open file handle the read itself uses — so there's no separate stat-then-read (or read-then-stat)
+/// syscall pair that could itself race a concurrent writer. [`write_if_unchanged`] later compares
+/// against this baseline right before the final write, to catch a different process (another agent
+/// session on the same repo, an editor autosave, a formatter/build step) modifying the file during the
+/// fuzzy-match/splice work `run` does in between.
+///
+/// `None` when the platform/filesystem doesn't report a modification time at all — rare, but exactly
+/// the same "best-effort, don't fail the whole operation over one unreadable timestamp" reasoning
+/// `session_store`'s trash-listing already uses for its own `.modified()` read.
+fn read_with_mtime(path: &str) -> Result<(String, Option<std::time::SystemTime>), ToolError> {
+    use std::io::Read as _;
+    let mut file =
+        std::fs::File::open(path).map_err(|e| ToolError::Execution(format!("read {path}: {e}")))?;
+    let initial_mtime = file.metadata().and_then(|m| m.modified()).ok();
+    let mut raw = String::new();
+    file.read_to_string(&mut raw)
+        .map_err(|e| ToolError::Execution(format!("read {path}: {e}")))?;
+    Ok((raw, initial_mtime))
+}
+
+/// Write `content` to `path` via [`super::write_atomic`] — but only if `path`'s mtime still matches
+/// `initial_mtime` (the baseline [`read_with_mtime`] captured when this edit's `old_string`/`new_string`
+/// work started). If it doesn't, a different process wrote to the file in the window between the read
+/// and this write; applying this edit anyway would silently discard that other write (last-writer-wins,
+/// with no signal to the model that called this tool) — so this refuses instead, surfacing a clear
+/// error the model can react to by re-reading the file and retrying.
+///
+/// Same-turn races from this agent's own overlapping tool calls are already handled elsewhere (see
+/// `write_target`/the write-lock registry that serializes calls targeting the same file) — this check
+/// is specifically for an *external* writer this agent has no other way to see coming.
+///
+/// Compares mtimes rather than content hashes: mtime is what the writability pre-check right above in
+/// `run` already reasons about via `std::fs::metadata`, and it's the same signal `auth_store`/
+/// `trust_store`/`settings`'s own stale-lock detection uses elsewhere in this codebase. `std::fs::metadata`
+/// (not `symlink_metadata`) follows a trailing symlink to the real target's metadata, matching
+/// `write_atomic`'s own symlink-following behavior (see its doc comment) — so this compares mtimes on
+/// the same resolved path `write_atomic` actually writes through, not the symlink's own (unchanging)
+/// directory-entry metadata, which would otherwise make an ordinary symlinked-dotfile edit spuriously
+/// fail this check every time.
+///
+/// `initial_mtime: None` — the initial read's own metadata call failed, or the platform doesn't report
+/// mtimes at all — skips the check entirely rather than hard-failing, the same graceful degradation the
+/// writability pre-check above already applies to its own failed metadata read.
+fn write_if_unchanged(
+    path: &str,
+    initial_mtime: Option<std::time::SystemTime>,
+    content: &[u8],
+) -> Result<(), ToolError> {
+    if let Some(initial) = initial_mtime {
+        let current = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        if current != Some(initial) {
+            return Err(ToolError::Execution(format!(
+                "{path} was modified on disk after it was read; the edit was aborted to avoid \
+                 discarding that change — re-read the file and retry"
+            )));
+        }
+    }
+    super::write_atomic(path, content)
+        .map_err(|e| ToolError::Execution(format!("write {path}: {e}")))
 }
 
 /// Byte `(start, end)` spans in `working` to replace. Tries an **exact** match first; if that finds
@@ -862,6 +922,62 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(std::fs::read_to_string(p).unwrap(), "greeting and planet");
+    }
+
+    #[tokio::test]
+    async fn rejects_a_write_when_the_file_changed_on_disk_after_it_was_read() {
+        // Simulates a concurrent *external* writer — a different process, not this agent's own
+        // same-turn write-lock (that's `write_target`/the write-lock registry's job, exercised
+        // elsewhere) — modifying the file in the window between `edit`'s read and its final write.
+        // `run` itself has no pause point a test can land in mid-flight, so this drives its two
+        // internal halves (`read_with_mtime` / `write_if_unchanged`) directly, exactly the way `run`
+        // chains them, with the concurrent write injected in between.
+        let f = write_tmp("the quick brown fox");
+        let p = f.path().to_str().unwrap();
+
+        let (raw, initial_mtime) = read_with_mtime(p).unwrap();
+        assert!(
+            initial_mtime.is_some(),
+            "this filesystem should report mtimes"
+        );
+        let restored = raw.replace("quick", "slow"); // the edit `run` would have computed
+
+        // The external writer's change, landing after the read this edit is based on. The mtime is
+        // bumped explicitly (rather than relying on clock resolution alone between two writes issued
+        // microseconds apart in a test) so the race is deterministic.
+        std::fs::write(p, "the quick brown fox, edited elsewhere").unwrap();
+        let bumped = initial_mtime.unwrap() + std::time::Duration::from_secs(5);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(p)
+            .unwrap()
+            .set_modified(bumped)
+            .unwrap();
+
+        let err = write_if_unchanged(p, initial_mtime, restored.as_bytes()).unwrap_err();
+        match err {
+            ToolError::Execution(msg) => {
+                assert!(msg.contains("modified") && msg.contains(p), "got: {msg}")
+            }
+            other => panic!("expected Execution(\"... modified ...\"), got {other:?}"),
+        }
+        // The concurrent writer's content must survive untouched — silently discarding it
+        // (last-writer-wins) is exactly the bug this check exists to prevent.
+        assert_eq!(
+            std::fs::read_to_string(p).unwrap(),
+            "the quick brown fox, edited elsewhere"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_if_unchanged_succeeds_when_the_mtime_is_unchanged() {
+        // The ordinary, non-racing path: nothing touched the file between the read and the write, so
+        // the mtime comparison must not spuriously reject it.
+        let f = write_tmp("the quick brown fox");
+        let p = f.path().to_str().unwrap();
+        let (raw, initial_mtime) = read_with_mtime(p).unwrap();
+        write_if_unchanged(p, initial_mtime, raw.replace("quick", "slow").as_bytes()).unwrap();
+        assert_eq!(std::fs::read_to_string(p).unwrap(), "the slow brown fox");
     }
 
     #[tokio::test]

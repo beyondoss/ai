@@ -1102,23 +1102,34 @@ impl Persistence {
     /// under an explicit `--session-dir` shared across projects: Track L28 (pi-parity fix) — this used
     /// to return every session in the directory unfiltered, so a shared `--session-dir` leaked another
     /// project's sessions into this one's `list_sessions` response.
-    fn list_with_progress(
+    ///
+    /// Runs the scan on `spawn_blocking` (like [`persist_blocking`]) rather than directly on the
+    /// caller's own task — `SessionRepo::list_with_progress`'s underlying `scan_listings` does
+    /// synchronous file I/O across a worker pool, and this command is reachable from the busy-mode
+    /// loop while a model turn is in flight (unlike `persist_blocking`'s dedicated task, this one
+    /// would otherwise stall that same task's turn-event delivery, `abort` handling, and checkpoint
+    /// persistence for however long a large, unpruned session directory takes to scan).
+    async fn list_with_progress(
         &self,
-        on_progress: impl Fn(usize, usize) + Send + Sync,
+        on_progress: impl Fn(usize, usize) + Send + Sync + 'static,
     ) -> Vec<SessionMeta> {
-        self.repo
-            .as_ref()
-            .and_then(|r| match r.list_with_progress(on_progress) {
-                Ok(sessions) => Some(sessions),
-                Err(e) => {
-                    eprintln!("serve: failed to list sessions: {e}");
-                    None
-                }
-            })
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|m| m.cwd == self.meta.cwd)
-            .collect()
+        let Some(repo) = self.repo.clone() else {
+            return Vec::new();
+        };
+        let cwd = self.meta.cwd.clone();
+        let sessions = match tokio::task::spawn_blocking(move || repo.list_with_progress(on_progress))
+            .await
+        {
+            Ok(Ok(sessions)) => sessions,
+            Ok(Err(e)) => {
+                eprintln!("serve: failed to list sessions: {e}");
+                Vec::new()
+            }
+            // `list_with_progress` never panics itself and this task is never cancelled — same
+            // reasoning as `persist_blocking`'s identical re-raise.
+            Err(e) => std::panic::resume_unwind(e.into_panic()),
+        };
+        sessions.into_iter().filter(|m| m.cwd == cwd).collect()
     }
 
     /// Every session across every project's own repo directory (pi's cross-project `listAll`), not
@@ -1128,18 +1139,35 @@ impl Persistence {
     /// `Err` when not in repo mode, or the repo directory has no parent to scan siblings of.
     /// `on_progress(scanned, total)` is invoked once per file across every project combined — see
     /// [`SessionRepo::list_all_with_progress`](crate::session_store::SessionRepo::list_all_with_progress).
-    fn list_all_with_progress(
+    ///
+    /// Runs on `spawn_blocking` — see [`Self::list_with_progress`]'s identical doc comment for why a
+    /// cross-project scan (bigger than a single repo's own) must not run directly on the caller's own
+    /// task.
+    async fn list_all_with_progress(
         &self,
-        on_progress: impl Fn(usize, usize) + Send + Sync,
+        on_progress: impl Fn(usize, usize) + Send + Sync + 'static,
     ) -> std::io::Result<Vec<SessionMeta>> {
         let repo = self.repo.as_ref().ok_or_else(not_in_repo_mode)?;
-        let root = repo.dir().parent().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "session directory has no parent to list other projects from",
-            )
-        })?;
-        SessionRepo::list_all_with_progress(root, on_progress)
+        let root = repo
+            .dir()
+            .parent()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "session directory has no parent to list other projects from",
+                )
+            })?
+            .to_path_buf();
+        match tokio::task::spawn_blocking(move || {
+            SessionRepo::list_all_with_progress(&root, on_progress)
+        })
+        .await
+        {
+            Ok(result) => result,
+            // `list_all_with_progress` never panics itself and this task is never cancelled — same
+            // reasoning as `persist_blocking`'s identical re-raise.
+            Err(e) => std::panic::resume_unwind(e.into_panic()),
+        }
     }
 
     /// Set the current session's title.
@@ -2420,13 +2448,15 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                                             }
                                             "list_sessions" => {
                                                 let progress_id = cid.clone();
+                                                let progress_tx = out_tx.clone();
                                                 let query = c.get("query").and_then(Value::as_str);
                                                 let sessions = persistence
-                                                    .list_with_progress(|scanned, total| {
+                                                    .list_with_progress(move |scanned, total| {
                                                         if should_report_scan_progress(scanned, total) {
-                                                            let _ = out_tx.send(list_progress_frame(progress_id.clone(), "list_sessions", scanned, total));
+                                                            let _ = progress_tx.send(list_progress_frame(progress_id.clone(), "list_sessions", scanned, total));
                                                         }
-                                                    });
+                                                    })
+                                                    .await;
                                                 let sessions: Vec<Value> = search_sessions(sessions, query)
                                                     .iter()
                                                     .map(SessionMeta::to_listing_json)
@@ -2435,12 +2465,13 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                                             }
                                             "list_all_sessions" => {
                                                 let progress_id = cid.clone();
+                                                let progress_tx = out_tx.clone();
                                                 let query = c.get("query").and_then(Value::as_str);
-                                                match persistence.list_all_with_progress(|scanned, total| {
+                                                match persistence.list_all_with_progress(move |scanned, total| {
                                                     if should_report_scan_progress(scanned, total) {
-                                                        let _ = out_tx.send(list_progress_frame(progress_id.clone(), "list_all_sessions", scanned, total));
+                                                        let _ = progress_tx.send(list_progress_frame(progress_id.clone(), "list_all_sessions", scanned, total));
                                                     }
-                                                }) {
+                                                }).await {
                                                     Ok(sessions) => {
                                                         let sessions: Vec<Value> = search_sessions(sessions, query).iter().map(SessionMeta::to_listing_json).collect();
                                                         let _ = out_tx.send(response(cid, "list_all_sessions", true, Some(json!({ "sessions": sessions })), None));
@@ -2840,17 +2871,20 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
             },
             "list_sessions" => {
                 let progress_id = id.clone();
+                let progress_tx = out_tx.clone();
                 let query = cmd.get("query").and_then(Value::as_str);
-                let sessions = persistence.list_with_progress(|scanned, total| {
-                    if should_report_scan_progress(scanned, total) {
-                        let _ = out_tx.send(list_progress_frame(
-                            progress_id.clone(),
-                            "list_sessions",
-                            scanned,
-                            total,
-                        ));
-                    }
-                });
+                let sessions = persistence
+                    .list_with_progress(move |scanned, total| {
+                        if should_report_scan_progress(scanned, total) {
+                            let _ = progress_tx.send(list_progress_frame(
+                                progress_id.clone(),
+                                "list_sessions",
+                                scanned,
+                                total,
+                            ));
+                        }
+                    })
+                    .await;
                 let sessions: Vec<Value> = search_sessions(sessions, query)
                     .iter()
                     .map(SessionMeta::to_listing_json)
@@ -2865,17 +2899,21 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
             }
             "list_all_sessions" => {
                 let progress_id = id.clone();
+                let progress_tx = out_tx.clone();
                 let query = cmd.get("query").and_then(Value::as_str);
-                match persistence.list_all_with_progress(|scanned, total| {
-                    if should_report_scan_progress(scanned, total) {
-                        let _ = out_tx.send(list_progress_frame(
-                            progress_id.clone(),
-                            "list_all_sessions",
-                            scanned,
-                            total,
-                        ));
-                    }
-                }) {
+                match persistence
+                    .list_all_with_progress(move |scanned, total| {
+                        if should_report_scan_progress(scanned, total) {
+                            let _ = progress_tx.send(list_progress_frame(
+                                progress_id.clone(),
+                                "list_all_sessions",
+                                scanned,
+                                total,
+                            ));
+                        }
+                    })
+                    .await
+                {
                     Ok(sessions) => {
                         let sessions: Vec<Value> = search_sessions(sessions, query)
                             .iter()
@@ -4782,6 +4820,10 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                         let pending_login_bg = pending_login.clone();
                         let login_id = id.clone();
                         tokio::spawn(async move {
+                            // Always clears `pending_login` when this task ends, even on panic — see
+                            // `PendingLoginGuard`'s own doc comment.
+                            let _reset_pending_login_on_exit =
+                                PendingLoginGuard(pending_login_bg.clone());
                             let callbacks = ServeLoginCallbacks {
                                 out_tx: out_tx_bg.clone(),
                                 id: login_id.clone(),
@@ -4834,7 +4876,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                                 Err(e) => response(login_id, "login", false, None, Some(&e.to_string())),
                             };
                             let _ = out_tx_bg.send(frame);
-                            *lock_ignoring_poison(&pending_login_bg) = None;
+                            // `_reset_pending_login_on_exit`'s `Drop` clears `pending_login` here.
                         });
                     }
                 }
@@ -5943,6 +5985,23 @@ struct PendingLogin {
     pending_code: PendingCodeSlot,
 }
 
+/// Resets `pending_login` back to `None` when the detached login task's future ends, for any
+/// reason — including a panic unwinding through it. The login task's own JoinHandle is discarded
+/// (nothing awaits it), so without this guard a panic anywhere in `crate::oauth::login` or the
+/// credential save would skip the task's normal end-of-body reset and leave `pending_login`
+/// permanently `Some`: every subsequent `login` call would return "busy: a login is already in
+/// flight" forever, with no way to recover short of restarting the whole `serve` process (even
+/// `abort_login` can't help — it just cancels a token nothing is left alive to observe). A `Drop`
+/// impl runs during unwinding, unlike a plain line of cleanup code placed after the panicking call,
+/// so this holds regardless of where in the task body things go wrong.
+struct PendingLoginGuard(Arc<std::sync::Mutex<Option<PendingLogin>>>);
+
+impl Drop for PendingLoginGuard {
+    fn drop(&mut self) {
+        *lock_ignoring_poison(&self.0) = None;
+    }
+}
+
 /// Drives an in-flight `login` RPC command: pushes `login_progress` frames for whatever the flow
 /// needs to show (a URL, a device code, narration), and for the manual-code-paste path, parks on
 /// `pending_code` until a `"submit_code"` command (processed by the same main loop, concurrently —
@@ -6208,6 +6267,34 @@ async fn write_frame(out: &mut tokio::io::Stdout, line: &str) -> std::io::Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_login_guard_resets_the_slot_even_when_the_task_panics() {
+        // Regression: the detached `login` task's `JoinHandle` is discarded (see the `"login"`
+        // dispatch arm), so nothing else can react to a panic inside it — only a `Drop`-based guard
+        // can guarantee `pending_login` gets reset, closing the "every subsequent login hangs behind
+        // 'busy' forever" failure mode. Exercises `PendingLoginGuard` directly rather than the real
+        // `oauth::login` flow, since forcing a genuine panic through that path would need a fake
+        // provider seam this module doesn't otherwise need.
+        let pending_login: Arc<std::sync::Mutex<Option<PendingLogin>>> =
+            Arc::new(std::sync::Mutex::new(Some(PendingLogin {
+                cancel: CancellationToken::new(),
+                pending_code: Arc::new(std::sync::Mutex::new(None)),
+            })));
+        let slot = pending_login.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = PendingLoginGuard(slot.clone());
+            panic!("simulated failure inside the login task");
+        }));
+        assert!(
+            result.is_err(),
+            "the simulated panic should propagate out of catch_unwind"
+        );
+        assert!(
+            lock_ignoring_poison(&pending_login).is_none(),
+            "pending_login must be cleared even though the guarded scope panicked"
+        );
+    }
 
     #[test]
     fn session_stats_reports_no_context_usage_before_any_turn_has_run() {

@@ -498,12 +498,39 @@ impl SettingsStore {
 
 /// Read and parse the store file at `path`, tolerating a missing or unparsable file (all-unset) — shared
 /// by [`SettingsStore::open`] and [`SettingsStore::mutate_locked`], which both need "current on-disk
-/// state, gracefully defaulted."
+/// state, gracefully defaulted." A missing file is the ordinary case (no settings configured yet) and
+/// stays silent; an existing-but-unparsable file (corrupted, hand-edited into invalid JSON, or written
+/// by a newer binary with a field this one doesn't understand) `warn!`s before defaulting — mirrors
+/// [`ModelOverrides::open`]'s identical "skip and warn, don't silently lose data" convention, which this
+/// function used to be the one exception to: silently resetting to all-unset with no diagnostic at all.
+/// That silence was especially costly here, since [`SettingsStore::mutate_locked`] re-reads through
+/// this same function and then *writes back* whatever it returns — a single transient parse failure
+/// during any `agent settings set-*` call could permanently overwrite every previously-configured field
+/// with no warning before or after.
 fn read_store_file(path: &Path) -> Settings {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    let contents = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Settings::default(),
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "could not read settings file, treating it as empty"
+            );
+            return Settings::default();
+        }
+    };
+    match serde_json::from_str(&contents) {
+        Ok(settings) => settings,
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "settings file is not valid JSON, treating it as empty"
+            );
+            Settings::default()
+        }
+    }
 }
 
 fn write_store_file(path: &Path, settings: &Settings) -> std::io::Result<()> {
@@ -1042,6 +1069,29 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = SettingsStore::open(dir.path().join("does-not-exist.json"));
         assert_eq!(store.get(), &Settings::default());
+    }
+
+    #[test]
+    fn a_corrupt_settings_file_warns_and_is_treated_as_empty() {
+        // Regression: `read_store_file` used to silently reset to all-unset on any read/parse
+        // failure, with zero diagnostic — unlike `ModelOverrides::open`'s identical case a few tests
+        // up, which has always warned. Worse, `mutate_locked` re-reads through this same function and
+        // writes back whatever it returns, so a transient parse failure during any `agent settings
+        // set-*` call could permanently overwrite every previously-configured field with no warning
+        // before or after.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, "not valid json at all { [ }").unwrap();
+
+        let capture = crate::tracing_test::capture(|| {
+            let store = SettingsStore::open(path);
+            assert_eq!(store.get(), &Settings::default());
+        });
+        assert!(
+            capture.messages().iter().any(|m| m.contains("settings")),
+            "a corrupt settings file must be logged, not silently swallowed: {:?}",
+            capture.messages()
+        );
     }
 
     #[test]

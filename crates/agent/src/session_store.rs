@@ -2469,7 +2469,10 @@ pub struct TrashEntry {
     pub original_path: String,
 }
 
-/// A directory of session files.
+/// A directory of session files. `Clone` is just a `PathBuf` copy — cheap, and lets a caller move an
+/// owned handle into a `spawn_blocking` closure (see `serve.rs`'s `Persistence::list_with_progress`)
+/// without holding a borrow of the original across the `.await`.
+#[derive(Clone)]
 pub struct SessionRepo {
     dir: PathBuf,
 }

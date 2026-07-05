@@ -81,9 +81,14 @@ impl ToolPolicy {
     /// Deny a `write`/`edit` call whenever its `path` argument matches `pattern` — the same glob
     /// engine `grep`'s `--glob`/`find`'s own pattern matching already use (`globset::Glob`), so a
     /// policy author reaches for one familiar syntax across this whole crate. An unparseable pattern
-    /// is reported and otherwise ignored (never denies anything, rather than the whole process
-    /// refusing to start over one bad `--deny-path` entry) — matching this codebase's general
-    /// crash-recovery posture toward malformed config elsewhere (e.g. a corrupted session line).
+    /// is reported and otherwise ignored by this low-level builder, so a single bad glob can't panic a
+    /// long-running `serve` process mid-`build_agent`-rebuild. This is *not* a safe default for
+    /// CLI/config-facing callers, though: silently dropping the pattern here means the resulting
+    /// policy just has one fewer rule, which for a security control is a fail-open — a typo'd
+    /// `--deny-path` would otherwise leave an operator believing a path is blocked when it plainly
+    /// isn't. Callers building a policy from user-supplied input must call
+    /// [`Self::validate_deny_path_patterns`] first and fail the whole process on `Err`, exactly as
+    /// `main.rs` does for both `run` and `serve` before ever reaching this builder.
     pub fn deny_path(mut self, pattern: impl AsRef<str>) -> Self {
         let pattern = pattern.as_ref();
         match Glob::new(pattern) {
@@ -91,6 +96,17 @@ impl ToolPolicy {
             Err(e) => eprintln!("policy: ignoring invalid --deny-path glob {pattern:?}: {e}"),
         }
         self
+    }
+
+    /// Validate every `--deny-path` glob up front, before any policy is installed or any hook
+    /// decision is made from it. Returns the first unparseable pattern's error so the caller can
+    /// reject the whole invocation rather than silently continuing with that rule dropped — see
+    /// [`Self::deny_path`]'s doc comment for why leniency at this boundary is the wrong default.
+    pub fn validate_deny_path_patterns(deny_path: &[String]) -> Result<(), String> {
+        for pattern in deny_path {
+            Glob::new(pattern).map_err(|e| format!("invalid --deny-path glob {pattern:?}: {e}"))?;
+        }
+        Ok(())
     }
 
     /// Whether this policy would ever actually block anything — a caller builds one unconditionally
@@ -279,11 +295,35 @@ mod tests {
     #[tokio::test]
     async fn an_invalid_deny_path_glob_is_ignored_rather_than_denying_everything() {
         // A malformed `--deny-path` pattern must not silently deny every `write`/`edit` call, nor
-        // crash the process — see `deny_path`'s own doc comment.
+        // crash the process — see `deny_path`'s own doc comment. (The CLI boundary is expected to
+        // reject this input outright before it ever reaches this low-level builder — see
+        // `validate_deny_path_patterns_rejects_an_unparseable_glob` below.)
         let policy = ToolPolicy::new().deny_path("[");
         assert!(
             policy.is_empty(),
             "an unparseable glob must be dropped, not silently kept as a standing deny-all"
+        );
+    }
+
+    #[test]
+    fn validate_deny_path_patterns_rejects_an_unparseable_glob() {
+        let err = ToolPolicy::validate_deny_path_patterns(&["[".to_string()])
+            .expect_err("an unparseable glob must be rejected, not silently accepted");
+        assert!(
+            err.contains("--deny-path"),
+            "error should name the flag: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_deny_path_patterns_accepts_valid_globs_and_an_empty_list() {
+        assert!(ToolPolicy::validate_deny_path_patterns(&[]).is_ok());
+        assert!(
+            ToolPolicy::validate_deny_path_patterns(&[
+                "*.env".to_string(),
+                "**/secrets/**".to_string()
+            ])
+            .is_ok()
         );
     }
 

@@ -15,7 +15,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Default cap on displayed lines. Pairs with the byte cap — whichever bites first wins — so a flood
 /// of short lines can't bury the model even while staying under the byte budget.
@@ -172,6 +172,53 @@ fn random_hex16() -> String {
     x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     x ^= x >> 31;
     format!("{x:016x}")
+}
+
+/// How long a spilled full-output temp file may sit before it's swept away as abandoned. Generous,
+/// and deliberately much larger than `trust_store.rs`'s `STALE_LOCK_AGE`: that constant reclaims a
+/// lock whose owner process almost certainly died (a trust-file write is milliseconds), whereas a
+/// spill file's whole purpose is to let something (the model, in a later turn) come back and read the
+/// complete output well after the tool call that created it returned — see `full_output_path` on
+/// [`OutputSnapshot`]. A day is generous enough that no realistic legitimate reader loses the file out
+/// from under it, while still bounding growth on a long-running unattended agent.
+const STALE_TEMP_FILE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Best-effort delete other `<prefix>-*.log` spill files older than [`STALE_TEMP_FILE_AGE`] from the
+/// system temp directory. Nothing else in this codebase ever deletes a spill file — it's handed back
+/// to the caller specifically so the full output can be read later — so without this sweep, a
+/// long-running unattended agent (this crate's own deployment target) that runs enough truncated bash
+/// commands accumulates one more `.log` file per call, forever. Run from [`ensure_temp_file`] right
+/// before a new one is created: cheap to piggyback on there, and self-limiting since it only runs as
+/// often as commands actually spill. Errors (an unreadable temp dir, a file that vanishes mid-scan,
+/// one this process can't remove) are swallowed — matching this file's existing "cleanup is
+/// best-effort, never fails the caller" convention (see `mark_spill_broken`) — since a missed sweep
+/// just means the next one catches it.
+fn sweep_stale_temp_files(prefix: &str) {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    let want_prefix = format!("{prefix}-");
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(&want_prefix) || !name.ends_with(".log") {
+            continue;
+        }
+        let is_stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .and_then(|modified| {
+                SystemTime::now()
+                    .duration_since(modified)
+                    .map_err(std::io::Error::other)
+            })
+            .is_ok_and(|age| age > STALE_TEMP_FILE_AGE);
+        if is_stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Incrementally accumulates streaming output with bounded memory.
@@ -439,6 +486,9 @@ impl OutputAccumulator {
         if self.spilled || self.spill_failed {
             return;
         }
+        // Sweep abandoned spill files from earlier commands before adding a new one — see
+        // `sweep_stale_temp_files`'s doc comment for why nothing else ever cleans these up.
+        sweep_stale_temp_files(&self.temp_prefix);
         let path =
             std::env::temp_dir().join(format!("{}-{}.log", self.temp_prefix, random_hex16()));
         let mut opts = std::fs::OpenOptions::new();
@@ -810,6 +860,58 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "spill file must be created private");
         }
+    }
+
+    #[test]
+    fn ensure_temp_file_sweeps_stale_siblings_but_leaves_fresh_ones() {
+        // Regression test for the safety-audit finding: nothing in the codebase ever deleted a
+        // spilled full-output temp file, so a long-running unattended agent (this crate's own
+        // deployment target) accumulates one `pi-bash-*.log` per truncated command, forever.
+        // `ensure_temp_file` now sweeps stale siblings (older than `STALE_TEMP_FILE_AGE`) before
+        // creating a new one. A fresh sibling — e.g. one from a command that just finished, whose
+        // `full_output_path` a caller may still legitimately be about to read — must survive.
+        let prefix = "test-stale-sweep";
+        let dir = std::env::temp_dir();
+        let stale_path = dir.join(format!("{prefix}-aaaaaaaaaaaaaaaa.log"));
+        let fresh_path = dir.join(format!("{prefix}-bbbbbbbbbbbbbbbb.log"));
+
+        std::fs::write(&stale_path, b"old full output").unwrap();
+        std::fs::write(&fresh_path, b"recent full output").unwrap();
+
+        // Backdate only the stale file's mtime, well past the sweep's age threshold — mirrors
+        // `trust_store.rs`'s `a_stale_lock_file_is_reclaimed_rather_than_blocking_forever` test,
+        // which backdates the same way via `File::open(..).set_modified(..)`.
+        let long_ago = SystemTime::now() - (STALE_TEMP_FILE_AGE + Duration::from_secs(60));
+        File::open(&stale_path)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+
+        // Drive a real spill under this prefix — the same `append` → `ensure_temp_file` path a
+        // truncated bash command takes — so the sweep is exercised exactly where it runs in
+        // production, not via a direct call to a test-only hook.
+        let mut acc = OutputAccumulator::with_prefix(prefix);
+        for n in 0..300u32 {
+            let mut line = format!("chunk-{n:04}-").into_bytes();
+            line.resize(1023, b'x');
+            line.push(b'\n');
+            acc.append(&line);
+        }
+        acc.finish();
+        let snap = acc.snapshot(true);
+        let new_path = snap.full_output_path.clone().expect("must spill");
+
+        assert!(
+            !stale_path.exists(),
+            "a stale sibling temp file must be swept on the next spill"
+        );
+        assert!(
+            fresh_path.exists(),
+            "a fresh sibling temp file must survive the sweep"
+        );
+
+        let _ = std::fs::remove_file(&fresh_path);
+        let _ = std::fs::remove_file(&new_path);
     }
 
     #[test]
