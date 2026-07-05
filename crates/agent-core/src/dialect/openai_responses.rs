@@ -976,7 +976,18 @@ impl StreamDecoder for Decoder {
                                 );
                             }
                         }
-                        _ => {}
+                        Some(other) => {
+                            // A genuinely new item type (the Responses API has several built-in
+                            // server-side tool items this harness doesn't request today — file/web
+                            // search, code interpreter, computer use, MCP calls) silently dropping the
+                            // whole item with no signal would hide a provider capability change until a
+                            // user notices missing content.
+                            tracing::warn!(
+                                item_type = other,
+                                "unrecognized OpenAI Responses output_item.done item type; dropping"
+                            );
+                        }
+                        None => {}
                     }
                     self.close(&mut out, index);
                 }
@@ -996,7 +1007,18 @@ impl StreamDecoder for Decoder {
                 self.saw_terminal = true;
                 self.failed = Some(failure_message(data));
             }
-            _ => {}
+            // The always-first event of every response, carrying only the (unused) response id — a
+            // real, expected no-op, not worth logging every time it fires.
+            "response.created" => {}
+            other => {
+                // A genuinely new top-level event type (the Responses API has added streaming event
+                // types before, and continues to) silently dropping the whole event with no signal
+                // would hide a provider capability change until a user notices missing content.
+                tracing::warn!(
+                    event_type = other,
+                    "unrecognized OpenAI Responses event type; dropping"
+                );
+            }
         }
         out
     }
@@ -1939,6 +1961,47 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
             events.last(),
             Some(&StreamEvent::MessageStop {
                 stop_reason: StopReason::ToolUse
+            })
+        );
+    }
+
+    #[test]
+    fn unrecognized_item_and_event_types_are_dropped_without_breaking_the_rest_of_the_stream() {
+        // The Responses API has several built-in server-side tool item types this harness doesn't
+        // request today (file/web search, code interpreter, computer use, MCP calls) and has added new
+        // top-level event types before; this simulates one arriving mid-stream — it must be dropped,
+        // not error out or corrupt decoding of the real content around it.
+        const SSE: &str = r#"
+data: {"type":"response.created","response":{"id":"resp_1"}}
+
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"some_future_item_type","id":"x_1"}}
+
+data: {"type":"response.output_text.delta","output_index":0,"delta":"partial"}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"some_future_item_type","id":"x_1"}}
+
+data: {"type":"some_future_top_level_event","whatever":"payload"}
+
+data: {"type":"response.output_item.added","output_index":1,"item":{"type":"message","id":"msg_1"}}
+
+data: {"type":"response.output_text.delta","output_index":1,"delta":"still works"}
+
+data: {"type":"response.output_item.done","output_index":1,"item":{"type":"message","id":"msg_1","content":[{"type":"output_text","text":"still works"}]}}
+
+data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, SSE).unwrap();
+        assert!(
+            events.iter().any(
+                |e| matches!(e, StreamEvent::TextFinal { index: 1, text, .. } if text == "still works")
+            ),
+            "real content around the unrecognized types must still decode: {events:?}"
+        );
+        assert_eq!(
+            events.last(),
+            Some(&StreamEvent::MessageStop {
+                stop_reason: StopReason::EndTurn
             })
         );
     }

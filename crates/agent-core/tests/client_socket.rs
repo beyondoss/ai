@@ -208,6 +208,57 @@ async fn gateway_client_gives_actionable_guidance_on_a_401() {
     );
 }
 
+#[tokio::test]
+async fn gateway_client_bounds_memory_on_an_oversized_error_body() {
+    // A misconfigured proxy or hostile upstream can return an arbitrarily large error page; the
+    // client must stop reading well before the full body arrives instead of buffering it all into
+    // memory ahead of the display truncation. `Content-Length` is set so the body isn't itself framed
+    // as an SSE stream — this exercises the non-2xx error path, not `LineFramer`.
+    const BODY_LEN: usize = 3 * 1024 * 1024; // comfortably over the 1MB read cap
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            let header = format!(
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: {BODY_LEN}\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(&vec![b'x'; BODY_LEN]);
+            let _ = stream.flush();
+        }
+    });
+
+    let client = GatewayClient::new(format!("http://{addr}"), "bai_v1.test").expect("client");
+    let mut stream = client
+        .stream(ModelRequest::new(
+            "claude-opus-4-8",
+            vec![Message::user("hi")],
+            64,
+        ))
+        .await
+        .expect("stream");
+    let first = stream.next().await.expect("an item");
+    let err = first
+        .expect_err("a 403 must surface as a stream error")
+        .to_string();
+
+    // The displayed message is always capped to a few thousand chars; what distinguishes a bounded
+    // read from an unbounded one is the *reported omitted count* — an unbounded read would report
+    // omitting the full ~3MB body, a bounded one only the ~1MB it actually buffered.
+    let omitted: usize = err
+        .rsplit("[truncated ")
+        .next()
+        .and_then(|s| s.split(' ').next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("expected a `[truncated N chars]` marker, got: {err}"));
+    assert!(
+        omitted < 2 * 1024 * 1024,
+        "expected the read to stop well short of the full {BODY_LEN}-byte body, omitted count was {omitted}"
+    );
+}
+
 /// Capture the raw bytes of the first request a one-shot server receives, then answer with a minimal
 /// empty-body SSE response. Returns the shared buffer the caller reads after driving the request.
 fn spawn_request_capturing_server() -> (String, std::sync::Arc<std::sync::Mutex<String>>) {

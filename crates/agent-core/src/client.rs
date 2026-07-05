@@ -585,8 +585,10 @@ impl ModelTransport for GatewayClient {
                         )
                     })
                     .collect();
-                hooks
-                    .after_provider_response(resp.status().as_u16(), &headers)
+                // Same "fails open" treatment every other hook call site gets (see
+                // `before_provider_payload` above): a panicking hook must not unwind through the
+                // in-flight stream it's only supposed to be observing.
+                let _ = catch_tool_panic(hooks.after_provider_response(resp.status().as_u16(), &headers))
                     .await;
             }
 
@@ -941,7 +943,7 @@ async fn send_with_retry(
                     // alone can't tell the two apart. Every other retryable status (408/409/5xx/529) is
                     // a pure infra hiccup, never a billing signal, so it skips this check.
                     if status.as_u16() == 429 {
-                        let detail = resp.text().await.unwrap_or_default();
+                        let detail = read_error_body_capped(resp).await;
                         if is_quota_exhausted(&detail) {
                             // Codex/ChatGPT's own usage-limit body carries a machine code and (often)
                             // a reset time — surface a friendly, human-readable sentence ahead of the
@@ -969,7 +971,7 @@ async fn send_with_retry(
                 // Non-retryable, or out of retries: surface the body so the caller sees *why* — capped,
                 // since an upstream can return an arbitrarily large error page (an HTML error document
                 // from a misconfigured proxy, say) and this ends up in logs and `AgentEvent::Error`.
-                let detail = resp.text().await.unwrap_or_default();
+                let detail = read_error_body_capped(resp).await;
                 // A live 401 (the gateway itself rejected the key, as opposed to `run`/`serve`'s own
                 // preflight "no key given at all" check, which this can't be — a request only reaches
                 // here with *some* key attached) gets a pointed, actionable message naming the actual
@@ -1088,7 +1090,9 @@ fn codex_friendly_usage_limit_message(detail: &str) -> Option<String> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
-            let mins = ((resets_at_secs - now_secs) as f64 / 60.0).round().max(0.0) as i64;
+            let mins = (resets_at_secs.saturating_sub(now_secs) as f64 / 60.0)
+                .round()
+                .max(0.0) as i64;
             format!(" Try again in ~{mins} min.")
         })
         .unwrap_or_default();
@@ -1130,6 +1134,30 @@ fn truncate_error_body(s: &str) -> String {
     format!("{kept}... [truncated {omitted} chars]")
 }
 
+/// Ceiling on bytes read from a non-2xx response body before giving up on it — the same defensive
+/// bound [`crate::dialect::LineFramer`]'s buffer cap applies to the 2xx SSE path, but for the
+/// error-body read: an error page (a misconfigured proxy's HTML, a hostile `Direct`-routed third
+/// party) can be arbitrarily large, and `Response::text()` has no size limit of its own. Comfortably
+/// above [`MAX_ERROR_BODY_CHARS`] (the *displayed* cap after truncation) so any real provider error
+/// body is read in full; this only stops reading once a response has already gone far past anything a
+/// genuine JSON/text error could need.
+const MAX_ERROR_BODY_READ_BYTES: usize = 1024 * 1024;
+
+/// Read a non-2xx response body, stopping at [`MAX_ERROR_BODY_READ_BYTES`] instead of buffering an
+/// unbounded error page into memory. Lossily decoded: this is already a truncated, human-facing error
+/// string (see [`truncate_error_body`]), never data a caller round-trips.
+async fn read_error_body_capped(resp: reqwest::Response) -> String {
+    let mut buf = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while buf.len() < MAX_ERROR_BODY_READ_BYTES {
+        match stream.next().await {
+            Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
+            _ => break,
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 /// Parse a `Retry-After` response header into a duration, capped at `max_backoff`. Checks the
 /// non-standard, millisecond-precision `retry-after-ms` header first — mirrors pi's Codex-specific
 /// `getRetryAfterDelayMs` (`openai-codex-responses.ts:130-137`), which checks it before falling back to
@@ -1165,7 +1193,11 @@ fn parse_retry_after_ms(raw: &str, max_backoff: Duration) -> Option<Duration> {
     if !millis.is_finite() {
         return None;
     }
-    Some(Duration::from_secs_f64(millis.max(0.0) / 1000.0).min(max_backoff))
+    // Clamp to `max_backoff` *before* converting: `Duration::from_secs_f64` panics if the seconds
+    // value doesn't fit a `Duration` (e.g. a header carrying `1e25`), so the value handed to it must
+    // already be bounded — clamping the resulting `Duration` afterward, as this used to, is too late.
+    let secs = (millis.max(0.0) / 1000.0).min(max_backoff.as_secs_f64());
+    Some(Duration::from_secs_f64(secs))
 }
 
 /// Parse a `Retry-After` header *value* into a wait, capped at `max_backoff`. RFC 7231 allows two
@@ -1429,6 +1461,16 @@ mod tests {
     }
 
     #[test]
+    fn codex_friendly_usage_limit_message_does_not_panic_on_an_out_of_range_resets_at() {
+        // A provider/proxy can send an arbitrary `resets_at` — subtracting it from "now" with a raw
+        // `-` would panic on underflow (`overflow-checks = true` in the release profile) for a value
+        // this far out of range; `saturating_sub` must be used instead.
+        let body = r#"{"error":{"code":"usage_limit_reached","resets_at":-9223372036854775808}}"#;
+        let msg = codex_friendly_usage_limit_message(body).expect("should still match the shape");
+        assert!(msg.starts_with("You have hit your ChatGPT usage limit."));
+    }
+
+    #[test]
     fn backoff_is_exponential_and_capped() {
         assert_eq!(backoff(0, None, BASE_BACKOFF, MAX_BACKOFF), BASE_BACKOFF);
         assert_eq!(
@@ -1562,6 +1604,18 @@ mod tests {
         // Non-finite (`NaN`/`Infinity` both parse as valid `f64` but must still be rejected).
         assert_eq!(parse_retry_after_ms("NaN", MAX_BACKOFF), None);
         assert_eq!(parse_retry_after_ms("inf", MAX_BACKOFF), None);
+    }
+
+    #[test]
+    fn parse_retry_after_ms_does_not_panic_on_an_astronomically_large_value() {
+        // `Duration::from_secs_f64` panics if the seconds value doesn't fit a `Duration` — a header
+        // carrying a value like `1e25` (finite, so it passes the `is_finite` check) must be clamped to
+        // `max_backoff` *before* the conversion, not after.
+        assert_eq!(parse_retry_after_ms("1e25", MAX_BACKOFF), Some(MAX_BACKOFF));
+        assert_eq!(
+            parse_retry_after_ms(&f64::MAX.to_string(), MAX_BACKOFF),
+            Some(MAX_BACKOFF)
+        );
     }
 
     #[test]
@@ -1964,6 +2018,56 @@ mod tests {
         assert!(
             !request.contains("_partial"),
             "a panicking hook's partial mutation must never reach the wire, got:\n{request}"
+        );
+    }
+
+    /// A panicking `after_provider_response` hook must not unwind through the in-flight stream it's
+    /// only supposed to be observing — same "fails open" convention every other hook call site uses
+    /// (see the sibling `before_provider_payload` test above). The response must still decode to
+    /// completion; only the hook's own panic is contained.
+    #[tokio::test]
+    async fn a_panicking_after_provider_response_hook_does_not_crash_the_stream() {
+        struct AlwaysPanics;
+        #[async_trait]
+        impl AgentHooks for AlwaysPanics {
+            async fn after_provider_response(&self, _status: u16, _headers: &[(String, String)]) {
+                panic!("boom: after_provider_response always panics");
+            }
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf).unwrap_or(0);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
+                      event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n\
+                      event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                )
+                .unwrap();
+            stream.flush().unwrap();
+        });
+
+        let hooks = Arc::new(AlwaysPanics);
+        let client = GatewayClient::new(format!("http://{addr}"), "test-key")
+            .unwrap()
+            .with_hooks(hooks);
+        let req = ModelRequest::new("claude-test", Vec::new(), 100);
+        let mut events = client.stream(req).await.unwrap();
+        let mut saw_event = false;
+        while let Some(ev) = events.next().await {
+            assert!(ev.is_ok(), "unexpected stream error: {ev:?}");
+            saw_event = true;
+        }
+        server.join().unwrap();
+
+        assert!(
+            saw_event,
+            "the stream must still decode to completion despite the panicking hook"
         );
     }
 

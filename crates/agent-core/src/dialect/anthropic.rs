@@ -735,7 +735,12 @@ impl StreamDecoder for Decoder {
                 vec![StreamEvent::MessageStart]
             }
             "content_block_start" => {
-                let index = usize_at(Some(data), "index");
+                let Some(index) = usize_at(Some(data), "index") else {
+                    tracing::warn!(
+                        "dropping Anthropic content_block_start event: missing/malformed index"
+                    );
+                    return Vec::new();
+                };
                 let block = data.get("content_block");
                 match block.and_then(|b| b.get("type")).and_then(Value::as_str) {
                     Some("tool_use") => {
@@ -758,11 +763,28 @@ impl StreamDecoder for Decoder {
                         data: str_at(block, "data").to_string(),
                     }],
                     // Text and (clear) thinking blocks open empty and accrue via deltas — no event.
-                    _ => Vec::new(),
+                    Some("text") | Some("thinking") => Vec::new(),
+                    Some(other) => {
+                        // A genuinely new content-block type (Anthropic has added several over time —
+                        // `server_tool_use`, `web_search_tool_result`, `mcp_tool_result`) silently
+                        // dropping the whole block with no signal would hide a provider capability
+                        // change until a user notices missing content.
+                        tracing::warn!(
+                            block_type = other,
+                            "unrecognized Anthropic content_block_start type; dropping block"
+                        );
+                        Vec::new()
+                    }
+                    None => Vec::new(),
                 }
             }
             "content_block_delta" => {
-                let index = usize_at(Some(data), "index");
+                let Some(index) = usize_at(Some(data), "index") else {
+                    tracing::warn!(
+                        "dropping Anthropic content_block_delta event: missing/malformed index"
+                    );
+                    return Vec::new();
+                };
                 let delta = data.get("delta");
                 match delta.and_then(|d| d.get("type")).and_then(Value::as_str) {
                     Some("text_delta") => {
@@ -789,12 +811,25 @@ impl StreamDecoder for Decoder {
                             partial_json: str_at(delta, "partial_json").to_string(),
                         }]
                     }
-                    _ => Vec::new(),
+                    Some(other) => {
+                        tracing::warn!(
+                            delta_type = other,
+                            "unrecognized Anthropic content_block_delta type; dropping delta"
+                        );
+                        Vec::new()
+                    }
+                    None => Vec::new(),
                 }
             }
-            "content_block_stop" => vec![StreamEvent::ContentBlockStop {
-                index: usize_at(Some(data), "index"),
-            }],
+            "content_block_stop" => match usize_at(Some(data), "index") {
+                Some(index) => vec![StreamEvent::ContentBlockStop { index }],
+                None => {
+                    tracing::warn!(
+                        "dropping Anthropic content_block_stop event: missing/malformed index"
+                    );
+                    Vec::new()
+                }
+            },
             "message_delta" => {
                 let delta = data.get("delta");
                 self.stop_reason = map_stop_reason(
@@ -870,7 +905,21 @@ impl StreamDecoder for Decoder {
                     },
                 ]
             }
-            _ => Vec::new(),
+            // A real, frequent no-op: Anthropic sends a periodic `ping` keepalive on a long-running
+            // stream — expected, not worth logging every time it fires.
+            "ping" => Vec::new(),
+            other => {
+                // Anthropic adding a new top-level SSE event type (this crate doesn't request any of
+                // the server-side tool capabilities that would trigger one today, but both providers
+                // have added streaming event types before) would otherwise silently drop that event's
+                // entire content with no signal — unlike `stop_reason`'s own unrecognized-value
+                // handling above, which does warn.
+                tracing::warn!(
+                    event_type = other,
+                    "unrecognized Anthropic SSE event type; dropping"
+                );
+                Vec::new()
+            }
         }
     }
 
@@ -916,11 +965,16 @@ fn u32_at(v: Option<&Value>, key: &str) -> u32 {
 /// Anthropic's own `content_block_start`/`_delta`/`_stop` all carry a real `index` — read it straight
 /// through rather than discarding it, so genuinely interleaved blocks (should Anthropic ever deliver
 /// them; not observed in practice today, but the wire already carries the field) accumulate correctly
-/// instead of relying on an assumption of strict sequential delivery.
-fn usize_at(v: Option<&Value>, key: &str) -> usize {
+/// instead of relying on an assumption of strict sequential delivery. `None` on a missing or
+/// non-numeric `index` (a malformed event, or an intermediary that mangled it) — never defaulted to
+/// `0`: that's a real, commonly-open index in a parallel-tool-call turn, so silently defaulting to it
+/// would misattribute this event's content into whichever block happens to occupy slot 0 instead of
+/// dropping the malformed event, matching how `dialect::openai`'s own index-ambiguity handling drops
+/// rather than guesses.
+fn usize_at(v: Option<&Value>, key: &str) -> Option<usize> {
     v.and_then(|v| v.get(key))
         .and_then(Value::as_u64)
-        .unwrap_or(0) as usize
+        .map(|n| n as usize)
 }
 
 #[cfg(test)]
@@ -1405,6 +1459,106 @@ data: {"type":"message_stop"}
                 },
             ]
         );
+    }
+
+    #[test]
+    fn content_block_delta_with_missing_index_is_dropped_not_misattributed_to_index_0() {
+        // Anthropic always sends `index` on every content_block_delta — this simulates a malformed or
+        // relay-corrupted event (a misbehaving gateway sitting in front of the real API) that drops
+        // it. Before the fix, a missing/malformed index silently defaulted to 0, corrupting whichever
+        // real block happened to occupy that slot; now the malformed event must be dropped instead.
+        const SSE: &str = r#"
+event: message_start
+data: {"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"read"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"a\":1}"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_stop
+data: {"type":"message_stop"}
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, SSE).unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::InputJsonDelta { .. })),
+            "a delta with no index must be dropped, not misattributed to block 0: {events:?}"
+        );
+    }
+
+    #[test]
+    fn content_block_start_with_a_non_numeric_index_is_dropped() {
+        const SSE: &str = r#"
+event: message_start
+data: {"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":"not-a-number","content_block":{"type":"tool_use","id":"toolu_1","name":"read"}}
+
+event: message_stop
+data: {"type":"message_stop"}
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, SSE).unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::ToolUseStart { .. })),
+            "a content_block_start with a malformed index must be dropped: {events:?}"
+        );
+    }
+
+    #[test]
+    fn unrecognized_event_and_block_types_are_dropped_without_breaking_the_rest_of_the_stream() {
+        // Anthropic has added new content-block/delta/event types before (`server_tool_use`,
+        // `web_search_tool_result`, `mcp_tool_result`); this simulates a not-yet-supported one arriving
+        // mid-stream — it must be dropped, not error out or corrupt decoding of the real content
+        // around it.
+        const SSE: &str = r#"
+event: message_start
+data: {"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"some_future_block_type"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"some_future_delta_type"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: some_future_event
+data: {"type":"some_future_event_type","whatever":"payload"}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"still works"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+event: message_stop
+data: {"type":"message_stop"}
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, SSE).unwrap();
+        assert!(
+            events.contains(&StreamEvent::TextDelta {
+                index: 1,
+                text: "still works".into()
+            }),
+            "real content around the unrecognized types must still decode: {events:?}"
+        );
+        assert!(matches!(events.last(), Some(StreamEvent::MessageStop { .. })));
     }
 
     #[test]

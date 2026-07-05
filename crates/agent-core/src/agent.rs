@@ -792,10 +792,15 @@ impl Agent {
 
             // Proactive compaction: once the live prompt crosses the threshold, summarize the prefix
             // before building the next request so the run never walks into the context wall. A
-            // failure here is reported, not propagated — see `compact_or_report`'s doc comment.
+            // failure here is reported, not propagated — see `compact_or_report`'s doc comment. A
+            // cancellation is routed through `finish_compaction` rather than a bare `?`, so it gets the
+            // same session/steering cleanup every other cancellation exit in this loop uses instead of
+            // leaving the session on a dangling `user` turn (see `cancel_run`'s doc comment).
             if self.compaction.enabled && compaction::should_compact(session, &self.compaction) {
-                self.compact_or_report(session, CompactionReason::Threshold, &cancel, &mut sink)
-                    .await?;
+                let result = self
+                    .compact_or_report(session, CompactionReason::Threshold, &cancel, &mut sink)
+                    .await;
+                finish_compaction(result, session, &current_model, &steering)?;
             } else if !self.compaction.enabled
                 && compaction::is_hard_overflow(
                     session,
@@ -810,8 +815,10 @@ impl Agent {
                 // requests that are already guaranteed to overflow. See `is_hard_overflow`'s doc
                 // comment for why this bypasses the `enabled` gate but the threshold check above
                 // doesn't.
-                self.compact_or_report(session, CompactionReason::Overflow, &cancel, &mut sink)
-                    .await?;
+                let result = self
+                    .compact_or_report(session, CompactionReason::Overflow, &cancel, &mut sink)
+                    .await;
+                finish_compaction(result, session, &current_model, &steering)?;
             }
 
             sink(AgentEvent::TurnStart {
@@ -864,9 +871,7 @@ impl Agent {
                 // turn-commit path below), so the session needs the same closing-out `run_turn`'s
                 // sibling paths give a mid-stream abort.
                 Err(Error::Cancelled) => {
-                    close_out_pending_cancellation(session, &current_model);
-                    steering.clear_run_scoped();
-                    return Err(Error::Cancelled);
+                    return Err(cancel_run(session, &current_model, &steering));
                 }
                 // The provider rejected the request for exceeding its context window. Compact once and
                 // retry the same turn; if it still overflows (or there's nothing to compact), give up.
@@ -892,17 +897,19 @@ impl Agent {
                             session.push(Message::error(e.to_string()));
                             return Err(e);
                         }
+                        // A cancellation is left exactly as-is: the user asked to stop, that's not a
+                        // compaction failure to explain — route it through the same session/steering
+                        // cleanup every other cancellation exit in this loop uses (see `cancel_run`'s
+                        // doc comment), rather than reporting it as an `AgentEvent::Error`.
+                        Err(Error::Cancelled) => {
+                            return Err(cancel_run(session, &current_model, &steering));
+                        }
                         // The recovery compaction itself failed (e.g. the summarization call errored)
                         // — surface a curated message, not the raw underlying failure, matching pi's
                         // own `_runAutoCompaction` catch block ("Context overflow recovery failed:
-                        // {error}"). A cancellation is left exactly as-is: the user asked to stop,
-                        // that's not a compaction failure to explain.
+                        // {error}").
                         Err(compact_err) => {
-                            let message = if matches!(compact_err, Error::Cancelled) {
-                                compact_err.to_string()
-                            } else {
-                                format!("Context overflow recovery failed: {compact_err}")
-                            };
+                            let message = format!("Context overflow recovery failed: {compact_err}");
                             sink(AgentEvent::Error {
                                 message: message.clone(),
                             });
@@ -1102,6 +1109,13 @@ impl Agent {
                             // Nothing worth compacting (already at a clean, minimal boundary) — the
                             // truncated response is the best available answer; fall through and report
                             // it normally rather than silently discarding it with nothing to replace it.
+                        }
+                        // The user asked to stop — surface it as the documented `Error::Cancelled`
+                        // contract every other cancellation exit in this loop honors (see `cancel_run`'s
+                        // doc comment), not as a `CompactionFailed` event falling through to an ordinary
+                        // `Ok(())` completion, which would silently swallow the cancellation.
+                        Err(Error::Cancelled) => {
+                            return Err(cancel_run(session, &current_model, &steering));
                         }
                         Err(e) => {
                             // The recovery attempt itself failed (e.g. the summarization call errored) —
@@ -2467,6 +2481,38 @@ fn close_out_pending_cancellation(session: &mut Session, model: &str) {
                 .with_aborted(),
         );
     }
+}
+
+/// The cancellation exit every path in `run_events_steered` that can observe `Error::Cancelled`
+/// mid-loop must use: closes the session on a clean `aborted` record ([`close_out_pending_cancellation`])
+/// and clears the steer/follow-up/switch state scoped to this run ([`Steering::clear_run_scoped`]).
+/// A cancellation racing a mid-loop `compact()` call used to skip both — leaving the session on a
+/// dangling `user` turn (a shape no dialect accepts) and leaking stale steering state into whatever
+/// run reuses this `Steering` handle next — because only the direct turn-cancellation arm called
+/// this pair; every `compact()`/`compact_or_report()` call site needs the same treatment.
+fn cancel_run(session: &mut Session, model: &str, steering: &Steering) -> Error {
+    close_out_pending_cancellation(session, model);
+    steering.clear_run_scoped();
+    Error::Cancelled
+}
+
+/// Route a `compact()`/`compact_or_report()` result through [`cancel_run`] when it's a cancellation,
+/// so the caller's `?` can't silently propagate `Error::Cancelled` past the session/steering cleanup
+/// every other cancellation exit in this loop performs. A non-cancellation error passes through
+/// untouched.
+fn finish_compaction<T>(
+    result: Result<T>,
+    session: &mut Session,
+    model: &str,
+    steering: &Steering,
+) -> Result<T> {
+    result.map_err(|e| {
+        if matches!(e, Error::Cancelled) {
+            cancel_run(session, model, steering)
+        } else {
+            e
+        }
+    })
 }
 
 /// Synthesize an error `tool_result` for every call whose group never finished (dispatch was
@@ -4019,6 +4065,88 @@ mod tests {
                 .last()
                 .and_then(|m| m.error_message.as_deref()),
             Some(error_messages[0].as_str())
+        );
+    }
+
+    /// Regression: a cancellation racing the *recovery* `compact()` call inside the
+    /// MaxTokens-silent-truncation path (`turn.stop_reason == StopReason::MaxTokens`, no tool calls)
+    /// used to fall through and treat `Error::Cancelled` exactly like an ordinary failed recompaction
+    /// attempt — reporting a non-terminal `CompactionFailed` event and continuing on to checkpoint and
+    /// `drain_at_stop()`, which (with nothing queued there) returned `Ok(())` for what should have been
+    /// a cancelled run, breaking the documented "returns `Error::Cancelled` once cancelled" contract
+    /// every other caller relies on for whole-run retry exclusion.
+    #[tokio::test]
+    async fn cancellation_during_max_tokens_recovery_compaction_surfaces_as_cancelled_not_ok() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct MaxTokensThenStalledCompaction {
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl ModelTransport for MaxTokensThenStalledCompaction {
+            async fn stream(&self, _req: ModelRequest) -> Result<crate::transport::EventStream> {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    // The live turn: cut off by max_tokens, no tool calls — the silent-truncation
+                    // recovery path this test targets.
+                    let s = futures::stream::iter(vec![
+                        Ok(StreamEvent::MessageStart),
+                        Ok(StreamEvent::TextDelta {
+                            index: 0,
+                            text: "cut off".into(),
+                        }),
+                        Ok(StreamEvent::ContentBlockStop { index: 0 }),
+                        Ok(StreamEvent::MessageStop {
+                            stop_reason: StopReason::MaxTokens,
+                        }),
+                    ]);
+                    Ok(Box::pin(s))
+                } else {
+                    // The recovery compaction's own summarization call — hangs forever so the test
+                    // can fire cancellation while it's in flight.
+                    Ok(Box::pin(futures::stream::pending()))
+                }
+            }
+        }
+
+        let session_messages = vec![
+            Message::user("first request"),
+            Message::assistant(vec![ContentBlock::text("first done")]),
+            Message::user("second request"),
+            Message::assistant(vec![ContentBlock::text("second done")]),
+            Message::user("third request, the one that gets cut off"),
+        ];
+        let mut session = Session::new();
+        session.messages = Arc::new(session_messages);
+
+        let transport = Arc::new(MaxTokensThenStalledCompaction {
+            calls: AtomicUsize::new(0),
+        });
+        let agent = Agent::new(transport, "claude-opus-4-8").with_compaction(CompactionConfig {
+            // Trivially trips `is_hard_overflow` on a `MaxTokens` stop regardless of live prompt size.
+            context_window: 10,
+            keep_recent_tokens: 1,
+            ..CompactionConfig::default()
+        });
+
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            trigger.cancel();
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            agent.run_events_cancellable(&mut session, |_| {}, cancel),
+        )
+        .await
+        .expect("cancellation must interrupt the stalled recovery compaction");
+
+        assert!(
+            matches!(result, Err(Error::Cancelled)),
+            "a cancellation racing the MaxTokens recovery compaction must surface as \
+             Error::Cancelled, not silently succeed with Ok(()), got: {result:?}"
         );
     }
 
