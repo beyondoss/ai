@@ -1392,6 +1392,7 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
                 model_id: None,
                 error_message: None,
                 aborted: false,
+                usage: None,
             }],
             64,
         );

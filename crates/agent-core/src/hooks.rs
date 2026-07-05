@@ -139,6 +139,31 @@ pub trait AgentHooks: Send + Sync {
     ) -> crate::message::Message {
         message
     }
+
+    /// Called immediately before a provider request is sent, once per attempt (including every
+    /// mid-stream retry — see `Agent::run_turn`), with the fully-built request. The seam a host uses to
+    /// inject a per-request header's *logical* equivalent at this layer (a stop sequence, a sampling
+    /// tweak — an actual wire header belongs in [`crate::client::GatewayClient::with_extra_headers`],
+    /// one layer below where a `ModelRequest` even exists), or otherwise patch what's about to be sent
+    /// before `client.rs` builds the dialect-specific wire body from it. Mirrors pi's
+    /// `beforeProviderRequest` (`agent-harness.ts:251-320`). Mutates `req` in place; defaults to a
+    /// no-op. A panicking hook has its (possibly partial) mutation discarded — the loop falls back to
+    /// the request exactly as it was before this call, the same "fails open" convention
+    /// [`on_assistant_message`](Self::on_assistant_message) uses.
+    async fn before_provider_request(&self, _req: &mut crate::transport::ModelRequest) {}
+
+    /// Called once a provider response's raw HTTP status and headers are known, before its body starts
+    /// streaming — pi's `afterProviderResponse` (`agent-harness.ts:321-385`). Read-only observability
+    /// (a host logging rate-limit headers, say): the response is already normalized into `StreamEvent`s
+    /// the loop consumes directly, so this isn't a rewrite seam the way [`after_tool_call`]
+    /// (Self::after_tool_call) is. `headers` is `(name, value)` pairs in wire order, a plain,
+    /// transport-agnostic shape rather than a `reqwest`-specific type — this hook stays implementable
+    /// without any implementor depending on `reqwest`, matching
+    /// [`crate::transport::ModelTransport`]'s own "the loop never depends on reqwest" contract. Called
+    /// from [`crate::client::GatewayClient::stream`] specifically (the one transport that actually talks
+    /// HTTP) rather than from the loop itself — a `MockTransport`-driven test never fires this, since
+    /// there is no real response to report. Defaults to a no-op.
+    async fn after_provider_response(&self, _status: u16, _headers: &[(String, String)]) {}
 }
 
 /// The default: every hook is a no-op. Used when no hooks are configured.
@@ -240,6 +265,61 @@ mod tests {
         )]);
         let unchanged = h.on_assistant_message(msg.clone(), &session, &cancel).await;
         assert_eq!(unchanged, msg);
+
+        // Task #14 (pi-parity): the default provider-request/response pair must be true no-ops too —
+        // `before_provider_request` leaves `req` untouched, `after_provider_response` does nothing
+        // observable (it has no return value to assert on; just confirm it doesn't panic/block).
+        let mut req = crate::transport::ModelRequest::new("claude-test", Vec::new(), 100);
+        let before = req.clone();
+        h.before_provider_request(&mut req).await;
+        assert_eq!(req.model, before.model);
+        assert_eq!(req.system, before.system);
+        h.after_provider_response(200, &[("x-test".to_string(), "1".to_string())])
+            .await;
+    }
+
+    struct InjectsHeaderNote;
+    #[async_trait]
+    impl AgentHooks for InjectsHeaderNote {
+        async fn before_provider_request(&self, req: &mut crate::transport::ModelRequest) {
+            req.system = Some(format!(
+                "{} [patched]",
+                req.system.clone().unwrap_or_default()
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn before_provider_request_hook_can_patch_the_outgoing_request() {
+        let hooks = InjectsHeaderNote;
+        let mut req = crate::transport::ModelRequest::new("claude-test", Vec::new(), 100)
+            .with_system("base prompt");
+        hooks.before_provider_request(&mut req).await;
+        assert_eq!(req.system.as_deref(), Some("base prompt [patched]"));
+    }
+
+    type SeenResponse = (u16, Vec<(String, String)>);
+    struct RecordsResponseMeta {
+        seen: std::sync::Mutex<Option<SeenResponse>>,
+    }
+    #[async_trait]
+    impl AgentHooks for RecordsResponseMeta {
+        async fn after_provider_response(&self, status: u16, headers: &[(String, String)]) {
+            *self.seen.lock().unwrap() = Some((status, headers.to_vec()));
+        }
+    }
+
+    #[tokio::test]
+    async fn after_provider_response_hook_observes_status_and_headers() {
+        let hooks = RecordsResponseMeta {
+            seen: std::sync::Mutex::new(None),
+        };
+        hooks
+            .after_provider_response(429, &[("retry-after".to_string(), "2".to_string())])
+            .await;
+        let seen = hooks.seen.lock().unwrap().clone().expect("must be set");
+        assert_eq!(seen.0, 429);
+        assert_eq!(seen.1, vec![("retry-after".to_string(), "2".to_string())]);
     }
 
     struct RedactSecrets;

@@ -488,6 +488,16 @@ fn mark_eager_tool_streaming(tools: &mut Value) {
 }
 
 /// Stamp a cache breakpoint onto the last tool definition.
+///
+/// pi-parity note (Task #30, checked and closed as a non-issue): pi gates this per-model via
+/// `compat.supportsCacheControlOnTools` (`anthropic-messages.ts:177`, default `true`). This dialect
+/// stamps unconditionally instead. That's safe today because every id this dialect's `build_body` ever
+/// serves is a `claude`/`fable` id (`Dialect::for_model` in `dialect/mod.rs` only routes those two
+/// prefixes here) — and no entry in `models::capabilities`'s Anthropic branches needs this disabled;
+/// pi's own catalogue only sets it `false` for Fireworks-hosted DeepSeek-on-Anthropic-wire, a
+/// provider/model pair this crate doesn't (and, per `Dialect::for_model`'s current routing, can't)
+/// reach through this dialect. Revisit if a future model reachable here ever needs it off — don't add
+/// a `ModelCaps` flag for it until then.
 fn mark_last_tool(tools: &mut Value, cc: &Value) {
     if let Some(tool) = tools
         .as_array_mut()
@@ -1495,6 +1505,7 @@ data: {"type":"message_stop"}
                 model_id: None,
                 error_message: None,
                 aborted: false,
+                usage: None,
             }],
             256,
         )

@@ -95,8 +95,22 @@ byo_rate_limit_rps = 1000
 # minimax = "anthropic"       # "openai" (default) | "anthropic"
 # fireworks-anthropic = "anthropic"
 # [provider_auth_schemes]
-# minimax = "x-api-key"       # "bearer" (default) | "x-api-key"
+# minimax = "x-api-key"       # "bearer" (default) | "x-api-key" | "api-key"
 # fireworks-anthropic = "x-api-key"
+
+# Azure OpenAI (Task #8, pi-parity): a per-resource host — never a KNOWN_PROVIDERS row (see
+# route::AuthScheme's doc comment) — added the same way as any other config-only provider, with
+# `provider_auth_schemes.azure = "api-key"` for Azure's bare-key `api-key` header (no `Bearer`
+# prefix; see pi's `packages/ai/src/api/azure-openai-responses.ts`, whose `AzureOpenAI` SDK client
+# always authenticates this way). The client reaches it at `/azure/openai/v1/…` — Azure's current
+# unified "v1" API surface (`https://{resource}.openai.azure.com/openai/v1/responses`, model id =
+# the deployment name) — forwarded verbatim, same as every other provider here.
+# [provider_authorities]
+# azure = "my-resource.openai.azure.com:443"
+# [provider_auth_schemes]
+# azure = "api-key"
+# [pool_keys]
+# azure = "<azure-api-key>"          # or AI_POOL_KEY_AZURE in production
 
 # Example: Fireworks' KNOWN_PROVIDERS row is fixed at OpenAI-dialect + Bearer for its
 # `/inference/v1/chat/completions` endpoint (docs: https://docs.fireworks.ai/tools-sdks/openai-compatibility) —

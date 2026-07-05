@@ -92,7 +92,7 @@ fn build_providers(config: &AiConfig, metrics: &Metrics) -> Result<HashMap<Strin
                 Some(s) => AuthScheme::parse_config(s).ok_or_else(|| {
                     GatewayError::Config(format!(
                         "provider_auth_schemes.{name} = {s:?} is not a recognized auth scheme \
-                         (expected \"bearer\" or \"x-api-key\")"
+                         (expected \"bearer\", \"x-api-key\", or \"api-key\")"
                     ))
                 })?,
                 None => AuthScheme::Bearer,

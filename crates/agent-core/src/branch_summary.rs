@@ -413,6 +413,31 @@ mod tests {
     }
 
     #[test]
+    fn branch_summary_request_does_not_count_ls_as_a_read_file() {
+        // Task #31 (pi-parity fix): `branch_summary_request` reuses `compaction::extract_file_ops`
+        // unchanged (see this module's own doc comment) — verifies the fix (dropping `ls` from the
+        // read bucket) actually reaches this call site too, not just `compaction.rs`'s own tests.
+        let messages = vec![
+            Message::user("look around"),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "1",
+                "ls",
+                json!({ "path": "src/" }),
+            )]),
+            Message::tool_result("1", "foo.rs\nbar.rs", false),
+            Message::assistant(vec![ContentBlock::text("just browsing, nothing to summarize")]),
+        ];
+        let req = branch_summary_request("claude-test", &messages, 512, 100_000, None, false);
+        let ContentBlock::Text { text, .. } = &req.messages[0].content[0] else {
+            panic!("expected text");
+        };
+        assert!(
+            !text.contains("<read-files>"),
+            "an `ls`-only branch must not surface a <read-files> tag at all: {text}"
+        );
+    }
+
+    #[test]
     fn branch_summary_request_appends_custom_instructions_as_additional_focus() {
         // Matches pi's own `generateSummary`/`compaction::summary_request`: "Additional focus:
         // {customInstructions}" appended after the structured instruction template, not replacing it.

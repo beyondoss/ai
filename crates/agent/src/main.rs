@@ -146,6 +146,23 @@ fn parse_reasoning_effort(s: &str) -> Result<agent_core::ReasoningEffort, String
     }
 }
 
+/// Parse `settings::Settings::thinking_budget_overrides`'s plain-string keys into the
+/// `agent_core::ReasoningEffort`-keyed table `agent_core::models::budget_for_effort_with_override`
+/// needs (Task #36, pi-parity feature) — an unrecognized key (a hand-edited typo in `settings.json`) is
+/// skipped rather than failing the whole lookup, matching this crate's usual "corrupt/unknown persisted
+/// value degrades to not-set" convention (see `default_reasoning_effort`'s identical precedent above).
+/// `None` when no table is configured at all, or every entry in it was unrecognized.
+fn resolve_thinking_budget_overrides(
+    settings: &beyond_ai_agent::settings::Settings,
+) -> Option<std::collections::HashMap<agent_core::ReasoningEffort, u32>> {
+    let table = settings.thinking_budget_overrides.as_ref()?;
+    let map: std::collections::HashMap<agent_core::ReasoningEffort, u32> = table
+        .iter()
+        .filter_map(|(k, v)| parse_reasoning_effort(k).ok().map(|effort| (effort, *v)))
+        .collect();
+    (!map.is_empty()).then_some(map)
+}
+
 /// The one further fallback tier below `--key`/`AI_AGENT_KEY`: an inferred, stored OAuth
 /// subscription login for whichever provider `model` implies. Consulted only when no explicit
 /// key/env var was given — an explicit `--key`/`AI_AGENT_KEY` always wins outright, unchanged.
@@ -260,11 +277,10 @@ fn resolve_gateway_credential(
     if let Some(over) = beyond_ai_agent::settings::ModelOverrides::open_default().get(model) {
         if let Some(base_url) = over.base_url.clone() {
             let dialect = agent_core::dialect::Dialect::for_model(model);
-            let bearer = over
-                .api_key
-                .clone()
-                .or_else(|| key.clone())
-                .unwrap_or_default();
+            // Task #11 (pi-parity feature): resolved through `!command`/`$VAR`/literal syntax (see
+            // `ModelOverride::resolved_api_key`'s own doc comment) rather than used as a raw literal —
+            // lets an operator avoid storing a plaintext secret in `models.json`.
+            let bearer = over.resolved_api_key(key.as_deref());
             let routing = agent_core::client::DirectRouting {
                 route: agent_core::client::RouteOverride::Direct {
                     base_url,
@@ -272,6 +288,12 @@ fn resolve_gateway_credential(
                 },
                 static_headers: Vec::new(),
                 copilot_dynamic_headers: false,
+                // Task #8 (pi-parity: Azure OpenAI routing support) — an operator-configured
+                // `auth_header` (e.g. `"api-key"` for Azure) sends `bearer` through that named header
+                // and omits `Authorization` entirely, instead of leaking a Bearer-shaped credential
+                // (or, worse, a silent fallback to the gateway's own virtual key) to an endpoint that
+                // doesn't want it.
+                auth_header: over.auth_header.clone(),
             };
             return Ok(serve::GatewayCredential::Oauth(Arc::new(
                 StaticDirectCredentialSource { bearer, routing },
@@ -315,6 +337,7 @@ fn resolve_gateway_credential(
                         ("OpenAI-Beta", "responses=experimental".to_string()),
                     ],
                     copilot_dynamic_headers: false,
+                    auth_header: None,
                 };
                 return Ok(serve::GatewayCredential::Oauth(Arc::new(
                     DirectRoutedCredentialSource {
@@ -347,6 +370,7 @@ fn resolve_gateway_credential(
                         .map(|(name, value)| (*name, value.to_string()))
                         .collect(),
                     copilot_dynamic_headers: true,
+                    auth_header: None,
                 };
                 return Ok(serve::GatewayCredential::Oauth(Arc::new(
                     DirectRoutedCredentialSource {
@@ -362,6 +386,21 @@ fn resolve_gateway_credential(
         "no gateway key: pass --key or set AI_AGENT_KEY (a bai_v1… virtual key), or run `agent login \
          <provider>` to use a subscription for model {model:?}"
     ))
+}
+
+/// The extra per-request headers a `models.json` override configures for this model id, if any (Task
+/// #11 pi-parity feature) — resolved via `settings::ModelOverride::resolved_headers` and merged onto
+/// the gateway client via `GatewayClient::with_extra_headers`. A separate lookup from
+/// `resolve_gateway_credential` (which only ever returns a bearer-token-shaped credential): `headers`
+/// is a client-level concern (merged onto every request regardless of dialect/routing), not a
+/// `CredentialSource` one, and applies independently of whether the same override also names a
+/// `base_url` — a header-only override (Azure's `api-key:` header, a custom proxy header) still routes
+/// through the gateway as usual, just with these headers merged on top.
+fn model_override_extra_headers(model: &str) -> std::collections::HashMap<String, String> {
+    beyond_ai_agent::settings::ModelOverrides::open_default()
+        .get(model)
+        .map(|over| over.resolved_headers())
+        .unwrap_or_default()
 }
 
 fn unknown_provider_error(provider: &str) -> String {
@@ -561,6 +600,22 @@ enum Command {
         /// `serve`'s identical flag.
         #[arg(long, env = "AI_AGENT_RETRY_BASE_DELAY_MS")]
         retry_base_delay_ms: Option<u64>,
+        /// Idle-read timeout between response chunks on the gateway HTTP client, in milliseconds —
+        /// overrides `agent_core::client::GatewayClient`'s built-in default, tuned for the gateway's own
+        /// upstream assumption. Consulted for every routing path (proxied through the gateway, or a
+        /// direct-routed/custom `models.json` `base_url` override, which bypasses the gateway entirely)
+        /// since a self-hosted or alternate-provider endpoint's own slow/fast tail has no reason to
+        /// match the gateway's (Task #19, pi-parity feature).
+        #[arg(long, env = "AI_AGENT_IDLE_TIMEOUT_MS")]
+        idle_timeout_ms: Option<u64>,
+        /// Force every image down the same downgrade-to-text-placeholder path a vision-incapable model
+        /// already gets, regardless of the active model's real `supports_vision` capability — for an
+        /// operator who wants image bytes kept out of the prompt entirely (bandwidth, compliance, a
+        /// proxy that strips/rejects multipart image content) even on a vision-capable model. Falls back
+        /// to the persisted `agent settings --block-images` default when not explicitly given (Task #26,
+        /// pi-parity feature).
+        #[arg(long, env = "AI_AGENT_BLOCK_IMAGES", default_value_t = false)]
+        block_images: bool,
         /// Default `bash` command timeout (ms) when the model omits `timeout_ms`. Defaults to 1,800,000
         /// (30 minutes). `serve`'s identical flag.
         #[arg(long, env = "AI_AGENT_BASH_TIMEOUT_MS")]
@@ -1054,6 +1109,26 @@ enum Command {
         /// Clear the stored default reasoning effort.
         #[arg(long, default_value_t = false)]
         clear_default_reasoning_effort: bool,
+        /// Set the stored default for `--block-images` (used when the flag isn't explicitly passed on a
+        /// given `run` invocation) — Task #26 (pi-parity feature). `true` behaves as if `--block-images`
+        /// were always given.
+        #[arg(long)]
+        block_images: Option<bool>,
+        /// Clear the stored default for `--block-images`, reverting to `run`'s own built-in default
+        /// (images allowed).
+        #[arg(long, default_value_t = false)]
+        clear_block_images: bool,
+        /// Set a persisted thinking-token-budget override for one reasoning-effort level —
+        /// `<effort>=<tokens>` (e.g. `high=40000`), one of minimal/low/medium/high/xhigh — Task #36
+        /// (pi-parity feature). Repeatable; consulted by `run` in place of the built-in
+        /// effort-to-budget ladder wherever a turn's thinking budget is derived from
+        /// `--reasoning-effort` (see `agent_core::models::budget_for_effort_with_override`).
+        #[arg(long = "thinking-budget", value_name = "EFFORT=TOKENS")]
+        thinking_budget: Vec<String>,
+        /// Clear a persisted thinking-token-budget override for this reasoning-effort level.
+        /// Repeatable.
+        #[arg(long = "clear-thinking-budget", value_name = "EFFORT")]
+        clear_thinking_budget: Vec<String>,
     },
     /// Render an existing session's `.jsonl` file as a self-contained HTML transcript and exit — pure
     /// offline rendering of what's already on disk, no gateway/key/model involved at all (unlike `run
@@ -1157,6 +1232,32 @@ fn swap_alpha_digit(query: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Render a token count the way pi's own `--list-models` does (`formatTokenCount`,
+/// `packages/coding-agent/src/cli/list-models.ts`) — Task #39 (pi-parity fix, cosmetic): `200000`/
+/// `1000000` as `"200K"`/`"1M"` rather than a raw integer, with one decimal place only when the
+/// abbreviated value isn't a whole number (`"1.5M"`, but plain `"2M"`). Below 1,000, the plain integer
+/// is already as short as any abbreviation would be.
+fn format_token_count(n: u32) -> String {
+    let n = n as f64;
+    if n >= 1_000_000.0 {
+        let millions = n / 1_000_000.0;
+        return if millions.fract() == 0.0 {
+            format!("{millions:.0}M")
+        } else {
+            format!("{millions:.1}M")
+        };
+    }
+    if n >= 1_000.0 {
+        let thousands = n / 1_000.0;
+        return if thousands.fract() == 0.0 {
+            format!("{thousands:.0}K")
+        } else {
+            format!("{thousands:.1}K")
+        };
+    }
+    format!("{n:.0}")
 }
 
 /// Rewrites the multi-character short-flag aliases pi's own hand-rolled CLI parser accepts
@@ -1280,6 +1381,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             no_compaction,
             retry_max_retries,
             retry_base_delay_ms,
+            idle_timeout_ms,
+            block_images,
             bash_timeout_ms,
             bash_shell_path,
             bash_command_prefix,
@@ -1327,6 +1430,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 no_compaction,
                 retry_max_retries,
                 retry_base_delay_ms,
+                idle_timeout_ms,
+                block_images,
                 bash_timeout_ms,
                 bash_shell_path,
                 bash_command_prefix,
@@ -1452,6 +1557,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // A stored `agent settings` default sits between an explicit flag/env var and this crate's
             // own built-in default — same convention `run_task` applies (see its identical comment).
             let stored_settings = beyond_ai_agent::settings::SettingsStore::open_default();
+            // Task #5 (pi-parity fix): whether the operator explicitly passed `--model`/
+            // `--reasoning-effort` for *this* invocation, as opposed to falling back to a stored
+            // `agent settings` default or this crate's own built-in default — the distinction `serve`'s
+            // own startup anti-bleed check needs in order to prefer a reattached session's own
+            // last-recorded model/level instead (see `ServeConfig::model_explicit`'s doc comment).
+            // Captured before either variable is shadowed by its own fallback resolution below. Same
+            // convention as `run_task`'s identical `model_explicit`, just below in this file.
+            let model_explicit = model.is_some();
+            let reasoning_effort_explicit = reasoning_effort.is_some();
             let resolved_model = model
                 .or_else(|| stored_settings.get().default_model.clone())
                 .unwrap_or_else(|| DEFAULT_MODEL.to_string());
@@ -1489,6 +1603,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap_or_else(|| DEFAULT_GATEWAY.to_string()),
                 key,
                 model: resolved_model,
+                model_explicit,
+                reasoning_effort_explicit,
                 max_steps,
                 max_tokens,
                 system,
@@ -1593,8 +1709,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!(
                     "{:<22} {:>10} {:>9} {:<8} {:<6}",
                     model,
-                    caps.context_window,
-                    caps.max_output,
+                    format_token_count(caps.context_window),
+                    format_token_count(caps.max_output),
                     if thinking { "yes" } else { "no" },
                     if caps.supports_vision { "yes" } else { "no" },
                 );
@@ -1689,6 +1805,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             clear_default_project_trust,
             default_reasoning_effort,
             clear_default_reasoning_effort,
+            block_images,
+            clear_block_images,
+            thinking_budget,
+            clear_thinking_budget,
         } => {
             let mut store = beyond_ai_agent::settings::SettingsStore::open_default();
             let any_write = model.is_some()
@@ -1700,7 +1820,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 || default_project_trust.is_some()
                 || clear_default_project_trust
                 || default_reasoning_effort.is_some()
-                || clear_default_reasoning_effort;
+                || clear_default_reasoning_effort
+                || block_images.is_some()
+                || clear_block_images
+                || !thinking_budget.is_empty()
+                || !clear_thinking_budget.is_empty();
             if model.is_some() || clear_model {
                 store.set_default_model(model)?;
             }
@@ -1717,6 +1841,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 store.set_default_reasoning_effort(
                     default_reasoning_effort.map(|e| e.as_str().to_string()),
                 )?;
+            }
+            if block_images.is_some() || clear_block_images {
+                store.set_block_images(if clear_block_images { None } else { block_images })?;
+            }
+            for kv in &thinking_budget {
+                let (effort, tokens) = kv
+                    .split_once('=')
+                    .ok_or_else(|| format!("--thinking-budget {kv:?} must be EFFORT=TOKENS"))?;
+                parse_reasoning_effort(effort)
+                    .map_err(|e| format!("--thinking-budget {kv:?}: {e}"))?;
+                let tokens: u32 = tokens
+                    .parse()
+                    .map_err(|_| format!("--thinking-budget {kv:?}: TOKENS must be a non-negative integer"))?;
+                store.set_thinking_budget_override(effort.to_string(), Some(tokens))?;
+            }
+            for effort in &clear_thinking_budget {
+                parse_reasoning_effort(effort)
+                    .map_err(|e| format!("--clear-thinking-budget {effort:?}: {e}"))?;
+                store.set_thinking_budget_override(effort.to_string(), None)?;
             }
             if any_write {
                 println!("updated settings:");
@@ -1747,6 +1890,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "default_reasoning_effort: {}",
                 s.default_reasoning_effort.as_deref().unwrap_or("(not set)")
             );
+            println!(
+                "block_images: {}",
+                match s.block_images {
+                    Some(true) => "true",
+                    Some(false) => "false",
+                    None => "(not set)",
+                }
+            );
+            match &s.thinking_budget_overrides {
+                Some(overrides) if !overrides.is_empty() => {
+                    let rendered = overrides
+                        .iter()
+                        .map(|(effort, tokens)| format!("{effort}={tokens}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    println!("thinking_budget_overrides: {rendered}");
+                }
+                _ => println!("thinking_budget_overrides: (not set)"),
+            }
             // Fix 9's "CLI-visible" requirement: this file is entirely hand-edited (like pi's own
             // `models.json`), with no `--set`/`--clear` flags of its own here — just enough surface so
             // an operator debugging "why is this model still hitting the gateway" can confirm the file
@@ -1858,9 +2020,10 @@ fn looks_like_image(path: &Path) -> bool {
     )
 }
 
-/// Read each of `file_refs` (resolved against `cwd`; an already-absolute ref is used as-is). A plain
-/// (non-image) file's contents are wrapped in a `<file name="...">` block, concatenated in argument
-/// order — unchanged from before this fix. A file whose leading bytes identify it as an image (see
+/// Read each of `file_refs` (tilde-expanded, then resolved against `cwd`; an already-absolute ref is
+/// used as-is). A plain (non-image) file's contents are wrapped in a `<file name="...">` block,
+/// concatenated in argument order — unchanged from before this fix. A zero-byte file is skipped
+/// entirely (Task #38). A file whose leading bytes identify it as an image (see
 /// [`looks_like_image`]) is instead run through the `read` tool's own image pipeline (sniffing,
 /// decode/validate, downscale-to-budget, format conversion) so it can be attached as a real
 /// [`agent_core::ImageSource`] rather than handed to `std::fs::read_to_string`, which errors outright
@@ -1872,10 +2035,38 @@ async fn read_file_refs(
     file_refs: &[String],
     cwd: &Path,
 ) -> Result<FileRefs, Box<dyn std::error::Error>> {
+    read_file_refs_with_home(file_refs, cwd, std::env::var("HOME").ok().as_deref()).await
+}
+
+/// [`read_file_refs`], with `home` passed explicitly instead of read fresh from `$HOME` — split out
+/// purely so the Task #20 tilde-expansion behavior is unit-testable without mutating the real,
+/// process-wide (and test-parallelism-unsafe) environment, the same reasoning `tools::expand_tilde`
+/// itself was already split out for.
+async fn read_file_refs_with_home(
+    file_refs: &[String],
+    cwd: &Path,
+    home: Option<&str>,
+) -> Result<FileRefs, Box<dyn std::error::Error>> {
     let mut text = String::new();
     let mut images = Vec::new();
     for r in file_refs {
-        let path = cwd.join(r);
+        // Task #20 (pi-parity fix): expand a leading `~` before resolving against `cwd` — the same
+        // `tools::expand_tilde` helper every tool already uses for a model-supplied path. The `@`
+        // prefix on a CLI file reference defeats the shell's own tilde-expansion (it's inside a single
+        // argument, so nothing ever substitutes it), so `agent run @~/notes.md "..."` previously failed
+        // outright with "failed to read ~/notes.md: No such file or directory" instead of reading the
+        // intended file.
+        let expanded = tools::expand_tilde(r, home);
+        let path = cwd.join(&expanded);
+        // Task #38 (pi-parity fix): skip a zero-byte file outright, before any image-format sniffing —
+        // matches pi's own `file-processor.ts` (`stats.size === 0` → `continue`). Without this, an
+        // empty `@file` produced an empty-but-present `<file name="...">\n\n</file>` block instead of
+        // contributing nothing at all. `unwrap_or(1)` (not `0`) on a failed `metadata()` call — a
+        // missing/unreadable file must still fall through to the normal "failed to read" error below,
+        // not be silently skipped as if it were merely empty.
+        if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(1) == 0 {
+            continue;
+        }
         if looks_like_image(&path) {
             let path_str = path.to_string_lossy().into_owned();
             let out = tools::read::Read
@@ -1922,8 +2113,12 @@ fn resolve_prompt_input(raw: &str) -> String {
     raw.to_string()
 }
 
-/// The full contents of stdin, if it's piped (not an interactive terminal) and non-empty. `None`
-/// otherwise — including on a read error, since a broken pipe just means there was nothing to add.
+/// The full contents of stdin, if it's piped (not an interactive terminal) and non-empty once trimmed.
+/// `None` otherwise — including on a read error (a broken pipe just means there was nothing to add) or
+/// whitespace-only input. Task #37 (pi-parity fix): matches pi's own `readPipedStdin`'s `data.trim() ||
+/// undefined` — previously a whitespace-only pipe (e.g. a trailing newline from an empty upstream
+/// command in `some-cmd | agent run "..."`) was included verbatim as the composed message's leading
+/// content instead of being treated as "nothing was actually piped".
 fn read_stdin_if_piped() -> Option<String> {
     let stdin = std::io::stdin();
     if stdin.is_terminal() {
@@ -1931,9 +2126,19 @@ fn read_stdin_if_piped() -> Option<String> {
     }
     let mut buf = String::new();
     match stdin.lock().read_to_string(&mut buf) {
-        Ok(_) if !buf.is_empty() => Some(buf),
-        _ => None,
+        Ok(_) => trim_piped_stdin(&buf),
+        Err(_) => None,
     }
+}
+
+/// [`read_stdin_if_piped`]'s trim/blank-check logic, split out so it's unit-testable without a real
+/// piped stdin — Task #37 (pi-parity fix): matches pi's own `readPipedStdin`'s `data.trim() ||
+/// undefined`. `None` for an empty or whitespace-only buffer (e.g. just a trailing newline from an
+/// empty upstream command in `some-cmd | agent run "..."`), previously included verbatim as the
+/// composed message's leading content instead of being treated as "nothing was actually piped".
+fn trim_piped_stdin(buf: &str) -> Option<String> {
+    let trimmed = buf.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 /// [`run_turn_once`], wrapped with the same whole-run auto-retry `serve.rs`'s `"prompt"` command gets
@@ -2015,6 +2220,31 @@ async fn run_turn(
 /// Returns the turn's final [`agent_core::StopReason`] — the *last* one observed, for a multi-step
 /// turn that made several model round-trips before actually finishing — so the caller can tell a
 /// refusal apart from a normal completion after streaming ends (`run_task`'s exit-code check).
+/// Write `text` to stdout through a locked handle, flushing immediately (matching the streamed,
+/// byte-at-a-time output `run_turn_once`'s callbacks need). Task #10 (pi-parity fix): `println!`/
+/// `print!` panic internally on any stdout write error — including `EPIPE` — so a downstream consumer
+/// that closes its end early (`agent run --json "task" | head -1`) previously crashed this process with
+/// "Broken pipe" (exit 101) instead of exiting cleanly, the moment `head` hung up. A closed read end is
+/// the normal, expected way a *nix pipeline ends a producer it's done reading from, not a bug in this
+/// process to report loudly — matches `serve.rs`'s own writer task, which already exits gracefully on a
+/// write failure instead of panicking. Exits the whole process (code 0) immediately on `BrokenPipe`,
+/// same as that write ending the run entirely — there is no remaining stdout consumer to stream
+/// anything else to, and nothing meaningful left to do with any not-yet-flushed output. Any other write
+/// error (a full disk, a redirected-to-file target that vanished) is swallowed instead, matching this
+/// callback's own prior `let _ = ...flush()` convention — exceptionally rare for a terminal/pipe fd, and
+/// not worth complicating this hot streaming path over.
+fn write_stdout_or_exit(text: &str) {
+    let mut stdout = std::io::stdout().lock();
+    let result = stdout
+        .write_all(text.as_bytes())
+        .and_then(|()| stdout.flush());
+    if let Err(e) = result {
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+    }
+}
+
 async fn run_turn_once(
     agent: &Agent,
     session: &mut Session,
@@ -2031,8 +2261,8 @@ async fn run_turn_once(
                         stop_reason = *r;
                     }
                     if let Ok(line) = serde_json::to_string(&ev) {
-                        println!("{line}");
-                        let _ = std::io::stdout().flush();
+                        write_stdout_or_exit(&line);
+                        write_stdout_or_exit("\n");
                     }
                 },
                 cancel.clone(),
@@ -2045,20 +2275,17 @@ async fn run_turn_once(
             session,
             |ev| match ev {
                 StreamEvent::TextDelta { text, .. } => {
-                    print!("{text}");
-                    let _ = std::io::stdout().flush();
+                    write_stdout_or_exit(text);
                 }
                 StreamEvent::ToolUseStart { name, .. } => {
                     // No trailing newline: `InputJsonDelta` fragments print immediately after, live,
                     // on this same line — a growing preview of the call's arguments as they stream in,
                     // rather than the model appearing to hang until the whole call (and its result)
                     // land.
-                    print!("\n[tool: {name}] ");
-                    let _ = std::io::stdout().flush();
+                    write_stdout_or_exit(&format!("\n[tool: {name}] "));
                 }
                 StreamEvent::InputJsonDelta { partial_json, .. } => {
-                    print!("{partial_json}");
-                    let _ = std::io::stdout().flush();
+                    write_stdout_or_exit(partial_json);
                 }
                 StreamEvent::MessageStop { stop_reason: r } => {
                     stop_reason = *r;
@@ -2068,7 +2295,7 @@ async fn run_turn_once(
             cancel.clone(),
         )
         .await?;
-    println!();
+    write_stdout_or_exit("\n");
     Ok(stop_reason)
 }
 
@@ -2169,6 +2396,8 @@ async fn run_task(
     no_compaction: bool,
     retry_max_retries: Option<u32>,
     retry_base_delay_ms: Option<u64>,
+    idle_timeout_ms: Option<u64>,
+    block_images: bool,
     bash_timeout_ms: Option<u64>,
     bash_shell_path: Option<String>,
     bash_command_prefix: Option<String>,
@@ -2264,6 +2493,11 @@ async fn run_task(
             .as_deref()
             .and_then(|s| parse_reasoning_effort(s).ok())
     });
+    // Task #26 (pi-parity feature): an explicit `--block-images` always wins; otherwise fall back to a
+    // persisted `agent settings --block-images` default before finally defaulting to images allowed —
+    // same "explicit flag, then stored setting, then built-in default" precedence every other
+    // `stored_settings`-backed fallback here follows.
+    let block_images = block_images || stored_settings.get().block_images.unwrap_or(false);
     // Whether the operator explicitly passed `--model`, as opposed to `run` falling back to a stored
     // default or `DEFAULT_MODEL` — the distinction a reopened `--session`/`--continue` needs below to
     // know whether to keep going on the model the session was actually last driven on instead of
@@ -2555,7 +2789,7 @@ async fn run_task(
     timing.mark("open session");
     timing.print();
 
-    let client = match key {
+    let mut client = match key {
         serve::GatewayCredential::Static(key) => GatewayClient::new(gateway, key)?,
         serve::GatewayCredential::Oauth(source) => {
             GatewayClient::with_credential_source(gateway, source)?
@@ -2566,7 +2800,19 @@ async fn run_task(
         retry_base_delay_ms
             .map(std::time::Duration::from_millis)
             .unwrap_or(agent_core::client::BASE_BACKOFF),
-    );
+    )
+    // Task #11 (pi-parity feature): a `models.json` override's `headers` (if any) merged onto every
+    // outgoing request via the generic `with_extra_headers` mechanism — harmless (a no-op) when no
+    // override configured any, since an empty map is also `GatewayClient::new`'s own default.
+    .with_extra_headers(model_override_extra_headers(&model));
+    // Task #19 (pi-parity feature): `with_idle_timeout` previously had zero callers anywhere in this
+    // codebase. Consulted here for every routing path (proxied through the gateway, or a
+    // direct-routed/custom `models.json` `base_url` override that bypasses the gateway's own ~600s
+    // built-in assumption entirely — see `RouteOverride::Direct`) since a self-hosted/alternate-provider
+    // endpoint's own slow/fast tail has no reason to match the gateway's.
+    if let Some(ms) = idle_timeout_ms {
+        client = client.with_idle_timeout(std::time::Duration::from_millis(ms))?;
+    }
     // Task #50: the same two operator-supplied overrides also drive the *whole-run* retry layer
     // (`retry::RunRetryPolicy`), not just the pre-connect/mid-stream layer just above — previously
     // `--retry-max-retries`/`--retry-base-delay-ms` silently had no effect on `run_turn`'s own retry loop.
@@ -2618,12 +2864,40 @@ async fn run_task(
     }
     if let Some(effort) = reasoning_effort {
         agent = agent.with_reasoning_effort(effort);
+        // Task #36 (pi-parity feature): derive a numeric thinking budget from the effort level for
+        // Budget/Adaptive-shape models when the operator didn't also pass an exact `--thinking` token
+        // count (which still wins outright) — mirrors `serve::build_agent`'s identical
+        // `thinking_for_level`-based derivation for its own initial `--reasoning-effort`, but consults
+        // the operator's `agent settings --thinking-budget` override table first (falling back to
+        // `agent_core`'s built-in ladder). Without this, `--reasoning-effort high` alone (no
+        // `--thinking`) set no thinking budget at all for a token-budget-shape model (Claude 3.x/4.x):
+        // that dialect's wire body only ever reads `thinking`, never `reasoning_effort`.
+        if thinking.is_none() {
+            let caps = agent_core::capabilities(&model);
+            if matches!(
+                caps.thinking,
+                agent_core::models::ThinkingShape::Budget | agent_core::models::ThinkingShape::Adaptive
+            ) {
+                let overrides = resolve_thinking_budget_overrides(stored_settings.get());
+                let budget = agent_core::models::budget_for_effort_with_override(
+                    effort,
+                    caps.max_output,
+                    overrides.as_ref(),
+                );
+                agent = agent.with_thinking(budget);
+            }
+        }
     }
     if let Some(temperature) = temperature {
         agent = agent.with_temperature(temperature);
     }
     if let Some(max_tokens) = max_tokens {
         agent = agent.with_max_tokens(max_tokens);
+    }
+    // Task #26 (pi-parity feature): forces every image down the vision-downgrade path regardless of
+    // the active model's real `supports_vision` capability — see `--block-images`'s own doc comment.
+    if block_images {
+        agent = agent.with_block_images(true);
     }
     let policy = ToolPolicy::from_lists(&deny_tool, &deny_bash_pattern, &deny_path);
     if !policy.is_empty() {
@@ -3464,5 +3738,198 @@ mod tests {
         let path = dir.path().join("notes.txt");
         std::fs::write(&path, "just some text").unwrap();
         assert!(!looks_like_image(&path));
+    }
+
+    #[tokio::test]
+    async fn read_file_refs_expands_a_leading_tilde_before_joining_with_cwd() {
+        // Task #20 (pi-parity fix): `@~/notes.md` previously failed outright — the `@` prefix defeats
+        // the shell's own tilde-expansion (it's inside a single argument), and `cwd.join("~/notes.md")`
+        // literally means `<cwd>/~/notes.md`, not the home directory.
+        let home_dir = tempfile::tempdir().unwrap();
+        std::fs::write(home_dir.path().join("notes.md"), "home directory contents").unwrap();
+        let cwd_dir = tempfile::tempdir().unwrap();
+
+        let out = read_file_refs_with_home(
+            &["~/notes.md".to_string()],
+            cwd_dir.path(),
+            Some(home_dir.path().to_str().unwrap()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.text.contains("home directory contents"),
+            "must read the file under the expanded home directory: {}",
+            out.text
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_refs_a_bare_tilde_with_no_slash_resolves_to_home_itself() {
+        let home_dir = tempfile::tempdir().unwrap();
+        std::fs::write(home_dir.path().join("direct.txt"), "direct child of home").unwrap();
+        let cwd_dir = tempfile::tempdir().unwrap();
+
+        // `~` alone (no trailing slash) followed by a plain relative join still lands inside the home
+        // directory via `cwd.join(expanded)`'s own absolute-path-replaces-base semantics.
+        let out = read_file_refs_with_home(
+            &["~/direct.txt".to_string()],
+            cwd_dir.path(),
+            Some(home_dir.path().to_str().unwrap()),
+        )
+        .await
+        .unwrap();
+        assert!(out.text.contains("direct child of home"));
+    }
+
+    #[tokio::test]
+    async fn read_file_refs_a_non_tilde_ref_is_unaffected_by_the_home_directory() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let cwd_dir = tempfile::tempdir().unwrap();
+        std::fs::write(cwd_dir.path().join("plain.txt"), "plain cwd file").unwrap();
+
+        let out = read_file_refs_with_home(
+            &["plain.txt".to_string()],
+            cwd_dir.path(),
+            Some(home_dir.path().to_str().unwrap()),
+        )
+        .await
+        .unwrap();
+        assert!(out.text.contains("plain cwd file"));
+    }
+
+    #[tokio::test]
+    async fn read_file_refs_skips_a_zero_byte_file_entirely() {
+        // Task #38 (pi-parity fix): matches pi's own `file-processor.ts` (`stats.size === 0` →
+        // `continue`) — an empty `@file` must contribute nothing, not an empty `<file
+        // name="...">\n\n</file>` block.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("empty.txt"), b"").unwrap();
+        let out = read_file_refs(&["empty.txt".to_string()], dir.path())
+            .await
+            .unwrap();
+        assert_eq!(out.text, "", "a zero-byte file must contribute nothing at all");
+        assert!(out.images.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_file_refs_skips_only_the_empty_file_among_several() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "AAA").unwrap();
+        std::fs::write(dir.path().join("empty.txt"), b"").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "BBB").unwrap();
+        let out = read_file_refs(
+            &[
+                "a.txt".to_string(),
+                "empty.txt".to_string(),
+                "b.txt".to_string(),
+            ],
+            dir.path(),
+        )
+        .await
+        .unwrap();
+        assert!(out.text.contains("AAA"));
+        assert!(out.text.contains("BBB"));
+        assert!(!out.text.contains("empty.txt"));
+    }
+
+    #[tokio::test]
+    async fn read_file_refs_still_errors_on_a_missing_file_rather_than_skipping_it() {
+        // A zero-byte skip must not swallow the genuinely-missing-file error — `metadata()` failing
+        // falls through to the normal read attempt, which reports the real problem.
+        let dir = tempfile::tempdir().unwrap();
+        let err = read_file_refs(&["does-not-exist.txt".to_string()], dir.path())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does-not-exist.txt"), "got: {err}");
+    }
+
+    #[test]
+    fn trim_piped_stdin_trims_surrounding_whitespace() {
+        assert_eq!(
+            trim_piped_stdin("  hello world  \n"),
+            Some("hello world".to_string())
+        );
+    }
+
+    #[test]
+    fn trim_piped_stdin_a_whitespace_only_buffer_is_none() {
+        assert_eq!(trim_piped_stdin("   \n\t  "), None);
+    }
+
+    #[test]
+    fn trim_piped_stdin_an_empty_buffer_is_none() {
+        assert_eq!(trim_piped_stdin(""), None);
+    }
+
+    #[test]
+    fn trim_piped_stdin_leaves_interior_whitespace_untouched() {
+        assert_eq!(
+            trim_piped_stdin("  line one\nline two  "),
+            Some("line one\nline two".to_string())
+        );
+    }
+
+    #[test]
+    fn format_token_count_below_a_thousand_is_a_plain_integer() {
+        assert_eq!(format_token_count(512), "512");
+        assert_eq!(format_token_count(0), "0");
+    }
+
+    #[test]
+    fn format_token_count_thousands_round_to_a_whole_k_when_exact() {
+        assert_eq!(format_token_count(200_000), "200K");
+        assert_eq!(format_token_count(1_000), "1K");
+    }
+
+    #[test]
+    fn format_token_count_thousands_keep_one_decimal_when_not_exact() {
+        assert_eq!(format_token_count(1_500), "1.5K");
+    }
+
+    #[test]
+    fn format_token_count_millions_round_to_a_whole_m_when_exact() {
+        assert_eq!(format_token_count(1_000_000), "1M");
+        assert_eq!(format_token_count(2_000_000), "2M");
+    }
+
+    #[test]
+    fn format_token_count_millions_keep_one_decimal_when_not_exact() {
+        assert_eq!(format_token_count(1_500_000), "1.5M");
+    }
+
+    #[test]
+    fn resolve_thinking_budget_overrides_returns_none_when_nothing_configured() {
+        let settings = beyond_ai_agent::settings::Settings::default();
+        assert_eq!(resolve_thinking_budget_overrides(&settings), None);
+    }
+
+    #[test]
+    fn resolve_thinking_budget_overrides_parses_recognized_wire_strings() {
+        let mut table = std::collections::BTreeMap::new();
+        table.insert("high".to_string(), 40_000u32);
+        table.insert("low".to_string(), 1_000u32);
+        let settings = beyond_ai_agent::settings::Settings {
+            thinking_budget_overrides: Some(table),
+            ..Default::default()
+        };
+        let overrides = resolve_thinking_budget_overrides(&settings).unwrap();
+        assert_eq!(overrides.get(&agent_core::ReasoningEffort::High), Some(&40_000));
+        assert_eq!(overrides.get(&agent_core::ReasoningEffort::Low), Some(&1_000));
+    }
+
+    #[test]
+    fn resolve_thinking_budget_overrides_skips_an_unrecognized_key() {
+        let mut table = std::collections::BTreeMap::new();
+        table.insert("not-a-real-effort".to_string(), 1u32);
+        let settings = beyond_ai_agent::settings::Settings {
+            thinking_budget_overrides: Some(table),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_thinking_budget_overrides(&settings),
+            None,
+            "an override table with only unrecognized keys must resolve to no overrides at all"
+        );
     }
 }

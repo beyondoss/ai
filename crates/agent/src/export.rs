@@ -124,7 +124,7 @@ fn render_html_inner(
         html_escape(&meta.model),
         messages.len()
     ));
-    render_stats_section(&mut out, meta, messages, usage);
+    render_stats_section(&mut out, meta, messages, usage, events);
     out.push_str("</header>\n");
     render_system_prompt_section(&mut out, system_prompt);
     render_tools_section(&mut out, tools);
@@ -359,12 +359,22 @@ pub struct UsageTotals {
     pub cache_write_tokens: u64,
 }
 
-/// Entry-type counts derived purely from `messages` — unlike token usage, these need no data beyond
-/// what [`render_html`] already receives.
+/// Entry-type counts derived purely from `messages`/`events` — unlike token usage, these need no data
+/// beyond what [`render_html_with_entries`] already receives.
 struct MessageStats {
     user_messages: usize,
     assistant_messages: usize,
     tool_calls: usize,
+    /// How many individual `ContentBlock::ToolResult` blocks appear across every message (Task #32,
+    /// pi-parity fix) — matching pi's own header line, which always shows a tool-results count
+    /// alongside `user`/`assistant` (e.g. "12 user, 15 assistant, 40 tool results"); this crate's own
+    /// `tool_calls` count already existed, but nothing on the results side did.
+    tool_results: usize,
+    /// How many [`crate::session_store::ExportEvent::Custom`] entries this session recorded (Task #32).
+    /// Unlike every other field here, this can't come from `messages` at all — a custom entry
+    /// contributes nothing to `Session.messages` (see that variant's own doc comment) — so it's the one
+    /// count `compute` derives from `events` instead.
+    custom_entries: usize,
     /// Distinct `model_id`s actually seen on an assistant turn (sorted), so a session that switched
     /// models mid-run shows every model actually used, not just the one it started with.
     models: Vec<String>,
@@ -378,10 +388,11 @@ struct MessageStats {
 }
 
 impl MessageStats {
-    fn compute(messages: &[Message]) -> Self {
+    fn compute(messages: &[Message], events: &[crate::session_store::ExportEvent]) -> Self {
         let mut user_messages = 0;
         let mut assistant_messages = 0;
         let mut tool_calls = 0;
+        let mut tool_results = 0;
         let mut models: Vec<String> = Vec::new();
         let mut compactions = 0;
         let mut branch_summaries = 0;
@@ -426,12 +437,23 @@ impl MessageStats {
                 .iter()
                 .filter(|b| matches!(b, ContentBlock::ToolUse { .. }))
                 .count();
+            tool_results += m
+                .content
+                .iter()
+                .filter(|b| matches!(b, ContentBlock::ToolResult { .. }))
+                .count();
         }
         models.sort();
+        let custom_entries = events
+            .iter()
+            .filter(|e| matches!(e, crate::session_store::ExportEvent::Custom { .. }))
+            .count();
         Self {
             user_messages,
             assistant_messages,
             tool_calls,
+            tool_results,
+            custom_entries,
             models,
             compactions,
             branch_summaries,
@@ -448,8 +470,9 @@ fn render_stats_section(
     meta: &SessionMeta,
     messages: &[Message],
     usage: Option<UsageTotals>,
+    events: &[crate::session_store::ExportEvent],
 ) {
-    let stats = MessageStats::compute(messages);
+    let stats = MessageStats::compute(messages, events);
     out.push_str("<div class=\"stats\">\n");
     let models = if stats.models.is_empty() {
         meta.model.clone()
@@ -459,16 +482,27 @@ fn render_stats_section(
     push_stat(out, "Models", &models);
     // pi-parity Fix 5: fold compaction/branch-summary counts into this same line, matching pi's own
     // `msgParts` (`template.js:1352-1381`) — appended only when present, so an ordinary session with
-    // neither renders exactly the plain "N user, N assistant" line it always has.
+    // neither renders exactly the plain "N user, N assistant" line it always has. Task #32 (pi-parity
+    // fix): `tool_results`/`custom_entries` join the same conditional-append pattern — pi's own header
+    // always folds a tool-results count into this line too (e.g. "12 user, 15 assistant, 40 tool
+    // results"), and a custom entry is exactly as rare/optional as a compaction or branch summary, so
+    // it gets the same "only when present" treatment rather than cluttering every ordinary session's
+    // line with "0 custom entries".
     let mut message_parts = vec![
         format!("{} user", stats.user_messages),
         format!("{} assistant", stats.assistant_messages),
     ];
+    if stats.tool_results > 0 {
+        message_parts.push(format!("{} tool results", stats.tool_results));
+    }
     if stats.compactions > 0 {
         message_parts.push(format!("{} compactions", stats.compactions));
     }
     if stats.branch_summaries > 0 {
         message_parts.push(format!("{} branch summaries", stats.branch_summaries));
+    }
+    if stats.custom_entries > 0 {
+        message_parts.push(format!("{} custom entries", stats.custom_entries));
     }
     push_stat(out, "Messages", &message_parts.join(", "));
     push_stat(out, "Tool calls", &stats.tool_calls.to_string());
@@ -2785,5 +2819,63 @@ mod tests {
         assert!(!html.contains("compactions"), "{html}");
         assert!(!html.contains("branch summaries"), "{html}");
         assert!(html.contains("1 user, 0 assistant"), "{html}");
+    }
+
+    #[test]
+    fn stats_section_folds_a_tool_results_count_into_the_messages_line() {
+        // Task #32 (pi-parity fix): matching pi's own header line, which always folds a tool-results
+        // count into this same "Messages" summary (e.g. "12 user, 15 assistant, 40 tool results").
+        let messages = vec![
+            Message::assistant(vec![ContentBlock::tool_use(
+                "1",
+                "read",
+                serde_json::json!({ "path": "a.rs" }),
+            )]),
+            Message::tool_results(vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "1".into(),
+                    content: "fn a() {}".into(),
+                    is_error: false,
+                    images: vec![],
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: "2".into(),
+                    content: "fn b() {}".into(),
+                    is_error: false,
+                    images: vec![],
+                },
+            ]),
+        ];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(html.contains("2 tool results"), "{html}");
+    }
+
+    #[test]
+    fn stats_section_folds_a_custom_entries_count_into_the_messages_line() {
+        // Task #32 (pi-parity fix): a custom entry (`SessionStore::append_custom`) contributes nothing
+        // to `messages` at all — this count can only come from `events`, unlike every other
+        // `MessageStats` field.
+        use crate::session_store::ExportEvent;
+        let events = vec![
+            ExportEvent::Custom {
+                kind: "checkpoint".into(),
+                data: serde_json::json!({}),
+            },
+            ExportEvent::Custom {
+                kind: "checkpoint".into(),
+                data: serde_json::json!({}),
+            },
+            // A non-`Custom` event must not be miscounted as one.
+            ExportEvent::ModelChange("claude-test".into()),
+        ];
+        let html = render_html_with_entries(&meta(), &[Message::user("hi")], &[], None, &events);
+        assert!(html.contains("2 custom entries"), "{html}");
+    }
+
+    #[test]
+    fn stats_section_omits_tool_results_and_custom_entries_counts_when_there_are_none() {
+        let html = render_html(&meta(), &[Message::user("hi")], &[], None);
+        assert!(!html.contains("tool results"), "{html}");
+        assert!(!html.contains("custom entries"), "{html}");
     }
 }

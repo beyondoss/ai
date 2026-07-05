@@ -104,6 +104,14 @@ pub const MAX_LISTING_BYTES: usize = 50 * 1024;
 /// marker: the byte cap is checked *before* any count marker is appended, and takes priority when both
 /// would otherwise fire, since appending the count marker first and then truncating to the byte cap
 /// could slice straight through — and silently drop — the marker just added.
+///
+/// The cut point is backed off twice: first to the nearest UTF-8 char boundary (so we never split a
+/// multi-byte codepoint), then further back to the last `\n` (or the very start of the string, if none
+/// precedes it) so a whole *line* is always kept — matching pi's `truncateHead` (`truncate.ts`), which
+/// is documented and enforced to "never return partial lines." Without the second back-off, the raw
+/// byte cut can land mid-filename/mid-match-line: the model then sees what looks like a complete,
+/// plausible path or match immediately before the truncation marker, when it's actually an arbitrary
+/// fragment that just happened to end where the byte budget ran out.
 pub fn cap_listing_bytes(out: &mut String, guidance: &str) -> bool {
     if out.len() <= MAX_LISTING_BYTES {
         return false;
@@ -112,6 +120,7 @@ pub fn cap_listing_bytes(out: &mut String, guidance: &str) -> bool {
     while !out.is_char_boundary(end) {
         end -= 1;
     }
+    end = out[..end].rfind('\n').map(|i| i + 1).unwrap_or(0);
     out.truncate(end);
     out.push_str("\n\n");
     out.push_str(&marker(format_args!(
@@ -886,6 +895,50 @@ mod tests {
             "got tail: {}",
             &out[out.len().saturating_sub(120)..]
         );
+    }
+
+    #[test]
+    fn cap_listing_bytes_never_cuts_a_line_in_half() {
+        // 98-byte lines (97 chars + '\n'): MAX_LISTING_BYTES (51200) is not a multiple of 98
+        // (51200 % 98 == 44), so the raw byte cut lands 44 bytes into a line — exactly the mid-line
+        // truncation this test guards against.
+        assert_ne!(
+            MAX_LISTING_BYTES % 98,
+            0,
+            "test setup must land mid-line at the raw byte cap"
+        );
+        let line = "x".repeat(97);
+        let mut out = String::new();
+        for _ in 0..600 {
+            out.push_str(&line);
+            out.push('\n');
+        }
+        assert!(
+            out.len() > MAX_LISTING_BYTES,
+            "test setup: listing must exceed the cap"
+        );
+
+        let truncated = cap_listing_bytes(&mut out, "narrow the search");
+        assert!(truncated);
+
+        let marker_start = out.find("[output truncated").expect("marker present");
+        let kept = out[..marker_start]
+            .strip_suffix("\n\n")
+            .unwrap_or(&out[..marker_start]);
+
+        assert!(
+            kept.is_empty() || kept.ends_with('\n'),
+            "kept listing must end on a full line, not mid-line: {:?}",
+            &kept[kept.len().saturating_sub(120)..]
+        );
+        // Every kept line must be a genuine, complete 97-'x' line — not a truncated fragment of one.
+        // `kept` ends with '\n' (it's whole lines only), so strip it before splitting or the final
+        // split element would be a spurious empty string, not a real line.
+        if !kept.is_empty() {
+            for l in kept.strip_suffix('\n').unwrap_or(kept).split('\n') {
+                assert_eq!(l, line, "a partial/fabricated-looking line leaked through");
+            }
+        }
     }
 
     #[test]

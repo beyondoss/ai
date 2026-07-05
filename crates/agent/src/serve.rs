@@ -32,10 +32,16 @@
 //!     what every subsequent turn of the *current* run targets, without stopping and restarting it.
 //!     Applied at the next turn boundary; the turn already in flight when this arrives is unaffected.
 //!     A no-op ack (pointing the client at `set_model` instead) when no `prompt` is in flight.
-//!   - `{type:"get_state"}`              → `data: {session_id, model, steps, message_count, title,
-//!     thinking_level, auto_compaction, auto_retry, steering_mode, follow_up_mode, pending_messages, …}`
-//!     — the last six are the runtime-mutable settings and current steer/follow-up queue depth
-//!     (`Steering::pending_count`), so a client can render current settings without a second round trip
+//!   - `{type:"get_state"}`              → `data: {session_id, model, steps, message_count, title, cwd,
+//!     git_branch, thinking_level, auto_compaction, auto_retry, steering_mode, follow_up_mode,
+//!     pending_messages, …}` — the middle six are the runtime-mutable settings and current steer/
+//!     follow-up queue depth (`Steering::pending_count`), so a client can render current settings without
+//!     a second round trip. `cwd`/`git_branch` (Task #25, pi-parity fix) matter more here than for pi:
+//!     a headless RPC client may have no shared filesystem with this process at all, so `get_state` is
+//!     its only way to learn which directory (and branch) the agent's tools are actually operating
+//!     against. `git_branch` is a lazily-resolved, best-effort `git symbolic-ref --short HEAD` — `null`
+//!     (never a failed call) outside a git repo, on detached `HEAD`, or if the lookup fails for any
+//!     other reason.
 //!   - `{type:"get_messages", since?}`   → `data: {messages: [...], leaf_id}` (each message tagged with
 //!     its tree `id` when persistence is configured, so a client can fork from any point via
 //!     `switch_branch`; `leaf_id` is the same active-tip id `get_tree`'s own response carries — pi's own
@@ -177,14 +183,17 @@
 //!   - `{type:"get_tree"}`               → `data: {nodes: [TreeNode…], leaf_id}` (every message on
 //!     every branch, not just the leaves `list_branches` reports; `leaf_id` is the active path's own
 //!     tip — `null` in pure in-memory mode — pi's own `get_tree`'s `leafId`)
-//!   - `{type:"switch_branch", target_id, before?, summarize?, custom_instructions?}` navigate to
-//!     another point in the tree — or, when `before:true`, to `target_id`'s own *parent* instead,
-//!     which is the tree's own root (before any message) when `target_id` is the very first message,
-//!     letting a client redo it in place (pi's own `SessionManager::resetLeaf`) — summarizing the
-//!     abandoned branch's activity first unless `summarize:false` (an optional `custom_instructions`
-//!     string steers what that recap emphasizes, the same "Additional focus" framing `compact`'s own
-//!     `custom_instructions` supports; ignored when `summarize:false`, since no summarization call
-//!     happens at all) → `data: {target_id, model, reasoning_effort}` — also restores whichever
+//!   - `{type:"switch_branch", target_id, before?, summarize?, custom_instructions?,
+//!     replace_instructions?}` navigate to another point in the tree — or, when `before:true`, to
+//!     `target_id`'s own *parent* instead, which is the tree's own root (before any message) when
+//!     `target_id` is the very first message, letting a client redo it in place (pi's own
+//!     `SessionManager::resetLeaf`) — summarizing the abandoned branch's activity first unless
+//!     `summarize:false` (an optional `custom_instructions` string steers what that recap emphasizes,
+//!     the same "Additional focus" framing `compact`'s own `custom_instructions` supports;
+//!     `replace_instructions:true` (Task #17, pi-parity fix) uses `custom_instructions` as the *entire*
+//!     instruction section instead of appending it after the default template — a no-op without
+//!     `custom_instructions`; both ignored when `summarize:false`, since no summarization call happens
+//!     at all) → `data: {target_id, model, reasoning_effort}` — also restores whichever
 //!     model/thinking-level was actually active at wherever the session actually landed (a
 //!     `set_model`/`cycle_model`/`set_reasoning_effort`/`cycle_thinking_level` made *after* leaving
 //!     that point doesn't leak backward into it), rebuilding the `Agent` if either differs from what's
@@ -295,6 +304,19 @@ pub struct ServeConfig {
     pub gateway: String,
     pub key: GatewayCredential,
     pub model: String,
+    /// Whether the operator explicitly passed `--model` for *this* invocation, as opposed to `model`
+    /// having fallen back to a stored `agent settings` default or this crate's own built-in default
+    /// (`main.rs`'s `resolved_model` resolution) — Task #5 (pi-parity fix). `serve`'s own startup uses
+    /// this to decide whether to prefer a reattached session's own last-recorded model
+    /// (`Persistence::model_and_level_at_active`) over `model` when reopening an existing session: a
+    /// merely-stored default must not override what that session was actually last running on, the same
+    /// "bleed" `switch_session`/`switch_branch` are already hardened against (see their own doc
+    /// comments) — previously unguarded at ordinary process restart. A no-op for a genuinely fresh
+    /// session, since its own recorded model already equals `model` either way. Matches `run
+    /// --continue`'s own identical `model_explicit` distinction (`main.rs::run_task`).
+    pub model_explicit: bool,
+    /// Same idea as [`Self::model_explicit`], for `--reasoning-effort`/`starting_level`.
+    pub reasoning_effort_explicit: bool,
     pub max_steps: u32,
     /// Base system prompt (agent identity). Project instructions, skills, and env are layered on top.
     pub system: String,
@@ -501,12 +523,28 @@ pub fn resolve_project_trust(
     if trust_project {
         return true;
     }
+    // Task #35 (pi-parity fix): pi's own `resolveProjectTrusted` (`project-trust.ts`) runs this
+    // "nothing here for project trust to actually gate" fast path *immediately* after the
+    // override check above — before even consulting the persisted trust store, let alone a blanket
+    // `default_project_trust` policy. Previously this crate only consulted `has_gated_resources` deep
+    // inside the `Unknown` arm below, as the final fallback — meaning an explicit per-path
+    // `Trust::Trusted`/`Trust::Untrusted` entry, or an explicit `always`/`never` blanket policy, would
+    // win even when the project has nothing trust-gated at all to protect. Currently inert in practice
+    // (no trust-gated resource type today actually depends on this ordering), but would silently
+    // matter the moment a new one is added without this precedence already matching pi's.
+    if !has_gated_resources {
+        return true;
+    }
     match trust_lookup {
         Trust::Trusted => true,
         Trust::Untrusted => false,
         Trust::Unknown => match default_project_trust {
             Some(TrustPolicy::Always) => true,
             Some(TrustPolicy::Never) => false,
+            // `has_gated_resources` is always `true` by the time this arm is reached (the fast path
+            // above already returned otherwise), so this is effectively always `false` now — kept as
+            // `!has_gated_resources` rather than a bare `false` literal so the fallback stays correct
+            // and self-documenting on its own terms if the fast path above is ever refactored away.
             Some(TrustPolicy::Ask) | None => !has_gated_resources,
         },
     }
@@ -877,21 +915,75 @@ impl Persistence {
     /// given, forks at that specific tree entry — anywhere in the whole tree, on or off the active
     /// path (`before` excludes the entry itself, matching pi's `position:"before"`/`"at"`) — otherwise
     /// falls back to `upto`, a message-count prefix of the active path (the original, narrower form).
+    ///
+    /// Also returns the model/thinking-level that was actually active at the forked-from point (Task #2,
+    /// pi-parity fix) — resolved against *this* session's own tree (see
+    /// [`Self::fork_target_model_and_level`]) *before* the swap below, since `SessionRepo::fork`/
+    /// `fork_at_entry` deliberately don't carry `ModelChange`/`ThinkingLevelChange` bookkeeping into the
+    /// freshly forked session's own file (see their own doc comments — forking only ever preserves
+    /// message content, never the surrounding per-branch bookkeeping). Concretely: a session that
+    /// switched models mid-run, then forked back to an entry on the *old* model's branch, previously kept
+    /// running on whatever the process was last set to — silently replaying that old provider's signed
+    /// `Thinking` blocks to a foreign model on the fork's very next turn. The caller (the `fork`/`clone`
+    /// RPC handlers) applies this exactly like `switch_session`/`switch_branch` already do: clamp,
+    /// `scrub_cross_model_state` when the model actually changes, and rebuild `agent` only if needed.
     fn fork(
         &mut self,
         upto: usize,
         entry_id: Option<&str>,
         before: bool,
-    ) -> std::io::Result<Session> {
+        starting_level: agent_core::ThinkingLevel,
+    ) -> std::io::Result<(Session, String, agent_core::ThinkingLevel)> {
         let id = self.meta.id.clone();
         let repo = self.repo.as_ref().ok_or_else(not_in_repo_mode)?;
+        let (restored_model, restored_level) =
+            self.fork_target_model_and_level(upto, entry_id, before, starting_level);
         let (store, session) = match entry_id {
             Some(entry_id) => repo.fork_at_entry(&id, entry_id, before)?,
             None => repo.fork(&id, upto)?,
         };
         self.meta = store.meta().clone();
         self.store = Some(store);
-        Ok(session)
+        Ok((session, restored_model, restored_level))
+    }
+
+    /// The model/thinking-level actually active at what a would-be [`Self::fork`] targets — see that
+    /// method's own doc comment for why this must be computed against the *source* tree before the fork
+    /// swaps `self.store` to the freshly created one. Mirrors `fork`'s own `entry_id`/`before`-vs-`upto`
+    /// resolution exactly, so the point this reads model/level at is the same one the copied prefix
+    /// actually ends on.
+    fn fork_target_model_and_level(
+        &self,
+        upto: usize,
+        entry_id: Option<&str>,
+        before: bool,
+        process_starting_level: agent_core::ThinkingLevel,
+    ) -> (String, agent_core::ThinkingLevel) {
+        match entry_id {
+            Some(entry_id) => {
+                // Same `before` resolution as `switch_branch`: `parent_of` returns `None` only for an
+                // unknown id, in which case there's nothing meaningful to resolve here anyway — the
+                // actual fork call just below fails with a clear `NotFound` and this fallback value is
+                // never returned to a caller.
+                let target: Option<String> = if before {
+                    self.store
+                        .as_ref()
+                        .and_then(|s| s.parent_of(entry_id))
+                        .unwrap_or(None)
+                } else {
+                    Some(entry_id.to_string())
+                };
+                self.model_and_level_at_opt(target.as_deref(), process_starting_level)
+            }
+            None => {
+                let active = self.active_ids();
+                let upto = upto.min(active.len());
+                match upto {
+                    0 => self.model_and_level_at_opt(None, process_starting_level),
+                    n => self.model_and_level_at(&active[n - 1], process_starting_level),
+                }
+            }
+        }
     }
 
     /// Preview what forking `session_id` would produce — the exact prefix `fork` would copy — without
@@ -1135,12 +1227,16 @@ impl Persistence {
     /// `custom_instructions`, when given, steers *what* the branch recap emphasizes — the same
     /// "Additional focus" framing manual `compact` already supports — threaded straight through to
     /// [`Agent::summarize_branch`]; ignored (no summarization call happens at all) when `summarize` is
-    /// `false`.
+    /// `false`. `replace_instructions` (Task #17, pi-parity fix) forwards straight through to that same
+    /// call's own parameter of the same name — `true` uses `custom_instructions` as the *entire*
+    /// instruction section instead of appending it after the default structured template; a no-op when
+    /// `custom_instructions` is `None`, same as `summarize_branch`'s own doc comment describes.
     ///
     /// Returns the resolved target alongside the switched-to `Session` — `None` when `before` resolved
     /// to the tree's own root — so the caller can restore the correct model/thinking-level for
     /// wherever the session actually landed (see [`Self::model_and_level_at_opt`]) instead of querying
     /// against the raw, pre-resolution `target_id` argument.
+    #[allow(clippy::too_many_arguments)]
     async fn switch_branch(
         &mut self,
         agent: &Agent,
@@ -1148,6 +1244,7 @@ impl Persistence {
         before: bool,
         summarize: bool,
         custom_instructions: Option<&str>,
+        replace_instructions: bool,
         cancel: &CancellationToken,
     ) -> std::io::Result<(Session, Option<String>)> {
         let store = self.store.as_mut().ok_or_else(|| {
@@ -1190,7 +1287,7 @@ impl Persistence {
                     let (ids, messages): (Vec<String>, Vec<agent_core::Message>) =
                         abandoned.into_iter().unzip();
                     match agent
-                        .summarize_branch(&messages, cancel, custom_instructions)
+                        .summarize_branch(&messages, cancel, custom_instructions, replace_instructions)
                         .await
                     {
                         Ok(summary) if !summary.trim().is_empty() => {
@@ -1397,6 +1494,69 @@ pub fn cwd_is_stale(meta_cwd: &str, actual_cwd: &std::path::Path) -> bool {
     !std::path::Path::new(meta_cwd).is_dir() || meta_cwd != actual_cwd.to_string_lossy()
 }
 
+/// The current short branch name at `cwd` (Task #25, pi-parity fix), for `get_state`'s `git_branch`
+/// field — matters more for this crate than for pi, since the whole point of the RPC protocol is
+/// letting a client with no shared filesystem drive the agent remotely; without this, such a client has
+/// no way at all to learn which branch the agent's tools are actually operating against.
+///
+/// `None` — never an error surfaced to the caller — when `cwd` isn't inside a git repo, `HEAD` is
+/// detached (matching `git symbolic-ref`'s own behavior: it only ever resolves a real branch ref, not a
+/// raw commit), `git` itself isn't installed, or the lookup fails for any other reason: a client polling
+/// `get_state` shouldn't have an unrelated git hiccup fail the whole call. Spawned via
+/// `tokio::process::Command` (not a blocking `std::process::Command`) so this never stalls the control
+/// loop's own task the way a blocking subprocess wait would — see `persist_blocking`'s doc comment for
+/// the same "don't block this task" reasoning applied to disk I/O instead of a subprocess. No
+/// filesystem watcher or caching: a plain request/response poll has nothing to invalidate, and a `git`
+/// invocation is cheap enough to just redo every call.
+async fn git_branch(cwd: &std::path::Path) -> Option<String> {
+    let output = tokio::process::Command::new("git")
+        .args(["symbolic-ref", "--short", "HEAD"])
+        .current_dir(cwd)
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8(output.stdout).ok()?;
+    let branch = branch.trim();
+    (!branch.is_empty()).then(|| branch.to_string())
+}
+
+/// Resolve the model/thinking-level `serve` actually starts with (Task #5, pi-parity fix). An explicit
+/// `--model`/`--reasoning-effort` for *this* invocation (`model_explicit`/`reasoning_effort_explicit` —
+/// see [`ServeConfig::model_explicit`]'s doc comment) always wins for its own half; otherwise the
+/// reattached session's own last-recorded value (`session_model`/`session_level`, from
+/// [`Persistence::model_and_level_at_active`]) wins instead of the CLI-resolved default
+/// (`cfg_model`/`cfg_level`) — the same "bleed" `switch_session`/`switch_branch` are already hardened
+/// against, previously left unguarded at ordinary process restart. Each half is resolved independently,
+/// matching `--model`/`--reasoning-effort` being independent flags. `session_model`/`session_level` are
+/// expected to already carry `model_and_level_at_active`'s own fallback-to-`cfg`-when-nothing-recorded
+/// behavior (see that method's doc comment), so this is a no-op for a genuinely fresh session or pure
+/// in-memory mode regardless of which flags were explicit. Pulled out as a pure function — no
+/// `Persistence`/gateway needed — so the precedence itself is unit-testable on its own.
+fn resolve_startup_model_and_level(
+    cfg_model: &str,
+    cfg_level: agent_core::ThinkingLevel,
+    model_explicit: bool,
+    reasoning_effort_explicit: bool,
+    session_model: String,
+    session_level: agent_core::ThinkingLevel,
+) -> (String, agent_core::ThinkingLevel) {
+    (
+        if model_explicit {
+            cfg_model.to_string()
+        } else {
+            session_model
+        },
+        if reasoning_effort_explicit {
+            cfg_level
+        } else {
+            session_level
+        },
+    )
+}
+
 /// Run the control loop until stdin closes.
 pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::error::Error>> {
     let mut timing = crate::timing::StartupTiming::new();
@@ -1534,7 +1694,35 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
     // The model, thinking budget, and auto-compaction flag are runtime-switchable; everything else
     // (transport, tools, system prompt, loop bounds, cache settings) is fixed for the process.
     // `build_agent` folds the mutable trio into a fresh `Agent` whenever any of them changes.
-    let mut current_model = cfg.model.clone();
+    //
+    // Task #5 (pi-parity fix): when the operator didn't explicitly pass `--model`/`--reasoning-effort`
+    // for *this* invocation (`cfg.model_explicit`/`cfg.reasoning_effort_explicit` — see their own doc
+    // comments), prefer whatever this reattached session's own active tip was actually last running on
+    // over the CLI-resolved default, via the same `model_and_level_at_active` lookup `switch_session`
+    // already uses. Without this, `set_model gpt-5` in a live session, disconnect, then a plain `serve`
+    // in the same directory with no `--model` re-passed silently reverted to the global default for the
+    // rest of the process — the exact "bleed" class `switch_session`/`switch_branch` are hardened
+    // against (see their own doc comments), just left unguarded at ordinary process restart.
+    // `model_and_level_at_active` already falls back to `cfg.model`/the CLI-resolved level (via
+    // `self.meta.model`, which a fresh session's own `SessionMeta` is seeded from — see
+    // `Persistence::open`) when nothing was ever recorded reaching the active tip, so this is a no-op
+    // for a genuinely fresh session or pure in-memory mode. Model and level are resolved independently,
+    // matching `--model`/`--reasoning-effort` being independent flags — an explicit `--model` with no
+    // `--reasoning-effort` must still pick up the session's own last thinking level, not the process's
+    // bare `Off` default, and vice versa.
+    let cfg_level = cfg
+        .reasoning_effort
+        .map(agent_core::ThinkingLevel::from)
+        .unwrap_or(agent_core::ThinkingLevel::Off);
+    let (session_model, session_level) = persistence.model_and_level_at_active(cfg_level);
+    let (mut current_model, restored_level) = resolve_startup_model_and_level(
+        &cfg.model,
+        cfg_level,
+        cfg.model_explicit,
+        cfg.reasoning_effort_explicit,
+        session_model,
+        session_level,
+    );
     // `cycle_model`'s candidate list: the operator-scoped `--models` set when given (parsed by
     // `resolve_model_scope` — comma-separated patterns, each an exact id, a glob against
     // `available_models()`, or either suffixed with `:<thinking-level>` to pin that entry's depth —
@@ -1549,7 +1737,8 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
     };
     let mut current_thinking = cfg.thinking;
     // The portable thinking-depth level (see `agent_core::ThinkingLevel`) — the runtime-mutable
-    // counterpart to `cfg.reasoning_effort`, seeded from it so a process started with
+    // counterpart to `cfg.reasoning_effort` (or, per the Task #5 restoration above, whatever this
+    // reattached session's own active tip last recorded), seeded from it so a process started with
     // `--reasoning-effort` keeps that depth until `cycle_thinking_level`/`set_reasoning_effort` change
     // it. Unlike `current_thinking` (an explicit raw-budget override that wins when present), this
     // always takes effect: `build_agent` derives both the thinking budget *and* the reasoning effort
@@ -1560,12 +1749,8 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
     // OpenAI gpt-5 codex/pro line) has no legal `Off` state at all — leaving it there would silently
     // omit the reasoning field on every request and let the provider apply its own hidden default
     // effort, with the operator believing reasoning is off. See `agent_core::clamp_thinking_level`.
-    let starting_level = agent_core::clamp_thinking_level(
-        &agent_core::capabilities(&current_model),
-        cfg.reasoning_effort
-            .map(agent_core::ThinkingLevel::from)
-            .unwrap_or(agent_core::ThinkingLevel::Off),
-    );
+    let starting_level =
+        agent_core::clamp_thinking_level(&agent_core::capabilities(&current_model), restored_level);
     // The runtime-mutable level starts at `starting_level`, but `switch_branch` needs the original
     // starting value too — as the fallback for a branch that never recorded its own thinking-level
     // change (see `Persistence::model_and_level_at`), so switching to it lands on the process's real
@@ -2093,6 +2278,9 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                                                     m.insert("title".into(), json!(persistence.meta.title));
                                                     m.insert("cwd_stale".into(), json!(cwd_is_stale(&persistence.meta.cwd, &cwd)));
                                                     m.insert("session_file".into(), json!(persistence.session_file().map(|p| p.display().to_string())));
+                                                    // Task #25 (pi-parity fix): same fields, same reasoning, as the idle `get_state` arm below.
+                                                    m.insert("cwd".into(), json!(cwd.display().to_string()));
+                                                    m.insert("git_branch".into(), json!(git_branch(&cwd).await));
                                                     m.insert("is_streaming".into(), json!(true));
                                                     m.insert("is_compacting".into(), json!(is_compacting.load(Ordering::Relaxed)));
                                                     if let Value::Object(rt) = runtime_settings(current_level, current_auto_compaction, current_auto_retry, &steering) {
@@ -2431,6 +2619,14 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                         "session_file".into(),
                         json!(persistence.session_file().map(|p| p.display().to_string())),
                     );
+                    // Task #25 (pi-parity fix): the directory (and, best-effort, branch) the agent's
+                    // tools are actually operating against — the live process `cwd`, not
+                    // `persistence.meta.cwd` (already separately surfaced via `cwd_stale` when the two
+                    // disagree), since that's what a remote client with no shared filesystem needs to
+                    // know. See `git_branch`'s own doc comment for why a lookup failure is `null`, not
+                    // an error.
+                    m.insert("cwd".into(), json!(cwd.display().to_string()));
+                    m.insert("git_branch".into(), json!(git_branch(&cwd).await));
                     // Both hardcoded, not stale placeholders: no `prompt`/compaction can possibly be
                     // in flight here at all — this arm only ever runs from the idle main loop, which
                     // processes one command to completion before reading the next, so there is no
@@ -2745,10 +2941,45 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                 // Defaults to `true` (excluding the target entry itself), matching pi's real
                 // production client convention — pi-parity fix; previously defaulted to including it.
                 let before = cmd.get("before").and_then(Value::as_bool).unwrap_or(true);
-                match persistence.fork(upto, target_id, before) {
-                    Ok(s) => {
+                match persistence.fork(upto, target_id, before, starting_level) {
+                    Ok((s, restored_model, restored_level)) => {
                         session = s;
                         steering.clear();
+                        // Task #2 (pi-parity fix): restore whichever model/thinking-level was actually
+                        // active at the forked-from point, the same way `switch_session`/`switch_branch`
+                        // already do — see `Persistence::fork`'s own doc comment for why the process's
+                        // current global model/level must not silently bleed into a fork landing on an
+                        // entry recorded under a *different* one.
+                        let restored_level = agent_core::clamp_thinking_level(
+                            &agent_core::capabilities(&restored_model),
+                            restored_level,
+                        );
+                        let mut rebuild_needed = false;
+                        if restored_model != current_model {
+                            session.scrub_cross_model_state(&restored_model);
+                            current_model = restored_model;
+                            rebuild_needed = true;
+                        }
+                        if restored_level != current_level {
+                            current_level = restored_level;
+                            current_thinking = None;
+                            rebuild_needed = true;
+                        }
+                        if rebuild_needed {
+                            agent = build_agent(
+                                client.clone(),
+                                &full_system(&static_system, &cwd),
+                                &cfg,
+                                &current_model,
+                                current_thinking,
+                                current_level,
+                                current_auto_compaction,
+                                current_auto_retry,
+                                persistence.session_id(),
+                                &write_locks,
+                                &checkpoint,
+                            );
+                        }
                         emit!(response(
                             id,
                             "fork",
@@ -2756,6 +2987,8 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                             Some(json!({
                                 "session_id": persistence.session_id(),
                                 "cwd_stale": cwd_is_stale(&persistence.meta.cwd, &cwd),
+                                "model": current_model,
+                                "reasoning_effort": current_level.as_str(),
                             })),
                             None,
                         ));
@@ -2768,10 +3001,42 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
             // already defaults to exactly that (no `upto`/`target_id` given), so `clone` is a thin,
             // deliberately-argument-free alias over the same call for a client speaking pi's protocol
             // shape, not a second code path.
-            "clone" => match persistence.fork(usize::MAX, None, false) {
-                Ok(s) => {
+            "clone" => match persistence.fork(usize::MAX, None, false, starting_level) {
+                Ok((s, restored_model, restored_level)) => {
                     session = s;
                     steering.clear();
+                    // Task #2 (pi-parity fix): same restoration `fork` just above applies — see its
+                    // comment there.
+                    let restored_level = agent_core::clamp_thinking_level(
+                        &agent_core::capabilities(&restored_model),
+                        restored_level,
+                    );
+                    let mut rebuild_needed = false;
+                    if restored_model != current_model {
+                        session.scrub_cross_model_state(&restored_model);
+                        current_model = restored_model;
+                        rebuild_needed = true;
+                    }
+                    if restored_level != current_level {
+                        current_level = restored_level;
+                        current_thinking = None;
+                        rebuild_needed = true;
+                    }
+                    if rebuild_needed {
+                        agent = build_agent(
+                            client.clone(),
+                            &full_system(&static_system, &cwd),
+                            &cfg,
+                            &current_model,
+                            current_thinking,
+                            current_level,
+                            current_auto_compaction,
+                            current_auto_retry,
+                            persistence.session_id(),
+                            &write_locks,
+                            &checkpoint,
+                        );
+                    }
                     emit!(response(
                         id,
                         "clone",
@@ -2779,6 +3044,8 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                         Some(json!({
                             "session_id": persistence.session_id(),
                             "cwd_stale": cwd_is_stale(&persistence.meta.cwd, &cwd),
+                            "model": current_model,
+                            "reasoning_effort": current_level.as_str(),
                         })),
                         None,
                     ));
@@ -3764,6 +4031,16 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                     // no summarization call happens at all in that case.
                     let custom_instructions =
                         cmd.get("custom_instructions").and_then(Value::as_str);
+                    // Task #17 (pi-parity fix): `true` uses `custom_instructions` as the *entire*
+                    // instruction section instead of appending it after the default structured
+                    // template — see `Agent::summarize_branch`'s own doc comment for the exact
+                    // semantics. Read the same way `custom_instructions` itself is, just above; a no-op
+                    // when `custom_instructions` is absent, or when `summarize` is false (no
+                    // summarization call happens at all in that case).
+                    let replace_instructions = cmd
+                        .get("replace_instructions")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
                     let target_id = target_id.to_string();
                     // Branch summarization is one LLM call, but it's still a real network round trip
                     // — potentially the slowest single operation this loop ever awaits outside a
@@ -3782,6 +4059,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                             before,
                             summarize,
                             custom_instructions,
+                            replace_instructions,
                             &branch_cancel,
                         );
                         tokio::pin!(fut);
@@ -4734,14 +5012,15 @@ fn session_stats(session: &Session, model: &str) -> Value {
         })
     });
     let breakdown = message_type_breakdown(session);
+    let usage_totals = message_usage_totals(session);
     json!({
         "steps": session.steps,
-        "input_tokens": session.input_tokens,
-        "output_tokens": session.output_tokens,
-        "cache_read_tokens": session.cache_read_tokens,
-        "cache_write_tokens": session.cache_write_tokens,
-        "cache_write_1h_tokens": session.cache_write_1h_tokens,
-        "reasoning_tokens": session.reasoning_tokens,
+        "input_tokens": usage_totals.input_tokens,
+        "output_tokens": usage_totals.output_tokens,
+        "cache_read_tokens": usage_totals.cache_read_tokens,
+        "cache_write_tokens": usage_totals.cache_write_tokens,
+        "cache_write_1h_tokens": usage_totals.cache_write_1h_tokens,
+        "reasoning_tokens": usage_totals.reasoning_tokens,
         "last_input_tokens": session.last_input_tokens,
         "context_usage": context_usage,
         "user_messages": breakdown.user_messages,
@@ -4750,6 +5029,51 @@ fn session_stats(session: &Session, model: &str) -> Value {
         "tool_results": breakdown.tool_results,
         "total_messages": session.messages.len(),
     })
+}
+
+/// Cumulative token usage across every message currently in `session.messages` (Task #6, pi-parity
+/// fix) — computed fresh on every `session_stats` call, the same way `message_type_breakdown`, just
+/// below, already derives its counts fresh from `session.messages` rather than a running counter.
+///
+/// Previously `session_stats` read `Session::input_tokens`/`output_tokens`/... directly — those fields
+/// are a *process-lifetime* running total (`Session::record_usage` only ever adds to them) that resets
+/// to zero every time the process restarts, since `SessionStore::open` only restores `session.messages`
+/// from disk, never those counters. A resumed session's `get_session_stats` (and the `prompt`
+/// response/`get_state`, both of which share this same function) therefore reported totals covering
+/// only activity since the *current* process started, not the session's full history — silently
+/// resetting on every restart with no indication anything was lost.
+///
+/// Same caveat `message_type_breakdown` already carries: a compacted-away message's `usage` is gone
+/// along with the rest of its content, so this reports what's still visible on the active path, not a
+/// truly unbounded historical total — an accepted, pre-existing limitation of deriving these figures
+/// from `session.messages` at all, not something this fix introduces.
+struct MessageUsageTotals {
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    cache_write_1h_tokens: u64,
+    reasoning_tokens: u64,
+}
+
+fn message_usage_totals(session: &Session) -> MessageUsageTotals {
+    let mut totals = MessageUsageTotals {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        cache_write_1h_tokens: 0,
+        reasoning_tokens: 0,
+    };
+    for usage in session.messages.iter().filter_map(|m| m.usage) {
+        totals.input_tokens += u64::from(usage.input_tokens);
+        totals.output_tokens += u64::from(usage.output_tokens);
+        totals.cache_read_tokens += u64::from(usage.cache_read_tokens);
+        totals.cache_write_tokens += u64::from(usage.cache_write_tokens);
+        totals.cache_write_1h_tokens += u64::from(usage.cache_write_1h_tokens);
+        totals.reasoning_tokens += u64::from(usage.reasoning_tokens);
+    }
+    totals
 }
 
 /// pi's `userMessages`/`assistantMessages`/`toolCalls`/`toolResults` (`getSessionStats`) — a client
@@ -4868,15 +5192,25 @@ struct LiveStats {
 impl LiveStats {
     /// Seed from a session's current cumulative totals, so a `get_state`/`get_session_stats` answered
     /// one event into a brand-new turn still reflects everything before it, not a reset-to-zero count.
+    ///
+    /// Task #6 (pi-parity fix): seeded from [`message_usage_totals`] — the same per-message sum
+    /// `session_stats` itself now uses — rather than `Session::input_tokens`/`output_tokens`/... those
+    /// fields are only ever a *process-lifetime* running total (`Session::record_usage`'s own doc
+    /// comment), reset to zero on every restart since `SessionStore::open` never restores them from
+    /// disk. Seeding from the stale counters here meant the mid-run "busy" snapshot a client polls via
+    /// `get_state`/`get_session_stats` while a `prompt` is in flight (see the `prompt` arm's own
+    /// busy-loop) reported only the *current process's* activity on a resumed session, same bug, same
+    /// fix, different call site.
     fn from_session(session: &Session) -> Self {
+        let totals = message_usage_totals(session);
         Self {
             steps: AtomicU32::new(session.steps),
-            input_tokens: session.input_tokens.into(),
-            output_tokens: session.output_tokens.into(),
-            cache_read_tokens: session.cache_read_tokens.into(),
-            cache_write_tokens: session.cache_write_tokens.into(),
-            cache_write_1h_tokens: session.cache_write_1h_tokens.into(),
-            reasoning_tokens: session.reasoning_tokens.into(),
+            input_tokens: totals.input_tokens.into(),
+            output_tokens: totals.output_tokens.into(),
+            cache_read_tokens: totals.cache_read_tokens.into(),
+            cache_write_tokens: totals.cache_write_tokens.into(),
+            cache_write_1h_tokens: totals.cache_write_1h_tokens.into(),
+            reasoning_tokens: totals.reasoning_tokens.into(),
             last_input_tokens: AtomicU32::new(session.last_input_tokens),
             pending_tool_ids: std::sync::Mutex::new(std::collections::BTreeSet::new()),
         }
@@ -5291,6 +5625,7 @@ mod tests {
             model_id: None,
             error_message: None,
             aborted: false,
+            usage: None,
         });
         session.push(agent_core::Message::assistant(vec![
             agent_core::ContentBlock::text("done reading both files"),
@@ -5328,6 +5663,7 @@ mod tests {
             model_id: None,
             error_message: None,
             aborted: false,
+            usage: None,
         });
 
         let stats = session_stats(&session, "claude-opus-4-8");
@@ -5396,6 +5732,116 @@ mod tests {
         assert_eq!(stats["context_usage"]["context_window"], expected_window);
     }
 
+    #[test]
+    fn session_stats_sums_usage_from_message_history_not_the_process_lifetime_counter() {
+        // Task #6 (pi-parity fix): a resumed session's `Session::input_tokens`/`output_tokens`/...
+        // reset to zero every process restart (`SessionStore::open` only restores `session.messages`,
+        // never those running counters) — simulated here by setting them directly while leaving
+        // `session.messages` carrying the real historical `usage` a persisted session would actually
+        // have. `session_stats` must report the totals from the message history, not the
+        // process-lifetime counters (which this test deliberately sets to an obviously-wrong sentinel
+        // to prove they're ignored).
+        let mut session = Session::new();
+        session.user("go");
+        session.push(
+            agent_core::Message::assistant(vec![agent_core::ContentBlock::text("ok")])
+                .with_model_id("claude-opus-4-8")
+                .with_usage(agent_core::TokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 20,
+                    cache_read_tokens: 5,
+                    cache_write_tokens: 3,
+                    cache_write_1h_tokens: 1,
+                    reasoning_tokens: 2,
+                }),
+        );
+        session.push(
+            agent_core::Message::assistant(vec![agent_core::ContentBlock::text("more")])
+                .with_model_id("claude-opus-4-8")
+                .with_usage(agent_core::TokenUsage {
+                    input_tokens: 50,
+                    output_tokens: 10,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                    cache_write_1h_tokens: 0,
+                    reasoning_tokens: 0,
+                }),
+        );
+        // A "reset on restart" process-lifetime counter simulated as a wrong, stale value that must
+        // not leak into the reported totals.
+        session.input_tokens = 999_999;
+        session.output_tokens = 999_999;
+
+        let stats = session_stats(&session, "claude-opus-4-8");
+        assert_eq!(stats["input_tokens"], 150, "got: {stats}");
+        assert_eq!(stats["output_tokens"], 30, "got: {stats}");
+        assert_eq!(stats["cache_read_tokens"], 5, "got: {stats}");
+        assert_eq!(stats["cache_write_tokens"], 3, "got: {stats}");
+        assert_eq!(stats["cache_write_1h_tokens"], 1, "got: {stats}");
+        assert_eq!(stats["reasoning_tokens"], 2, "got: {stats}");
+    }
+
+    #[test]
+    fn session_stats_reports_full_history_after_a_simulated_restart() {
+        // The exact scenario Task #6 names: persist a session with several messages carrying usage,
+        // reload it fresh (simulating a process restart via a real `SessionStore`/`Persistence` round
+        // trip, not just constructing a `Session` by hand), then confirm `session_stats` reflects the
+        // full history rather than zero/current-process-only.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut persistence, mut session) =
+            Persistence::open_repo(dir.path(), "/w", "claude-opus-4-8", None).unwrap();
+        session.user("go");
+        session.push(
+            agent_core::Message::assistant(vec![agent_core::ContentBlock::text("ok")])
+                .with_model_id("claude-opus-4-8")
+                .with_usage(agent_core::TokenUsage {
+                    input_tokens: 1_000,
+                    output_tokens: 200,
+                    ..Default::default()
+                }),
+        );
+        persistence.persist(&session, None).unwrap();
+        drop(persistence);
+        drop(session);
+
+        // "Restart": a fresh `Persistence::open_repo` — a brand-new `Session::new()` with none of the
+        // in-memory counters the original process accumulated (matching a real process restart exactly,
+        // since those counters never persist regardless).
+        let (_restarted, reloaded) =
+            Persistence::open_repo(dir.path(), "/w", "claude-opus-4-8", None).unwrap();
+        assert_eq!(reloaded.input_tokens, 0, "sanity: the running counter itself stayed at zero");
+
+        let stats = session_stats(&reloaded, "claude-opus-4-8");
+        assert_eq!(
+            stats["input_tokens"], 1_000,
+            "must reflect the full persisted history, not the fresh process's zeroed counter: {stats}"
+        );
+        assert_eq!(stats["output_tokens"], 200, "got: {stats}");
+    }
+
+    #[test]
+    fn live_stats_from_session_seeds_from_message_history_not_the_process_lifetime_counter() {
+        // Same Task #6 fix, for the mid-run "busy" snapshot path (`LiveStats::from_session`, consulted
+        // by `get_state`/`get_session_stats` while a `prompt` is in flight) — it must seed from the same
+        // per-message totals `session_stats` uses, not the process-lifetime `Session` counters.
+        let mut session = Session::new();
+        session.push(
+            agent_core::Message::assistant(vec![agent_core::ContentBlock::text("ok")])
+                .with_model_id("claude-opus-4-8")
+                .with_usage(agent_core::TokenUsage {
+                    input_tokens: 42,
+                    output_tokens: 7,
+                    ..Default::default()
+                }),
+        );
+        session.input_tokens = 999_999; // stale process-lifetime counter, must be ignored
+
+        let live = LiveStats::from_session(&session);
+        let snapshot = live.snapshot();
+        assert_eq!(snapshot["input_tokens"], 42, "got: {snapshot}");
+        assert_eq!(snapshot["output_tokens"], 7, "got: {snapshot}");
+    }
+
     // Fix 1 (pi-parity bug): `default_project_trust` used to be checked *before* an explicit per-path
     // `TrustStore` entry, so an operator's specific `agent trust`/`agent untrust <path>` exception could
     // be silently overridden by a coarser blanket policy. `resolve_project_trust` is the shared
@@ -5447,6 +5893,9 @@ mod tests {
     #[test]
     fn resolve_project_trust_an_explicit_untrusted_entry_wins_over_an_always_policy() {
         // The mirror case: `agent untrust <path>` must win over a blanket `always` default too.
+        // `has_gated_resources: true` — Task #35's own fast path (below) short-circuits to trusted
+        // whenever there's nothing to gate at all, which would defeat the very precedence this test
+        // means to isolate if it were `false` here instead.
         use crate::settings::TrustPolicy;
         use crate::trust_store::Trust;
         assert!(!resolve_project_trust(
@@ -5454,12 +5903,15 @@ mod tests {
             false,
             Some(TrustPolicy::Always),
             Trust::Untrusted,
-            false,
+            true,
         ));
     }
 
     #[test]
     fn resolve_project_trust_falls_back_to_the_blanket_policy_only_when_the_lookup_is_unknown() {
+        // Both cases use `has_gated_resources: true` for the same reason as the test above — isolating
+        // the `Unknown`-branch blanket-policy precedence from Task #35's separate "nothing to gate"
+        // fast path, which is covered by its own dedicated test below.
         use crate::settings::TrustPolicy;
         use crate::trust_store::Trust;
         assert!(resolve_project_trust(
@@ -5474,8 +5926,28 @@ mod tests {
             false,
             Some(TrustPolicy::Never),
             Trust::Unknown,
-            false,
+            true,
         ));
+    }
+
+    #[test]
+    fn resolve_project_trust_nothing_to_gate_wins_outright_over_the_trust_store_and_any_policy() {
+        // Task #35 (pi-parity fix): pi's own `resolveProjectTrusted` runs the "nothing here for
+        // project trust to actually gate" fast path *before* consulting the trust store at all — so it
+        // wins even over an explicit per-path `Trust::Untrusted` entry or a blanket `never` policy, not
+        // just the `Unknown`+no-policy fallback this crate previously limited it to. Currently inert
+        // (no gated resource type hits this today), but this pins the correct precedence so a future
+        // gated resource type added without re-checking this ordering doesn't silently regress it.
+        use crate::settings::TrustPolicy;
+        use crate::trust_store::Trust;
+        assert!(
+            resolve_project_trust(false, false, None, Trust::Untrusted, false),
+            "an explicit untrusted entry must not matter when there's nothing to gate"
+        );
+        assert!(
+            resolve_project_trust(false, false, Some(TrustPolicy::Never), Trust::Unknown, false),
+            "a blanket never policy must not matter either, for the same reason"
+        );
     }
 
     #[test]
@@ -5708,7 +6180,7 @@ mod tests {
         let cancel = CancellationToken::new();
 
         let err = persistence
-            .switch_branch(&agent, "some-id", false, true, None, &cancel)
+            .switch_branch(&agent, "some-id", false, true, None, false, &cancel)
             .await
             .expect_err("must fail clearly, not panic, when there's no session tree to navigate");
 
@@ -5752,7 +6224,7 @@ mod tests {
         // Switching to `ids[1]` ("b") abandons "c"/"d" (non-empty), so `summarize:true` actually
         // attempts a summarization call rather than skipping it as a no-op.
         let err = persistence
-            .switch_branch(&agent, &ids[1], false, true, None, &cancel)
+            .switch_branch(&agent, &ids[1], false, true, None, false, &cancel)
             .await
             .expect_err("a genuine summarization failure must fail the whole switch");
         assert_ne!(
@@ -5766,6 +6238,67 @@ mod tests {
             persistence.store.as_ref().unwrap().active_ids(),
             ids.as_slice(),
             "a failed summarization must leave the session on its original branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn switch_branch_threads_replace_instructions_through_to_the_summarization_request() {
+        // Task #17 (pi-parity fix): `replace_instructions:true` must actually reach
+        // `Agent::summarize_branch`/`branch_summary::branch_summary_request` — previously `switch_branch`
+        // had no such parameter at all and always passed a hardcoded `false`, so a caller asking to
+        // fully replace the default structured template with its own instructions had no way to do so.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut persistence, _session) =
+            Persistence::open_repo(dir.path(), "/w", "claude-test", None).unwrap();
+        let ids = {
+            let store = persistence.store.as_mut().unwrap();
+            let mut session = Session::new();
+            session.user("a");
+            session.user("b");
+            session.user("c");
+            session.user("d");
+            store.append_new(&session.messages).unwrap();
+            store.active_ids().to_vec()
+        };
+
+        let transport = Arc::new(agent_core::MockTransport::new(vec![
+            agent_core::mock::turn::text("recap"),
+        ]));
+        let agent = Agent::new(transport.clone(), "claude-test");
+        let cancel = CancellationToken::new();
+
+        // Switching to "b" abandons "c"/"d" (non-empty), so `summarize:true` actually attempts a
+        // summarization call rather than skipping it as a no-op.
+        let (_session, _resolved) = persistence
+            .switch_branch(
+                &agent,
+                &ids[1],
+                false,
+                true,
+                Some("only mention the file names"),
+                true,
+                &cancel,
+            )
+            .await
+            .expect("summarization is scripted to succeed");
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1, "exactly one summarization call must fire");
+        let prompt = match requests[0].messages.first().map(|m| &m.content[0]) {
+            Some(agent_core::ContentBlock::Text { text, .. }) => text.clone(),
+            other => panic!("expected a single text block, got {other:?}"),
+        };
+        assert!(
+            prompt.contains("only mention the file names"),
+            "custom_instructions must reach the request: {prompt}"
+        );
+        assert!(
+            !prompt.contains(agent_core::branch_summary::BRANCH_SUMMARY_INSTRUCTION),
+            "replace_instructions:true must drop the default structured template entirely: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Additional focus:"),
+            "replace_instructions:true must not use the append-style framing: {prompt}"
         );
     }
 
@@ -5871,9 +6404,278 @@ mod tests {
         };
 
         let err = persistence
-            .fork(usize::MAX, None, false)
+            .fork(usize::MAX, None, false, agent_core::ThinkingLevel::Off)
             .expect_err("must fail clearly, not panic, without a repo to fork within");
 
         assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn fork_restores_the_model_and_level_recorded_at_the_forked_from_point() {
+        // Task #2 (pi-parity fix): `fork`/`clone` previously swapped `session`/`store` but never
+        // resolved model/level at all — the process's current global setting silently bled into the
+        // forked session regardless of what was actually recorded on the branch being forked. Since
+        // `SessionRepo::fork_at_entry` deliberately doesn't carry `ModelChange` bookkeeping into the new
+        // session's own file (see its doc comment), this must be resolved against the *source* tree,
+        // before the fork swaps `self.store`.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut persistence, _session) =
+            Persistence::open_repo(dir.path(), "/w", "claude-a", None).unwrap();
+        let ids = {
+            let store = persistence.store.as_mut().unwrap();
+            let mut session = Session::new();
+            session.user("a");
+            session.user("b");
+            store.append_new(&session.messages).unwrap();
+            store.active_ids().to_vec()
+        };
+        // Record a model change anchored at "a" (ids[0]) — everything from there on (including "b")
+        // should resolve to "claude-b", even though the *source* session's `meta.model` is still
+        // "claude-a" (its creation-time model) and the live process may be running neither.
+        {
+            let store = persistence.store.as_mut().unwrap();
+            store.switch_active(&ids[0]).unwrap();
+            store.record_model_change("claude-b").unwrap();
+            store.switch_active(&ids[1]).unwrap();
+        }
+
+        let (_session, restored_model, restored_level) = persistence
+            .fork(usize::MAX, None, false, agent_core::ThinkingLevel::Off)
+            .expect("fork must succeed");
+
+        assert_eq!(
+            restored_model, "claude-b",
+            "must resolve against the source tree's own recorded model change, not meta.model \
+             (\"claude-a\") or a hardcoded default"
+        );
+        // No thinking-level change was ever recorded, so this falls back to the process's own starting
+        // level, exactly like `model_and_level_at`'s doc comment describes.
+        assert_eq!(restored_level, agent_core::ThinkingLevel::Off);
+
+        // The new session's own header must NOT have silently inherited a stale model either — Task
+        // #18 fixes `record_model_change` to also keep `meta.model` current, so the source's `meta`
+        // (copied verbatim into the fork's own header by `SessionRepo::fork`) already reflects the
+        // latest recorded model by the time the fork runs.
+        assert_eq!(persistence.meta.model, "claude-b");
+    }
+
+    #[test]
+    fn fork_at_entry_restores_the_model_recorded_at_the_target_not_the_active_tip() {
+        // Same as the test above, but for the `target_id`-based `fork_at_entry` path — the resolved
+        // point is `target_id` itself (or its parent, when `before` is set), not wherever the active
+        // path currently ends.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut persistence, _session) =
+            Persistence::open_repo(dir.path(), "/w", "claude-a", None).unwrap();
+        let ids = {
+            let store = persistence.store.as_mut().unwrap();
+            let mut session = Session::new();
+            session.user("a");
+            session.user("b");
+            store.append_new(&session.messages).unwrap();
+            store.active_ids().to_vec()
+        };
+        {
+            let store = persistence.store.as_mut().unwrap();
+            store.record_model_change("claude-b").unwrap(); // anchored at the active tip, "b"
+        }
+
+        // Forking at "a" (before the model change ever took effect) must resolve to "claude-a", not
+        // "claude-b" — the change was anchored at "b", not "a".
+        let (_session, restored_model, _restored_level) = persistence
+            .fork(
+                usize::MAX,
+                Some(&ids[0]),
+                false,
+                agent_core::ThinkingLevel::Off,
+            )
+            .expect("fork_at_entry must succeed");
+        assert_eq!(restored_model, "claude-a");
+    }
+
+    #[test]
+    fn resolve_startup_model_and_level_prefers_the_session_only_when_not_explicit() {
+        // Task #5 (pi-parity fix): the precedence matrix `serve`'s startup relies on — each half
+        // (model vs level) resolved independently, matching `--model`/`--reasoning-effort` being
+        // independent flags.
+        let cfg_level = agent_core::ThinkingLevel::Off;
+        let session_level = agent_core::ThinkingLevel::High;
+
+        // Neither flag explicit: both halves come from the session.
+        assert_eq!(
+            resolve_startup_model_and_level(
+                "cfg-model",
+                cfg_level,
+                false,
+                false,
+                "session-model".to_string(),
+                session_level,
+            ),
+            ("session-model".to_string(), session_level)
+        );
+
+        // Both explicit: both halves come from cfg, regardless of what the session recorded.
+        assert_eq!(
+            resolve_startup_model_and_level(
+                "cfg-model",
+                cfg_level,
+                true,
+                true,
+                "session-model".to_string(),
+                session_level,
+            ),
+            ("cfg-model".to_string(), cfg_level)
+        );
+
+        // Only `--model` explicit: model from cfg, level still from the session — an explicit model
+        // override must not also silently reset the thinking level back to the process's bare default.
+        assert_eq!(
+            resolve_startup_model_and_level(
+                "cfg-model",
+                cfg_level,
+                true,
+                false,
+                "session-model".to_string(),
+                session_level,
+            ),
+            ("cfg-model".to_string(), session_level)
+        );
+
+        // Only `--reasoning-effort` explicit: the reverse split.
+        assert_eq!(
+            resolve_startup_model_and_level(
+                "cfg-model",
+                cfg_level,
+                false,
+                true,
+                "session-model".to_string(),
+                session_level,
+            ),
+            ("session-model".to_string(), cfg_level)
+        );
+    }
+
+    #[test]
+    fn serve_startup_restores_a_reattached_sessions_own_model_over_the_cli_default() {
+        // Task #5 (pi-parity fix): a plain `serve` reattaching to an existing session — no `--model`
+        // passed — must continue on whatever that session was actually last driven on
+        // (`set_model gpt-5` mid-session, then a restart), not silently revert to the process's
+        // CLI-resolved default. This drives the exact pieces `serve`'s own startup composes
+        // (`Persistence::open_repo` to "restart", then `model_and_level_at_active` +
+        // `resolve_startup_model_and_level`) without needing a live gateway/stdin to exercise `serve`
+        // itself end to end.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut persistence, _session) =
+            Persistence::open_repo(dir.path(), "/w", "claude-original", None).unwrap();
+        let mut session = Session::new();
+        {
+            let store = persistence.store.as_mut().unwrap();
+            session.user("hello");
+            store.append_new(&session.messages).unwrap();
+        }
+        persistence
+            .store
+            .as_mut()
+            .unwrap()
+            .record_model_change("gpt-5")
+            .unwrap();
+        {
+            // A change is anchored at the tip it's recorded against and takes effect for what comes
+            // *after* it, not the tip itself (see `SessionStore::record_model_change`'s own doc comment
+            // and `model_and_thinking_level_changes_are_branch_scoped`) — so a follow-up turn actually
+            // has to land *after* the `set_model` for the active tip to observe the new model, matching
+            // every real `set_model`-then-continue session shape.
+            let store = persistence.store.as_mut().unwrap();
+            session.push(agent_core::Message::assistant(vec![agent_core::ContentBlock::text(
+                "hi there",
+            )]));
+            store.append_new(&session.messages).unwrap();
+        }
+        drop(persistence);
+
+        // "Restart": a fresh `Persistence::open_repo` against the same directory/cwd, exactly like a
+        // brand-new `serve` process's `Persistence::open` would do — reattaching to the most recent
+        // session for this cwd rather than creating a new one.
+        let (restarted, _session) =
+            Persistence::open_repo(dir.path(), "/w", "claude-cli-default", None).unwrap();
+
+        let cfg_level = agent_core::ThinkingLevel::Off;
+        let (session_model, session_level) = restarted.model_and_level_at_active(cfg_level);
+        // No `--model`/`--reasoning-effort` passed on this "restart" (`model_explicit: false`,
+        // `reasoning_effort_explicit: false`) — the session's own recorded model must win over
+        // "claude-cli-default", the value a bare `serve` with no flag would otherwise have resolved to.
+        let (current_model, _starting_level) = resolve_startup_model_and_level(
+            "claude-cli-default",
+            cfg_level,
+            false,
+            false,
+            session_model,
+            session_level,
+        );
+        assert_eq!(
+            current_model, "gpt-5",
+            "must continue on the session's own last-set model, not the CLI/global default"
+        );
+
+        // An explicit `--model` on the same restart must still win outright.
+        let (session_model, session_level) = restarted.model_and_level_at_active(cfg_level);
+        let (current_model, _starting_level) = resolve_startup_model_and_level(
+            "claude-explicit-override",
+            cfg_level,
+            true,
+            false,
+            session_model,
+            session_level,
+        );
+        assert_eq!(current_model, "claude-explicit-override");
+    }
+
+    /// Runs `git` with `args` in `cwd`, synchronously — test setup only (the production `git_branch`
+    /// helper uses the async `tokio::process::Command` instead; see its own doc comment for why).
+    fn run_git(cwd: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .status()
+            .expect("git must be on PATH for this test");
+        assert!(status.success(), "git {args:?} failed in {}", cwd.display());
+    }
+
+    #[tokio::test]
+    async fn git_branch_reports_none_outside_a_git_repository() {
+        // Task #25 (pi-parity fix): a lookup failure (no repo here at all) must report `None`, never
+        // an error surfaced to the RPC caller.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(git_branch(dir.path()).await, None);
+    }
+
+    #[tokio::test]
+    async fn git_branch_reports_the_current_branch_inside_a_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        run_git(dir.path(), &["init", "--quiet", "--initial-branch=main"]);
+        run_git(dir.path(), &["commit", "--quiet", "--allow-empty", "-m", "init"]);
+        run_git(dir.path(), &["checkout", "--quiet", "-b", "feature/pi-parity"]);
+
+        assert_eq!(
+            git_branch(dir.path()).await.as_deref(),
+            Some("feature/pi-parity")
+        );
+    }
+
+    #[tokio::test]
+    async fn git_branch_reports_none_on_a_detached_head() {
+        // `git symbolic-ref --short HEAD` (and this helper) only ever resolves a real branch ref —
+        // detached HEAD has none, matching `symbolic-ref`'s own failure in that state rather than
+        // falling back to a raw commit SHA.
+        let dir = tempfile::tempdir().unwrap();
+        run_git(dir.path(), &["init", "--quiet", "--initial-branch=main"]);
+        run_git(dir.path(), &["commit", "--quiet", "--allow-empty", "-m", "init"]);
+        run_git(dir.path(), &["checkout", "--quiet", "HEAD~0"]);
+
+        assert_eq!(git_branch(dir.path()).await, None);
     }
 }

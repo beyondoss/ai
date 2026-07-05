@@ -331,20 +331,11 @@ pub fn build_body(req: &ModelRequest) -> Value {
         max_tokens_field.into(),
         json!(super::clamp_max_tokens_to_context(req, &caps)),
     );
-    // Reasoning models are driven by `reasoning_effort` (minimal/low/medium/high/xhigh) rather than a
-    // thinking-token budget; emit it when the model takes one and the caller set a level. When no
-    // level is set but the model can be told explicitly to turn reasoning off, send that instead of
-    // omitting the field — matching `dialect::openai_responses`'s `{"effort":"none"}` (this dialect's
-    // field is flat, so the equivalent here is `reasoning_effort: "none"`) rather than silently
-    // relying on whatever the provider's own undocumented default does when the field is absent.
-    if caps.reasoning_effort {
-        if let Some(effort) = req.reasoning_effort {
-            let effort = crate::models::clamp_reasoning_effort(&caps, effort);
-            map.insert("reasoning_effort".into(), json!(effort.as_str()));
-        } else if caps.reasoning_disableable {
-            map.insert("reasoning_effort".into(), json!("none"));
-        }
-    }
+    // Reasoning models are driven by a reasoning-toggle field rather than a thinking-token budget; the
+    // exact wire shape is family-specific (see `apply_reasoning_wire`'s own doc comment) — most take a
+    // bare `reasoning_effort` string, several third-party providers want a nested `thinking`/`reasoning`
+    // object instead.
+    apply_reasoning_wire(&mut map, &caps, req.reasoning_effort);
     map.insert("stream".into(), json!(true));
     // Ask for a trailing usage chunk so token accounting works on the streaming path.
     map.insert("stream_options".into(), json!({ "include_usage": true }));
@@ -412,6 +403,91 @@ pub fn build_body(req: &ModelRequest) -> Value {
         map.insert("tool_choice".into(), tool_choice(choice));
     }
     Value::Object(map)
+}
+
+/// Emit `req`'s reasoning effort (if any) onto `map` in whichever wire shape `caps`'s model actually
+/// expects — mirrors pi's per-`compat.thinkingFormat` branch in `openai-completions.ts::buildParams`.
+/// `requested` is `req.reasoning_effort` (`None` when no thinking level is active this turn); every
+/// clamp/effort-string derivation below goes through [`crate::models::clamp_reasoning_effort`] so a
+/// level a specific model doesn't accept (e.g. an unsupported `xhigh`) never reaches the wire raw.
+///
+/// - [`OpenAiReasoningFormat::Standard`] (o-series, gpt-5, xAI, Groq, Cerebras, and any model this
+///   table doesn't special-case): the shape this dialect always emitted before third-party coverage
+///   existed — a bare `reasoning_effort` string, or an explicit `"none"` when the model can be told to
+///   turn reasoning off ([`ModelCaps::reasoning_disableable`]) and no level is requested.
+/// - [`OpenAiReasoningFormat::DeepSeek`] (DeepSeek, and Moonshot/Kimi which pi tags identically):
+///   `thinking: {"type": "enabled"|"disabled"}`, the `"disabled"` arm gated on
+///   `reasoning_disableable` (pi: `thinkingLevelMap?.off !== null`) — plus a sibling top-level
+///   `reasoning_effort` string only when [`ModelCaps::reasoning_effort`] is also `true` (DeepSeek has a
+///   real effort vocabulary; Kimi never does).
+/// - [`OpenAiReasoningFormat::Zai`] (Z.ai/GLM): the same `thinking` toggle, but sent *unconditionally*
+///   (pi never gates the `"disabled"` arm here) and with `clear_thinking: false` on the enabled shape;
+///   plus a sibling `reasoning_effort` string only from GLM-5.2 onward
+///   ([`ModelCaps::reasoning_effort`]).
+/// - [`OpenAiReasoningFormat::Together`]: a nested `reasoning: {"enabled": bool}`, sent
+///   unconditionally, plus a sibling top-level `reasoning_effort` string only when
+///   [`ModelCaps::reasoning_effort`] is also `true`.
+/// - [`OpenAiReasoningFormat::OpenRouter`] (OpenRouter, and the generic vendor/model-shaped fallback):
+///   a nested `reasoning: {"effort": "<level>"}`, or `{"effort": "none"}` when `reasoning_disableable`
+///   and no level is requested.
+fn apply_reasoning_wire(
+    map: &mut Map<String, Value>,
+    caps: &crate::models::ModelCaps,
+    requested: Option<crate::transport::ReasoningEffort>,
+) {
+    use crate::models::OpenAiReasoningFormat as Fmt;
+    let wire_str = |e: crate::transport::ReasoningEffort| -> &'static str {
+        crate::models::clamp_reasoning_effort(caps, e).as_str()
+    };
+    match caps.openai_reasoning_format {
+        Fmt::Standard => {
+            if caps.reasoning_effort {
+                if let Some(effort) = requested {
+                    map.insert("reasoning_effort".into(), json!(wire_str(effort)));
+                } else if caps.reasoning_disableable {
+                    map.insert("reasoning_effort".into(), json!("none"));
+                }
+            }
+        }
+        Fmt::DeepSeek => {
+            if let Some(effort) = requested {
+                map.insert("thinking".into(), json!({ "type": "enabled" }));
+                if caps.reasoning_effort {
+                    map.insert("reasoning_effort".into(), json!(wire_str(effort)));
+                }
+            } else if caps.reasoning_disableable {
+                map.insert("thinking".into(), json!({ "type": "disabled" }));
+            }
+        }
+        Fmt::Zai => {
+            if let Some(effort) = requested {
+                map.insert(
+                    "thinking".into(),
+                    json!({ "type": "enabled", "clear_thinking": false }),
+                );
+                if caps.reasoning_effort {
+                    map.insert("reasoning_effort".into(), json!(wire_str(effort)));
+                }
+            } else {
+                map.insert("thinking".into(), json!({ "type": "disabled" }));
+            }
+        }
+        Fmt::Together => {
+            map.insert("reasoning".into(), json!({ "enabled": requested.is_some() }));
+            if caps.reasoning_effort {
+                if let Some(effort) = requested {
+                    map.insert("reasoning_effort".into(), json!(wire_str(effort)));
+                }
+            }
+        }
+        Fmt::OpenRouter => {
+            if let Some(effort) = requested {
+                map.insert("reasoning".into(), json!({ "effort": wire_str(effort) }));
+            } else if caps.reasoning_disableable {
+                map.insert("reasoning".into(), json!({ "effort": "none" }));
+            }
+        }
+    }
 }
 
 /// Map a [`ToolChoice`] to OpenAI's `tool_choice`. The auto/none/required cases are bare strings; a
@@ -1070,6 +1146,137 @@ mod tests {
         assert!(body.get("reasoning_effort").is_none());
     }
 
+    // ---- Third-party reasoning-toggle wire shapes (pi-parity: these used to always emit nothing) ----
+
+    #[test]
+    fn deepseek_thinking_toggle_and_reasoning_effort_are_both_emitted() {
+        use crate::transport::ReasoningEffort;
+        // DeepSeek: a requested effort turns on `thinking: {"type": "enabled"}` *and* a sibling
+        // top-level `reasoning_effort` string (DeepSeek has a real effort vocabulary).
+        let body = build_body(
+            &ModelRequest::new("deepseek-v4-pro", vec![Message::user("hi")], 64)
+                .with_reasoning_effort(ReasoningEffort::High),
+        );
+        assert_eq!(body["thinking"], json!({ "type": "enabled" }));
+        assert_eq!(body["reasoning_effort"], "high");
+
+        // No level requested — the model is disableable, so an explicit "disabled" toggle is sent
+        // (not a fabricated `reasoning_effort`, which this family never receives when idle).
+        let body = build_body(&ModelRequest::new(
+            "deepseek-v4-pro",
+            vec![Message::user("hi")],
+            64,
+        ));
+        assert_eq!(body["thinking"], json!({ "type": "disabled" }));
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn kimi_thinking_toggle_is_emitted_with_no_reasoning_effort_string() {
+        use crate::transport::ReasoningEffort;
+        // Moonshot/Kimi shares DeepSeek's toggle shape but has no effort vocabulary at all
+        // (`supportsReasoningEffort: false` on every id) — the toggle turns on, but no
+        // `reasoning_effort` string ever accompanies it.
+        let body = build_body(
+            &ModelRequest::new("kimi-k2-thinking", vec![Message::user("hi")], 64)
+                .with_reasoning_effort(ReasoningEffort::Medium),
+        );
+        assert_eq!(body["thinking"], json!({ "type": "enabled" }));
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "Kimi never gets a reasoning_effort string"
+        );
+    }
+
+    #[test]
+    fn zai_glm_thinking_toggle_is_unconditional_even_when_idle() {
+        use crate::transport::ReasoningEffort;
+        // Z.ai/GLM sends the toggle unconditionally (pi never gates the "disabled" arm on a
+        // reasoning_disableable check the way DeepSeek does), with `clear_thinking: false` on enable.
+        let body = build_body(
+            &ModelRequest::new("glm-4.7", vec![Message::user("hi")], 64)
+                .with_reasoning_effort(ReasoningEffort::High),
+        );
+        assert_eq!(
+            body["thinking"],
+            json!({ "type": "enabled", "clear_thinking": false })
+        );
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "pre-5.2 GLM has no effort vocabulary"
+        );
+
+        // glm-5.2 additionally gets the reasoning_effort string once it has a real vocabulary.
+        let body = build_body(
+            &ModelRequest::new("glm-5.2", vec![Message::user("hi")], 64)
+                .with_reasoning_effort(ReasoningEffort::High),
+        );
+        assert_eq!(body["reasoning_effort"], "high");
+
+        // Idle (no level requested) still gets the unconditional "disabled" toggle.
+        let body = build_body(&ModelRequest::new("glm-4.7", vec![Message::user("hi")], 64));
+        assert_eq!(body["thinking"], json!({ "type": "disabled" }));
+    }
+
+    #[test]
+    fn together_reasoning_object_is_always_present_with_enabled_flag() {
+        use crate::transport::ReasoningEffort;
+        // Together: a nested `reasoning: {"enabled": bool}` sent unconditionally, regardless of
+        // whether a level is requested.
+        let idle = build_body(&ModelRequest::new(
+            "qwen/qwen3.6-plus",
+            vec![Message::user("hi")],
+            64,
+        ));
+        assert_eq!(idle["reasoning"], json!({ "enabled": false }));
+        assert!(idle.get("reasoning_effort").is_none());
+
+        let active = build_body(
+            &ModelRequest::new("qwen/qwen3.6-plus", vec![Message::user("hi")], 64)
+                .with_reasoning_effort(ReasoningEffort::Medium),
+        );
+        assert_eq!(active["reasoning"], json!({ "enabled": true }));
+    }
+
+    #[test]
+    fn openrouter_style_reasoning_effort_is_nested_under_a_reasoning_object() {
+        use crate::transport::ReasoningEffort;
+        // OpenRouter (and the generic vendor/model-shaped fallback): a nested `reasoning: {"effort"}`,
+        // never a bare top-level `reasoning_effort`.
+        let body = build_body(
+            &ModelRequest::new("some-vendor/some-model", vec![Message::user("hi")], 64)
+                .with_reasoning_effort(ReasoningEffort::Low),
+        );
+        assert_eq!(body["reasoning"], json!({ "effort": "low" }));
+        assert!(body.get("reasoning_effort").is_none());
+
+        // Idle and disableable: an explicit "none" effort, not a missing field.
+        let idle = build_body(&ModelRequest::new(
+            "some-vendor/some-model",
+            vec![Message::user("hi")],
+            64,
+        ));
+        assert_eq!(idle["reasoning"], json!({ "effort": "none" }));
+    }
+
+    #[test]
+    fn xai_never_gets_a_reasoning_or_thinking_field_at_all() {
+        use crate::transport::ReasoningEffort;
+        // xAI/Grok: pi's `detectCompat` marks this whole family `supportsReasoningEffort: false`
+        // unconditionally — no client-steerable toggle exists on the wire, so even an explicit
+        // `with_reasoning_effort` call must produce no reasoning-shaped field at all.
+        let body = build_body(
+            &ModelRequest::new("grok-4.3", vec![Message::user("hi")], 64)
+                .with_reasoning_effort(ReasoningEffort::High),
+        );
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("reasoning").is_none());
+        assert!(body.get("thinking").is_none());
+        // Its real output ceiling (30k, not the flat 4096 `unknown()` default) is exercised by
+        // `models::tests::xai_never_emits_a_reasoning_field_matching_pis_unconditional_opt_out`.
+        assert_eq!(body["max_completion_tokens"], 64);
+    }
+
     #[test]
     fn tool_result_images_fan_out_to_a_user_message() {
         use crate::message::ImageSource;
@@ -1311,6 +1518,7 @@ mod tests {
                 model_id: None,
                 error_message: None,
                 aborted: false,
+                usage: None,
             }],
             64,
         );

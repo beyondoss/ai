@@ -1,8 +1,9 @@
-//! GitHub Copilot — device-code login. Standard (non-Enterprise) GitHub only for the interactive
-//! `login()` flow (this port's scoped simplification — Enterprise's own device/token endpoints are
-//! identical modulo the domain, so `refresh()`/`base_url_from_token()` both still take an
-//! `enterprise_domain` for a credential that already has one recorded, e.g. hand-edited into
-//! `auth.json`; only the initial interactive login doesn't prompt for one).
+//! GitHub Copilot — device-code login. `login()` prompts for an optional GitHub Enterprise domain
+//! (Task #4, pi-parity fix — mirrors pi's own `loginGitHubCopilot`'s identical prompt): a blank answer
+//! defaults to `github.com`; any other answer normalizes to a bare hostname and threads through every
+//! URL the device/token exchange builds, ending up recorded on the stored credential's own
+//! `enterprise_url` — the same field `refresh()`/`base_url_from_token()` already accepted for a
+//! credential that had one recorded some other way (e.g. hand-edited into `auth.json`) before this fix.
 
 use std::time::Duration;
 
@@ -79,8 +80,20 @@ pub async fn login(
     known_model_ids: &[&str],
 ) -> Result<GithubCopilotCredential> {
     let http = Client::new();
-    let domain = "github.com";
-    let device = request_device_code(&http, domain).await?;
+    // Task #4 (pi-parity fix): prompt for an optional GitHub Enterprise domain before starting the
+    // device flow — mirrors pi's own `loginGitHubCopilot`'s identical `onPrompt`/`normalizeDomain`
+    // sequence. `TextPrompt` already exists for exactly this purpose (see its own doc comment naming
+    // "a GitHub Enterprise domain" as a use case); this was previously the one login flow that never
+    // actually asked, so `enterprise_url` on the stored credential was always `None` regardless of
+    // account type.
+    let domain_input = callbacks
+        .prompt_text(&super::callbacks::TextPrompt {
+            message: "GitHub Enterprise URL/domain (blank for github.com)",
+            placeholder: Some("company.ghe.com"),
+        })
+        .await?;
+    let (enterprise_url, domain) = resolve_login_domain(&domain_input)?;
+    let device = request_device_code(&http, &domain).await?;
 
     callbacks
         .show_device_code(&DeviceCodeInfo {
@@ -108,8 +121,9 @@ pub async fn login(
     .await?;
 
     callbacks.progress("Fetching Copilot token...").await;
-    let (copilot_token, expires_at_ms) = fetch_copilot_token(&http, &github_token, None).await?;
-    let base_url = base_url_from_token(Some(&copilot_token), None);
+    let (copilot_token, expires_at_ms) =
+        fetch_copilot_token(&http, &github_token, enterprise_url.as_deref()).await?;
+    let base_url = base_url_from_token(Some(&copilot_token), enterprise_url.as_deref());
 
     callbacks.progress("Enabling available models...").await;
     enable_models(&http, &base_url, &copilot_token, known_model_ids).await;
@@ -121,9 +135,43 @@ pub async fn login(
         access: copilot_token,
         refresh: github_token,
         expires_at_ms,
-        enterprise_url: None,
+        enterprise_url,
         available_model_ids,
     })
+}
+
+/// Resolve `login()`'s prompted domain input into `(stored_enterprise_url, device_flow_domain)` — pi's
+/// own `loginGitHubCopilot` does the identical thing inline (`normalizeDomain` + `enterpriseDomain ||
+/// "github.com"`). A blank/whitespace-only answer means plain `github.com`, nothing enterprise-specific
+/// to record (`stored_enterprise_url: None`); anything else must normalize to a real hostname (see
+/// [`normalize_enterprise_domain`]) or the whole login fails outright — matching pi, which throws
+/// rather than silently falling back to `github.com` on a typo'd domain.
+fn resolve_login_domain(input: &str) -> Result<(Option<String>, String)> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok((None, "github.com".to_string()));
+    }
+    match normalize_enterprise_domain(trimmed) {
+        Some(host) => Ok((Some(host.clone()), host)),
+        None => Err(OAuthError::InvalidInput(
+            "Invalid GitHub Enterprise URL/domain".to_string(),
+        )),
+    }
+}
+
+/// Normalize a raw GitHub Enterprise URL/domain into a bare hostname (`"company.ghe.com"`) — accepts
+/// either a bare host or a full URL with an explicit scheme, mirrors pi's own `normalizeDomain`
+/// (`packages/ai/src/utils/oauth/github-copilot.ts`). `None` for input that doesn't parse as a URL/host
+/// at all; the caller ([`resolve_login_domain`]) turns that into a hard login error rather than a
+/// silent fallback to `github.com`.
+fn normalize_enterprise_domain(trimmed: &str) -> Option<String> {
+    let candidate = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
+    };
+    let parsed = url::Url::parse(&candidate).ok()?;
+    parsed.host_str().map(str::to_string)
 }
 
 /// Refresh the Copilot-internal token from the long-lived GitHub device-flow token. Unlike `login`,
@@ -558,6 +606,76 @@ mod tests {
             base_url_from_token(Some("tid=abc;exp=123"), None),
             "https://api.individual.githubcopilot.com"
         );
+    }
+
+    #[test]
+    fn resolve_login_domain_a_blank_answer_defaults_to_github_com_with_no_stored_enterprise_url() {
+        let (enterprise_url, domain) = resolve_login_domain("").unwrap();
+        assert_eq!(enterprise_url, None);
+        assert_eq!(domain, "github.com");
+    }
+
+    #[test]
+    fn resolve_login_domain_whitespace_only_is_treated_as_blank() {
+        let (enterprise_url, domain) = resolve_login_domain("   \n  ").unwrap();
+        assert_eq!(enterprise_url, None);
+        assert_eq!(domain, "github.com");
+    }
+
+    #[test]
+    fn resolve_login_domain_a_bare_hostname_is_used_verbatim_and_stored_as_the_enterprise_url() {
+        let (enterprise_url, domain) = resolve_login_domain("company.ghe.com").unwrap();
+        assert_eq!(enterprise_url.as_deref(), Some("company.ghe.com"));
+        assert_eq!(domain, "company.ghe.com");
+        // The device-flow URLs this feeds `request_device_code`/`fetch_copilot_token` are built
+        // directly from `domain` — confirming the resolved value is exactly the hostname the device
+        // flow (and the stored credential's `enterprise_url`) must both use.
+        assert_eq!(
+            format!("https://{domain}/login/device/code"),
+            "https://company.ghe.com/login/device/code"
+        );
+    }
+
+    #[test]
+    fn resolve_login_domain_a_full_url_normalizes_down_to_just_the_hostname() {
+        let (enterprise_url, domain) =
+            resolve_login_domain("https://company.ghe.com/some/path").unwrap();
+        assert_eq!(enterprise_url.as_deref(), Some("company.ghe.com"));
+        assert_eq!(domain, "company.ghe.com");
+    }
+
+    #[test]
+    fn resolve_login_domain_trims_surrounding_whitespace_before_normalizing() {
+        let (enterprise_url, domain) = resolve_login_domain("  company.ghe.com  ").unwrap();
+        assert_eq!(enterprise_url.as_deref(), Some("company.ghe.com"));
+        assert_eq!(domain, "company.ghe.com");
+    }
+
+    #[test]
+    fn resolve_login_domain_rejects_unparsable_non_blank_input() {
+        let err = resolve_login_domain("not a valid domain!! ??").unwrap_err();
+        assert!(matches!(err, OAuthError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn normalize_enterprise_domain_accepts_a_bare_host_with_no_scheme() {
+        assert_eq!(
+            normalize_enterprise_domain("company.ghe.com").as_deref(),
+            Some("company.ghe.com")
+        );
+    }
+
+    #[test]
+    fn normalize_enterprise_domain_accepts_a_url_with_a_scheme_and_path() {
+        assert_eq!(
+            normalize_enterprise_domain("https://company.ghe.com/x/y").as_deref(),
+            Some("company.ghe.com")
+        );
+    }
+
+    #[test]
+    fn normalize_enterprise_domain_rejects_garbage() {
+        assert_eq!(normalize_enterprise_domain("not a valid domain!! ??"), None);
     }
 
     #[test]

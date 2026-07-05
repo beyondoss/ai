@@ -79,6 +79,33 @@ pub struct Settings {
     /// rather than a panic or a silently-wrong effort reaching the wire.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_reasoning_effort: Option<String>,
+    /// A persisted, cross-session override for whether every image is forced down the same
+    /// downgrade-to-text-placeholder path a vision-*incapable* model already gets — Task #26 (pi-parity
+    /// feature): Round 1 added `agent_core::Agent::with_block_images`/`Agent.block_images`, an
+    /// operator-facing override independent of the active model's real `supports_vision` capability
+    /// (bandwidth, compliance, or a proxy that strips/rejects multipart image content, even against a
+    /// vision-capable model). `Some(true)` behaves as if `--block-images` were always passed;
+    /// `Some(false)`/`None` leave `--block-images`'s own default (images allowed) as the sole source of
+    /// truth — mirrors `compaction_enabled`'s identical tri-state convention above. Set via
+    /// `agent settings --block-images`/`--clear-block-images`: unlike `compaction_enabled` (mutated via
+    /// a live `serve` RPC command), `run` has no long-lived session to toggle it from, so the CLI is the
+    /// only mutation surface here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_images: Option<bool>,
+    /// Persisted per-reasoning-effort thinking-token-budget overrides — Task #36 (pi-parity feature):
+    /// Round 1 added `agent_core::models::budget_for_effort_with_override`, letting a caller tune the
+    /// effort-to-token-budget ladder itself rather than only picking an effort level (pi's own model
+    /// registry supports the identical per-deployment tuning). Keyed by the same wire vocabulary
+    /// `default_reasoning_effort` uses above (minimal/low/medium/high/xhigh); consulted by `main.rs`'s
+    /// `run` wherever a turn's thinking budget is derived from `--reasoning-effort`, in place of
+    /// `agent_core`'s built-in fixed ladder. Stored as plain strings to u32, not
+    /// `agent_core::ReasoningEffort` to u32, matching `default_reasoning_effort`'s own "no hard
+    /// dependency on `agent_core`'s exact type layout" convention; an unrecognized key is skipped at
+    /// read time rather than failing the whole file (`main.rs::resolve_thinking_budget_overrides`).
+    /// `None`/empty are treated the same (no overrides configured at all) — an override table that
+    /// loses its last entry is pruned back to `None` rather than left as `Some({})`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_budget_overrides: Option<std::collections::BTreeMap<String, u32>>,
 }
 
 /// A persisted settings file, one per machine (not per-project — matches pi's own global settings tier;
@@ -143,6 +170,38 @@ impl SettingsStore {
     /// reaches here).
     pub fn set_default_reasoning_effort(&mut self, effort: Option<String>) -> std::io::Result<()> {
         self.mutate_locked(move |s| s.default_reasoning_effort = effort)
+    }
+
+    /// Set (`Some`) or clear (`None`) the persisted `--block-images` default, persisting atomically.
+    pub fn set_block_images(&mut self, block_images: Option<bool>) -> std::io::Result<()> {
+        self.mutate_locked(move |s| s.block_images = block_images)
+    }
+
+    /// Set (`Some(tokens)`) or clear (`None`) the persisted thinking-token-budget override for one
+    /// reasoning-effort level (`effort`: a wire string — validated by the caller, matching
+    /// `default_reasoning_effort`'s own plain-string convention so this store doesn't need a hard
+    /// dependency on `agent_core`'s enum layout), persisting atomically. An override table that becomes
+    /// empty after clearing its last entry is pruned back to `None` rather than left as `Some({})`,
+    /// mirroring every other optional field's "unset looks unset" convention.
+    pub fn set_thinking_budget_override(
+        &mut self,
+        effort: String,
+        tokens: Option<u32>,
+    ) -> std::io::Result<()> {
+        self.mutate_locked(move |s| {
+            let table = s.thinking_budget_overrides.get_or_insert_with(Default::default);
+            match tokens {
+                Some(t) => {
+                    table.insert(effort, t);
+                }
+                None => {
+                    table.remove(&effort);
+                }
+            }
+            if table.is_empty() {
+                s.thinking_budget_overrides = None;
+            }
+        })
     }
 
     /// Acquire the cross-process lock (see [`FileLock`]), re-read the store's *current* on-disk state —
@@ -304,13 +363,212 @@ pub struct ModelOverride {
     /// OAuth login (see `main.rs::resolve_gateway_credential`), reused here rather than duplicated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
-    /// A literal bearer token to send instead of whatever `--key`/`AI_AGENT_KEY` resolved to — e.g. a
-    /// distinct key for a self-hosted or alternate-provider endpoint. `None` falls back to `--key`/
+    /// A bearer token to send instead of whatever `--key`/`AI_AGENT_KEY` resolved to — e.g. a distinct
+    /// key for a self-hosted or alternate-provider endpoint. `None` falls back to `--key`/
     /// `AI_AGENT_KEY` (empty string if neither is set — many self-hosted OpenAI-compatible servers, like
     /// Ollama/LM Studio, ignore the `Authorization` header entirely, so this is a usable default rather
-    /// than a hard error).
+    /// than a hard error). May be a literal, a `!command` (the rest of the string run as a shell
+    /// command, trimmed stdout used), or a `$VAR`/`${VAR}` environment-variable reference — see
+    /// [`resolve_config_value`] — so an operator doesn't have to store a plaintext secret in
+    /// `models.json`. Resolved via [`Self::resolved_api_key`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// Extra headers to send on every request to this model, merged in via
+    /// `agent_core::client::GatewayClient::with_extra_headers` (Task #11 pi-parity feature) — a custom
+    /// proxy auth header, a tracing header, anything unrelated to the primary credential — matching pi's
+    /// own `model-registry.ts` `headers` config. Independent of `base_url`: a header-only override (no
+    /// `base_url` at all) still routes through the gateway as usual, with these headers merged on top.
+    /// Each value resolves through the same [`resolve_config_value`] syntax `api_key` does — a literal,
+    /// a `!command`, or a `$VAR`/`${VAR}` reference. Resolved via [`Self::resolved_headers`].
+    ///
+    /// For a *direct* (bypassing-the-gateway, `base_url`-set) override whose endpoint needs a non-Bearer
+    /// auth scheme — Azure OpenAI's `api-key: <key>` instead of `Authorization: Bearer <key>` being the
+    /// motivating case — use [`Self::auth_header`] instead of stuffing the credential in here: `headers`
+    /// is merged *alongside* whatever `Authorization` header `base_url`/`api_key` produces, so putting a
+    /// duplicate credential here doesn't stop that `Authorization: Bearer` header (carrying either
+    /// `api_key` or, if unset, a silent fallback to `--key`/`AI_AGENT_KEY` — a real risk of leaking the
+    /// gateway's own virtual key to an unrelated third-party endpoint) from also being sent.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub headers: std::collections::BTreeMap<String, String>,
+    /// For a *direct* (`base_url`-set) override: send `api_key`'s resolved value through this header
+    /// name instead of `Authorization: Bearer <key>` — e.g. `"api-key"` for Azure OpenAI, which never
+    /// accepts a Bearer token and whose SDK omits `Authorization` entirely. `None` (the default) keeps
+    /// the existing `Authorization: Bearer` behavior. Has no effect without `base_url` set — a
+    /// gateway-routed override's auth scheme is the gateway's concern, not the client's. Threaded to
+    /// `agent_core::client::DirectRouting::auth_header` in `main.rs::resolve_gateway_credential`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_header: Option<String>,
+}
+
+impl ModelOverride {
+    /// Resolve this override's `api_key` (if any) through [`resolve_config_value`] — falling back to
+    /// `fallback` (whatever `--key`/`AI_AGENT_KEY` resolved to) when `api_key` is unset, unresolvable
+    /// (an unset env var, a failing `!command`), or resolves to an empty string, then finally to `""`
+    /// when neither is usable — many self-hosted OpenAI-compatible servers ignore the `Authorization`
+    /// header entirely, so an empty bearer is a usable default rather than a hard error (matches this
+    /// struct's own prior literal-`api_key` convention).
+    pub fn resolved_api_key(&self, fallback: Option<&str>) -> String {
+        self.resolved_api_key_with_env(fallback, None)
+    }
+
+    /// [`Self::resolved_api_key`], but with an explicit environment-variable override map consulted
+    /// before the real process environment — production callers go through the public method (`None`
+    /// here, real environment only); tests inject a fixed map instead of mutating the real,
+    /// process-wide (and test-parallelism-unsafe — see `resources.rs`'s identical `$HOME` concern)
+    /// environment.
+    fn resolved_api_key_with_env(
+        &self,
+        fallback: Option<&str>,
+        env_overrides: Option<&std::collections::HashMap<String, String>>,
+    ) -> String {
+        self.api_key
+            .as_deref()
+            .and_then(|v| resolve_config_value(v, env_overrides))
+            .filter(|v| !v.is_empty())
+            .or_else(|| fallback.map(str::to_string))
+            .unwrap_or_default()
+    }
+
+    /// Resolve every configured header value through [`resolve_config_value`], dropping any entry that
+    /// fails to resolve (an unset env var, a failing `!command`) rather than sending a literal `$VAR`/
+    /// `!command` string as a header value.
+    pub fn resolved_headers(&self) -> std::collections::HashMap<String, String> {
+        self.resolved_headers_with_env(None)
+    }
+
+    /// [`Self::resolved_headers`], but with an explicit environment-variable override map — see
+    /// [`Self::resolved_api_key_with_env`]'s doc comment for why tests use this instead of the public
+    /// method.
+    fn resolved_headers_with_env(
+        &self,
+        env_overrides: Option<&std::collections::HashMap<String, String>>,
+    ) -> std::collections::HashMap<String, String> {
+        self.headers
+            .iter()
+            .filter_map(|(k, v)| resolve_config_value(v, env_overrides).map(|v| (k.clone(), v)))
+            .collect()
+    }
+}
+
+/// Resolve a `models.json` `api_key`/header config value that may be a literal, an environment-variable
+/// reference (`$VAR`/`${VAR}`, with `$$`/`$!` escaping a literal `$`/`!`), or a shell command
+/// (`!command`) — pi's own `resolveConfigValue`
+/// (`packages/coding-agent/src/core/resolve-config-value.ts`), the exact mechanism its
+/// `model-registry.ts` already uses for this (a self-hosted/corporate-proxied endpoint's non-Bearer
+/// auth, or keeping a plaintext secret out of `models.json`). Ported down to what this crate's
+/// `ModelOverride` needs: no process-lifetime command-result cache (each override is resolved once, at
+/// gateway-client-construction time, not per-request, so there's nothing to amortize), and no
+/// configured-shell/Windows fallback (this binary only ships for Unix — see `tools::bash`'s own
+/// shell-resolution precedent).
+///
+/// `env_overrides`, when given, is consulted before the real process environment for every `$VAR`/
+/// `${VAR}` reference — production callers pass `None` (real environment only); tests inject a fixed
+/// map instead of mutating the real, process-wide environment (see `ModelOverride::
+/// resolved_api_key_with_env`'s doc comment).
+///
+/// - A value starting with `!` runs the rest as a shell command (`sh -c`) and uses its trimmed stdout; a
+///   nonzero exit or empty stdout resolves to `None`.
+/// - Otherwise, `$VAR`/`${VAR}` references are substituted with that environment variable's value; `$$`
+///   escapes a literal `$`, `$!` escapes a literal `!`. Any referenced variable that's unset resolves
+///   the *whole* value to `None` — never a partial/garbled substitution.
+/// - A value with no `$`/`!` markup at all resolves to itself, unchanged.
+fn resolve_config_value(
+    config: &str,
+    env_overrides: Option<&std::collections::HashMap<String, String>>,
+) -> Option<String> {
+    if let Some(command) = config.strip_prefix('!') {
+        return run_config_value_command(command);
+    }
+    let lookup = |name: &str| -> Option<String> {
+        env_overrides
+            .and_then(|m| m.get(name).cloned())
+            .or_else(|| std::env::var(name).ok())
+    };
+    resolve_config_value_template(config, &lookup)
+}
+
+/// The `$VAR`/`${VAR}`/`$$`/`$!` template half of [`resolve_config_value`] — split out so its
+/// character-by-character scan is unit-testable independent of the `!command`/env-lookup plumbing
+/// around it.
+fn resolve_config_value_template(config: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    let chars: Vec<char> = config.chars().collect();
+    let mut out = String::with_capacity(config.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '$' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        match chars.get(i + 1).copied() {
+            Some('$') => {
+                out.push('$');
+                i += 2;
+            }
+            Some('!') => {
+                out.push('!');
+                i += 2;
+            }
+            Some('{') => match chars[i + 2..].iter().position(|&c| c == '}') {
+                Some(rel) => {
+                    let end = i + 2 + rel;
+                    let name: String = chars[i + 2..end].iter().collect();
+                    if is_env_var_name(&name) {
+                        out.push_str(&lookup(&name)?);
+                    } else {
+                        out.extend(chars[i..=end].iter());
+                    }
+                    i = end + 1;
+                }
+                None => {
+                    out.push('$');
+                    i += 1;
+                }
+            },
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+                let start = i + 1;
+                let mut end = start;
+                while end < chars.len() && (chars[end].is_ascii_alphanumeric() || chars[end] == '_') {
+                    end += 1;
+                }
+                let name: String = chars[start..end].iter().collect();
+                out.push_str(&lookup(&name)?);
+                i = end;
+            }
+            _ => {
+                out.push('$');
+                i += 1;
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Whether `s` is a valid shell-style environment-variable name (`[A-Za-z_][A-Za-z0-9_]*`) — gates
+/// `${...}` template substitution so e.g. `${not a var}` is left as a literal instead of silently
+/// resolving to `None` (matches pi's own `ENV_VAR_NAME_RE`).
+fn is_env_var_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Run `command` via `sh -c` and return its trimmed stdout, or `None` on a nonzero exit, empty stdout,
+/// or a failure to even spawn the shell (matches pi's own `executeCommand`'s "unresolvable" semantics).
+fn run_config_value_command(command: &str) -> Option<String> {
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!text.is_empty()).then_some(text)
 }
 
 /// On-disk shape: a flat JSON object of model id → [`ModelOverride`] (`{"my-model": {"base_url":
@@ -623,5 +881,246 @@ mod tests {
             model_overrides_path().parent(),
             default_path().parent()
         );
+    }
+
+    #[test]
+    fn set_block_images_persists_and_reopening_sees_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut store = SettingsStore::open(path.clone());
+        assert_eq!(store.get().block_images, None);
+
+        store.set_block_images(Some(true)).unwrap();
+        assert_eq!(store.get().block_images, Some(true));
+        let reopened = SettingsStore::open(path.clone());
+        assert_eq!(reopened.get().block_images, Some(true));
+
+        let mut store = SettingsStore::open(path.clone());
+        store.set_block_images(None).unwrap();
+        assert_eq!(store.get().block_images, None);
+        let reopened = SettingsStore::open(path);
+        assert_eq!(reopened.get().block_images, None);
+    }
+
+    #[test]
+    fn set_thinking_budget_override_persists_a_single_entry_and_reopening_sees_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut store = SettingsStore::open(path.clone());
+        assert_eq!(store.get().thinking_budget_overrides, None);
+
+        store
+            .set_thinking_budget_override("high".to_string(), Some(40_000))
+            .unwrap();
+        assert_eq!(
+            store.get().thinking_budget_overrides.as_ref().unwrap().get("high"),
+            Some(&40_000)
+        );
+        let reopened = SettingsStore::open(path);
+        assert_eq!(
+            reopened
+                .get()
+                .thinking_budget_overrides
+                .as_ref()
+                .unwrap()
+                .get("high"),
+            Some(&40_000)
+        );
+    }
+
+    #[test]
+    fn set_thinking_budget_override_accumulates_multiple_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut store = SettingsStore::open(path.clone());
+        store
+            .set_thinking_budget_override("high".to_string(), Some(40_000))
+            .unwrap();
+        store
+            .set_thinking_budget_override("low".to_string(), Some(1_000))
+            .unwrap();
+
+        let table = store.get().thinking_budget_overrides.as_ref().unwrap();
+        assert_eq!(table.get("high"), Some(&40_000));
+        assert_eq!(table.get("low"), Some(&1_000));
+        assert_eq!(table.len(), 2);
+    }
+
+    #[test]
+    fn set_thinking_budget_override_clearing_the_last_entry_prunes_the_table_back_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut store = SettingsStore::open(path.clone());
+        store
+            .set_thinking_budget_override("high".to_string(), Some(40_000))
+            .unwrap();
+        store
+            .set_thinking_budget_override("high".to_string(), None)
+            .unwrap();
+        assert_eq!(
+            store.get().thinking_budget_overrides,
+            None,
+            "clearing the only entry must prune the table back to None, not leave Some({{}})"
+        );
+    }
+
+    #[test]
+    fn model_overrides_file_round_trips_a_header_only_override_with_no_base_url_or_api_key() {
+        // Task #11: a header-only override (e.g. Azure's `api-key:` header) must still route through
+        // the gateway as usual — no `base_url`/`api_key` needed at all for `headers` to be useful.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.json");
+        fs::write(
+            &path,
+            r#"{"azure-gpt": {"headers": {"api-key": "my-azure-key"}}}"#,
+        )
+        .unwrap();
+
+        let overrides = ModelOverrides::open(path);
+        let over = overrides.get("azure-gpt").unwrap();
+        assert_eq!(over.base_url, None);
+        assert_eq!(over.api_key, None);
+        assert_eq!(
+            over.resolved_headers().get("api-key").map(String::as_str),
+            Some("my-azure-key")
+        );
+    }
+
+    #[test]
+    fn resolved_api_key_runs_a_bang_prefixed_command_and_uses_its_trimmed_stdout() {
+        let over = ModelOverride {
+            api_key: Some("!echo -n my-secret-123".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(over.resolved_api_key(None), "my-secret-123");
+    }
+
+    #[test]
+    fn resolved_api_key_falls_back_when_the_command_fails() {
+        let over = ModelOverride {
+            api_key: Some("!exit 1".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(over.resolved_api_key(Some("fallback-key")), "fallback-key");
+        assert_eq!(over.resolved_api_key(None), "");
+    }
+
+    #[test]
+    fn resolved_api_key_falls_back_to_the_operator_key_when_unset() {
+        let over = ModelOverride::default();
+        assert_eq!(over.resolved_api_key(Some("operator-key")), "operator-key");
+        assert_eq!(over.resolved_api_key(None), "");
+    }
+
+    #[test]
+    fn resolved_api_key_uses_the_literal_value_unchanged_when_it_has_no_markup() {
+        let over = ModelOverride {
+            api_key: Some("plain-literal-key".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(over.resolved_api_key(None), "plain-literal-key");
+    }
+
+    #[test]
+    fn resolved_headers_substitutes_a_dollar_var_reference_from_the_injected_env_map() {
+        let mut over = ModelOverride::default();
+        over.headers.insert(
+            "Authorization".to_string(),
+            "Bearer $MY_PROXY_TOKEN".to_string(),
+        );
+        let mut env = std::collections::HashMap::new();
+        env.insert("MY_PROXY_TOKEN".to_string(), "tok-abc-123".to_string());
+
+        let resolved = over.resolved_headers_with_env(Some(&env));
+        assert_eq!(
+            resolved.get("Authorization").map(String::as_str),
+            Some("Bearer tok-abc-123")
+        );
+    }
+
+    #[test]
+    fn resolved_headers_substitutes_a_braced_dollar_var_reference() {
+        let mut over = ModelOverride::default();
+        over.headers
+            .insert("X-Proxy-Key".to_string(), "${PROXY_KEY}-suffix".to_string());
+        let mut env = std::collections::HashMap::new();
+        env.insert("PROXY_KEY".to_string(), "abc".to_string());
+
+        let resolved = over.resolved_headers_with_env(Some(&env));
+        assert_eq!(
+            resolved.get("X-Proxy-Key").map(String::as_str),
+            Some("abc-suffix")
+        );
+    }
+
+    #[test]
+    fn resolved_headers_drops_an_entry_whose_referenced_env_var_is_unset() {
+        let mut over = ModelOverride::default();
+        over.headers
+            .insert("X-Missing".to_string(), "$TOTALLY_UNSET_VAR_XYZ".to_string());
+        over.headers
+            .insert("X-Present".to_string(), "literal".to_string());
+
+        let resolved = over.resolved_headers_with_env(Some(&std::collections::HashMap::new()));
+        assert_eq!(resolved.get("X-Missing"), None);
+        assert_eq!(resolved.get("X-Present").map(String::as_str), Some("literal"));
+    }
+
+    #[test]
+    fn auth_header_defaults_to_none_and_round_trips_through_json() {
+        let over = ModelOverride::default();
+        assert_eq!(over.auth_header, None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.json");
+        std::fs::write(
+            &path,
+            r#"{"azure-gpt": {"base_url": "https://foo.openai.azure.com/openai/deployments/x", "auth_header": "api-key", "api_key": "my-azure-key"}}"#,
+        )
+        .unwrap();
+
+        let overrides = ModelOverrides::open(path);
+        let over = overrides.get("azure-gpt").unwrap();
+        assert_eq!(over.auth_header.as_deref(), Some("api-key"));
+        assert_eq!(over.resolved_api_key(None), "my-azure-key");
+    }
+
+    #[test]
+    fn auth_header_is_omitted_from_serialized_json_when_unset() {
+        let over = ModelOverride {
+            base_url: Some("https://example.com".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&over).unwrap();
+        assert!(
+            !json.contains("auth_header"),
+            "unset auth_header must not appear in the serialized form, got: {json}"
+        );
+    }
+
+    #[test]
+    fn resolve_config_value_template_escapes_dollar_and_bang() {
+        let lookup = |_: &str| -> Option<String> { None };
+        assert_eq!(
+            resolve_config_value_template("price: $$5 $!important", &lookup),
+            Some("price: $5 !important".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_config_value_command_form_takes_precedence_over_template_parsing() {
+        // A `!`-prefixed value is a command outright, even though `!` alone (unescaped, not at the
+        // start) is otherwise just a literal character in template parsing.
+        assert_eq!(
+            resolve_config_value("!echo -n hello", None),
+            Some("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn is_env_var_name_rejects_a_name_starting_with_a_digit_or_containing_a_space() {
+        assert!(!is_env_var_name("1BAD"));
+        assert!(!is_env_var_name("not a var"));
+        assert!(is_env_var_name("_valid_Name9"));
     }
 }

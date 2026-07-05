@@ -4,6 +4,7 @@
 mod common;
 
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use common::{run_cmd, spawn_model_server, sse, turn_text, turn_text_responses, turn_tool_use};
 use serde_json::json;
@@ -159,9 +160,11 @@ fn run_binary_list_models_prints_capability_columns_not_just_bare_ids() {
         .lines()
         .find(|l| l.contains("claude-opus-4-8"))
         .unwrap_or_else(|| panic!("no claude-opus-4-8 row: {stdout}"));
+    // Task #39 (pi-parity fix, cosmetic): humanized (`"1M"`), not the raw integer — matches pi's own
+    // `--list-models` `formatTokenCount`.
     assert!(
-        opus_line.contains("1000000"),
-        "expected the real context window on claude-opus-4-8's row: {opus_line}"
+        opus_line.contains("1M"),
+        "expected the humanized context window on claude-opus-4-8's row: {opus_line}"
     );
     assert!(
         opus_line.contains("yes"),
@@ -1531,5 +1534,332 @@ fn run_binary_short_nc_flag_is_an_alias_for_no_context_files() {
         !bodies[0].contains("PROJECT-MARKER-777"),
         "-nc must behave exactly like --no-context-files: {}",
         bodies[0]
+    );
+}
+
+#[test]
+fn run_binary_model_override_header_only_reaches_the_wire_request() {
+    // Task #11 (pi-parity feature): a `models.json` `headers`-only override (no `base_url`/`api_key`)
+    // must still route through the gateway as usual, with the configured header merged onto the
+    // request via `GatewayClient::with_extra_headers`.
+    let dir = tempfile::tempdir().unwrap();
+    let config_dir = dir.path().join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("models.json"),
+        r#"{"claude-test": {"headers": {"X-Custom-Auth": "literal-header-value"}}}"#,
+    )
+    .unwrap();
+    let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .env("AI_AGENT_CONFIG_DIR", &config_dir)
+        .args([
+            "run",
+            "hello",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--no-session-persistence",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[0]
+            .to_ascii_lowercase()
+            .contains("x-custom-auth: literal-header-value"),
+        "the header-only override's header must reach the request: {}",
+        bodies[0]
+    );
+}
+
+#[test]
+fn run_binary_model_override_header_resolves_a_dollar_var_reference() {
+    // Task #11 (pi-parity feature): a header value may be a `$VAR`/`${VAR}` reference into the
+    // process environment, resolved at client-construction time — lets an operator avoid storing a
+    // plaintext secret in `models.json`.
+    let dir = tempfile::tempdir().unwrap();
+    let config_dir = dir.path().join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("models.json"),
+        r#"{"claude-test": {"headers": {"X-Proxy-Token": "$MY_E2E_PROXY_TOKEN"}}}"#,
+    )
+    .unwrap();
+    let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .env("AI_AGENT_CONFIG_DIR", &config_dir)
+        .env("MY_E2E_PROXY_TOKEN", "resolved-from-env")
+        .args([
+            "run",
+            "hello",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--no-session-persistence",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[0]
+            .to_ascii_lowercase()
+            .contains("x-proxy-token: resolved-from-env"),
+        "the $VAR reference must resolve against the process environment: {}",
+        bodies[0]
+    );
+}
+
+#[test]
+fn run_binary_model_override_api_key_resolves_a_bang_command() {
+    // Task #11 (pi-parity feature): `api_key` may be a `!command` — the rest of the string run as a
+    // shell command, trimmed stdout used as the bearer value. Paired with `base_url` here since that's
+    // this override's only consumer (an `api_key` with no `base_url` has no effect — `--key`/
+    // `AI_AGENT_KEY`/OAuth resolution is what an ordinary, non-overridden model uses instead).
+    let dir = tempfile::tempdir().unwrap();
+    let config_dir = dir.path().join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
+    std::fs::write(
+        config_dir.join("models.json"),
+        format!(
+            r#"{{"claude-test": {{"base_url": "{base}", "api_key": "!echo -n cmd-resolved-secret"}}}}"#
+        ),
+    )
+    .unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .env("AI_AGENT_CONFIG_DIR", &config_dir)
+        .args([
+            "run",
+            "hello",
+            // `--gateway-url` is deliberately bogus/unreachable — the base_url override must bypass it
+            // entirely, so a value that would otherwise fail the run proves the override actually took
+            // effect rather than merely being ignored.
+            "--gateway-url",
+            "http://127.0.0.1:1",
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--no-session-persistence",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[0]
+            .to_ascii_lowercase()
+            .contains("authorization: bearer cmd-resolved-secret"),
+        "the !command-resolved api_key must reach the request as the bearer token: {}",
+        bodies[0]
+    );
+}
+
+#[test]
+fn run_binary_idle_timeout_ms_flag_causes_a_stalled_response_to_fail_quickly() {
+    // Task #19 (pi-parity feature): `with_idle_timeout` previously had zero callers. A server that
+    // answers headers plus one partial event, then goes silent well past a deliberately shrunk
+    // `--idle-timeout-ms`, must fail quickly instead of hanging on the default (~600s) read timeout.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        use std::io::{Read as _, Write as _};
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 8192];
+            // Drain enough of the request to avoid a server-close race with the client still writing
+            // (mirrors `common::read_http_request`'s own full-body drain, simplified: this request has
+            // no further body once headers are read for a bare `read()` of this size in practice).
+            let _ = stream.read(&mut buf);
+            // Headers plus one partial SSE event, `Content-Length` claiming far more is coming — the
+            // connection is then held open with nothing further sent, well past the shrunk idle timeout.
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100000\r\n\r\n\
+                  data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n",
+            );
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_secs(5));
+        }
+    });
+    let base = format!("http://{addr}");
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let start = std::time::Instant::now();
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "hello",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--no-session-persistence",
+            "--idle-timeout-ms",
+            "200",
+            "--retry-max-retries",
+            "0",
+        ])
+        .current_dir(std::env::temp_dir())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+    let elapsed = start.elapsed();
+
+    assert!(
+        !output.status.success(),
+        "a permanently-stalled response must fail the run, not silently succeed"
+    );
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "--idle-timeout-ms=200 must cut the stalled read short well before the default ~600s \
+         timeout would — took {elapsed:?}. stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn run_binary_block_images_flag_forces_a_read_tool_image_to_a_text_placeholder() {
+    // Task #26 (pi-parity feature): `--block-images` forces `agent_core::Agent`'s per-tool-call
+    // `_model_supports_vision` flag to `false` regardless of the active model's real capability — the
+    // model here calls `read` on a real image; the *next* request's tool_result must carry the `read`
+    // tool's own non-vision placeholder note (`tools::read::NON_VISION_IMAGE_NOTE`), proving the flag
+    // reached the tool. (Whether `read`'s own handling of that flag also omits the raw image bytes is
+    // that tool's own pre-existing, separate concern — out of scope for wiring the CLI flag itself,
+    // which is the only thing this test is pinning down.)
+    use base64::Engine as _;
+    const RED_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAIAAADYYG7QAAAANklEQVR42u3OQQ0AAAgAoetfWls4H2wEoKlXEhISEhISEhISEhISEhISEhISEhISEhISEhK6s98T93mKDkyKAAAAAElFTkSuQmCC";
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(RED_PNG_B64)
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("shot.png"), &png).unwrap();
+
+    let turn1 = turn_tool_use("toolu_1", "read", &json!({ "path": "shot.png" }).to_string());
+    let (base, bodies) = spawn_model_server(vec![turn1, turn_text("described")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "read shot.png and describe it",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--block-images",
+            "--no-session-persistence",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[1].contains("does not support images"),
+        "the non-vision placeholder note must reach the follow-up request, proving --block-images's \
+         _model_supports_vision:false reached the read tool: {}",
+        bodies[1]
+    );
+}
+
+#[test]
+fn run_binary_without_block_images_a_read_tool_image_carries_no_non_vision_placeholder() {
+    // Control for the test above: absent `--block-images`, `read`'s own non-vision placeholder note
+    // must not appear at all — proving the flag (not some other change) is what causes it.
+    use base64::Engine as _;
+    const RED_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAIAAADYYG7QAAAANklEQVR42u3OQQ0AAAgAoetfWls4H2wEoKlXEhISEhISEhISEhISEhISEhISEhISEhISEhK6s98T93mKDkyKAAAAAElFTkSuQmCC";
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(RED_PNG_B64)
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("shot.png"), &png).unwrap();
+
+    let turn1 = turn_tool_use("toolu_1", "read", &json!({ "path": "shot.png" }).to_string());
+    let (base, bodies) = spawn_model_server(vec![turn1, turn_text("described")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "read shot.png and describe it",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--no-session-persistence",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[1].contains("\"type\":\"image\""),
+        "the real image content block must still reach the request: {}",
+        bodies[1]
+    );
+    assert!(
+        !bodies[1].contains("does not support images"),
+        "without --block-images, claude-test (vision-capable) must not get the non-vision \
+         placeholder note: {}",
+        bodies[1]
     );
 }

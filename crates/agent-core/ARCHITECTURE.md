@@ -55,6 +55,21 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   original, as-configured model, matching pi's own summarization path (no `nextTurnSnapshot` awareness
   there either). `serve`'s `switch_model` RPC command is the concrete surface for this; `set_model`/
   `set_thinking` are a separate, idle-only mechanism that only takes effect on the *next* `prompt`.
+- **Mid-run tool-set switching** — `Steering::request_tool_set(tools)` (pi's `setTools`/
+  `setActiveTools` equivalent, `agent-harness.ts:871-928`) reconfigures a run's advertised tools —
+  replacing both the wire definitions and the actual `Arc<dyn Tool>` lookup dispatch uses — applied at
+  the exact same turn boundary a mid-run model switch is, so it takes effect starting the very next
+  turn, never mid-turn. A `ToolsUpdated { tool_names }` event fires when it's applied, mirroring pi's own
+  `tools_update`. Before this, the tool set really was fixed for the whole run, not just the `Agent`'s
+  own configured baseline.
+- **Per-turn system prompt** — `Agent::with_system_fn(|| String)` installs a callback re-evaluated
+  fresh every turn, at the same point the static `with_system` string would otherwise be read — takes
+  priority over `with_system` when both are set (mirrors pi's function-valued `systemPrompt`,
+  `harness/types.ts:817-826`, one field, either a string or a callback, re-evaluated via
+  `createTurnState()`). `set_system(&mut self, ..)` needs exclusive access, unavailable while
+  `run_events_steered` holds `&self` for a whole in-flight run — `with_system_fn`'s callback works from
+  *inside* one, through `&self` alone, so a long run can keep a time-varying prompt (a date stamp)
+  current turn-to-turn without a full `Agent` rebuild.
 - **Graceful stop** — two independent, OR-combined ways to end a run at a turn boundary rather than a
   hard abort: `Steering::request_stop` — an external flag a host sets from outside the loop (`serve`'s
   `stop_after_turn` RPC command) — and `AgentHooks::should_stop_after_turn` — an in-process,
@@ -94,6 +109,19 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   whose role isn't `Role::Assistant` (a caller bug), for the same reason. Defaults to `NoHooks`.
   `crates/agent`'s own `ToolPolicy` (`--deny-tool`/`--deny-bash-pattern`) is the concrete implementation
   this workspace actually installs; see its `ARCHITECTURE.md`.
+- **Provider request/response hooks** — `AgentHooks::before_provider_request(&mut ModelRequest)` and
+  `after_provider_response(status, headers)` are the raw-HTTP-layer counterpart to the tool-call hooks
+  above — pi's `beforeProviderRequest`/`afterProviderResponse` (`agent-harness.ts:251-385`). The request
+  half is called from `Agent::run_turn_once` (the one place already holding both the configured hooks
+  and the not-yet-sent request) right before `self.transport.stream(req)`, so a host can inject a
+  request-shape tweak that reaches `client.rs`'s dialect/body construction; a panicking hook's partial
+  mutation is discarded, falling back to the request as it was before the call. The response half is
+  instead called from `client.rs::GatewayClient::stream` itself, the instant a response's status/headers
+  are known (before its body starts streaming) — `headers` is a plain `&[(String, String)]`, not a
+  `reqwest`-specific type, so the hook trait stays implementable/testable without depending on `reqwest`,
+  matching `ModelTransport`'s own "the loop never depends on reqwest" contract; a `MockTransport`-driven
+  test never fires it, since there's no real response to report. Both default to no-ops, so an existing
+  `AgentHooks` implementor is unaffected.
 - **Panic isolation** — every `before_tool_call`/`Tool::run_streaming`/`after_tool_call` invocation runs
   behind a `catch_unwind` boundary (`catch_tool_panic`): a panic in any of them degrades to one failed
   tool call (an error `tool_result`, or a fail-closed block for `before_tool_call`) instead of unwinding
@@ -198,7 +226,37 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   minimal `ModelCaps` table (context window, max output, `max_tokens` vs `max_completion_tokens` field,
   long-cache support, vision, thinking shape, reasoning-effort, explicit-disable capability, eager
   tool-streaming). The dialects and `Agent::new` consult it, so adding a model rarely needs new
-  request-shape plumbing.
+  request-shape plumbing. Coverage extends past Anthropic/native-OpenAI ids to the third-party
+  OpenAI-wire families the gateway actually routes to — DeepSeek, Z.ai/GLM, Moonshot/Kimi, Qwen,
+  MiniMax, xAI, Groq, Cerebras, Together, and a generic vendor/model-shaped fallback (OpenRouter, or any
+  uncatalogued addition) — matched by id prefix/substring rather than an exhaustive per-exact-id table
+  the way the native Anthropic/OpenAI branches are (those providers' catalogues are large and change
+  often; a reasonably-accurate family default closes the truncation/no-thinking gap without needing to
+  track every id). `ModelCaps::openai_reasoning_format` (an `OpenAiReasoningFormat`, only read by
+  `dialect::openai::build_body`) selects which of these families' real reasoning-toggle shape to emit —
+  `Standard`'s bare `reasoning_effort` string (o-series, gpt-5, xAI, Groq, Cerebras, and anything
+  unrecognized), or a third-party shape (`DeepSeek`'s/`Zai`'s nested `thinking:{}` toggle,
+  `Together`'s/`OpenRouter`'s nested `reasoning:{}` object) — mirroring pi's own
+  `compat.thinkingFormat` tag. Several of these families (Kimi; GLM below 5.2) have a real on/off toggle
+  but no graduated effort vocabulary at all (`reasoning_effort: false`); `models::has_reasoning_mechanism`
+  (consulted by `available_thinking_levels`/`clamp_thinking_level`/`thinking_for_level`) treats
+  `openai_reasoning_format != Standard` as its own "has a mechanism" signal so such a model isn't
+  reported as `Off`-locked. A model id genuinely reachable through more than one host (a
+  Together-hosted "deepseek-ai/deepseek-r1" also matching the native-DeepSeek prefix, say) can still
+  land on the wrong sub-branch — a known limitation of a table keyed on model id alone, with no
+  route/provider context to disambiguate by. MiniMax is a special case: pi serves it over the Anthropic
+  wire, but this crate's `Dialect::for_model` only recognizes a `claude`/`anthropic`-named id as
+  Anthropic, so a `minimax-*` request is routed through the OpenAI Chat Completions dialect regardless
+  — its capability entry fixes the context/output-ceiling numbers `Agent::new` reads either way, but
+  doesn't attempt an OpenAI-shaped reasoning toggle a real MiniMax endpoint wouldn't understand; fixing
+  the underlying dialect-routing gap is `dialect/mod.rs`'s call, not this table's.
+- **Thinking-budget overrides** — [`models::budget_for_effort_with_override`](src/models.rs) is the
+  same fixed effort→token-budget ladder [`models::budget_for_effort`] uses (itself unchanged, and still
+  the only path `thinking_for_level` calls), but takes an optional
+  `&HashMap<ReasoningEffort, u32>` consulted before the hardcoded ladder — the extension point a
+  settings/CLI layer can wire an operator-supplied override through (e.g. `--thinking-budget
+  high=40000`) without this crate taking any opinion on where that table comes from. The `max_output`
+  clamp still applies to an overridden value the same as the built-in one.
 - **Vision downgrade** — a model whose `ModelCaps::supports_vision` is `false` never sees a raw image
   block: each dialect replaces a user/tool-result image with a text placeholder
   (`"(image omitted: model does not support images)"` / the tool-result variant) instead of sending
@@ -208,6 +266,11 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   advertised `input_schema`) and ignored by every tool except `crates/agent`'s `read`, which reads it
   back to append a "current model doesn't support images" note when the file it read is an image; see
   `agent.rs::tests::dispatch_tells_a_tool_whether_the_active_model_supports_vision`.
+  `Agent::with_block_images(true)` is an operator-facing override that forces this same
+  `_model_supports_vision: false` dispatch regardless of the active model's real capability — the
+  mechanism a host's own `--block-images`-style flag wires into (a cost/bandwidth policy, a text-only
+  audit log), not just a fallback for a genuinely non-vision model. Defaults to `false` (report the
+  model's real capability untouched).
 - **Eager tool-input streaming** — every Anthropic tool definition is marked
   `eager_input_streaming: true` when `ModelCaps::supports_eager_tool_streaming` is set (true for every
   current Anthropic id); `client.rs` only sends the mutually-exclusive
@@ -304,8 +367,31 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   (default enabled) disables this specific layer — a normally-retried
   failure surfaces on the very first attempt instead — for debugging a flaky connection without several
   silent attempts first; `GatewayClient`'s own pre-first-byte retry above is unaffected either way.
+  `is_retryable_status` also matches `524` (Cloudflare's "origin didn't respond in time") alongside the
+  other 5xx entries — matching pi's `packages/ai/src/utils/retry.ts:36`, which treats it as its only
+  retry signal for that status; the coarser whole-run retry layer (`crates/agent::retry`) already covered
+  it, but that restarts the entire turn from scratch instead of this cheap pre-first-byte retry.
+  `MAX_BACKOFF` (the ceiling on both exponential backoff and a server-supplied `Retry-After` hint) is
+  raised from an earlier 10s to 60s, toward pi's own `openai-codex-responses.ts` default
+  (`DEFAULT_MAX_RETRY_DELAY_MS`) — at 10s, a 429 with a `Retry-After: 30` hint got retried back into the
+  very rate-limit window it named, capable of exhausting the whole retry budget before that window
+  closed; `GatewayClient::with_max_backoff` overrides it per client, independent of
+  `with_retry`'s `max_retries`/`base_backoff` pair. `GatewayClient::with_extra_headers(HashMap<String,
+  String>)` merges an operator-configured header map onto every outgoing request, applied last (via
+  `HeaderMap::insert`, not `RequestBuilder::header`'s append semantics) so an operator's value always
+  wins on a name collision — the plumbing a self-hosted/proxied endpoint's custom auth/routing header
+  needs (pi's `model-registry.ts` supports the same per-deployment concept); the CLI/settings surface
+  that actually lets an operator configure this lives in `crates/agent/src/settings.rs`, not here.
 - **Cache observability** — `StreamEvent::Usage` carries `TokenUsage` (input/output + cache-read/write
   - reasoning); both decoders populate it, and `Session` folds the cumulative totals + `last_input_tokens`.
+  `Message::usage: Option<TokenUsage>` additionally stamps the *exact* per-turn figure directly onto the
+  assistant message that turn produced (pi's own `AssistantMessage.usage`, a required field there) —
+  `None` for every `user`/tool-result turn and for a synthetic closing record with no real model call
+  behind it (`Message::error`'s bare case), `Some` even on an aborted/error-tagged turn that still
+  carries real content. Session-level totals answer "how much has this session cost so far"; this field
+  answers "how much did *this* turn cost" without needing to diff two running totals — the data a
+  session-persistence layer (`crates/agent`, a later change) needs to actually exist before it can save
+  per-message cost.
 - **Lifecycle events** — `AgentEvent` adds `AgentStart`/`TurnStart`/`Steered`/`AgentEnd`/`CompactionStart`/
   `Compacted`/`Error`. `CompactionStart` (carrying the same `CompactionReason` `Compacted` does) fires
   once `Agent::compact` confirms a worthwhile prefix exists, right before its first summarization model
@@ -507,6 +593,25 @@ two guards, so concurrency never costs correctness:
   unconditionally, host-selected rather than inferred from the calls themselves (a deterministic-repro
   debugging session, or a host policy that never wants two tool calls actually overlapping) — matching
   pi's own `AgentOptions.toolExecution: "sequential" | "parallel"`.
+
+This default split is always **gate the whole batch, then execute** — every call's `before_tool_call`
+resolves, in call order, before any call's actual tool execution begins (`Agent::run_events_steered`'s
+phase 1/phase 2, matching pi's `prepareToolCall` loop ahead of `executeToolCallsParallel`'s
+`Promise.all`). Phase 1 re-checks cancellation twice per call, not once: at the top of its loop
+iteration, *and* again right after that call's own `before_tool_call` hook returns (and after arg
+coercion) — a slow permission-check hook can observe cancellation firing mid-await, and without the
+second check a single-call (or last-in-batch) turn had no *later* iteration to catch it, so the call
+was marked ready and phase 2 dispatched it for real despite the run already having been cancelled
+(pi-parity fix). A per-tool override changes this default entirely: any call in the batch naming a tool
+whose `Tool::execution_mode()` returns `Some(ToolExecutionMode::Sequential)` routes the turn's *whole*
+batch through `Agent::run_tool_calls_interleaved` instead — a fully-interleaved
+gate→execute→finalize-per-call path (pi's `executeToolCallsSequential`) where call 1 is completely
+resolved, including its `after_tool_call` rewrite, before call 2's own gate even starts. This is the
+seam a concurrency-aware policy (a permission hook reasoning about "what's already run", a rate
+limiter) needs and the default split structurally can't offer; `ToolStart` is still emitted upfront for
+the whole batch either way (not duplicated by the interleaved path), so the two paths differ only in
+when gating/execution/`after_tool_call` happen relative to each other, not in the observable
+`ToolStart` ordering.
 
 The transcript stays deterministic regardless of which tool finishes first: every `ToolStart` is sunk
 _before_ dispatch (in call order), and every `ToolEnd` + `ToolResult` block is rebuilt in call order
@@ -764,16 +869,16 @@ both fields `None` and never reads them.
 | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `lib.rs`                      | Crate root: module list, public re-exports, and the crate-wide `#![cfg_attr(test, allow(...))]` panic-free gate                                                                                                                                                                                                                                                                            |
 | `agent.rs`                    | `Agent` config + `run`/`run_cancellable`/`run_events`/`run_events_cancellable`/`run_events_steered` loop, `Accumulator`, concurrent tool dispatch (threading text/images/`terminate`), tool-driven termination, mid-run + stop-boundary steering, `with_reasoning_effort`, model-aware `new` defaults, hooks, auto-compaction + overflow retry                                                               |
-| `message.rs`                  | `Role`/`ContentBlock`(+ `Thinking`/`RedactedThinking`/`Image`; `ToolResult` carries optional `images`; `Text` carries optional `id`/`phase`, OpenAI Responses' replay metadata)/`Message`/`ToolDef`/`StopReason`(+ `Refusal`)/`StreamEvent`/`TokenUsage`(+ `reasoning_tokens`) — the internal model                                                                                                                                                                 |
+| `message.rs`                  | `Role`/`ContentBlock`(+ `Thinking`/`RedactedThinking`/`Image`; `ToolResult` carries optional `images`; `Text` carries optional `id`/`phase`, OpenAI Responses' replay metadata)/`Message`(+ `usage: Option<TokenUsage>`, the per-turn figure stamped on an assistant message)/`ToolDef`/`StopReason`(+ `Refusal`)/`StreamEvent`/`TokenUsage`(+ `reasoning_tokens`) — the internal model                                                                                                                                                                 |
 | `compaction.rs`               | Context compaction: trigger, cut-point search, summary-prompt build (`summary_request` takes an optional `custom_instructions`, appended as "Additional focus: …" — a manual compaction's client-supplied steering, matching pi's `generateSummary`; never applied to the split-turn prefix call, matching pi's `generateTurnPrefixSummary` not accepting one at all), file-op extraction, and incremental update (`previous_summary`/`SUMMARY_MARKER` fold-forward) — the network-free half of `Agent::compact`                                                                                                                                                                             |
 | `models.rs`                   | `capabilities(model) -> ModelCaps`: minimal per-model wire table (max-tokens field, long-cache, vision, thinking shape, reasoning-effort, context window), matched by id prefix; consumed by the dialects and `Agent::new`                                                                                                                                                                 |
-| `hooks.rs`                    | `AgentHooks` interception trait (`before_tool_call`/`after_tool_call`/`should_stop_after_turn`/`on_assistant_message`, all cancellation-aware) + `NoHooks` default                                                                                                                                                                                                                                                                        |
-| `steering.rs`                 | `Steering` — two shared queues of `SteeringMessage` (text + optional images): `push_steer` (mid-run, folded onto the tool-results turn) and `push`/follow-up (injected at would-stop boundaries), each with its own independent `QueueMode` (`set_steering_mode`/`set_follow_up_mode`); `pending_count` peeks the combined depth of both lanes without draining; plus `request_stop`/`take_stop_requested`, a graceful-stop flag checked at turn boundaries; `clear()` drops both lanes and the stop flag without returning them, for a caller about to swap in a different session's conversation     |
+| `hooks.rs`                    | `AgentHooks` interception trait (`before_tool_call`/`after_tool_call`/`should_stop_after_turn`/`on_assistant_message`/`before_provider_request`/`after_provider_response`, all cancellation-aware where a run is in flight) + `NoHooks` default                                                                                                                                                                                                                                                                        |
+| `steering.rs`                 | `Steering` — three shared queues of `SteeringMessage` (text + optional images): `push_steer` (mid-run, folded onto the tool-results turn), `push`/follow-up (injected at would-stop boundaries), `push_next_turn` (folded onto a fresh run's first prompt turn), each independently `QueueMode`-tunable (`set_steering_mode`/`set_follow_up_mode`); `pending_count` peeks the combined depth without draining; `request_stop`/`take_stop_requested` (graceful-stop flag), `request_model_switch`/`take_model_switch` (mid-run model/thinking retarget), `request_tool_set`/`take_tool_switch` (mid-run tool-set retarget — see the `Mid-run tool-set switching` capability), all consumed at the same turn boundary; `clear()`/`clear_run_scoped()` drop the relevant lanes/flags without returning them, for a session swap vs. a mere cancellation respectively                                                                                                                                                                     |
 | `write_lock.rs`               | `WriteLockRegistry` — a process-scoped, path-keyed async-mutex map (`Agent::with_write_locks`) extending same-path write exclusivity across `Agent` rebuilds (a `set_model`/`set_thinking` rebuild, or multiple sessions sharing one registry), layered on top of the per-turn write-target grouping below; `WriteLockGuard`'s `Drop` evicts a key's entry once its refcount shows no other holder/waiter left (see the `Cross-run file-mutation exclusivity` capability above) so the map stays bounded to currently-contended paths, not every path ever locked |
-| `tool.rs`                     | `Tool` trait (`run -> ToolOutput`, optional streaming `run_streaming` + `ToolProgress` sink) + `ToolOutput { text, images, terminate }` + `ToolRegistry` (name-keyed `Arc<dyn Tool>` map, last-registration-wins, name-sorted `definitions`)                                                                                                                                               |
+| `tool.rs`                     | `Tool` trait (`run -> ToolOutput`, optional streaming `run_streaming` + `ToolProgress` sink, optional `execution_mode() -> Option<ToolExecutionMode>` — `Some(Sequential)` routes a turn's whole batch through `Agent::run_tool_calls_interleaved`) + `ToolOutput { text, images, terminate }` + `ToolRegistry` (name-keyed `Arc<dyn Tool>` map, last-registration-wins, name-sorted `definitions`)                                                                                                                                               |
 | `validation.rs`               | `coerce_tool_arguments(schema, input)` — best-effort JSON-Schema-shaped type coercion (numeric string → number, `"true"`/`"false"` → bool, etc., never lossy int/float or non-canonical bool text) run on every dispatched call's args before `Tool::run`/`run_streaming` sees them (`agent.rs`'s dispatch, `.unwrap_or_else(\|_\| input.clone())` on failure — a tool that can't be coerced still reaches the tool's own, clearer validation error rather than a new failure path here); recurses into `properties`, schema-typed `additionalProperties` (a bare `true`/`false` is not a schema and is left alone), array `items` (both the tuple-per-index form and the single-schema-for-every-element form), and `allOf`/`anyOf`/`oneOf` composition (best-effort — a member that fails to coerce is skipped/falls back to the value untouched, never fails the surrounding call, unlike every other coercion path here, which is all-or-nothing per AJV's own `coerceTypes` — matches pi's `coerceWithJsonSchema`/`coerceWithUnionSchema`) |
-| `transport.rs`                | `ModelRequest` (system/tools/thinking/`reasoning_effort`/`tool_choice`/cache_key/cache_long/`user_id` — Anthropic's `metadata.user_id` abuse-detection hint, unset by default), `ReasoningEffort` + `ToolChoice` enums, `ModelTransport` trait, `EventStream` alias                                                                                                                                                                                                          |
-| `client.rs`                   | `GatewayClient`: production `ModelTransport`; retry-with-backoff (`Retry-After` delta-seconds _or_ HTTP-date), chunked-SSE byte framing into whole UTF-8 lines; sends both `session_id: <cache_key>` and `x-client-request-id: <cache_key>` for the OpenAI Responses dialect only, when a `cache_key` is set — connection-level session-affinity routing, distinct from `prompt_cache_key`'s cache-node affinity in the body, matching pi's `openai-responses.ts` (which sends both headers, not just one); `needs_interleaved_thinking_beta(model)` gates the `interleaved-thinking-2025-05-14` beta header on the model's own thinking *shape* alone (any non-`Adaptive` model, `Adaptive` skipped since it interleaves by default) — pi-parity fix: previously also required *this turn's own* `req.thinking.is_some()`, so a request with thinking off mid-session dropped the header even though a `Budget`-shape model always benefits from it being present, matching pi's own default-on `interleavedThinking ?? true` gate                                                                                                                                                                                                                            |
+| `transport.rs`                | `ModelRequest` (system/tools/thinking/`reasoning_effort`/`tool_choice`/cache_key/cache_long/`user_id` — Anthropic's `metadata.user_id` abuse-detection hint, unset by default), `ReasoningEffort` + `ToolChoice` enums, `ModelTransport` trait, `EventStream` alias. `tools` is fixed for a given *request*, but not necessarily the whole *run* it belongs to — see `Mid-run tool-set switching` above                                                                                                                                                                                                          |
+| `client.rs`                   | `GatewayClient`: production `ModelTransport`; retry-with-backoff (`Retry-After` delta-seconds _or_ HTTP-date, `MAX_BACKOFF` 60s default, `with_max_backoff` override, `is_retryable_status` matching 429/5xx/524/408/409), chunked-SSE byte framing into whole UTF-8 lines; `with_extra_headers`/`with_hooks` (see `Transport resilience`/`Provider request/response hooks` above); sends both `session_id: <cache_key>` and `x-client-request-id: <cache_key>` for the OpenAI Responses dialect only, when a `cache_key` is set — connection-level session-affinity routing, distinct from `prompt_cache_key`'s cache-node affinity in the body, matching pi's `openai-responses.ts` (which sends both headers, not just one); `needs_interleaved_thinking_beta(model)` gates the `interleaved-thinking-2025-05-14` beta header on the model's own thinking *shape* alone (any non-`Adaptive` model, `Adaptive` skipped since it interleaves by default) — pi-parity fix: previously also required *this turn's own* `req.thinking.is_some()`, so a request with thinking off mid-session dropped the header even though a `Budget`-shape model always benefits from it being present, matching pi's own default-on `interleavedThinking ?? true` gate                                                                                                                                                                                                                            |
 | `dialect/mod.rs`              | `Dialect` enum (model-id → wire selection), `StreamDecoder` trait, SSE line-splitting (`push_sse_line`/`decode_sse`), `clamp_max_tokens_to_context` (shared by all three dialects), `ensure_non_empty_content` — pads a message's outbound copy (never the persisted session record) to a placeholder text block when it's whitespace-only/empty, *or* (pi-parity fix) when the whole message is a `Message::aborted`/`with_error` assistant turn: replaying a dangling `Thinking` block or other partial content from a cancelled/errored turn is exactly Anthropic/OpenAI's own "reasoning with nothing following it"/incomplete-turn rejection, and once one turn hits it every later turn resends the identical dangling block and fails identically — matches pi's `transform-messages.ts:186-194`, which skips such a message outright when building the next request                                                                                                                        |
 | `dialect/anthropic.rs`        | `/v1/messages` body builder (three prompt-cache breakpoints, capability-gated 1h TTL, per-model thinking shape, `tool_choice`, tool-result image rewrite, `normalize_cross_model_tool_ids` — disallowed-character/length normalization of a foreign-model tool-call id at the point a request reaches the wire) + decoder (text/thinking/tool/cache-usage, reasoning-token breakout, `pause_turn`/refusal-explanation, in-band error + truncation detection)                                                                                     |
 | `dialect/openai.rs`           | `/v1/chat/completions` body builder + decoder — real translation: flattened messages, string-encoded tool args, `image_url` data-URIs (user + fanned-out tool-result images), `max_completion_tokens` vs `max_tokens`, `reasoning_effort`, `tool_choice`, synthesized block-stop events                                                                                                    |
@@ -791,9 +896,13 @@ both fields `None` and never reads them.
 | `DEFAULT_MAX_TOKENS` / `Agent::with_max_tokens` | model-aware (≥ 4096) | Per-turn output ceiling (`max_tokens`/`max_completion_tokens` per dialect). `Agent::new` seeds it from `capabilities(model).max_output` (floored at 4096); the compaction `context_window` is likewise seeded from `capabilities`. Both still overridable via the builders |
 | `DEFAULT_MAX_STEPS` / `Agent::with_max_steps`   | 50                   | Loop-iteration ceiling; once `session.steps` reaches it, the _next_ iteration returns `Error::MaxSteps` before sending a request — a runaway-tool-call backstop. `Error::MaxSteps` is resumable: the check runs before any per-turn state is touched, so a fresh `run`/`run_events_steered` call against the same session simply continues past it with a new per-call step budget |
 | `Agent::with_system`                            | `None`               | System prompt; hoisted to each dialect's native system field (Anthropic top-level `system`, OpenAI leading `system` message)                                                                                                                                               |
-| `Agent::with_tools`                             | empty                | The tool set advertised to the model; definitions + JSON Schemas computed once here, shared via `Arc<[ToolDef]>` for the agent's lifetime                                                                                                                                  |
+| `Agent::with_system_fn`                         | `None`               | Per-turn system-prompt callback, re-evaluated every turn; takes priority over `with_system` when both are set                                                                                                                                                              |
+| `Agent::with_tools`                             | empty                | The tool set advertised to the model; definitions + JSON Schemas computed once here, shared via `Arc<[ToolDef]>` for the agent's lifetime (mid-run overridable — see `Steering::request_tool_set`)                                                                        |
+| `Agent::with_block_images`                      | `false`              | Force the vision-downgrade path regardless of the active model's real `supports_vision` capability                                                                                                                                                                         |
 | `CONNECT_TIMEOUT` (`client.rs`)                 | 10s                  | TCP+TLS handshake cap to the gateway; mirrors the gateway's own upstream `connect_timeout_secs`                                                                                                                                                                            |
 | `READ_TIMEOUT` (`client.rs`)                    | 600s                 | Idle timeout _between_ reads on the streaming body (not total stream duration); sized to the gateway's own upstream `read_timeout_secs`                                                                                                                                    |
+| `MAX_BACKOFF` / `GatewayClient::with_max_backoff` | 60s                | Ceiling on a single backoff wait (exponential or `Retry-After`-derived), independent of `with_retry`'s `max_retries`/`base_backoff`                                                                                                                                        |
+| `GatewayClient::with_extra_headers`             | empty                | Operator-configured headers merged onto every outgoing request, applied last (wins on a name collision)                                                                                                                                                                    |
 
 ## Failure Modes
 

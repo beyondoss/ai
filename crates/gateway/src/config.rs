@@ -83,10 +83,11 @@ pub struct AiConfig {
     /// `"openai"` — that fallback is exactly the bug this field exists to let an operator opt out of.
     pub provider_dialects: HashMap<String, String>,
 
-    /// Managed auth scheme for a **config-added** provider, by provider name: `"bearer"` or
-    /// `"x-api-key"` (case-insensitive, `-`/`_` ignored; see `AuthScheme::parse_config`). Has no
-    /// effect on a known provider. Missing ⇒ `"bearer"` (backward-compatible default). An unrecognized
-    /// value is a hard boot failure.
+    /// Managed auth scheme for a **config-added** provider, by provider name: `"bearer"`,
+    /// `"x-api-key"`, or `"api-key"` (Azure OpenAI's bare-key header — see `AuthScheme::ApiKey`;
+    /// case-insensitive, `-`/`_` ignored; see `AuthScheme::parse_config`). Has no effect on a known
+    /// provider. Missing ⇒ `"bearer"` (backward-compatible default). An unrecognized value is a hard
+    /// boot failure.
     pub provider_auth_schemes: HashMap<String, String>,
 
     /// Upstream timeouts (seconds). Streaming responses are long, so read/idle are generous.

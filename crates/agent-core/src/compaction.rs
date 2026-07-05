@@ -540,8 +540,13 @@ fn truncate_chars(s: &str, max: usize) -> String {
     format!("{kept}… [{dropped} more characters truncated]")
 }
 
-/// Files the prefix read vs. modified, extracted from `read`/`write`/`edit` tool calls. Appended to
-/// the summary so the model keeps file awareness across the cut.
+/// Files the prefix read vs. modified, extracted from `read`/`write`/`edit` tool calls only. Appended
+/// to the summary so the model keeps file awareness across the cut.
+///
+/// Task #31 (pi-parity fix): `ls` used to be bucketed alongside `read` here, contrary to both this
+/// function's own doc comment and pi's `compaction/utils.ts:44-55` (`read`/`write`/`edit` only) — every
+/// directory listing was diluting the read-files list with paths the prefix never actually read the
+/// *contents* of, just enumerated.
 pub fn extract_file_ops(messages: &[Message]) -> (Vec<String>, Vec<String>) {
     let mut read = Vec::new();
     let mut modified = Vec::new();
@@ -552,7 +557,7 @@ pub fn extract_file_ops(messages: &[Message]) -> (Vec<String>, Vec<String>) {
                     continue;
                 };
                 let bucket = match name.as_str() {
-                    "read" | "ls" => &mut read,
+                    "read" => &mut read,
                     "write" | "edit" => &mut modified,
                     _ => continue,
                 };
@@ -1260,6 +1265,34 @@ mod tests {
         let (read, modified) = extract_file_ops(&convo());
         assert_eq!(read, vec!["src/foo.rs"]);
         assert_eq!(modified, vec!["src/foo.rs"]);
+    }
+
+    #[test]
+    fn extract_file_ops_does_not_count_ls_as_a_read() {
+        // Task #31 (pi-parity fix): a directory listing must not dilute the read-files list — matches
+        // pi's `compaction/utils.ts:44-55` (`read`/`write`/`edit` only, no `ls`).
+        let messages = vec![
+            Message::user("look around"),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "1",
+                "ls",
+                json!({ "path": "src/" }),
+            )]),
+            Message::tool_result("1", "foo.rs\nbar.rs", false),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "2",
+                "read",
+                json!({ "path": "src/foo.rs" }),
+            )]),
+            Message::tool_result("2", "fn foo() {}", false),
+        ];
+        let (read, modified) = extract_file_ops(&messages);
+        assert_eq!(
+            read,
+            vec!["src/foo.rs".to_string()],
+            "an `ls` call must not appear in (or otherwise pollute) the read-files list"
+        );
+        assert!(modified.is_empty());
     }
 
     #[test]

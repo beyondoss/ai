@@ -117,6 +117,17 @@ pub struct SessionMeta {
     /// `dropped_messages`. Defaults to 0.
     #[serde(default)]
     pub summarized_branch_messages: u64,
+    /// The portable thinking level ([`agent_core::ThinkingLevel::as_str`]'s wire string, e.g. `"high"`)
+    /// most recently recorded via [`SessionStore::record_thinking_level_change`] — `None` when no
+    /// change was ever recorded (a session that never called `set_reasoning_effort`/
+    /// `cycle_thinking_level`, or one written before this field existed). Task #18 (pi-parity fix):
+    /// added alongside `model`'s own "keep meta current" fix for the same reason — a flat "last known"
+    /// figure a simple consumer (a future `run --continue` reopen path) can read directly, without
+    /// needing the full per-branch `SessionStore::thinking_level_at` tree lookup `switch_session`/
+    /// `switch_branch` already use. `#[serde(default)]` so older headers (written before this field
+    /// existed) round-trip unchanged.
+    #[serde(default)]
+    pub thinking_level: Option<String>,
 
     // --- Derived listing fields ---
     // Populated only by [`SessionRepo::list`] (from the file's mtime and a light scan), never persisted
@@ -171,6 +182,7 @@ impl SessionMeta {
             dropped_messages: 0,
             branch_summaries: 0,
             summarized_branch_messages: 0,
+            thinking_level: None,
             updated_at: 0,
             message_count: 0,
             preview: None,
@@ -886,13 +898,19 @@ impl SessionStore {
                     );
                 }
                 // Neither moves the tip — a pure lookup record, last-write-wins per anchor (see
-                // `Entry::ModelChange`'s doc comment).
+                // `Entry::ModelChange`'s doc comment). Deliberately does NOT touch `meta.model`/
+                // `meta.thinking_level` (Task #18, pi-parity investigation) — see
+                // `SessionStore::record_model_change`'s own doc comment for why: `meta.model` must stay
+                // the session's true creation-time value (never overwritten by a later change) for
+                // `Persistence::model_and_level_at`'s fallback to resolve correctly on reopen, exactly
+                // as it already does for a still-running process.
                 Ok(Entry::ModelChange {
                     parent_id, model, ..
                 }) => {
                     events.push(ExportEvent::ModelChange(model.clone()));
                     model_changes.insert(parent_id, model);
                 }
+                // Same idea as `ModelChange` just above.
                 Ok(Entry::ThinkingLevelChange {
                     parent_id, level, ..
                 }) => {
@@ -958,21 +976,54 @@ impl SessionStore {
         let persisted = messages.len();
         let mut session = Session::new();
         session.messages = Arc::new(messages);
-        // Restore a proactive-compaction trigger signal for a resumed session. Usage isn't persisted
-        // per-message anywhere in this format (only ever lived on the in-memory `Session`), so a
-        // freshly-opened session's `last_input_tokens` defaults to 0 — and `should_compact`/
-        // `is_hard_overflow` both require it to be positive to fire at all. Left unset, a resumed
-        // session already well over the compaction threshold wouldn't proactively compact until a
-        // *new* turn produced fresh real usage — one whole turn later than it should (pi's own
-        // regression test: `pre-prompt-compaction-no-continue`). Estimate it the same way
-        // `compaction::trailing_tokens` already estimates *any* span of messages it has no exact
-        // provider-reported figure for (the char/4 heuristic) — good enough for a trigger check, which
-        // only needs the right ballpark — treating the whole persisted transcript as "trailing" (by
-        // calling `trailing_tokens` while `last_usage_message_count` is still its default 0) and then
-        // marking every persisted message as already accounted for, so the very next real
+        // Restore a proactive-compaction trigger signal for a resumed session — a freshly-opened
+        // session's `last_input_tokens` otherwise defaults to 0, and `should_compact`/`is_hard_overflow`
+        // both require it to be positive to fire at all. Left unset, a resumed session already well
+        // over the compaction threshold wouldn't proactively compact until a *new* turn produced fresh
+        // real usage — one whole turn later than it should (pi's own regression test:
+        // `pre-prompt-compaction-no-continue`).
+        //
+        // Task #6 (pi-parity fix): Round 1 added per-message `usage` (`Message::usage`/
+        // `Message::with_usage`), persisted automatically as part of `Message`'s own `Serialize`/
+        // `Deserialize` derive — no format change needed here, and `#[serde(default,
+        // skip_serializing_if = "Option::is_none")]` means a session file written before that field
+        // existed just deserializes every message's `usage` as `None` (full backward compatibility: no
+        // migration, no version bump). When the most recent message carrying one exists, its own
+        // provider-reported figures reconstruct `last_input_tokens`/`last_output_tokens`/
+        // `last_usage_message_count` *exactly* as a still-running process would have them immediately
+        // after that turn (the same `input + cache_read + cache_write` combination
+        // `Session::record_usage`'s own `live_input` computes, and the same "snapshot taken right
+        // before this message was pushed" positioning `trailing_tokens`'s own substitution relies on —
+        // see its doc comment) — a real figure, not the char/4 estimate below. Everything *after* that
+        // message (usually nothing) is still covered by `trailing_tokens`' own per-message estimate,
+        // exactly like a live session's own turns since its last real usage snapshot.
+        //
+        // A session with no `usage`-carrying message at all (every message predates Round 1, or the
+        // active path is entirely a compaction/branch-summary recap with none recorded) falls back to
+        // the previous whole-transcript char/4 estimate, unchanged: treat every persisted message as
+        // "trailing" (by calling `trailing_tokens` while `last_usage_message_count` is still its
+        // default 0) and then mark it all as already accounted for, so the very next real
         // `trailing_tokens` call doesn't double-count it.
-        session.last_input_tokens = agent_core::compaction::trailing_tokens(&session);
-        session.last_usage_message_count = session.messages.len();
+        match session
+            .messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, m)| m.usage.map(|u| (i, u)))
+        {
+            Some((i, usage)) => {
+                session.last_usage_message_count = i;
+                session.last_output_tokens = usage.output_tokens;
+                session.last_input_tokens = usage
+                    .input_tokens
+                    .saturating_add(usage.cache_read_tokens)
+                    .saturating_add(usage.cache_write_tokens);
+            }
+            None => {
+                session.last_input_tokens = agent_core::compaction::trailing_tokens(&session);
+                session.last_usage_message_count = session.messages.len();
+            }
+        }
         Ok((
             Self {
                 path,
@@ -2003,6 +2054,27 @@ impl SessionStore {
     /// append (see [`Entry::ModelChange`]'s doc comment), not a rewrite. Call only when the model
     /// actually changed (the caller compares against its own current value first) — recording a no-op
     /// change would just bloat the file with a redundant entry.
+    ///
+    /// Deliberately does **not** touch `self.meta.model` (Task #18, pi-parity investigation): an earlier
+    /// version of this fix did exactly that, on the theory that `meta.model` staying frozen at the
+    /// session's creation-time model was simply a staleness bug reaching `SessionRepo::fork`'s copied
+    /// header and a future `run --continue` consumer. It regressed `Persistence::model_and_level_at`'s
+    /// existing, load-bearing fallback contract instead — that lookup already relies on `meta.model`
+    /// meaning specifically "the model in effect *before any change was ever recorded*", to resolve
+    /// what a `switch_branch`/`switch_session`/`fork` target should restore when no `ModelChange` is
+    /// found on the path to it (see that method's own doc comment: "every session has a real starting
+    /// model"). Mutating `meta.model` here overwrites that baseline the moment the *first*
+    /// `set_model` ever fires, so navigating back to a point that predates every recorded change then
+    /// incorrectly resolves to whatever model is *currently* active instead of the session's real
+    /// original one — caught by `serve_switch_branch_restores_the_model_active_on_that_branch`
+    /// (`tests/serve_session_tree.rs`), which this exact regression broke.
+    ///
+    /// The actual bug this task named — `SessionRepo::fork`/`fork_at_entry`/`fork_from_path` copying
+    /// `src.meta.model` verbatim into a forked session's own header, even when the fork point is well
+    /// past the source's last recorded `set_model` — is instead fixed at the fork call sites themselves:
+    /// each one resolves the correct "model active at the fork point" via the same per-branch
+    /// `model_at`/`change_at` lookup this method's own `model_changes` map already supports, rather than
+    /// reading `meta.model` at all. See [`SessionRepo::fork`]'s own doc comment.
     pub fn record_model_change(&mut self, model: &str) -> std::io::Result<()> {
         let anchor = self.active.last().cloned();
         let entry = Entry::ModelChange {
@@ -2018,7 +2090,8 @@ impl SessionStore {
     }
 
     /// Same idea as [`Self::record_model_change`], for the portable thinking level (`level` is
-    /// [`agent_core::ThinkingLevel::as_str`]'s wire string, e.g. `"high"`).
+    /// [`agent_core::ThinkingLevel::as_str`]'s wire string, e.g. `"high"`) — same deliberate
+    /// non-mutation of `self.meta`, for the identical reason (see that method's doc comment).
     pub fn record_thinking_level_change(&mut self, level: &str) -> std::io::Result<()> {
         let anchor = self.active.last().cloned();
         let entry = Entry::ThinkingLevelChange {
@@ -2057,6 +2130,23 @@ impl SessionStore {
     /// Same idea as [`Self::model_at_root`], for the portable thinking level.
     pub fn thinking_level_at_root(&self) -> Option<&str> {
         self.level_changes.get(&None).map(String::as_str)
+    }
+
+    /// The model that was actually active at `target_id` (or, when `None`, at the tree's own root) —
+    /// what a fresh fork's own header should carry (Task #18, pi-parity fix), since forking doesn't
+    /// carry `ModelChange` bookkeeping into the new file at all (see this struct's module doc and
+    /// [`Self::record_model_change`]'s own doc comment on why blindly copying `meta.model` is wrong
+    /// once even one `set_model` has happened past the fork point — or, for a fork landing *earlier*
+    /// than the source's *first* `set_model`, wrong in the other direction). Falls back to
+    /// `self.meta.model` (the session's true creation-time value) only when nothing was ever recorded
+    /// reaching that point — the exact same "nothing changed on this branch yet" resolution
+    /// `Persistence::model_and_level_at` (`serve.rs`) already applies for `switch_branch`/
+    /// `switch_session`, just scoped to the one value a fork's own new header needs up front.
+    fn model_at_or_created(&self, target_id: Option<&str>) -> &str {
+        target_id
+            .and_then(|id| self.model_at(id))
+            .or_else(|| self.model_at_root())
+            .unwrap_or(&self.meta.model)
     }
 
     /// Set (and persist) the session title — an O(1) append (see [`Entry::TitleChange`]'s doc
@@ -2473,7 +2563,16 @@ impl SessionRepo {
     pub fn fork(&self, id: &str, upto: usize) -> std::io::Result<(SessionStore, Session)> {
         let (src, src_session) = self.open_id(id)?;
         let upto = upto.min(src_session.messages.len());
-        let mut meta = SessionMeta::new(src.meta.cwd.clone(), src.meta.model.clone());
+        // Task #18 (pi-parity fix): the model actually active at the copied prefix's own last message
+        // — not `src.meta.model` (the source's creation-time value, blindly copied here previously) —
+        // see `model_at_or_created`'s own doc comment for why that matters once a `set_model` has
+        // happened anywhere relative to the fork point.
+        let target_id = (upto > 0)
+            .then(|| src.active_ids().get(upto - 1))
+            .flatten()
+            .map(String::as_str);
+        let model = src.model_at_or_created(target_id).to_string();
+        let mut meta = SessionMeta::new(src.meta.cwd.clone(), model);
         // The source's own resolved id, not the caller's raw `id` argument — since `open_id` now accepts
         // a unique prefix, blindly echoing `id` back would persist the *prefix* as `parent` instead of
         // the real full id it resolved to.
@@ -2503,7 +2602,13 @@ impl SessionRepo {
     ) -> std::io::Result<(SessionStore, Session)> {
         let (src, src_session) = SessionStore::open(source_path.to_path_buf())?;
         let upto = upto.min(src_session.messages.len());
-        let mut meta = SessionMeta::new(target_cwd.to_string(), src.meta.model.clone());
+        // Task #18 (pi-parity fix): same reasoning as `fork`'s identical resolution just above.
+        let target_id = (upto > 0)
+            .then(|| src.active_ids().get(upto - 1))
+            .flatten()
+            .map(String::as_str);
+        let model = src.model_at_or_created(target_id).to_string();
+        let mut meta = SessionMeta::new(target_cwd.to_string(), model);
         meta.parent = Some(src.meta.id.clone());
         meta.title = src.meta.title.clone();
 
@@ -2588,12 +2693,6 @@ impl SessionRepo {
                 format!("no message with id {entry_id} in session {id}"),
             ));
         }
-        let mut meta = SessionMeta::new(src.meta.cwd.clone(), src.meta.model.clone());
-        // The source's own resolved id, not the caller's raw `id` argument — see `fork`'s identical fix
-        // for why: `open_id` now accepts a unique prefix, so `id` itself may not be the real full id.
-        meta.parent = Some(src.meta.id.clone());
-        meta.title = src.meta.title.clone();
-
         // `before` (now the default — see `serve.rs`'s `fork`/`preview_fork` handlers) means "fork
         // right before this entry", which only makes sense anchored to a user turn: popping a
         // non-user entry (an assistant reply, a materialized branch-summary recap, or a custom entry)
@@ -2618,6 +2717,20 @@ impl SessionRepo {
         if before {
             path.pop();
         }
+        // Task #18 (pi-parity fix): the model actually active at the resolved fork point (`path`'s own
+        // last id post-`before`-adjustment, or the tree's root if `before` popped the very first entry)
+        // — not `src.meta.model` (the source's creation-time value) — see `model_at_or_created`'s own
+        // doc comment. Computed *after* the `before` adjustment above, since that's what determines the
+        // actual point being forked at.
+        let model = src
+            .model_at_or_created(path.last().map(String::as_str))
+            .to_string();
+        let mut meta = SessionMeta::new(src.meta.cwd.clone(), model);
+        // The source's own resolved id, not the caller's raw `id` argument — see `fork`'s identical fix
+        // for why: `open_id` now accepts a unique prefix, so `id` itself may not be the real full id.
+        meta.parent = Some(src.meta.id.clone());
+        meta.title = src.meta.title.clone();
+
         // Labels are looked up against the *full* path (including any custom entry's id) — a label
         // whose target is a custom entry that then gets filtered out below simply won't be found in
         // `fork_at_entry`'s old-id → new-id map, and is correctly dropped the same way an
@@ -3067,19 +3180,29 @@ fn read_listing(path: &Path) -> Option<SessionMeta> {
                     }
                 }
             }
-            // A stray header mid-file (or a branch-navigation/summary/compaction-provenance/model-or-
-            // thinking-level-change/label/custom marker) is ignored — a custom entry contributes no
-            // message text of its own, matching `message_count`'s "real conversation messages only"
-            // semantics.
+            // A stray header mid-file (or a branch-navigation/summary/compaction-provenance/label/custom
+            // marker) is ignored — a custom entry contributes no message text of its own, matching
+            // `message_count`'s "real conversation messages only" semantics.
             Ok(Entry::Session(_))
             | Ok(Entry::Leaf { .. })
             | Ok(Entry::BranchSummary { .. })
             | Ok(Entry::Compaction { .. })
-            | Ok(Entry::ModelChange { .. })
-            | Ok(Entry::ThinkingLevelChange { .. })
             | Ok(Entry::Label { .. })
             | Ok(Entry::Custom { .. }) => {}
-            // Whole-session-scoped: the most recent one anywhere in the file wins.
+            // Whole-session-scoped: the most recent one anywhere in the file wins (Task #18, pi-parity
+            // fix, for `model`/`thinking_level`) — so a `list_sessions`/`list_all_sessions` listing shows
+            // the session's actual last-used model rather than its frozen creation-time one. Safe here
+            // specifically because `read_listing`'s own `SessionMeta` is a display-only, throwaway
+            // value (never fed into `Persistence::model_and_level_at`'s tree-fallback resolution the way
+            // a real `SessionStore::open` would be) — see `SessionStore::record_model_change`'s doc
+            // comment for why the *real*, operative `meta.model` (built by `open`, not this listing scan)
+            // must NOT be mutated the same way.
+            Ok(Entry::ModelChange { model, .. }) => {
+                meta.model = model;
+            }
+            Ok(Entry::ThinkingLevelChange { level, .. }) => {
+                meta.thinking_level = Some(level);
+            }
             Ok(Entry::TitleChange { title, .. }) => {
                 meta.title = title_or_clear(title);
             }
@@ -3602,6 +3725,139 @@ mod tests {
         let (_store, restored) = repo.open_id(&id).unwrap();
         // The intact first message survives; the torn record is dropped.
         assert_eq!(restored.messages.len(), 1);
+    }
+
+    #[test]
+    fn message_usage_round_trips_through_persist_and_reopen() {
+        // Task #6 (pi-parity fix): Round 1 added `Message.usage` (`agent_core::TokenUsage`) — confirm
+        // this persistence format actually carries it through a real append + reopen, not just relying
+        // on `Message`'s `Serialize`/`Deserialize` derive being correct in isolation. No format/version
+        // change was needed: `Entry::Message.message` embeds the whole `Message`, so the new
+        // `#[serde(default, skip_serializing_if = "Option::is_none")]` field round-trips automatically.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo
+            .create(SessionMeta::new("/work", "claude-test"))
+            .unwrap();
+        let usage = agent_core::TokenUsage {
+            input_tokens: 120,
+            output_tokens: 45,
+            cache_read_tokens: 10,
+            cache_write_tokens: 5,
+            cache_write_1h_tokens: 0,
+            reasoning_tokens: 7,
+        };
+        let mut session = Session::new();
+        session.user("hi");
+        session.push(
+            Message::assistant(vec![ContentBlock::text("hello")])
+                .with_model_id("claude-test")
+                .with_usage(usage),
+        );
+        store.append_new(&session.messages).unwrap();
+
+        let id = store.meta().id.clone();
+        let (_reopened, restored) = repo.open_id(&id).unwrap();
+        assert_eq!(restored.messages.len(), 2);
+        assert_eq!(restored.messages[0].usage, None, "a user turn never carries usage");
+        assert_eq!(
+            restored.messages[1].usage,
+            Some(usage),
+            "the assistant turn's own usage must survive a real append + reopen round trip"
+        );
+    }
+
+    #[test]
+    fn message_usage_round_trips_when_absent_matching_a_pre_round_1_file() {
+        // Backward compatibility: a session with no `usage` on any message (every message predates
+        // Round 1's field, or was never populated) must still load cleanly — `#[serde(default)]` reads
+        // it as `None` rather than failing to deserialize the line at all.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo
+            .create(SessionMeta::new("/work", "claude-test"))
+            .unwrap();
+        let mut session = Session::new();
+        session.user("hi");
+        session.push(Message::assistant(vec![ContentBlock::text("hello")]));
+        store.append_new(&session.messages).unwrap();
+
+        let id = store.meta().id.clone();
+        let (_reopened, restored) = repo.open_id(&id).unwrap();
+        assert_eq!(restored.messages.len(), 2);
+        assert!(restored.messages.iter().all(|m| m.usage.is_none()));
+    }
+
+    #[test]
+    fn open_restores_last_input_tokens_exactly_from_the_most_recent_messages_usage() {
+        // Task #6 (pi-parity fix): when the active path's most recent usage-carrying message is
+        // available, restoration must use its exact provider-reported figures — the same
+        // `input + cache_read + cache_write` combination `Session::record_usage`'s own `live_input`
+        // computes — rather than the coarser whole-transcript char/4 estimate.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo
+            .create(SessionMeta::new("/work", "claude-test"))
+            .unwrap();
+        let usage = agent_core::TokenUsage {
+            input_tokens: 1_000,
+            output_tokens: 250,
+            cache_read_tokens: 200,
+            cache_write_tokens: 50,
+            cache_write_1h_tokens: 0,
+            reasoning_tokens: 0,
+        };
+        let mut session = Session::new();
+        session.user("go");
+        session.push(
+            Message::assistant(vec![ContentBlock::text("ok")])
+                .with_model_id("claude-test")
+                .with_usage(usage),
+        );
+        store.append_new(&session.messages).unwrap();
+
+        let id = store.meta().id.clone();
+        let (_reopened, restored) = repo.open_id(&id).unwrap();
+        assert_eq!(restored.last_input_tokens, 1_000 + 200 + 50);
+        assert_eq!(restored.last_output_tokens, 250);
+        // Positioned at the assistant message's own index (1), not `messages.len()` (2) — so
+        // `compaction::trailing_tokens` treats that message itself as the "just completed turn" slot
+        // (substituting `last_output_tokens` for it) rather than double-counting it as trailing.
+        assert_eq!(restored.last_usage_message_count, 1);
+        assert_eq!(
+            agent_core::compaction::trailing_tokens(&restored),
+            250,
+            "the assistant message at the snapshot position must use last_output_tokens, not a fresh \
+             char/4 estimate of its short reply text"
+        );
+    }
+
+    #[test]
+    fn open_falls_back_to_the_char4_estimate_when_no_message_has_usage() {
+        // Pre-Round-1 (or otherwise usage-less) sessions must keep the previous whole-transcript
+        // estimate behavior — this is the fallback branch `open_restores_last_input_tokens_exactly_...`
+        // above bypasses whenever real usage is available.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo
+            .create(SessionMeta::new("/work", "claude-test"))
+            .unwrap();
+        let mut session = Session::new();
+        session.user("x".repeat(400)); // ~100 estimated tokens (char/4)
+        store.append_new(&session.messages).unwrap();
+
+        let id = store.meta().id.clone();
+        let (_reopened, restored) = repo.open_id(&id).unwrap();
+        assert!(
+            restored.last_input_tokens > 0,
+            "must still estimate something so should_compact/is_hard_overflow can fire on a resumed \
+             session that's already over threshold"
+        );
+        assert_eq!(
+            restored.last_usage_message_count,
+            restored.messages.len(),
+            "with no real usage snapshot, every persisted message is treated as already accounted for"
+        );
     }
 
     #[test]
@@ -6025,6 +6281,90 @@ mod tests {
     }
 
     #[test]
+    fn record_model_change_does_not_mutate_metas_own_creation_time_model() {
+        // Task #18 (pi-parity investigation): an earlier version of this fix had
+        // `record_model_change` also assign `self.meta.model = model`, on the theory that leaving
+        // `meta.model` frozen at the session's creation-time model was simply a staleness bug. It
+        // regressed `Persistence::model_and_level_at`'s existing fallback contract instead — that
+        // lookup relies on `meta.model` staying the session's true *original* model forever, as the
+        // "nothing was ever recorded reaching this point" baseline for `switch_branch`/`switch_session`
+        // (see `SessionStore::record_model_change`'s own doc comment for the full story, and
+        // `tests/serve_session_tree.rs::serve_switch_branch_restores_the_model_active_on_that_branch`,
+        // the real end-to-end regression that caught it). This pins the corrected, deliberate
+        // non-mutation down so it can't quietly regress back.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "model-a")).unwrap();
+        assert_eq!(store.meta().model, "model-a");
+
+        store.record_model_change("model-b").unwrap();
+        assert_eq!(
+            store.meta().model,
+            "model-a",
+            "meta.model must stay the session's true creation-time value, even after a set_model"
+        );
+
+        // Must hold across a reopen too, not just in the same in-memory `self.meta`.
+        let (reopened, _) = repo.open_id(&store.meta().id.clone()).unwrap();
+        assert_eq!(reopened.meta().model, "model-a");
+        // The per-branch lookup map — the mechanism that actually IS supposed to track this — sees the
+        // change instead (anchored at the tree's own root here, since no message was ever pushed).
+        assert_eq!(store.model_at_root(), Some("model-b"));
+    }
+
+    #[test]
+    fn record_thinking_level_change_does_not_mutate_metas_thinking_level_field() {
+        // Same reasoning as `record_model_change_does_not_mutate_metas_own_creation_time_model` — the
+        // new `SessionMeta::thinking_level` field (Task #18) exists (available for a future consumer,
+        // e.g. `run --continue`'s reopen path) but is deliberately never auto-populated by this method,
+        // for the identical "would break the tree-fallback contract" reason `model` has.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "model-a")).unwrap();
+        assert_eq!(store.meta().thinking_level, None);
+
+        store.record_thinking_level_change("high").unwrap();
+        assert_eq!(
+            store.meta().thinking_level, None,
+            "meta.thinking_level is not auto-populated by record_thinking_level_change"
+        );
+    }
+
+    #[test]
+    fn fork_resolves_the_updated_model_via_the_tree_not_the_sessions_stale_meta() {
+        // Task #18's actual, real-world fix location: `SessionRepo::fork`/`fork_at_entry`/
+        // `fork_from_path` used to copy `src.meta.model` verbatim into the new session's own header —
+        // always the *original* creation-time model, regardless of any `set_model` since. Fixed by
+        // resolving the model active at the fork point via the same per-branch `model_at` lookup
+        // `Persistence::model_and_level_at` (`serve.rs`) already uses for `switch_branch`/
+        // `switch_session`, rather than by mutating `meta.model` itself (which would have broken that
+        // other lookup's own fallback — see `record_model_change`'s doc comment).
+        //
+        // "b" is a *child* of the model change's anchor ("a"), so it's the point that actually observes
+        // the new model — forking at the anchor itself ("a") would still correctly see the *original*
+        // model, matching the same "anchored-at, not before" contract this whole file already tests
+        // elsewhere (`model_and_thinking_level_changes_are_branch_scoped`).
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "model-a")).unwrap();
+        let mut session = Session::new();
+        session.user("a");
+        store.append_new(&session.messages).unwrap();
+        store.record_model_change("model-b").unwrap(); // anchored at "a"
+        session.user("b"); // "a"'s child — observes the model-b change
+        store.append_new(&session.messages).unwrap();
+
+        let session_id = store.meta().id.clone();
+        let (forked, _) = repo.fork(&session_id, usize::MAX).unwrap();
+        assert_eq!(
+            forked.meta().model,
+            "model-b",
+            "a fork's own header must carry the model active at the fork point, not the session's \
+             original one"
+        );
+    }
+
+    #[test]
     fn switch_active_rejects_unknown_id() {
         let dir = tmpdir();
         let repo = SessionRepo::open(dir.path()).unwrap();
@@ -6977,6 +7317,77 @@ mod tests {
                 .iter()
                 .any(|b| b.leaf_id == active_tip && b.is_active)
         );
+    }
+
+    #[test]
+    fn abandoned_branches_of_an_abandoned_branch_collide_on_the_same_shared_prefix() {
+        // Task #34 (pi-parity audit, low-priority/unconfirmed edge case) — investigating whether
+        // branching off an *already-abandoned* branch (not off the active path) is handled correctly.
+        //
+        // Build active [m1, m2]. Branch A off m1: [m1, a1, a2]. Branch B off A's own a1 (not off
+        // active at all): [m1, a1, b1]. Restore active to [m1, m2] so both A and B are abandoned
+        // leaves. `shared` is always computed against the *active* path only (see
+        // `abandoned_branches`'s own loop, `path.zip(self.active.iter())`) — since neither A nor B
+        // shares anything with active beyond `m1`, both come out with the *same* `shared == 1`, even
+        // though B actually shares two messages ([m1, a1]) with A, not just one ([m1]) with active.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("m1");
+        session.user("m2");
+        store.append_new(&session.messages).unwrap();
+        let ids = store.active_ids().to_vec(); // [m1, m2]
+
+        // Branch A off m1: [m1, a1, a2].
+        let root = store.switch_active(&ids[0]).unwrap();
+        let mut branch_a = Session::new();
+        branch_a.messages = Arc::new(root);
+        branch_a.user("a1");
+        branch_a.user("a2");
+        store.append_new(&branch_a.messages).unwrap();
+        let a_ids = store.active_ids().to_vec(); // [m1, a1, a2]
+        let a1_id = a_ids[1].clone();
+
+        // Branch B off A's own a1 (an already-abandoned branch, not the active path at all): [m1, a1, b1].
+        let root = store.switch_active(&a1_id).unwrap();
+        let mut branch_b = Session::new();
+        branch_b.messages = Arc::new(root);
+        branch_b.user("b1");
+        store.append_new(&branch_b.messages).unwrap();
+
+        // Restore active to the original [m1, m2] — both A and B are now abandoned leaves.
+        store.switch_active(&ids[1]).unwrap();
+
+        let mut abandoned = store.abandoned_branches();
+        assert_eq!(abandoned.len(), 2, "both A (leaf a2) and B (leaf b1): {abandoned:?}");
+        abandoned.sort_by_key(|(_, messages)| messages.len());
+        let (shared_b, messages_b) = &abandoned[0]; // [m1, a1, b1] — the shorter chain
+        let (shared_a, messages_a) = &abandoned[1]; // [m1, a1, a2]
+        assert_eq!(messages_b.len(), 3);
+        assert_eq!(messages_a.len(), 3);
+
+        // The bug this test confirms: both report the same `shared` (their common prefix with
+        // *active*), even though B's true divergence point is from A's own a1, two messages deep —
+        // not from active's m1, one message deep.
+        assert_eq!(*shared_a, 1);
+        assert_eq!(
+            *shared_b, 1,
+            "confirms Task #34: B collides with A's own `shared` value despite actually forking off \
+             A (sharing [m1, a1], not just [m1])"
+        );
+
+        // Concretely: `export.rs`'s `render_branches_diverging_at` renders `branch_messages[shared..]`
+        // for *every* branch at a given `shared` value as sibling `<details>` blocks — so with both at
+        // `shared == 1`, B's own box would render `[a1, b1]` (duplicating `a1`, already shown inside
+        // A's own separate box as part of `[a1, a2]`), rather than being nested inside A's box showing
+        // only its own net-new `[b1]`. Confirmed real; fixing it properly means reshaping
+        // `abandoned_branches`'s flat `(shared, messages)` list into an actual tree (and
+        // `render_branches_diverging_at` into a recursive renderer) — a disproportionate restructuring
+        // for a narrow edge case this crate's RPC surface allows but no real workflow is known to
+        // exercise, per this task's own low-priority/unconfirmed framing. Left as documented,
+        // proven-real, deliberately unfixed.
+        assert_eq!(&messages_b[..*shared_b], &messages_a[..*shared_a]);
     }
 
     #[test]

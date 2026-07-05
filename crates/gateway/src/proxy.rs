@@ -33,10 +33,12 @@
 //!
 //! Routing is by the **first path segment** = provider name (`route`, data-driven): `/{provider}/…`
 //! selects the provider and the rest of the path is forwarded **verbatim** (the gateway holds no
-//! per-provider mount knowledge). A bare path with no provider prefix that starts with `/v1` is the
-//! drop-in default — dialect picks openai/anthropic (`dialect_for_path`) — so an OpenAI/Anthropic
-//! client works by changing only the host. An unknown first segment is a 404. Model isn't used for
-//! routing (the body isn't read pre-connect); it's still captured from the body for usage.
+//! per-provider mount knowledge). A bare path with no provider prefix that is exactly `/v1` or
+//! starts with `/v1/` (boundary-checked — see `route::is_default_prefix`, not a raw
+//! `starts_with("/v1")`, which would also absorb a lookalike like Google Gemini's `/v1beta/…`) is
+//! the drop-in default — dialect picks openai/anthropic (`dialect_for_path`) — so an OpenAI/
+//! Anthropic client works by changing only the host. An unknown first segment is a 404. Model isn't
+//! used for routing (the body isn't read pre-connect); it's still captured from the body for usage.
 
 use crate::route::{self, Dialect, Provider};
 use crate::state::{GatewayState, RequestId};
@@ -240,14 +242,23 @@ fn sanitize_model(model: String) -> Cow<'static, str> {
     }
 }
 
-/// Set OpenRouter's attribution headers when (and only when) `provider_name` is `"openrouter"` —
-/// every other provider is untouched, so this is a no-op dead weight of one string compare on the
-/// hot path for everyone else.
+/// Set OpenRouter's attribution headers when (and only when) `provider_name` is `"openrouter"`
+/// **and** the request is managed — every other provider, and every BYO request regardless of
+/// provider, is untouched. Task #22 (pi-parity, Medium): pi gates this dashboard-attribution
+/// behind a user-controllable telemetry setting (`isInstallTelemetryEnabled`,
+/// `packages/coding-agent/src/core/provider-attribution.ts`); this gateway has no per-user
+/// telemetry-opt-out setting to consult, but it already has an unambiguous, always-correct proxy
+/// for "is this Beyond's own attribution to make, or someone else's traffic passing through us": a
+/// BYO request carries the *caller's own* OpenRouter key, not Beyond's — attributing *their*
+/// traffic to Beyond's dashboard app would misrepresent whose usage it is, the same harm the
+/// telemetry opt-out exists to prevent. Managed traffic (Beyond's own pool key) is the only case
+/// these headers describe accurately.
 fn apply_provider_attribution(
     upstream_request: &mut pingora::http::RequestHeader,
     provider_name: &str,
+    managed: bool,
 ) -> Result<()> {
-    if provider_name == "openrouter" {
+    if provider_name == "openrouter" && managed {
         upstream_request.insert_header("HTTP-Referer", OPENROUTER_REFERER)?;
         upstream_request.insert_header("X-OpenRouter-Title", OPENROUTER_TITLE)?;
         upstream_request.insert_header("X-OpenRouter-Categories", OPENROUTER_CATEGORY)?;
@@ -262,6 +273,16 @@ fn dialect_for_path(path: &str) -> Dialect {
     } else {
         Dialect::OpenAI
     }
+}
+
+/// Resolve the provider name for a request whose first path segment matched no known/config
+/// provider: `Some(name)` for the bare-path default — `path` is boundary-checked against
+/// [`route::DEFAULT_PREFIX`] (see [`route::is_default_prefix`]) so a lookalike like Google
+/// Gemini's `/v1beta/…` doesn't qualify — with the dialect picking openai/anthropic
+/// ([`dialect_for_path`]); `None` for anything else, which the caller turns into a 404 rather than
+/// silently guessing a provider (Task #7, pi-parity).
+fn bare_default_provider_name(path: &str) -> Option<&'static str> {
+    route::is_default_prefix(path).then(|| route::dialect_default(dialect_for_path(path)))
 }
 
 /// Whether the **forwarded** (provider-native) path targets the OpenAI Chat Completions endpoint.
@@ -311,10 +332,12 @@ impl ProxyHttp for AiProxy {
 
         // 1. Route by the **first path segment** = provider; forward the rest of the path verbatim
         // (native passthrough — the gateway holds no per-provider mount knowledge). A path with no
-        // provider segment that starts with `/v1` is the drop-in default: dialect picks
-        // openai/anthropic and the path is forwarded as-is. Anything else → unknown provider (404).
-        // We resolve before auth (an unknown route is cheap) and compute owned values inside the
-        // block so the session borrow ends before any `&mut session` reject below.
+        // provider segment that is exactly `/v1` or starts with `/v1/` (boundary-checked — see
+        // `bare_default_provider_name`/`route::is_default_prefix`, not a raw prefix test) is the
+        // drop-in default: dialect picks openai/anthropic and the path is forwarded as-is. Anything
+        // else → unknown provider (404). We resolve before auth (an unknown route is cheap) and
+        // compute owned values inside the block so the session borrow ends before any `&mut session`
+        // reject below.
         let (provider_opt, forward_path) = {
             let uri = &session.req_header().uri;
             let path = uri.path();
@@ -332,9 +355,8 @@ impl ProxyHttp for AiProxy {
                     Some(p.clone()),
                     with_query(if rest.is_empty() { "/" } else { rest }),
                 )
-            } else if path.starts_with(route::DEFAULT_PREFIX) {
+            } else if let Some(name) = bare_default_provider_name(path) {
                 // Bare default: dialect picks the provider; forward the path unchanged.
-                let name = route::dialect_default(dialect_for_path(path));
                 (self.state.provider(name).cloned(), with_query(path))
             } else {
                 (None, String::new())
@@ -630,12 +652,17 @@ impl ProxyHttp for AiProxy {
         };
 
         // Managed: swap the virtual key for the real pool key (precomputed at boot) in the scheme
-        // the upstream wants — removing *both* inbound auth headers first so the virtual key never
-        // leaks upstream. BYO (`!managed`): leave the user's own auth header exactly as presented.
+        // the upstream wants — removing every inbound static-key header first (see
+        // `STATIC_KEY_HEADERS`) so the virtual key never leaks upstream, and so a provider whose own
+        // auth header (e.g. Azure's `api-key` — Task #8) happens to be the same header the client
+        // presented its virtual key in doesn't end up with two stacked values. BYO (`!managed`):
+        // leave the user's own auth header exactly as presented.
         if rc.managed {
             if let Some(av) = &rc.provider.pool_auth_value {
                 upstream_request.remove_header("authorization");
-                upstream_request.remove_header("x-api-key");
+                for header in STATIC_KEY_HEADERS {
+                    upstream_request.remove_header(header);
+                }
                 upstream_request.insert_header(rc.provider.auth.header(), av.expose())?;
             }
         }
@@ -643,8 +670,9 @@ impl ProxyHttp for AiProxy {
         // Point Host at the upstream.
         upstream_request.insert_header("host", rc.provider.host.as_str())?;
 
-        // Dashboard-attribution headers (OpenRouter only — see `apply_provider_attribution`).
-        apply_provider_attribution(upstream_request, rc.provider.name.as_str())?;
+        // Dashboard-attribution headers (OpenRouter, managed traffic only — Task #22, see
+        // `apply_provider_attribution`).
+        apply_provider_attribution(upstream_request, rc.provider.name.as_str(), rc.managed)?;
 
         // Forward the provider-native path (computed in `request_filter`): the client path with the
         // `/{provider}` segment stripped, or unchanged for a bare-path default. We send it verbatim —
@@ -1129,6 +1157,29 @@ mod tests {
     }
 
     #[test]
+    fn bare_default_provider_name_rejects_gemini_v1beta_lookalike() {
+        // Task #7 (pi-parity, High): a raw `path.starts_with("/v1")` absorbed Google Gemini's real
+        // path shape (`/v1beta/models/{model}:generateContent`) into the bare-default branch, which
+        // then routed it to OpenAI — a silent misroute that 404s against `api.openai.com` instead of
+        // failing with a clear "unknown provider" error. Boundary-checking must reject it.
+        assert_eq!(
+            bare_default_provider_name("/v1beta/models/gemini-2.5-pro:generateContent"),
+            None,
+            "/v1beta must NOT be routed to OpenAI (or any provider) via the bare-default path"
+        );
+        assert_eq!(bare_default_provider_name("/v1beta"), None);
+
+        // The real bare-default shape still resolves correctly, dialect-picked.
+        assert_eq!(bare_default_provider_name("/v1/messages"), Some("anthropic"));
+        assert_eq!(bare_default_provider_name("/v1/chat/completions"), Some("openai"));
+        assert_eq!(bare_default_provider_name("/v1"), Some("openai"));
+
+        // Other near-miss prefixes must also be rejected, not just /v1beta.
+        assert_eq!(bare_default_provider_name("/v10/messages"), None);
+        assert_eq!(bare_default_provider_name("/v2/messages"), None);
+    }
+
+    #[test]
     fn is_streamable_path_matches_generation_suffixes_across_prefixes() {
         // Only chat-completions gets buffered for `stream_options.include_usage` injection. The
         // check is by *suffix* so it holds whatever mount prefix the provider uses; a mismatch here
@@ -1148,14 +1199,14 @@ mod tests {
     }
 
     #[test]
-    fn openrouter_attribution_present_only_for_openrouter() {
+    fn openrouter_attribution_present_only_for_openrouter_managed_traffic() {
         let mut openrouter_req = pingora::http::RequestHeader::build(
             http::Method::POST,
             b"/api/v1/chat/completions",
             None,
         )
         .unwrap();
-        apply_provider_attribution(&mut openrouter_req, "openrouter").unwrap();
+        apply_provider_attribution(&mut openrouter_req, "openrouter", true).unwrap();
         assert_eq!(
             openrouter_req.headers.get("HTTP-Referer").unwrap(),
             OPENROUTER_REFERER
@@ -1179,7 +1230,7 @@ mod tests {
                 None,
             )
             .unwrap();
-            apply_provider_attribution(&mut req, other).unwrap();
+            apply_provider_attribution(&mut req, other, true).unwrap();
             assert!(
                 req.headers.get("HTTP-Referer").is_none(),
                 "{other} should not get HTTP-Referer"
@@ -1193,5 +1244,33 @@ mod tests {
                 "{other} should not get X-OpenRouter-Categories"
             );
         }
+    }
+
+    #[test]
+    fn openrouter_attribution_gated_off_for_byo_traffic() {
+        // Task #22 (pi-parity, Medium): pi gates its OpenRouter dashboard-attribution headers
+        // behind a user-controllable telemetry opt-out (`isInstallTelemetryEnabled`) — before this
+        // fix, this gateway injected them unconditionally, including onto a BYO caller's own
+        // OpenRouter key, misattributing *their* traffic to Beyond's dashboard app. `managed=false`
+        // (BYO) must suppress every one of the three headers, even for the OpenRouter provider.
+        let mut byo_req = pingora::http::RequestHeader::build(
+            http::Method::POST,
+            b"/api/v1/chat/completions",
+            None,
+        )
+        .unwrap();
+        apply_provider_attribution(&mut byo_req, "openrouter", false).unwrap();
+        assert!(
+            byo_req.headers.get("HTTP-Referer").is_none(),
+            "BYO OpenRouter traffic must not get HTTP-Referer"
+        );
+        assert!(
+            byo_req.headers.get("X-OpenRouter-Title").is_none(),
+            "BYO OpenRouter traffic must not get X-OpenRouter-Title"
+        );
+        assert!(
+            byo_req.headers.get("X-OpenRouter-Categories").is_none(),
+            "BYO OpenRouter traffic must not get X-OpenRouter-Categories"
+        );
     }
 }

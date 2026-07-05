@@ -203,6 +203,7 @@ impl Tool for Read {
             match result {
                 Ok(mut out) => {
                     if !supports_vision {
+                        out.images.clear();
                         if !out.text.is_empty() {
                             out.text.push('\n');
                         }
@@ -670,10 +671,16 @@ struct ResizedImage {
 /// `max_width`x`max_height`. At each size tried, a lossless PNG re-encode is attempted *first* — pi's
 /// own `tryEncodings` order — since a downscaled screenshot/diagram/text-heavy image often already fits
 /// losslessly, and a lossy JPEG re-encode would otherwise smear small text at block-compression edges
-/// for no reason; only when the PNG doesn't fit the budget does it fall back to JPEG (the only format
-/// here with a quality knob left to trade against size). If PNG-at-this-size still doesn't fit, both
-/// the dimensions and JPEG quality are stepped down and it retries a bounded number of times; returns
-/// `None` only if even the smallest re-encode can't fit.
+/// for no reason; only when the PNG doesn't fit the budget does it fall back to a ladder of JPEG
+/// qualities at that same size — `[requested, 85, 70, 55, 40]`, matching pi's own fixed ladder — before
+/// shrinking further. If nothing at this size fits, dimensions are cut by 25% (pi's own factor, not
+/// 20%) and it retries, with **no round limit** and a floor of 1×1 pixel (both matching pi's
+/// `resizeImageInProcess` exactly, instead of a 6-round cap and a 64×64 floor): shrinking always
+/// eventually reaches a size small enough for *some* encoding to fit under any sane byte budget, so
+/// giving up after a fixed number of rounds — and reporting the image as unservable — was the actual
+/// bug; pi's version is "guaranteed to eventually fit" by construction, and this now is too. `None` is
+/// only returned once the 1×1 floor itself still doesn't fit — a budget so small no image could ever
+/// satisfy it.
 fn resize_image(
     bytes: &[u8],
     format: image::ImageFormat,
@@ -699,11 +706,11 @@ fn resize_image(
 
     let mut width = max_width.min(orig_dims.0).max(1);
     let mut height = max_height.min(orig_dims.1).max(1);
-    let mut quality = jpeg_quality;
-    // A handful of shrink-and-retry rounds is enough in practice to find a fit (each round cuts pixel
-    // count by ~36% and quality by 10); a pathological image that still can't fit at the size/quality
-    // floor genuinely can't be served inline, and `None` tells the caller to say so.
-    for _ in 0..6 {
+    // JPEG qualities tried at every size, highest first — pi's own fixed ladder. The caller's
+    // requested quality leads it; trying the rest before shrinking further means a lower-quality
+    // encode at the *current* size is always preferred over a higher-quality encode at a smaller one.
+    let jpeg_quality_ladder = [jpeg_quality, 85, 70, 55, 40];
+    loop {
         let scaled = if width < orig_dims.0 || height < orig_dims.1 {
             img.resize(width, height, image::imageops::FilterType::Lanczos3)
         } else {
@@ -732,35 +739,40 @@ fn resize_image(
             }
         }
 
-        let mut jpeg_buf = Vec::new();
-        let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_buf, quality);
-        if encoder
-            .write_image(
-                rgb.as_raw(),
-                scaled.width(),
-                scaled.height(),
-                image::ExtendedColorType::Rgb8,
-            )
-            .is_err()
-        {
+        for &quality in &jpeg_quality_ladder {
+            let mut jpeg_buf = Vec::new();
+            let encoder =
+                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_buf, quality);
+            if encoder
+                .write_image(
+                    rgb.as_raw(),
+                    scaled.width(),
+                    scaled.height(),
+                    image::ExtendedColorType::Rgb8,
+                )
+                .is_err()
+            {
+                continue;
+            }
+            let data = base64::engine::general_purpose::STANDARD.encode(&jpeg_buf);
+            if data.len() <= max_base64_bytes {
+                return Some(ResizedImage {
+                    base64_data: data,
+                    media_type: "image/jpeg",
+                    dimensions: (scaled.width(), scaled.height()),
+                    orig_dimensions: orig_dims,
+                });
+            }
+        }
+
+        // Nothing fit at this size. Already at the 1×1 floor with nowhere left to shrink → genuinely
+        // can't be served inline under this budget.
+        if width <= 1 && height <= 1 {
             return None;
         }
-        let data = base64::engine::general_purpose::STANDARD.encode(&jpeg_buf);
-        if data.len() <= max_base64_bytes {
-            return Some(ResizedImage {
-                base64_data: data,
-                media_type: "image/jpeg",
-                dimensions: (scaled.width(), scaled.height()),
-                orig_dimensions: orig_dims,
-            });
-        }
-        width = ((width as f64) * 0.8) as u32;
-        height = ((height as f64) * 0.8) as u32;
-        width = width.max(64);
-        height = height.max(64);
-        quality = quality.saturating_sub(10).max(30);
+        width = (((width as f64) * 0.75) as u32).max(1);
+        height = (((height as f64) * 0.75) as u32).max(1);
     }
-    None
 }
 
 #[cfg(test)]
@@ -1028,6 +1040,49 @@ mod tests {
         assert!(
             !out.contains("not valid UTF-8"),
             "a clip-induced split codepoint must not be flagged as the file being invalid: {out}"
+        );
+    }
+
+    #[test]
+    fn resize_image_converges_on_a_high_entropy_incompressible_image() {
+        // A deliberately high-entropy, incompressible synthetic image (per-pixel pseudo-random
+        // noise): PNG can't compress noise meaningfully, and JPEG needs a low quality (and/or a much
+        // smaller size) to shrink it much at all. Before this fix, `resize_image` capped out at 6
+        // shrink rounds with a 64x64 floor and a single JPEG quality per round — nowhere near enough
+        // for noise at a tight byte budget — and gave up with `None`. With no round limit, a 1x1
+        // floor, and a ladder of JPEG qualities per round (matching pi's `resizeImageInProcess`),
+        // shrinking must always eventually reach a size that fits.
+        let (w, h) = (512, 512);
+        let mut img = image::RgbImage::new(w, h);
+        // Deterministic xorshift32 PRNG — no external RNG dependency needed for a reproducible test.
+        let mut state: u32 = 0x1234_5678;
+        let mut next_byte = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state & 0xFF) as u8
+        };
+        for pixel in img.pixels_mut() {
+            *pixel = image::Rgb([next_byte(), next_byte(), next_byte()]);
+        }
+        let mut png_bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut png_bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+
+        // A byte budget the un-shrunk (or lightly-shrunk) noise image can't possibly meet, forcing
+        // many rounds of shrinking before anything fits.
+        let tiny_budget = 2000;
+        let resized = resize_image(&png_bytes, image::ImageFormat::Png, w, h, tiny_budget, 80)
+            .expect("resize must converge to a fit instead of giving up");
+
+        assert!(
+            resized.base64_data.len() <= tiny_budget,
+            "resized payload ({} bytes) exceeds the budget ({tiny_budget})",
+            resized.base64_data.len()
         );
     }
 
@@ -2013,6 +2068,10 @@ mod tests {
             ),
             "got: {}",
             out.text
+        );
+        assert!(
+            out.images.is_empty(),
+            "the image must actually be stripped when the model can't see it, not just noted in text"
         );
     }
 

@@ -5,6 +5,7 @@
 //! the real provider, and meters usage. The client only picks the *dialect* (by model id), builds
 //! the request body, and frames the streaming SSE response back into [`StreamEvent`]s.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,6 +17,7 @@ use zeroize::Zeroize;
 
 use crate::dialect::{Dialect, SseEventBuffer, push_sse_line};
 use crate::error::{Error, MID_STREAM_NETWORK_ERROR, Result};
+use crate::hooks::AgentHooks;
 use crate::transport::{EventStream, ModelRequest, ModelTransport};
 
 /// Anthropic's Messages API requires this header; the gateway relays it to the upstream verbatim.
@@ -52,8 +54,14 @@ pub const MAX_RETRIES: u32 = 3;
 /// Base of the exponential backoff between retries (`BASE · 2^(attempt-1)`). Public — see
 /// [`MAX_RETRIES`].
 pub const BASE_BACKOFF: Duration = Duration::from_millis(250);
-/// Ceiling on a single backoff wait, so a server-supplied `Retry-After` can't park a run for minutes.
-const MAX_BACKOFF: Duration = Duration::from_secs(10);
+/// Default ceiling on a single backoff wait (exponential or `Retry-After`-derived), so a
+/// server-supplied hint can't park a run for minutes. Raised from an earlier 10s toward pi's own
+/// default of 60s (`openai-codex-responses.ts`'s `DEFAULT_MAX_RETRY_DELAY_MS`, itself overridable) —
+/// at 10s, a 429 with a `Retry-After: 30` hint got retried back into the very rate-limit window it
+/// named, capable of exhausting the whole retry budget before that window actually closed. `pub` so a
+/// caller overriding only [`GatewayClient::with_retry`]'s two knobs can still reference this default
+/// for the third; override the ceiling itself with [`GatewayClient::with_max_backoff`].
+pub const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 /// Cap on the TCP+TLS handshake to the gateway. Mirrors the gateway's own upstream
 /// `connect_timeout_secs` (10s): a connection it can't establish in this window is a dead gateway,
@@ -151,6 +159,15 @@ pub struct DirectRouting {
     /// Attach GitHub Copilot's `X-Initiator`/`Openai-Intent`/`Copilot-Vision-Request` headers,
     /// computed fresh per turn from this request's own messages — `false` for every other provider.
     pub copilot_dynamic_headers: bool,
+    /// Send this credential's key in a named header, verbatim (no `Bearer` prefix), instead of the
+    /// usual `Authorization: Bearer <key>` — and omit `Authorization` entirely. `None` (every
+    /// existing route: Codex, Copilot, a self-hosted `ModelOverride`) preserves the
+    /// Authorization-Bearer behavior every provider up to now has needed. `Some("api-key")` is
+    /// Azure OpenAI's real wire (Task #8, pi-parity): its `AzureOpenAI` SDK client authenticates via
+    /// a bare key in `api-key`, never `Authorization` (see
+    /// `packages/ai/src/api/azure-openai-responses.ts` in pi-mono) — sending both would risk Azure
+    /// attempting to validate a well-formed-looking but bogus `Authorization` value as an AAD token.
+    pub auth_header: Option<String>,
 }
 
 /// A live, ready-to-attach bearer credential for one request, plus the context header construction
@@ -229,6 +246,17 @@ pub struct GatewayClient {
     credential_source: Arc<dyn CredentialSource>,
     max_retries: u32,
     base_backoff: Duration,
+    max_backoff: Duration,
+    /// Extra headers merged onto every outgoing request, applied last so an operator-configured value
+    /// wins over anything this client would otherwise set — the plumbing a self-hosted/proxied
+    /// endpoint's custom auth/routing header needs (see [`with_extra_headers`](Self::with_extra_headers)).
+    /// `Arc` so the (small, deployment-wide, effectively-static) map is cloned by pointer into the
+    /// `'static` stream generator in [`ModelTransport::stream`], not copied per request.
+    extra_headers: Arc<HashMap<String, String>>,
+    /// Optional hook seam for the raw HTTP layer — only [`AgentHooks::after_provider_response`] is
+    /// ever called from here (see [`with_hooks`](Self::with_hooks)'s doc comment for why the request-side
+    /// half of the pair, `before_provider_request`, is instead called from `Agent::run_turn_once`).
+    hooks: Option<Arc<dyn AgentHooks>>,
 }
 
 impl GatewayClient {
@@ -258,14 +286,48 @@ impl GatewayClient {
             credential_source: source,
             max_retries: MAX_RETRIES,
             base_backoff: BASE_BACKOFF,
+            max_backoff: MAX_BACKOFF,
+            extra_headers: Arc::new(HashMap::new()),
+            hooks: None,
         })
     }
 
     /// Builder-style: override the pre-first-byte retry budget and exponential-backoff base (still
-    /// capped at [`MAX_BACKOFF`]).
+    /// capped at [`MAX_BACKOFF`], or at [`with_max_backoff`](Self::with_max_backoff)'s override).
     pub fn with_retry(mut self, max_retries: u32, base_backoff: Duration) -> Self {
         self.max_retries = max_retries;
         self.base_backoff = base_backoff;
+        self
+    }
+
+    /// Builder-style: override the ceiling on a single backoff wait (exponential or
+    /// `Retry-After`-derived). Defaults to [`MAX_BACKOFF`] (60s) — see that constant's doc comment.
+    pub fn with_max_backoff(mut self, max_backoff: Duration) -> Self {
+        self.max_backoff = max_backoff;
+        self
+    }
+
+    /// Builder-style: merge `headers` onto every outgoing request, applied last so an operator's value
+    /// wins over anything else this client would otherwise set for the same name. The plumbing a
+    /// self-hosted or proxied endpoint's custom auth/routing header needs (pi's `model-registry.ts`
+    /// supports the same per-deployment concept) — the CLI/settings surface that lets an operator
+    /// actually configure this lives one layer up (`crates/agent/src/settings.rs`), not here.
+    pub fn with_extra_headers(mut self, headers: HashMap<String, String>) -> Self {
+        self.extra_headers = Arc::new(headers);
+        self
+    }
+
+    /// Builder-style: install a hook seam for the raw HTTP layer. Only
+    /// [`AgentHooks::after_provider_response`] is ever called from here, once a response's status and
+    /// headers are known, before its body starts streaming — pi's `afterProviderResponse`. The
+    /// request-side half of the pair, [`AgentHooks::before_provider_request`], instead runs one layer
+    /// up, in `Agent::run_turn_once` (the one place that already holds both the configured hooks and
+    /// the not-yet-sent [`ModelRequest`]) — mutating it there is what actually reaches this client's
+    /// own dialect/body construction, so there's nothing left for this layer to do for that half.
+    /// A caller wanting both this transport-level observability and the loop's own tool/message hooks
+    /// installs the *same* `Arc<dyn AgentHooks>` here and via `Agent::with_hooks`.
+    pub fn with_hooks(mut self, hooks: Arc<dyn AgentHooks>) -> Self {
+        self.hooks = Some(hooks);
         self
     }
 
@@ -328,6 +390,10 @@ impl ModelTransport for GatewayClient {
             .as_ref()
             .map(|d| d.static_headers.clone())
             .unwrap_or_default();
+        // A non-Bearer auth header (see `DirectRouting::auth_header`'s doc comment) — `None` for
+        // every route but one that explicitly opts out of `Authorization: Bearer` (Azure OpenAI's
+        // `api-key`, Task #8).
+        let auth_header = credential.direct.as_ref().and_then(|d| d.auth_header.clone());
         // Anthropic's own OAuth identity-spoofing headers (`CLAUDE_CODE_BETA`/`CLAUDE_CLI_IDENTITY`
         // etc., below) only apply to a genuine direct-to-Anthropic request — a Claude-family model
         // routed through a Copilot credential (`direct.is_some()`) is `is_oauth` too, but must not
@@ -337,6 +403,9 @@ impl ModelTransport for GatewayClient {
         let http = self.http.clone();
         let max_retries = self.max_retries;
         let base_backoff = self.base_backoff;
+        let max_backoff = self.max_backoff;
+        let extra_headers = self.extra_headers.clone();
+        let hooks = self.hooks.clone();
 
         let is_anthropic = dialect == Dialect::Anthropic;
         // Both OpenAI wire dialects use this for connection-level session-affinity routing, distinct
@@ -380,10 +449,33 @@ impl ModelTransport for GatewayClient {
                 send_x_session_affinity,
                 &direct_headers,
                 copilot_dynamic,
+                auth_header.as_deref(),
                 max_retries,
                 base_backoff,
+                max_backoff,
+                &extra_headers,
             )
             .await?;
+
+            // Observability seam (Task #14, pi-parity: `afterProviderResponse`,
+            // `agent-harness.ts:321-385`): fires once the response's status/headers are known, before
+            // its body starts streaming. Read-only — the response itself is already normalized into
+            // `StreamEvent`s the loop consumes directly, so there's nothing here to rewrite.
+            if let Some(hooks) = &hooks {
+                let headers: Vec<(String, String)> = resp
+                    .headers()
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            name.to_string(),
+                            value.to_str().unwrap_or_default().to_string(),
+                        )
+                    })
+                    .collect();
+                hooks
+                    .after_provider_response(resp.status().as_u16(), &headers)
+                    .await;
+            }
 
             // Frame the chunked body line-by-line. A partial trailing line is buffered across chunks
             // until its newline arrives. The framing (byte buffering + newline split) lives in
@@ -588,12 +680,30 @@ async fn send_with_retry(
     // turn's own messages: `(X-Initiator value, has an image)` — `None` for every provider but
     // Copilot.
     copilot_dynamic: Option<(&'static str, bool)>,
+    // Send `api_key` verbatim in this named header instead of `Authorization: Bearer <api_key>` (and
+    // omit `Authorization` entirely) — see `DirectRouting::auth_header`'s doc comment. `None` for
+    // every route but Azure OpenAI's `api-key` (Task #8, pi-parity).
+    auth_header: Option<&str>,
     max_retries: u32,
     base_backoff: Duration,
+    max_backoff: Duration,
+    // Operator-configured headers merged onto every request (see
+    // `GatewayClient::with_extra_headers`) — empty for a client that never set any. Applied *last*,
+    // after every other header this function sets, so an operator's own value always wins on a name
+    // collision (e.g. overriding `anthropic-version`, or adding a reverse-proxy auth header a
+    // self-hosted endpoint needs).
+    extra_headers: &HashMap<String, String>,
 ) -> Result<reqwest::Response> {
     let mut attempt = 0u32;
     loop {
-        let mut builder = http.post(url).bearer_auth(api_key).json(body);
+        let mut builder = http.post(url).json(body);
+        builder = match auth_header {
+            // Azure OpenAI shape: the bare key, verbatim, in its own header — never `Authorization`
+            // (see `DirectRouting::auth_header`'s doc comment on why sending both is a real risk,
+            // not just redundant).
+            Some(name) => builder.header(name, api_key),
+            None => builder.bearer_auth(api_key),
+        };
         for (name, value) in direct_headers {
             builder = builder.header(*name, value.as_str());
         }
@@ -647,12 +757,30 @@ async fn send_with_retry(
                     .header("x-app", "cli");
             }
         }
-        match builder.send().await {
+        // `RequestBuilder::header` *appends* rather than replaces — calling it for a name this
+        // function already set above (an operator overriding `anthropic-version` for a self-hosted/
+        // proxied endpoint, say) would send the name twice on the wire instead of the operator's value
+        // winning. Building the request, then `HeaderMap::insert`-ing each extra header directly, gives
+        // replace semantics instead — matching this builder's own documented "applied last, wins on a
+        // name collision" contract.
+        let mut request = match builder.build() {
+            Ok(request) => request,
+            Err(e) => return Err(Error::Transport(e.to_string())),
+        };
+        for (name, value) in extra_headers {
+            if let (Ok(header_name), Ok(header_value)) = (
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+                reqwest::header::HeaderValue::from_str(value),
+            ) {
+                request.headers_mut().insert(header_name, header_value);
+            }
+        }
+        match http.execute(request).await {
             Ok(resp) if resp.status().is_success() => return Ok(resp),
             Ok(resp) => {
                 let status = resp.status();
                 if is_retryable_status(status.as_u16()) && attempt < max_retries {
-                    let hint = retry_after(&resp);
+                    let hint = retry_after(&resp, max_backoff);
                     // A 429 needs a quick body peek before committing to a retry: some providers use it
                     // for genuine rate limiting (worth retrying — the request will likely succeed once
                     // the window resets) and others for quota/billing exhaustion (retrying only delays
@@ -668,7 +796,7 @@ async fn send_with_retry(
                             )));
                         }
                     }
-                    let wait = backoff(attempt, hint, base_backoff);
+                    let wait = backoff(attempt, hint, base_backoff, max_backoff);
                     attempt += 1;
                     futures_timer::Delay::new(wait).await;
                     continue;
@@ -702,7 +830,7 @@ async fn send_with_retry(
                 // Connection-level failures (refused, reset, timed out) are exactly the transient
                 // class worth retrying; a malformed-request error is not.
                 if is_retryable_send_error(&e) && attempt < max_retries {
-                    let wait = backoff(attempt, None, base_backoff);
+                    let wait = backoff(attempt, None, base_backoff, max_backoff);
                     attempt += 1;
                     futures_timer::Delay::new(wait).await;
                     continue;
@@ -713,10 +841,14 @@ async fn send_with_retry(
     }
 }
 
-/// Status codes worth retrying: rate limiting, the Anthropic-specific `529 overloaded`, and the
-/// transient 5xx gateway/upstream failures. A 4xx other than 429 is the caller's fault — don't retry.
+/// Status codes worth retrying: rate limiting, the Anthropic-specific `529 overloaded`, the transient
+/// 5xx gateway/upstream failures, and Cloudflare's `524` ("a connection was established between
+/// Cloudflare and the origin server, but the origin did not respond before the connection timed out")
+/// — pi's `packages/ai/src/utils/retry.ts:36` treats `"524"` as its only retry signal for that status,
+/// matched here too since a `524` is exactly the same transient-infra-hiccup class as the other 5xx
+/// entries. A 4xx other than 429 is the caller's fault — don't retry.
 fn is_retryable_status(status: u16) -> bool {
-    matches!(status, 408 | 409 | 429 | 500 | 502 | 503 | 504 | 529)
+    matches!(status, 408 | 409 | 429 | 500 | 502 | 503 | 504 | 524 | 529)
 }
 
 /// Phrases seen in a 429 body when the rejection is quota/billing exhaustion rather than transient
@@ -772,44 +904,49 @@ fn truncate_error_body(s: &str) -> String {
     format!("{kept}… [truncated]")
 }
 
-/// Parse a `Retry-After` response header into a duration, capped at [`MAX_BACKOFF`].
-fn retry_after(resp: &reqwest::Response) -> Option<Duration> {
+/// Parse a `Retry-After` response header into a duration, capped at `max_backoff`.
+fn retry_after(resp: &reqwest::Response, max_backoff: Duration) -> Option<Duration> {
     let raw = resp
         .headers()
         .get(reqwest::header::RETRY_AFTER)?
         .to_str()
         .ok()?;
-    parse_retry_after(raw)
+    parse_retry_after(raw, max_backoff)
 }
 
-/// Parse a `Retry-After` header *value* into a wait, capped at [`MAX_BACKOFF`]. RFC 7231 allows two
+/// Parse a `Retry-After` header *value* into a wait, capped at `max_backoff`. RFC 7231 allows two
 /// forms: delta-seconds (`120`) and an absolute HTTP-date (`Wed, 21 Oct 2025 07:28:00 GMT`). The
 /// date form is converted to a delay from now; a date already in the past (clock skew, a stale hint)
 /// yields no extra wait. Split out from [`retry_after`] so it's testable without a `reqwest::Response`.
-fn parse_retry_after(raw: &str) -> Option<Duration> {
+fn parse_retry_after(raw: &str, max_backoff: Duration) -> Option<Duration> {
     let raw = raw.trim();
     // Delta-seconds: a bare non-negative integer count of seconds.
     if let Ok(secs) = raw.parse::<u64>() {
-        return Some(Duration::from_secs(secs).min(MAX_BACKOFF));
+        return Some(Duration::from_secs(secs).min(max_backoff));
     }
     // HTTP-date: the absolute instant to retry at. Anything we can't parse as either form is ignored.
     let target = httpdate::parse_http_date(raw).ok()?;
     let delay = target
         .duration_since(std::time::SystemTime::now())
         .unwrap_or(Duration::ZERO);
-    Some(delay.min(MAX_BACKOFF))
+    Some(delay.min(max_backoff))
 }
 
 /// The wait before the next attempt (0-indexed): the larger of the server's `Retry-After` hint and
-/// our exponential backoff `base_backoff · 2^attempt`, capped at [`MAX_BACKOFF`].
-fn backoff(attempt: u32, retry_after: Option<Duration>, base_backoff: Duration) -> Duration {
+/// our exponential backoff `base_backoff · 2^attempt`, capped at `max_backoff`.
+fn backoff(
+    attempt: u32,
+    retry_after: Option<Duration>,
+    base_backoff: Duration,
+    max_backoff: Duration,
+) -> Duration {
     // `min(16)` keeps the shift well within `u32` (and `saturating_mul` mops up the rest); by then the
-    // result has long since hit `MAX_BACKOFF`.
+    // result has long since hit `max_backoff`.
     let exp = base_backoff
         .saturating_mul(1u32 << attempt.min(16))
-        .min(MAX_BACKOFF);
+        .min(max_backoff);
     match retry_after {
-        Some(hint) => hint.max(exp).min(MAX_BACKOFF),
+        Some(hint) => hint.max(exp).min(max_backoff),
         None => exp,
     }
 }
@@ -888,12 +1025,20 @@ mod tests {
 
     #[test]
     fn retryable_status_classification() {
-        for s in [429, 500, 502, 503, 504, 529, 408, 409] {
+        for s in [429, 500, 502, 503, 504, 524, 529, 408, 409] {
             assert!(is_retryable_status(s), "{s} should be retryable");
         }
         for s in [200, 400, 401, 403, 404, 422] {
             assert!(!is_retryable_status(s), "{s} should not be retryable");
         }
+    }
+
+    #[test]
+    fn cloudflare_524_is_retryable() {
+        // Task #16 (pi-parity): pi's `packages/ai/src/utils/retry.ts:36` treats "524" as its only
+        // retry signal for this status — a Cloudflare-fronted origin that timed out responding, the
+        // same transient-infra class as the other 5xx entries already covered.
+        assert!(is_retryable_status(524));
     }
 
     #[test]
@@ -923,17 +1068,23 @@ mod tests {
 
     #[test]
     fn backoff_is_exponential_and_capped() {
-        assert_eq!(backoff(0, None, BASE_BACKOFF), BASE_BACKOFF);
-        assert_eq!(backoff(1, None, BASE_BACKOFF), BASE_BACKOFF * 2);
-        assert_eq!(backoff(2, None, BASE_BACKOFF), BASE_BACKOFF * 4);
-        assert_eq!(backoff(20, None, BASE_BACKOFF), MAX_BACKOFF); // saturates, never overflows
+        assert_eq!(backoff(0, None, BASE_BACKOFF, MAX_BACKOFF), BASE_BACKOFF);
+        assert_eq!(
+            backoff(1, None, BASE_BACKOFF, MAX_BACKOFF),
+            BASE_BACKOFF * 2
+        );
+        assert_eq!(
+            backoff(2, None, BASE_BACKOFF, MAX_BACKOFF),
+            BASE_BACKOFF * 4
+        );
+        assert_eq!(backoff(20, None, BASE_BACKOFF, MAX_BACKOFF), MAX_BACKOFF); // saturates, never overflows
         // A server hint wins when larger, but is still capped.
         assert_eq!(
-            backoff(0, Some(Duration::from_secs(2)), BASE_BACKOFF),
+            backoff(0, Some(Duration::from_secs(2)), BASE_BACKOFF, MAX_BACKOFF),
             Duration::from_secs(2)
         );
         assert_eq!(
-            backoff(0, Some(Duration::from_secs(3600)), BASE_BACKOFF),
+            backoff(0, Some(Duration::from_secs(3600)), BASE_BACKOFF, MAX_BACKOFF),
             MAX_BACKOFF
         );
     }
@@ -941,9 +1092,31 @@ mod tests {
     #[test]
     fn backoff_honors_a_custom_base() {
         let custom = Duration::from_millis(1000);
-        assert_eq!(backoff(0, None, custom), custom);
-        assert_eq!(backoff(1, None, custom), custom * 2);
-        assert_eq!(backoff(20, None, custom), MAX_BACKOFF); // still saturates at the shared cap
+        assert_eq!(backoff(0, None, custom, MAX_BACKOFF), custom);
+        assert_eq!(backoff(1, None, custom, MAX_BACKOFF), custom * 2);
+        assert_eq!(backoff(20, None, custom, MAX_BACKOFF), MAX_BACKOFF); // still saturates at the shared cap
+    }
+
+    #[test]
+    fn backoff_honors_a_custom_max_backoff_ceiling() {
+        // Task #21 (pi-parity): the ceiling itself must be an overridable knob, not just the base —
+        // a caller who wants a *tighter* cap than the new 60s default (e.g. reverting to the old 10s
+        // behavior) must be able to get it via `GatewayClient::with_max_backoff`.
+        let tight = Duration::from_secs(10);
+        assert_eq!(backoff(0, None, BASE_BACKOFF, tight), BASE_BACKOFF);
+        assert_eq!(backoff(20, None, BASE_BACKOFF, tight), tight);
+        assert_eq!(
+            backoff(0, Some(Duration::from_secs(3600)), BASE_BACKOFF, tight),
+            tight
+        );
+    }
+
+    #[test]
+    fn max_backoff_default_is_raised_toward_pis_own_default() {
+        // Task #21 (pi-parity): raised from an earlier 10s ceiling toward pi's own 60s default
+        // (`openai-codex-responses.ts`'s `DEFAULT_MAX_RETRY_DELAY_MS`) — a 429 with a `Retry-After: 30`
+        // hint used to get retried back into the very rate-limit window it named.
+        assert_eq!(MAX_BACKOFF, Duration::from_secs(60));
     }
 
     #[test]
@@ -963,23 +1136,38 @@ mod tests {
     #[test]
     fn retry_after_accepts_delta_seconds_and_http_date() {
         // Delta-seconds form, capped at MAX_BACKOFF.
-        assert_eq!(parse_retry_after("2"), Some(Duration::from_secs(2)));
-        assert_eq!(parse_retry_after(" 3 "), Some(Duration::from_secs(3)));
-        assert_eq!(parse_retry_after("99999"), Some(MAX_BACKOFF));
+        assert_eq!(
+            parse_retry_after("2", MAX_BACKOFF),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            parse_retry_after(" 3 ", MAX_BACKOFF),
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(parse_retry_after("99999", MAX_BACKOFF), Some(MAX_BACKOFF));
         // A value that is neither an integer nor an HTTP-date is ignored.
-        assert_eq!(parse_retry_after("soon"), None);
+        assert_eq!(parse_retry_after("soon", MAX_BACKOFF), None);
         // HTTP-date already in the past → no extra wait.
         assert_eq!(
-            parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"),
+            parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT", MAX_BACKOFF),
             Some(Duration::ZERO)
         );
         // HTTP-date in the future → a positive, capped delay.
         let future = std::time::SystemTime::now() + Duration::from_secs(5);
-        let delay = parse_retry_after(&httpdate::fmt_http_date(future)).expect("a parsed delay");
+        let delay = parse_retry_after(&httpdate::fmt_http_date(future), MAX_BACKOFF)
+            .expect("a parsed delay");
         assert!(
             delay > Duration::ZERO && delay <= MAX_BACKOFF,
             "future http-date should yield a bounded positive delay, got {delay:?}"
         );
+    }
+
+    #[test]
+    fn parse_retry_after_honors_a_custom_max_backoff_cap() {
+        // A `Retry-After` hint larger than a caller's custom (tighter) ceiling must still be capped to
+        // that ceiling, not the module default.
+        let tight = Duration::from_secs(5);
+        assert_eq!(parse_retry_after("999", tight), Some(tight));
     }
 
     /// A source that always yields a fixed OAuth-flagged credential — the test double for
@@ -1164,6 +1352,111 @@ mod tests {
         assert!(
             tagged,
             "a read past the configured idle timeout must surface as a mid-stream network error"
+        );
+    }
+
+    /// Task #11 (pi-parity): `with_extra_headers` must merge onto every outgoing request, and win over
+    /// a header this client would otherwise set itself for the same name (an operator overriding
+    /// `anthropic-version` for a self-hosted/proxied endpoint that speaks a different wire version).
+    #[tokio::test]
+    async fn extra_headers_are_merged_onto_the_request_and_win_on_a_name_collision() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let captured_clone = captured.clone();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap();
+            *captured_clone.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).into_owned();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+        });
+
+        let mut extra = HashMap::new();
+        extra.insert("anthropic-version".to_string(), "2099-01-01".to_string());
+        extra.insert("x-operator-header".to_string(), "custom-value".to_string());
+        let client = GatewayClient::new(format!("http://{addr}"), "test-key")
+            .unwrap()
+            .with_extra_headers(extra);
+        // Anthropic dialect, so this client would otherwise send `anthropic-version: 2023-06-01` —
+        // the operator's own value must win instead.
+        let req = ModelRequest::new("claude-test", Vec::new(), 100);
+        let mut events = client.stream(req).await.unwrap();
+        while events.next().await.is_some() {}
+        server.join().unwrap();
+
+        let request = captured.lock().unwrap().clone();
+        let lower = request.to_lowercase();
+        assert!(
+            lower.contains("anthropic-version: 2099-01-01"),
+            "operator-configured header must win over the client's own default, got:\n{request}"
+        );
+        assert!(
+            !lower.contains("anthropic-version: 2023-06-01"),
+            "the client's own default value must not also be present, got:\n{request}"
+        );
+        assert!(
+            lower.contains("x-operator-header: custom-value"),
+            "a brand-new operator header must also be attached, got:\n{request}"
+        );
+    }
+
+    /// Task #14 (pi-parity): a hook installed via `with_hooks` must have `after_provider_response`
+    /// called with the real response's status and headers, once they're known — proves the wiring
+    /// reaches all the way from `GatewayClient::stream` through to the hook, not just that the trait
+    /// method exists.
+    #[tokio::test]
+    async fn after_provider_response_hook_fires_with_the_real_status_and_headers() {
+        type SeenResponse = (u16, Vec<(String, String)>);
+        struct RecordsResponse {
+            seen: std::sync::Mutex<Option<SeenResponse>>,
+        }
+        #[async_trait]
+        impl AgentHooks for RecordsResponse {
+            async fn after_provider_response(&self, status: u16, headers: &[(String, String)]) {
+                *self.seen.lock().unwrap() = Some((status, headers.to_vec()));
+            }
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nX-Probe: yes\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            stream.flush().unwrap();
+        });
+
+        let hooks = Arc::new(RecordsResponse {
+            seen: std::sync::Mutex::new(None),
+        });
+        let client = GatewayClient::new(format!("http://{addr}"), "test-key")
+            .unwrap()
+            .with_hooks(hooks.clone());
+        let req = ModelRequest::new("claude-test", Vec::new(), 100);
+        let mut events = client.stream(req).await.unwrap();
+        while events.next().await.is_some() {}
+        server.join().unwrap();
+
+        let (status, headers) = hooks.seen.lock().unwrap().clone().expect(
+            "after_provider_response must have fired once the response's status/headers were known",
+        );
+        assert_eq!(status, 200);
+        assert!(
+            headers
+                .iter()
+                .any(|(name, value)| name.eq_ignore_ascii_case("x-probe") && value == "yes"),
+            "expected the real response's own headers to reach the hook, got: {headers:?}"
         );
     }
 
@@ -1529,6 +1822,7 @@ mod tests {
                 ("OpenAI-Beta", "responses=experimental".to_string()),
             ],
             copilot_dynamic_headers: false,
+            auth_header: None,
         };
         let client = GatewayClient::with_credential_source(
             format!("http://{addr}"),
@@ -1597,6 +1891,7 @@ mod tests {
             },
             static_headers: vec![("User-Agent", "GitHubCopilotChat/0.35.0".to_string())],
             copilot_dynamic_headers: true,
+            auth_header: None,
         };
         let client = GatewayClient::with_credential_source(
             // A closed port: if the client ever mistakenly used this instead of the credential's own
@@ -1643,6 +1938,72 @@ mod tests {
         );
     }
 
+    /// Proves the [`DirectRouting::auth_header`] mechanism (Task #8, pi-parity: Azure OpenAI
+    /// routing support). A route that sets `auth_header: Some("api-key")` must send the credential's
+    /// key verbatim in that header, with **no** `Authorization` header at all — Azure's
+    /// `AzureOpenAI` SDK client authenticates this way, never via `Authorization: Bearer` (see
+    /// `packages/ai/src/api/azure-openai-responses.ts` in pi-mono). Also bypasses the gateway
+    /// entirely (`RouteOverride::Direct`, like Copilot) at the "v1"-unified Azure path shape
+    /// (`{base_url}/responses`, base_url already carrying `/openai/v1`).
+    #[tokio::test]
+    async fn direct_route_with_custom_auth_header_sends_bare_key_and_omits_authorization() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+            drop(stream);
+            request
+        });
+
+        let routing = DirectRouting {
+            route: RouteOverride::Direct {
+                base_url: format!("http://{addr}/openai/v1"),
+                path: "/responses",
+            },
+            static_headers: Vec::new(),
+            copilot_dynamic_headers: false,
+            auth_header: Some("api-key".to_string()),
+        };
+        let client = GatewayClient::with_credential_source(
+            // A closed port, same guard as the Copilot test: if the client ever fell back to the
+            // gateway's own base_url instead of this credential's `Direct` override, the connection
+            // would fail fast rather than this test hanging.
+            "http://127.0.0.1:1".to_string(),
+            Arc::new(DirectTestCredential(routing)),
+        )
+        .unwrap();
+        // `gpt-4o-azure-deployment` is `Dialect::OpenAiResponses` (falls through to Chat Completions
+        // only for non-native ids that aren't `ApiKind::Responses` — but any model id works here
+        // since the path is fully overridden by `RouteOverride::Direct` regardless of dialect).
+        let req = ModelRequest::new("gpt-4o", Vec::new(), 100);
+        let mut events = client.stream(req).await.unwrap();
+        while events.next().await.is_some() {}
+
+        let request = server.join().unwrap();
+        let request_line = request.lines().next().unwrap_or_default();
+        assert_eq!(
+            request_line, "POST /openai/v1/responses HTTP/1.1",
+            "expected Azure's v1-unified responses path, got:\n{request}"
+        );
+        let lower = request.to_lowercase();
+        assert!(
+            lower.contains("api-key: test-oauth-token"),
+            "missing bare key in the api-key header, got:\n{request}"
+        );
+        assert!(
+            !lower.contains("authorization:"),
+            "Authorization must be entirely absent when auth_header overrides it, got:\n{request}"
+        );
+    }
+
     /// A Copilot turn whose last message is an assistant/tool follow-up (not a fresh user message)
     /// gets `X-Initiator: agent`; one carrying an image gets `Copilot-Vision-Request: true` — both
     /// computed fresh per turn from the request's own messages, matching pi's
@@ -1672,6 +2033,7 @@ mod tests {
             },
             static_headers: Vec::new(),
             copilot_dynamic_headers: true,
+            auth_header: None,
         };
         let client = GatewayClient::with_credential_source(
             "http://127.0.0.1:1".to_string(),

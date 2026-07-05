@@ -160,6 +160,19 @@ pub struct Message {
     /// consecutive `user` turn.
     #[serde(default, skip_serializing_if = "is_false")]
     pub aborted: bool,
+    /// The token usage the provider reported for the turn that produced this message — pi's
+    /// `AssistantMessage.usage` (`types.ts:392`), a required field there since every assistant turn's
+    /// own request/response accounting is meaningful per-message, not just as a running session total.
+    /// `Some` on an assistant turn produced by a real model call (including an aborted or
+    /// error-tagged one — [`crate::session::Session::record_usage`]'s zero-usage handling doesn't apply
+    /// here, since this is the raw per-turn figure, not the session's running "live context size"
+    /// snapshot); `None` on every `user`/tool-result turn and on an assistant turn synthesized with no
+    /// model call behind it at all (e.g. [`Message::error`]'s bare closing record). Persisting this
+    /// alongside the session's own cumulative totals is what lets a later reader (a transcript export,
+    /// a per-turn cost breakdown) attribute tokens to the specific turn that spent them instead of only
+    /// ever seeing the running sum.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TokenUsage>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -175,6 +188,7 @@ impl Message {
             model_id: None,
             error_message: None,
             aborted: false,
+            usage: None,
         }
     }
 
@@ -186,6 +200,7 @@ impl Message {
             model_id: None,
             error_message: None,
             aborted: false,
+            usage: None,
         }
     }
 
@@ -202,6 +217,7 @@ impl Message {
             model_id: None,
             error_message: Some(message.into()),
             aborted: false,
+            usage: None,
         }
     }
 
@@ -222,6 +238,7 @@ impl Message {
             model_id: None,
             error_message: None,
             aborted: false,
+            usage: None,
         }
     }
 
@@ -242,6 +259,7 @@ impl Message {
             model_id: None,
             error_message: None,
             aborted: false,
+            usage: None,
         }
     }
 
@@ -256,6 +274,7 @@ impl Message {
             model_id: None,
             error_message: None,
             aborted: false,
+            usage: None,
         }
     }
 
@@ -269,6 +288,14 @@ impl Message {
     /// Mark this assistant turn as cancelled mid-stream — see the [`aborted`](Self::aborted) field doc.
     pub fn with_aborted(mut self) -> Self {
         self.aborted = true;
+        self
+    }
+
+    /// Stamp the per-turn token usage the provider reported for this message — see the
+    /// [`usage`](Self::usage) field doc. Used right after `Message::assistant` alongside
+    /// [`with_model_id`](Self::with_model_id), the same way `Agent::run_events_steered` stamps both.
+    pub fn with_usage(mut self, usage: TokenUsage) -> Self {
+        self.usage = Some(usage);
         self
     }
 

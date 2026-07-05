@@ -164,6 +164,22 @@ impl From<&str> for ToolOutput {
     }
 }
 
+/// How a turn's tool calls should be dispatched relative to each other — pi's `ToolExecutionMode`
+/// (`types.ts:41`). Only meaningful as a per-tool *override*: the loop's default (a tool returning
+/// `None` from [`Tool::execution_mode`]) is already the equivalent of pi's `"parallel"` (bounded-
+/// concurrent, or fully sequential if [`crate::agent::Agent::with_sequential_tools`]/
+/// [`Tool::conservative_exclusive`] already force it), so there's no variant to opt into that
+/// behavior — only into the stricter one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolExecutionMode {
+    /// Any call in a turn naming a tool that returns this routes the turn's *whole* batch through a
+    /// fully-interleaved gate→execute→finalize-per-call path (one call completely resolved before the
+    /// next call's own gate even starts) instead of the default "gate the whole batch, then execute"
+    /// split. Matches pi's `agent-loop.ts` `executeToolCallsSequential`, chosen whenever any call names
+    /// a tool with `executionMode: "sequential"` (`types.ts:393`).
+    Sequential,
+}
+
 /// A capability the model can call. Implementors are cheap, `Send + Sync` values stored behind an
 /// `Arc` in the registry.
 #[async_trait]
@@ -220,6 +236,16 @@ pub trait Tool: Send + Sync {
     /// mutate, or name their exact target via `write_target`.
     fn conservative_exclusive(&self) -> bool {
         false
+    }
+
+    /// Request a non-default dispatch mode for any turn containing a call to this tool (see
+    /// [`ToolExecutionMode`]). `None` (the default) leaves dispatch exactly as it is today. Checked
+    /// against *every* call in a turn's batch, not just this tool's own: pi's contract is that one
+    /// sequential-requesting call routes the whole batch through the interleaved path, since the
+    /// ordering guarantee it exists for (a permission/rate-limiting policy reasoning about "what's
+    /// already run") only holds if every call in the same batch goes through it.
+    fn execution_mode(&self) -> Option<ToolExecutionMode> {
+        None
     }
 
     /// The advertised definition sent to the model. Derived from the accessors; override only if a
@@ -445,5 +471,39 @@ mod tests {
         cancel.cancel();
         // A clone made *before* the trip still observes it — the token is shared, not snapshotted.
         assert!(progress.is_cancelled());
+    }
+
+    #[test]
+    fn execution_mode_defaults_to_none() {
+        // A tool that never overrides it (every tool before Task #28) must keep dispatching through
+        // the default bounded-concurrent path — no behavior change for existing tools.
+        assert_eq!(EchoTool.execution_mode(), None);
+    }
+
+    #[test]
+    fn a_tool_can_opt_into_sequential_execution_mode() {
+        struct SequentialTool;
+        #[async_trait]
+        impl Tool for SequentialTool {
+            fn name(&self) -> &str {
+                "sequential"
+            }
+            fn description(&self) -> &str {
+                "opts into sequential execution"
+            }
+            fn input_schema(&self) -> Value {
+                json!({ "type": "object" })
+            }
+            async fn run(&self, _: Value) -> Result<ToolOutput, ToolError> {
+                Ok("ok".into())
+            }
+            fn execution_mode(&self) -> Option<ToolExecutionMode> {
+                Some(ToolExecutionMode::Sequential)
+            }
+        }
+        assert_eq!(
+            SequentialTool.execution_mode(),
+            Some(ToolExecutionMode::Sequential)
+        );
     }
 }

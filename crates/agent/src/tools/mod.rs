@@ -98,11 +98,13 @@ pub(crate) fn root_is_inside_git_repo(root: &std::path::Path) -> bool {
 /// unchanged rather than erroring, consistent with every tool here surfacing a filesystem error at the
 /// point of actual use rather than pre-validating input that might still resolve to something real.
 ///
-/// `pub(crate)` (not just used by `normalize_path` here): `skills`/`prompts` reuse it for
+/// `pub` (not just used by `normalize_path` here): `skills`/`prompts` reuse it for
 /// `--skill`/`--prompt-template`'s extra discovery-root paths, which previously weren't tilde-expanded
 /// at all — usually masked by the shell doing it first, but not for a quoted argument or one built
-/// programmatically.
-pub(crate) fn expand_tilde(path: &str, home: Option<&str>) -> String {
+/// programmatically. Also reached from the separate `beyond-ai-agent` *binary* crate (`main.rs`'s
+/// `read_file_refs`, Task #20 pi-parity fix) for an `@~/notes.md` CLI file reference — `pub(crate)`
+/// would only reach modules inside this library crate itself, not the bin target that depends on it.
+pub fn expand_tilde(path: &str, home: Option<&str>) -> String {
     let Some(home) = home else {
         return path.to_string();
     };

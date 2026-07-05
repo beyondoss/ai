@@ -60,7 +60,7 @@ impl ThinkingDisplay {
 /// `PartialOrd`/`Ord` follow declaration order (`Minimal` lowest, `XHigh` highest) — depended on by
 /// [`crate::models::clamp_reasoning_effort`] to clamp a requested level up/down to whatever a specific
 /// model actually accepts on the wire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ReasoningEffort {
     Minimal,
     Low,
@@ -166,9 +166,11 @@ pub struct ModelRequest {
     /// Conversation history. An `Arc<Vec<…>>` shared with the `Session` it came from: building a
     /// request clones the pointer, not the (growing) message list.
     pub messages: Arc<Vec<Message>>,
-    /// Tools advertised to the model this turn. An `Arc<[…]>` because the set is fixed for the run:
-    /// the agent computes it once and hands the same slice to every turn's request by cloning the
-    /// pointer, not the (schema-bearing) definitions.
+    /// Tools advertised to the model this turn. An `Arc<[…]>` so building a request clones the pointer,
+    /// not the (schema-bearing) definitions. Fixed for any one *request*, but not necessarily for the
+    /// whole *run* it belongs to: `Agent::run_events_steered` normally hands the same `Arc` to every
+    /// turn, but a mid-run `Steering::request_tool_set` (Task #13) swaps it for a different one starting
+    /// the very next turn.
     pub tools: Arc<[ToolDef]>,
     /// Output token ceiling for the turn.
     pub max_tokens: u32,

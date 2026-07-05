@@ -37,6 +37,21 @@
 //! say, every mid-run redirect folded together while follow-ups still land one at a time, or vice versa.
 //! The next-turn lane has no `QueueMode` of its own — like pi's `nextTurnQueue.splice(0)`, a drain
 //! always takes everything queued; there's no "one at a time" reading of "prepended to the next prompt."
+//!
+//! **Deliberate gap (Task #29, pi-parity, low priority)**: pi's `emitQueueUpdate()` fires synchronously
+//! on every `steer`/follow-up/next-turn push, notifying a subscriber the instant a message lands in a
+//! queue. `Steering` here has no equivalent push-time observer/subscribe hook — left out on purpose
+//! rather than added as a token gesture. Every caller that pushes onto a lane (`push`/`push_steer`/
+//! `push_next_turn`) is, in this codebase's actual shape, the same RPC layer (`serve.rs`'s `prompt`/
+//! `steer` handlers) that already knows the instant its own push call returns — there is no *other*
+//! observer anywhere in the process that doesn't already have that information some other way. Adding a
+//! callback field here would mean either a second, redundant notification path for the one caller that
+//! doesn't need it, or a new cross-cutting registration API (`Steering::on_queued(...)`) with no current
+//! consumer to validate its shape against — exactly the "awkward API churn for a hypothetical" this
+//! crate's own minimal-abstraction bias (see the workspace root `CLAUDE.md`) argues against. If a future
+//! caller genuinely needs to observe a queue push from *outside* the code that performed it (a second
+//! process, a different task), that's a concrete requirement this doc comment's reasoning no longer
+//! covers — revisit then, with a real shape to design against instead of a speculative one.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,6 +59,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::message::ImageSource;
 use crate::models::ThinkingLevel;
+use crate::tool::ToolRegistry;
 
 /// A queued steer/follow-up message: text plus optional image attachments — the same shape a fresh
 /// `prompt` accepts (`serve.rs`'s own `images` field), so a message routed through `steer`/`follow_up`
@@ -161,6 +177,9 @@ pub struct Steering {
     /// Set by [`request_model_switch`](Self::request_model_switch); consumed by the loop at the next
     /// turn boundary (the same point `stop_requested` is checked).
     model_switch: Arc<Mutex<Option<ModelSwitch>>>,
+    /// Set by [`request_tool_set`](Self::request_tool_set); consumed by the loop at the same turn
+    /// boundary as `model_switch` (see that field's doc comment).
+    tool_switch: Arc<Mutex<Option<ToolRegistry>>>,
 }
 
 impl Steering {
@@ -289,11 +308,13 @@ impl Steering {
         lock(&self.follow_up).clear();
         lock(&self.next_turn).clear();
         self.stop_requested.store(false, Ordering::Relaxed);
-        *lock_switch(&self.model_switch) = None;
+        *lock_opt(&self.model_switch) = None;
+        *lock_opt(&self.tool_switch) = None;
     }
 
-    /// Drop the steer and follow-up lanes, plus any pending stop request and mid-run model switch —
-    /// but, unlike [`clear`](Self::clear), leave the **next-turn** lane untouched. For a run that's
+    /// Drop the steer and follow-up lanes, plus any pending stop request, mid-run model switch, and
+    /// mid-run tool-set switch — but, unlike [`clear`](Self::clear), leave the **next-turn** lane
+    /// untouched. For a run that's
     /// ending because of *cancellation*, not because a different session is about to take over (see
     /// [`clear`](Self::clear) for that case).
     ///
@@ -309,7 +330,8 @@ impl Steering {
         lock(&self.steer).clear();
         lock(&self.follow_up).clear();
         self.stop_requested.store(false, Ordering::Relaxed);
-        *lock_switch(&self.model_switch) = None;
+        *lock_opt(&self.model_switch) = None;
+        *lock_opt(&self.tool_switch) = None;
     }
 
     /// Request that the run stop gracefully at the next turn boundary — after the current turn's tool
@@ -347,7 +369,7 @@ impl Steering {
         thinking: Option<u32>,
         thinking_level: Option<ThinkingLevel>,
     ) {
-        *lock_switch(&self.model_switch) = Some(ModelSwitch {
+        *lock_opt(&self.model_switch) = Some(ModelSwitch {
             model: model.into(),
             thinking,
             thinking_level,
@@ -356,7 +378,24 @@ impl Steering {
 
     /// Consume and return the pending model switch, if any. Each request is observed at most once.
     pub(crate) fn take_model_switch(&self) -> Option<ModelSwitch> {
-        lock_switch(&self.model_switch).take()
+        lock_opt(&self.model_switch).take()
+    }
+
+    /// Request that every subsequent turn of this run advertise `tools` instead of whatever the
+    /// `Agent` was originally configured with — applied at the same turn boundary a model switch is
+    /// (see [`request_model_switch`](Self::request_model_switch)), so the change takes effect starting
+    /// the very next turn rather than mid-turn. Mirrors pi's `setTools`/`setActiveTools`
+    /// (`agent-harness.ts:871-928`): a host can add, remove, or swap a run's tool set without stopping
+    /// and restarting the whole call. A second call before the first is observed replaces it outright
+    /// — same "no queue of switches, only the most recent request matters" contract
+    /// [`request_model_switch`](Self::request_model_switch) uses.
+    pub fn request_tool_set(&self, tools: ToolRegistry) {
+        *lock_opt(&self.tool_switch) = Some(tools);
+    }
+
+    /// Consume and return the pending tool-set switch, if any. Each request is observed at most once.
+    pub(crate) fn take_tool_switch(&self) -> Option<ToolRegistry> {
+        lock_opt(&self.tool_switch).take()
     }
 }
 
@@ -370,10 +409,10 @@ fn lock_mode(m: &Arc<Mutex<QueueMode>>) -> std::sync::MutexGuard<'_, QueueMode> 
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Same recovery posture as [`lock`], for the pending [`ModelSwitch`].
-fn lock_switch(
-    m: &Arc<Mutex<Option<ModelSwitch>>>,
-) -> std::sync::MutexGuard<'_, Option<ModelSwitch>> {
+/// Same recovery posture as [`lock`], for a pending single-slot request (a [`ModelSwitch`] or a
+/// replacement [`ToolRegistry`]) — both are "at most one pending, replaced outright by a later
+/// request" state, just for different payload types.
+fn lock_opt<T>(m: &Arc<Mutex<Option<T>>>) -> std::sync::MutexGuard<'_, Option<T>> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -652,6 +691,94 @@ mod tests {
         let b = a.clone();
         a.request_stop();
         assert!(b.take_stop_requested());
+    }
+
+    /// A trivial named tool, standing in for a real one — just enough to distinguish one
+    /// [`ToolRegistry`] from another by name in the tests below.
+    struct NamedTool(&'static str);
+    #[async_trait::async_trait]
+    impl crate::tool::Tool for NamedTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "test tool"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+        async fn run(
+            &self,
+            _input: serde_json::Value,
+        ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+            Ok("ok".into())
+        }
+    }
+
+    fn registry_with(names: &[&'static str]) -> ToolRegistry {
+        let mut reg = ToolRegistry::new();
+        for name in names {
+            reg.register(std::sync::Arc::new(NamedTool(name)));
+        }
+        reg
+    }
+
+    #[test]
+    fn tool_switch_is_taken_at_most_once() {
+        // Task #13 (pi-parity): mirrors `model_switch`'s own "observed exactly once" contract — pi's
+        // `setTools` is queued the same way a `prepareNextTurn` model switch is.
+        let s = Steering::new();
+        assert!(s.take_tool_switch().is_none(), "nothing queued yet");
+        s.request_tool_set(registry_with(&["bash"]));
+        let taken = s.take_tool_switch().expect("a tool switch must be queued");
+        assert!(taken.get("bash").is_some());
+        assert!(
+            s.take_tool_switch().is_none(),
+            "a tool-set switch must be observed at most once, like the model switch"
+        );
+    }
+
+    #[test]
+    fn a_second_tool_switch_before_the_first_is_observed_replaces_it() {
+        let s = Steering::new();
+        s.request_tool_set(registry_with(&["bash"]));
+        s.request_tool_set(registry_with(&["read", "write"]));
+        let taken = s.take_tool_switch().expect("a tool switch must be queued");
+        assert!(
+            taken.get("bash").is_none() && taken.get("read").is_some() && taken.get("write").is_some(),
+            "only the most recent request should apply — no queue of switches"
+        );
+    }
+
+    #[test]
+    fn clear_also_drops_a_pending_tool_switch() {
+        let s = Steering::new();
+        s.request_tool_set(registry_with(&["bash"]));
+        s.clear();
+        assert!(
+            s.take_tool_switch().is_none(),
+            "clear must not leave a tool-set switch that could apply to a different session's run"
+        );
+    }
+
+    #[test]
+    fn clear_run_scoped_also_drops_a_pending_tool_switch() {
+        let s = Steering::new();
+        s.request_tool_set(registry_with(&["bash"]));
+        s.clear_run_scoped();
+        assert!(
+            s.take_tool_switch().is_none(),
+            "a cancelled run must not leave a tool-set switch queued for an unrelated later run"
+        );
+    }
+
+    #[test]
+    fn tool_switch_is_shared_across_clones() {
+        let a = Steering::new();
+        let b = a.clone();
+        a.request_tool_set(registry_with(&["bash"]));
+        let taken = b.take_tool_switch().expect("shared across clones");
+        assert!(taken.get("bash").is_some());
     }
 
     #[test]
