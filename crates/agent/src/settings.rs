@@ -116,10 +116,166 @@ pub struct Settings {
     /// loses its last entry is pruned back to `None` rather than left as `Some({})`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_budget_overrides: Option<std::collections::BTreeMap<String, u32>>,
+    /// Used when neither `--bash-shell-path` nor `AI_AGENT_BASH_SHELL_PATH` is given, for both `run` and
+    /// `serve` — pi-parity fix (Round 3): previously flag/env-only, with no persisted stored-default
+    /// fallback at all, unlike `default_model`/`default_gateway_url`/`default_session_dir` above.
+    /// Consulted at the same fallback-chain position those fields already occupy (explicit flag/env,
+    /// then this stored setting, then the auto-resolved shell — `/bin/bash`, else `bash` on `$PATH`,
+    /// else `sh`). Not itself re-validated to exist by this store — `serve`'s existing
+    /// `--bash-shell-path`-not-found startup check runs against whichever value wins the whole chain,
+    /// exactly as it would for an explicit flag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_bash_shell_path: Option<String>,
+    /// Used when neither `--bash-command-prefix` nor `AI_AGENT_BASH_COMMAND_PREFIX` is given —
+    /// pi-parity fix (Round 3), [`Self::default_bash_shell_path`]'s identical fallback rationale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_bash_command_prefix: Option<String>,
+    /// Used when neither `--compaction-reserve-tokens` nor `AI_AGENT_COMPACTION_RESERVE_TOKENS` is
+    /// given — pi-parity fix (Round 3): an operator-persisted override of one layer *below* this,
+    /// `agent_core::CompactionConfig::default()`'s own built-in 16,384-token reserve — the same
+    /// "override the built-in default, don't replace it outright" relationship
+    /// [`Self::default_reasoning_effort`] has to `agent_core`'s own reasoning default. `None` leaves
+    /// `CompactionConfig::default()`'s value in effect, unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_compaction_reserve_tokens: Option<u32>,
+    /// Used when neither `--compaction-keep-recent-tokens` nor
+    /// `AI_AGENT_COMPACTION_KEEP_RECENT_TOKENS` is given — pi-parity fix (Round 3),
+    /// [`Self::default_compaction_reserve_tokens`]'s identical relationship to
+    /// `CompactionConfig::default()`'s own built-in 20,000-token `keep_recent_tokens`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_compaction_keep_recent_tokens: Option<u32>,
+    /// Used when neither `--retry-max-retries` nor `AI_AGENT_RETRY_MAX_RETRIES` is given — pi-parity fix
+    /// (Round 3): previously flag/env-only, unlike `default_model` et al. above. `None` leaves both
+    /// layers this flag already drives (`agent_core::client::MAX_RETRIES`'s pre-first-byte/mid-stream
+    /// retry, and `retry::MAX_RUN_RETRIES`'s whole-run retry — see `run_task`'s own `with_retry`/
+    /// `RunRetryPolicy::from_overrides` call sites) at their built-in defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_retry_max_retries: Option<u32>,
+    /// Used when neither `--retry-base-delay-ms` nor `AI_AGENT_RETRY_BASE_DELAY_MS` is given —
+    /// pi-parity fix (Round 3), [`Self::default_retry_max_retries`]'s identical relationship to
+    /// `agent_core::client::BASE_BACKOFF`/`retry::RUN_RETRY_BASE_BACKOFF`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_retry_base_delay_ms: Option<u64>,
+    /// Used when neither `--idle-timeout-ms` nor `AI_AGENT_IDLE_TIMEOUT_MS` is given — this crate's
+    /// "provider timeout": the idle-read timeout between response chunks on the gateway HTTP client (see
+    /// `run`'s `--idle-timeout-ms` doc comment, Task #19) — pi-parity fix (Round 3): the last of the
+    /// retry/timeout cluster with no persisted fallback at all. `serve` has no `--idle-timeout-ms` flag
+    /// of its own yet to fall back from (a pre-existing gap, out of this fix's scope — see `ServeConfig`
+    /// in `serve.rs`), so only `run` consults this field today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_provider_timeout_ms: Option<u64>,
+    /// Used when neither `--models` nor `AI_AGENT_MODELS` is given — pi-parity fix (Round 3): `serve`'s
+    /// `cycle_model` candidate-scoping list previously had no persisted default, unlike `default_model`
+    /// itself. An empty/absent explicit `--models` falls back to this list *in full*; a non-empty
+    /// explicit `--models` wins outright with no merge between the two — matching every other field's
+    /// plain override precedence (see [`Settings::merge_over`]'s own doc comment for why the project-tier
+    /// merge treats this list field identically: replace, never append/concat). `run` has no `--models`
+    /// flag of its own (nothing to scope — it never cycles models mid-run), so this is `serve`-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_models_list: Option<Vec<String>>,
+    /// Used when no `--skill <path>`/`AI_AGENT_SKILL_PATH` is given, for both `run` and `serve` —
+    /// pi-parity fix (Round 3): extra skill-discovery roots (beyond the two standard
+    /// `~/.claude/skills`/`<cwd>/.claude/skills`) had no persisted default. An empty/absent explicit
+    /// `--skill` list falls back to this list *in full*; a non-empty explicit list wins outright with no
+    /// merge — same plain-override precedence as every other field (see
+    /// [`Self::default_models_list`]'s doc comment).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_skill_paths: Option<Vec<String>>,
+    /// Used when no `--prompt-template <path>`/`AI_AGENT_PROMPT_TEMPLATE_PATH` is given — pi-parity fix
+    /// (Round 3), [`Self::default_skill_paths`]'s identical relationship to prompt-template discovery
+    /// roots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_prompt_template_paths: Option<Vec<String>>,
 }
 
-/// A persisted settings file, one per machine (not per-project — matches pi's own global settings tier;
-/// this crate has no per-project settings tier to layer on top of it).
+impl Settings {
+    /// Deep-merge a `project`-tier [`Settings`] over `self` (the global tier), field by field: any
+    /// `Some` on `project` overrides the corresponding field on `self`; a `None` field on `project` falls
+    /// through to `self`'s own value unchanged. Mirrors pi's own two-tier design
+    /// (`packages/coding-agent/src/core/settings-manager.ts`'s `deepMergeSettings`) — matched exactly for
+    /// the `Vec<String>` list fields here (`default_models_list`/`default_skill_paths`/
+    /// `default_prompt_template_paths`): pi's own array handling explicitly diverts any array-valued
+    /// field out of its one-level-deep object-spread-merge branch (`!Array.isArray(...)` guards) into
+    /// wholesale replacement, never a concat/append — so a project's list here, when set at all,
+    /// *replaces* the global list outright rather than appending to it, matching that upstream behavior.
+    /// This is also simpler and more predictable on its own merits: a project author reading their own
+    /// `.claude/settings.json` sees exactly the list that applies, with no need to cross-reference the
+    /// global file to reconstruct a merged result.
+    ///
+    /// Used by [`effective_settings_for_cwd`]'s project-tier resolution — never by [`SettingsStore`]
+    /// itself, which has no project-tier concept of its own (see its own doc comment).
+    #[must_use]
+    pub fn merge_over(&self, project: &Settings) -> Settings {
+        Settings {
+            default_model: project
+                .default_model
+                .clone()
+                .or_else(|| self.default_model.clone()),
+            default_gateway_url: project
+                .default_gateway_url
+                .clone()
+                .or_else(|| self.default_gateway_url.clone()),
+            default_session_dir: project
+                .default_session_dir
+                .clone()
+                .or_else(|| self.default_session_dir.clone()),
+            default_project_trust: project.default_project_trust.or(self.default_project_trust),
+            compaction_enabled: project.compaction_enabled.or(self.compaction_enabled),
+            default_reasoning_effort: project
+                .default_reasoning_effort
+                .clone()
+                .or_else(|| self.default_reasoning_effort.clone()),
+            block_images: project.block_images.or(self.block_images),
+            image_auto_resize: project.image_auto_resize.or(self.image_auto_resize),
+            thinking_budget_overrides: project
+                .thinking_budget_overrides
+                .clone()
+                .or_else(|| self.thinking_budget_overrides.clone()),
+            default_bash_shell_path: project
+                .default_bash_shell_path
+                .clone()
+                .or_else(|| self.default_bash_shell_path.clone()),
+            default_bash_command_prefix: project
+                .default_bash_command_prefix
+                .clone()
+                .or_else(|| self.default_bash_command_prefix.clone()),
+            default_compaction_reserve_tokens: project
+                .default_compaction_reserve_tokens
+                .or(self.default_compaction_reserve_tokens),
+            default_compaction_keep_recent_tokens: project
+                .default_compaction_keep_recent_tokens
+                .or(self.default_compaction_keep_recent_tokens),
+            default_retry_max_retries: project
+                .default_retry_max_retries
+                .or(self.default_retry_max_retries),
+            default_retry_base_delay_ms: project
+                .default_retry_base_delay_ms
+                .or(self.default_retry_base_delay_ms),
+            default_provider_timeout_ms: project
+                .default_provider_timeout_ms
+                .or(self.default_provider_timeout_ms),
+            default_models_list: project
+                .default_models_list
+                .clone()
+                .or_else(|| self.default_models_list.clone()),
+            default_skill_paths: project
+                .default_skill_paths
+                .clone()
+                .or_else(|| self.default_skill_paths.clone()),
+            default_prompt_template_paths: project
+                .default_prompt_template_paths
+                .clone()
+                .or_else(|| self.default_prompt_template_paths.clone()),
+        }
+    }
+}
+
+/// A persisted settings file, one per machine — the *global* tier. A project-level tier also exists now
+/// (Round 3, pi-parity feature: [`effective_settings_for_cwd`], `<cwd>/.claude/settings.json`, deep-merged
+/// on top of this one via [`Settings::merge_over`] whenever `cwd` is trusted), matching pi's own two-tier
+/// `settings.json` design — but this type itself remains the global tier only. `agent settings` (the CLI
+/// subcommand) manages only this global tier; a project's own `.claude/settings.json` is hand-edited,
+/// like `models.json`, with no CLI mutation surface of its own.
 pub struct SettingsStore {
     path: PathBuf,
     settings: Settings,
@@ -218,6 +374,70 @@ impl SettingsStore {
                 s.thinking_budget_overrides = None;
             }
         })
+    }
+
+    /// Set (`Some`) or clear (`None`) the stored default `--bash-shell-path`, persisting atomically.
+    pub fn set_default_bash_shell_path(&mut self, path: Option<String>) -> std::io::Result<()> {
+        self.mutate_locked(move |s| s.default_bash_shell_path = path)
+    }
+
+    /// Set (`Some`) or clear (`None`) the stored default `--bash-command-prefix`, persisting atomically.
+    pub fn set_default_bash_command_prefix(&mut self, prefix: Option<String>) -> std::io::Result<()> {
+        self.mutate_locked(move |s| s.default_bash_command_prefix = prefix)
+    }
+
+    /// Set (`Some`) or clear (`None`) the stored default compaction reserve-token override, persisting
+    /// atomically.
+    pub fn set_default_compaction_reserve_tokens(&mut self, tokens: Option<u32>) -> std::io::Result<()> {
+        self.mutate_locked(move |s| s.default_compaction_reserve_tokens = tokens)
+    }
+
+    /// Set (`Some`) or clear (`None`) the stored default compaction keep-recent-token override,
+    /// persisting atomically.
+    pub fn set_default_compaction_keep_recent_tokens(
+        &mut self,
+        tokens: Option<u32>,
+    ) -> std::io::Result<()> {
+        self.mutate_locked(move |s| s.default_compaction_keep_recent_tokens = tokens)
+    }
+
+    /// Set (`Some`) or clear (`None`) the stored default retry max-retries override, persisting
+    /// atomically.
+    pub fn set_default_retry_max_retries(&mut self, retries: Option<u32>) -> std::io::Result<()> {
+        self.mutate_locked(move |s| s.default_retry_max_retries = retries)
+    }
+
+    /// Set (`Some`) or clear (`None`) the stored default retry base-delay override (milliseconds),
+    /// persisting atomically.
+    pub fn set_default_retry_base_delay_ms(&mut self, ms: Option<u64>) -> std::io::Result<()> {
+        self.mutate_locked(move |s| s.default_retry_base_delay_ms = ms)
+    }
+
+    /// Set (`Some`) or clear (`None`) the stored default provider (idle-read) timeout override
+    /// (milliseconds), persisting atomically.
+    pub fn set_default_provider_timeout_ms(&mut self, ms: Option<u64>) -> std::io::Result<()> {
+        self.mutate_locked(move |s| s.default_provider_timeout_ms = ms)
+    }
+
+    /// Set (`Some`) or clear (`None`) the stored default `--models` scoping/cycling list, persisting
+    /// atomically.
+    pub fn set_default_models_list(&mut self, models: Option<Vec<String>>) -> std::io::Result<()> {
+        self.mutate_locked(move |s| s.default_models_list = models)
+    }
+
+    /// Set (`Some`) or clear (`None`) the stored default extra skill-discovery paths, persisting
+    /// atomically.
+    pub fn set_default_skill_paths(&mut self, paths: Option<Vec<String>>) -> std::io::Result<()> {
+        self.mutate_locked(move |s| s.default_skill_paths = paths)
+    }
+
+    /// Set (`Some`) or clear (`None`) the stored default extra prompt-template-discovery paths,
+    /// persisting atomically.
+    pub fn set_default_prompt_template_paths(
+        &mut self,
+        paths: Option<Vec<String>>,
+    ) -> std::io::Result<()> {
+        self.mutate_locked(move |s| s.default_prompt_template_paths = paths)
     }
 
     /// Acquire the cross-process lock (see [`FileLock`]), re-read the store's *current* on-disk state —
@@ -360,6 +580,59 @@ fn default_path() -> PathBuf {
     config_dir_root().join("settings.json")
 }
 
+/// Where a project-level settings tier lives, if trusted: `<cwd>/.claude/settings.json` — a sibling of
+/// the same project's `.claude/SYSTEM.md`/`skills`/`prompts` (see
+/// `trust_store::has_trust_gated_resources`), gated by the exact same persisted-trust mechanism (Round 3,
+/// pi-parity feature).
+pub fn project_settings_path(cwd: &Path) -> PathBuf {
+    cwd.join(".claude/settings.json")
+}
+
+/// The effective settings for a `run`/`serve` invocation in `cwd`: the global tier
+/// ([`SettingsStore::open_default`]) with a project-level `<cwd>/.claude/settings.json` tier deep-merged
+/// on top ([`Settings::merge_over`]) — but *only* when `cwd` is trusted per the persisted
+/// [`crate::trust_store::TrustStore`] allowlist (`TrustStore::is_trusted`: the exact-path-or-inherited
+/// grant `agent trust`/`agent untrust` manage). An untrusted project's `.claude/settings.json` is
+/// completely ignored — not partially applied — since a hostile untrusted checkout could otherwise use it
+/// to redirect `default_gateway_url`/`default_model` (or any other field) to something
+/// attacker-controlled just by shipping the file; the global tier alone is returned in that case,
+/// identical to `SettingsStore::open_default().get().clone()`.
+///
+/// Deliberately checks only the persisted allowlist, not the fuller `resolve_project_trust` precedence
+/// `run`/`serve` apply for `SYSTEM.md`/skills/prompts (which also honors a one-shot `--trust-project`
+/// flag and a "nothing here to gate" fast path) — a transient, session-scoped `--trust-project` is an
+/// operator saying "honor this project's *identity* override for this one run", not "also let this
+/// project's settings.json silently redirect where my credentials/requests go." Only a *persisted*
+/// `agent trust <path>` grant is trusted enough for that.
+///
+/// Returns a plain [`Settings`] snapshot, not a [`SettingsStore`] handle: there's no project-tier
+/// mutation surface analogous to `agent settings` for the global tier — a project's
+/// `.claude/settings.json` is hand-edited (matching `models.json`'s own convention), not managed via any
+/// CLI flag here.
+pub fn effective_settings_for_cwd(cwd: &Path) -> Settings {
+    effective_settings_with_stores(
+        &SettingsStore::open_default(),
+        cwd,
+        &crate::trust_store::TrustStore::open_default(),
+    )
+}
+
+/// [`effective_settings_for_cwd`], but against already-open stores — split out so tests can point both
+/// at temporary paths instead of the real `~/.claude` (see `ModelOverride::resolved_api_key_with_env`'s
+/// doc comment for why this crate prefers threading test doubles through rather than mutating real,
+/// process-wide state like `$HOME`).
+fn effective_settings_with_stores(
+    global: &SettingsStore,
+    cwd: &Path,
+    trust: &crate::trust_store::TrustStore,
+) -> Settings {
+    if !trust.is_trusted(cwd) {
+        return global.get().clone();
+    }
+    let project = read_store_file(&project_settings_path(cwd));
+    global.get().merge_over(&project)
+}
+
 /// A single model's on-disk connection override — pi-parity feature (Fix 9): pi's own
 /// `model-registry.ts` lets an operator override a model's base URL/auth/routing preferences via a
 /// `models.json`, merged over its built-in provider catalog. This crate holds no catalog of its own to
@@ -411,9 +684,55 @@ pub struct ModelOverride {
     /// accepts a Bearer token and whose SDK omits `Authorization` entirely. `None` (the default) keeps
     /// the existing `Authorization: Bearer` behavior. Has no effect without `base_url` set — a
     /// gateway-routed override's auth scheme is the gateway's concern, not the client's. Threaded to
-    /// `agent_core::client::DirectRouting::auth_header` in `main.rs::resolve_gateway_credential`.
+    /// `agent_core::client::DirectRouting::auth_header` in `gateway_credential::resolve_gateway_credential`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_header: Option<String>,
+    /// Prepended to `api_key`'s resolved value when sent through [`Self::auth_header`] — pi-parity Fix
+    /// 4 (Round 2): Cloudflare AI Gateway wants `cf-aig-authorization: Bearer <key>`, a *named* header
+    /// (already covered by `auth_header` alone) carrying a Bearer-*prefixed* value (which bare
+    /// `auth_header` doesn't — it sends the credential verbatim, correct for Azure's `api-key` scheme
+    /// but wrong here). `None` (the default) keeps `auth_header`'s existing bare-value behavior. Has
+    /// no effect without `auth_header` also set — there's no header to prefix a value into otherwise.
+    /// Threaded to `agent_core::client::DirectRouting::auth_header_prefix`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_header_prefix: Option<String>,
+    /// Override which provider wire (Anthropic/OpenAI Chat Completions/OpenAI Responses) this model's
+    /// requests build and decode as, instead of `agent_core::dialect::Dialect::for_model`'s own
+    /// name-heuristic (a "claude"/"anthropic" substring ⇒ Anthropic, else OpenAI-family) — pi-parity
+    /// Fix 1 (Round 2). Only meaningful alongside [`Self::base_url`]: a plain gateway-relayed
+    /// request's provider routing is inherently tied to which dialect-specific endpoint path the
+    /// gateway's own known-provider table matches on, so an isolated `dialect` override with no
+    /// companion `base_url` would have nothing to attach to. The motivating case is a genuinely
+    /// Anthropic-wire third-party provider whose model ids don't carry a "claude"/"anthropic"
+    /// substring (Kimi-Coding's `kimi-k2-thinking`, reached via `api.kimi.com/coding`) — without this,
+    /// beyond builds an OpenAI-shaped body and POSTs it to an Anthropic Messages endpoint, a hard
+    /// wire-format mismatch. One of `"anthropic"`/`"openai"`/`"openai_responses"` (see
+    /// [`agent_core::dialect::Dialect`]'s own `Serialize`/`Deserialize` impl). `None` (the default)
+    /// keeps the existing heuristic. Threaded to `agent_core::client::DirectRouting::dialect_override`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialect: Option<agent_core::dialect::Dialect>,
+    /// For a *direct* (`base_url`-set) override: send this instead of the app-level model id (the
+    /// string passed to `--model`/configured here as this override's own key) as the request body's
+    /// wire-level `"model"` field — pi-parity Fix 2 (Round 2): Azure OpenAI's deployment name doesn't
+    /// have to match the model id used for capability lookups (mirrors pi's own
+    /// `AZURE_OPENAI_DEPLOYMENT_NAME_MAP` env var in `azure-openai-responses.ts`, expressed here as a
+    /// per-model-id `models.json` field instead of a separate comma-joined map, since this override is
+    /// already keyed per model id). `None` (the default) leaves the wire-level `"model"` field as the
+    /// app-level id. Threaded to `agent_core::client::DirectRouting::deployment_name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_name: Option<String>,
+    /// For a *direct* (`base_url`-set) override: Azure's dated REST `api-version` (e.g.
+    /// `"2024-08-01-preview"`), sent as a `?api-version=…` query-string parameter on every request —
+    /// pi-parity Fix 2 (Round 2): most real enterprise Azure OpenAI deployments are pinned to a dated
+    /// API version (pi's own default, absent an explicit override, is `"v1"` —
+    /// `DEFAULT_AZURE_API_VERSION` in `azure-openai-responses.ts`), and beyond previously had no way to
+    /// send one at all. `None` (the default) sends no query string, unchanged — deliberately no
+    /// auto-detection from `base_url` looking like an Azure host: an explicit field is simpler to
+    /// reason about than a heuristic that silently changes behavior based on hostname shape. Threaded
+    /// to `agent_core::client::DirectRouting::query` (percent-encoded at resolution time, since this is
+    /// a bare value here, not a pre-built query string).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_version: Option<String>,
 }
 
 impl ModelOverride {
@@ -1159,6 +1478,132 @@ mod tests {
     }
 
     #[test]
+    fn dialect_override_round_trips_through_json_and_defaults_to_none() {
+        // Fix 1 (pi-parity, Round 2): a `models.json` `dialect` field names one of
+        // `agent_core::dialect::Dialect`'s own short JSON strings directly.
+        let over = ModelOverride::default();
+        assert_eq!(over.dialect, None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.json");
+        fs::write(
+            &path,
+            r#"{"kimi-k2-thinking": {"base_url": "https://api.kimi.com/coding", "dialect": "anthropic"}}"#,
+        )
+        .unwrap();
+
+        let overrides = ModelOverrides::open(path);
+        let over = overrides.get("kimi-k2-thinking").unwrap();
+        assert_eq!(over.dialect, Some(agent_core::dialect::Dialect::Anthropic));
+    }
+
+    #[test]
+    fn dialect_override_is_omitted_from_serialized_json_when_unset() {
+        let over = ModelOverride {
+            base_url: Some("https://example.com".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&over).unwrap();
+        assert!(
+            !json.contains("dialect"),
+            "unset dialect must not appear in the serialized form, got: {json}"
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_dialect_string_fails_to_parse_the_whole_file_which_is_treated_as_empty() {
+        // Matches every other field's forward-compatibility posture (see
+        // `unrecognized_fields_in_the_file_are_ignored_not_a_parse_error`): a *field value* that fails
+        // to deserialize fails that model's whole entry, and `ModelOverrides::open` degrades the whole
+        // file to empty (with a `warn!`) rather than panicking the process over a hand-edited typo.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.json");
+        fs::write(
+            &path,
+            r#"{"bad-model": {"base_url": "https://example.com", "dialect": "not-a-real-dialect"}}"#,
+        )
+        .unwrap();
+
+        let capture = crate::tracing_test::capture(|| {
+            let overrides = ModelOverrides::open(path);
+            assert!(overrides.is_empty());
+        });
+        assert!(
+            capture
+                .messages()
+                .iter()
+                .any(|m| m.contains("model overrides")),
+            "got: {:?}",
+            capture.messages()
+        );
+    }
+
+    #[test]
+    fn deployment_name_and_api_version_round_trip_through_json_and_default_to_none() {
+        // Fix 2 (pi-parity, Round 2): Azure OpenAI's deployment-name mapping and dated `api-version`.
+        let over = ModelOverride::default();
+        assert_eq!(over.deployment_name, None);
+        assert_eq!(over.api_version, None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.json");
+        fs::write(
+            &path,
+            r#"{"gpt-4o-azure": {"base_url": "https://foo.openai.azure.com/openai/v1", "deployment_name": "my-deployment", "api_version": "2024-08-01-preview"}}"#,
+        )
+        .unwrap();
+
+        let overrides = ModelOverrides::open(path);
+        let over = overrides.get("gpt-4o-azure").unwrap();
+        assert_eq!(over.deployment_name.as_deref(), Some("my-deployment"));
+        assert_eq!(over.api_version.as_deref(), Some("2024-08-01-preview"));
+    }
+
+    #[test]
+    fn deployment_name_and_api_version_are_omitted_from_serialized_json_when_unset() {
+        let over = ModelOverride {
+            base_url: Some("https://example.com".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&over).unwrap();
+        assert!(!json.contains("deployment_name"), "got: {json}");
+        assert!(!json.contains("api_version"), "got: {json}");
+    }
+
+    #[test]
+    fn auth_header_prefix_round_trips_through_json_and_defaults_to_none() {
+        // Fix 4 (pi-parity, Round 2): Cloudflare AI Gateway's Bearer-prefixed named header.
+        let over = ModelOverride::default();
+        assert_eq!(over.auth_header_prefix, None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.json");
+        fs::write(
+            &path,
+            r#"{"cf-model": {"base_url": "https://gateway.ai.cloudflare.com/x", "auth_header": "cf-aig-authorization", "auth_header_prefix": "Bearer "}}"#,
+        )
+        .unwrap();
+
+        let overrides = ModelOverrides::open(path);
+        let over = overrides.get("cf-model").unwrap();
+        assert_eq!(over.auth_header.as_deref(), Some("cf-aig-authorization"));
+        assert_eq!(over.auth_header_prefix.as_deref(), Some("Bearer "));
+    }
+
+    #[test]
+    fn auth_header_prefix_is_omitted_from_serialized_json_when_unset() {
+        let over = ModelOverride {
+            base_url: Some("https://example.com".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&over).unwrap();
+        assert!(
+            !json.contains("auth_header_prefix"),
+            "unset auth_header_prefix must not appear in the serialized form, got: {json}"
+        );
+    }
+
+    #[test]
     fn resolve_config_value_template_escapes_dollar_and_bang() {
         let lookup = |_: &str| -> Option<String> { None };
         assert_eq!(
@@ -1182,5 +1627,424 @@ mod tests {
         assert!(!is_env_var_name("1BAD"));
         assert!(!is_env_var_name("not a var"));
         assert!(is_env_var_name("_valid_Name9"));
+    }
+
+    // --- Round 3 (pi-parity): five more flag/env-only settings gain a persisted stored-default fallback.
+
+    #[test]
+    fn set_default_bash_shell_path_persists_and_reopening_sees_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut store = SettingsStore::open(path.clone());
+        assert_eq!(store.get().default_bash_shell_path, None);
+
+        store
+            .set_default_bash_shell_path(Some("/bin/zsh".to_string()))
+            .unwrap();
+        assert_eq!(store.get().default_bash_shell_path.as_deref(), Some("/bin/zsh"));
+        let reopened = SettingsStore::open(path.clone());
+        assert_eq!(
+            reopened.get().default_bash_shell_path.as_deref(),
+            Some("/bin/zsh")
+        );
+
+        let mut store = SettingsStore::open(path.clone());
+        store.set_default_bash_shell_path(None).unwrap();
+        assert_eq!(store.get().default_bash_shell_path, None);
+        let reopened = SettingsStore::open(path);
+        assert_eq!(reopened.get().default_bash_shell_path, None);
+    }
+
+    #[test]
+    fn set_default_bash_command_prefix_persists_and_reopening_sees_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut store = SettingsStore::open(path.clone());
+        assert_eq!(store.get().default_bash_command_prefix, None);
+
+        store
+            .set_default_bash_command_prefix(Some("source .venv/bin/activate".to_string()))
+            .unwrap();
+        assert_eq!(
+            store.get().default_bash_command_prefix.as_deref(),
+            Some("source .venv/bin/activate")
+        );
+        let reopened = SettingsStore::open(path.clone());
+        assert_eq!(
+            reopened.get().default_bash_command_prefix.as_deref(),
+            Some("source .venv/bin/activate")
+        );
+
+        let mut store = SettingsStore::open(path.clone());
+        store.set_default_bash_command_prefix(None).unwrap();
+        assert_eq!(store.get().default_bash_command_prefix, None);
+        let reopened = SettingsStore::open(path);
+        assert_eq!(reopened.get().default_bash_command_prefix, None);
+    }
+
+    #[test]
+    fn set_default_compaction_reserve_tokens_persists_and_reopening_sees_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut store = SettingsStore::open(path.clone());
+        assert_eq!(store.get().default_compaction_reserve_tokens, None);
+
+        store.set_default_compaction_reserve_tokens(Some(8_192)).unwrap();
+        assert_eq!(store.get().default_compaction_reserve_tokens, Some(8_192));
+        let reopened = SettingsStore::open(path.clone());
+        assert_eq!(reopened.get().default_compaction_reserve_tokens, Some(8_192));
+
+        let mut store = SettingsStore::open(path.clone());
+        store.set_default_compaction_reserve_tokens(None).unwrap();
+        assert_eq!(store.get().default_compaction_reserve_tokens, None);
+        let reopened = SettingsStore::open(path);
+        assert_eq!(reopened.get().default_compaction_reserve_tokens, None);
+    }
+
+    #[test]
+    fn set_default_compaction_keep_recent_tokens_persists_and_reopening_sees_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut store = SettingsStore::open(path.clone());
+        assert_eq!(store.get().default_compaction_keep_recent_tokens, None);
+
+        store
+            .set_default_compaction_keep_recent_tokens(Some(12_000))
+            .unwrap();
+        assert_eq!(
+            store.get().default_compaction_keep_recent_tokens,
+            Some(12_000)
+        );
+        let reopened = SettingsStore::open(path.clone());
+        assert_eq!(
+            reopened.get().default_compaction_keep_recent_tokens,
+            Some(12_000)
+        );
+
+        let mut store = SettingsStore::open(path.clone());
+        store.set_default_compaction_keep_recent_tokens(None).unwrap();
+        assert_eq!(store.get().default_compaction_keep_recent_tokens, None);
+        let reopened = SettingsStore::open(path);
+        assert_eq!(reopened.get().default_compaction_keep_recent_tokens, None);
+    }
+
+    #[test]
+    fn set_default_retry_max_retries_persists_and_reopening_sees_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut store = SettingsStore::open(path.clone());
+        assert_eq!(store.get().default_retry_max_retries, None);
+
+        store.set_default_retry_max_retries(Some(5)).unwrap();
+        assert_eq!(store.get().default_retry_max_retries, Some(5));
+        let reopened = SettingsStore::open(path.clone());
+        assert_eq!(reopened.get().default_retry_max_retries, Some(5));
+
+        let mut store = SettingsStore::open(path.clone());
+        store.set_default_retry_max_retries(None).unwrap();
+        assert_eq!(store.get().default_retry_max_retries, None);
+        let reopened = SettingsStore::open(path);
+        assert_eq!(reopened.get().default_retry_max_retries, None);
+    }
+
+    #[test]
+    fn set_default_retry_base_delay_ms_persists_and_reopening_sees_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut store = SettingsStore::open(path.clone());
+        assert_eq!(store.get().default_retry_base_delay_ms, None);
+
+        store.set_default_retry_base_delay_ms(Some(500)).unwrap();
+        assert_eq!(store.get().default_retry_base_delay_ms, Some(500));
+        let reopened = SettingsStore::open(path.clone());
+        assert_eq!(reopened.get().default_retry_base_delay_ms, Some(500));
+
+        let mut store = SettingsStore::open(path.clone());
+        store.set_default_retry_base_delay_ms(None).unwrap();
+        assert_eq!(store.get().default_retry_base_delay_ms, None);
+        let reopened = SettingsStore::open(path);
+        assert_eq!(reopened.get().default_retry_base_delay_ms, None);
+    }
+
+    #[test]
+    fn set_default_provider_timeout_ms_persists_and_reopening_sees_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut store = SettingsStore::open(path.clone());
+        assert_eq!(store.get().default_provider_timeout_ms, None);
+
+        store.set_default_provider_timeout_ms(Some(60_000)).unwrap();
+        assert_eq!(store.get().default_provider_timeout_ms, Some(60_000));
+        let reopened = SettingsStore::open(path.clone());
+        assert_eq!(reopened.get().default_provider_timeout_ms, Some(60_000));
+
+        let mut store = SettingsStore::open(path.clone());
+        store.set_default_provider_timeout_ms(None).unwrap();
+        assert_eq!(store.get().default_provider_timeout_ms, None);
+        let reopened = SettingsStore::open(path);
+        assert_eq!(reopened.get().default_provider_timeout_ms, None);
+    }
+
+    #[test]
+    fn set_default_models_list_persists_and_reopening_sees_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut store = SettingsStore::open(path.clone());
+        assert_eq!(store.get().default_models_list, None);
+
+        store
+            .set_default_models_list(Some(vec!["claude-opus-4-8".to_string(), "gpt-5".to_string()]))
+            .unwrap();
+        assert_eq!(
+            store.get().default_models_list,
+            Some(vec!["claude-opus-4-8".to_string(), "gpt-5".to_string()])
+        );
+        let reopened = SettingsStore::open(path.clone());
+        assert_eq!(
+            reopened.get().default_models_list,
+            Some(vec!["claude-opus-4-8".to_string(), "gpt-5".to_string()])
+        );
+
+        let mut store = SettingsStore::open(path.clone());
+        store.set_default_models_list(None).unwrap();
+        assert_eq!(store.get().default_models_list, None);
+        let reopened = SettingsStore::open(path);
+        assert_eq!(reopened.get().default_models_list, None);
+    }
+
+    #[test]
+    fn set_default_skill_paths_persists_and_reopening_sees_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut store = SettingsStore::open(path.clone());
+        assert_eq!(store.get().default_skill_paths, None);
+
+        store
+            .set_default_skill_paths(Some(vec!["/opt/skills".to_string()]))
+            .unwrap();
+        assert_eq!(
+            store.get().default_skill_paths,
+            Some(vec!["/opt/skills".to_string()])
+        );
+        let reopened = SettingsStore::open(path.clone());
+        assert_eq!(
+            reopened.get().default_skill_paths,
+            Some(vec!["/opt/skills".to_string()])
+        );
+
+        let mut store = SettingsStore::open(path.clone());
+        store.set_default_skill_paths(None).unwrap();
+        assert_eq!(store.get().default_skill_paths, None);
+        let reopened = SettingsStore::open(path);
+        assert_eq!(reopened.get().default_skill_paths, None);
+    }
+
+    #[test]
+    fn set_default_prompt_template_paths_persists_and_reopening_sees_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut store = SettingsStore::open(path.clone());
+        assert_eq!(store.get().default_prompt_template_paths, None);
+
+        store
+            .set_default_prompt_template_paths(Some(vec!["/opt/prompts".to_string()]))
+            .unwrap();
+        assert_eq!(
+            store.get().default_prompt_template_paths,
+            Some(vec!["/opt/prompts".to_string()])
+        );
+        let reopened = SettingsStore::open(path.clone());
+        assert_eq!(
+            reopened.get().default_prompt_template_paths,
+            Some(vec!["/opt/prompts".to_string()])
+        );
+
+        let mut store = SettingsStore::open(path.clone());
+        store.set_default_prompt_template_paths(None).unwrap();
+        assert_eq!(store.get().default_prompt_template_paths, None);
+        let reopened = SettingsStore::open(path);
+        assert_eq!(reopened.get().default_prompt_template_paths, None);
+    }
+
+    // --- Feature 2 (Round 3, pi-parity): project-level `.claude/settings.json` tier.
+
+    #[test]
+    fn merge_over_prefers_the_project_value_when_both_set_a_scalar_field() {
+        let global = Settings {
+            default_model: Some("global-model".to_string()),
+            ..Default::default()
+        };
+        let project = Settings {
+            default_model: Some("project-model".to_string()),
+            ..Default::default()
+        };
+        let merged = global.merge_over(&project);
+        assert_eq!(merged.default_model.as_deref(), Some("project-model"));
+    }
+
+    #[test]
+    fn merge_over_falls_through_to_the_global_value_when_the_project_leaves_a_field_unset() {
+        let global = Settings {
+            default_model: Some("global-model".to_string()),
+            default_gateway_url: Some("http://global-gw".to_string()),
+            ..Default::default()
+        };
+        let project = Settings {
+            default_gateway_url: Some("http://project-gw".to_string()),
+            ..Default::default()
+        };
+        let merged = global.merge_over(&project);
+        assert_eq!(
+            merged.default_model.as_deref(),
+            Some("global-model"),
+            "a field the project doesn't set must fall through to the global value unchanged"
+        );
+        assert_eq!(merged.default_gateway_url.as_deref(), Some("http://project-gw"));
+    }
+
+    #[test]
+    fn merge_over_replaces_a_list_field_wholesale_rather_than_appending() {
+        let global = Settings {
+            default_skill_paths: Some(vec!["/global/skills".to_string()]),
+            ..Default::default()
+        };
+        let project = Settings {
+            default_skill_paths: Some(vec!["/project/skills".to_string()]),
+            ..Default::default()
+        };
+        let merged = global.merge_over(&project);
+        assert_eq!(
+            merged.default_skill_paths,
+            Some(vec!["/project/skills".to_string()]),
+            "a project-set list must replace the global list outright, matching pi's own \
+             deepMergeSettings array handling — not concatenate the two"
+        );
+    }
+
+    #[test]
+    fn merge_over_falls_through_to_the_global_list_when_the_project_leaves_it_unset() {
+        let global = Settings {
+            default_skill_paths: Some(vec!["/global/skills".to_string()]),
+            ..Default::default()
+        };
+        let project = Settings::default();
+        let merged = global.merge_over(&project);
+        assert_eq!(
+            merged.default_skill_paths,
+            Some(vec!["/global/skills".to_string()])
+        );
+    }
+
+    #[test]
+    fn effective_settings_merges_a_trusted_projects_settings_json_over_the_global_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().join("project");
+        fs::create_dir_all(project_dir.join(".claude")).unwrap();
+        fs::write(
+            project_dir.join(".claude/settings.json"),
+            r#"{"default_model":"project-model"}"#,
+        )
+        .unwrap();
+
+        let mut global = SettingsStore::open(dir.path().join("settings.json"));
+        global
+            .set_default_gateway_url(Some("http://global-gw".to_string()))
+            .unwrap();
+
+        let mut trust = crate::trust_store::TrustStore::open(dir.path().join("trusted-projects.json"));
+        trust.trust(&project_dir).unwrap();
+
+        let effective = effective_settings_with_stores(&global, &project_dir, &trust);
+        assert_eq!(effective.default_model.as_deref(), Some("project-model"));
+        assert_eq!(
+            effective.default_gateway_url.as_deref(),
+            Some("http://global-gw"),
+            "a global field the project doesn't set must survive the merge"
+        );
+    }
+
+    #[test]
+    fn effective_settings_completely_ignores_an_untrusted_projects_settings_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().join("project");
+        fs::create_dir_all(project_dir.join(".claude")).unwrap();
+        fs::write(
+            project_dir.join(".claude/settings.json"),
+            r#"{"default_model":"attacker-model","default_gateway_url":"http://evil.example"}"#,
+        )
+        .unwrap();
+
+        let mut global = SettingsStore::open(dir.path().join("settings.json"));
+        global
+            .set_default_model(Some("global-model".to_string()))
+            .unwrap();
+
+        // Deliberately never trusted — the trust store is empty.
+        let trust = crate::trust_store::TrustStore::open(dir.path().join("trusted-projects.json"));
+
+        let effective = effective_settings_with_stores(&global, &project_dir, &trust);
+        assert_eq!(
+            effective.default_model.as_deref(),
+            Some("global-model"),
+            "an untrusted project's settings.json must be completely ignored, not partially applied"
+        );
+        assert_eq!(
+            effective.default_gateway_url, None,
+            "the untrusted project's gateway-url redirection attempt must not apply at all"
+        );
+    }
+
+    #[test]
+    fn effective_settings_degrades_to_global_only_when_the_project_settings_file_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().join("project");
+        fs::create_dir_all(&project_dir).unwrap(); // no `.claude/settings.json` at all
+
+        let mut global = SettingsStore::open(dir.path().join("settings.json"));
+        global
+            .set_default_model(Some("global-model".to_string()))
+            .unwrap();
+
+        let mut trust = crate::trust_store::TrustStore::open(dir.path().join("trusted-projects.json"));
+        trust.trust(&project_dir).unwrap();
+
+        let effective = effective_settings_with_stores(&global, &project_dir, &trust);
+        assert_eq!(effective.default_model.as_deref(), Some("global-model"));
+    }
+
+    #[test]
+    fn effective_settings_degrades_to_global_only_when_the_project_settings_file_is_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().join("project");
+        fs::create_dir_all(project_dir.join(".claude")).unwrap();
+        fs::write(
+            project_dir.join(".claude/settings.json"),
+            "not valid json at all { [ }",
+        )
+        .unwrap();
+
+        let mut global = SettingsStore::open(dir.path().join("settings.json"));
+        global
+            .set_default_model(Some("global-model".to_string()))
+            .unwrap();
+
+        let mut trust = crate::trust_store::TrustStore::open(dir.path().join("trusted-projects.json"));
+        trust.trust(&project_dir).unwrap();
+
+        let effective = effective_settings_with_stores(&global, &project_dir, &trust);
+        assert_eq!(
+            effective.default_model.as_deref(),
+            Some("global-model"),
+            "a malformed project settings.json must degrade to global-only, not error or panic"
+        );
+    }
+
+    #[test]
+    fn project_settings_path_is_dot_claude_settings_json_under_cwd() {
+        let cwd = Path::new("/some/project");
+        assert_eq!(
+            project_settings_path(cwd),
+            Path::new("/some/project/.claude/settings.json")
+        );
     }
 }

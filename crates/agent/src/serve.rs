@@ -828,9 +828,17 @@ impl Persistence {
             return Ok(());
         };
         let r = match tokens_before {
-            Some(tokens_before) => {
-                store.rewrite_compacted(&session.messages, CompactionMeta { tokens_before })
-            }
+            Some(tokens_before) => store.rewrite_compacted(
+                &session.messages,
+                CompactionMeta {
+                    tokens_before,
+                    // Fix 2 (pi-parity fix): persist this round's folded-forward file-provenance onto
+                    // the new `Entry::Compaction` record — otherwise it never reaches disk at all, and
+                    // a restart/reattach after this round forgets every file this session has ever
+                    // touched (see `Entry::Compaction::read_files`'s own doc comment).
+                    provenance: session.compaction.clone(),
+                },
+            ),
             None => store.append_new(&session.messages),
         };
         if let Err(e) = &r {
@@ -1610,9 +1618,11 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
     // trust can change mid-process (`agent trust`/`--trust-project` since startup) without a restart.
     if !project_trusted && has_gated_resources {
         eprintln!(
-            "warning: {} has a project-local SYSTEM.md/APPEND_SYSTEM.md, skills, or prompt templates \
-             on disk, but the project isn't trusted, so they were skipped — pass --trust-project or run \
-             `agent trust {}` to enable them",
+            "warning: {} has a project-local SYSTEM.md/APPEND_SYSTEM.md, skills, prompt templates, or a \
+             settings.json on disk, but the project isn't trusted, so they were skipped — pass \
+             --trust-project or run `agent trust {}` to enable them (a project's own settings.json \
+             additionally requires a *persisted* `agent trust`, not just a one-off --trust-project — see \
+             `settings::effective_settings_for_cwd`'s doc comment)",
             cwd.display(),
             cwd.display()
         );
@@ -2999,6 +3009,28 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                 // Defaults to `true` (excluding the target entry itself), matching pi's real
                 // production client convention — pi-parity fix; previously defaulted to including it.
                 let before = cmd.get("before").and_then(Value::as_bool).unwrap_or(true);
+                // Fix 3 (pi-parity gap): pi's own `{success, data:{text, cancelled}}` shape — `text` is
+                // the forked-from message's own content (pi's `selectedText`, `extractUserMessageText`
+                // on the entry the caller picked), not anything derived from the *copied* prefix. Must be
+                // resolved *before* `persistence.fork` below swaps `self.store` onto the freshly created
+                // session: `target_id` can name an entry that isn't even on the copied prefix at all (an
+                // off-active-path fork point, or one `before` excludes), so it wouldn't survive into the
+                // new tree to look up afterward. `target_id` resolves directly against the *current*
+                // (pre-fork) store; bare `upto` resolves against the still-current `session.messages`
+                // (parallel to the active path by construction), matching `fork_target_model_and_level`'s
+                // own `active[n - 1]` indexing for the same no-`target_id` case.
+                let fork_text = match target_id {
+                    Some(tid) => persistence
+                        .store
+                        .as_ref()
+                        .and_then(|s| s.message_at(tid))
+                        .and_then(message_text),
+                    None => upto
+                        .min(session.messages.len())
+                        .checked_sub(1)
+                        .and_then(|i| session.messages.get(i))
+                        .and_then(message_text),
+                };
                 match persistence.fork(upto, target_id, before, starting_level) {
                     Ok((s, restored_model, restored_level)) => {
                         session = s;
@@ -3059,6 +3091,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                                 "cwd_stale": cwd_is_stale(&persistence.meta.cwd, &cwd),
                                 "model": current_model,
                                 "reasoning_effort": current_level.as_str(),
+                                "text": fork_text,
                             })),
                             None,
                         ));
@@ -3388,6 +3421,10 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                 let mut compacted_tokens_before: Option<u32> = None;
                 let mut compacted_summary: Option<String> = None;
                 let mut compacted_tokens_after: Option<u32> = None;
+                // Fix 2 (pi-parity gap): pi's own `CompactionResult.firstKeptEntryId`, minus its unit —
+                // agent-core's `AgentEvent::Compacted::first_kept` is a plain pre-compaction message
+                // index, since the tree/entry-id layer lives one level up in this crate (`SessionStore`).
+                let mut compacted_first_kept: Option<usize> = None;
                 let result = agent
                     .compact(
                         &mut session,
@@ -3401,12 +3438,14 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                                 tokens_before,
                                 summary,
                                 tokens_after,
+                                first_kept,
                                 ..
                             } = &ev
                             {
                                 compacted_tokens_before = Some(*tokens_before);
                                 compacted_summary = Some(summary.clone());
                                 compacted_tokens_after = Some(*tokens_after);
+                                compacted_first_kept = Some(*first_kept);
                             }
                             if let Some(frame) = event_frame(ev) {
                                 let _ = tx.send(frame);
@@ -3417,6 +3456,22 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                     .await;
                 match result {
                     Ok(outcome) => {
+                        // Fix 2 (pi-parity gap): the tree entry that begins the retained (post-
+                        // compaction) portion of history — pi's own `firstKeptEntryId` — resolved
+                        // *before* `persist_blocking` below rewrites `persistence`'s own store (which
+                        // mints a fresh id for every entry on the new active path, kept suffix included —
+                        // see `SessionStore::rewrite_compacted`'s doc comment): at this point
+                        // `persistence`'s `active_ids()` still mirrors the *pre*-compaction
+                        // `session.messages` exactly (nothing has touched the store yet this round), so
+                        // indexing it at `first_kept` recovers the id a tree-aware client already knows
+                        // from an earlier `get_tree`/`get_fork_messages` call. `None` when persistence
+                        // isn't configured (no tree to resolve against) or no compaction actually fired.
+                        let first_kept_entry_id = compacted_first_kept.and_then(|first_kept| {
+                            persistence
+                                .store
+                                .as_ref()
+                                .and_then(|s| s.active_ids().get(first_kept).cloned())
+                        });
                         // `agent.compact` can itself fire a mid-compaction `CheckpointHook` call (see
                         // `agent_core::Agent::compact`'s own doc comment) — swept up here for the same
                         // reason the `prompt` handler's own inner run-loop does, right before its
@@ -3444,6 +3499,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                                     "summary": compacted_summary,
                                     "tokens_before": compacted_tokens_before,
                                     "tokens_after": compacted_tokens_after,
+                                    "first_kept_entry_id": first_kept_entry_id,
                                 })),
                                 None
                             )),
@@ -3547,9 +3603,11 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                 // gotten from a fresh `serve` invocation instead of silence.
                 if !project_trusted && has_gated_resources {
                     eprintln!(
-                        "warning: {} has a project-local SYSTEM.md/APPEND_SYSTEM.md, skills, or \
-                         prompt templates on disk, but the project isn't trusted, so they were \
-                         skipped — pass --trust-project or run `agent trust {}` to enable them",
+                        "warning: {} has a project-local SYSTEM.md/APPEND_SYSTEM.md, skills, prompt \
+                         templates, or a settings.json on disk, but the project isn't trusted, so they \
+                         were skipped — pass --trust-project or run `agent trust {}` to enable them (a \
+                         project's own settings.json additionally requires a *persisted* `agent trust`, \
+                         not just a one-off --trust-project)",
                         cwd.display(),
                         cwd.display()
                     );
@@ -4550,6 +4608,22 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                     .and_then(|d| d.get("full_output_path"))
                     .and_then(Value::as_str)
                     .map(str::to_string);
+                // Fix 3 (pi-parity gap): thread these same four fields into the *persisted* message
+                // too, as a leading status line `export.rs`'s host-bash parser now understands — see
+                // `HOST_BASH_STATUS_LINE_PREFIX`'s own doc comment for why this rides on the marker
+                // text rather than a new `agent_core::Message` field. Previously only a bare `is_error`
+                // bool (the `"(error)\n"` marker below) ever reached the persisted message, even though
+                // this RPC response has always reported the real exit code/cancelled/truncated/
+                // full-output-path live, a few lines down.
+                let status_line = format!(
+                    "{HOST_BASH_STATUS_LINE_PREFIX}{}\n",
+                    json!({
+                        "exit_code": exit_code,
+                        "cancelled": cancelled,
+                        "truncated": truncated,
+                        "full_output_path": full_output_path,
+                    })
+                );
                 if let Some(frame) = event_frame(AgentEvent::ToolEnd {
                     id: call_id,
                     name: "bash".to_string(),
@@ -4584,7 +4658,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                     HOST_BASH_LABEL
                 };
                 session.push(agent_core::Message::user(format!(
-                    "{label}\n$ {command}\n\n{}{result_text}",
+                    "{label}\n$ {command}\n\n{status_line}{}{result_text}",
                     if is_error { "(error)\n" } else { "" }
                 )));
                 if let Err(e) = persistence.persist(&session, None) {
@@ -4991,6 +5065,17 @@ impl AgentHooks for ServeHooks {
 const HOST_BASH_EXCLUDED_LABEL: &str = "[Host bash command, excluded from model context]";
 /// The ordinary (not excluded) counterpart to [`HOST_BASH_EXCLUDED_LABEL`] — unchanged from before Fix 9.
 const HOST_BASH_LABEL: &str = "[Host bash command, run outside the model's own turn]";
+/// Prefix for the structured `exit_code`/`cancelled`/`truncated`/`full_output_path` status line the
+/// `bash` RPC command now writes into the persisted host-bash message, right after the blank-line
+/// separator and before the legacy `"(error)\n"` marker (Fix 3, pi-parity gap). Same "ride on the
+/// self-describing marker text, don't widen `agent_core::Message`" reasoning as
+/// [`HOST_BASH_EXCLUDED_LABEL`] above — this RPC's own response has always carried these four fields
+/// live (a few lines below), but nothing threaded them into what actually gets persisted/exported until
+/// now. `export.rs`'s own copy of this constant (`~export.rs:HOST_BASH_STATUS_LINE_PREFIX`) is what
+/// parses it back out at export time; a session written before this line existed simply has none, which
+/// `export.rs`'s parser treats exactly like any other line that doesn't start with this prefix — falls
+/// back to the old `"(error)\n"`-marker-only detection, no migration needed.
+const HOST_BASH_STATUS_LINE_PREFIX: &str = "[Host bash status] ";
 
 /// Whether `m` is a [`HOST_BASH_EXCLUDED_LABEL`]-tagged message — see that constant's own doc comment.
 fn is_excluded_from_model_context(m: &agent_core::Message) -> bool {
@@ -5029,16 +5114,23 @@ fn build_tools(cfg: &ServeConfig) -> agent_core::ToolRegistry {
 /// explicitly disabled (`reasoning_disableable`) — wire-sends an explicit `{"type":"disabled"}"`/
 /// `{"effort":"none"}` rather than picking any default depth at all.
 ///
-/// `None` for a model with no thinking/reasoning mechanism whatsoever (`reasoning_effort`/`thinking`
-/// capability both absent) — nothing to default there. Deliberately a CLI/serve-layer default, not new
-/// `agent_core` plumbing: `agent_core::Agent::new`/`with_reasoning_effort` are unchanged, still doing
-/// exactly nothing when the caller never calls the latter — this only changes what `main.rs`/`serve`
-/// pass in when the operator didn't specify anything themselves.
+/// `None` for a model with no thinking/reasoning mechanism whatsoever — see
+/// [`agent_core::models::has_reasoning_mechanism`] — nothing to default there. Deliberately a
+/// CLI/serve-layer default, not new `agent_core` plumbing: `agent_core::Agent::new`/
+/// `with_reasoning_effort` are unchanged, still doing exactly nothing when the caller never calls the
+/// latter — this only changes what `main.rs`/`serve` pass in when the operator didn't specify anything
+/// themselves.
+///
+/// Calls agent-core's own [`has_reasoning_mechanism`](agent_core::models::has_reasoning_mechanism)
+/// rather than reimplementing the check here: a prior version tested only `caps.thinking !=
+/// ThinkingShape::None || caps.reasoning_effort`, narrower than agent-core's own internal gate by
+/// exactly one arm (`caps.openai_reasoning_format != OpenAiReasoningFormat::Standard`) — so
+/// Kimi-thinking and pre-5.2 GLM models, which signal their reasoning toggle only via that third arm,
+/// silently fell through to "no default" here even though pi's own reference defaults them to medium
+/// effort too.
 pub fn default_reasoning_effort_for_model(model: &str) -> Option<agent_core::ReasoningEffort> {
     let caps = agent_core::capabilities(model);
-    let supports_reasoning =
-        caps.thinking != agent_core::models::ThinkingShape::None || caps.reasoning_effort;
-    supports_reasoning.then_some(agent_core::ReasoningEffort::Medium)
+    agent_core::models::has_reasoning_mechanism(&caps).then_some(agent_core::ReasoningEffort::Medium)
 }
 
 /// A small, non-exhaustive list of model ids the [`capabilities`](agent_core::capabilities) table
@@ -5243,7 +5335,11 @@ fn model_info(model: &str) -> Value {
         "provider": provider,
         "context_window": caps.context_window,
         "max_output": caps.max_output,
-        "reasoning": caps.reasoning_effort || caps.thinking != agent_core::models::ThinkingShape::None,
+        // Shares `default_reasoning_effort_for_model`'s own `has_reasoning_mechanism` gate rather than a
+        // separate `reasoning_effort || thinking != None` check — that narrower pair previously missed
+        // the `openai_reasoning_format` toggle shapes (Kimi-thinking, pre-5.2 GLM), reporting `reasoning:
+        // false` for a model that genuinely does support a client-steerable reasoning toggle.
+        "reasoning": agent_core::models::has_reasoning_mechanism(&caps),
         "supports_vision": caps.supports_vision,
     })
 }
@@ -5264,13 +5360,13 @@ fn model_switch_response(model: &str, level: agent_core::ThinkingLevel) -> Value
     info
 }
 
-/// The concatenated text of a `User`-role message, for `get_fork_messages`'s candidate list — pi's own
-/// `getUserMessagesForForking`. `None` for a message with no plain-text block at all (a pure
-/// tool-result turn), which isn't a meaningful fork-point candidate to offer.
-fn user_message_text(msg: &agent_core::Message) -> Option<String> {
-    if msg.role != agent_core::Role::User {
-        return None;
-    }
+/// The concatenated text of any message's plain-text blocks, regardless of role — pi's own
+/// `extractUserMessageText` (despite the name, role-agnostic there too: it just joins every `text` part
+/// of whatever content array it's given). `None` for a message with no plain-text block at all (a pure
+/// tool-use/tool-result/thinking/image turn), which has nothing meaningful to report as "the message's
+/// text". Shared by [`user_message_text`] (which adds the role restriction its own callers need) and
+/// `fork`'s response (Fix 3, pi-parity gap — see the `"fork"` command handler).
+fn message_text(msg: &agent_core::Message) -> Option<String> {
     let text: String = msg
         .content
         .iter()
@@ -5280,6 +5376,15 @@ fn user_message_text(msg: &agent_core::Message) -> Option<String> {
         })
         .collect();
     (!text.is_empty()).then_some(text)
+}
+
+/// The concatenated text of a `User`-role message, for `get_fork_messages`'s candidate list — pi's own
+/// `getUserMessagesForForking`, which only ever lists user turns as fork candidates. `None` for a
+/// non-`User` message too, not just a textless one — see [`message_text`] for the shared extraction.
+fn user_message_text(msg: &agent_core::Message) -> Option<String> {
+    (msg.role == agent_core::Role::User)
+        .then(|| message_text(msg))
+        .flatten()
 }
 
 /// The concatenated text of the most recent assistant message, for scripting clients that just want
@@ -6575,6 +6680,41 @@ mod tests {
             None
         );
         assert_eq!(default_reasoning_effort_for_model("gpt-4o"), None);
+    }
+
+    // Fix 1 (pi-parity remediation, Round 2): `default_reasoning_effort_for_model` previously
+    // reimplemented `has_reasoning_mechanism`'s own check narrower than the original — missing the
+    // `openai_reasoning_format` arm — so a Kimi-thinking or pre-5.2 GLM model (both toggle reasoning
+    // only via that third-party wire format, with `reasoning_effort: false` and
+    // `thinking: ThinkingShape::None`) silently got no default reasoning effort at all, even though pi's
+    // own reference defaults every reasoning-capable model to medium effort.
+    #[test]
+    fn default_reasoning_effort_for_model_is_medium_for_a_kimi_thinking_model() {
+        assert_eq!(
+            default_reasoning_effort_for_model("kimi-k2-thinking"),
+            Some(agent_core::ReasoningEffort::Medium)
+        );
+    }
+
+    #[test]
+    fn default_reasoning_effort_for_model_is_medium_for_a_pre_5_2_glm_model() {
+        assert_eq!(
+            default_reasoning_effort_for_model("glm-4.5"),
+            Some(agent_core::ReasoningEffort::Medium)
+        );
+    }
+
+    // Fix 1's sibling gap: `model_info`'s own `"reasoning"` field (surfaced via `get_available_models`/
+    // `set_model`/`cycle_model`) reimplemented the identical narrower check independently, so it too
+    // reported `false` for these families even though they have a genuine client-steerable toggle.
+    #[test]
+    fn model_info_reasoning_is_true_for_a_kimi_thinking_model() {
+        assert_eq!(model_info("kimi-k2-thinking")["reasoning"], true);
+    }
+
+    #[test]
+    fn model_info_reasoning_is_true_for_a_pre_5_2_glm_model() {
+        assert_eq!(model_info("glm-4.5")["reasoning"], true);
     }
 
     // Fix 10 (pi-parity feature): `--model`/`set_model` previously forwarded any id verbatim with no

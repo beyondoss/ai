@@ -329,7 +329,9 @@ impl Tool for Grep {
     fn description(&self) -> &str {
         "Search file contents by regular expression, honoring .gitignore. Optionally restrict to a \
          `path`, a `glob` (e.g. \"*.rs\"), case-insensitive with `ignore_case`. Results are sorted by \
-         path; when more than `limit` match, the lexicographically-smallest are reported."
+         path and truncated to at most 100 matches or 50.0KB, whichever is hit first, with individual \
+         lines truncated to 500 characters; when truncated, the lexicographically-smallest matches \
+         are reported."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -1201,6 +1203,24 @@ mod tests {
         assert!(
             !out.contains("blob.bin"),
             "the binary file must be skipped, not reported: {out}"
+        );
+    }
+
+    #[test]
+    fn description_documents_the_truncation_budgets() {
+        // Pi-parity fix: unlike `bash`'s description (which states both its default timeout and its
+        // output truncation budget numerically), `grep`'s description only stated the match-count
+        // default in the `limit` schema field, never the overall byte-truncation cap it shares with
+        // `find`/`ls`, nor the per-line character clip.
+        let desc = Grep.description().to_string();
+        assert!(
+            desc.contains(&DEFAULT_LIMIT.to_string())
+                && desc.contains(&super::super::output::format_size(
+                    super::super::output::MAX_LISTING_BYTES as u64
+                ))
+                && desc.contains(&MAX_LINE.to_string()),
+            "description should state the match-count, byte, and per-line truncation budgets \
+             numerically, got: {desc}"
         );
     }
 }

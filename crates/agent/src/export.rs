@@ -474,6 +474,17 @@ fn render_stats_section(
 ) {
     let stats = MessageStats::compute(messages, events);
     out.push_str("<div class=\"stats\">\n");
+    // pi-parity fix: pi's own export always renders a `Date:` line first
+    // (`template.js:1395`, `header.timestamp`) — this crate's stats section previously read
+    // `meta.model`/every message/`usage`/`events` but never `meta.created_at` at all, so the session's
+    // creation date never appeared in an exported transcript anywhere. Formatted with
+    // `resources::format_local_datetime` — the same hand-rolled, no-date-crate machinery already used
+    // for the system prompt's own dynamic "today" footer, rather than introducing a second convention.
+    push_stat(
+        out,
+        "Date",
+        &crate::resources::format_local_datetime(meta.created_at),
+    );
     let models = if stats.models.is_empty() {
         meta.model.clone()
     } else {
@@ -558,6 +569,13 @@ background: #232323; }\n\
 .branch[open] summary { margin-bottom: 0.5rem; color: #fff; }\n\
 .branch-body { border-left: 2px solid #555; padding-left: 0.75rem; }\n\
 .bash-command { color: #7ee2a8; }\n\
+.bash-status { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-bottom: 0.4rem; }\n\
+.bash-badge { display: inline-block; font-size: 0.75rem; font-weight: 600; padding: 0.1rem 0.5rem; \
+border-radius: 3px; }\n\
+.bash-badge-ok { background: rgba(80, 200, 120, 0.15); color: #7ee2a8; }\n\
+.bash-badge-error { background: rgba(220, 80, 80, 0.15); color: #f0908f; }\n\
+.bash-badge-cancelled { background: rgba(208, 169, 76, 0.15); color: #d0a94c; }\n\
+.bash-badge-truncated { background: rgba(108, 182, 255, 0.15); color: #6cb6ff; font-weight: 400; }\n\
 .markdown { line-height: 1.5; }\n\
 .markdown p { margin: 0.4rem 0; }\n\
 .markdown p:first-child { margin-top: 0; }\n\
@@ -1081,12 +1099,29 @@ fn render_bash_call(out: &mut String, input: &serde_json::Value) {
     out.push_str("</div>\n");
 }
 
-/// Render a `read` call: just the path being read — the tool's own args carry nothing else worth a
-/// title beyond that.
+/// Render a `read` call: the path being read, plus a `:start-end` line range when the call actually
+/// passed `offset`/`limit` (`crate::tools::read`'s own two params) — pi-parity fix: pi's own
+/// `formatToolCall`/render path (`template.js:573-583`, `946-957`) always appends this when either
+/// arg is present (`start = offset ?? 1`, `end = limit !== undefined ? start + limit - 1 : ''`), which
+/// this renderer previously dropped outright, showing a plain path indistinguishable from a whole-file
+/// read. A call that passed neither still renders as a bare path — no `:0-0` or similar invented range.
 fn render_read_call(out: &mut String, input: &serde_json::Value) {
     let path = input.get("path").and_then(serde_json::Value::as_str);
+    let offset = input.get("offset").and_then(serde_json::Value::as_u64);
+    let limit = input.get("limit").and_then(serde_json::Value::as_u64);
     let title = match path {
-        Some(p) => format!("Read <code>{}</code>", html_escape(p)),
+        Some(p) => {
+            let mut t = format!("Read <code>{}", html_escape(p));
+            if offset.is_some() || limit.is_some() {
+                let start = offset.unwrap_or(1);
+                t.push_str(&format!(":{start}"));
+                if let Some(limit) = limit {
+                    t.push_str(&format!("-{}", start + limit.saturating_sub(1)));
+                }
+            }
+            t.push_str("</code>");
+            t
+        }
         None => "Read".to_string(),
     };
     out.push_str(&format!(
@@ -1130,15 +1165,23 @@ fn render_find_call(out: &mut String, input: &serde_json::Value) {
     ));
 }
 
-/// Render an `ls` call: the directory listed, defaulting to `.` — matching the tool's own default.
+/// Render an `ls` call: the directory listed, defaulting to `.` — matching the tool's own default —
+/// plus a `(limit N)` note when the call passed a non-default `limit` (`crate::tools::ls`'s own param)
+/// — pi-parity fix: pi's own render path (`template.js:1008-1014`) always appends this note when
+/// `limit` is present; previously dropped here, showing a plain path indistinguishable from a listing
+/// with `ls`'s default cap. A call with no `limit` still renders as a bare path, same as before.
 fn render_ls_call(out: &mut String, input: &serde_json::Value) {
     let path = input
         .get("path")
         .and_then(serde_json::Value::as_str)
         .unwrap_or(".");
+    let limit = input.get("limit").and_then(serde_json::Value::as_u64);
+    let mut title = format!("Listed <code>{}</code>", html_escape(path));
+    if let Some(limit) = limit {
+        title.push_str(&format!(" (limit {limit})"));
+    }
     out.push_str(&format!(
-        "<div class=\"tool-call\"><div class=\"tool-title\">Listed <code>{}</code></div></div>\n",
-        html_escape(path)
+        "<div class=\"tool-call\"><div class=\"tool-title\">{title}</div></div>\n"
     ));
 }
 
@@ -1433,6 +1476,11 @@ struct HostBashBlock<'a> {
     /// annotated so the exported transcript doesn't silently look identical to a command the model did
     /// see.
     excluded_from_context: bool,
+    /// The structured exit-code/cancelled/truncated/full-output-path status line (Fix 3, pi-parity gap)
+    /// — see [`HOST_BASH_STATUS_LINE_PREFIX`]. `None` for a session persisted before this line existed,
+    /// in which case [`render_host_bash_marker`] falls back to `is_error`'s plain border-color styling,
+    /// exactly as before this fix.
+    status: Option<HostBashStatus>,
 }
 
 /// The exact literal prefix `serve.rs` tags a host-run bash command with (`~serve.rs:HOST_BASH_LABEL`),
@@ -1443,12 +1491,19 @@ const HOST_BASH_MARKER_PREFIX: &str = "[Host bash command, run outside the model
 /// recorded at all, so there was no marker shape for this case to recognize.
 const HOST_BASH_EXCLUDED_MARKER_PREFIX: &str =
     "[Host bash command, excluded from model context]\n$ ";
+/// This module's copy of `~serve.rs:HOST_BASH_STATUS_LINE_PREFIX` — the line `serve.rs`'s `bash` RPC
+/// command now writes right after the blank-line separator (before the legacy `"(error)\n"` marker, if
+/// present), carrying the same `exit_code`/`cancelled`/`truncated`/`full_output_path` fields its RPC
+/// response has always reported live but never persisted (Fix 3, pi-parity gap). See
+/// [`parse_host_bash_status`].
+const HOST_BASH_STATUS_LINE_PREFIX: &str = "[Host bash status] ";
 
 /// Detect and split apart `serve.rs`'s host-bash-command marker: the fixed prefix (either shape — see
 /// [`HOST_BASH_MARKER_PREFIX`]/[`HOST_BASH_EXCLUDED_MARKER_PREFIX`]), the command up to the first
-/// `\n\n`, then either the result text directly or (if the command errored) a literal `"(error)\n"`
-/// immediately before it. Anything that doesn't fit either exact shape isn't a host-bash marker at all
-/// — returns `None`, and the caller falls through to ordinary text rendering (mirrors
+/// `\n\n`, then an optional structured status line (see [`parse_host_bash_status`]), then either the
+/// result text directly or (if the command errored) a literal `"(error)\n"` immediately before it.
+/// Anything that doesn't fit either exact shape isn't a host-bash marker at all — returns `None`, and
+/// the caller falls through to ordinary text rendering (mirrors
 /// [`parse_summary_marker`]/[`parse_skill_block`]'s same exact-shape-or-not-at-all precedent). Not
 /// robust to a `command` that itself contains a blank line (an embedded `\n\n`) — splits at the first
 /// one, same simplifying assumption `parse_skill_block` makes for its own body boundary.
@@ -1458,6 +1513,7 @@ fn parse_host_bash_marker(text: &str) -> Option<HostBashBlock<'_>> {
         None => (text.strip_prefix(HOST_BASH_EXCLUDED_MARKER_PREFIX)?, true),
     };
     let (command, rest) = rest.split_once("\n\n")?;
+    let (status, rest) = parse_host_bash_status(rest);
     let (is_error, output) = match rest.strip_prefix("(error)\n") {
         Some(o) => (true, o),
         None => (false, rest),
@@ -1467,7 +1523,64 @@ fn parse_host_bash_marker(text: &str) -> Option<HostBashBlock<'_>> {
         is_error,
         output,
         excluded_from_context,
+        status,
     })
+}
+
+/// `serve.rs`'s `bash` RPC command's own structured result fields (`exit_code`/`cancelled`/
+/// `truncated`/`full_output_path`) — Fix 3, pi-parity gap: previously only a bare `is_error` bool ever
+/// reached the persisted message (as the `"(error)\n"` marker text [`parse_host_bash_marker`] already
+/// detected), even though the *live* RPC response for the exact same command already carried a real
+/// provider exit code, whether the run was cancelled outright, and whether its output was truncated —
+/// none of which a later export could show. `agent_core::Message`/`ContentBlock` deliberately carries
+/// no generic per-message side-channel for this (see `serve.rs::HOST_BASH_EXCLUDED_LABEL`'s own doc
+/// comment on why that field stays wire-shaped 1:1), so this rides on the same
+/// self-describing-marker-text approach already used for a host-bash command itself, rather than
+/// widening that shared type for one caller's metadata.
+struct HostBashStatus {
+    /// The provider's own exit code, when available — `None` for a cancelled/timed-out run (mirrors
+    /// `serve.rs::bash_exit_code_from_status_line`, which is what actually computes this).
+    exit_code: Option<i64>,
+    /// Whether the run was cancelled (`abort_bash`/`abort`) or timed out, rather than completing with an
+    /// exit code either way.
+    cancelled: bool,
+    /// Whether `tools::bash`'s own output cap truncated what's shown here.
+    truncated: bool,
+    /// Where the untruncated output was saved, when `truncated` and a path was actually captured.
+    full_output_path: Option<String>,
+}
+
+/// Parse an optional structured status line (see [`HOST_BASH_STATUS_LINE_PREFIX`]) off the front of
+/// `rest` — Fix 3, pi-parity gap. Returns `(None, rest)` unchanged for a legacy session predating this
+/// line, or for one whose status line fails to parse as JSON (at worst rendered as an ordinary line of
+/// output text below, never silently dropped) — either way, [`parse_host_bash_marker`]'s caller falls
+/// straight through to its existing `"(error)\n"`-marker-only handling exactly as it did before this fix.
+fn parse_host_bash_status(rest: &str) -> (Option<HostBashStatus>, &str) {
+    let Some(after_prefix) = rest.strip_prefix(HOST_BASH_STATUS_LINE_PREFIX) else {
+        return (None, rest);
+    };
+    let Some((json_line, remainder)) = after_prefix.split_once('\n') else {
+        return (None, rest);
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json_line) else {
+        return (None, rest);
+    };
+    let status = HostBashStatus {
+        exit_code: value.get("exit_code").and_then(serde_json::Value::as_i64),
+        cancelled: value
+            .get("cancelled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        truncated: value
+            .get("truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        full_output_path: value
+            .get("full_output_path")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+    };
+    (Some(status), remainder)
 }
 
 /// Render a parsed host-bash-command marker (see [`parse_host_bash_marker`]) as its own distinct,
@@ -1477,6 +1590,9 @@ fn parse_host_bash_marker(text: &str) -> Option<HostBashBlock<'_>> {
 /// unreadable run-on line. `is_error` gets its own CSS class, matching pi's own success/error coloring
 /// for its dedicated `bashExecution` role (`template.js:1273-1285`). `excluded_from_context` (Fix 9,
 /// pi-parity gap) gets its own note in the title — still visible here, just never sent to the model.
+/// `status` (Fix 3, pi-parity gap), when present, renders as its own row of distinctly-styled badges
+/// (see [`render_host_bash_status`]) rather than only ever being visible as the border-color `is_error`
+/// already drove.
 fn render_host_bash_marker(out: &mut String, block: &HostBashBlock) {
     let class = if block.is_error {
         "tool-call host-bash error"
@@ -1491,12 +1607,49 @@ fn render_host_bash_marker(out: &mut String, block: &HostBashBlock) {
     out.push_str(&format!(
         "<div class=\"{class}\"><div class=\"tool-title\">{title}</div>\n"
     ));
+    if let Some(status) = &block.status {
+        render_host_bash_status(out, status);
+    }
     out.push_str(&format!(
         "<pre class=\"bash-command\">$ {}</pre>",
         html_escape(block.command)
     ));
     if !block.output.is_empty() {
         out.push_str(&format!("<pre>{}</pre>", html_escape(block.output)));
+    }
+    out.push_str("</div>\n");
+}
+
+/// Render `status`'s fields as their own row of distinctly-styled badges (Fix 3, pi-parity gap) — a
+/// real exit code (and whether the run was cancelled outright, as opposed to merely erroring) is more
+/// specific than `is_error`'s plain binary success/fail, and deserves a visible element of its own
+/// rather than being inferable only from the `<pre>` block's border color. `cancelled` wins outright
+/// over `exit_code` when both would otherwise apply — a cancelled run's exit code (if any survived) is
+/// incidental, not the reason it stopped. `truncated`/`full_output_path` get their own note alongside
+/// the badges (not a badge of their own — informative, not a success/failure signal).
+fn render_host_bash_status(out: &mut String, status: &HostBashStatus) {
+    out.push_str("<div class=\"bash-status\">\n");
+    if status.cancelled {
+        out.push_str("<span class=\"bash-badge bash-badge-cancelled\">Cancelled</span>\n");
+    } else if let Some(code) = status.exit_code {
+        let class = if code == 0 {
+            "bash-badge-ok"
+        } else {
+            "bash-badge-error"
+        };
+        out.push_str(&format!(
+            "<span class=\"bash-badge {class}\">Exit {code}</span>\n"
+        ));
+    }
+    if status.truncated {
+        out.push_str("<span class=\"bash-badge bash-badge-truncated\">Output truncated");
+        if let Some(path) = &status.full_output_path {
+            out.push_str(&format!(
+                " &middot; saved to <code>{}</code>",
+                html_escape(path)
+            ));
+        }
+        out.push_str("</span>\n");
     }
     out.push_str("</div>\n");
 }
@@ -1876,6 +2029,83 @@ mod tests {
         }])];
         let html = render_html(&meta(), &messages, &[], None);
         assert!(html.contains("Called <code>edit</code>"));
+    }
+
+    #[test]
+    fn read_call_renders_the_line_range_when_offset_or_limit_were_given() {
+        // pi-parity gap (fixed): the exported `read` call used to render only the path, silently
+        // dropping `offset`/`limit` even when the call actually used them — indistinguishable from a
+        // whole-file read. Matches pi's own `path:start-end` shape (`template.js:573-583`).
+        let messages = vec![
+            // offset only: start = offset, no end (open-ended).
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "1".into(),
+                name: "read".into(),
+                input: serde_json::json!({ "path": "a.rs", "offset": 10 }),
+                thought_signature: None,
+            }]),
+            // limit only: start defaults to 1.
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "2".into(),
+                name: "read".into(),
+                input: serde_json::json!({ "path": "b.rs", "limit": 20 }),
+                thought_signature: None,
+            }]),
+            // both: start = offset, end = offset + limit - 1.
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "3".into(),
+                name: "read".into(),
+                input: serde_json::json!({ "path": "c.rs", "offset": 5, "limit": 3 }),
+                thought_signature: None,
+            }]),
+        ];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(html.contains("Read <code>a.rs:10</code>"), "{html}");
+        assert!(html.contains("Read <code>b.rs:1-20</code>"), "{html}");
+        assert!(html.contains("Read <code>c.rs:5-7</code>"), "{html}");
+    }
+
+    #[test]
+    fn read_call_renders_a_bare_path_when_neither_offset_nor_limit_were_given() {
+        // No invented `:0-0`-shaped range for a plain whole-file read — same assertion
+        // `renders_edit_write_bash_and_read_calls_with_dedicated_rendering` already makes for this call
+        // shape; kept here too as its own explicit regression target for this fix.
+        let messages = vec![Message::assistant(vec![ContentBlock::ToolUse {
+            id: "1".into(),
+            name: "read".into(),
+            input: serde_json::json!({ "path": "README.md" }),
+            thought_signature: None,
+        }])];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(html.contains("Read <code>README.md</code>"), "{html}");
+        assert!(!html.contains("README.md:"), "{html}");
+    }
+
+    #[test]
+    fn ls_call_renders_the_limit_note_when_given() {
+        // pi-parity gap (fixed): the exported `ls` call used to render only the path, silently dropping
+        // a non-default `limit` — matches pi's own `(limit N)` note (`template.js:1010-1014`).
+        let messages = vec![Message::assistant(vec![ContentBlock::ToolUse {
+            id: "1".into(),
+            name: "ls".into(),
+            input: serde_json::json!({ "path": "src", "limit": 50 }),
+            thought_signature: None,
+        }])];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(html.contains("Listed <code>src</code> (limit 50)"), "{html}");
+    }
+
+    #[test]
+    fn ls_call_renders_a_bare_path_when_no_limit_was_given() {
+        let messages = vec![Message::assistant(vec![ContentBlock::ToolUse {
+            id: "1".into(),
+            name: "ls".into(),
+            input: serde_json::json!({ "path": "src" }),
+            thought_signature: None,
+        }])];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(html.contains("Listed <code>src</code></div>"), "{html}");
+        assert!(!html.contains("limit"), "{html}");
     }
 
     #[test]
@@ -2413,6 +2643,108 @@ mod tests {
     }
 
     #[test]
+    fn renders_a_host_bash_status_line_as_distinct_badges() {
+        // Fix 3 (pi-parity gap): `serve.rs`'s `bash` RPC command now threads its own
+        // exit_code/cancelled/truncated/full_output_path fields into the persisted marker as a leading
+        // status line — previously only `is_error`'s border color ever reached the exported page.
+        let messages = vec![Message::user(
+            "[Host bash command, run outside the model's own turn]\n$ cargo test\n\n\
+             [Host bash status] {\"exit_code\":0,\"cancelled\":false,\"truncated\":false,\"full_output_path\":null}\n\
+             all tests passed",
+        )];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(html.contains("class=\"bash-status\""), "{html}");
+        assert!(
+            html.contains("class=\"bash-badge bash-badge-ok\">Exit 0</span>"),
+            "{html}"
+        );
+        assert!(!html.contains("Cancelled"), "{html}");
+        assert!(html.contains("all tests passed"));
+        // The raw status line must not leak verbatim into the rendered output.
+        assert!(!html.contains("[Host bash status]"), "{html}");
+    }
+
+    #[test]
+    fn renders_a_nonzero_host_bash_exit_code_with_the_error_badge() {
+        let messages = vec![Message::user(
+            "[Host bash command, run outside the model's own turn]\n$ false\n\n\
+             [Host bash status] {\"exit_code\":1,\"cancelled\":false,\"truncated\":false,\"full_output_path\":null}\n\
+             (error)\ncommand exited 1",
+        )];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(
+            html.contains("class=\"bash-badge bash-badge-error\">Exit 1</span>"),
+            "{html}"
+        );
+        // `is_error`'s own block-level styling (the `"(error)\n"` marker) is untouched by this fix.
+        assert!(html.contains("class=\"tool-call host-bash error\""), "{html}");
+    }
+
+    #[test]
+    fn renders_a_cancelled_host_bash_run_with_its_own_badge_instead_of_an_exit_code() {
+        let messages = vec![Message::user(
+            "[Host bash command, run outside the model's own turn]\n$ sleep 100\n\n\
+             [Host bash status] {\"exit_code\":null,\"cancelled\":true,\"truncated\":false,\"full_output_path\":null}\n\
+             (error)\ncancelled",
+        )];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(
+            html.contains("class=\"bash-badge bash-badge-cancelled\">Cancelled</span>"),
+            "{html}"
+        );
+        assert!(!html.contains("Exit "), "{html}");
+    }
+
+    #[test]
+    fn renders_a_truncated_host_bash_output_with_its_saved_path() {
+        let messages = vec![Message::user(
+            "[Host bash command, run outside the model's own turn]\n$ yes\n\n\
+             [Host bash status] {\"exit_code\":0,\"cancelled\":false,\"truncated\":true,\"full_output_path\":\"/tmp/out.txt\"}\n\
+             y\ny\ny",
+        )];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(
+            html.contains("class=\"bash-badge bash-badge-truncated\">Output truncated"),
+            "{html}"
+        );
+        assert!(html.contains("<code>/tmp/out.txt</code>"), "{html}");
+    }
+
+    #[test]
+    fn a_host_bash_marker_with_no_status_line_still_renders_with_no_badges() {
+        // Backward compatibility: a session persisted before Fix 3 has no status line at all — must
+        // still render exactly as before (no `bash-status` row), falling back to `is_error`'s plain
+        // border-color styling. This is the same fixture
+        // `renders_a_host_bash_command_marker_as_a_distinct_block_not_plain_markdown` already uses.
+        let messages = vec![Message::user(
+            "[Host bash command, run outside the model's own turn]\n$ ls -la\n\n\
+             file1.txt\nfile2.txt\ndrwxr-xr-x  dir",
+        )];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(!html.contains("class=\"bash-status\""), "{html}");
+        // Not a bare `contains("bash-badge")` check: the document's own `<style>` block always defines
+        // `.bash-badge`/`.bash-badge-*` CSS rules regardless of whether any badge is ever rendered in
+        // the body, so that substring alone would never actually catch a regression here.
+        assert!(!html.contains("<span class=\"bash-badge"), "{html}");
+        assert!(html.contains("class=\"tool-call host-bash\""), "{html}");
+    }
+
+    #[test]
+    fn a_malformed_host_bash_status_line_falls_back_gracefully() {
+        // A corrupted/truncated status line must never break parsing of the rest of the block — falls
+        // back to no status (rendered, at worst, as an ordinary line of output text) rather than losing
+        // the command/output entirely.
+        let messages = vec![Message::user(
+            "[Host bash command, run outside the model's own turn]\n$ echo hi\n\n\
+             [Host bash status] not valid json\nhi",
+        )];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(html.contains("class=\"tool-call host-bash\""), "{html}");
+        assert!(html.contains("$ echo hi"));
+        assert!(!html.contains("class=\"bash-status\""), "{html}");
+    }
+
+    #[test]
     fn renders_an_aggregate_stats_section_with_models_messages_and_tool_calls() {
         let messages = vec![
             Message::user("hello"),
@@ -2434,6 +2766,27 @@ mod tests {
         assert!(
             html.contains("<span class=\"stat-value\">1</span>"),
             "exactly one tool call must be counted: {html}"
+        );
+    }
+
+    #[test]
+    fn stats_section_includes_the_session_creation_date() {
+        // pi-parity gap (fixed): pi's own export always renders a `Date:` line first
+        // (`template.js:1395`); this crate's stats section previously read `meta.model`/every
+        // message/`usage`/`events` but never `meta.created_at` at all.
+        let mut m = meta();
+        m.created_at = 1_700_000_000;
+        let html = render_html(&m, &[], &[], None);
+        assert!(html.contains(">Date<"), "{html}");
+        // Tied to the same formatting function `render_stats_section` calls, rather than a hardcoded
+        // string, so this test isn't itself flaky across the host's own local timezone.
+        let expected = crate::resources::format_local_datetime(m.created_at);
+        assert!(
+            html.contains(&format!(
+                "<span class=\"stat-value\">{}</span>",
+                html_escape(&expected)
+            )),
+            "expected formatted date {expected:?} in: {html}"
         );
     }
 

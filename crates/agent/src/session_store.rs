@@ -53,6 +53,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use agent_core::compaction::{CompactionProvenance, CompactionReason};
 use agent_core::{ContentBlock, Message, Role, Session};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -343,6 +344,22 @@ enum Entry {
         /// neighboring `Message` entry purely so this record is self-describing without needing to
         /// cross-reference it.
         summary: String,
+        /// `agent_core::Session.compaction`'s file-provenance (`read_files`/`modified_files`, folded
+        /// forward via `merge_file_ops`) as of *this* round — i.e. this round's own new activity already
+        /// merged with every prior round's. Since each record is already a complete, self-contained
+        /// snapshot, `SessionStore::open` only needs the *last* one in file order to restore
+        /// `Session.compaction` in full, not fold every record together itself. `#[serde(default)]` so a
+        /// file written before this field existed round-trips unchanged — such a session simply doesn't
+        /// get its provenance restored across a reopen (no worse than before this fix), rather than
+        /// failing to parse. Fixes a bug where this provenance was purely in-memory: every `serve`
+        /// restart or session reattach past a compaction silently forgot it, so the *next* compaction's
+        /// `<read-files>`/`<modified-files>` tags quietly omitted everything from before the restart.
+        #[serde(default)]
+        read_files: Vec<String>,
+        #[serde(default)]
+        modified_files: Vec<String>,
+        #[serde(default)]
+        last_reason: Option<CompactionReason>,
     },
     /// A record that the active model changed, anchored to whatever message was the tip at the moment
     /// it did — see [`SessionStore::record_model_change`]/[`SessionStore::model_at`]. `parent_id` here
@@ -442,6 +459,11 @@ pub struct CompactionMeta {
     /// Estimated input tokens at the moment this compaction fired (before the reset) — the same value
     /// carried on `agent_core::AgentEvent::Compacted`.
     pub tokens_before: u32,
+    /// `Session.compaction` right after this round's own `merge_file_ops` fold — persisted onto the new
+    /// `Entry::Compaction` record's `read_files`/`modified_files`/`last_reason` (see that variant's own
+    /// doc comment) so a later `SessionStore::open` can restore it instead of silently starting over
+    /// from empty.
+    pub provenance: CompactionProvenance,
 }
 
 /// An [`Entry::Compaction`] record, indexed by its own id — read back out for [`SessionStore::tree`]
@@ -497,6 +519,11 @@ struct ForkPrefix {
     /// Labels recorded in the source session against any id in `original_ids`, as `(target_id, label)`
     /// pairs — see [`SessionStore::labels_within`].
     labels: Vec<(String, String)>,
+    /// The thinking level actually in effect at the resolved fork point — see
+    /// [`SessionStore::thinking_level_at_or_created`]'s own doc comment. `None` when nothing was ever
+    /// recorded reaching that point (a fork of a session, or a branch of one, that never touched its
+    /// thinking level), in which case [`SessionRepo::fork_at_entry`] writes no entry for it at all.
+    thinking_level: Option<String>,
 }
 
 /// One branch in the session's tree, as reported by [`SessionStore::list_branches`] — a leaf (a node
@@ -774,6 +801,11 @@ impl SessionStore {
         let mut title_changes: HashMap<Option<String>, Option<String>> = HashMap::new();
         let mut labels: HashMap<String, String> = HashMap::new();
         let mut compactions: HashMap<String, CompactionRecord> = HashMap::new();
+        // The most recent `Entry::Compaction` record's file-provenance seen so far, in file order — see
+        // that variant's own doc comment for why "most recent" is already "complete" and needs no
+        // folding here. `None` when this session was never compacted, matching `Session.compaction`'s
+        // own all-empty default.
+        let mut compaction_provenance: Option<CompactionProvenance> = None;
         let mut events: Vec<ExportEvent> = Vec::new();
 
         let mut reader = BufReader::new(file);
@@ -902,8 +934,24 @@ impl SessionStore {
                     parent_id,
                     tokens_before,
                     folded_ids,
+                    read_files,
+                    modified_files,
+                    last_reason,
                     ..
                 }) => {
+                    // Each record already carries every earlier round's file-provenance folded in (via
+                    // `merge_file_ops`, before it was even written — see `CompactionMeta::provenance`'s
+                    // doc comment), so it's a complete, self-contained snapshot: the *last* one in file
+                    // order (this loop runs in file order, so a later assignment here simply overwrites
+                    // an earlier one) is all `Session.compaction` needs, restored below once `meta` (for
+                    // its `compactions` counter) is available. Fixes a bug where this provenance was
+                    // purely in-memory and silently reset to empty on every reopen past a compaction.
+                    compaction_provenance = Some(CompactionProvenance {
+                        read_files,
+                        modified_files,
+                        compactions: 0, // replaced by `meta.compactions` (the authoritative counter) below
+                        last_reason,
+                    });
                     compactions.insert(
                         id,
                         CompactionRecord {
@@ -1000,6 +1048,17 @@ impl SessionStore {
         let persisted = messages.len();
         let mut session = Session::new();
         session.messages = Arc::new(messages);
+        // Restore `Session.compaction` (Fix 2, pi-parity fix) from the last `Entry::Compaction` record's
+        // file-provenance, if this session was ever compacted — see that variant's own doc comment.
+        // `compactions` is replaced with `meta.compactions` (the counter already correctly restored by
+        // `migrate` above) rather than trusting the record's own implicit count, so this can't drift
+        // from the one other place this session already tracks it.
+        if let Some(provenance) = compaction_provenance {
+            session.compaction = CompactionProvenance {
+                compactions: meta.compactions,
+                ..provenance
+            };
+        }
         // Restore a proactive-compaction trigger signal for a resumed session — a freshly-opened
         // session's `last_input_tokens` otherwise defaults to 0, and `should_compact`/`is_hard_overflow`
         // both require it to be positive to fire at all. Left unset, a resumed session already well
@@ -1083,6 +1142,14 @@ impl SessionStore {
     /// back to [`Self::switch_active`] to navigate to a specific point in the history.
     pub fn active_ids(&self) -> &[String] {
         &self.active
+    }
+
+    /// The message at tree entry `id`, anywhere in the whole tree (on or off the active path) —
+    /// `None` for an unknown id or one naming a non-message node ([`Entry::Custom`]). Used by `fork`'s
+    /// own response (`serve.rs`'s `Persistence::fork_source_text`) to echo the forked-from message's
+    /// text back to the caller without a second `get_fork_messages`-style round trip.
+    pub fn message_at(&self, id: &str) -> Option<&Message> {
+        self.nodes.get(id).and_then(Node::as_message)
     }
 
     /// Append the messages added since the last persist. O(new messages).
@@ -1495,6 +1562,9 @@ impl SessionStore {
             tokens_before: meta.tokens_before,
             folded_ids: folded_ids.clone(),
             summary,
+            read_files: meta.provenance.read_files,
+            modified_files: meta.provenance.modified_files,
+            last_reason: meta.provenance.last_reason,
         };
 
         // An updated header snapshot (the new `compactions`/`dropped_messages` counters) first, then the
@@ -2163,6 +2233,34 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Seed a resolved thinking level onto this session's tree root — always anchored at `None`
+    /// regardless of `self.active`'s current tip, unlike [`Self::record_thinking_level_change`]'s
+    /// "wherever the tip currently is" anchor. What `SessionRepo::fork`/`fork_from_path`/
+    /// `fork_at_entry` call, *after* [`Self::rewrite`] has already replaced the file's own bytes
+    /// wholesale (a full temp-file-then-rename swap, not an append — see that method's own doc
+    /// comment): calling `record_thinking_level_change` *before* `rewrite` would get silently
+    /// discarded by that swap (`rewrite` only knows about `self.nodes`/the new message prefix, not
+    /// this module's other side-channel append-only records), and calling it *after* would anchor at
+    /// the new chain's own tip — which `change_at`'s deliberate "anchored-at, not before" exclusion
+    /// (see that function's own doc comment) would then never see when a caller queries "the level at
+    /// this same tip", exactly the query `Persistence::model_and_level_at_active` (`serve.rs`) makes
+    /// on every reopen. Anchoring at the root instead means it's picked up by `change_at`'s own base
+    /// case (`changes.get(&None)`, checked before any ancestor) for every id in the new tree, the same
+    /// way `rewrite_compacted` already re-anchors a resolved model/level onto a fresh chain's `None`
+    /// baseline.
+    fn seed_thinking_level_at_root(&mut self, level: &str) -> std::io::Result<()> {
+        let entry = Entry::ThinkingLevelChange {
+            id: new_id(),
+            parent_id: None,
+            level: level.to_string(),
+        };
+        append_line(&self.path, &entry)?;
+        self.events
+            .push(ExportEvent::ThinkingLevelChange(level.to_string()));
+        self.level_changes.insert(None, level.to_string());
+        Ok(())
+    }
+
     /// The model recorded as active at `target_id` — the most recent [`Entry::ModelChange`] anchored at
     /// `target_id` itself or any of its ancestors back to the root, if any were ever recorded on this
     /// branch. `None` means no change was ever recorded reaching this point — the caller should keep
@@ -2221,6 +2319,28 @@ impl SessionStore {
             .and_then(|id| change_at(&self.nodes, &self.title_changes, id))
             .or_else(|| self.title_changes.get(&None))
             .and_then(|title| title.as_deref())
+    }
+
+    /// The thinking level that was actually active at `target_id` (or, when `None`, at the tree's own
+    /// root) — the thinking-level analogue of [`Self::model_at_or_created`], for the same fork-header
+    /// use. Mirrors its three-tier fallback exactly (an anchored change reaching `target_id`, then
+    /// whatever was recorded at the tree's own root, then the session's own creation-time value) but
+    /// returns `Option<&str>` rather than `&str`: unlike `meta.model` (always populated), `meta
+    /// .thinking_level` is itself optional (`None` for a session that never called
+    /// `set_reasoning_effort`/`cycle_thinking_level` at all — see that field's own doc comment), so a
+    /// fork of one has no creation-time value to fall back to either and should carry none of its own,
+    /// letting the forking process's own default apply exactly as it would for a brand-new session.
+    ///
+    /// Before this existed, none of `fork`/`fork_from_path`/`fork_at_entry_prefix` resolved the
+    /// thinking level at all (unlike `model`/`title`, which already had their own pi-parity fixes for
+    /// this) — a fork silently dropped whatever reasoning-effort level the source session had actually
+    /// settled on, reverting to the forking process's bare default the moment the new session was
+    /// reopened in a fresh process (`run --continue`, a `serve` restart, `switch_session` back to it).
+    fn thinking_level_at_or_created(&self, target_id: Option<&str>) -> Option<&str> {
+        target_id
+            .and_then(|id| self.thinking_level_at(id))
+            .or_else(|| self.thinking_level_at_root())
+            .or(self.meta.thinking_level.as_deref())
     }
 
     /// Set (and persist) the session title — an O(1) append (see [`Entry::TitleChange`]'s doc
@@ -2665,10 +2785,32 @@ impl SessionRepo {
         // previously) — see `title_at_or_root`'s own doc comment for why that matters once a rename has
         // happened anywhere relative to the fork point.
         meta.title = src.title_at_or_root(target_id).map(str::to_string);
+        // Thinking-level analogue of the model/title fixes just above — see
+        // `thinking_level_at_or_created`'s own doc comment.
+        let thinking_level = src
+            .thinking_level_at_or_created(target_id)
+            .map(str::to_string);
+        meta.thinking_level = thinking_level.clone();
 
         let mut store = self.create(meta)?;
         let prefix: Vec<Message> = src_session.messages[..upto].to_vec();
         store.rewrite(&prefix)?;
+        // Re-anchor the resolved level onto the new session's own tree root — *after* `rewrite` above,
+        // never before: `rewrite` is a full temp-file-then-rename swap of the whole file (see its own
+        // doc comment), not an append, so anything appended earlier would just be silently discarded
+        // by it. `seed_thinking_level_at_root` anchors at `None` (the tree's own root) rather than
+        // `record_thinking_level_change`'s usual "wherever the tip currently is" — see that method's
+        // own doc comment for why: anchoring at the new chain's own tip would put it exactly where
+        // `change_at`'s "anchored-at, not before" exclusion never sees it once queried at that same
+        // tip, the precise query `Persistence::model_and_level_at_active` (`serve.rs`) makes on every
+        // reopen. Without this, a fresh reopen of the forked file (`run --continue`, a `serve`
+        // restart, `switch_session` back to it) finds nothing recorded on the fork's brand-new chain
+        // at all — the source's own `ThinkingLevelChange` entries are anchored to the *source*'s old
+        // message ids, which don't exist in this file — and silently falls back to the process's own
+        // starting level instead of the level actually in effect at the fork point.
+        if let Some(level) = &thinking_level {
+            store.seed_thinking_level_at_root(level)?;
+        }
         let mut session = Session::new();
         session.messages = Arc::new(prefix);
         Ok((store, session))
@@ -2699,10 +2841,21 @@ impl SessionRepo {
         meta.parent = Some(src.meta.id.clone());
         // Pass 15 (pi-parity fix): same reasoning as `fork`'s identical resolution just above.
         meta.title = src.title_at_or_root(target_id).map(str::to_string);
+        // Same reasoning as `fork`'s identical resolution just above — see
+        // `thinking_level_at_or_created`'s own doc comment.
+        let thinking_level = src
+            .thinking_level_at_or_created(target_id)
+            .map(str::to_string);
+        meta.thinking_level = thinking_level.clone();
 
         let mut store = self.create(meta)?;
         let prefix: Vec<Message> = src_session.messages[..upto].to_vec();
         store.rewrite(&prefix)?;
+        // See `fork`'s identical re-anchoring for why this must happen after `rewrite` above, not
+        // before.
+        if let Some(level) = &thinking_level {
+            store.seed_thinking_level_at_root(level)?;
+        }
         let mut session = Session::new();
         session.messages = Arc::new(prefix);
         Ok((store, session))
@@ -2742,6 +2895,12 @@ impl SessionRepo {
         let prefix = self.fork_at_entry_prefix(id, entry_id, before)?;
         let mut store = self.create(prefix.meta)?;
         store.rewrite(&prefix.messages)?;
+        // See `fork`'s identical re-anchoring for why this must happen after `rewrite` above, not
+        // before — anchors at the tree's own root rather than the source's now-nonexistent message
+        // ids.
+        if let Some(level) = &prefix.thinking_level {
+            store.seed_thinking_level_at_root(level)?;
+        }
         if !prefix.labels.is_empty() {
             let new_ids: Vec<String> = store.active_ids().to_vec();
             debug_assert_eq!(new_ids.len(), prefix.original_ids.len());
@@ -2768,6 +2927,28 @@ impl SessionRepo {
     /// beyond the initial `open_id` read — no file is created. Used both by `fork_at_entry` itself (to
     /// avoid duplicating the prefix logic) and by [`fork_at_entry_messages`](Self::fork_at_entry_messages)
     /// for side-effect-free previews.
+    ///
+    /// Investigated (Round 2 pi-parity remediation, Low severity, left unfixed): `entry_id` must name a
+    /// real tree node (a key in `nodes` — a `Message`/`BranchSummary`/`Custom` entry), so it 404s for
+    /// one of the anchored side-channel entries (`Entry::Label`/`ModelChange`/`ThinkingLevelChange`/
+    /// `TitleChange`) below `nodes.contains_key` — those deliberately never occupy a tree slot at all
+    /// (see [`Entry::Label`]'s own doc comment on why). Pi's own uniform tree model allows forking at
+    /// any entry id, including these; beyond's narrower one doesn't.
+    ///
+    /// Assessed as confirmed-real but disproportionate to fix, the same judgment call already made for
+    /// the abandoned-branch export-nesting edge case (see `orphaned_off_branch_survives_compaction_of_its_ancestor`'s
+    /// sibling test, "confirms Task #34"): no known workflow needs this, and — more than
+    /// "unconfirmed" — it's provably unreachable through any surface this crate currently exposes.
+    /// [`Self::tree`] (a client's only way to discover an entry id worth forking at) synthesizes
+    /// `TreeNode`s solely from `nodes` and `self.compactions`; a label is surfaced only as the `label`
+    /// *field* of the node it targets, never as its own addressable entry, and `ModelChange`/
+    /// `ThinkingLevelChange`/`TitleChange` aren't surfaced as tree nodes at all. So no client can ever
+    /// have actually *seen* one of these entries' own ids to pass back in here in the first place —
+    /// there is no live caller this gap could affect today. Properly supporting it would mean first
+    /// giving each of these four variants its own discoverable identity in `tree()` (a real new surface,
+    /// not a bug fix) and then reworking this method's resolution to translate such an id to the
+    /// nearest real tree position — a meaningful reshaping of the entry model for a target no code path
+    /// can currently reach. Left as documented, deliberately unfixed.
     fn fork_at_entry_prefix(
         &self,
         id: &str,
@@ -2822,6 +3003,12 @@ impl SessionRepo {
         meta.title = src
             .title_at_or_root(path.last().map(String::as_str))
             .map(str::to_string);
+        // Same reasoning as `fork`'s identical resolution — the thinking level actually in effect at
+        // the resolved fork point. See `thinking_level_at_or_created`'s own doc comment.
+        let thinking_level = src
+            .thinking_level_at_or_created(path.last().map(String::as_str))
+            .map(str::to_string);
+        meta.thinking_level = thinking_level.clone();
 
         // Labels are looked up against the *full* path (including any custom entry's id) — a label
         // whose target is a custom entry that then gets filtered out below simply won't be found in
@@ -2845,6 +3032,7 @@ impl SessionRepo {
             messages,
             original_ids,
             labels,
+            thinking_level,
         })
     }
 
@@ -4180,6 +4368,7 @@ mod tests {
                 &compacted_messages,
                 CompactionMeta {
                     tokens_before: 12345,
+                    provenance: Default::default(),
                 },
             )
             .unwrap();
@@ -4267,6 +4456,129 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_compacted_persists_file_provenance_and_it_survives_a_reopen() {
+        // Fix 2 (pi-parity remediation, Round 2): `agent_core::Session.compaction`
+        // (`CompactionProvenance`'s `read_files`/`modified_files`/`last_reason`, folded forward
+        // turn-to-turn by `agent_core::compaction::merge_file_ops`) was purely in-memory — the on-disk
+        // `Entry::Compaction` record had no field to carry it at all, and `SessionStore::open` never
+        // restored it. So a `serve` restart or session reattach after even one compaction round
+        // silently forgot every file that round already knew about: the *next* compaction's
+        // `<read-files>`/`<modified-files>` tags would quietly omit everything from before the
+        // restart. Reproduced here exactly as that would happen: seed `Session.compaction` as if a
+        // live compaction round just fired, persist it via `rewrite_compacted`, then reopen the
+        // session fresh (a brand-new `SessionStore::open`/`repo.open_id` call, not the same in-memory
+        // `store`) and assert the provenance is back.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("a");
+        session.user("b");
+        store.append_new(&session.messages).unwrap();
+
+        let provenance = CompactionProvenance {
+            read_files: vec!["src/main.rs".to_string(), "README.md".to_string()],
+            modified_files: vec!["src/lib.rs".to_string()],
+            compactions: 1,
+            last_reason: Some(agent_core::compaction::CompactionReason::Threshold),
+        };
+        store
+            .rewrite_compacted(
+                &[Message::user("summary")],
+                CompactionMeta {
+                    tokens_before: 4242,
+                    provenance: provenance.clone(),
+                },
+            )
+            .unwrap();
+
+        let (_reopened, restored) = repo.open_id(&store.meta().id.clone()).unwrap();
+        assert_eq!(
+            restored.compaction.read_files, provenance.read_files,
+            "read_files must survive a fresh reopen, not reset to empty"
+        );
+        assert_eq!(
+            restored.compaction.modified_files, provenance.modified_files,
+            "modified_files must survive a fresh reopen, not reset to empty"
+        );
+        assert_eq!(
+            restored.compaction.last_reason, provenance.last_reason,
+            "last_reason must survive a fresh reopen"
+        );
+        // The counter is restored from `SessionMeta::compactions` (already correctly persisted
+        // separately), not trusted verbatim from the record itself — see `SessionStore::open`'s own
+        // doc comment on why.
+        assert_eq!(restored.compaction.compactions, store.meta().compactions);
+    }
+
+    #[test]
+    fn rewrite_compacted_folds_file_provenance_forward_across_two_rounds_and_both_survive_a_reopen()
+    {
+        // The forward-folding half of Fix 2: a *second* compaction round's own `CompactionMeta
+        // .provenance` (what `agent_core::compaction::merge_file_ops` already folds forward in
+        // memory) must still be a complete snapshot on its own — `SessionStore::open` only ever reads
+        // the *last* `Entry::Compaction` record, trusting that it already carries every earlier
+        // round's files, exactly like `Session.compaction` already does turn-to-turn in memory.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("a");
+        session.user("b");
+        session.user("c");
+        session.user("d");
+        store.append_new(&session.messages).unwrap();
+
+        let round1 = CompactionProvenance {
+            read_files: vec!["a.rs".to_string()],
+            modified_files: vec![],
+            compactions: 1,
+            last_reason: Some(agent_core::compaction::CompactionReason::Threshold),
+        };
+        store
+            .rewrite_compacted(
+                &[
+                    Message::user("summary1"),
+                    Message::user("c"),
+                    Message::user("d"),
+                ],
+                CompactionMeta {
+                    tokens_before: 100,
+                    provenance: round1,
+                },
+            )
+            .unwrap();
+
+        // Round 2 folds round 1's `a.rs` forward with its own new activity, matching what
+        // `merge_file_ops` would actually do — the persisted record must reflect that already-folded
+        // union, not just round 2's own new files.
+        let round2 = CompactionProvenance {
+            read_files: vec!["a.rs".to_string(), "b.rs".to_string()],
+            modified_files: vec!["c.rs".to_string()],
+            compactions: 2,
+            last_reason: Some(agent_core::compaction::CompactionReason::Manual),
+        };
+        store
+            .rewrite_compacted(
+                &[Message::user("summary2")],
+                CompactionMeta {
+                    tokens_before: 200,
+                    provenance: round2,
+                },
+            )
+            .unwrap();
+
+        let (_reopened, restored) = repo.open_id(&store.meta().id.clone()).unwrap();
+        assert_eq!(restored.compaction.read_files, vec!["a.rs", "b.rs"]);
+        assert_eq!(restored.compaction.modified_files, vec!["c.rs"]);
+        assert_eq!(
+            restored.compaction.last_reason,
+            Some(agent_core::compaction::CompactionReason::Manual)
+        );
+        assert_eq!(restored.compaction.compactions, 2);
+    }
+
+    #[test]
     fn tree_reports_entry_kind_for_a_compaction_and_a_branch_summary_not_just_a_plain_message() {
         // Track L25 (pi-parity fix): `Entry::BranchSummary`/`Entry::Compaction` used to be
         // indistinguishable from an ordinary message once materialized into `tree()`'s output — a
@@ -4311,7 +4623,10 @@ mod tests {
         store
             .rewrite_compacted(
                 &[Message::user("kept after compaction")],
-                CompactionMeta { tokens_before: 999 },
+                CompactionMeta {
+                    tokens_before: 999,
+                    provenance: Default::default(),
+                },
             )
             .unwrap();
         let tree = store.tree();
@@ -4367,7 +4682,13 @@ mod tests {
             session.messages[4].clone(),
         ];
         store
-            .rewrite_compacted(&compacted, CompactionMeta { tokens_before: 1 })
+            .rewrite_compacted(
+                &compacted,
+                CompactionMeta {
+                    tokens_before: 1,
+                    provenance: Default::default(),
+                },
+            )
             .unwrap();
 
         let after = fs::read(&path).unwrap();
@@ -4409,7 +4730,13 @@ mod tests {
             session.messages[4].clone(), // "five"
         ];
         store
-            .rewrite_compacted(&round1_messages, CompactionMeta { tokens_before: 100 })
+            .rewrite_compacted(
+                &round1_messages,
+                CompactionMeta {
+                    tokens_before: 100,
+                    provenance: Default::default(),
+                },
+            )
             .unwrap();
         assert_eq!(store.meta().compactions, 1);
         assert_eq!(store.meta().dropped_messages, 2);
@@ -4433,7 +4760,13 @@ mod tests {
             continued.messages[4].clone(), // "seven"
         ];
         store
-            .rewrite_compacted(&round2_messages, CompactionMeta { tokens_before: 200 })
+            .rewrite_compacted(
+                &round2_messages,
+                CompactionMeta {
+                    tokens_before: 200,
+                    provenance: Default::default(),
+                },
+            )
             .unwrap();
 
         // Both rounds' provenance accumulate independently — not overwritten.
@@ -4501,7 +4834,13 @@ mod tests {
             Message::user("two (rewritten)"),
         ];
         store
-            .rewrite_compacted(&same_length, CompactionMeta { tokens_before: 1 })
+            .rewrite_compacted(
+                &same_length,
+                CompactionMeta {
+                    tokens_before: 1,
+                    provenance: Default::default(),
+                },
+            )
             .unwrap();
 
         assert_eq!(
@@ -6070,6 +6409,53 @@ mod tests {
     }
 
     #[test]
+    fn fork_at_entry_rejects_an_anchored_side_channel_entry_as_a_target_and_it_is_unreachable_anyway()
+     {
+        // Investigated (Round 2 pi-parity remediation, Low severity, left unfixed — see
+        // `fork_at_entry_prefix`'s own doc comment for the full assessment). Pi's uniform tree model
+        // lets a caller fork/switch at *any* entry id, including a `Label`/`ModelChange`/
+        // `ThinkingLevelChange`/`TitleChange` — beyond's narrower one requires `entry_id` to be a real
+        // `nodes` entry (`Message`/`BranchSummary`/`Custom`), so one of these 404s. Confirmed here two
+        // ways: (a) `fork_at_entry` really does reject such an id, and (b) that id was never something
+        // a client could have discovered in the first place — `tree()`, the only surface that lists
+        // forkable ids, never lists one of these at all — so no real caller can actually hit case (a).
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("a");
+        store.append_new(&session.messages).unwrap();
+        let msg_id = store.active_ids()[0].clone();
+        store.set_label(&msg_id, Some("checkpoint")).unwrap();
+
+        // The label entry's own id is never returned by any public method — recovered here only by
+        // parsing the raw file, which no real client does either (see `tree()`'s own doc comment: it
+        // reports the label as the *target* node's `label` field, never as its own addressable entry).
+        let raw = fs::read_to_string(&store.path).unwrap();
+        let label_entry_id = raw
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .find(|v| v["type"] == json!("label"))
+            .and_then(|v| v["id"].as_str().map(str::to_string))
+            .expect("set_label must have appended an Entry::Label line with its own id");
+
+        // (b) unreachable via the client-facing surface: no `TreeNode` ever carries this id.
+        assert!(
+            store.tree().iter().all(|n| n.id != label_entry_id),
+            "a label's own entry id must never be independently listed by `tree()`"
+        );
+
+        // (a) and, even if a caller somehow obtained it anyway (as this test does, by reading the raw
+        // file), it's still rejected as a fork target.
+        let session_id = store.meta().id.clone();
+        match repo.fork_at_entry(&session_id, &label_entry_id, false) {
+            Ok(_) => panic!("expected NotFound when forking at a label entry's own id"),
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
+        }
+    }
+
+    #[test]
     fn set_label_sets_and_gets() {
         // pi: session-manager/labels.test.ts, "sets and gets labels".
         let dir = tmpdir();
@@ -6544,6 +6930,56 @@ mod tests {
             forked.meta().title, None,
             "forking at a point that predates every rename on its own path must not inherit one made \
              later on the same chain"
+        );
+    }
+
+    #[test]
+    fn fork_carries_the_active_thinking_level_forward_and_it_survives_a_reopen() {
+        // Fix 1 (pi-parity remediation, Round 2): unlike `model`/`title` just above (each already
+        // fixed by `model_at_or_created`/`title_at_or_root`), none of `fork`/`fork_from_path`/
+        // `fork_at_entry_prefix` ever resolved or persisted the source's active thinking level at all
+        // — a fork silently dropped whatever reasoning-effort depth the source session had actually
+        // settled on. The bug only shows up on a genuine reopen (a still-live in-memory store keeps
+        // whatever the caller already had in scope) — exactly what a fresh process would do on `run
+        // --continue`, a `serve` restart, or `switch_session` back to this session — so this reproduces
+        // that: fork, then reopen the forked *file* from scratch via a brand-new `SessionStore::open`,
+        // not the same `forked` handle `fork` already returned.
+        // "b" is a *child* of the level change's anchor ("a"), so it's the point that actually
+        // observes "high" — same "anchored-at, not before" contract
+        // `fork_resolves_the_updated_model_via_the_tree_not_the_sessions_stale_meta` already exercises
+        // for model: forking exactly at "a" (the change's own anchor) would still correctly see
+        // whatever level was active *before* it, not "high" yet.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("a");
+        store.append_new(&session.messages).unwrap();
+        store.record_thinking_level_change("high").unwrap(); // anchored at "a"
+        session.user("b"); // "a"'s child — observes the "high" change
+        store.append_new(&session.messages).unwrap();
+
+        let session_id = store.meta().id.clone();
+        let (forked, _) = repo.fork(&session_id, usize::MAX).unwrap();
+        assert_eq!(
+            forked.meta().thinking_level.as_deref(),
+            Some("high"),
+            "a fork's own header must carry the thinking level active at the fork point"
+        );
+        let forked_path = forked.path().to_path_buf();
+        drop(forked);
+
+        let (reopened, _) = SessionStore::open(forked_path).unwrap();
+        let tip = reopened
+            .active_ids()
+            .last()
+            .cloned()
+            .expect("forked session has at least one message");
+        assert_eq!(
+            reopened.thinking_level_at(&tip),
+            Some("high"),
+            "the active thinking level must survive a fresh reopen of the forked file, not just live \
+             in the in-memory store `fork` already returned"
         );
     }
 
@@ -7782,7 +8218,10 @@ mod tests {
         store
             .rewrite_compacted(
                 &summary_session.messages,
-                CompactionMeta { tokens_before: 100 },
+                CompactionMeta {
+                    tokens_before: 100,
+                    provenance: Default::default(),
+                },
             )
             .unwrap();
 
@@ -7883,7 +8322,13 @@ mod tests {
             agent_core::compaction::SUMMARY_MARKER
         ))];
         store
-            .rewrite_compacted(&compacted_messages, CompactionMeta { tokens_before: 999 })
+            .rewrite_compacted(
+                &compacted_messages,
+                CompactionMeta {
+                    tokens_before: 999,
+                    provenance: Default::default(),
+                },
+            )
             .unwrap();
         assert_eq!(store.active_ids().len(), 1);
 
@@ -7948,7 +8393,13 @@ mod tests {
             agent_core::compaction::SUMMARY_MARKER
         ))];
         store
-            .rewrite_compacted(&compacted_messages, CompactionMeta { tokens_before: 999 })
+            .rewrite_compacted(
+                &compacted_messages,
+                CompactionMeta {
+                    tokens_before: 999,
+                    provenance: Default::default(),
+                },
+            )
             .unwrap();
 
         let new_tip = store.active_ids().last().unwrap().clone();
@@ -7995,7 +8446,13 @@ mod tests {
             agent_core::compaction::SUMMARY_MARKER
         ))];
         store
-            .rewrite_compacted(&compacted_messages, CompactionMeta { tokens_before: 999 })
+            .rewrite_compacted(
+                &compacted_messages,
+                CompactionMeta {
+                    tokens_before: 999,
+                    provenance: Default::default(),
+                },
+            )
             .unwrap();
 
         let (forked, _) = repo.fork(&id, usize::MAX).unwrap();
@@ -8043,7 +8500,13 @@ mod tests {
             Message::user("four"),
         ];
         store
-            .rewrite_compacted(&compacted_messages, CompactionMeta { tokens_before: 999 })
+            .rewrite_compacted(
+                &compacted_messages,
+                CompactionMeta {
+                    tokens_before: 999,
+                    provenance: Default::default(),
+                },
+            )
             .unwrap();
 
         let active_ids = store.active_ids().to_vec();

@@ -394,8 +394,13 @@ pub fn build_body(req: &ModelRequest) -> Value {
     let caps = crate::models::capabilities(&req.model);
     let mut input: Vec<Value> = Vec::new();
 
-    if let Some(system) = &req.system {
-        input.push(json!({ "role": instruction_role(&caps), "content": system }));
+    // Codex/ChatGPT's own backend wants the system prompt carried in a separate top-level
+    // `instructions` field (below) instead of folded into `input[0]` — every other route keeps this
+    // vanilla native-OpenAI-Responses shape. See `req.is_codex`'s own doc comment.
+    if !req.is_codex {
+        if let Some(system) = &req.system {
+            input.push(json!({ "role": instruction_role(&caps), "content": system }));
+        }
     }
     for (msg_index, m) in req.messages.iter().enumerate() {
         match m.role {
@@ -420,6 +425,26 @@ pub fn build_body(req: &ModelRequest) -> Value {
     // Stateless harness: every turn resends the full history, so nothing should be retained
     // server-side to reference via `previous_response_id`.
     map.insert("store".into(), json!(false));
+    if req.is_codex {
+        // Mirrors pi's `openai-codex-responses.ts` `buildRequestBody`: the system prompt rides in a
+        // top-level `instructions` field (never folded into `input` for this route — see above),
+        // falling back to the same default pi sends when no system prompt was configured at all, so a
+        // Codex-routed turn is never sent with no `instructions` field at all. `parallel_tool_calls`
+        // and `text.verbosity` are also always sent for this backend specifically, not gated on
+        // anything the caller configured — beyond has no equivalent verbosity option yet, hence the
+        // hardcoded `"low"` pi itself defaults to.
+        map.insert(
+            "instructions".into(),
+            json!(
+                req.system
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("You are a helpful assistant.")
+            ),
+        );
+        map.insert("parallel_tool_calls".into(), json!(true));
+        map.insert("text".into(), json!({ "verbosity": "low" }));
+    }
     // A queueing/latency class, not purely a pricing knob — omitted entirely (leaving OpenAI's own
     // default tier) unless the caller explicitly asked for one.
     if let Some(tier) = req.service_tier {
@@ -582,6 +607,40 @@ fn message_item_text(item: Option<&Value>) -> Option<String> {
         }
     }
     (!text.is_empty()).then_some(text)
+}
+
+/// Join a `reasoning`-type item's text-bearing parts (`summary` or `content`, both `[{..., "text": ...}]`
+/// shaped) with a blank-line separator — mirrors pi's `item.summary?.map((s) => s.text).join("\n\n")`.
+fn join_reasoning_parts(parts: &[Value]) -> String {
+    parts
+        .iter()
+        .filter_map(|p| p.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// A `reasoning`-type item's visible thinking text — its `summary` parts (visible reasoning summaries,
+/// the common case) if any are non-empty, else its `content` parts (raw reasoning text, some models'
+/// more verbose channel) — used at `output_item.done` as a resync ground truth, same purpose as
+/// [`message_item_text`] for a text/refusal item. Mirrors pi's `summaryText || contentText` fallback
+/// (`openai-responses-shared.ts`'s `output_item.done` handler). `None` when neither field yields any
+/// text — nothing to resync against, so the block's accumulated `ThinkingDelta`s stand as-is.
+fn reasoning_item_text(item: Option<&Value>) -> Option<String> {
+    let item = item?;
+    let summary = item
+        .get("summary")
+        .and_then(Value::as_array)
+        .map(|parts| join_reasoning_parts(parts))
+        .unwrap_or_default();
+    if !summary.is_empty() {
+        return Some(summary);
+    }
+    let content = item
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|parts| join_reasoning_parts(parts))
+        .unwrap_or_default();
+    (!content.is_empty()).then_some(content)
 }
 
 /// A `message`-type item's `id` and `phase` (see `ContentBlock::Text`'s doc comment) — captured at
@@ -838,6 +897,21 @@ impl StreamDecoder for Decoder {
                                     signature: item.map(ToString::to_string).unwrap_or_default(),
                                 },
                             );
+                            // Ground-truth resync, same purpose as the text/tool-call block resyncs
+                            // above: a single dropped/duplicated mid-stream
+                            // `reasoning_summary_text.delta`/`reasoning_text.delta` chunk (a relay
+                            // hiccup with no transport-level error — nothing else would ever catch it)
+                            // must not silently leave the persisted/displayed thinking text corrupted.
+                            if let Some(text) = reasoning_item_text(item) {
+                                self.emit(
+                                    &mut out,
+                                    index,
+                                    StreamEvent::ThinkingFinal {
+                                        index: index as usize,
+                                        text,
+                                    },
+                                );
+                            }
                         }
                         Some("function_call") => {
                             // Ground-truth resync, same as `function_call_arguments.done` above — belt
@@ -877,7 +951,17 @@ impl StreamDecoder for Decoder {
                     self.close(&mut out, index);
                 }
             }
-            "response.completed" | "response.incomplete" => self.finalize(data, &mut out),
+            // `response.done` is Codex/ChatGPT-OAuth's own backend-specific terminal event
+            // (`RouteOverride::Prefixed`-routed requests, see `client.rs`) — functionally identical to
+            // `response.completed`/`response.incomplete` (same embedded `response.status`/`usage`
+            // shape), just a different event name for that one backend. Mirrors pi's `mapCodexEvents`
+            // (`openai-codex-responses.ts`), which normalizes all three into `response.completed`
+            // before handing off to the shared processor. Left unrecognized, this event used to fall
+            // through the catch-all arm below and do nothing — silently hanging a Codex-routed turn
+            // forever waiting for a terminal event that already arrived.
+            "response.completed" | "response.incomplete" | "response.done" => {
+                self.finalize(data, &mut out)
+            }
             "response.failed" => {
                 self.saw_terminal = true;
                 self.failed = Some(failure_message(data));
@@ -1502,6 +1586,52 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
     }
 
     #[test]
+    fn codex_routed_requests_send_instructions_field_instead_of_folding_system_into_input() {
+        // HIGH pi-parity fix: Codex/ChatGPT's actual backend wants the system prompt in a top-level
+        // `instructions` field, with `input` excluding it entirely — unlike every other route, which
+        // folds it into `input[0]` (the vanilla native-OpenAI-Responses shape). If the real ChatGPT
+        // backend only honors `instructions` for system-level guidance, sending the vanilla shape
+        // instead is a functional regression, not cosmetic: every Codex-routed turn's system prompt
+        // would silently land in a field/position the backend ignores. Mirrors pi's
+        // `openai-codex-responses.ts` `buildRequestBody`, which also always sends
+        // `parallel_tool_calls: true` and `text.verbosity` for this backend specifically.
+        let req = ModelRequest::new("gpt-5-codex", vec![Message::user("hi")], 64)
+            .with_system("be terse")
+            .with_codex(true);
+        let body = build_body(&req);
+
+        assert_eq!(body["instructions"], "be terse");
+        assert_eq!(
+            body["input"][0]["role"], "user",
+            "a Codex-routed request must not fold the system prompt into input[0]: {:#?}",
+            body["input"]
+        );
+        assert_eq!(body["parallel_tool_calls"], true);
+        assert_eq!(body["text"]["verbosity"], "low");
+
+        // A non-Codex request (the default) is unaffected: system prompt still folds into `input[0]`,
+        // and none of Codex's extra fields appear at all.
+        let req =
+            ModelRequest::new("gpt-5-codex", vec![Message::user("hi")], 64).with_system("be terse");
+        let body = build_body(&req);
+        assert_eq!(body["input"][0]["content"], "be terse");
+        assert!(body.get("instructions").is_none());
+        assert!(body.get("parallel_tool_calls").is_none());
+        assert!(body.get("text").is_none());
+    }
+
+    #[test]
+    fn codex_routed_requests_default_instructions_when_no_system_prompt_is_set() {
+        // pi's own `buildRequestBody` always sends `instructions`, falling back to a default string
+        // when no system prompt was configured (`context.systemPrompt || "You are a helpful
+        // assistant."`) — a Codex-routed turn is never sent with no `instructions` field at all, unlike
+        // every other route, which simply omits the folded-in system message when none is set.
+        let req = ModelRequest::new("gpt-5-codex", vec![Message::user("hi")], 64).with_codex(true);
+        let body = build_body(&req);
+        assert_eq!(body["instructions"], "You are a helpful assistant.");
+    }
+
+    #[test]
     fn prompt_cache_key_is_clamped_to_64_chars() {
         let long_key = "k".repeat(200);
         let req =
@@ -1575,10 +1705,19 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
             assert_eq!(parsed["type"], "reasoning");
             assert_eq!(parsed["id"], "rs_1");
         }
-        assert_eq!(events[3], StreamEvent::ContentBlockStop { index: 0 });
+        // pi-parity fix: `output_item.done` also resyncs the block's visible thinking text from the
+        // item's own authoritative `summary`, same as the text/tool-call resyncs below.
+        assert_eq!(
+            events[3],
+            StreamEvent::ThinkingFinal {
+                index: 0,
+                text: "Let me check.".into()
+            }
+        );
+        assert_eq!(events[4], StreamEvent::ContentBlockStop { index: 0 });
         // Tool call.
         assert_eq!(
-            events[4],
+            events[5],
             StreamEvent::ToolUseStart {
                 index: 1,
                 id: "call_42|fc_1".into(),
@@ -1586,14 +1725,14 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
             }
         );
         assert_eq!(
-            events[5],
+            events[6],
             StreamEvent::InputJsonDelta {
                 index: 1,
                 partial_json: "{\"city\":".into()
             }
         );
         assert_eq!(
-            events[6],
+            events[7],
             StreamEvent::InputJsonDelta {
                 index: 1,
                 partial_json: "\"SF\"}".into()
@@ -1602,13 +1741,13 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
         // `output_item.done` resyncs to the provider's own authoritative arguments before closing —
         // see `message_item_text`'s sibling `Some("function_call")` resync arm.
         assert_eq!(
-            events[7],
+            events[8],
             StreamEvent::InputJsonFinal {
                 index: 1,
                 full_json: "{\"city\":\"SF\"}".into()
             }
         );
-        assert_eq!(events[8], StreamEvent::ContentBlockStop { index: 1 });
+        assert_eq!(events[9], StreamEvent::ContentBlockStop { index: 1 });
         // Terminal: usage + a ToolUse-upgraded stop reason (status was "completed", but a tool call
         // happened).
         let usage = events
@@ -1758,6 +1897,49 @@ data: {"type":"response.incomplete","response":{"status":"cancelled"}}
         let mut dec = Decoder::default();
         let err = decode_sse(&mut dec, SSE).unwrap_err();
         assert!(matches!(err, Error::Transport(_)));
+    }
+
+    #[test]
+    fn response_done_is_treated_as_an_equivalent_terminal_event_to_response_completed() {
+        // CRITICAL pi-parity fix: Codex/ChatGPT-OAuth-routed requests (`RouteOverride::Prefixed`, see
+        // `client.rs`) terminate the stream with a backend-specific `response.done` event instead of
+        // `response.completed`/`response.incomplete` — a real backend quirk pi's own `mapCodexEvents`
+        // (`openai-codex-responses.ts`) explicitly normalizes into `response.completed` before handing
+        // off to its shared processor. Before this fix, `response.done` fell through this decoder's
+        // catch-all `_ => {}` arm and did nothing: `saw_terminal` never got set, `finish()` would then
+        // hard-error every Codex-routed turn as a stream that "ended before a terminal response event"
+        // even though the terminal event had, in fact, already arrived.
+        const SSE: &str = r#"
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1"}}
+
+data: {"type":"response.output_text.delta","output_index":0,"delta":"hi"}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1","content":[{"type":"output_text","text":"hi"}]}}
+
+data: {"type":"response.done","response":{"status":"completed","usage":{"input_tokens":10,"output_tokens":5}}}
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, SSE).unwrap();
+        assert!(
+            dec.is_terminal(),
+            "response.done must set saw_terminal, same as response.completed"
+        );
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::Usage(u) => Some(*u),
+                _ => None,
+            })
+            .expect("a usage event");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 5);
+        assert_eq!(
+            events.last(),
+            Some(&StreamEvent::MessageStop {
+                stop_reason: StopReason::EndTurn
+            }),
+            "response.done must finalize exactly like response.completed, including the stop reason"
+        );
     }
 
     #[test]
@@ -2120,6 +2302,64 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
             }),
             "expected a TextFinal resync to the item's authoritative content, carrying its real \
              wire id for replay: {events:#?}"
+        );
+    }
+
+    #[test]
+    fn reasoning_item_resyncs_its_visible_thinking_text_on_output_item_done() {
+        // LOW-MEDIUM pi-parity fix: unlike the text/tool-call resyncs above, a `reasoning` item's
+        // `output_item.done` used to only emit `SignatureDelta` (the raw item JSON, for replay) — never
+        // resyncing the *visible* `thinking` text the deltas accumulated. A single dropped/duplicated
+        // mid-stream `reasoning_summary_text.delta` chunk (a relay hiccup, no transport error — nothing
+        // else would ever catch it) could silently corrupt the persisted/displayed thinking text for
+        // the turn. Mirrors pi's `openai-responses-shared.ts` `output_item.done` handler
+        // (`summaryText || contentText || slot.block.thinking`). Simulated here by the item's own
+        // `summary` disagreeing with what the streamed delta alone would have produced ("Let m" vs the
+        // full "Let me check the docs.") — the resync must win.
+        const SSE: &str = r#"
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1"}}
+
+data: {"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"Let m"}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"Let me check the docs."}]}}
+
+data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, SSE).unwrap();
+        assert!(
+            events.contains(&StreamEvent::ThinkingFinal {
+                index: 0,
+                text: "Let me check the docs.".into(),
+            }),
+            "expected a ThinkingFinal resync to the item's authoritative summary text, not just the \
+             accumulated (truncated) deltas: {events:#?}"
+        );
+    }
+
+    #[test]
+    fn reasoning_item_with_no_summary_or_content_emits_no_thinking_final() {
+        // The flip side: when the item carries neither `summary` nor `content` text at all (some
+        // models' `output_item.done` for a reasoning item is genuinely empty beyond the signature),
+        // there's nothing authoritative to resync against — the accumulated deltas must be left alone,
+        // not clobbered with an empty string.
+        const SSE: &str = r#"
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1"}}
+
+data: {"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"kept as-is"}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1"}}
+
+data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, SSE).unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::ThinkingFinal { .. })),
+            "no ThinkingFinal should be emitted when the item has no summary/content text to resync \
+             against: {events:#?}"
         );
     }
 

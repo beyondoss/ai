@@ -464,6 +464,10 @@ impl CopilotRoutedCredentialSource {
             ],
             copilot_dynamic_headers: true,
             auth_header: None,
+            auth_header_prefix: None,
+            dialect_override: None,
+            deployment_name: None,
+            query: None,
         }
     }
 }

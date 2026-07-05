@@ -811,6 +811,77 @@ fn serve_fork_by_target_id_reaches_an_off_active_path_branch() {
 }
 
 #[test]
+fn serve_fork_includes_the_forked_from_messages_text() {
+    // Fix 3 (pi-parity remediation, Round 2): `fork`'s response previously had no `text` field at all
+    // — pi's own `{success, data:{text, cancelled}}` shape echoes the forked-from message's own content
+    // (`selectedText`, `extractUserMessageText`) so a client doesn't need a second
+    // `get_fork_messages`-style round trip just to redisplay what it already selected. Covers both of
+    // this crate's own fork resolutions: a `target_id`-named entry (here, an assistant reply — proving
+    // `text` isn't silently role-gated the way `get_fork_messages`'s own user-turn-only candidate list
+    // is) and a bare `upto` count with no `target_id` at all.
+    let dir = tempfile::tempdir().unwrap();
+    let session_dir = dir.path().join("sessions").to_string_lossy().into_owned();
+
+    let (base, _bodies) = spawn_model_server(vec![turn_text("a-reply"), turn_text("b-reply")]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_dir_cmd(bin, &base, &session_dir).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    for msg in ["a", "b"] {
+        writeln!(stdin, "{}", json!({ "type": "prompt", "message": msg })).unwrap();
+        stdin.flush().unwrap();
+        read_until_response(&mut stdout, "prompt");
+    }
+
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_messages");
+    let messages = frames.last().unwrap()["data"]["messages"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let ids: Vec<String> = messages
+        .iter()
+        .map(|m| m["id"].as_str().unwrap().to_string())
+        .collect();
+    // ids[0] = user "a", ids[1] = assistant "a-reply", ids[2] = user "b", ids[3] = assistant "b-reply".
+
+    // `target_id` at an assistant reply (non-user role); `before:false` since `true` at a non-user
+    // entry is an invalid fork target (Track L27) — `text` must echo that exact reply's own content
+    // regardless, not anything derived from the copied prefix.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "fork", "target_id": ids[1], "before": false })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "fork");
+    assert_eq!(frames.last().unwrap()["success"], true, "{frames:#?}");
+    assert_eq!(
+        frames.last().unwrap()["data"]["text"],
+        "a-reply",
+        "got: {frames:#?}"
+    );
+
+    // Bare `upto` (no `target_id`) now operates on the just-forked session (`[user "a", assistant
+    // "a-reply"]`): `text` is the last message the copied `upto:1` prefix actually ends on.
+    writeln!(stdin, "{}", json!({ "type": "fork", "upto": 1 })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "fork");
+    assert_eq!(frames.last().unwrap()["success"], true, "{frames:#?}");
+    assert_eq!(
+        frames.last().unwrap()["data"]["text"],
+        "a",
+        "got: {frames:#?}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
 fn serve_fork_and_preview_fork_default_before_to_true() {
     // Track L17: pi's real production client always forks with `position:"before"` — this crate's
     // `before` used to default to `false` (include the target entry), the opposite of pi's actual

@@ -135,11 +135,24 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   matching `ModelTransport`'s own "the loop never depends on reqwest" contract; a `MockTransport`-driven
   test never fires it, since there's no real response to report. Both default to no-ops, so an existing
   `AgentHooks` implementor is unaffected.
-- **Panic isolation** — every `before_tool_call`/`Tool::run_streaming`/`after_tool_call` invocation runs
-  behind a `catch_unwind` boundary (`catch_tool_panic`): a panic in any of them degrades to one failed
-  tool call (an error `tool_result`, or a fail-closed block for `before_tool_call`) instead of unwinding
-  the whole run. Neither trait returns a `Result` a panic could be redirected through instead, so this is
-  the one place that actually needs to catch the unwind.
+- **Wire-payload hook** — `AgentHooks::before_provider_payload(&mut serde_json::Value)` fills the
+  pi-parity gap between the two hooks above: `before_provider_request` only ever sees the abstract,
+  dialect-agnostic `ModelRequest`, and `after_provider_response` is read-only, so nothing previously
+  exposed the *literal* dialect-specific wire JSON a host might need to inspect or rewrite. Called from
+  `client.rs::GatewayClient::stream`, once per attempt, immediately after `dialect.build_body(..)` builds
+  the wire body and before it's handed to `send_with_retry` — mirrors pi's low-level `Agent.onPayload`
+  and the harness's `beforeProviderPayload` (`agent-harness.ts`'s `emitBeforeProviderPayload`), except it
+  mutates `payload` in place rather than returning a wholesale replacement, matching
+  `before_provider_request`'s own convention. Same "fails open" panic handling as the other two: a
+  panicking hook's partial mutation is discarded and the payload falls back to exactly what `build_body`
+  produced. Defaults to a no-op, so an existing `AgentHooks` implementor is unaffected.
+- **Panic isolation** — every `before_tool_call`/`Tool::run_streaming`/`after_tool_call` invocation (in
+  `agent.rs`) and `before_provider_payload` invocation (in `client.rs`) runs behind a `catch_unwind`
+  boundary (`catch_tool_panic`, `pub(crate)` so both modules share it): a panic in any of them degrades
+  to one failed tool call (an error `tool_result`, or a fail-closed block for `before_tool_call`) or a
+  discarded payload mutation, instead of unwinding the whole run. None of these hook traits return a
+  `Result` a panic could be redirected through instead, so this is the mechanism that actually needs to
+  catch the unwind.
 - **Compaction** — when the live prompt strictly exceeds `context_window − reserve` (landing exactly on
   the threshold still leaves the full reserve intact, so `compaction::should_compact` requires `>`, not
   pi-mismatched `>=`) (or the provider rejects an
@@ -646,10 +659,16 @@ two guards, so concurrency never costs correctness:
 This default split is always **gate the whole batch, then execute** — every call's argument coercion
 runs, then its `before_tool_call` resolves, in call order, before any call's actual tool execution
 begins (`Agent::run_events_steered`'s phase 1/phase 2, matching pi's `prepareToolCall` loop ahead of
-`executeToolCallsParallel`'s `Promise.all`). Coercion runs *before* the hook, not just before the tool
-itself (pi-parity fix — matches pi's own `prepareToolCall`, which calls `validateToolArguments` ahead
-of `config.beforeToolCall`): a permission hook must see the same coerced/typed arguments the tool is
-about to run with, not the model's raw, possibly stringified wire values. Phase 1 re-checks
+`executeToolCallsParallel`'s `Promise.all`). The tool lookup itself runs *first*, ahead of both
+coercion and the hook (pi-parity fix — matches pi's own `prepareToolCall`, which returns its
+`Tool ${name} not found` immediate outcome before `prepareToolCallArguments`/`validateToolArguments`/
+`config.beforeToolCall` ever run): a name naming no registered tool short-circuits straight to the
+same "unknown tool: {name}" error result the execution phase would otherwise only discover later,
+without ever invoking `before_tool_call` for a call that was never going to run anyway. Coercion runs
+*before* the hook, not just before the tool itself (pi-parity fix — matches pi's own `prepareToolCall`,
+which calls `validateToolArguments` ahead of `config.beforeToolCall`): a permission hook must see the
+same coerced/typed arguments the tool is about to run with, not the model's raw, possibly stringified
+wire values. Phase 1 re-checks
 cancellation twice per call, not once: at the top of its loop iteration, *and* again right after that
 call's own `before_tool_call` hook returns — a slow permission-check hook can observe cancellation
 firing mid-await, and without the second check a single-call (or last-in-batch) turn had no *later*
@@ -925,7 +944,7 @@ both fields `None` and never reads them.
 | `message.rs`                  | `Role`/`ContentBlock`(+ `Thinking`/`RedactedThinking`/`Image`; `ToolResult` carries optional `images`; `Text` carries optional `id`/`phase`, OpenAI Responses' replay metadata)/`Message`(+ `usage: Option<TokenUsage>`, the per-turn figure stamped on an assistant message; + `stop_reason: Option<StopReason>`, why that turn ended, persisted so it survives across runs/processes)/`ToolDef`/`StopReason`(+ `Refusal`)/`StreamEvent`/`TokenUsage`(+ `reasoning_tokens`) — the internal model                                                                                                                                                                 |
 | `compaction.rs`               | Context compaction: trigger, cut-point search, summary-prompt build (`summary_request` takes an optional `custom_instructions`, appended as "Additional focus: …" — a manual compaction's client-supplied steering, matching pi's `generateSummary`; never applied to the split-turn prefix call, matching pi's `generateTurnPrefixSummary` not accepting one at all), file-op extraction, and incremental update (`previous_summary`/`SUMMARY_MARKER` fold-forward) — the network-free half of `Agent::compact`                                                                                                                                                                             |
 | `models.rs`                   | `capabilities(model) -> ModelCaps`: minimal per-model wire table (max-tokens field, long-cache, vision, thinking shape, reasoning-effort, context window), matched by id prefix; consumed by the dialects and `Agent::new`                                                                                                                                                                 |
-| `hooks.rs`                    | `AgentHooks` interception trait (`before_tool_call`/`after_tool_call`/`should_stop_after_turn`/`on_assistant_message`/`before_provider_request`/`after_provider_response`, all cancellation-aware where a run is in flight) + `NoHooks` default                                                                                                                                                                                                                                                                        |
+| `hooks.rs`                    | `AgentHooks` interception trait (`before_tool_call`/`after_tool_call`/`should_stop_after_turn`/`on_assistant_message`/`before_provider_request`/`before_provider_payload`/`after_provider_response`, all cancellation-aware where a run is in flight) + `NoHooks` default                                                                                                                                                                                                                                                                        |
 | `steering.rs`                 | `Steering` — three shared queues of `SteeringMessage` (text + optional images): `push_steer` (mid-run, folded onto the tool-results turn), `push`/follow-up (injected at would-stop boundaries), `push_next_turn` (folded onto a fresh run's first prompt turn), each independently `QueueMode`-tunable (`set_steering_mode`/`set_follow_up_mode`); `pending_count` peeks the combined depth without draining; `request_stop`/`take_stop_requested` (graceful-stop flag), `request_model_switch`/`take_model_switch` (mid-run model/thinking retarget), `request_tool_set`/`take_tool_switch` (mid-run tool-set retarget — see the `Mid-run tool-set switching` capability), all consumed at the same turn boundary; `clear()`/`clear_run_scoped()` drop the relevant lanes/flags without returning them, for a session swap vs. a mere cancellation respectively                                                                                                                                                                     |
 | `write_lock.rs`               | `WriteLockRegistry` — a process-scoped, path-keyed async-mutex map (`Agent::with_write_locks`) extending same-path write exclusivity across `Agent` rebuilds (a `set_model`/`set_thinking` rebuild, or multiple sessions sharing one registry), layered on top of the per-turn write-target grouping below; `WriteLockGuard`'s `Drop` evicts a key's entry once its refcount shows no other holder/waiter left (see the `Cross-run file-mutation exclusivity` capability above) so the map stays bounded to currently-contended paths, not every path ever locked |
 | `tool.rs`                     | `Tool` trait (`run -> ToolOutput`, optional streaming `run_streaming` + `ToolProgress` sink, optional `execution_mode() -> Option<ToolExecutionMode>` — `Some(Sequential)` routes a turn's whole batch through `Agent::run_tool_calls_interleaved`) + `ToolOutput { text, images, terminate }` + `ToolRegistry` (name-keyed `Arc<dyn Tool>` map, last-registration-wins, name-sorted `definitions`)                                                                                                                                               |

@@ -15,6 +15,7 @@ use futures::StreamExt;
 use serde_json::Value;
 use zeroize::Zeroize;
 
+use crate::agent::catch_tool_panic;
 use crate::dialect::{Dialect, SseEventBuffer, push_sse_line};
 use crate::error::{Error, MID_STREAM_NETWORK_ERROR, Result};
 use crate::hooks::AgentHooks;
@@ -168,6 +169,42 @@ pub struct DirectRouting {
     /// `packages/ai/src/api/azure-openai-responses.ts` in pi-mono) — sending both would risk Azure
     /// attempting to validate a well-formed-looking but bogus `Authorization` value as an AAD token.
     pub auth_header: Option<String>,
+    /// Prepended to the credential's value when sent through [`auth_header`](Self::auth_header) — pi-parity
+    /// Fix 4, Round 2: Cloudflare AI Gateway wants `cf-aig-authorization: Bearer <key>`, a *named*
+    /// header (so `auth_header` alone, which already covers that) carrying a Bearer-*prefixed* value
+    /// (which bare `auth_header` doesn't — it sends the credential verbatim, correct for Azure's
+    /// `api-key` scheme but wrong here). `None` (every existing route, including Azure's) preserves
+    /// the bare-value behavior `auth_header` already had. Has no effect without `auth_header` also
+    /// set — there's no header to prefix a value into otherwise.
+    pub auth_header_prefix: Option<String>,
+    /// Override the wire dialect (Anthropic/OpenAI Chat Completions/OpenAI Responses) this request
+    /// builds and decodes as, instead of inferring it from the model id via
+    /// [`Dialect::for_model_via_copilot`] — pi-parity Fix 1, Round 2: a `models.json` `base_url`
+    /// override can point at a genuinely Anthropic-wire (or OpenAI-wire) third-party provider whose
+    /// model ids don't match [`Dialect::for_model`]'s name heuristic (Kimi-Coding's
+    /// `kimi-k2-thinking`, e.g. — no "claude"/"anthropic" substring, so the heuristic would build an
+    /// OpenAI-shaped body and POST it to an Anthropic Messages endpoint). `None` (every existing
+    /// route) preserves the heuristic. Consulted at the same single call site that already picks the
+    /// dialect for every route (gateway-relayed, `Prefixed`, and `Direct` alike) in
+    /// [`GatewayClient::stream`], so the override applies consistently to body-building, decoding,
+    /// and the Anthropic-specific header/beta logic there — not just the URL.
+    pub dialect_override: Option<Dialect>,
+    /// Send this instead of the app-level model id (`ModelRequest::model`) as the request body's
+    /// wire-level `"model"` field — pi-parity Fix 2, Round 2: Azure OpenAI's deployment name doesn't
+    /// have to match the model id used for capability lookups (`AZURE_OPENAI_DEPLOYMENT_NAME_MAP` in
+    /// pi's own `azure-openai-responses.ts`). `None` (every existing route) leaves the body's
+    /// `"model"` field as `dialect.build_body` already set it. Deliberately *not* a rewrite of
+    /// `ModelRequest::model` itself — that field also drives `crate::models::capabilities` lookups
+    /// (context window, thinking shape, …), which must stay keyed on the app-level id the operator
+    /// actually configured capabilities for, not the wire-level deployment name.
+    pub deployment_name: Option<String>,
+    /// Extra query string (already escaped, no leading `?`) appended to the built URL — pi-parity Fix
+    /// 2, Round 2: an Azure resource pinned to a dated `api-version` (true of most real enterprise
+    /// Azure OpenAI deployments) needs `?api-version=2024-08-01-preview` on every request; beyond
+    /// previously never sent one at all. Only consulted for [`RouteOverride::Direct`] — a
+    /// `Prefixed`-routed request (Codex) has no analogous need and ignores this field. `None`/empty
+    /// (every existing route) builds the URL with no query string, unchanged.
+    pub query: Option<String>,
 }
 
 /// A live, ready-to-attach bearer credential for one request, plus the context header construction
@@ -374,12 +411,31 @@ impl ModelTransport for GatewayClient {
             .direct
             .as_ref()
             .is_some_and(|d| d.copilot_dynamic_headers);
-        let dialect = Dialect::for_model_via_copilot(&req.model, via_copilot);
+        // Pi-parity Fix 1 (Round 2): an operator-configured dialect override (`DirectRouting::
+        // dialect_override` — a `models.json` `base_url` override naming a genuinely Anthropic- or
+        // OpenAI-wire third-party provider whose model ids don't match `for_model_via_copilot`'s own
+        // name heuristic) wins outright. Checked at this single call site — the one place every route
+        // (gateway-relayed, `Prefixed`, `Direct`) picks its dialect — so the override applies
+        // consistently to the URL below, `build_body`, the decoder, and the Anthropic-specific
+        // header/beta logic further down, not just one of them.
+        let dialect = credential
+            .direct
+            .as_ref()
+            .and_then(|d| d.dialect_override)
+            .unwrap_or_else(|| Dialect::for_model_via_copilot(&req.model, via_copilot));
+        // Pi-parity Fix 2 (Round 2): an Azure resource pinned to a dated `api-version` needs that as a
+        // query param on every request (`DirectRouting::query`) — only meaningful for a `Direct` route,
+        // which is the only variant that builds a URL from scratch rather than relaying through the
+        // gateway's own known-provider table.
+        let direct_query = credential.direct.as_ref().and_then(|d| d.query.as_deref());
         let url = match credential.direct.as_ref().map(|d| &d.route) {
             Some(RouteOverride::Prefixed { prefix, path }) => {
                 format!("{}{prefix}{path}", self.base_url)
             }
-            Some(RouteOverride::Direct { base_url, path }) => format!("{base_url}{path}"),
+            Some(RouteOverride::Direct { base_url, path }) => match direct_query {
+                Some(q) if !q.is_empty() => format!("{base_url}{path}?{q}"),
+                _ => format!("{base_url}{path}"),
+            },
             None => format!("{}{}", self.base_url, dialect.endpoint_path()),
         };
         // GitHub Copilot's per-turn dynamic headers (see `DirectRouting::copilot_dynamic_headers`'s
@@ -399,11 +455,26 @@ impl ModelTransport for GatewayClient {
         // every route but one that explicitly opts out of `Authorization: Bearer` (Azure OpenAI's
         // `api-key`, Task #8).
         let auth_header = credential.direct.as_ref().and_then(|d| d.auth_header.clone());
+        // Pi-parity Fix 4 (Round 2): a prefix prepended to `auth_header`'s value (Cloudflare AI
+        // Gateway's `cf-aig-authorization: Bearer <key>` — a named header, like Azure's `api-key`,
+        // but carrying a Bearer-prefixed value, unlike Azure's bare one). `None` unless both this and
+        // `auth_header` are set — see `DirectRouting::auth_header_prefix`'s doc comment.
+        let auth_header_prefix = credential
+            .direct
+            .as_ref()
+            .and_then(|d| d.auth_header_prefix.clone());
         // Distinguishes Copilot- and Azure-routed requests for dialect-body branches that need to
         // know (gpt-5.x reasoning-disable suppression, Azure's prompt_cache_retention suppression) —
         // reuses the same signals already computed above rather than adding a third detection path.
         req.is_copilot = via_copilot;
         req.is_azure = auth_header.as_deref() == Some("api-key");
+        // Same `RouteOverride::Prefixed` signal that already picked Codex's own URL/path above — not
+        // a second, independent detection path. See `ModelRequest::is_codex`'s own doc comment for the
+        // dialect-body branch this feeds.
+        req.is_codex = matches!(
+            credential.direct.as_ref().map(|d| &d.route),
+            Some(RouteOverride::Prefixed { .. })
+        );
         // Anthropic's own OAuth identity-spoofing headers (`CLAUDE_CODE_BETA`/`CLAUDE_CLI_IDENTITY`
         // etc., below) and body shape (Claude Code's identity system prompt, canonical tool-name
         // casing — `dialect::anthropic::build_body`) only apply to a genuine direct-to-Anthropic
@@ -413,14 +484,40 @@ impl ModelTransport for GatewayClient {
         // decoder (reversing tool_use names back) so the two halves of the round-trip always agree.
         let has_direct_override = credential.direct.is_some();
         let is_oauth = credential.is_oauth && !has_direct_override;
-        let body = dialect.build_body(&req, is_oauth);
+        let mut body = dialect.build_body(&req, is_oauth);
+        // Pi-parity Fix 2 (Round 2): Azure OpenAI's deployment name (`DirectRouting::deployment_name`)
+        // overwrites just the wire-level `"model"` field `build_body` already set — never
+        // `req.model`/`ModelRequest::model` itself, which stays keyed on the app-level id the operator
+        // configured capabilities for (`crate::models::capabilities`, thinking budgets, …) rather than
+        // whatever wire name the request happens to go out under.
+        if let Some(name) = credential.direct.as_ref().and_then(|d| d.deployment_name.as_deref()) {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("model".to_string(), Value::String(name.to_string()));
+            }
+        }
+        let hooks = self.hooks.clone();
+        // Pi-parity gap: nothing between `ModelRequest` and this dialect-built body ever exposed the
+        // *literal* wire-format JSON to a hook — only the abstract, pre-dialect `ModelRequest` via
+        // `before_provider_request` above (one layer up, before `build_body` even ran). Mirrors pi's
+        // `onPayload`/`beforeProviderPayload` (see `AgentHooks::before_provider_payload`'s own doc
+        // comment). Same "fails open" convention as `before_provider_request`: a panicking hook's
+        // (possibly partial) mutation is discarded and `body` falls back to exactly what `build_body`
+        // produced.
+        if let Some(hooks) = &hooks {
+            let before_hook = body.clone();
+            if catch_tool_panic(hooks.before_provider_payload(&mut body))
+                .await
+                .is_err()
+            {
+                body = before_hook;
+            }
+        }
         let tools_for_decoder = req.tools.clone();
         let http = self.http.clone();
         let max_retries = self.max_retries;
         let base_backoff = self.base_backoff;
         let max_backoff = self.max_backoff;
         let extra_headers = self.extra_headers.clone();
-        let hooks = self.hooks.clone();
 
         let is_anthropic = dialect == Dialect::Anthropic;
         // Both OpenAI wire dialects use this for connection-level session-affinity routing, distinct
@@ -462,6 +559,7 @@ impl ModelTransport for GatewayClient {
                 &direct_headers,
                 copilot_dynamic,
                 auth_header.as_deref(),
+                auth_header_prefix.as_deref(),
                 max_retries,
                 base_backoff,
                 max_backoff,
@@ -490,8 +588,8 @@ impl ModelTransport for GatewayClient {
             }
 
             // Frame the chunked body line-by-line. A partial trailing line is buffered across chunks
-            // until its newline arrives. The framing (byte buffering + newline split) lives in
-            // `LineFramer` — see its doc comment for why it buffers raw *bytes*, not a lossy per-chunk
+            // until its terminator arrives. The framing (byte buffering + line-terminator split) lives
+            // in `LineFramer` — see its doc comment for why it buffers raw *bytes*, not a lossy per-chunk
             // string. `sse_buf` is the separate SSE-level buffer that joins consecutive `data:` lines
             // belonging to one logical event (see `SseEventBuffer`'s doc comment) — real
             // Anthropic/OpenAI never split an event across lines, but a spec-conformant intermediary
@@ -539,23 +637,25 @@ impl ModelTransport for GatewayClient {
     }
 }
 
-/// Reassembles a chunked byte stream into whole newline-terminated lines — the SSE framing seam.
+/// Reassembles a chunked byte stream into whole line-terminated lines — the SSE framing seam.
 ///
 /// It buffers raw *bytes*, not a per-chunk lossy string: a TCP/HTTP chunk boundary can split a
 /// multi-byte UTF-8 character, and `from_utf8_lossy` per chunk would replace each half with U+FFFD,
-/// silently corrupting non-ASCII tool arguments and prose. A `\n` (0x0A) never falls inside a UTF-8
-/// multi-byte sequence, so every newline-terminated line handed back by [`next_line`](Self::next_line)
-/// is guaranteed whole UTF-8; only the unterminated tail — which may split a character — stays
-/// buffered for the next chunk (surfaced by [`take_tail`](Self::take_tail) at end-of-stream).
+/// silently corrupting non-ASCII tool arguments and prose. Every terminator this framer recognizes
+/// (`\n`, `\r\n`, or a bare `\r`) is itself a single-byte ASCII value that never falls inside a UTF-8
+/// multi-byte sequence, so every terminated line handed back by [`next_line`](Self::next_line) is
+/// guaranteed whole UTF-8; only the unterminated tail — which may split a character — stays buffered
+/// for the next chunk (surfaced by [`take_tail`](Self::take_tail) at end-of-stream).
 ///
 /// Public so the streaming decode hot path is benchable in isolation (`benches/decode.rs`), the same
 /// way the gateway exposes its request-scan primitives.
 ///
-/// Backed by a [`BytesMut`]: [`next_line`](Self::next_line) finds the newline with SIMD [`memchr`] and
-/// hands the line back via `split_to`, an O(1) pointer split that shares the backing allocation — so a
-/// line costs neither a per-line heap allocation nor a memmove of the buffer remainder. (A `Vec<u8>`
-/// framer paid both on *every* line: `drain(..=nl).collect()` allocates the line and shifts the rest
-/// of the buffer down, which is O(lines × remaining) when a chunk carries many coalesced lines.)
+/// Backed by a [`BytesMut`]: [`next_line`](Self::next_line) finds the terminator with SIMD
+/// [`memchr::memchr2`] and hands the line back via `split_to`, an O(1) pointer split that shares the
+/// backing allocation — so a line costs neither a per-line heap allocation nor a memmove of the buffer
+/// remainder. (A `Vec<u8>` framer paid both on *every* line: `drain(..=nl).collect()` allocates the
+/// line and shifts the rest of the buffer down, which is O(lines × remaining) when a chunk carries many
+/// coalesced lines.)
 #[derive(Default)]
 pub struct LineFramer {
     buf: BytesMut,
@@ -567,6 +667,29 @@ pub struct LineFramer {
 /// pathologically long one from a misbehaving provider/gateway) can grow the buffer before the
 /// stream errors out instead of the process running out of memory.
 const MAX_BUFFERED_LINE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Find the next SSE line terminator in `buf`, returning `(start, len)` where `len` is how many bytes
+/// the terminator itself occupies — `1` for a bare `\n` or a bare `\r`, `2` for a `\r\n` pair (treated
+/// as one terminator, not two separate lines). `None` if no complete terminator is present yet.
+///
+/// The SSE spec accepts all three of LF, CR, and CRLF as a line terminator (matches pi's own
+/// `nextLineBreakIndex`/`consumeLine`, `anthropic-messages.ts`) — this crate used to only recognize
+/// `\n`, so a lone `\r` (no `\n` ever following) sat buffered indefinitely and could merge two logical
+/// SSE lines into one once a later, unrelated `\n` finally arrived. A trailing `\r` with nothing after
+/// it yet is ambiguous — it might be the first half of a CRLF pair whose `\n` hasn't arrived in a later
+/// chunk — so that case waits for more data (or is resolved by [`LineFramer::take_tail`] at
+/// end-of-stream) rather than splitting prematurely.
+fn find_line_break(buf: &[u8]) -> Option<(usize, usize)> {
+    let pos = memchr::memchr2(b'\r', b'\n', buf)?;
+    if buf[pos] == b'\n' {
+        return Some((pos, 1));
+    }
+    match buf.get(pos + 1) {
+        Some(b'\n') => Some((pos, 2)), // CRLF: one terminator, not two
+        Some(_) => Some((pos, 1)),     // bare CR, immediately followed by a non-`\n` byte
+        None => None,                  // trailing CR — could still become CRLF; wait for more data
+    }
+}
 
 impl LineFramer {
     /// A framer with an empty buffer.
@@ -586,13 +709,14 @@ impl LineFramer {
         Ok(())
     }
 
-    /// Pop the next complete line (including its trailing `\n`), or `None` if the buffer holds no
-    /// full line yet — the caller then awaits the next chunk. The returned [`Bytes`] shares the
+    /// Pop the next complete line (including its trailing terminator — `\n`, `\r\n`, or a bare `\r`;
+    /// see [`find_line_break`]), or `None` if the buffer holds no full line yet — the caller then
+    /// awaits the next chunk. The returned [`Bytes`] shares the
     /// framer's backing buffer (no copy); it's dropped as soon as the line is decoded, freeing that
     /// region for the buffer to reclaim.
     pub fn next_line(&mut self) -> Option<Bytes> {
-        let nl = memchr::memchr(b'\n', &self.buf)?;
-        Some(self.buf.split_to(nl + 1).freeze())
+        let (start, len) = find_line_break(&self.buf)?;
+        Some(self.buf.split_to(start + len).freeze())
     }
 
     /// The leftover unterminated tail at end-of-stream (a final line with no trailing newline), or
@@ -696,6 +820,11 @@ async fn send_with_retry(
     // omit `Authorization` entirely) — see `DirectRouting::auth_header`'s doc comment. `None` for
     // every route but Azure OpenAI's `api-key` (Task #8, pi-parity).
     auth_header: Option<&str>,
+    // Prepended to `api_key` when sent through `auth_header` above — Cloudflare AI Gateway's
+    // `cf-aig-authorization: Bearer <key>` (Fix 4, pi-parity Round 2). `None` for every route but
+    // that one, including Azure's (whose `api-key` value stays bare). Has no effect when
+    // `auth_header` itself is `None`.
+    auth_header_prefix: Option<&str>,
     max_retries: u32,
     base_backoff: Duration,
     max_backoff: Duration,
@@ -710,10 +839,14 @@ async fn send_with_retry(
     loop {
         let mut builder = http.post(url).json(body);
         builder = match auth_header {
-            // Azure OpenAI shape: the bare key, verbatim, in its own header — never `Authorization`
-            // (see `DirectRouting::auth_header`'s doc comment on why sending both is a real risk,
-            // not just redundant).
-            Some(name) => builder.header(name, api_key),
+            // Azure OpenAI shape (no prefix, the ordinary case): the bare key, verbatim, in its own
+            // header — never `Authorization` (see `DirectRouting::auth_header`'s doc comment on why
+            // sending both is a real risk, not just redundant). Cloudflare AI Gateway shape (`Some`
+            // prefix, Fix 4): the same named header, but carrying a Bearer-prefixed value.
+            Some(name) => match auth_header_prefix {
+                Some(prefix) => builder.header(name, format!("{prefix}{api_key}")),
+                None => builder.header(name, api_key),
+            },
             None => builder.bearer_auth(api_key),
         };
         for (name, value) in direct_headers {
@@ -912,13 +1045,19 @@ fn is_retryable_send_error(e: &reqwest::Error) -> bool {
 /// proxy's HTML, say) can be arbitrarily large, and this text ends up in logs and `AgentEvent::Error`.
 const MAX_ERROR_BODY_CHARS: usize = 4_000;
 
-/// Truncate an error body to [`MAX_ERROR_BODY_CHARS`], on a char boundary, noting what was cut.
+/// Truncate an error body to [`MAX_ERROR_BODY_CHARS`], on a char boundary, noting what was cut —
+/// including *how much* was cut, matching pi's `truncateErrorText` (`error-body.ts:115-118`:
+/// `` `${text.slice(0, maxChars)}... [truncated ${text.length - maxChars} chars]` ``). The omitted
+/// count matters operationally: a bare "[truncated]" marker with no count leaves an on-call engineer
+/// unable to tell a 1-char overflow from a multi-megabyte proxy error page from the marker alone.
 fn truncate_error_body(s: &str) -> String {
-    if s.chars().count() <= MAX_ERROR_BODY_CHARS {
+    let total = s.chars().count();
+    if total <= MAX_ERROR_BODY_CHARS {
         return s.to_string();
     }
     let kept: String = s.chars().take(MAX_ERROR_BODY_CHARS).collect();
-    format!("{kept}… [truncated]")
+    let omitted = total - MAX_ERROR_BODY_CHARS;
+    format!("{kept}... [truncated {omitted} chars]")
 }
 
 /// Parse a `Retry-After` response header into a duration, capped at `max_backoff`.
@@ -1003,6 +1142,51 @@ mod tests {
         let chunk = vec![b'x'; MAX_BUFFERED_LINE_BYTES];
         framer.extend(&chunk).unwrap(); // exactly at the cap: still fine
         assert!(framer.extend(b"y").is_err()); // one more byte tips it over
+    }
+
+    #[test]
+    fn line_framer_splits_on_a_bare_cr_line_terminator() {
+        // pi-parity fix: the SSE spec (and pi's own `nextLineBreakIndex`/`consumeLine`,
+        // `anthropic-messages.ts`) accepts a lone `\r` (not followed by `\n`) as a valid line
+        // terminator, same as LF and CRLF. Before this fix, `next_line` only searched for `\n`, so a
+        // bare `\r` sat buffered and silently merged two logical SSE lines into one once a later,
+        // unrelated `\n` arrived.
+        let mut framer = LineFramer::new();
+        framer
+            .extend(b"data: {\"a\":1}\rdata: {\"b\":2}\n")
+            .unwrap();
+        assert_eq!(framer.next_line().unwrap(), &b"data: {\"a\":1}\r"[..]);
+        assert_eq!(framer.next_line().unwrap(), &b"data: {\"b\":2}\n"[..]);
+        assert!(framer.next_line().is_none());
+    }
+
+    #[test]
+    fn line_framer_treats_crlf_as_one_terminator_not_two() {
+        // A `\r\n` pair must yield exactly one line break, not a bare-CR line break immediately
+        // followed by an empty LF-terminated line.
+        let mut framer = LineFramer::new();
+        framer.extend(b"data: 1\r\ndata: 2\n").unwrap();
+        assert_eq!(framer.next_line().unwrap(), &b"data: 1\r\n"[..]);
+        assert_eq!(framer.next_line().unwrap(), &b"data: 2\n"[..]);
+        assert!(framer.next_line().is_none());
+    }
+
+    #[test]
+    fn line_framer_holds_a_trailing_bare_cr_until_it_can_tell_it_apart_from_crlf() {
+        // A `\r` at the very end of the currently-buffered bytes is ambiguous — the next chunk might
+        // start with `\n`, making it a CRLF pair instead of a bare-CR-terminated line. Must not split
+        // prematurely; the ambiguity resolves once more bytes (or end-of-stream, via `take_tail`)
+        // arrive.
+        let mut framer = LineFramer::new();
+        framer.extend(b"data: 1\r").unwrap();
+        assert!(
+            framer.next_line().is_none(),
+            "a trailing bare CR must wait for more data before splitting"
+        );
+        // Resolves as a bare CR once a non-`\n` byte follows.
+        framer.extend(b"data: 2\n").unwrap();
+        assert_eq!(framer.next_line().unwrap(), &b"data: 1\r"[..]);
+        assert_eq!(framer.next_line().unwrap(), &b"data: 2\n"[..]);
     }
 
     #[test]
@@ -1141,12 +1325,18 @@ mod tests {
         let short = "gateway timeout";
         assert_eq!(truncate_error_body(short), short);
 
+        // pi-parity fix: the omitted-character count must be included, matching pi's
+        // `truncateErrorText` (`error-body.ts:115-118`), not a bare "[truncated]" marker that leaves
+        // an on-call engineer unable to tell a 1-char overflow from a multi-megabyte error page.
         let huge = "x".repeat(MAX_ERROR_BODY_CHARS + 500);
         let truncated = truncate_error_body(&huge);
-        assert!(truncated.ends_with("… [truncated]"));
+        assert!(
+            truncated.ends_with("... [truncated 500 chars]"),
+            "got: {truncated}"
+        );
         assert_eq!(
             truncated.chars().count(),
-            MAX_ERROR_BODY_CHARS + "… [truncated]".chars().count()
+            MAX_ERROR_BODY_CHARS + "... [truncated 500 chars]".chars().count()
         );
     }
 
@@ -1478,6 +1668,107 @@ mod tests {
                 .iter()
                 .any(|(name, value)| name.eq_ignore_ascii_case("x-probe") && value == "yes"),
             "expected the real response's own headers to reach the hook, got: {headers:?}"
+        );
+    }
+
+    /// Pi-parity fix: nothing previously exposed the literal, dialect-built wire JSON to a hook — only
+    /// the abstract, pre-dialect `ModelRequest` via `before_provider_request` (one layer up, before
+    /// `dialect.build_body` even runs). Proves `before_provider_payload` reaches all the way from
+    /// `GatewayClient::stream` to the *actual bytes* landing on the wire, not just that the trait method
+    /// exists — mirrors the `after_provider_response` test above, but on the request side.
+    #[tokio::test]
+    async fn before_provider_payload_hook_rewrites_the_literal_wire_body_sent_over_http() {
+        struct InjectsPayloadMarker;
+        #[async_trait]
+        impl AgentHooks for InjectsPayloadMarker {
+            async fn before_provider_payload(&self, payload: &mut Value) {
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.insert(
+                        "_wire_marker".to_string(),
+                        serde_json::json!("injected-by-hook"),
+                    );
+                }
+            }
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_clone = captured.clone();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            *captured_clone.lock().unwrap() = buf[..n].to_vec();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+        });
+
+        let hooks = Arc::new(InjectsPayloadMarker);
+        let client = GatewayClient::new(format!("http://{addr}"), "test-key")
+            .unwrap()
+            .with_hooks(hooks);
+        let req = ModelRequest::new("claude-test", Vec::new(), 100);
+        let mut events = client.stream(req).await.unwrap();
+        while events.next().await.is_some() {}
+        server.join().unwrap();
+
+        let request = String::from_utf8_lossy(&captured.lock().unwrap()).to_string();
+        assert!(
+            request.contains("_wire_marker") && request.contains("injected-by-hook"),
+            "expected the hook's mutation to reach the literal wire body actually sent over HTTP, got:\n{request}"
+        );
+    }
+
+    /// A panicking `before_provider_payload` hook must not corrupt or drop the request — same
+    /// "fails open" convention `before_provider_request`'s own panic-safety test uses. The payload sent
+    /// over the wire must be exactly what `build_body` produced, with none of the panicking hook's
+    /// partial mutation.
+    #[tokio::test]
+    async fn a_panicking_before_provider_payload_hook_keeps_the_original_body() {
+        struct AlwaysPanics;
+        #[async_trait]
+        impl AgentHooks for AlwaysPanics {
+            async fn before_provider_payload(&self, payload: &mut Value) {
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.insert("_partial".to_string(), serde_json::json!(true));
+                }
+                panic!("boom: before_provider_payload always panics");
+            }
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_clone = captured.clone();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            *captured_clone.lock().unwrap() = buf[..n].to_vec();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+        });
+
+        let hooks = Arc::new(AlwaysPanics);
+        let client = GatewayClient::new(format!("http://{addr}"), "test-key")
+            .unwrap()
+            .with_hooks(hooks);
+        let req = ModelRequest::new("claude-test", Vec::new(), 100);
+        let mut events = client.stream(req).await.unwrap();
+        while events.next().await.is_some() {}
+        server.join().unwrap();
+
+        let request = String::from_utf8_lossy(&captured.lock().unwrap()).to_string();
+        assert!(
+            !request.contains("_partial"),
+            "a panicking hook's partial mutation must never reach the wire, got:\n{request}"
         );
     }
 
@@ -1844,6 +2135,10 @@ mod tests {
             ],
             copilot_dynamic_headers: false,
             auth_header: None,
+            auth_header_prefix: None,
+            dialect_override: None,
+            deployment_name: None,
+            query: None,
         };
         let client = GatewayClient::with_credential_source(
             format!("http://{addr}"),
@@ -1913,6 +2208,10 @@ mod tests {
             static_headers: vec![("User-Agent", "GitHubCopilotChat/0.35.0".to_string())],
             copilot_dynamic_headers: true,
             auth_header: None,
+            auth_header_prefix: None,
+            dialect_override: None,
+            deployment_name: None,
+            query: None,
         };
         let client = GatewayClient::with_credential_source(
             // A closed port: if the client ever mistakenly used this instead of the credential's own
@@ -1992,6 +2291,10 @@ mod tests {
             static_headers: vec![("User-Agent", "GitHubCopilotChat/0.35.0".to_string())],
             copilot_dynamic_headers: true,
             auth_header: None,
+            auth_header_prefix: None,
+            dialect_override: None,
+            deployment_name: None,
+            query: None,
         };
         let client = GatewayClient::with_credential_source(
             "http://127.0.0.1:1".to_string(),
@@ -2047,6 +2350,10 @@ mod tests {
             static_headers: vec![("User-Agent", "GitHubCopilotChat/0.35.0".to_string())],
             copilot_dynamic_headers: true,
             auth_header: None,
+            auth_header_prefix: None,
+            dialect_override: None,
+            deployment_name: None,
+            query: None,
         };
         let client = GatewayClient::with_credential_source(
             "http://127.0.0.1:1".to_string(),
@@ -2135,6 +2442,10 @@ mod tests {
             static_headers: Vec::new(),
             copilot_dynamic_headers: true,
             auth_header: None,
+            auth_header_prefix: None,
+            dialect_override: None,
+            deployment_name: None,
+            query: None,
         };
         let client = GatewayClient::with_credential_source(
             "http://127.0.0.1:1".to_string(),
@@ -2182,6 +2493,10 @@ mod tests {
             static_headers: Vec::new(),
             copilot_dynamic_headers: false,
             auth_header: Some("api-key".to_string()),
+            auth_header_prefix: None,
+            dialect_override: None,
+            deployment_name: None,
+            query: None,
         };
         let client = GatewayClient::with_credential_source(
             "http://127.0.0.1:1".to_string(),
@@ -2233,6 +2548,10 @@ mod tests {
             static_headers: Vec::new(),
             copilot_dynamic_headers: false,
             auth_header: Some("api-key".to_string()),
+            auth_header_prefix: None,
+            dialect_override: None,
+            deployment_name: None,
+            query: None,
         };
         let client = GatewayClient::with_credential_source(
             // A closed port, same guard as the Copilot test: if the client ever fell back to the
@@ -2296,6 +2615,10 @@ mod tests {
             static_headers: Vec::new(),
             copilot_dynamic_headers: true,
             auth_header: None,
+            auth_header_prefix: None,
+            dialect_override: None,
+            deployment_name: None,
+            query: None,
         };
         let client = GatewayClient::with_credential_source(
             "http://127.0.0.1:1".to_string(),
@@ -2326,6 +2649,325 @@ mod tests {
         assert!(
             lower.contains("copilot-vision-request: true"),
             "an Image content block in this turn must set Copilot-Vision-Request, got:\n{request}"
+        );
+    }
+
+    /// HIGH pi-parity fix: proves `GatewayClient::stream` actually sets [`ModelRequest::is_codex`] on
+    /// the live request from the same `RouteOverride::Prefixed` signal that already picks Codex's own
+    /// URL/path (`prefixed_route_override_reaches_the_gateway_under_the_provider_prefix_with_static_
+    /// headers` proves the routing half; `codex_routed_requests_send_instructions_field_instead_of_
+    /// folding_system_into_input` in `dialect/openai_responses.rs` covers the dialect-side gate
+    /// directly) — the system prompt must land in a top-level `instructions` field, never folded into
+    /// `input`, with `parallel_tool_calls`/`text.verbosity` always present, on the real wire body.
+    #[tokio::test]
+    async fn codex_routed_request_sends_instructions_and_parallel_tool_calls_end_to_end() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+            drop(stream);
+            request
+        });
+
+        let routing = DirectRouting {
+            route: RouteOverride::Prefixed {
+                prefix: "/openai-codex",
+                path: "/backend-api/codex/responses",
+            },
+            static_headers: Vec::new(),
+            copilot_dynamic_headers: false,
+            auth_header: None,
+            auth_header_prefix: None,
+            dialect_override: None,
+            deployment_name: None,
+            query: None,
+        };
+        let client = GatewayClient::with_credential_source(
+            format!("http://{addr}"),
+            Arc::new(DirectTestCredential(routing)),
+        )
+        .unwrap();
+        let req = ModelRequest::new("gpt-5-codex", vec![crate::message::Message::user("hi")], 100)
+            .with_system("be terse");
+        let mut events = client.stream(req).await.unwrap();
+        while events.next().await.is_some() {}
+
+        let request = server.join().unwrap();
+        assert!(
+            request.contains("\"instructions\":\"be terse\""),
+            "expected the system prompt in a top-level instructions field, got:\n{request}"
+        );
+        assert!(
+            request.contains("\"parallel_tool_calls\":true"),
+            "expected parallel_tool_calls:true always sent for a Codex-routed request, got:\n{request}"
+        );
+        assert!(
+            request.contains("\"text\":{\"verbosity\":\"low\"}"),
+            "expected text.verbosity always sent for a Codex-routed request, got:\n{request}"
+        );
+    }
+
+    /// Pi-parity Fix 1 (Round 2): proves [`DirectRouting::dialect_override`] wins over
+    /// `Dialect::for_model_via_copilot`'s own name heuristic. `kimi-k2-thinking` matches neither
+    /// `for_model`'s "claude"/"anthropic" substring check nor `ApiKind::Responses`, so without the
+    /// override it would build an OpenAI Chat Completions body and never send Anthropic's
+    /// `anthropic-version` header — exactly the wire-format mismatch a genuinely Anthropic-wire
+    /// third-party provider (Kimi-Coding) would hit.
+    #[tokio::test]
+    async fn dialect_override_forces_anthropic_wire_for_a_model_id_that_fails_the_name_heuristic() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+            drop(stream);
+            request
+        });
+
+        let routing = DirectRouting {
+            route: RouteOverride::Direct {
+                base_url: format!("http://{addr}"),
+                path: "/v1/messages",
+            },
+            static_headers: Vec::new(),
+            copilot_dynamic_headers: false,
+            auth_header: None,
+            auth_header_prefix: None,
+            dialect_override: Some(Dialect::Anthropic),
+            deployment_name: None,
+            query: None,
+        };
+        let client = GatewayClient::with_credential_source(
+            "http://127.0.0.1:1".to_string(),
+            Arc::new(DirectTestCredential(routing)),
+        )
+        .unwrap();
+        let req = ModelRequest::new("kimi-k2-thinking", vec![crate::message::Message::user("hi")], 100);
+        let mut events = client.stream(req).await.unwrap();
+        while events.next().await.is_some() {}
+
+        let request = server.join().unwrap();
+        let lower = request.to_lowercase();
+        assert!(
+            lower.contains("anthropic-version: 2023-06-01"),
+            "a model id that fails the name heuristic must still build Anthropic wire when \
+             dialect_override says so, got:\n{request}"
+        );
+    }
+
+    /// A non-overridden request for the same id proves the baseline this fix closes: without
+    /// `dialect_override`, `kimi-k2-thinking` falls through to Chat Completions and never sends
+    /// Anthropic's `anthropic-version` header.
+    #[tokio::test]
+    async fn without_a_dialect_override_the_same_model_id_builds_chat_completions_wire() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+            drop(stream);
+            request
+        });
+
+        let client = GatewayClient::new(format!("http://{addr}"), "test-key").unwrap();
+        let req = ModelRequest::new("kimi-k2-thinking", vec![crate::message::Message::user("hi")], 100);
+        let mut events = client.stream(req).await.unwrap();
+        while events.next().await.is_some() {}
+
+        let request = server.join().unwrap();
+        assert!(
+            !request.to_lowercase().contains("anthropic-version:"),
+            "baseline check: an unclassified model id must NOT get Anthropic's own version header \
+             without an explicit dialect_override, got:\n{request}"
+        );
+    }
+
+    /// Pi-parity Fix 2 (Round 2): proves [`DirectRouting::query`] is appended to a `Direct` route's
+    /// URL — an Azure resource pinned to a dated `api-version` needs this on every request.
+    #[tokio::test]
+    async fn direct_route_query_param_is_appended_to_the_built_url() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+            drop(stream);
+            request
+        });
+
+        let routing = DirectRouting {
+            route: RouteOverride::Direct {
+                base_url: format!("http://{addr}/openai/v1"),
+                path: "/responses",
+            },
+            static_headers: Vec::new(),
+            copilot_dynamic_headers: false,
+            auth_header: Some("api-key".to_string()),
+            auth_header_prefix: None,
+            dialect_override: None,
+            deployment_name: None,
+            query: Some("api-version=2024-08-01-preview".to_string()),
+        };
+        let client = GatewayClient::with_credential_source(
+            "http://127.0.0.1:1".to_string(),
+            Arc::new(DirectTestCredential(routing)),
+        )
+        .unwrap();
+        let req = ModelRequest::new("gpt-4o", Vec::new(), 100);
+        let mut events = client.stream(req).await.unwrap();
+        while events.next().await.is_some() {}
+
+        let request = server.join().unwrap();
+        let request_line = request.lines().next().unwrap_or_default();
+        assert_eq!(
+            request_line, "POST /openai/v1/responses?api-version=2024-08-01-preview HTTP/1.1",
+            "expected the api-version query param appended to the Direct route's URL, got:\n{request}"
+        );
+    }
+
+    /// Pi-parity Fix 2 (Round 2): proves [`DirectRouting::deployment_name`] overwrites just the
+    /// wire-level `"model"` field the dialect already built, not `ModelRequest::model` itself — an
+    /// Azure deployment name doesn't have to match the app-level model id.
+    #[tokio::test]
+    async fn deployment_name_override_replaces_the_wire_level_model_field() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+            drop(stream);
+            request
+        });
+
+        let routing = DirectRouting {
+            route: RouteOverride::Direct {
+                base_url: format!("http://{addr}/openai/v1"),
+                path: "/responses",
+            },
+            static_headers: Vec::new(),
+            copilot_dynamic_headers: false,
+            auth_header: Some("api-key".to_string()),
+            auth_header_prefix: None,
+            dialect_override: None,
+            deployment_name: Some("my-azure-deployment".to_string()),
+            query: None,
+        };
+        let client = GatewayClient::with_credential_source(
+            "http://127.0.0.1:1".to_string(),
+            Arc::new(DirectTestCredential(routing)),
+        )
+        .unwrap();
+        // The app-level id used for capability lookups; the wire-level `"model"` field must instead
+        // carry the deployment name.
+        let req = ModelRequest::new("gpt-4o", Vec::new(), 100);
+        let mut events = client.stream(req).await.unwrap();
+        while events.next().await.is_some() {}
+
+        let request = server.join().unwrap();
+        let body_start = request.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+        let body = &request[body_start..];
+        assert!(
+            body.contains("\"model\":\"my-azure-deployment\""),
+            "expected the deployment name in the wire-level model field, got body:\n{body}"
+        );
+        assert!(
+            !body.contains("\"model\":\"gpt-4o\""),
+            "the app-level model id must not leak into the wire-level model field when a deployment \
+             name override is set, got body:\n{body}"
+        );
+    }
+
+    /// Pi-parity Fix 4 (Round 2): proves [`DirectRouting::auth_header_prefix`] prepends the prefix to
+    /// the credential value sent through `auth_header` — Cloudflare AI Gateway's
+    /// `cf-aig-authorization: Bearer <key>`, a named header (like Azure's bare `api-key`) but carrying
+    /// a Bearer-prefixed value (unlike Azure's).
+    #[tokio::test]
+    async fn auth_header_prefix_is_prepended_to_the_credential_value() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+            drop(stream);
+            request
+        });
+
+        let routing = DirectRouting {
+            route: RouteOverride::Direct {
+                base_url: format!("http://{addr}"),
+                path: "/v1/chat/completions",
+            },
+            static_headers: Vec::new(),
+            copilot_dynamic_headers: false,
+            auth_header: Some("cf-aig-authorization".to_string()),
+            auth_header_prefix: Some("Bearer ".to_string()),
+            dialect_override: None,
+            deployment_name: None,
+            query: None,
+        };
+        let client = GatewayClient::with_credential_source(
+            "http://127.0.0.1:1".to_string(),
+            Arc::new(DirectTestCredential(routing)),
+        )
+        .unwrap();
+        let req = ModelRequest::new("llama-3.1-70b", Vec::new(), 100);
+        let mut events = client.stream(req).await.unwrap();
+        while events.next().await.is_some() {}
+
+        let request = server.join().unwrap();
+        let lower = request.to_lowercase();
+        assert!(
+            lower.contains("cf-aig-authorization: bearer test-oauth-token"),
+            "expected the Bearer-prefixed credential in the named header, got:\n{request}"
+        );
+        // `\nauthorization:` (not a bare `"authorization:"` substring, which `cf-aig-authorization:`
+        // itself also contains) — the real `Authorization` header must still be entirely absent.
+        assert!(
+            !lower.contains("\nauthorization:"),
+            "Authorization must be entirely absent when auth_header overrides it, got:\n{request}"
         );
     }
 }

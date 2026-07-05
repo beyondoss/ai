@@ -121,7 +121,8 @@ impl Tool for Find {
     fn description(&self) -> &str {
         "Find files by glob pattern (e.g. \"*.rs\", \"src/**/*.test.ts\"), honoring .gitignore. A \
          pattern without \"/\" matches the file name; with \"/\" it matches the full path. Results are \
-         sorted by path; when more than `limit` match, the lexicographically-smallest are reported."
+         sorted by path and truncated to at most 1000 paths or 50.0KB, whichever is hit first; when \
+         truncated, the lexicographically-smallest paths are reported."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -832,6 +833,23 @@ mod tests {
             out.len() <= super::super::output::MAX_LISTING_BYTES + 256,
             "output should be capped near MAX_LISTING_BYTES, got {} bytes",
             out.len()
+        );
+    }
+
+    #[test]
+    fn description_documents_the_truncation_budget() {
+        // Pi-parity fix: unlike `bash`'s description (which states both its default timeout and its
+        // output truncation budget numerically), `find`'s description only stated the result-count
+        // default in the `limit` schema field, never the overall byte-truncation cap it shares with
+        // `grep`/`ls`.
+        let desc = Find.description().to_string();
+        assert!(
+            desc.contains(&DEFAULT_LIMIT.to_string())
+                && desc.contains(&super::super::output::format_size(
+                    super::super::output::MAX_LISTING_BYTES as u64
+                )),
+            "description should state the result-count and byte truncation budgets numerically, got: \
+             {desc}"
         );
     }
 }

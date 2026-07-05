@@ -159,8 +159,11 @@ impl Tool for Read {
         "read"
     }
     fn description(&self) -> &str {
-        "Read a text file. Optionally start at a 1-based line `offset` and return up to `limit` \
-         lines. Output is line-numbered."
+        "Read a file: text or image (png, jpeg, gif, webp, bmp). Images are sent as attachments the \
+         model can see; a model without vision support gets a text note instead. For text files, \
+         output is line-numbered and truncated to at most 2000 lines or 50.0KB, whichever is hit \
+         first. Use `offset`/`limit` to continue reading a large file from where a truncated call \
+         left off."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -2317,6 +2320,31 @@ mod tests {
             out.text.contains("does not support images"),
             "got: {}",
             out.text
+        );
+    }
+
+    #[test]
+    fn description_documents_image_support_and_the_truncation_budget() {
+        // Pi-parity fix: the description never mentioned this tool's extensive image/vision handling
+        // at all, despite `read_image`/`sniff_image_format` supporting five formats — a model reading
+        // the tool description alone had no way to know it could ask `read` to look at a screenshot.
+        // Matches pi's `read.ts` description, which states both the supported formats and the
+        // text-truncation budget numerically (mirroring `bash`'s own numeric description).
+        let desc = Read::default().description().to_string();
+        for format in ["png", "jpeg", "gif", "webp", "bmp"] {
+            assert!(
+                desc.contains(format),
+                "description should list {format} as a supported image format, got: {desc}"
+            );
+        }
+        assert!(
+            desc.to_lowercase().contains("image"),
+            "description should mention image support, got: {desc}"
+        );
+        assert!(
+            desc.contains(&DEFAULT_LIMIT.to_string())
+                && desc.contains(&super::super::output::format_size(MAX_OUTPUT_BYTES as u64)),
+            "description should state the line/byte truncation budget numerically, got: {desc}"
         );
     }
 }

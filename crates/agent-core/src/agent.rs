@@ -94,6 +94,14 @@ pub enum AgentEvent {
         /// always 0 immediately after `apply_summary` resets that snapshot to point past the rebuilt
         /// list's end.
         tokens_after: u32,
+        /// The pre-compaction index (into the *old* `session.messages`, before [`compaction::apply_summary`]
+        /// spliced the summary in) of the first message this round kept rather than folded away — pi's own
+        /// `CompactionResult.firstKeptEntryId`, minus the id translation: this crate's tree/entry-id layer
+        /// lives one level up in `crates/agent` (`SessionStore`), which this crate has no visibility into,
+        /// so this carries the same cut point as a plain message index instead. A caller that also tracks
+        /// entry ids (the `compact` RPC) resolves this against its own pre-compaction active-path id list
+        /// (parallel to `session.messages` by construction) to recover the actual id pi's field names.
+        first_kept: usize,
     },
     /// The run is ending abnormally (transport failure after retries, malformed SSE, or the step
     /// ceiling). A terminal marker on the event stream so a streaming client sees *why* a run stopped
@@ -1286,6 +1294,25 @@ impl Agent {
                         )));
                         continue;
                     }
+                    // Pi-parity fix: pi's `prepareToolCall` looks up the tool *first* — an unregistered
+                    // tool name resolves straight to its "not found" immediate outcome before
+                    // `prepareToolCallArguments`, `validateToolArguments`, or `config.beforeToolCall` ever
+                    // run (`agent-loop.ts`'s `prepareToolCall`, `!tool` branch). This used to fall through
+                    // to the coercion step and `before_tool_call` below with `input.clone()` unchanged,
+                    // invoking the permission hook for a call that was never going to run anyway — the
+                    // "unknown tool" outcome only surfaced later, in this turn's execution phase. Detect
+                    // it here instead, before either runs, short-circuiting straight to the exact same
+                    // "unknown tool: {name}" error result the execution phase below already produces —
+                    // only *when* it's detected moves, not the message or outcome itself.
+                    let Some(tool) = current_tools.get(name) else {
+                        outcomes[i] = Some(GateOutcome::Immediate((
+                            format!("unknown tool: {name}"),
+                            Vec::new(),
+                            true,
+                            false,
+                        )));
+                        continue;
+                    };
                     // Best-effort pi-parity coercion (`validation.rs`, matches pi's AJV-backed
                     // `validateToolArguments`): a provider that stringified a primitive the model emitted
                     // as genuinely typed (`{"count":"42"}` instead of `{"count":42}`) would otherwise fail
@@ -1297,30 +1324,24 @@ impl Agent {
                     // `config.beforeToolCall`): a permission hook must see the same coerced/typed
                     // arguments the tool itself is about to run with, not the model's raw, possibly
                     // stringified wire values.
-                    let coerced = match current_tools.get(name) {
-                        Some(tool) => {
-                            let mut c = crate::validation::coerce_tool_arguments(
-                                &tool.input_schema(),
-                                input.clone(),
-                            )
-                            .unwrap_or_else(|_| input.clone());
-                            // Task #36 (pi-parity): lets `read` append a "current model doesn't support
-                            // images" note when it reads an image file — schema-undocumented, so it's
-                            // invisible to the model and ignored by every other tool. Task #26 (pi-parity):
-                            // `this.block_images` is an operator-facing override that forces this same
-                            // downgrade path regardless of the model's real capability.
-                            if let Some(obj) = c.as_object_mut() {
-                                obj.insert(
-                                    "_model_supports_vision".to_string(),
-                                    (crate::models::capabilities(&this.model).supports_vision
-                                        && !this.block_images)
-                                        .into(),
-                                );
-                            }
-                            c
-                        }
-                        None => input.clone(),
-                    };
+                    let mut coerced = crate::validation::coerce_tool_arguments(
+                        &tool.input_schema(),
+                        input.clone(),
+                    )
+                    .unwrap_or_else(|_| input.clone());
+                    // Task #36 (pi-parity): lets `read` append a "current model doesn't support
+                    // images" note when it reads an image file — schema-undocumented, so it's
+                    // invisible to the model and ignored by every other tool. Task #26 (pi-parity):
+                    // `this.block_images` is an operator-facing override that forces this same
+                    // downgrade path regardless of the model's real capability.
+                    if let Some(obj) = coerced.as_object_mut() {
+                        obj.insert(
+                            "_model_supports_vision".to_string(),
+                            (crate::models::capabilities(&this.model).supports_vision
+                                && !this.block_images)
+                                .into(),
+                        );
+                    }
                     if let Some(reason) = match catch_tool_panic(
                         this.hooks.before_tool_call(name, &coerced, session_ref, cancel_ref),
                     )
@@ -1692,29 +1713,29 @@ impl Agent {
                 ));
                 continue;
             }
+            // Pi-parity fix: same "look up the tool first" fix as the default gate loop above (see its
+            // own doc comment for the pi `agent-loop.ts` citation) — an unregistered tool name resolves
+            // straight to the "unknown tool" error result, before coercion or `before_tool_call` run.
+            let Some(tool) = tools.get(name) else {
+                results[i] = Some((format!("unknown tool: {name}"), Vec::new(), true, false));
+                continue;
+            };
             // Same pi-parity coercion as the default gate loop, run *before* `before_tool_call` (matches
             // pi's `prepareToolCall`, which calls `validateToolArguments` before `config.beforeToolCall`)
             // so a permission hook sees the same coerced/typed arguments the tool is about to run with,
             // not the model's raw, possibly stringified wire values.
-            let coerced = match tools.get(name) {
-                Some(tool) => {
-                    let mut c = crate::validation::coerce_tool_arguments(
-                        &tool.input_schema(),
-                        input.clone(),
-                    )
-                    .unwrap_or_else(|_| input.clone());
-                    if let Some(obj) = c.as_object_mut() {
-                        obj.insert(
-                            "_model_supports_vision".to_string(),
-                            (crate::models::capabilities(&self.model).supports_vision
-                                && !self.block_images)
-                                .into(),
-                        );
-                    }
-                    c
-                }
-                None => input.clone(),
-            };
+            let mut coerced = crate::validation::coerce_tool_arguments(
+                &tool.input_schema(),
+                input.clone(),
+            )
+            .unwrap_or_else(|_| input.clone());
+            if let Some(obj) = coerced.as_object_mut() {
+                obj.insert(
+                    "_model_supports_vision".to_string(),
+                    (crate::models::capabilities(&self.model).supports_vision && !self.block_images)
+                        .into(),
+                );
+            }
             let blocked = match catch_tool_panic(
                 self.hooks.before_tool_call(name, &coerced, session, cancel),
             )
@@ -2158,6 +2179,7 @@ impl Agent {
             tokens_before,
             summary,
             tokens_after,
+            first_kept,
         });
         Ok(CompactOutcome::Compacted)
     }
@@ -2322,7 +2344,9 @@ fn emit_tool_update(sink: &mut dyn FnMut(AgentEvent), update: crate::tool::ToolU
 /// `execute`, `afterToolCall`) in try/catch, degrading a buggy hook/tool to one failed call instead of
 /// killing the run. Neither `AgentHooks`'s trait methods nor `Tool::run_streaming` return a `Result` a
 /// panic could be redirected through instead — a caller can't opt out of this by returning an error, so
-/// this is the one place that needs to actually catch the unwind.
+/// this is one of the places that needs to actually catch the unwind. `pub(crate)`: `client.rs` reuses it
+/// for the same "fails open" treatment of [`crate::hooks::AgentHooks::before_provider_payload`], one layer
+/// below where this loop lives.
 ///
 /// `AssertUnwindSafe`: the futures here borrow `&self`/`&CancellationToken`/`&Value`/`&str` — all
 /// either `Copy`, plain data, or (for a caller's own hook/tool trait object) opaque behind `&dyn Trait`,
@@ -2331,7 +2355,7 @@ fn emit_tool_update(sink: &mut dyn FnMut(AgentEvent), update: crate::tool::ToolU
 /// about (see the `std::panic` module docs on "exception safety") — there is no interior mutability this
 /// crate's own state relies on being consistent across the unwind (a hook/tool with its own is the
 /// author's responsibility, same as it would be for any other panic in their code).
-async fn catch_tool_panic<F, T>(fut: F) -> std::result::Result<T, String>
+pub(crate) async fn catch_tool_panic<F, T>(fut: F) -> std::result::Result<T, String>
 where
     F: std::future::Future<Output = T>,
 {
@@ -2937,6 +2961,11 @@ impl Accumulator {
                     s.clone_from(text);
                     block_id.clone_from(id);
                     block_phase.clone_from(phase);
+                }
+            }
+            StreamEvent::ThinkingFinal { index, text } => {
+                if let Some(OpenBlock::Thinking(t, _)) = self.open.get_mut(index) {
+                    t.clone_from(text);
                 }
             }
             StreamEvent::ContentBlockStop { index } => self.flush_block(*index),
@@ -5736,6 +5765,168 @@ mod tests {
         }
     }
 
+    /// Pi-parity fix: pi's `prepareToolCall` looks up the tool *first* — an unregistered tool name never
+    /// reaches `config.beforeToolCall` at all (`agent-loop.ts`'s `prepareToolCall`, `!tool` branch).
+    /// This crate used to invoke `before_tool_call` unconditionally, coercion and all, before the
+    /// "tool not found" check ran (in the execution phase, much later) — a permission hook would see (and
+    /// could even block!) a call that was never going to run anyway. Confirms the hook is skipped
+    /// entirely on the default (non-interleaved) dispatch path, while the exact same "unknown tool: …"
+    /// error result from `unknown_tool_yields_error_result` above is still produced.
+    #[tokio::test]
+    async fn before_tool_call_is_not_invoked_for_an_unregistered_tool_name() {
+        struct RecordsCalls(std::sync::Mutex<Vec<String>>);
+        #[async_trait]
+        impl AgentHooks for RecordsCalls {
+            async fn before_tool_call(
+                &self,
+                name: &str,
+                _input: &Value,
+                _session: &Session,
+                _cancel: &CancellationToken,
+            ) -> Option<String> {
+                self.0.lock().unwrap().push(name.to_string());
+                None
+            }
+        }
+
+        let (agent, _mock) = agent_with(
+            vec![
+                turn::tool_call("tu_1", "nonexistent", "{}"),
+                turn::text("ok"),
+            ],
+            ToolRegistry::new(),
+        );
+        let hook = Arc::new(RecordsCalls(std::sync::Mutex::new(Vec::new())));
+        let agent = agent.with_hooks(hook.clone());
+        let mut session = Session::new();
+        session.user("go");
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        assert!(
+            hook.0.lock().unwrap().is_empty(),
+            "before_tool_call must never be invoked for a tool name that isn't registered at all"
+        );
+        match &session.messages[2].content[0] {
+            ContentBlock::ToolResult {
+                is_error, content, ..
+            } => {
+                assert!(is_error);
+                assert!(content.contains("unknown tool"));
+            }
+            other => panic!("expected error tool_result, got {other:?}"),
+        }
+    }
+
+    /// Same fix as the test above, exercised on the *interleaved* dispatch path
+    /// (`Agent::run_tool_calls_interleaved`) instead — a batch containing an unregistered tool name
+    /// alongside a genuinely `ToolExecutionMode::Sequential` tool routes the whole turn through the
+    /// interleaved gate→execute→finalize-per-call loop, which had its own independent copy of the same
+    /// premature-`before_tool_call` bug.
+    #[tokio::test]
+    async fn before_tool_call_is_not_invoked_for_an_unregistered_tool_name_on_the_interleaved_path() {
+        struct SeqTool;
+        #[async_trait]
+        impl Tool for SeqTool {
+            fn name(&self) -> &str {
+                "seq"
+            }
+            fn description(&self) -> &str {
+                "a tool that forces the interleaved dispatch path"
+            }
+            fn input_schema(&self) -> Value {
+                json!({ "type": "object" })
+            }
+            async fn run(
+                &self,
+                _: Value,
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+                Ok("seq-done".into())
+            }
+            fn execution_mode(&self) -> Option<crate::tool::ToolExecutionMode> {
+                Some(crate::tool::ToolExecutionMode::Sequential)
+            }
+        }
+
+        struct RecordsCalls(std::sync::Mutex<Vec<String>>);
+        #[async_trait]
+        impl AgentHooks for RecordsCalls {
+            async fn before_tool_call(
+                &self,
+                name: &str,
+                _input: &Value,
+                _session: &Session,
+                _cancel: &CancellationToken,
+            ) -> Option<String> {
+                self.0.lock().unwrap().push(name.to_string());
+                None
+            }
+        }
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(SeqTool));
+
+        // Both calls land in the same assistant turn — one names a genuinely unregistered tool, the
+        // other names the registered `Sequential` tool that forces the whole batch through
+        // `run_tool_calls_interleaved`.
+        let two_calls = vec![
+            StreamEvent::MessageStart,
+            StreamEvent::ToolUseStart {
+                index: 0,
+                id: "tu_1".into(),
+                name: "nonexistent".into(),
+            },
+            StreamEvent::InputJsonDelta {
+                index: 0,
+                partial_json: "{}".into(),
+            },
+            StreamEvent::ContentBlockStop { index: 0 },
+            StreamEvent::ToolUseStart {
+                index: 0,
+                id: "tu_2".into(),
+                name: "seq".into(),
+            },
+            StreamEvent::InputJsonDelta {
+                index: 0,
+                partial_json: "{}".into(),
+            },
+            StreamEvent::ContentBlockStop { index: 0 },
+            StreamEvent::MessageStop {
+                stop_reason: StopReason::ToolUse,
+            },
+        ];
+        let (agent, _mock) = agent_with(vec![two_calls, turn::text("ok")], tools);
+        let hook = Arc::new(RecordsCalls(std::sync::Mutex::new(Vec::new())));
+        let agent = agent.with_hooks(hook.clone());
+        let mut session = Session::new();
+        session.user("go");
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        assert_eq!(
+            hook.0.lock().unwrap().as_slice(),
+            ["seq"],
+            "before_tool_call must fire for the registered call but never for the unregistered one, \
+             even when both share a batch routed through the interleaved path"
+        );
+        match &session.messages[2].content[0] {
+            ContentBlock::ToolResult {
+                is_error, content, ..
+            } => {
+                assert!(is_error);
+                assert!(content.contains("unknown tool"));
+            }
+            other => panic!("expected error tool_result for the unregistered call, got {other:?}"),
+        }
+        match &session.messages[2].content[1] {
+            ContentBlock::ToolResult {
+                is_error, content, ..
+            } => {
+                assert!(!is_error);
+                assert_eq!(content, "seq-done");
+            }
+            other => panic!("expected a successful tool_result for the registered call, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn failing_tool_is_reported_not_fatal() {
         let mut tools = ToolRegistry::new();
@@ -7323,7 +7514,7 @@ mod tests {
         // No turns scripted at all: any model call at all would panic/error the mock, failing the
         // test loudly rather than silently passing.
         let mock = Arc::new(MockTransport::new(vec![]));
-        let agent = Agent::new(mock.clone(), "claude-opus-4-8"); // default keep_recent_tokens (40k)
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8"); // default keep_recent_tokens (20k)
         let cancel = CancellationToken::new();
         let compacted = agent
             .compact(
@@ -7350,7 +7541,7 @@ mod tests {
     #[tokio::test]
     async fn compact_is_a_no_op_when_new_content_since_the_prior_summary_still_fits_the_budget() {
         // Broader than the `first_kept == 1` test above (pi-parity gap, second pass): with the real
-        // default `keep_recent_tokens` (40k), `[summary, user, assistant, user, assistant]` lands
+        // default `keep_recent_tokens` (20k), `[summary, user, assistant, user, assistant]` lands
         // `find_split_cut`'s `first_kept` at 2, not 1 — the old narrower guard only checked for
         // exactly 1 and would have re-summarized here even though none of the new content is remotely
         // close to the recent-token budget. Verified empirically before the fix: this exact fixture
@@ -7370,7 +7561,7 @@ mod tests {
 
         // No turns scripted: any model call at all fails the test loudly.
         let mock = Arc::new(MockTransport::new(vec![]));
-        let agent = Agent::new(mock.clone(), "claude-opus-4-8"); // default keep_recent_tokens (40k)
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8"); // default keep_recent_tokens (20k)
         let cancel = CancellationToken::new();
         let compacted = agent
             .compact(
@@ -7481,7 +7672,7 @@ mod tests {
         // unreachably large number the model would reject.
         let mock = Arc::new(MockTransport::new(vec![]));
         // claude-3-haiku-20240307: gen-3 legacy, max_output 4_096 (see `models.rs`) — comfortably
-        // below the default reserve_tokens(24_000)*0.8 = 19_200, so the clamp must bite.
+        // below the default reserve_tokens(16_384)*0.8 = 13_107, so the clamp must bite.
         let agent = Agent::new(mock, "claude-3-haiku-20240307");
         assert_eq!(
             agent.compaction.summary_max_tokens, 4_096,
@@ -7492,7 +7683,7 @@ mod tests {
         // old flat 4096 default.
         let mock2 = Arc::new(MockTransport::new(vec![]));
         let agent2 = Agent::new(mock2, "claude-opus-4-8");
-        assert_eq!(agent2.compaction.summary_max_tokens, 19_200);
+        assert_eq!(agent2.compaction.summary_max_tokens, 13_107);
     }
 
     #[test]
@@ -7509,7 +7700,7 @@ mod tests {
             ..CompactionConfig::default()
         });
         assert_eq!(
-            agent.compaction.summary_max_tokens, 19_200,
+            agent.compaction.summary_max_tokens, 13_107,
             "must rescale to 0.8 * reserve_tokens against the model's real max_output, not reset to \
              the flat 4096 default"
         );
@@ -7573,6 +7764,52 @@ mod tests {
             &session.messages[1].content[1],
             ContentBlock::Text { text, .. } if text == "the answer"
         ));
+    }
+
+    #[tokio::test]
+    async fn thinking_final_resyncs_over_a_dropped_mid_stream_delta() {
+        // pi-parity fix: OpenAI Responses' `output_item.done` for a `reasoning` item now resyncs the
+        // block's visible thinking text via `StreamEvent::ThinkingFinal` (mirroring `TextFinal` for a
+        // text block), so a single dropped/duplicated mid-stream `ThinkingDelta` — a relay hiccup with
+        // no transport-level error, nothing else would ever catch it — can't silently leave the
+        // persisted/displayed thinking text corrupted. Here the delta alone only ever accumulates
+        // "partial reason", but the resync's authoritative text is longer — the assembled block must
+        // reflect the resync, not the deltas it replaces.
+        let thinking_turn = vec![
+            StreamEvent::MessageStart,
+            StreamEvent::ThinkingDelta {
+                index: 0,
+                text: "partial reason".into(),
+            },
+            StreamEvent::ThinkingFinal {
+                index: 0,
+                text: "partial reasoning, now complete".into(),
+            },
+            StreamEvent::SignatureDelta {
+                index: 0,
+                signature: "sig-xyz".into(),
+            },
+            StreamEvent::ContentBlockStop { index: 0 },
+            StreamEvent::MessageStop {
+                stop_reason: StopReason::EndTurn,
+            },
+        ];
+        let (agent, _mock) = agent_with(vec![thinking_turn], ToolRegistry::new());
+        let mut session = Session::new();
+        session.user("think");
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        match &session.messages[1].content[0] {
+            ContentBlock::Thinking { text, signature } => {
+                assert_eq!(
+                    text, "partial reasoning, now complete",
+                    "ThinkingFinal must replace whatever the accumulated deltas produced, not be \
+                     ignored"
+                );
+                assert_eq!(signature, "sig-xyz");
+            }
+            other => panic!("expected a thinking block first, got {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -468,6 +468,14 @@ pub enum StreamEvent {
         id: Option<String>,
         phase: Option<String>,
     },
+    /// The provider's own authoritative, complete visible thinking text for block `index`, replacing
+    /// whatever `ThinkingDelta` fragments accumulated so far. Same resync purpose as `TextFinal`, for a
+    /// reasoning item: OpenAI Responses' `output_item.done` carries the item's own `summary`/`content`
+    /// parts as ground truth, so a single dropped or duplicated mid-stream
+    /// `reasoning_summary_text.delta`/`reasoning_text.delta` chunk — a relay hiccup with no
+    /// transport-level error, nothing else would ever catch it — can't silently leave the persisted/
+    /// displayed thinking text corrupted. `None` from every other dialect, which never emits this event.
+    ThinkingFinal { index: usize, text: String },
     /// Block `index` finished (text or tool-call).
     ContentBlockStop { index: usize },
     /// Token accounting. May arrive at end-of-stream (OpenAI) or alongside other events (Anthropic).

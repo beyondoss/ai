@@ -1948,6 +1948,221 @@ fn run_binary_model_override_api_key_resolves_a_bang_command() {
 }
 
 #[test]
+fn run_binary_model_override_dialect_forces_anthropic_wire_for_a_model_id_that_fails_the_heuristic() {
+    // Fix 1 (pi-parity, Round 2): a genuinely Anthropic-wire third-party provider (the motivating case:
+    // Kimi-Coding's `api.kimi.com/coding`) whose model ids don't carry a "claude"/"anthropic" substring
+    // would, without a `dialect` override, get an OpenAI-shaped body built and POSTed to an Anthropic
+    // Messages endpoint — a hard wire-format mismatch. `kimi-k2-thinking` deliberately fails
+    // `Dialect::for_model`'s own heuristic; the mock server only understands the Anthropic SSE shape
+    // (`turn_text`), so the run only succeeds end-to-end if `dialect: "anthropic"` actually won.
+    let dir = tempfile::tempdir().unwrap();
+    let config_dir = dir.path().join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
+    std::fs::write(
+        config_dir.join("models.json"),
+        format!(r#"{{"kimi-k2-thinking": {{"base_url": "{base}", "dialect": "anthropic"}}}}"#),
+    )
+    .unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .env("AI_AGENT_CONFIG_DIR", &config_dir)
+        .args([
+            "run",
+            "hello",
+            "--gateway-url",
+            "http://127.0.0.1:1",
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "kimi-k2-thinking",
+            "--no-session-persistence",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed — a model id that fails the dialect heuristic must still work end-to-end \
+         when `dialect` is overridden.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("done"),
+        "expected the mock's Anthropic-shaped turn to have been decoded successfully: {stdout}"
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[0].to_ascii_lowercase().contains("anthropic-version: 2023-06-01"),
+        "expected the Anthropic-only version header on the outgoing request, proving the override \
+         actually changed the wire dialect, not just the endpoint path: {}",
+        bodies[0]
+    );
+}
+
+#[test]
+fn run_binary_model_override_api_version_is_appended_as_a_query_param() {
+    // Fix 2 (pi-parity, Round 2): most real enterprise Azure OpenAI deployments are pinned to a dated
+    // `api-version`; beyond previously had no way to send one at all on a `base_url`-direct-routed
+    // request.
+    let dir = tempfile::tempdir().unwrap();
+    let config_dir = dir.path().join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
+    std::fs::write(
+        config_dir.join("models.json"),
+        format!(r#"{{"claude-test": {{"base_url": "{base}", "api_version": "2024-08-01-preview"}}}}"#),
+    )
+    .unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .env("AI_AGENT_CONFIG_DIR", &config_dir)
+        .args([
+            "run",
+            "hello",
+            "--gateway-url",
+            "http://127.0.0.1:1",
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--no-session-persistence",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    let request_line = bodies[0].lines().next().unwrap_or_default();
+    assert_eq!(
+        request_line, "POST /v1/messages?api-version=2024-08-01-preview HTTP/1.1",
+        "expected the api_version override appended as a query param, got:\n{}",
+        bodies[0]
+    );
+}
+
+#[test]
+fn run_binary_model_override_deployment_name_replaces_the_wire_level_model_field() {
+    // Fix 2 (pi-parity, Round 2): an Azure deployment's name doesn't have to match the model id used
+    // for capability lookups (mirrors pi's own `AZURE_OPENAI_DEPLOYMENT_NAME_MAP`).
+    let dir = tempfile::tempdir().unwrap();
+    let config_dir = dir.path().join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
+    std::fs::write(
+        config_dir.join("models.json"),
+        format!(r#"{{"claude-test": {{"base_url": "{base}", "deployment_name": "my-azure-deployment"}}}}"#),
+    )
+    .unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .env("AI_AGENT_CONFIG_DIR", &config_dir)
+        .args([
+            "run",
+            "hello",
+            "--gateway-url",
+            "http://127.0.0.1:1",
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--no-session-persistence",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[0].contains(r#""model":"my-azure-deployment""#),
+        "expected the deployment name in the wire-level model field, got:\n{}",
+        bodies[0]
+    );
+    assert!(
+        !bodies[0].contains(r#""model":"claude-test""#),
+        "the app-level model id must not leak into the wire-level model field, got:\n{}",
+        bodies[0]
+    );
+}
+
+#[test]
+fn run_binary_model_override_auth_header_prefix_prepends_bearer_to_a_named_header() {
+    // Fix 4 (pi-parity, Round 2): Cloudflare AI Gateway wants `cf-aig-authorization: Bearer <key>` — a
+    // named header (already possible via `auth_header`) carrying a Bearer-prefixed value (which bare
+    // `auth_header` doesn't).
+    let dir = tempfile::tempdir().unwrap();
+    let config_dir = dir.path().join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
+    std::fs::write(
+        config_dir.join("models.json"),
+        format!(
+            r#"{{"claude-test": {{"base_url": "{base}", "api_key": "my-cf-key", "auth_header": "cf-aig-authorization", "auth_header_prefix": "Bearer "}}}}"#
+        ),
+    )
+    .unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .env("AI_AGENT_CONFIG_DIR", &config_dir)
+        .args([
+            "run",
+            "hello",
+            "--gateway-url",
+            "http://127.0.0.1:1",
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--no-session-persistence",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    let lower = bodies[0].to_ascii_lowercase();
+    assert!(
+        lower.contains("cf-aig-authorization: bearer my-cf-key"),
+        "expected the Bearer-prefixed credential in the named header, got:\n{}",
+        bodies[0]
+    );
+    assert!(
+        !lower.contains("\nauthorization:"),
+        "Authorization must be entirely absent when auth_header overrides it, got:\n{}",
+        bodies[0]
+    );
+}
+
+#[test]
 fn run_binary_idle_timeout_ms_flag_causes_a_stalled_response_to_fail_quickly() {
     // Task #19 (pi-parity feature): `with_idle_timeout` previously had zero callers. A server that
     // answers headers plus one partial event, then goes silent well past a deliberately shrunk

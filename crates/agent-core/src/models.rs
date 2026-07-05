@@ -120,6 +120,13 @@ pub struct ModelCaps {
     /// mutually-exclusive `fine-grained-tool-streaming-2025-05-14` beta header instead has somewhere to
     /// say so.
     pub supports_eager_tool_streaming: bool,
+    /// Whether tool definitions on the OpenAI Chat-Completions wire should be sent alongside a
+    /// top-level `tool_stream: true` (ignored outside that dialect, and only ever emitted when the
+    /// request actually carries tools — see [`crate::dialect::openai::build_body`]). Mirrors pi's
+    /// `compat.zaiToolStream` (`openai-completions.ts:582-586`): every current Z.ai/GLM id sets it
+    /// except `glm-4.5-air`, the one id pi's own `zai.models.ts`/`zai-coding-cn.models.ts` catalogue
+    /// leaves it off for; no other family sets it at all.
+    pub supports_tool_stream: bool,
     /// Which OpenAI-wire API surface the model speaks (ignored for Anthropic ids). See [`ApiKind`].
     pub api: ApiKind,
     /// The lowest [`crate::transport::ReasoningEffort`] this model's wire actually accepts — a request
@@ -158,6 +165,7 @@ impl ModelCaps {
             reasoning_effort: false,
             reasoning_disableable: false,
             supports_eager_tool_streaming: false,
+            supports_tool_stream: false,
             api: ApiKind::ChatCompletions,
             min_reasoning_effort: crate::transport::ReasoningEffort::Minimal,
             supports_xhigh_reasoning: true,
@@ -259,6 +267,27 @@ pub fn is_non_standard_store_provider(model: &str) -> bool {
 pub fn capabilities(model: &str) -> ModelCaps {
     use crate::transport::ReasoningEffort as RE;
     let m = model.to_ascii_lowercase();
+    // The id the third-party family branches below (DeepSeek, GLM, Kimi, MiniMax, Qwen, MiMo) match
+    // their bare-id patterns against: the suffix after the last `/` for a vendor-slug id — the shape
+    // aggregator hosts (Together, HuggingFace, NVIDIA NIM, …) prefix a model with the org that trained
+    // it (`"moonshotai/Kimi-K2.6"`, `"zai-org/GLM-5.2"`, `"XiaomiMiMo/MiMo-V2.5-Pro"`) — or the id
+    // itself when it isn't slug-prefixed at all. Using this (rather than the raw id, or a
+    // `.contains(family)` substring check) fixes two failure modes at once: a slug-prefixed id whose
+    // org slug doesn't happen to start with the family name (`"moonshotai/kimi-k2.6"` doesn't start
+    // with `"kimi"`) used to fall all the way through to the generic 128k/32k vendor-slug fallback
+    // further below; and an org slug that *does* happen to share a literal prefix with a different
+    // family's own name — `"MiniMaxAI/MiniMax-M3"` lowercases to `"minimaxai/minimax-m3"`, which
+    // itself begins with the literal string `"minimax"` one character early — used to land in the
+    // right family branch but silently match the wrong per-id sub-case inside it (the flat "else"
+    // shape, not `minimax-m3`'s real one). Deliberately not applied to Anthropic/OpenAI/Mistral/
+    // xAI/Cerebras-native/Groq/Llama below: none of those are reachable through an aggregator's
+    // vendor-slug id shape in pi's live catalogues, and blanket-applying it there would let a
+    // vendor-slug id's *suffix* alone decide family membership for providers that never actually
+    // appear slug-prefixed — an unnecessary widening of what each of those branches matches.
+    let family_id: &str = match m.rfind('/') {
+        Some(idx) => &m[idx + 1..],
+        None => &m,
+    };
 
     // ---- Anthropic Claude (+ Fable, which speaks the Anthropic wire) ----
     if m.starts_with("claude") || m.starts_with("fable") {
@@ -315,6 +344,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
                 reasoning_effort: false,
                 reasoning_disableable,
                 supports_eager_tool_streaming: true,
+                supports_tool_stream: false,
                 api: ApiKind::ChatCompletions,
                 min_reasoning_effort: crate::transport::ReasoningEffort::Minimal,
                 supports_xhigh_reasoning,
@@ -353,6 +383,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
                 // that never supported thinking might reject.
                 reasoning_disableable: false,
                 supports_eager_tool_streaming: true,
+                supports_tool_stream: false,
                 api: ApiKind::ChatCompletions,
                 min_reasoning_effort: crate::transport::ReasoningEffort::Minimal,
                 supports_xhigh_reasoning: true,
@@ -379,6 +410,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
             reasoning_effort: false,
             reasoning_disableable: true,
             supports_eager_tool_streaming: true,
+            supports_tool_stream: false,
             api: ApiKind::ChatCompletions,
             // Budget-shape thinking sends a numeric `budget_tokens`, never a named effort string, so
             // `min_reasoning_effort`/`adaptive_xhigh_effort_wire` are never read for this shape — left
@@ -431,6 +463,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
             // o-series ids are disable-capable by default in pi's catalogue (no override).
             reasoning_disableable: true,
             supports_eager_tool_streaming: false,
+            supports_tool_stream: false,
             api: ApiKind::Responses,
             min_reasoning_effort: crate::transport::ReasoningEffort::Minimal,
             // No o-series id carries a `thinkingLevelMap` at all in pi's catalogue, and an unmapped
@@ -463,6 +496,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
                 reasoning_effort,
                 reasoning_disableable: false,
                 supports_eager_tool_streaming: false,
+                supports_tool_stream: false,
                 api: ApiKind::Responses,
                 min_reasoning_effort: crate::transport::ReasoningEffort::Minimal,
                 supports_xhigh_reasoning: gpt5_supports_xhigh(&m),
@@ -487,6 +521,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
                 reasoning_effort: true,
                 reasoning_disableable: false,
                 supports_eager_tool_streaming: false,
+                supports_tool_stream: false,
                 api: ApiKind::Responses,
                 min_reasoning_effort: crate::transport::ReasoningEffort::Minimal,
                 supports_xhigh_reasoning: true,
@@ -541,6 +576,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
             reasoning_effort: true,
             reasoning_disableable,
             supports_eager_tool_streaming: false,
+            supports_tool_stream: false,
             api: ApiKind::Responses,
             min_reasoning_effort,
             supports_xhigh_reasoning: gpt5_supports_xhigh(&m),
@@ -565,6 +601,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
                 reasoning_effort: false,
                 reasoning_disableable: false,
                 supports_eager_tool_streaming: false,
+                supports_tool_stream: false,
                 api: ApiKind::Responses,
                 // The gpt-4 family never takes `reasoning_effort` at all — these three are unread.
                 min_reasoning_effort: crate::transport::ReasoningEffort::Minimal,
@@ -586,6 +623,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
                 reasoning_effort: false,
                 reasoning_disableable: false,
                 supports_eager_tool_streaming: false,
+                supports_tool_stream: false,
                 api: ApiKind::Responses,
                 // The gpt-4 family never takes `reasoning_effort` at all — these three are unread.
                 min_reasoning_effort: crate::transport::ReasoningEffort::Minimal,
@@ -618,6 +656,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
             reasoning_effort: false,
             reasoning_disableable: false,
             supports_eager_tool_streaming: false,
+            supports_tool_stream: false,
             api: ApiKind::Responses,
             min_reasoning_effort: crate::transport::ReasoningEffort::Minimal,
             supports_xhigh_reasoning: true,
@@ -650,8 +689,10 @@ pub fn capabilities(model: &str) -> ModelCaps {
     // wired as `"max"`) — pi: `compat.thinkingFormat: "deepseek"`, `thinkingLevelMap: {high:"high",
     // xhigh:"max"}`, `supportsReasoningEffort` left at its (`!isZai && …`) default of `true`.
     // DeepSeek's own auto-detected `maxTokensField` is `max_completion_tokens` (not in pi's
-    // `useMaxTokens` allowlist), matching this table's other reasoning-model families.
-    if m.starts_with("deepseek") {
+    // `useMaxTokens` allowlist), matching this table's other reasoning-model families. Also matches a
+    // vendor-slug id whose suffix is a DeepSeek id (e.g. Together/HuggingFace's
+    // `"deepseek-ai/DeepSeek-V4-Pro"`) via `family_id` — see its own doc comment above.
+    if m.starts_with("deepseek") || family_id.starts_with("deepseek") {
         return ModelCaps {
             context_window: 1_000_000,
             max_output: 384_000,
@@ -663,10 +704,61 @@ pub fn capabilities(model: &str) -> ModelCaps {
             reasoning_effort: true,
             reasoning_disableable: true,
             supports_eager_tool_streaming: false,
+            supports_tool_stream: false,
             api: ApiKind::ChatCompletions,
             min_reasoning_effort: RE::High,
             supports_xhigh_reasoning: true,
             adaptive_xhigh_effort_wire: "max",
+            openai_reasoning_format: OpenAiReasoningFormat::DeepSeek,
+        };
+    }
+
+    // Xiaomi/MiMo: no bare "mimo"/"xiaomi" branch existed at all before this — every current id
+    // (`packages/ai/src/providers/xiaomi.models.ts`, identical across the ams/cn/sgp token-plan
+    // variants — only `baseUrl`/`provider` differ) fell all the way through to `ModelCaps::unknown()`,
+    // capping `max_output` at 4096 regardless of the model's real 65536-384000 one and disabling
+    // reasoning entirely. pi tags every id `compat: {"requiresReasoningContentOnAssistantMessages":
+    // true, "thinkingFormat": "deepseek"}` — the identical `thinking:{enabled/disabled}` toggle
+    // DeepSeek and Kimi share, with a sibling `reasoning_effort` string since `supportsReasoningEffort`
+    // resolves `true` for this provider (xiaomi isn't in pi's `isGrok`/`isZai`/`isMoonshot`/`isTogether`/
+    // `isCloudflareAiGateway`/`isNvidia`/`isAntLing` exclusion list) — the exact same
+    // `OpenAiReasoningFormat::DeepSeek` shape, reused rather than adding a new enum variant. No id
+    // carries a `thinkingLevelMap` at all, so (unlike real DeepSeek) there's no floor/remap: every
+    // effort level is legal and sent under its own literal name. `"mimo-v2.5-pro"` starts with the same
+    // string as the vision-capable bare `"mimo-v2.5"`, so vision is matched by exact id, not prefix.
+    // Also matches a vendor-slug id (HuggingFace's `"XiaomiMiMo/MiMo-V2.5-Pro"`) via `family_id`.
+    if m.starts_with("mimo") || family_id.starts_with("mimo") {
+        // Keyed on whether `m` is slug-shaped at all — same reasoning as the MiniMax/GLM/Kimi branches.
+        let k = if m.contains('/') { family_id } else { m.as_str() };
+        let (context_window, max_output, supports_vision) = if k == "mimo-v2-flash" {
+            (262_144, 65_536, false)
+        } else if k == "mimo-v2-omni" {
+            (262_144, 131_072, true)
+        } else if k == "mimo-v2-pro" {
+            (1_048_576, 131_072, false)
+        } else if k == "mimo-v2.5" {
+            (1_048_576, 131_072, true)
+        } else {
+            // "mimo-v2.5-pro", "mimo-v2.5-pro-ultraspeed", and any future id this exact-match table
+            // doesn't recognize yet: most current ids share this 1M/131k, text-only shape.
+            (1_048_576, 131_072, false)
+        };
+        return ModelCaps {
+            context_window,
+            max_output,
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+            supports_long_cache: true,
+            supports_vision,
+            supports_temperature: true,
+            thinking: ThinkingShape::None,
+            reasoning_effort: true,
+            reasoning_disableable: true,
+            supports_eager_tool_streaming: false,
+            supports_tool_stream: false,
+            api: ApiKind::ChatCompletions,
+            min_reasoning_effort: RE::Minimal,
+            supports_xhigh_reasoning: true,
+            adaptive_xhigh_effort_wire: "xhigh",
             openai_reasoning_format: OpenAiReasoningFormat::DeepSeek,
         };
     }
@@ -731,6 +823,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
             // every reasoning-capable id can be told to turn reasoning off.
             reasoning_disableable: reasoning_effort,
             supports_eager_tool_streaming: false,
+            supports_tool_stream: false,
             api: ApiKind::ChatCompletions,
             min_reasoning_effort: RE::Minimal,
             // No Mistral id defines an "xhigh" wire value at all.
@@ -743,13 +836,18 @@ pub fn capabilities(model: &str) -> ModelCaps {
     // Z.ai/GLM: `compat.thinkingFormat: "zai"` — a `thinking:{enabled/disabled}` toggle sent
     // unconditionally, with a `reasoning_effort` string only from GLM-5.2 onward
     // (`supportsReasoningEffort` is `false` on every earlier id in pi's catalogue). `glm-5v*` is the
-    // one vision-capable id; every other current id is text-only.
-    if m.starts_with("glm") {
-        let (context_window, max_output, reasoning_effort) = if m.starts_with("glm-5.2") {
+    // one vision-capable id; every other current id is text-only. Also matches a vendor-slug id (e.g.
+    // Together's/HuggingFace's `"zai-org/GLM-5.2"`) via `family_id` — see its own doc comment above.
+    if m.starts_with("glm") || family_id.starts_with("glm") {
+        // Keyed on whether `m` is slug-shaped at all (not on which disjunct above matched) — same
+        // reasoning as the MiniMax branch below, applied uniformly even though no current GLM org
+        // slug happens to collide with the literal prefix "glm" the way MiniMax's does.
+        let g = if m.contains('/') { family_id } else { m.as_str() };
+        let (context_window, max_output, reasoning_effort) = if g.starts_with("glm-5.2") {
             (1_000_000, 131_072, true)
-        } else if m.starts_with("glm-4.5-air") {
+        } else if g.starts_with("glm-4.5-air") {
             (131_072, 98_304, false)
-        } else if m.starts_with("glm-4.7") {
+        } else if g.starts_with("glm-4.7") {
             (204_800, 131_072, false)
         } else {
             (200_000, 131_072, false)
@@ -759,17 +857,21 @@ pub fn capabilities(model: &str) -> ModelCaps {
             max_output,
             max_tokens_field: MaxTokensField::MaxCompletionTokens,
             supports_long_cache: true,
-            supports_vision: m.starts_with("glm-5v"),
+            supports_vision: g.starts_with("glm-5v"),
             supports_temperature: true,
             thinking: ThinkingShape::None,
             reasoning_effort,
             reasoning_disableable: true,
             supports_eager_tool_streaming: false,
+            // Every current GLM id sets pi's `compat.zaiToolStream: true` except "glm-4.5-air", the
+            // one id both `zai.models.ts` and `zai-coding-cn.models.ts` leave it off for (see
+            // `ModelCaps::supports_tool_stream`'s own doc comment).
+            supports_tool_stream: !g.starts_with("glm-4.5-air"),
             api: ApiKind::ChatCompletions,
             // glm-5.2+ nulls "minimal" out of its `thinkingLevelMap` (excluded entirely, not just
             // remapped) — every earlier GLM id has no reasoning vocabulary at all, so this floor is
             // unread for them regardless.
-            min_reasoning_effort: if m.starts_with("glm-5.2") {
+            min_reasoning_effort: if g.starts_with("glm-5.2") {
                 RE::Low
             } else {
                 RE::Minimal
@@ -786,18 +888,22 @@ pub fn capabilities(model: &str) -> ModelCaps {
     // (0711/0905/turbo-preview previews) have `reasoning: false` in pi's catalogue, so they get
     // `OpenAiReasoningFormat::Standard` instead (with `reasoning_effort: false`, that emits nothing —
     // matching pi's own `model.reasoning` gate). `kimi-k2.7-code*` uniquely has no "off" wire value
-    // (`thinkingLevelMap: {"off": null}`); every other reasoning-capable id can be disabled.
-    if m.starts_with("kimi") {
-        let non_reasoning = m.starts_with("kimi-k2-0711")
-            || m.starts_with("kimi-k2-0905")
-            || m.starts_with("kimi-k2-turbo-preview");
-        let (context_window, max_output) = if m.starts_with("kimi-k2-0711") {
+    // (`thinkingLevelMap: {"off": null}`); every other reasoning-capable id can be disabled. Also
+    // matches a vendor-slug id (e.g. Together's/HuggingFace's `"moonshotai/Kimi-K2.6"`) via
+    // `family_id` — see its own doc comment above.
+    if m.starts_with("kimi") || family_id.starts_with("kimi") {
+        // Keyed on whether `m` is slug-shaped at all — same reasoning as the MiniMax/GLM branches.
+        let k = if m.contains('/') { family_id } else { m.as_str() };
+        let non_reasoning = k.starts_with("kimi-k2-0711")
+            || k.starts_with("kimi-k2-0905")
+            || k.starts_with("kimi-k2-turbo-preview");
+        let (context_window, max_output) = if k.starts_with("kimi-k2-0711") {
             (131_072, 16_384)
         } else {
             (262_144, 262_144)
         };
         let supports_vision =
-            m.starts_with("kimi-k2.5") || m.starts_with("kimi-k2.6") || m.starts_with("kimi-k2.7");
+            k.starts_with("kimi-k2.5") || k.starts_with("kimi-k2.6") || k.starts_with("kimi-k2.7");
         return ModelCaps {
             context_window,
             max_output,
@@ -807,8 +913,9 @@ pub fn capabilities(model: &str) -> ModelCaps {
             supports_temperature: true,
             thinking: ThinkingShape::None,
             reasoning_effort: false,
-            reasoning_disableable: !non_reasoning && !m.starts_with("kimi-k2.7-code"),
+            reasoning_disableable: !non_reasoning && !k.starts_with("kimi-k2.7-code"),
             supports_eager_tool_streaming: false,
+            supports_tool_stream: false,
             api: ApiKind::ChatCompletions,
             min_reasoning_effort: RE::Minimal,
             supports_xhigh_reasoning: true,
@@ -849,6 +956,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
             reasoning_effort: false,
             reasoning_disableable: false,
             supports_eager_tool_streaming: false,
+            supports_tool_stream: false,
             api: ApiKind::ChatCompletions,
             min_reasoning_effort: RE::Minimal,
             supports_xhigh_reasoning: false,
@@ -866,9 +974,20 @@ pub fn capabilities(model: &str) -> ModelCaps {
     // truncation gap (context/max output) `Agent::new` reads regardless of which dialect ends up
     // serving the request, and deliberately leaves `reasoning_effort`/`openai_reasoning_format` at
     // their inert defaults rather than emit an OpenAI-shaped reasoning toggle a real MiniMax endpoint
-    // wouldn't understand.
-    if m.starts_with("minimax") {
-        let (context_window, max_output, supports_vision) = if m.starts_with("minimax-m3") {
+    // wouldn't understand. Also matches a vendor-slug id via `family_id` — see its own doc comment
+    // above; this one matters even for a *bare* MiniMax-family match, not just a missed one:
+    // HuggingFace/Together's real id is `"MiniMaxAI/MiniMax-M3"`, whose lowercased org slug
+    // (`"minimaxai"`) itself starts with the literal string `"minimax"` one character early, so
+    // matching against the raw `m` here would already (mis)fire this whole branch — just against the
+    // wrong per-id sub-case inside it (the flat "else" shape below, not `minimax-m3`'s real one) —
+    // without `family_id` correctly isolating the actual suffix first.
+    if m.starts_with("minimax") || family_id.starts_with("minimax") {
+        // Deliberately keyed on whether `m` is slug-shaped at all (`m.contains('/')`), not on which
+        // disjunct above matched: `m.starts_with("minimax")` is *already* (coincidentally) true for
+        // "minimaxai/minimax-m3" itself, so selecting on that would silently keep matching the raw,
+        // slug-prefixed `m` below instead of the real suffix `family_id` isolated it to.
+        let mm = if m.contains('/') { family_id } else { m.as_str() };
+        let (context_window, max_output, supports_vision) = if mm.starts_with("minimax-m3") {
             (1_000_000, 128_000, true)
         } else {
             (204_800, 131_072, false)
@@ -884,6 +1003,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
             reasoning_effort: false,
             reasoning_disableable: false,
             supports_eager_tool_streaming: false,
+            supports_tool_stream: false,
             api: ApiKind::ChatCompletions,
             min_reasoning_effort: RE::Minimal,
             supports_xhigh_reasoning: false,
@@ -909,6 +1029,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
             reasoning_effort: true,
             reasoning_disableable: false,
             supports_eager_tool_streaming: false,
+            supports_tool_stream: false,
             api: ApiKind::ChatCompletions,
             min_reasoning_effort: RE::High,
             supports_xhigh_reasoning: false,
@@ -916,7 +1037,12 @@ pub fn capabilities(model: &str) -> ModelCaps {
             openai_reasoning_format: OpenAiReasoningFormat::Standard,
         };
     }
-    if m.starts_with("qwen") {
+    // In practice every Together/HuggingFace-hosted Qwen id's own org slug is literally "qwen/…", so
+    // `m.starts_with("qwen")` already matches these without needing `family_id` — but check it too
+    // (harmless: `family_id` reduces to the same suffix either way) so a future host whose org slug
+    // *doesn't* happen to start with "qwen" isn't silently missed the way Kimi/GLM/MiniMax/DeepSeek's
+    // vendor-slug ids used to be.
+    if m.starts_with("qwen") || family_id.starts_with("qwen") {
         return ModelCaps {
             context_window: 200_000,
             max_output: 40_960,
@@ -928,6 +1054,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
             reasoning_effort: false,
             reasoning_disableable: true,
             supports_eager_tool_streaming: false,
+            supports_tool_stream: false,
             api: ApiKind::ChatCompletions,
             min_reasoning_effort: RE::Minimal,
             supports_xhigh_reasoning: true,
@@ -956,6 +1083,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
             reasoning_effort: true,
             reasoning_disableable: true,
             supports_eager_tool_streaming: false,
+            supports_tool_stream: false,
             api: ApiKind::ChatCompletions,
             min_reasoning_effort: RE::Minimal,
             supports_xhigh_reasoning: true,
@@ -979,6 +1107,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
             reasoning_effort: true,
             reasoning_disableable: true,
             supports_eager_tool_streaming: false,
+            supports_tool_stream: false,
             api: ApiKind::ChatCompletions,
             min_reasoning_effort: RE::Minimal,
             supports_xhigh_reasoning: true,
@@ -998,6 +1127,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
             reasoning_effort: false,
             reasoning_disableable: false,
             supports_eager_tool_streaming: false,
+            supports_tool_stream: false,
             api: ApiKind::ChatCompletions,
             min_reasoning_effort: RE::Minimal,
             supports_xhigh_reasoning: false,
@@ -1027,6 +1157,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
             reasoning_effort: true,
             reasoning_disableable: true,
             supports_eager_tool_streaming: false,
+            supports_tool_stream: false,
             api: ApiKind::ChatCompletions,
             min_reasoning_effort: RE::Minimal,
             supports_xhigh_reasoning: true,
@@ -1064,16 +1195,24 @@ pub fn reasoning_wire_override(
 ) -> Option<&'static str> {
     use crate::transport::ReasoningEffort as RE;
     let m = model.to_ascii_lowercase();
+    // Matched the same way `capabilities` matches its own family branches — see `family_id`'s doc
+    // comment there — so a vendor-slug id (`"zai-org/glm-5.2"`, Together/HuggingFace) remaps
+    // identically to the bare id it's slug-prefixed with, instead of silently keeping the clamped
+    // effort's own literal name just because the full id doesn't start with the family's prefix.
+    let family_id: &str = match m.rfind('/') {
+        Some(idx) => &m[idx + 1..],
+        None => &m,
+    };
     // DeepSeek: `thinkingLevelMap` nulls minimal/low/medium (already reflected in
     // `min_reasoning_effort: High`, so only High/XHigh can ever reach here); xhigh alone remaps, to
     // "max".
-    if m.starts_with("deepseek") {
+    if m.starts_with("deepseek") || family_id.starts_with("deepseek") {
         return (effort == RE::XHigh).then_some("max");
     }
     // GLM-5.2+: low/medium/high all collapse to the literal "high", and xhigh remaps to "max". Every
     // earlier GLM id has no reasoning_effort vocabulary at all (`caps.reasoning_effort == false`), so
     // `apply_reasoning_wire` never calls this for them regardless.
-    if m.starts_with("glm-5.2") {
+    if m.starts_with("glm-5.2") || family_id.starts_with("glm-5.2") {
         return match effort {
             RE::Low | RE::Medium | RE::High => Some("high"),
             RE::XHigh => Some("max"),
@@ -1261,7 +1400,16 @@ pub fn clamp_reasoning_effort(
 /// without this arm such a model would be misreported as having no mechanism at all, `Off`-locked, even
 /// though `--thinking high` genuinely turns its reasoning on. Shared by [`available_thinking_levels`],
 /// [`clamp_thinking_level`], and [`thinking_for_level`] so the three stay consistent with each other.
-fn has_reasoning_mechanism(caps: &ModelCaps) -> bool {
+///
+/// `pub` (not module-private): `crates/agent`'s own `default_reasoning_effort_for_model`/`model_info`
+/// call this directly instead of maintaining their own narrower copy of the same check. A prior version
+/// of both did exactly that — checking only `reasoning_effort`/`thinking` — which silently missed the
+/// third arm above: Kimi-thinking and pre-5.2 GLM models (`openai_reasoning_format` toggle shapes with
+/// `reasoning_effort: false` and `thinking: ThinkingShape::None`) read as "no reasoning mechanism at
+/// all" under that narrower check, so a bare invocation picked no default reasoning effort for them at
+/// all, even though pi's own reference defaults every reasoning-capable model — this family included —
+/// to medium effort.
+pub fn has_reasoning_mechanism(caps: &ModelCaps) -> bool {
     caps.reasoning_effort
         || caps.thinking != ThinkingShape::None
         || caps.openai_reasoning_format != OpenAiReasoningFormat::Standard
@@ -2359,6 +2507,154 @@ mod tests {
         assert_eq!(bare.max_output, 4_096);
     }
 
+    // ---- Vendor-slug family matching + MiMo (pi-parity remediation) ----
+
+    #[test]
+    fn together_hosted_vendor_slug_ids_hit_their_real_family_not_the_generic_fallback() {
+        // Before `family_id`, a vendor-slug id whose org prefix doesn't happen to start with the
+        // family name (`"moonshotai/Kimi-K2.6"` doesn't start with "kimi") fell all the way through to
+        // the generic 128k/32k `ApiKind::ChatCompletions`/`OpenRouter`-shaped fallback further below —
+        // wrong by roughly 2-8x depending on the field. Numbers ported from
+        // `packages/ai/src/providers/together.models.ts`.
+        let kimi = capabilities("moonshotai/Kimi-K2.6");
+        assert_eq!(kimi.context_window, 262_144);
+        assert!(kimi.supports_vision, "kimi-k2.6 is vision-capable");
+        assert_eq!(kimi.openai_reasoning_format, OpenAiReasoningFormat::DeepSeek);
+        assert_ne!(
+            kimi.openai_reasoning_format,
+            OpenAiReasoningFormat::OpenRouter,
+            "must not land on the generic vendor-slug fallback"
+        );
+
+        let glm = capabilities("zai-org/GLM-5.2");
+        assert_eq!(glm.context_window, 1_000_000);
+        assert_eq!(glm.max_output, 131_072);
+        assert!(glm.reasoning_effort, "glm-5.2 has a real effort vocabulary");
+        assert_eq!(glm.openai_reasoning_format, OpenAiReasoningFormat::Zai);
+    }
+
+    #[test]
+    fn huggingface_hosted_vendor_slug_ids_also_hit_their_real_family() {
+        // A different aggregator, same org-slug id shape (`packages/ai/src/providers/
+        // huggingface.models.ts`) — confirms the fix isn't Together-specific.
+        let kimi = capabilities("moonshotai/Kimi-K2-Thinking");
+        assert_eq!(kimi.context_window, 262_144);
+        assert_eq!(kimi.max_output, 262_144);
+        assert_eq!(kimi.openai_reasoning_format, OpenAiReasoningFormat::DeepSeek);
+
+        let glm = capabilities("zai-org/GLM-4.7");
+        assert_eq!(glm.context_window, 204_800);
+        assert_eq!(glm.max_output, 131_072);
+        assert_eq!(glm.openai_reasoning_format, OpenAiReasoningFormat::Zai);
+    }
+
+    #[test]
+    fn vendor_slug_minimax_m3_isnt_shadowed_by_its_own_org_slug_prefix_collision() {
+        // "MiniMaxAI/MiniMax-M3" lowercases to "minimaxai/minimax-m3" — the org slug ("minimaxai")
+        // itself begins with the literal string "minimax" one character early. Selecting the match
+        // target by "did the raw id already start with the family name" (rather than by whether the
+        // id is slug-shaped at all) would silently land in the right family branch but match the
+        // wrong per-id sub-case inside it: the flat, smaller "else" shape below instead of
+        // "minimax-m3"'s real 1M-context/vision-capable one.
+        let c = capabilities("MiniMaxAI/MiniMax-M3");
+        assert_eq!(c.context_window, 1_000_000);
+        assert_eq!(c.max_output, 128_000);
+        assert!(c.supports_vision);
+    }
+
+    #[test]
+    fn vendor_slug_deepseek_and_groq_qwen_ids_are_unaffected_by_family_id() {
+        // These two already matched correctly before `family_id` existed (DeepSeek's org slug
+        // "deepseek-ai" itself starts with "deepseek"; Groq's real qwen id already carries its own
+        // slash). Regression guard that the refactor didn't change either.
+        let ds = capabilities("deepseek-ai/DeepSeek-V4-Pro");
+        assert_eq!(ds.context_window, 1_000_000);
+        assert_eq!(ds.max_output, 384_000);
+
+        let groq = capabilities("qwen/qwen3-32b");
+        assert_eq!(groq.openai_reasoning_format, OpenAiReasoningFormat::Standard);
+        assert!(groq.reasoning_effort);
+    }
+
+    #[test]
+    fn mimo_gets_its_real_capabilities_not_the_unknown_default() {
+        // The CRITICAL bug this closes: no "mimo"/"xiaomi" branch existed at all, so every bare
+        // "mimo-*" id (`xiaomi.models.ts`'s ids aren't vendor-slug prefixed) fell all the way through
+        // to `ModelCaps::unknown()` — a 4096-token output ceiling regardless of the model's real
+        // 65536-384000 one, and no reasoning support at all.
+        let flash = capabilities("mimo-v2-flash");
+        assert_eq!(flash.context_window, 262_144);
+        assert_eq!(flash.max_output, 65_536);
+        assert!(!flash.supports_vision);
+
+        let omni = capabilities("mimo-v2-omni");
+        assert_eq!(omni.max_output, 131_072);
+        assert!(omni.supports_vision);
+
+        let v25 = capabilities("mimo-v2.5");
+        assert_eq!(v25.context_window, 1_048_576);
+        assert!(v25.supports_vision, "bare mimo-v2.5 is vision-capable");
+
+        // "mimo-v2.5-pro" shares its prefix with "mimo-v2.5" but is NOT vision-capable — regression
+        // guard that vision is matched by exact id, not by prefix.
+        let v25_pro = capabilities("mimo-v2.5-pro");
+        assert_eq!(v25_pro.context_window, 1_048_576);
+        assert!(!v25_pro.supports_vision);
+
+        for id in [
+            "mimo-v2-flash",
+            "mimo-v2-omni",
+            "mimo-v2-pro",
+            "mimo-v2.5",
+            "mimo-v2.5-pro",
+            "mimo-v2.5-pro-ultraspeed",
+        ] {
+            let c = capabilities(id);
+            assert!(c.reasoning_effort, "{id}");
+            assert!(c.reasoning_disableable, "{id}");
+            assert_eq!(c.max_tokens_field, MaxTokensField::MaxCompletionTokens, "{id}");
+            assert_eq!(c.openai_reasoning_format, OpenAiReasoningFormat::DeepSeek, "{id}");
+            assert!(
+                c.max_output > ModelCaps::unknown().max_output,
+                "{id} should beat unknown()'s 4096 ceiling"
+            );
+        }
+    }
+
+    #[test]
+    fn mimo_vendor_slug_id_also_matches_the_family() {
+        // HuggingFace hosts this family vendor-slug-prefixed: "XiaomiMiMo/MiMo-V2.5-Pro".
+        let c = capabilities("XiaomiMiMo/MiMo-V2.5-Pro");
+        assert_eq!(c.context_window, 1_048_576);
+        assert_eq!(c.max_output, 131_072);
+        assert!(!c.supports_vision);
+        assert_eq!(c.openai_reasoning_format, OpenAiReasoningFormat::DeepSeek);
+    }
+
+    #[test]
+    fn supports_tool_stream_is_true_for_every_glm_id_except_glm_4_5_air() {
+        for id in ["glm-4.7", "glm-5-turbo", "glm-5.1", "glm-5.2", "glm-5v-turbo"] {
+            assert!(capabilities(id).supports_tool_stream, "{id} should set tool_stream");
+        }
+        assert!(
+            !capabilities("glm-4.5-air").supports_tool_stream,
+            "glm-4.5-air is the one id both zai.models.ts and zai-coding-cn.models.ts leave it off for"
+        );
+        // Vendor-slug GLM ids inherit the flag through the same family branch.
+        assert!(capabilities("zai-org/GLM-5.2").supports_tool_stream);
+        // No other family sets it.
+        for id in [
+            "deepseek-v4-pro",
+            "kimi-k2-thinking",
+            "gpt-4o",
+            "claude-opus-4-8",
+            "mimo-v2.5",
+            "some-vendor/some-model",
+        ] {
+            assert!(!capabilities(id).supports_tool_stream, "{id}");
+        }
+    }
+
     #[test]
     fn budget_for_effort_with_override_prefers_the_override_table_but_still_clamps_to_max_output() {
         use crate::transport::ReasoningEffort as RE;
@@ -2493,6 +2789,16 @@ mod tests {
         // function would ever see it in practice; confirm that floor directly.
         assert_eq!(capabilities("glm-5.2").min_reasoning_effort, RE::Low);
         assert_eq!(capabilities("glm-4.7").min_reasoning_effort, RE::Minimal);
+    }
+
+    #[test]
+    fn reasoning_wire_override_remaps_vendor_slug_glm_5_2_same_as_the_bare_id() {
+        use crate::transport::ReasoningEffort as RE;
+        // "zai-org/glm-5.2" (Together/HuggingFace) must remap identically to the bare "glm-5.2" it's
+        // slug-prefixed with, not silently fall through to `None` because the full id doesn't start
+        // with "glm-5.2".
+        assert_eq!(reasoning_wire_override("zai-org/glm-5.2", RE::Low), Some("high"));
+        assert_eq!(reasoning_wire_override("zai-org/glm-5.2", RE::XHigh), Some("max"));
     }
 
     #[test]

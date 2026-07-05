@@ -490,6 +490,13 @@ pub fn build_body(req: &ModelRequest) -> Value {
             }))
             .collect();
         map.insert("tools".into(), Value::Array(tools));
+        // Z.ai/GLM's streamed tool-call protocol extension — pi: `if (context.tools?.length &&
+        // compat.zaiToolStream) params.tool_stream = true` (`openai-completions.ts:582-586`), sent only
+        // alongside a non-empty `tools` array, never on the tool-history-only fallback just below (pi's
+        // own condition is on `context.tools`, not `hasToolHistory`).
+        if caps.supports_tool_stream {
+            map.insert("tool_stream".into(), json!(true));
+        }
     } else if has_tool_history(&req.messages) {
         // pi-parity fix: no tools are registered *this* turn (e.g. the caller toggled tools off
         // mid-session, or ran `--no-tools` on a follow-up), but the conversation already contains
@@ -2800,6 +2807,42 @@ data: [DONE]
             let body = build_body(&ModelRequest::new(id, vec![Message::user("hi")], 64));
             assert!(body.get("store").is_none(), "{id}: got {body:#?}");
         }
+    }
+
+    #[test]
+    fn tool_stream_is_emitted_for_glm_ids_when_tools_are_present() {
+        // pi: `if (context.tools?.length && compat.zaiToolStream) params.tool_stream = true`
+        // (`openai-completions.ts:582-586`). Every current GLM id sets `zaiToolStream` except
+        // "glm-4.5-air".
+        let tool = ToolDef {
+            name: "get_weather".into(),
+            description: "weather".into(),
+            input_schema: json!({ "type": "object" }),
+        };
+        let req = ModelRequest::new("glm-5.2", vec![Message::user("hi")], 64)
+            .with_tools(vec![tool.clone()]);
+        assert_eq!(build_body(&req)["tool_stream"], true);
+
+        // glm-4.5-air is the one GLM id that does NOT set it.
+        let req = ModelRequest::new("glm-4.5-air", vec![Message::user("hi")], 64)
+            .with_tools(vec![tool.clone()]);
+        assert!(build_body(&req).get("tool_stream").is_none());
+
+        // No other family emits it, even with tools present.
+        for id in ["gpt-4o", "deepseek-v4-pro", "kimi-k2-thinking", "mistral-large-latest"] {
+            let req = ModelRequest::new(id, vec![Message::user("hi")], 64)
+                .with_tools(vec![tool.clone()]);
+            assert!(
+                build_body(&req).get("tool_stream").is_none(),
+                "{id}: got {:#?}",
+                build_body(&req)
+            );
+        }
+
+        // A GLM id with no tools this turn (and no tool history) must not emit it either — pi's own
+        // condition is gated on `context.tools?.length`, not on the model alone.
+        let req = ModelRequest::new("glm-5.2", vec![Message::user("hi")], 64);
+        assert!(build_body(&req).get("tool_stream").is_none());
     }
 
     #[test]

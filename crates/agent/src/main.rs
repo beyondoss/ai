@@ -357,11 +357,11 @@ enum Command {
         #[arg(long, env = "AI_AGENT_CONTEXT_WINDOW")]
         context_window: Option<u32>,
         /// Compaction headroom (tokens) reserved below the context window before it fires. Defaults to
-        /// `CompactionConfig::default()`'s 24,000. `serve`'s identical flag.
+        /// `CompactionConfig::default()`'s 16,384. `serve`'s identical flag.
         #[arg(long, env = "AI_AGENT_COMPACTION_RESERVE_TOKENS")]
         compaction_reserve_tokens: Option<u32>,
         /// Roughly how many tokens of recent conversation compaction keeps verbatim. Defaults to
-        /// `CompactionConfig::default()`'s 40,000. `serve`'s identical flag.
+        /// `CompactionConfig::default()`'s 20,000. `serve`'s identical flag.
         #[arg(long, env = "AI_AGENT_COMPACTION_KEEP_RECENT_TOKENS")]
         compaction_keep_recent_tokens: Option<u32>,
         /// Disable automatic (threshold-triggered) compaction entirely — the loop only ever compacts on
@@ -668,11 +668,11 @@ enum Command {
         #[arg(long, default_value_t = false)]
         force_untrusted: bool,
         /// Compaction headroom (tokens) reserved below the context window before it fires. Defaults to
-        /// `CompactionConfig::default()`'s 24,000.
+        /// `CompactionConfig::default()`'s 16,384.
         #[arg(long, env = "AI_AGENT_COMPACTION_RESERVE_TOKENS")]
         compaction_reserve_tokens: Option<u32>,
         /// Roughly how many tokens of recent conversation compaction keeps verbatim. Defaults to
-        /// `CompactionConfig::default()`'s 40,000.
+        /// `CompactionConfig::default()`'s 20,000.
         #[arg(long, env = "AI_AGENT_COMPACTION_KEEP_RECENT_TOKENS")]
         compaction_keep_recent_tokens: Option<u32>,
         /// Disable automatic (threshold-triggered) compaction entirely — `run`'s identical flag. When
@@ -926,6 +926,81 @@ enum Command {
         /// Repeatable.
         #[arg(long = "clear-thinking-budget", value_name = "EFFORT")]
         clear_thinking_budget: Vec<String>,
+        /// Set the stored default `--bash-shell-path` (used when neither `--bash-shell-path` nor
+        /// `AI_AGENT_BASH_SHELL_PATH` is given, for both `run` and `serve`) — Round 3 (pi-parity fix).
+        #[arg(long)]
+        default_bash_shell_path: Option<String>,
+        /// Clear the stored default `--bash-shell-path`.
+        #[arg(long, default_value_t = false)]
+        clear_default_bash_shell_path: bool,
+        /// Set the stored default `--bash-command-prefix` (used when neither the flag nor
+        /// `AI_AGENT_BASH_COMMAND_PREFIX` is given) — Round 3 (pi-parity fix).
+        #[arg(long)]
+        default_bash_command_prefix: Option<String>,
+        /// Clear the stored default `--bash-command-prefix`.
+        #[arg(long, default_value_t = false)]
+        clear_default_bash_command_prefix: bool,
+        /// Set the stored default compaction reserve-token override (used when neither
+        /// `--compaction-reserve-tokens` nor `AI_AGENT_COMPACTION_RESERVE_TOKENS` is given) — Round 3
+        /// (pi-parity fix).
+        #[arg(long)]
+        default_compaction_reserve_tokens: Option<u32>,
+        /// Clear the stored default compaction reserve-token override.
+        #[arg(long, default_value_t = false)]
+        clear_default_compaction_reserve_tokens: bool,
+        /// Set the stored default compaction keep-recent-token override (used when neither
+        /// `--compaction-keep-recent-tokens` nor `AI_AGENT_COMPACTION_KEEP_RECENT_TOKENS` is given) —
+        /// Round 3 (pi-parity fix).
+        #[arg(long)]
+        default_compaction_keep_recent_tokens: Option<u32>,
+        /// Clear the stored default compaction keep-recent-token override.
+        #[arg(long, default_value_t = false)]
+        clear_default_compaction_keep_recent_tokens: bool,
+        /// Set the stored default retry max-retries override (used when neither `--retry-max-retries`
+        /// nor `AI_AGENT_RETRY_MAX_RETRIES` is given) — Round 3 (pi-parity fix).
+        #[arg(long)]
+        default_retry_max_retries: Option<u32>,
+        /// Clear the stored default retry max-retries override.
+        #[arg(long, default_value_t = false)]
+        clear_default_retry_max_retries: bool,
+        /// Set the stored default retry base-delay override, in milliseconds (used when neither
+        /// `--retry-base-delay-ms` nor `AI_AGENT_RETRY_BASE_DELAY_MS` is given) — Round 3 (pi-parity
+        /// fix).
+        #[arg(long)]
+        default_retry_base_delay_ms: Option<u64>,
+        /// Clear the stored default retry base-delay override.
+        #[arg(long, default_value_t = false)]
+        clear_default_retry_base_delay_ms: bool,
+        /// Set the stored default provider (idle-read) timeout override, in milliseconds (used when
+        /// neither `--idle-timeout-ms` nor `AI_AGENT_IDLE_TIMEOUT_MS` is given; `run`-only today) —
+        /// Round 3 (pi-parity fix).
+        #[arg(long)]
+        default_provider_timeout_ms: Option<u64>,
+        /// Clear the stored default provider-timeout override.
+        #[arg(long, default_value_t = false)]
+        clear_default_provider_timeout_ms: bool,
+        /// Set the stored default `--models` scoping/cycling candidate list, comma-separated (used when
+        /// neither `--models` nor `AI_AGENT_MODELS` is given; `serve`-only) — Round 3 (pi-parity fix).
+        #[arg(long = "default-models", value_delimiter = ',')]
+        default_models: Option<Vec<String>>,
+        /// Clear the stored default `--models` list.
+        #[arg(long, default_value_t = false)]
+        clear_default_models: bool,
+        /// Set the stored default extra skill-discovery paths, comma-separated (used when no `--skill
+        /// <path>`/`AI_AGENT_SKILL_PATH` is given) — Round 3 (pi-parity fix).
+        #[arg(long = "default-skill-paths", value_delimiter = ',')]
+        default_skill_paths: Option<Vec<String>>,
+        /// Clear the stored default extra skill-discovery paths.
+        #[arg(long, default_value_t = false)]
+        clear_default_skill_paths: bool,
+        /// Set the stored default extra prompt-template-discovery paths, comma-separated (used when no
+        /// `--prompt-template <path>`/`AI_AGENT_PROMPT_TEMPLATE_PATH` is given) — Round 3 (pi-parity
+        /// fix).
+        #[arg(long = "default-prompt-template-paths", value_delimiter = ',')]
+        default_prompt_template_paths: Option<Vec<String>>,
+        /// Clear the stored default extra prompt-template-discovery paths.
+        #[arg(long, default_value_t = false)]
+        clear_default_prompt_template_paths: bool,
     },
     /// Render an existing session's `.jsonl` file as a self-contained HTML transcript and exit — pure
     /// offline rendering of what's already on disk, no gateway/key/model involved at all (unlike `run
@@ -1302,11 +1377,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             name,
             prompt_guidelines,
         } => {
-            if let Some(path) = &bash_shell_path {
-                if !std::path::Path::new(path).exists() {
-                    return Err(format!("--bash-shell-path not found: {path}").into());
-                }
-            }
             // Fail fast, before starting the server — see `run_task`'s identical check for why this
             // rejects rather than silently clearing (pi's own `--name` behavior).
             if let Some(n) = &name {
@@ -1355,7 +1425,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             // A stored `agent settings` default sits between an explicit flag/env var and this crate's
             // own built-in default — same convention `run_task` applies (see its identical comment).
-            let stored_settings = beyond_ai_agent::settings::SettingsStore::open_default();
+            // Feature 2 (Round 3, pi-parity): merges a trusted project's own
+            // `<cwd>/.claude/settings.json` tier on top of the global one first — see
+            // `settings::effective_settings_for_cwd`'s own doc comment for the trust-gating rationale.
+            let cwd = canonical_cwd(&std::env::current_dir().unwrap_or_default());
+            let stored_settings = beyond_ai_agent::settings::effective_settings_for_cwd(&cwd);
+            // Round 3 (pi-parity fix): same "explicit flag/env, then stored setting, then built-in
+            // default" precedence as every other `stored_settings`-backed fallback here — see
+            // `run_task`'s identical block, just below in this file, for the full set.
+            let bash_shell_path =
+                bash_shell_path.or_else(|| stored_settings.default_bash_shell_path.clone());
+            let bash_command_prefix =
+                bash_command_prefix.or_else(|| stored_settings.default_bash_command_prefix.clone());
+            let compaction_reserve_tokens =
+                compaction_reserve_tokens.or(stored_settings.default_compaction_reserve_tokens);
+            let compaction_keep_recent_tokens =
+                compaction_keep_recent_tokens.or(stored_settings.default_compaction_keep_recent_tokens);
+            let retry_max_retries = retry_max_retries.or(stored_settings.default_retry_max_retries);
+            let retry_base_delay_ms =
+                retry_base_delay_ms.or(stored_settings.default_retry_base_delay_ms);
+            let models = models.or_else(|| stored_settings.default_models_list.clone());
+            let extra_skill_paths = if extra_skill_paths.is_empty() {
+                stored_settings.default_skill_paths.clone().unwrap_or_default()
+            } else {
+                extra_skill_paths
+            };
+            let extra_prompt_template_paths = if extra_prompt_template_paths.is_empty() {
+                stored_settings
+                    .default_prompt_template_paths
+                    .clone()
+                    .unwrap_or_default()
+            } else {
+                extra_prompt_template_paths
+            };
+            // Validated once the whole fallback chain (explicit flag, then stored setting) has resolved
+            // — moved below the resolution above so a value that only came from a stored default is
+            // checked exactly like an explicit flag would be, not skipped.
+            if let Some(path) = &bash_shell_path {
+                if !std::path::Path::new(path).exists() {
+                    return Err(format!("--bash-shell-path not found: {path}").into());
+                }
+            }
             // Task #5 (pi-parity fix): whether the operator explicitly passed `--model`/
             // `--reasoning-effort` for *this* invocation, as opposed to falling back to a stored
             // `agent settings` default or this crate's own built-in default — the distinction `serve`'s
@@ -1366,7 +1476,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let model_explicit = model.is_some();
             let mut reasoning_effort_explicit = reasoning_effort.is_some();
             let resolved_model = model
-                .or_else(|| stored_settings.get().default_model.clone())
+                .or_else(|| stored_settings.default_model.clone())
                 .unwrap_or_else(|| DEFAULT_MODEL.to_string());
             // Fix 10 (pi-parity feature): `run`'s identical resolution — see that call site's doc
             // comment for why this must happen before `resolve_gateway_credential` below.
@@ -1399,7 +1509,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // — see that call site's doc comment.
             let reasoning_effort = reasoning_effort.or_else(|| {
                 stored_settings
-                    .get()
                     .default_reasoning_effort
                     .as_deref()
                     .and_then(|s| parse_reasoning_effort(s).ok())
@@ -1410,14 +1519,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // stored session-dir default even when the operator explicitly chose `--session-file`
                 // would silently switch them into repo mode instead of the file mode they asked for.
                 if session_file.is_none() {
-                    stored_settings.get().default_session_dir.clone()
+                    stored_settings.default_session_dir.clone()
                 } else {
                     None
                 }
             });
             let shutdown_cause = serve::serve(serve::ServeConfig {
                 gateway: gateway_url
-                    .or_else(|| stored_settings.get().default_gateway_url.clone())
+                    .or_else(|| stored_settings.default_gateway_url.clone())
                     .unwrap_or_else(|| DEFAULT_GATEWAY.to_string()),
                 key,
                 model: resolved_model,
@@ -1464,7 +1573,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // `agent settings --default-project-trust` policy had zero effect on serve sessions even
                 // though `run` above already partially honored it — see `serve::resolve_project_trust`,
                 // the shared precedence both now consult.
-                default_project_trust: stored_settings.get().default_project_trust,
+                default_project_trust: stored_settings.default_project_trust,
             })
             .await?;
             // `serve` reads stdin via `tokio::io::stdin()`, which parks a dedicated blocking OS
@@ -1629,6 +1738,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             clear_image_auto_resize,
             thinking_budget,
             clear_thinking_budget,
+            default_bash_shell_path,
+            clear_default_bash_shell_path,
+            default_bash_command_prefix,
+            clear_default_bash_command_prefix,
+            default_compaction_reserve_tokens,
+            clear_default_compaction_reserve_tokens,
+            default_compaction_keep_recent_tokens,
+            clear_default_compaction_keep_recent_tokens,
+            default_retry_max_retries,
+            clear_default_retry_max_retries,
+            default_retry_base_delay_ms,
+            clear_default_retry_base_delay_ms,
+            default_provider_timeout_ms,
+            clear_default_provider_timeout_ms,
+            default_models,
+            clear_default_models,
+            default_skill_paths,
+            clear_default_skill_paths,
+            default_prompt_template_paths,
+            clear_default_prompt_template_paths,
         } => {
             let mut store = beyond_ai_agent::settings::SettingsStore::open_default();
             let any_write = model.is_some()
@@ -1646,7 +1775,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 || image_auto_resize.is_some()
                 || clear_image_auto_resize
                 || !thinking_budget.is_empty()
-                || !clear_thinking_budget.is_empty();
+                || !clear_thinking_budget.is_empty()
+                || default_bash_shell_path.is_some()
+                || clear_default_bash_shell_path
+                || default_bash_command_prefix.is_some()
+                || clear_default_bash_command_prefix
+                || default_compaction_reserve_tokens.is_some()
+                || clear_default_compaction_reserve_tokens
+                || default_compaction_keep_recent_tokens.is_some()
+                || clear_default_compaction_keep_recent_tokens
+                || default_retry_max_retries.is_some()
+                || clear_default_retry_max_retries
+                || default_retry_base_delay_ms.is_some()
+                || clear_default_retry_base_delay_ms
+                || default_provider_timeout_ms.is_some()
+                || clear_default_provider_timeout_ms
+                || default_models.is_some()
+                || clear_default_models
+                || default_skill_paths.is_some()
+                || clear_default_skill_paths
+                || default_prompt_template_paths.is_some()
+                || clear_default_prompt_template_paths;
             if model.is_some() || clear_model {
                 store.set_default_model(model)?;
             }
@@ -1689,6 +1838,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 parse_reasoning_effort(effort)
                     .map_err(|e| format!("--clear-thinking-budget {effort:?}: {e}"))?;
                 store.set_thinking_budget_override(effort.to_string(), None)?;
+            }
+            if default_bash_shell_path.is_some() || clear_default_bash_shell_path {
+                store.set_default_bash_shell_path(default_bash_shell_path)?;
+            }
+            if default_bash_command_prefix.is_some() || clear_default_bash_command_prefix {
+                store.set_default_bash_command_prefix(default_bash_command_prefix)?;
+            }
+            if default_compaction_reserve_tokens.is_some() || clear_default_compaction_reserve_tokens {
+                store.set_default_compaction_reserve_tokens(default_compaction_reserve_tokens)?;
+            }
+            if default_compaction_keep_recent_tokens.is_some()
+                || clear_default_compaction_keep_recent_tokens
+            {
+                store
+                    .set_default_compaction_keep_recent_tokens(default_compaction_keep_recent_tokens)?;
+            }
+            if default_retry_max_retries.is_some() || clear_default_retry_max_retries {
+                store.set_default_retry_max_retries(default_retry_max_retries)?;
+            }
+            if default_retry_base_delay_ms.is_some() || clear_default_retry_base_delay_ms {
+                store.set_default_retry_base_delay_ms(default_retry_base_delay_ms)?;
+            }
+            if default_provider_timeout_ms.is_some() || clear_default_provider_timeout_ms {
+                store.set_default_provider_timeout_ms(default_provider_timeout_ms)?;
+            }
+            if default_models.is_some() || clear_default_models {
+                store.set_default_models_list(default_models)?;
+            }
+            if default_skill_paths.is_some() || clear_default_skill_paths {
+                store.set_default_skill_paths(default_skill_paths)?;
+            }
+            if default_prompt_template_paths.is_some() || clear_default_prompt_template_paths {
+                store.set_default_prompt_template_paths(default_prompt_template_paths)?;
             }
             if any_write {
                 println!("updated settings:");
@@ -1746,6 +1928,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 _ => println!("thinking_budget_overrides: (not set)"),
             }
+            println!(
+                "default_bash_shell_path: {}",
+                s.default_bash_shell_path.as_deref().unwrap_or("(not set)")
+            );
+            println!(
+                "default_bash_command_prefix: {}",
+                s.default_bash_command_prefix.as_deref().unwrap_or("(not set)")
+            );
+            println!(
+                "default_compaction_reserve_tokens: {}",
+                s.default_compaction_reserve_tokens
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "(not set)".to_string())
+            );
+            println!(
+                "default_compaction_keep_recent_tokens: {}",
+                s.default_compaction_keep_recent_tokens
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "(not set)".to_string())
+            );
+            println!(
+                "default_retry_max_retries: {}",
+                s.default_retry_max_retries
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "(not set)".to_string())
+            );
+            println!(
+                "default_retry_base_delay_ms: {}",
+                s.default_retry_base_delay_ms
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "(not set)".to_string())
+            );
+            println!(
+                "default_provider_timeout_ms: {}",
+                s.default_provider_timeout_ms
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "(not set)".to_string())
+            );
+            println!(
+                "default_models_list: {}",
+                s.default_models_list
+                    .as_ref()
+                    .map(|v| v.join(","))
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "(not set)".to_string())
+            );
+            println!(
+                "default_skill_paths: {}",
+                s.default_skill_paths
+                    .as_ref()
+                    .map(|v| v.join(","))
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "(not set)".to_string())
+            );
+            println!(
+                "default_prompt_template_paths: {}",
+                s.default_prompt_template_paths
+                    .as_ref()
+                    .map(|v| v.join(","))
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "(not set)".to_string())
+            );
             // Fix 9's "CLI-visible" requirement: this file is entirely hand-edited (like pi's own
             // `models.json`), with no `--set`/`--clear` flags of its own here — just enough surface so
             // an operator debugging "why is this model still hitting the gateway" can confirm the file
@@ -2318,23 +2562,51 @@ async fn run_task(
 
     // A stored `agent settings` default sits between an explicit flag/env var and this crate's own
     // built-in default — checked here, once, rather than threading `SettingsStore` through every
-    // individual flag's own resolution site.
-    let stored_settings = beyond_ai_agent::settings::SettingsStore::open_default();
+    // individual flag's own resolution site. Feature 2 (Round 3, pi-parity): merges a trusted project's
+    // own `<cwd>/.claude/settings.json` tier on top of the global one first — see
+    // `settings::effective_settings_for_cwd`'s own doc comment for the trust-gating rationale.
+    let stored_settings = beyond_ai_agent::settings::effective_settings_for_cwd(&cwd);
     let gateway = gateway_url
-        .or_else(|| stored_settings.get().default_gateway_url.clone())
+        .or_else(|| stored_settings.default_gateway_url.clone())
         .unwrap_or_else(|| DEFAULT_GATEWAY.to_string());
     // Task #26 (pi-parity feature): an explicit `--block-images` always wins; otherwise fall back to a
     // persisted `agent settings --block-images` default before finally defaulting to images allowed —
     // same "explicit flag, then stored setting, then built-in default" precedence every other
     // `stored_settings`-backed fallback here follows.
-    let block_images = block_images || stored_settings.get().block_images.unwrap_or(false);
+    let block_images = block_images || stored_settings.block_images.unwrap_or(false);
     // Task #4 (pi-parity feature): same "explicit flag, then stored setting, then built-in default"
     // precedence as `block_images` above, adapted for a negating `--no-x` flag: an explicit
     // `--no-image-auto-resize` always forces it off; otherwise fall back to the persisted
     // `agent settings --image-auto-resize` default; otherwise resize stays on (pi's own
     // `ImageSettings.autoResize` default).
     let image_auto_resize =
-        !no_image_auto_resize && stored_settings.get().image_auto_resize.unwrap_or(true);
+        !no_image_auto_resize && stored_settings.image_auto_resize.unwrap_or(true);
+    // Round 3 (pi-parity fix): five more flag/env-only settings gain the same "explicit flag/env, then
+    // stored setting, then built-in default" precedence — `serve`'s identical block, in its own command
+    // handler above, for the full set (including `--models`, `serve`-only).
+    let bash_shell_path = bash_shell_path.or_else(|| stored_settings.default_bash_shell_path.clone());
+    let bash_command_prefix =
+        bash_command_prefix.or_else(|| stored_settings.default_bash_command_prefix.clone());
+    let compaction_reserve_tokens =
+        compaction_reserve_tokens.or(stored_settings.default_compaction_reserve_tokens);
+    let compaction_keep_recent_tokens =
+        compaction_keep_recent_tokens.or(stored_settings.default_compaction_keep_recent_tokens);
+    let retry_max_retries = retry_max_retries.or(stored_settings.default_retry_max_retries);
+    let retry_base_delay_ms = retry_base_delay_ms.or(stored_settings.default_retry_base_delay_ms);
+    let idle_timeout_ms = idle_timeout_ms.or(stored_settings.default_provider_timeout_ms);
+    let extra_skill_paths = if extra_skill_paths.is_empty() {
+        stored_settings.default_skill_paths.clone().unwrap_or_default()
+    } else {
+        extra_skill_paths
+    };
+    let extra_prompt_template_paths = if extra_prompt_template_paths.is_empty() {
+        stored_settings
+            .default_prompt_template_paths
+            .clone()
+            .unwrap_or_default()
+    } else {
+        extra_prompt_template_paths
+    };
     // Whether the operator explicitly passed `--model`, as opposed to `run` falling back to a stored
     // default or `DEFAULT_MODEL` — the distinction a reopened `--session`/`--continue` needs below to
     // know whether to keep going on the model the session was actually last driven on instead of
@@ -2344,7 +2616,7 @@ async fn run_task(
     // invocation to use it.
     let model_explicit = model.is_some();
     let model = model
-        .or_else(|| stored_settings.get().default_model.clone())
+        .or_else(|| stored_settings.default_model.clone())
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
     // Fix 10 (pi-parity feature): resolve a partial/fuzzy `--model` id against the known-model hint list
     // before it's used for anything else — dialect inference, OAuth-provider inference, and the model
@@ -2372,7 +2644,6 @@ async fn run_task(
         .or_else(|| model_thinking_level.and_then(|l| l.reasoning_effort()))
         .or_else(|| {
             stored_settings
-                .get()
                 .default_reasoning_effort
                 .as_deref()
                 .and_then(|s| parse_reasoning_effort(s).ok())
@@ -2393,7 +2664,7 @@ async fn run_task(
     let project_trusted = serve::resolve_project_trust(
         trust_project,
         force_untrusted,
-        stored_settings.get().default_project_trust,
+        stored_settings.default_project_trust,
         beyond_ai_agent::trust_store::TrustStore::open_default().lookup(&cwd),
         has_gated_resources,
     );
@@ -2403,9 +2674,11 @@ async fn run_task(
     // `warning: ...` convention (see the `cwd_is_stale` check further down).
     if !project_trusted && has_gated_resources {
         eprintln!(
-            "warning: {} has a project-local SYSTEM.md/APPEND_SYSTEM.md, skills, or prompt templates \
-             on disk, but the project isn't trusted, so they were skipped — pass --trust-project or run \
-             `agent trust {}` to enable them",
+            "warning: {} has a project-local SYSTEM.md/APPEND_SYSTEM.md, skills, prompt templates, or a \
+             settings.json on disk, but the project isn't trusted, so they were skipped — pass \
+             --trust-project or run `agent trust {}` to enable them (a project's own settings.json \
+             additionally requires a *persisted* `agent trust`, not just a one-off --trust-project — see \
+             `settings::effective_settings_for_cwd`'s doc comment)",
             cwd.display(),
             cwd.display()
         );
@@ -2510,7 +2783,7 @@ async fn run_task(
     // `list_all_sessions` already applies (`Persistence::list_all_with_progress`'s `repo.dir().parent()`)
     // when `--session-dir` is set there, so both binaries scope a cross-project scan identically.
     let (repo_dir, fork_search_root): (PathBuf, PathBuf) =
-        match session_dir.or_else(|| stored_settings.get().default_session_dir.clone()) {
+        match session_dir.or_else(|| stored_settings.default_session_dir.clone()) {
             Some(dir) => {
                 let dir = PathBuf::from(dir);
                 let search_root = dir
@@ -2737,7 +3010,7 @@ async fn run_task(
                 caps.thinking,
                 agent_core::models::ThinkingShape::Budget | agent_core::models::ThinkingShape::Adaptive
             ) {
-                let overrides = resolve_thinking_budget_overrides(stored_settings.get());
+                let overrides = resolve_thinking_budget_overrides(&stored_settings);
                 let budget = agent_core::models::budget_for_effort_with_override(
                     effort,
                     caps.max_output,

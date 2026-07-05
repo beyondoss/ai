@@ -294,9 +294,43 @@ fn today() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    format_local_datetime_at(secs, false)
+}
+
+/// Format a unix-seconds timestamp as a human-readable local date/time string, without pulling in a
+/// date crate — reuses the exact same [`local_utc_offset`]/[`civil_from_days`] machinery [`today`]
+/// already relies on for the system prompt's dynamic footer (same rationale: local, not UTC, so the
+/// rendered moment never reads a day behind/ahead of the viewer near midnight), just also keeping the
+/// time-of-day component `today` itself discards. Used by `export::render_stats_section` for a
+/// session's `created_at` (pi-parity fix: pi's own export always renders a `Date:` line, `new
+/// Date(...).toLocaleString()`) — `export.rs` has no date-formatting convention of its own to diverge
+/// from, so this is it.
+pub(crate) fn format_local_datetime(secs: u64) -> String {
+    format_local_datetime_at(secs as i64, true)
+}
+
+/// Shared implementation behind [`today`]/[`format_local_datetime`] — `with_time` selects whether the
+/// `HH:MM:SS` suffix is included, so `today`'s existing `YYYY-MM-DD`-only output stays byte-for-byte
+/// unchanged. Resolves the local offset (the one host-dependent, not-purely-deterministic step) and
+/// hands off to [`format_civil_datetime`] for the actual formatting, so that part stays independently
+/// testable against fixed inputs regardless of the host's own timezone.
+fn format_local_datetime_at(secs: i64, with_time: bool) -> String {
     let local = secs + local_utc_offset(secs);
-    let (y, m, d) = civil_from_days(local.div_euclid(86_400));
-    format!("{y:04}-{m:02}-{d:02}")
+    format_civil_datetime(local, with_time)
+}
+
+/// Format `local_secs` (unix seconds already shifted into whatever timezone the caller wants shown) as
+/// `YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS` — pure date/time-of-day math over [`civil_from_days`], no
+/// timezone lookup of its own, so it's deterministic for a fixed input regardless of the host running
+/// it (unlike [`format_local_datetime_at`], which resolves the host's own local offset first).
+fn format_civil_datetime(local_secs: i64, with_time: bool) -> String {
+    let (y, m, d) = civil_from_days(local_secs.div_euclid(86_400));
+    if !with_time {
+        return format!("{y:04}-{m:02}-{d:02}");
+    }
+    let time_of_day = local_secs.rem_euclid(86_400);
+    let (hh, mm, ss) = (time_of_day / 3600, (time_of_day % 3600) / 60, time_of_day % 60);
+    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02}")
 }
 
 /// The host's UTC offset in seconds at `now`. We have no date crate and `unsafe_code` is forbidden (so
@@ -450,6 +484,23 @@ mod tests {
         assert_eq!(civil_from_days(18_993), (2022, 1, 1));
         // 2020-02-29 (a leap day) is day 18321.
         assert_eq!(civil_from_days(18_321), (2020, 2, 29));
+    }
+
+    #[test]
+    fn format_civil_datetime_renders_the_epoch_and_a_known_date() {
+        // Pure date/time-of-day math, no timezone lookup involved — deterministic regardless of the
+        // host running the test (unlike `format_local_datetime`/`today`, which resolve the host's own
+        // local offset first).
+        assert_eq!(format_civil_datetime(0, true), "1970-01-01 00:00:00");
+        assert_eq!(format_civil_datetime(0, false), "1970-01-01");
+        // One second before the epoch rolls back to the last second of 1969.
+        assert_eq!(format_civil_datetime(-1, true), "1969-12-31 23:59:59");
+        // 2022-01-01T00:00:00Z is day 18993 (see `civil_date_matches_known_epochs`) plus a mid-day
+        // time-of-day component, exercising the HH:MM:SS math too.
+        assert_eq!(
+            format_civil_datetime(18_993 * 86_400 + 12 * 3600 + 34 * 60 + 56, true),
+            "2022-01-01 12:34:56"
+        );
     }
 
     #[test]

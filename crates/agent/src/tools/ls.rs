@@ -46,7 +46,8 @@ impl Tool for Ls {
     }
     fn description(&self) -> &str {
         "List the entries of a directory. Directories are suffixed with `/`. Hidden entries are \
-         shown only when `all` is true."
+         shown only when `all` is true. Output is truncated to at most 500 entries or 50.0KB, \
+         whichever is hit first."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -448,6 +449,23 @@ mod tests {
             out.len() <= super::super::output::MAX_LISTING_BYTES + 256,
             "output should be capped near MAX_LISTING_BYTES, got {} bytes",
             out.len()
+        );
+    }
+
+    #[test]
+    fn description_documents_the_truncation_budget() {
+        // Pi-parity fix: unlike `bash`'s description (which states both its default timeout and its
+        // output truncation budget numerically), `ls`'s description only stated the entry-count
+        // default in the `limit` schema field, never the overall byte-truncation cap it shares with
+        // `find`/`grep`.
+        let desc = Ls.description().to_string();
+        assert!(
+            desc.contains(&DEFAULT_LIMIT.to_string())
+                && desc.contains(&super::super::output::format_size(
+                    super::super::output::MAX_LISTING_BYTES as u64
+                )),
+            "description should state the entry-count and byte truncation budgets numerically, got: \
+             {desc}"
         );
     }
 }

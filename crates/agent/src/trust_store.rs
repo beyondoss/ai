@@ -27,19 +27,22 @@ use crate::path_utils::resolved_path as resolved_key_path;
 
 /// Whether `cwd` has anything project trust actually gates: a `SYSTEM.md`/`APPEND_SYSTEM.md`
 /// override, project-local skills (`.claude/skills`, or an `.agents/skills` at any ancestor level up
-/// to the enclosing git-repo root), or project-local prompt templates (`.claude/prompts`) — see
-/// `resources.rs`/`skills.rs`/`prompts.rs` for where each of these is actually read. When none exist,
-/// there's nothing an untrusted checkout could do differently by being trusted, so a caller can treat
-/// the directory as trusted without ever consulting the allowlist — matching pi's own
-/// `hasTrustRequiringProjectResources`/`resolveProjectTrusted` fast path (`trust-manager.ts`), which
-/// skips the trust store (and its own interactive prompt) entirely for the same reason. Nothing here
-/// is cached or sticky: a directory that gains one of these later (e.g. a fresh `git init` adding
-/// `.claude/skills`) simply starts requiring trust from that point on, the next time this is checked.
+/// to the enclosing git-repo root), project-local prompt templates (`.claude/prompts`), or a
+/// project-level settings tier (`.claude/settings.json` — Round 3, pi-parity feature: see
+/// `settings::effective_settings_for_cwd`) — see `resources.rs`/`skills.rs`/`prompts.rs`/`settings.rs`
+/// for where each of these is actually read. When none exist, there's nothing an untrusted checkout
+/// could do differently by being trusted, so a caller can treat the directory as trusted without ever
+/// consulting the allowlist — matching pi's own `hasTrustRequiringProjectResources`/
+/// `resolveProjectTrusted` fast path (`trust-manager.ts`), which skips the trust store (and its own
+/// interactive prompt) entirely for the same reason. Nothing here is cached or sticky: a directory that
+/// gains one of these later (e.g. a fresh `git init` adding `.claude/skills`) simply starts requiring
+/// trust from that point on, the next time this is checked.
 pub fn has_trust_gated_resources(cwd: &Path) -> bool {
     cwd.join(".claude/SYSTEM.md").is_file()
         || cwd.join(".claude/APPEND_SYSTEM.md").is_file()
         || cwd.join(".claude/skills").is_dir()
         || cwd.join(".claude/prompts").is_dir()
+        || cwd.join(".claude/settings.json").is_file()
         || crate::skills::collect_ancestor_agents_skill_dirs(cwd)
             .iter()
             .any(|dir| dir.is_dir())
@@ -373,6 +376,17 @@ mod tests {
     fn has_trust_gated_resources_is_true_for_a_project_prompts_directory() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join(".claude/prompts")).unwrap();
+        assert!(has_trust_gated_resources(dir.path()));
+    }
+
+    #[test]
+    fn has_trust_gated_resources_is_true_for_a_project_settings_json() {
+        // Round 3 (pi-parity feature): a project-level settings tier (`settings::
+        // effective_settings_for_cwd`) is itself a trust-gated resource, same as SYSTEM.md/skills/
+        // prompts above.
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        fs::write(dir.path().join(".claude/settings.json"), r#"{"default_model":"m"}"#).unwrap();
         assert!(has_trust_gated_resources(dir.path()));
     }
 

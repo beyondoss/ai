@@ -100,7 +100,14 @@ pub fn resolve_gateway_credential(key: Option<String>, model: &str) -> Result<Ga
     // on-disk schema.
     if let Some(over) = crate::settings::ModelOverrides::open_default().get(model) {
         if let Some(base_url) = over.base_url.clone() {
-            let dialect = agent_core::dialect::Dialect::for_model(model);
+            // Fix 1 (pi-parity, Round 2): an explicit `dialect` override wins over `Dialect::for_model`'s
+            // name heuristic — consulted here (to pick the right endpoint path for a provider whose
+            // model ids don't match the heuristic, e.g. Kimi-Coding's `kimi-k2-thinking`) AND threaded
+            // into `DirectRouting::dialect_override` below (for the actual body-building/decoding
+            // dialect `GatewayClient::stream` picks), so the two never disagree.
+            let dialect = over
+                .dialect
+                .unwrap_or_else(|| agent_core::dialect::Dialect::for_model(model));
             // Task #11 (pi-parity feature): resolved through `!command`/`$VAR`/literal syntax (see
             // `ModelOverride::resolved_api_key`'s own doc comment) rather than used as a raw literal —
             // lets an operator avoid storing a plaintext secret in `models.json`.
@@ -118,6 +125,16 @@ pub fn resolve_gateway_credential(key: Option<String>, model: &str) -> Result<Ga
                 // (or, worse, a silent fallback to the gateway's own virtual key) to an endpoint that
                 // doesn't want it.
                 auth_header: over.auth_header.clone(),
+                // Fix 4 (pi-parity, Round 2): Cloudflare AI Gateway's Bearer-prefixed named header
+                // (`cf-aig-authorization: Bearer <key>`) — `None` preserves `auth_header`'s existing
+                // bare-value behavior (Azure's `api-key`).
+                auth_header_prefix: over.auth_header_prefix.clone(),
+                dialect_override: over.dialect,
+                // Fix 2 (pi-parity, Round 2): Azure OpenAI's deployment-name mapping — sends this
+                // instead of `model` as the wire-level `"model"` field.
+                deployment_name: over.deployment_name.clone(),
+                // Fix 2 (pi-parity, Round 2): Azure's dated `api-version` query param.
+                query: azure_api_version_query(over.api_version.as_deref()),
             };
             return Ok(GatewayCredential::Oauth(Arc::new(StaticDirectCredentialSource {
                 bearer,
@@ -161,6 +178,10 @@ pub fn resolve_gateway_credential(key: Option<String>, model: &str) -> Result<Ga
                     ],
                     copilot_dynamic_headers: false,
                     auth_header: None,
+                    auth_header_prefix: None,
+                    dialect_override: None,
+                    deployment_name: None,
+                    query: None,
                 };
                 return Ok(GatewayCredential::Oauth(Arc::new(DirectRoutedCredentialSource {
                     inner: oauth_source(OAuthProviderId::OpenaiCodex),
@@ -201,4 +222,50 @@ pub fn resolve_gateway_credential(key: Option<String>, model: &str) -> Result<Ga
         "no gateway key: pass --key or set AI_AGENT_KEY (a bai_v1… virtual key), or run `agent login \
          <provider>` to use a subscription for model {model:?}"
     ))
+}
+
+/// Build the `api-version=…` query string from a `models.json` override's [`ModelOverride::api_version`]
+/// field (Fix 2, pi-parity Round 2 — Azure OpenAI's dated REST `api-version`), or `None` if unset/empty.
+/// Percent-encoded via [`url::form_urlencoded`] — the same general-purpose query-param encoder any other
+/// query value would go through, rather than a hand-rolled `format!("api-version={v}")` that would
+/// silently misbuild the URL if an operator's value ever contained a character needing escaping.
+fn azure_api_version_query(api_version: Option<&str>) -> Option<String> {
+    let version = api_version?;
+    if version.is_empty() {
+        return None;
+    }
+    Some(
+        url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("api-version", version)
+            .finish(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn azure_api_version_query_builds_the_expected_query_string() {
+        assert_eq!(
+            azure_api_version_query(Some("2024-08-01-preview")),
+            Some("api-version=2024-08-01-preview".to_string())
+        );
+    }
+
+    #[test]
+    fn azure_api_version_query_percent_encodes_special_characters() {
+        // A defensive check, not a realistic input: Azure's own api-version strings never carry a
+        // space, but the encoder must still do the right thing rather than build a broken URL.
+        assert_eq!(
+            azure_api_version_query(Some("2024 08 01")),
+            Some("api-version=2024+08+01".to_string())
+        );
+    }
+
+    #[test]
+    fn azure_api_version_query_is_none_when_unset_or_empty() {
+        assert_eq!(azure_api_version_query(None), None);
+        assert_eq!(azure_api_version_query(Some("")), None);
+    }
 }

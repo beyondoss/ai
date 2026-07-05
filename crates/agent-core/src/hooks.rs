@@ -152,6 +152,32 @@ pub trait AgentHooks: Send + Sync {
     /// [`on_assistant_message`](Self::on_assistant_message) uses.
     async fn before_provider_request(&self, _req: &mut crate::transport::ModelRequest) {}
 
+    /// Called once the dialect-specific wire body is fully built from the (possibly
+    /// [`before_provider_request`](Self::before_provider_request)-patched) [`crate::transport::ModelRequest`],
+    /// immediately before it's sent — [`crate::client::GatewayClient::stream`], right after
+    /// `dialect.build_body(..)` runs, once per attempt (same per-attempt/per-retry cadence as
+    /// `before_provider_request`). **Unlike `before_provider_request`'s abstract, dialect-agnostic
+    /// `ModelRequest`, `payload` here is the literal wire-format JSON about to cross the wire** —
+    /// Anthropic's `{"model": ..., "messages": [...], "tools": [...]}` shape, OpenAI's
+    /// Responses/Chat-Completions shape, whichever dialect this turn's model resolved to. This is the
+    /// seam a host uses when it needs to see or rewrite the actual bytes on the wire — a dialect-specific
+    /// field `ModelRequest` has no abstraction for — rather than the higher-level request
+    /// `before_provider_request` exposes one layer up.
+    ///
+    /// Mirrors pi's two-layer version of this seam: the low-level `Agent`'s `onPayload` (passed straight
+    /// to its HTTP-streaming function) and the harness's `beforeProviderPayload`
+    /// (`agent-harness.ts`'s `emitBeforeProviderPayload`, `BeforeProviderPayloadEvent`/
+    /// `BeforeProviderPayloadResult` in `types.ts`), which can replace the payload object wholesale. This
+    /// mutates `payload` in place instead of returning a replacement — matching
+    /// `before_provider_request`'s own convention rather than giving this trait two different "rewrite a
+    /// request" shapes.
+    ///
+    /// Defaults to a no-op. A panicking hook has its (possibly partial) mutation discarded —
+    /// [`crate::client::GatewayClient::stream`] falls back to the payload exactly as `build_body` produced
+    /// it, the same "fails open" convention [`before_provider_request`](Self::before_provider_request)
+    /// uses.
+    async fn before_provider_payload(&self, _payload: &mut Value) {}
+
     /// Called once a provider response's raw HTTP status and headers are known, before its body starts
     /// streaming — pi's `afterProviderResponse` (`agent-harness.ts:321-385`). Read-only observability
     /// (a host logging rate-limit headers, say): the response is already normalized into `StreamEvent`s
@@ -276,6 +302,36 @@ mod tests {
         assert_eq!(req.system, before.system);
         h.after_provider_response(200, &[("x-test".to_string(), "1".to_string())])
             .await;
+
+        // pi-parity gap: no seam previously exposed the literal wire-format JSON payload (only the
+        // abstract `ModelRequest`) — the default must be a true no-op here too.
+        let mut payload = json!({"model": "claude-test", "messages": []});
+        let before = payload.clone();
+        h.before_provider_payload(&mut payload).await;
+        assert_eq!(payload, before);
+    }
+
+    struct InjectsPayloadMarker;
+    #[async_trait]
+    impl AgentHooks for InjectsPayloadMarker {
+        async fn before_provider_payload(&self, payload: &mut Value) {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("_injected_marker".to_string(), json!(true));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn before_provider_payload_hook_can_rewrite_the_literal_wire_body() {
+        // pi-parity fix: unlike `before_provider_request` (which only ever sees the abstract
+        // `ModelRequest`), this hook must see and be able to mutate the fully dialect-built JSON body —
+        // pi's `onPayload`/`beforeProviderPayload` seam.
+        let hooks = InjectsPayloadMarker;
+        let mut payload = json!({"model": "claude-test", "messages": []});
+        hooks.before_provider_payload(&mut payload).await;
+        assert_eq!(payload["_injected_marker"], json!(true));
+        // The rest of the payload must survive untouched.
+        assert_eq!(payload["model"], json!("claude-test"));
     }
 
     struct InjectsHeaderNote;

@@ -500,6 +500,107 @@ fn serve_compact_preserves_pre_compaction_entries_in_get_tree() {
 }
 
 #[test]
+fn serve_compact_reports_first_kept_entry_id_naming_a_real_pre_compaction_entry() {
+    // Fix 2 (pi-parity remediation, Round 2): `compact`'s response previously had no way for a
+    // tree-aware client to learn which entry begins the retained (post-compaction) portion of
+    // history — pi's own `CompactionResult.firstKeptEntryId`. Verifies the returned id names a real
+    // id from *before* the fold (still resolvable via `get_tree`, per this store's
+    // non-destructive-compaction guarantee — see `serve_compact_preserves_pre_compaction_entries_in_get_tree`
+    // just above), and that it lands on the message `find_cut` actually cuts at, which is always an
+    // assistant reply (`find_cut`'s own invariant — `crates/agent-core/src/compaction.rs`).
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+
+    let (base, _bodies) = spawn_model_server(vec![
+        turn_text("answer one"),
+        turn_text("answer two"),
+        turn_text("SUMMARY"),
+    ]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = Command::new(bin)
+        .args([
+            "serve",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--session-file",
+            &session_file,
+            "--compaction-keep-recent-tokens",
+            "1",
+        ])
+        .env("HOME", ISOLATED_HOME)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    for msg in ["pre-compaction-hello", "pre-compaction-again"] {
+        writeln!(stdin, "{}", json!({ "type": "prompt", "message": msg })).unwrap();
+        stdin.flush().unwrap();
+        read_until_response(&mut stdout, "prompt");
+    }
+
+    // Snapshot every pre-compaction message's own id/role before the fold, to check
+    // `first_kept_entry_id` against.
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_messages");
+    let pre_messages = frames.last().unwrap()["data"]["messages"]
+        .as_array()
+        .unwrap()
+        .clone();
+
+    writeln!(stdin, "{}", json!({ "type": "compact" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "compact");
+    assert_eq!(frames.last().unwrap()["success"], true, "{frames:#?}");
+    let data = &frames.last().unwrap()["data"];
+    assert_eq!(data["compacted"], true, "{frames:#?}");
+
+    let first_kept_entry_id = data["first_kept_entry_id"].as_str().unwrap_or_else(|| {
+        panic!("compact response must carry a first_kept_entry_id on a real compaction: {frames:#?}")
+    });
+
+    let pre_ids: Vec<&str> = pre_messages
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        pre_ids.contains(&first_kept_entry_id),
+        "first_kept_entry_id {first_kept_entry_id:?} must name a real pre-compaction message id: \
+         {pre_ids:#?}"
+    );
+    let kept_message = pre_messages
+        .iter()
+        .find(|m| m["id"] == first_kept_entry_id)
+        .unwrap();
+    assert_eq!(
+        kept_message["role"], "assistant",
+        "find_cut always lands on an assistant reply: {kept_message:#?}"
+    );
+
+    // Still resolvable via `get_tree` after the fold, exactly like every other pre-compaction entry.
+    writeln!(stdin, "{}", json!({ "type": "get_tree" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_tree");
+    let nodes = frames.last().unwrap()["data"]["nodes"].as_array().unwrap();
+    assert!(
+        nodes.iter().any(|n| n["id"] == first_kept_entry_id),
+        "first_kept_entry_id must still resolve via get_tree after the fold: {nodes:#?}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
 fn serve_set_auto_retry_toggles_and_rejects_a_non_boolean() {
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();

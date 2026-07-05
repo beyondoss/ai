@@ -108,11 +108,15 @@ pub struct CompactionConfig {
 
 impl Default for CompactionConfig {
     fn default() -> Self {
-        // Defaults sized for a 200k-context Claude model; override per deployment.
+        // Defaults sized for a 200k-context Claude model; override per deployment. Matches pi's own
+        // shipped tuning (`DEFAULT_COMPACTION_SETTINGS`, `compaction.ts:111-115`, and the coding-agent
+        // product's `compaction.ts:122-125`) — `reserveTokens: 16384, keepRecentTokens: 20000` — rather
+        // than the earlier 24_000/40_000, which triggered compaction earlier and retained 2x more raw
+        // verbatim context per round than the reference, for no documented reason.
         Self {
             context_window: 200_000,
-            reserve_tokens: 24_000,
-            keep_recent_tokens: 40_000,
+            reserve_tokens: 16_384,
+            keep_recent_tokens: 20_000,
             summary_max_tokens: 4_096,
             enabled: true,
         }
@@ -783,6 +787,18 @@ mod tests {
             Message::tool_result("2", "edited", false),
             Message::assistant(vec![ContentBlock::text("done")]),
         ]
+    }
+
+    #[test]
+    fn default_config_matches_pis_shipped_compaction_tuning() {
+        // pi-parity fix: pi's `DEFAULT_COMPACTION_SETTINGS` (`compaction.ts:111-115`, and the shipped
+        // coding-agent product agrees at `packages/coding-agent/src/core/compaction/compaction.ts:122-125`)
+        // uses `reserveTokens: 16384, keepRecentTokens: 20000`. This crate used to diverge at
+        // 24_000/40_000 — triggering compaction earlier (more reserved headroom) and retaining 2x more
+        // raw verbatim context per round than the reference, for no documented reason.
+        let cfg = CompactionConfig::default();
+        assert_eq!(cfg.reserve_tokens, 16_384);
+        assert_eq!(cfg.keep_recent_tokens, 20_000);
     }
 
     #[test]

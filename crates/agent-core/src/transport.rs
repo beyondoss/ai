@@ -238,6 +238,16 @@ pub struct ModelRequest {
     /// `false` by default; set by `GatewayClient::stream` from the same `via_copilot`
     /// (`DirectRouting::copilot_dynamic_headers`) signal already used to pick the dialect itself.
     pub is_copilot: bool,
+    /// Whether this request is being routed through an OpenAI Codex/ChatGPT-OAuth credential
+    /// (`RouteOverride::Prefixed`, `client.rs`). Only the OpenAI Responses dialect reads this: Codex's
+    /// actual backend wants the system prompt in a top-level `instructions` field instead of folded
+    /// into `input[0]` (the vanilla native-OpenAI-Responses shape), and always sends
+    /// `parallel_tool_calls: true` plus `text.verbosity`, matching pi's `openai-codex-responses.ts`
+    /// `buildRequestBody` (distinct from the plain `openai-responses.ts` dialect it otherwise shares a
+    /// wire shape with). `false` by default; set by `GatewayClient::stream` from the same
+    /// `RouteOverride::Prefixed` signal that already picks Codex's own URL/path — not a second,
+    /// independent detection path.
+    pub is_codex: bool,
 }
 
 impl ModelRequest {
@@ -265,6 +275,7 @@ impl ModelRequest {
             temperature: None,
             is_azure: false,
             is_copilot: false,
+            is_codex: false,
         }
     }
 
@@ -370,6 +381,13 @@ impl ModelRequest {
     /// [`is_copilot`](Self::is_copilot)'s own doc comment for what this does (and doesn't yet) wire up.
     pub fn with_copilot(mut self, is_copilot: bool) -> Self {
         self.is_copilot = is_copilot;
+        self
+    }
+
+    /// Builder-style: mark this request as routed through an OpenAI Codex/ChatGPT-OAuth credential.
+    /// See [`is_codex`](Self::is_codex)'s own doc comment for what this does (and doesn't yet) wire up.
+    pub fn with_codex(mut self, is_codex: bool) -> Self {
+        self.is_codex = is_codex;
         self
     }
 }
