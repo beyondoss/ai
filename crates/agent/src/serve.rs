@@ -81,7 +81,7 @@
 //!   - `{type:"fork", upto?, target_id?, before?}` (repo mode) copy a prefix into a new session, switch
 //!     to it. `target_id` (any tree entry, on or off the active path) wins over `upto` (a message-count
 //!     prefix of just the active path) when given; `before:true` excludes `target_id` itself from the
-//!     copied prefix (fork right before it), the default `false` includes it.
+//!     copied prefix (fork right before it), the default `true` excludes it.
 //!   - `{type:"clone"}` (repo mode) `fork` with no arguments — the current session's active path in
 //!     full, at its current tip. pi's own `clone`: a thin, argument-free alias, not a separate code
 //!     path (pi needs it because pi's own `fork` requires an explicit entry id; this crate's `fork`
@@ -118,10 +118,12 @@
 //!     `session-<unix-seconds>.html` in the current directory; parent directories are created as
 //!     needed.
 //!   - `{type:"compact", custom_instructions?}` summarize the prefix now → `data: {compacted: bool,
-//!     reason?, summary?, tokens_before?, tokens_after?}` — `reason` (Task #26 pi-parity fix) is `null`
-//!     on a real compaction, else `"too_small"`/`"already_compacted"` (`agent_core::CompactOutcome`),
-//!     matching pi's own two distinct thrown errors instead of collapsing both no-op cases into the
-//!     same bare `compacted:false`
+//!     reason?, summary?, tokens_before?, tokens_after?, first_kept_entry_id?}` — `reason` (Task #26
+//!     pi-parity fix) is `null` on a real compaction, else `"too_small"`/`"already_compacted"`
+//!     (`agent_core::CompactOutcome`), matching pi's own two distinct thrown errors instead of
+//!     collapsing both no-op cases into the same bare `compacted:false`; `first_kept_entry_id` (Fix 2,
+//!     pi-parity gap) is the tree entry beginning the retained post-compaction portion of history —
+//!     pi's own `firstKeptEntryId` — `null` when persistence isn't configured or no compaction fired
 //!   - `{type:"get_last_assistant_text"}` → `data: {text}` (the latest assistant reply)
 //!   - `{type:"get_session_stats"}`      → token/step accounting + message-type breakdown
 //!     (`user_messages`/`assistant_messages`/`tool_calls`/`tool_results`/`total_messages`)
@@ -397,6 +399,13 @@ pub struct ServeConfig {
     /// Roughly how many tokens of recent conversation compaction keeps verbatim. `None` keeps
     /// `CompactionConfig::default()`'s value.
     pub compaction_keep_recent_tokens: Option<u32>,
+    /// Token budget reserved below the context window when summarizing an abandoned tree branch —
+    /// independent of `compaction_reserve_tokens`. `None` keeps `Agent`'s prior hard-tied behavior
+    /// (falls back to whatever `compaction.reserve_tokens` resolves to — see
+    /// `agent_core::Agent::summarize_branch`'s doc comment). Task #31 (pi-parity feature):
+    /// `agent_core::Agent::with_branch_summary_reserve_tokens` previously had no caller in either
+    /// binary; `run`'s identical `--branch-summary-reserve-tokens` flag.
+    pub branch_summary_reserve_tokens: Option<u32>,
     /// Disable automatic (threshold-triggered) compaction entirely for this process — `run`'s
     /// identical flag. Only ever a one-way "definitely off" here: when `false` (the flag/env's own
     /// default, indistinguishable from "not given" for a bare disable-only flag), `serve`'s startup
@@ -410,6 +419,31 @@ pub struct ServeConfig {
     /// Base of the exponential backoff between those retries. `None` keeps the client's built-in
     /// default.
     pub retry_base_delay_ms: Option<std::time::Duration>,
+    /// Ceiling on that exponential backoff. `None` keeps the client's built-in default
+    /// (`agent_core::client::MAX_BACKOFF`, 60s). Task #30 (pi-parity feature): the retry cluster's
+    /// third knob, `agent_core::client::GatewayClient::with_max_backoff`, previously had no CLI flag or
+    /// persisted override at all.
+    pub retry_max_backoff_ms: Option<std::time::Duration>,
+    /// Idle-read timeout between response chunks on the gateway HTTP client. `None` keeps the client's
+    /// built-in default. Task #38 (pi-parity fix): `run`'s identical `--idle-timeout-ms`/
+    /// `AI_AGENT_IDLE_TIMEOUT_MS`/persisted `default_provider_timeout_ms` setting (see `main.rs::
+    /// run_task`'s own `with_idle_timeout` call site) previously had no `serve` counterpart at all —
+    /// `build_gateway_client` never called `GatewayClient::with_idle_timeout`.
+    pub idle_timeout_ms: Option<u64>,
+    /// Force every image down the same downgrade-to-text-placeholder path a vision-incapable model
+    /// already gets, regardless of the active model's real `supports_vision` capability — Task #34
+    /// (pi-parity fix): `run`'s identical `--block-images`/`agent settings --block-images` (see
+    /// `main.rs::run_task`'s own `Agent::with_block_images` call site) previously had no `serve`
+    /// counterpart at all. Threaded to `Agent::with_block_images` in `build_agent`.
+    pub block_images: bool,
+    /// Whether `read` downscales/re-encodes an oversized image to fit the inline size budget — Task #34
+    /// (pi-parity fix): `run`'s identical `--image-auto-resize`/`agent settings --image-auto-resize`
+    /// (see `main.rs::run_task`'s own `default_registry_with_prefix_and_image_auto_resize` call site)
+    /// previously had no `serve` counterpart at all — `build_tools` always called the `image_auto_resize`
+    /// registry constructor with a hardcoded `true`, so `--no-image-auto-resize`/`agent settings
+    /// --image-auto-resize false` had no effect on a `serve` process. Threaded to
+    /// `tools::default_registry_with_prefix_and_image_auto_resize` in `build_tools`.
+    pub image_auto_resize: bool,
     /// Default `bash` command timeout when the model omits `timeout_ms`. `None` keeps the tool's
     /// built-in default.
     pub bash_timeout_ms: Option<u64>,
@@ -1232,8 +1266,11 @@ impl Persistence {
     /// *other* summarization failure (a network error, the model returning an error) is fatal to the
     /// whole navigation too — Fix 3 (pi-parity gap): this used to log the failure and switch anyway
     /// (`eprintln!("serve: branch summarization failed, switching anyway: ...")`), matching neither pi's
-    /// own `agent-session.ts`/`agent-harness.ts` (which treat any non-abort summarization error as fatal
-    /// to the navigation) nor this RPC's own error-handling convention elsewhere (`switch_active_with_summary`
+    /// own `packages/coding-agent/src/core/agent-session.ts`'s `navigateTree` (which `throw`s on any
+    /// non-abort summarization error — see `generateBranchSummary` in
+    /// `packages/coding-agent/src/core/compaction/branch-summarization.ts`, whose `{error}` result
+    /// `navigateTree` turns into that throw, aborting the whole navigation before ever switching the
+    /// active leaf) nor this RPC's own error-handling convention elsewhere (`switch_active_with_summary`
     /// failing to *persist* an already-generated summary, just below, still falls back to a plain switch —
     /// a different, later failure mode this fix does not touch: the summary text already exists there,
     /// only the durable record of it is what's missing, so blocking navigation over that would strand the
@@ -1724,9 +1761,23 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
     // outright instead of picking any default depth. `default_reasoning_effort_for_model` supplies pi's
     // own "medium" default in that case (see its own doc comment); a model with no reasoning mechanism
     // at all still falls through to `Off`, same as before.
+    //
+    // Task #29 (pi-parity fix): that "medium" fallback must never fire when `cfg.reasoning_effort_explicit`
+    // is `true` — an explicit `--model <pattern>:off` (or `--reasoning-effort` with no portable "off"
+    // value of its own) resolves `cfg.reasoning_effort` to this same bare `None`, previously
+    // indistinguishable here from "the operator never said anything", so it was silently promoted back
+    // to the default depth instead of actually starting off. `main.rs` already computes
+    // `reasoning_effort_explicit` correctly for both `run` and `serve` (see `ServeConfig::
+    // reasoning_effort_explicit`'s own doc comment) — this is the one place that value wasn't consulted.
     let cfg_level = cfg
         .reasoning_effort
-        .or_else(|| default_reasoning_effort_for_model(&cfg.model))
+        .or_else(|| {
+            if cfg.reasoning_effort_explicit {
+                None
+            } else {
+                default_reasoning_effort_for_model(&cfg.model)
+            }
+        })
         .map(agent_core::ThinkingLevel::from)
         .unwrap_or(agent_core::ThinkingLevel::Off);
     let (session_model, session_level) = persistence.model_and_level_at_active(cfg_level);
@@ -4921,6 +4972,25 @@ fn build_gateway_client(cfg: &ServeConfig, model: &str) -> Result<GatewayClient,
         cfg.retry_base_delay_ms
             .unwrap_or(agent_core::client::BASE_BACKOFF),
     );
+    // Task #30 (pi-parity feature): `run`'s identical `--retry-max-backoff-ms` wiring (`main.rs::
+    // run_task`'s own `with_max_backoff` call site) previously had no `serve` counterpart — called on
+    // every model switch, same as `with_retry` above, so the override survives a mid-run switch.
+    let client = if let Some(max_backoff) = cfg.retry_max_backoff_ms {
+        client.with_max_backoff(max_backoff)
+    } else {
+        client
+    };
+    // Task #38 (pi-parity fix): `run`'s identical `--idle-timeout-ms` wiring (`main.rs::run_task`'s own
+    // `with_idle_timeout` call site) previously had no `serve` counterpart — this is called on every
+    // model switch (`set_model`/`cycle_model` rebuild the whole client), same as `with_retry` above, so
+    // the override survives a mid-run switch rather than only applying at startup.
+    let client = if let Some(ms) = cfg.idle_timeout_ms {
+        client
+            .with_idle_timeout(std::time::Duration::from_millis(ms))
+            .map_err(|e| e.to_string())?
+    } else {
+        client
+    };
     Ok(client)
 }
 
@@ -4984,6 +5054,14 @@ fn build_agent(
         // mid-run point (see `ChannelCheckpoint`), so a long multi-step turn is persisted incrementally
         // instead of only once it fully completes.
         .with_checkpoint_hook(checkpoint.clone());
+    // Task #31 (pi-parity feature): `run`'s identical `--branch-summary-reserve-tokens` wiring
+    // (`main.rs::run_task`'s own `with_branch_summary_reserve_tokens` call site) previously had no
+    // `serve` counterpart — `Agent::with_branch_summary_reserve_tokens` had zero callers in either
+    // binary. Applied on every `build_agent` rebuild, like every other `cfg`-sourced override, so it
+    // survives a model switch.
+    if let Some(reserve) = cfg.branch_summary_reserve_tokens {
+        agent = agent.with_branch_summary_reserve_tokens(reserve);
+    }
     // `level` (the portable ladder) supplies the default thinking/reasoning-effort pair for whichever
     // mechanism `model`'s capabilities actually call for; `thinking`, when present, is an explicit raw
     // budget override that wins over the level's own derived budget (but never touches reasoning
@@ -5001,6 +5079,13 @@ fn build_agent(
     }
     if let Some(max_tokens) = cfg.max_tokens {
         agent = agent.with_max_tokens(max_tokens);
+    }
+    // Task #34 (pi-parity fix): forces every image down the vision-downgrade path regardless of the
+    // active model's real `supports_vision` capability — `run`'s identical `--block-images` handling
+    // (`main.rs::run_task`'s own `with_block_images` call site), previously never threaded through here
+    // at all.
+    if cfg.block_images {
+        agent = agent.with_block_images(true);
     }
     let policy = crate::policy::ToolPolicy::from_lists(
         &cfg.deny_tool,
@@ -5090,10 +5175,15 @@ fn is_excluded_from_model_context(m: &agent_core::Message) -> bool {
 /// from the model's own tool set also disables the host command rather than leaving a side door open
 /// around an operator's explicit restriction.
 fn build_tools(cfg: &ServeConfig) -> agent_core::ToolRegistry {
-    let mut registry = tools::default_registry_with_prefix(
+    // Task #34 (pi-parity fix): previously always called the plain `default_registry_with_prefix`,
+    // hardcoding `image_auto_resize: true` regardless of `cfg.image_auto_resize` — `run`'s identical
+    // `default_registry_with_prefix_and_image_auto_resize` call site (`main.rs::run_task`) is the one
+    // this should have matched all along.
+    let mut registry = tools::default_registry_with_prefix_and_image_auto_resize(
         cfg.bash_timeout_ms,
         cfg.bash_shell_path.as_deref(),
         cfg.bash_command_prefix.as_deref(),
+        cfg.image_auto_resize,
     );
     tools::apply_filter(
         &mut registry,
@@ -6838,7 +6928,8 @@ mod tests {
         // Fix 3 (pi-parity gap): a genuine (non-abort) summarization failure used to be logged and the
         // switch proceeded anyway with no summary attached — this test pins the corrected behavior:
         // the switch must not happen at all, and the caller must see it failed, matching pi's own
-        // `agent-session.ts`/`agent-harness.ts` (any non-abort summarization error is fatal to the whole
+        // `packages/coding-agent/src/core/agent-session.ts`'s `navigateTree`, which `throw`s on any
+        // non-abort summarization error (any non-abort summarization error is fatal to the whole
         // navigation).
         let dir = tempfile::tempdir().unwrap();
         let (mut persistence, _session) =

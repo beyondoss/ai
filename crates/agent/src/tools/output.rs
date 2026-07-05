@@ -97,7 +97,13 @@ pub fn format_size(bytes: u64) -> String {
 /// Ceiling on total rendered output bytes for listing-style tools (`grep`, `find`, `ls`). Their
 /// per-item cap (`limit`) bounds *count*, but long paths/lines can still blow past a sane context
 /// budget well before `limit` items are reached; this is the backstop on the assembled text itself.
-pub const MAX_LISTING_BYTES: usize = 50 * 1024;
+///
+/// Deliberately defined as [`DEFAULT_MAX_BYTES`], not a second independent `50 * 1024` literal: pi
+/// has a single shared `DEFAULT_MAX_BYTES` (`truncate.ts`) for both the streaming (`bash`/`read`) and
+/// one-shot (`ls`/`grep`/`find`) truncation paths. The two byte caps here agreed only by coincidence
+/// before this alias — changing one without the other would have silently split bash/read's
+/// truncation budget from ls/grep/find's, with no compiler or test to catch the drift.
+pub const MAX_LISTING_BYTES: usize = DEFAULT_MAX_BYTES;
 
 /// Truncate an already-assembled listing `out` to [`MAX_LISTING_BYTES`] and append a marker, when it
 /// exceeds the cap. Returns whether truncation happened, so callers can skip a redundant count-based
@@ -939,6 +945,21 @@ mod tests {
                 assert_eq!(l, line, "a partial/fabricated-looking line leaked through");
             }
         }
+    }
+
+    #[test]
+    fn max_listing_bytes_stays_in_sync_with_default_max_bytes() {
+        // Pi-parity fix (task 51): `MAX_LISTING_BYTES` (ls/grep/find's one-shot output cap) and
+        // `DEFAULT_MAX_BYTES` (bash/read's streaming truncation budget) used to be two independently
+        // hardcoded `50 * 1024` literals that agreed only by coincidence — changing one without the
+        // other would silently split the two budgets apart with nothing to catch it. Pi has a single
+        // shared `DEFAULT_MAX_BYTES` (`truncate.ts`) for both. This test doesn't just restate the
+        // `const MAX_LISTING_BYTES: usize = DEFAULT_MAX_BYTES` alias (a compiler error would already
+        // catch a typo there) — it pins the *value* the two must share, so a future edit that turns
+        // the alias back into a second independent literal (reintroducing the drift) fails here even
+        // if both literals happen to still parse.
+        assert_eq!(MAX_LISTING_BYTES, DEFAULT_MAX_BYTES);
+        assert_eq!(MAX_LISTING_BYTES, 50 * 1024);
     }
 
     #[test]

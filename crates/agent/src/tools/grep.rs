@@ -15,6 +15,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agent_core::tool::Tool;
@@ -327,11 +328,21 @@ impl Tool for Grep {
         "grep"
     }
     fn description(&self) -> &str {
-        "Search file contents by regular expression, honoring .gitignore. Optionally restrict to a \
-         `path`, a `glob` (e.g. \"*.rs\"), case-insensitive with `ignore_case`. Results are sorted by \
-         path and truncated to at most 100 matches or 50.0KB, whichever is hit first, with individual \
-         lines truncated to 500 characters; when truncated, the lexicographically-smallest matches \
-         are reported."
+        // Pi-parity fix (task 52): built via `format!` referencing the real constants — like
+        // `bash.rs`'s `describe()` — instead of a hand-typed literal safety-netted only by a unit test
+        // that has to be kept in sync manually. `OnceLock` caches the one-time render since `Grep` is a
+        // unit struct with no field to build it into at construction the way `Bash` does.
+        static DESC: OnceLock<String> = OnceLock::new();
+        DESC.get_or_init(|| {
+            format!(
+                "Search file contents by regular expression, honoring .gitignore. Optionally restrict \
+                 to a `path`, a `glob` (e.g. \"*.rs\"), case-insensitive with `ignore_case`. Results \
+                 are sorted by path and truncated to at most {DEFAULT_LIMIT} matches or {}, whichever \
+                 is hit first, with individual lines truncated to {MAX_LINE} characters; when \
+                 truncated, the lexicographically-smallest matches are reported.",
+                super::output::format_size(super::output::MAX_LISTING_BYTES as u64)
+            )
+        })
     }
     fn input_schema(&self) -> Value {
         json!({

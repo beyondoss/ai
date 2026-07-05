@@ -714,6 +714,41 @@ fn serve_starts_clamped_not_off_for_a_model_that_cannot_disable_reasoning() {
 }
 
 #[test]
+fn serve_model_flag_off_suffix_starts_with_reasoning_off_not_the_medium_default() {
+    // Task #29 (pi-parity fix): `ThinkingLevel::Off.reasoning_effort()` is `None`, the exact same value
+    // a bare "nothing requested" invocation produces — so `--model claude-haiku-4-5:off` previously
+    // reached `cfg_level`'s own `default_reasoning_effort_for_model` fallback (see the comment right
+    // above it in `serve.rs::serve`), silently promoting the explicit "off" request back to Fix 1's own
+    // "medium" default instead of actually starting off. `reasoning_effort_explicit` (already correctly
+    // computed by `main.rs` for the `:off` suffix, per `ServeConfig::reasoning_effort_explicit`'s own
+    // doc comment) must gate that fallback.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd_with_model(bin, &base, &session_file, "claude-haiku-4-5:off")
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_state");
+    let data = &frames.last().unwrap()["data"];
+    assert_eq!(data["model"], "claude-haiku-4-5", "got: {data:#?}");
+    assert_eq!(
+        data["thinking_level"], "off",
+        "--model claude-haiku-4-5:off must start with reasoning off, not silently promoted to the \
+         medium default: got {data:#?}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
 fn serve_set_model_reclamps_off_when_switching_onto_a_non_disableable_model() {
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();

@@ -349,8 +349,31 @@ impl Tool for Read {
         }
         if truncated {
             let last = offset + shown - 1;
+            // `lineno` right now is the first not-yet-shown line — already consumed from the reader
+            // (so it's exactly the right `offset` to continue from), but not counted towards `shown`
+            // or written to `out`. Save it before the drain below overwrites `lineno` with the file's
+            // true total.
+            let continue_offset = lineno;
+            // pi's own truncation message (`read.ts`) includes the file's true total line count
+            // ("Showing lines X-Y of {totalFileLines}"); without it the model has no idea how much
+            // more content is left. We stream and stop at the truncation point by design (see this
+            // function's own doc comment on `MAX_LINE_BYTES`/streaming), so getting that total means
+            // reading the rest of the file here — but only a cheap, bounded byte scan via
+            // `read_line_capped`, the same streaming line counter already used above: no line is
+            // stored or decoded, only counted, and reusing it keeps this total consistent with
+            // `lineno`'s own "real content lines" convention (see the comment above on `offset >
+            // lineno`) rather than a raw `\n` byte count that would double-count that same
+            // trailing-newline edge case.
+            loop {
+                let (n, _clipped) = read_line_capped(&mut reader, &mut line, MAX_LINE_BYTES)
+                    .map_err(|e| ToolError::Execution(format!("read {path}: {e}")))?;
+                if n == 0 {
+                    break; // EOF
+                }
+                lineno += 1;
+            }
             out.push_str(&super::output::marker(format_args!(
-                "showing lines {offset}-{last}; use offset={lineno} to continue"
+                "showing lines {offset}-{last} of {lineno} total; use offset={continue_offset} to continue"
             )));
             out.push('\n');
         }
@@ -754,6 +777,12 @@ struct ResizedImage {
 /// bug; pi's version is "guaranteed to eventually fit" by construction, and this now is too. `None` is
 /// only returned once the 1×1 floor itself still doesn't fit — a budget so small no image could ever
 /// satisfy it.
+///
+/// The PNG re-encode preserves an alpha channel when the source image actually carries one (a
+/// transparent PNG needing this resize path), matching pi's Photon-based pipeline, which operates on
+/// RGBA internally with no flattening step of its own — see the `has_alpha` branch inline below. The
+/// JPEG fallback ladder has no such option: JPEG carries no alpha channel at all, so a transparent
+/// image that must fall all the way to JPEG unavoidably loses transparency there, same as pi.
 fn resize_image(
     bytes: &[u8],
     format: image::ImageFormat,
@@ -789,17 +818,38 @@ fn resize_image(
         } else {
             img.clone()
         };
-        let rgb = scaled.to_rgb8();
+        // Whether *this* decoded image actually carries an alpha channel (Rgba8/LumaA8) — most source
+        // images (JPEG/BMP/opaque PNG) don't, so this only changes behavior for a genuinely
+        // transparent image. PNG can carry alpha losslessly, so the PNG re-encode below preserves it
+        // via `to_rgba8()`/`Rgba8` instead of unconditionally flattening through `to_rgb8()`, which
+        // silently dropped the channel entirely (not "flatten onto a background" — just discarded, so
+        // a half-transparent pixel came back fully opaque) — matching pi's Photon-based pipeline, which
+        // operates on RGBA internally with no flattening step before its own PNG re-encode. JPEG has no
+        // alpha channel at all, so that ladder below still flattens via `to_rgb8()` regardless — that
+        // part is unavoidable and was already correct.
+        let has_alpha = scaled.color().has_alpha();
 
         let mut png_buf = Vec::new();
-        let png_ok = image::codecs::png::PngEncoder::new(&mut png_buf)
-            .write_image(
-                rgb.as_raw(),
-                scaled.width(),
-                scaled.height(),
-                image::ExtendedColorType::Rgb8,
-            )
-            .is_ok();
+        let png_ok = if has_alpha {
+            let rgba = scaled.to_rgba8();
+            image::codecs::png::PngEncoder::new(&mut png_buf)
+                .write_image(
+                    rgba.as_raw(),
+                    scaled.width(),
+                    scaled.height(),
+                    image::ExtendedColorType::Rgba8,
+                )
+                .is_ok()
+        } else {
+            image::codecs::png::PngEncoder::new(&mut png_buf)
+                .write_image(
+                    scaled.to_rgb8().as_raw(),
+                    scaled.width(),
+                    scaled.height(),
+                    image::ExtendedColorType::Rgb8,
+                )
+                .is_ok()
+        };
         if png_ok {
             let data = base64::engine::general_purpose::STANDARD.encode(&png_buf);
             if data.len() <= max_base64_bytes {
@@ -812,6 +862,10 @@ fn resize_image(
             }
         }
 
+        // JPEG has no alpha channel at all — flatten via `to_rgb8()` regardless of `has_alpha`. This
+        // is the one place a transparent source image genuinely loses its alpha, same as pi (which
+        // hits the identical constraint whenever its own PNG re-encode doesn't fit the budget either).
+        let rgb = scaled.to_rgb8();
         for &quality in &jpeg_quality_ladder {
             let mut jpeg_buf = Vec::new();
             let encoder =
@@ -911,6 +965,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn truncation_message_reports_the_true_total_line_count() {
+        // Task 50 (pi-parity fix): pi's own truncation message (`read.ts`) is "Showing lines X-Y of
+        // {totalFileLines}" — the total was previously missing entirely here, an information-loss
+        // gap the model had no way to work around (was truncation 1 line short of the end, or 10,000
+        // lines short?). The total must reflect the *whole* file, not just what was shown or what
+        // was left after an `offset` — proven here with an offset partway into a file bigger than
+        // what's shown.
+        let body = (1..=50).map(|i| i.to_string()).collect::<Vec<_>>().join("\n");
+        let f = tmp_file(&format!("{body}\n")); // 50 lines total
+        let out = Read::default()
+            .run(json!({ "path": f.path().to_str().unwrap(), "offset": 10, "limit": 5 }))
+            .await
+            .unwrap()
+            .text;
+        // Shown lines 10-14 (5 lines starting at offset 10); the file has 50 lines total regardless
+        // of where the window started or stopped.
+        assert!(
+            out.contains("[showing lines 10-14 of 50 total; use offset=15 to continue]"),
+            "got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn truncation_message_total_is_unaffected_by_a_trailing_newline() {
+        // The total in the truncation marker must follow the same trailing-newline-independent
+        // "real content lines" convention as every other "N lines total" this tool reports (see
+        // `line_count_is_the_same_whether_or_not_the_file_ends_with_a_trailing_newline` above) — not
+        // a raw `\n` byte count over the undrained remainder, which would silently be one *higher*
+        // than the file's real line count whenever it ends with a newline.
+        let with_trailing = tmp_file("a\nb\nc\nd\ne\n");
+        let without_trailing = tmp_file("a\nb\nc\nd\ne");
+
+        let out_with = Read::default()
+            .run(json!({ "path": with_trailing.path().to_str().unwrap(), "limit": 2 }))
+            .await
+            .unwrap()
+            .text;
+        let out_without = Read::default()
+            .run(json!({ "path": without_trailing.path().to_str().unwrap(), "limit": 2 }))
+            .await
+            .unwrap()
+            .text;
+        assert!(out_with.contains("of 5 total"), "got: {out_with}");
+        assert!(out_without.contains("of 5 total"), "got: {out_without}");
+    }
+
+    #[tokio::test]
     async fn truncation_reports_next_offset() {
         let f = tmp_file("a\nb\nc\nd\ne\n");
         let out = Read::default()
@@ -918,9 +1019,9 @@ mod tests {
             .await
             .unwrap()
             .text;
-        //Showed lines 1-2; the model is told to continue at line 3.
+        // Showed lines 1-2 of the file's 5 total lines; the model is told to continue at line 3.
         assert!(
-            out.contains("[showing lines 1-2; use offset=3 to continue]"),
+            out.contains("[showing lines 1-2 of 5 total; use offset=3 to continue]"),
             "got: {out}"
         );
     }
@@ -1924,6 +2025,98 @@ mod tests {
         let resized = resize_image(&bytes, image::ImageFormat::Png, 200, 200, 200_000, 80)
             .expect("a downscaled smooth gradient must fit comfortably");
         assert_eq!(resized.media_type, "image/png");
+    }
+
+    #[test]
+    fn resize_image_preserves_alpha_channel_for_a_transparent_png() {
+        // Task 37 (pi-parity fix): `resize_image`'s PNG re-encode used to flatten every resized
+        // image through `to_rgb8()` unconditionally — not "flatten onto a background", just
+        // discarding the alpha channel entirely — so a half-transparent PNG needing this resize
+        // path came back fully opaque. pi's Photon-based pipeline operates on RGBA internally with
+        // no flattening step before its own PNG re-encode, so this must preserve transparency
+        // through a downscale too. A smooth gradient (not noise) keeps this deterministic: it
+        // compresses so well under PNG that it's guaranteed to win the PNG-vs-JPEG race regardless
+        // of the extra byte cost alpha adds, so the test doesn't depend on incompressible-noise size
+        // math at all — only on whether the alpha channel survives.
+        let img = image::RgbaImage::from_fn(400, 400, |x, y| {
+            image::Rgba([(x % 256) as u8, (y % 256) as u8, 128, 100]) // uniform, well below opaque
+        });
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+
+        let resized = resize_image(&bytes, image::ImageFormat::Png, 200, 200, 200_000, 80)
+            .expect("a downscaled smooth gradient with alpha must fit comfortably");
+        assert_eq!(
+            resized.media_type, "image/png",
+            "a compressible gradient must still win as lossless PNG — the only format here that can carry alpha at all"
+        );
+
+        let decoded_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&resized.base64_data)
+            .unwrap();
+        let decoded = image::load_from_memory(&decoded_bytes).unwrap();
+        assert!(
+            decoded.color().has_alpha(),
+            "resized PNG must still carry an alpha channel, not be flattened to RGB"
+        );
+        let rgba = decoded.to_rgba8();
+        assert!(
+            rgba.pixels().all(|p| p[3] == 100),
+            "alpha values must survive the resize+re-encode intact, not be dropped to fully opaque: \
+             sample pixel alpha = {}",
+            rgba.get_pixel(0, 0)[3]
+        );
+    }
+
+    #[tokio::test]
+    async fn read_resize_preserves_transparency_for_an_oversized_transparent_png() {
+        // Task 37 (pi-parity fix), exercised end-to-end through `Read::run` with the tool's real
+        // production budget/dimension constants: a transparent PNG whose dimensions alone exceed
+        // `MAX_IMAGE_DIMENSION` forces the resize path (regardless of how small the file itself is),
+        // matching this crate's other `MAX_IMAGE_DIMENSION`-forced-resize tests. Before this fix, a
+        // half-transparent pixel here would have come back fully opaque, indistinguishable from an
+        // originally-opaque image.
+        let width = MAX_IMAGE_DIMENSION + 500;
+        let height = 600;
+        let img = image::RgbaImage::from_fn(width, height, |x, y| {
+            image::Rgba([(x % 256) as u8, (y % 256) as u8, 128, 90]) // uniform, well below opaque
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transparent_gradient.png");
+        image::DynamicImage::ImageRgba8(img)
+            .save_with_format(&path, image::ImageFormat::Png)
+            .unwrap();
+
+        let out = Read::default()
+            .run(json!({ "path": path.to_str().unwrap() }))
+            .await
+            .unwrap();
+        assert_eq!(out.images.len(), 1);
+        assert!(out.text.contains("resized from"), "got: {}", out.text);
+        assert_eq!(
+            out.images[0].media_type, "image/png",
+            "a compressible gradient must still win as lossless PNG"
+        );
+
+        let decoded_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&out.images[0].data)
+            .unwrap();
+        let decoded = image::load_from_memory(&decoded_bytes).unwrap();
+        assert!(
+            decoded.color().has_alpha(),
+            "the resized/re-encoded image must still carry an alpha channel"
+        );
+        let rgba = decoded.to_rgba8();
+        assert!(
+            rgba.pixels().any(|p| p[3] != 255),
+            "resized image must retain non-opaque pixels, not flatten to fully opaque: sample alpha = {}",
+            rgba.get_pixel(0, 0)[3]
+        );
     }
 
     #[test]

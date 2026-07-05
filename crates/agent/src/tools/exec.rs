@@ -88,6 +88,15 @@ impl RealRunner {
         timeout: Duration,
         on_chunk: Option<ChunkSink<'_>>,
     ) -> std::io::Result<ExecResult> {
+        // No `PATH` manipulation here — `Command` inherits the parent process's environment
+        // (including `PATH`) as-is. Pi-parity note: this is a deliberate, documented DIVERGENCE, not
+        // an oversight. Pi's `getShellEnv()` (`packages/coding-agent/src/utils/shell.ts`) prepends a
+        // managed-binaries directory (pinned `rg`/`fd` it downloads itself) onto `PATH` for every
+        // spawn, so its `grep`/`find` tools work even on a host with neither installed. Beyond's own
+        // `grep`/`find` tools are native (ripgrep/globset linked in-process, see `grep.rs`/`find.rs`) —
+        // unaffected either way — so this only matters for an arbitrary model-invoked `bash: rg ...` /
+        // `fd ...` on a host that happens to lack them. Not worth a from-scratch bundled-binaries
+        // mechanism just to cover that narrow case.
         let mut cmd = tokio::process::Command::new(program);
         cmd.args(args)
             // Closed, not inherited: a model-run command has no business reading the agent process's

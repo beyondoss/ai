@@ -131,8 +131,15 @@ pub enum AgentEvent {
     /// A pending [`crate::steering::Steering::request_tool_set`] was applied at a turn boundary (Task
     /// #13, pi-parity) — every subsequent turn of this run now advertises the tools in `tool_names`
     /// (sorted, matching [`crate::tool::ToolRegistry::definitions`]'s own order) instead of whatever the
-    /// `Agent` was originally configured with. Mirrors pi's `tools_update` event
-    /// (`agent-harness.ts`'s `setTools`/`setActiveTools`).
+    /// `Agent` was originally configured with. Mirrors the underlying mechanism pi's real shipped
+    /// product uses for the same feature — `packages/coding-agent/src/core/agent-session.ts`'s
+    /// `setActiveToolsByName` (defined at line 840; called from the extension runtime's `setActiveTools`
+    /// handler at line 2283, and internally at line 2428), which likewise reconfigures a run's tool set
+    /// mid-flight, taking effect starting the next turn. pi's own `setActiveToolsByName` has no discrete
+    /// event of its own, though — this explicit `ToolsUpdated` event (so a streaming client can observe
+    /// the change) is this crate's own addition. The `tools_update` event *name* traces to the dead,
+    /// unshipped `packages/agent/src/harness/agent-harness.ts` (zero references from
+    /// `packages/coding-agent`), not to a real pi event.
     ToolsUpdated { tool_names: Vec<String> },
 }
 
@@ -616,7 +623,8 @@ impl Agent {
         }
         let _clear_stop_on_drop = ClearStopOnDrop(steering.clone());
         sink(AgentEvent::AgentStart);
-        // Drain the next-turn lane (pi's `nextTurnQueue`) before this run's very first request is
+        // Drain the next-turn lane (a beyond-only capability — see `steering.rs`'s own module doc
+        // comment for why it has no real pi-product equivalent) before this run's very first request is
         // built — a message queued via `Steering::push_next_turn` while the agent was idle (no run in
         // flight for `push`/`push_steer` to attach to) must still land on turn 1 of whatever prompt
         // comes next, not just eventually after a tool round-trip. Folded as leading content blocks on
@@ -716,9 +724,20 @@ impl Agent {
         loop {
             if cancel.is_cancelled() {
                 close_out_pending_cancellation(session, &current_model);
-                // Matches pi's `agent-harness.ts` `abort()`: a message queued via `push`/`push_steer`
-                // shortly before (or during) cancellation must not silently ride into whatever
-                // unrelated run reuses this same `Steering` handle next. Deliberately the narrower,
+                // A deliberate beyond design choice, not a port of pi: a message queued via
+                // `push`/`push_steer` shortly before (or during) cancellation is discarded here rather
+                // than silently riding into whatever unrelated run reuses this same `Steering` handle
+                // next — a conservative safety default (a stale queued message surviving an abort is
+                // arguably worse than losing it). This diverges from pi's real headless/RPC abort path
+                // (`AgentSession.abort()`, `packages/coding-agent/src/core/agent-session.ts:1449-1453`,
+                // called from `packages/coding-agent/src/modes/rpc/rpc-mode.ts:424-426`), which does
+                // *not* clear queued steer/follow-up messages at all — only the TUI's own `clearQueue()`
+                // does, and beyond is headless, not a TUI. (The unused
+                // `packages/agent/src/harness/agent-harness.ts`'s `abort()` also clears them, but that's
+                // dead code, not pi's real product.) Open question, not settled by this comment: whether
+                // beyond's stricter behavior is actually the right default, or whether it should instead
+                // match pi's real headless behavior and preserve a queued message across cancellation —
+                // flagging for a human call, not deciding it here. Deliberately the narrower,
                 // run-scoped clear — not `clear()` — so a message queued via `push_next_turn` still
                 // survives into whatever prompt comes next, aborted or not (see `clear_run_scoped`'s
                 // own doc comment).
@@ -1156,14 +1175,21 @@ impl Agent {
             }
 
             // The assistant's own turn — including the `tool_use` blocks collected into `calls` above —
-            // is durable now, *before* any of those tools ever run. Matches pi's `agent-harness.ts`
-            // (persists every message the instant it's produced, tool_use turn included). Without this,
-            // a crash mid-tool-execution (e.g. mid-`bash`) loses the record that the model asked for
-            // these specific calls even though a tool that already ran (an `edit`, a `write`) already
-            // took effect on disk — the persisted transcript and physical reality silently diverge on
-            // resume. Only reachable here (past the `calls.is_empty()` branch above, which checkpoints
-            // its own tool-less case separately) — a call requesting tools never falls through to that
-            // other checkpoint, so this is the one and only checkpoint a `tool_use` turn pays for here.
+            // is durable now, *before* any of those tools ever run. Confirmed to match pi's real
+            // persistence path, not just the dead harness: `packages/agent/src/agent-loop.ts` awaits
+            // `emit({ type: "message_end", message })` (line 185) before ever calling `executeToolCalls`
+            // (line 208); that `emit` is `Agent.processEvents` (`packages/agent/src/agent.ts`), which
+            // awaits every registered listener — including
+            // `packages/coding-agent/src/core/agent-session.ts`'s `_handleAgentEvent`, which persists
+            // synchronously via `SessionManager.appendMessage` → `_persist`'s `appendFileSync`
+            // (`packages/coding-agent/src/core/session-manager.ts:934-967`) — to completion first.
+            // Without this, a crash mid-tool-execution (e.g. mid-`bash`) loses the record that the model
+            // asked for these specific calls even though a tool that already ran (an `edit`, a `write`)
+            // already took effect on disk — the persisted transcript and physical reality silently
+            // diverge on resume. Only reachable here (past the `calls.is_empty()` branch above, which
+            // checkpoints its own tool-less case separately) — a call requesting tools never falls
+            // through to that other checkpoint, so this is the one and only checkpoint a `tool_use` turn
+            // pays for here.
             self.checkpoint.checkpoint(session).await;
 
             // Run the tools and feed results back as a single user turn. A tool's own failure becomes
@@ -1172,11 +1198,28 @@ impl Agent {
             // The calls run concurrently: tools are I/O-bound (file reads, shell commands, the
             // `beyond` CLI), and a model routinely batches independent ones in a single turn, so
             // overlapping them collapses the tool phase from the sum of their latencies to its slowest
-            // member. `ToolStart` is emitted up front in call order; `ToolEnd` is emitted live, the
-            // instant each call's own result is known — a client watching the event stream sees
-            // completions in actual finish order, not batched after the slowest call joins. The
-            // *transcript* (the `tool_result` blocks pushed to the session below) still stays
-            // deterministic regardless of finish order, rebuilt in call order after the join.
+            // member. `ToolStart` is emitted up front, for the *whole* batch, in call order, before
+            // Phase 1's own gating loop below even begins; `ToolEnd` is emitted live, the instant each
+            // call's own result is known — a client watching the event stream sees completions in
+            // actual finish order, not batched after the slowest call joins. The *transcript* (the
+            // `tool_result` blocks pushed to the session below) still stays deterministic regardless of
+            // finish order, rebuilt in call order after the join.
+            //
+            // A known departure from pi's own literal order: pi's real `executeToolCallsParallel`
+            // (`packages/agent/src/agent-loop.ts`, the live library the shipped `Agent` class actually
+            // runs — not the unused harness) interleaves each call's own `tool_execution_start` emission
+            // with that same call's `prepareToolCall` gate, one call fully gated before the next call's
+            // start event even fires (`start1 → gate1 → start2 → gate2 → ...`), only parallelizing the
+            // execution phase afterward via `Promise.all`. Emitting the whole batch's `ToolStart` up
+            // front instead means a client sees every call announced immediately, before any gate/hook
+            // has had a chance to run or block one — observability/UX only, the persisted transcript and
+            // tool semantics are unaffected either way. Left as up-front-batch emission here rather than
+            // interleaved with Phase 1's gate loop below: the `sequential_execution_requested` branch
+            // (`run_tool_calls_interleaved`, Task #28) deliberately emits no `ToolStart` of its own and
+            // relies on this same up-front loop having already covered its whole batch (see that
+            // function's own doc comment) — moving emission into Phase 1's gate loop would need to move
+            // in lockstep with that other dispatch path too, not just this one, to keep both giving every
+            // call a `ToolStart` exactly once.
             //
             // Calls aren't always independent, though: two calls that write the same path (the model
             // batching two `edit`s against one file) would otherwise race on disk. `Tool::write_target`
@@ -3587,9 +3630,15 @@ mod tests {
         // The other half of the fix above: once the failure closes the turn with a real assistant
         // record, a client retrying with a fresh `session.user(...)` must restore valid role
         // alternation — not append a second consecutive `user` message, a shape no wire dialect
-        // accepts. Mirrors pi's own harness-level proof
-        // (`packages/agent/test/harness/agent-harness.test.ts:262-291`,
-        // `await expect(harness.prompt("after failure")).resolves.toMatchObject({ role: "assistant" })`).
+        // accepts. The shared premise — a failed run must close with a real, role:"assistant" record —
+        // is proven in pi's own real, shipped test suite too: `packages/agent/test/agent.test.ts`'s
+        // "emits full lifecycle events for thrown run failures" asserts the same `lastMessage.role ===
+        // "assistant"` shape (not the dead `packages/agent/test/harness/agent-harness.test.ts`, which
+        // tests the unused harness — zero references from `packages/coding-agent`). The second half
+        // proven here — that a subsequent prompt doesn't then double-push a consecutive user turn — is
+        // this crate's own additional invariant; a search of both `packages/agent/test/agent.test.ts`
+        // and `packages/coding-agent/test/agent-session-retry.test.ts` didn't turn up a directly
+        // equivalent assertion in pi's real test suite.
         let mock = Arc::new(MockTransport::scripted(vec![
             vec![
                 Ok(StreamEvent::MessageStart),
@@ -8756,11 +8805,13 @@ mod tests {
 
     #[tokio::test]
     async fn next_turn_queued_while_idle_lands_in_the_very_first_request_of_the_next_run() {
-        // pi-parity gap (task 43): pi's `nextTurnQueue` guarantees a message queued while idle is
-        // prepended to the very next prompt's own first model request — visible to the model on turn 1
-        // of that prompt, not just eventually after a tool round-trip or a stop boundary the way
-        // `steer`/`follow_up` are. Confirms `Steering::push_next_turn` actually reaches the first
-        // request `run_events_steered` sends, folded onto the same user turn as the prompt itself.
+        // Task 43: this crate's next-turn lane guarantees a message queued while idle is prepended to
+        // the very next prompt's own first model request — visible to the model on turn 1 of that
+        // prompt, not just eventually after a tool round-trip or a stop boundary the way `steer`/
+        // `follow_up` are. A beyond-only capability, not pi parity — see `steering.rs`'s own module doc
+        // comment for why no equivalent lane exists in pi's real product. Confirms
+        // `Steering::push_next_turn` actually reaches the first request `run_events_steered` sends,
+        // folded onto the same user turn as the prompt itself.
         let (agent, mock) = agent_with(vec![turn::text("ok")], ToolRegistry::new());
         let steering = Steering::new();
         steering.push_next_turn("queued while idle");
@@ -9288,11 +9339,11 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_clears_queued_steer_and_follow_up_messages() {
-        // pi-parity gap: pi's `agent-harness.ts` `abort()` clears the steer/follow-up queues so a
-        // message queued right before (or during) cancellation doesn't silently ride into whatever
-        // unrelated run reuses the same `Steering` handle next. `agent.rs` used to never call
-        // `Steering::clear()` (or its narrower successor, `clear_run_scoped()`) on any of its
-        // cancellation exit paths at all.
+        // Beyond design choice (not a pi port — see `clear_run_scoped`'s own doc comment): clearing the
+        // steer/follow-up queues on cancellation means a message queued right before (or during)
+        // cancellation doesn't silently ride into whatever unrelated run reuses the same `Steering`
+        // handle next. `agent.rs` used to never call `Steering::clear()` (or its narrower successor,
+        // `clear_run_scoped()`) on any of its cancellation exit paths at all.
         let agent = Agent::new(Arc::new(MockTransport::new(vec![])), "claude-opus-4-8");
         let mut session = Session::new();
         session.user("go");
@@ -9317,11 +9368,12 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_does_not_clear_a_queued_next_turn_message() {
-        // pi-parity fix: cancellation must use the narrower `clear_run_scoped()`, not the general
-        // `clear()` — mirroring pi's `AgentHarness.abort()` (`agent-harness.ts:970-997`), which
-        // explicitly clears only `steerQueue`/`followUpQueue`, leaving `nextTurnQueue` untouched. A
-        // message queued via `push_next_turn` is meant to survive into whatever prompt comes next,
-        // aborted or not — a run ending in cancellation must not silently drop it.
+        // Cancellation must use the narrower `clear_run_scoped()`, not the general `clear()` — the
+        // steer/follow-up lanes are cleared as a beyond-only conservative default (see
+        // `clear_run_scoped`'s own doc comment for why, and how that diverges from pi's real headless
+        // abort path), but the next-turn lane is left untouched regardless. A message queued via
+        // `push_next_turn` is meant to survive into whatever prompt comes next, aborted or not — a run
+        // ending in cancellation must not silently drop it.
         //
         // The next-turn lane is drained exactly once, right at the very start of
         // `run_events_steered` (folded onto this run's own first turn) — so to actually exercise
@@ -9821,11 +9873,13 @@ mod tests {
     async fn a_mid_run_tool_set_switch_applies_to_the_next_turn_not_the_current_one() {
         use std::time::Duration;
 
-        // Task #13 (pi-parity): pi's `setTools`/`setActiveTools` (`agent-harness.ts:871-928`) let a
-        // host reconfigure a run's tool set mid-flight, taking effect starting the very next turn —
-        // this crate's `Steering::request_tool_set` is the equivalent, applied at the same turn
-        // boundary a model switch already is. Requested *during* the first tool call (concurrently),
-        // it must not affect the request already in flight, only the next one's.
+        // Task #13 (pi-parity): pi's real shipped product lets a host reconfigure a run's tool set
+        // mid-flight via `setActiveToolsByName` (`packages/coding-agent/src/core/agent-session.ts:840`,
+        // wired to the extension runtime's `setActiveTools` handler at line 2283), taking effect
+        // starting the very next turn — this crate's `Steering::request_tool_set` is the equivalent,
+        // applied at the same turn boundary a model switch already is. Requested *during* the first
+        // tool call (concurrently), it must not affect the request already in flight, only the next
+        // one's.
         struct SwitchableSleepyTool;
         #[async_trait]
         impl Tool for SwitchableSleepyTool {

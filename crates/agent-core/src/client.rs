@@ -539,7 +539,8 @@ impl ModelTransport for GatewayClient {
         let send_x_session_affinity = dialect == Dialect::OpenAi;
         let needs_interleaved_beta = needs_interleaved_thinking_beta(&req.model);
         let needs_fine_grained_tool_streaming_beta = !req.tools.is_empty()
-            && !crate::models::capabilities(&req.model).supports_eager_tool_streaming;
+            && !crate::models::capabilities_for_route(&req.model, req.is_codex, req.is_azure)
+                .supports_eager_tool_streaming;
         let stream = async_stream::try_stream! {
             // Retry the request up to the first byte: a transient failure (refused connection, 429,
             // 503) is re-issued with backoff. We do *not* retry once events have started flowing — a
@@ -567,9 +568,11 @@ impl ModelTransport for GatewayClient {
             )
             .await?;
 
-            // Observability seam (Task #14, pi-parity: `afterProviderResponse`,
-            // `agent-harness.ts:321-385`): fires once the response's status/headers are known, before
-            // its body starts streaming. Read-only — the response itself is already normalized into
+            // Observability seam (Task #14, pi-parity: pi's real `onResponse`,
+            // `packages/coding-agent/src/core/sdk.ts:340-346`, wired to the `"after_provider_response"`
+            // extension event — see `AgentHooks::after_provider_response`'s own doc comment for the
+            // full citation): fires once the response's status/headers are known, before its body
+            // starts streaming. Read-only — the response itself is already normalized into
             // `StreamEvent`s the loop consumes directly, so there's nothing here to rewrite.
             if let Some(hooks) = &hooks {
                 let headers: Vec<(String, String)> = resp
@@ -940,10 +943,22 @@ async fn send_with_retry(
                     if status.as_u16() == 429 {
                         let detail = resp.text().await.unwrap_or_default();
                         if is_quota_exhausted(&detail) {
-                            return Err(Error::Transport(format!(
-                                "gateway returned {status}: {}",
-                                truncate_error_body(detail.trim())
-                            )));
+                            // Codex/ChatGPT's own usage-limit body carries a machine code and (often)
+                            // a reset time — surface a friendly, human-readable sentence ahead of the
+                            // raw upstream detail when it's actually present, rather than only ever
+                            // showing the bare JSON. Pure UX polish: the raw detail stays visible
+                            // either way.
+                            let msg = match codex_friendly_usage_limit_message(&detail) {
+                                Some(friendly) => format!(
+                                    "{friendly} (gateway returned {status}: {})",
+                                    truncate_error_body(detail.trim())
+                                ),
+                                None => format!(
+                                    "gateway returned {status}: {}",
+                                    truncate_error_body(detail.trim())
+                                ),
+                            };
+                            return Err(Error::Transport(msg));
                         }
                     }
                     let wait = backoff(attempt, hint, base_backoff, max_backoff);
@@ -1012,6 +1027,14 @@ const QUOTA_EXHAUSTED_PATTERNS: &[&str] = &[
     "billing",
     "out of budget",
     "exceeded your current quota",
+    // Codex/ChatGPT-specific usage-cap phrases — pi's `isTerminalRateLimitError`
+    // (`openai-codex-responses.ts:114-118`) recognizes these alongside the generic phrases above.
+    // Without them, a 429 carrying one of these Codex-only bodies fell through to ordinary
+    // rate-limit handling and retried with full exponential backoff instead of failing fast.
+    "gousagelimiterror",
+    "freeusagelimiterror",
+    "monthly usage limit reached",
+    "available balance",
 ];
 
 /// Whether a 429 response body indicates quota/billing exhaustion (fail fast) rather than ordinary
@@ -1023,6 +1046,53 @@ const QUOTA_EXHAUSTED_PATTERNS: &[&str] = &[
 pub fn is_quota_exhausted(body: &str) -> bool {
     let m = body.to_ascii_lowercase();
     QUOTA_EXHAUSTED_PATTERNS.iter().any(|p| m.contains(p))
+}
+
+/// A friendlier message for a Codex/ChatGPT-specific usage-limit body, matching pi's Codex-specific
+/// `parseErrorResponse` (`openai-codex-responses.ts:1459-1484`): `{"error":{"code":
+/// "usage_limit_reached"|"usage_not_included"|"rate_limit_exceeded", "plan_type": "plus", "resets_at":
+/// <unix seconds>}}` becomes `"You have hit your ChatGPT usage limit (plus plan). Try again in ~45
+/// min."`. `None` for anything that isn't this specific shape — deliberately narrower than pi's own
+/// gate (which also fires on bare `response.status === 429` with no code match at all, safe there only
+/// because pi's call site is already reached exclusively through its Codex-specific
+/// `isTerminalRateLimitError` gate; beyond routes every provider through this same generic retry loop,
+/// so requiring the actual `code` match keeps a non-Codex 429's quota body — Anthropic's, OpenAI's own
+/// native billing error, DeepSeek's, etc. — showing its own raw detail unchanged instead of an
+/// incongruous "ChatGPT usage limit" rewrite). Pure UX polish: the raw body this is derived from stays
+/// visible alongside it either way (see the one call site), so a body that fails to parse or doesn't
+/// match just yields `None` rather than being treated as an error itself.
+fn codex_friendly_usage_limit_message(detail: &str) -> Option<String> {
+    let parsed: Value = serde_json::from_str(detail).ok()?;
+    let err = parsed.get("error")?;
+    let code = err
+        .get("code")
+        .and_then(Value::as_str)
+        .or_else(|| err.get("type").and_then(Value::as_str))
+        .unwrap_or_default();
+    let is_usage_limit_code = ["usage_limit_reached", "usage_not_included", "rate_limit_exceeded"]
+        .iter()
+        .any(|p| code.eq_ignore_ascii_case(p));
+    if !is_usage_limit_code {
+        return None;
+    }
+    let plan = err
+        .get("plan_type")
+        .and_then(Value::as_str)
+        .map(|p| format!(" ({} plan)", p.to_ascii_lowercase()))
+        .unwrap_or_default();
+    let when = err
+        .get("resets_at")
+        .and_then(Value::as_i64)
+        .map(|resets_at_secs| {
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let mins = ((resets_at_secs - now_secs) as f64 / 60.0).round().max(0.0) as i64;
+            format!(" Try again in ~{mins} min.")
+        })
+        .unwrap_or_default();
+    Some(format!("You have hit your ChatGPT usage limit{plan}.{when}").trim().to_string())
 }
 
 /// Whether a `reqwest` send error is the transient connection class (refused/reset/timed out).
@@ -1060,14 +1130,42 @@ fn truncate_error_body(s: &str) -> String {
     format!("{kept}... [truncated {omitted} chars]")
 }
 
-/// Parse a `Retry-After` response header into a duration, capped at `max_backoff`.
+/// Parse a `Retry-After` response header into a duration, capped at `max_backoff`. Checks the
+/// non-standard, millisecond-precision `retry-after-ms` header first — mirrors pi's Codex-specific
+/// `getRetryAfterDelayMs` (`openai-codex-responses.ts:130-137`), which checks it before falling back to
+/// the standard header, but applied generically to every provider's response here rather than gated on
+/// a Codex-specific retry path: beyond routes Codex through this same generic retry loop as every other
+/// provider, so there's no separate Codex-only call site to special-case instead. A provider that never
+/// sends `retry-after-ms` simply never matches the first branch and falls through unchanged.
 fn retry_after(resp: &reqwest::Response, max_backoff: Duration) -> Option<Duration> {
+    if let Some(ms) = resp
+        .headers()
+        .get("retry-after-ms")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|raw| parse_retry_after_ms(raw, max_backoff))
+    {
+        return Some(ms);
+    }
     let raw = resp
         .headers()
         .get(reqwest::header::RETRY_AFTER)?
         .to_str()
         .ok()?;
     parse_retry_after(raw, max_backoff)
+}
+
+/// Parse a `retry-after-ms` header *value* (milliseconds, not seconds) into a wait, capped at
+/// `max_backoff`. Mirrors pi's `getRetryAfterDelayMs`: any non-negative finite number is accepted
+/// (including a fractional one — `Number.isFinite` in JS accepts floats same as this parses `f64`),
+/// clamped up to zero for a negative value (clock skew, a malformed hint), and anything that doesn't
+/// parse as a plain number at all is ignored rather than treated as a hard error. Split out from
+/// [`retry_after`] so it's testable without a `reqwest::Response`.
+fn parse_retry_after_ms(raw: &str, max_backoff: Duration) -> Option<Duration> {
+    let millis: f64 = raw.trim().parse().ok()?;
+    if !millis.is_finite() {
+        return None;
+    }
+    Some(Duration::from_secs_f64(millis.max(0.0) / 1000.0).min(max_backoff))
 }
 
 /// Parse a `Retry-After` header *value* into a wait, capped at `max_backoff`. RFC 7231 allows two
@@ -1268,6 +1366,69 @@ mod tests {
     }
 
     #[test]
+    fn quota_exhaustion_classification_covers_codex_usage_cap_phrases() {
+        // pi-parity (pass 17): pi's Codex-specific `isTerminalRateLimitError`
+        // (`openai-codex-responses.ts:114-118`) also recognizes these ChatGPT/Codex usage-cap phrases,
+        // which previously fell through to ordinary rate-limit handling (full exponential backoff)
+        // instead of failing fast.
+        for body in [
+            r#"{"error":{"type":"GoUsageLimitError","message":"you're out for today"}}"#,
+            r#"{"error":{"type":"FreeUsageLimitError","message":"free tier exhausted"}}"#,
+            r#"{"error":"Monthly usage limit reached for this account"}"#,
+            r#"{"error":"insufficient available balance to complete this request"}"#,
+        ] {
+            assert!(
+                is_quota_exhausted(body),
+                "should classify as quota exhaustion: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_friendly_usage_limit_message_matches_pis_parse_error_response() {
+        // pi-parity (pass 17, Task 5): pi's Codex-specific `parseErrorResponse`
+        // (`openai-codex-responses.ts:1459-1484`) turns this raw shape into a friendly sentence rather
+        // than surfacing the bare JSON.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        // +20s of slack so the function's own (slightly later) `now` still rounds to the same 45
+        // minutes — avoids flaking right at a rounding boundary.
+        let resets_at = now + 45 * 60 + 20;
+        let body = format!(
+            r#"{{"error":{{"code":"usage_limit_reached","plan_type":"Plus","resets_at":{resets_at}}}}}"#
+        );
+        let msg = codex_friendly_usage_limit_message(&body).expect("should match");
+        assert_eq!(msg, "You have hit your ChatGPT usage limit (plus plan). Try again in ~45 min.");
+
+        // No `plan_type`/`resets_at` at all → still a friendly message, just without those clauses.
+        let body = r#"{"error":{"code":"rate_limit_exceeded"}}"#;
+        assert_eq!(
+            codex_friendly_usage_limit_message(body).unwrap(),
+            "You have hit your ChatGPT usage limit."
+        );
+
+        // `type` is accepted as a fallback for `code`.
+        let body = r#"{"error":{"type":"usage_not_included"}}"#;
+        assert_eq!(
+            codex_friendly_usage_limit_message(body).unwrap(),
+            "You have hit your ChatGPT usage limit."
+        );
+
+        // A quota body that ISN'T this specific Codex shape (e.g. plain OpenAI billing, or unparseable
+        // text) must not get rewritten — every other provider's raw detail stays exactly as-is.
+        assert!(
+            codex_friendly_usage_limit_message(
+                r#"{"error":{"type":"insufficient_quota","message":"You exceeded your current quota"}}"#
+            )
+            .is_none()
+        );
+        assert!(codex_friendly_usage_limit_message("not json at all").is_none());
+        assert!(codex_friendly_usage_limit_message(r#"{"error":"a bare string, no code field"}"#).is_none());
+    }
+
+    #[test]
     fn backoff_is_exponential_and_capped() {
         assert_eq!(backoff(0, None, BASE_BACKOFF, MAX_BACKOFF), BASE_BACKOFF);
         assert_eq!(
@@ -1367,6 +1528,40 @@ mod tests {
             delay > Duration::ZERO && delay <= MAX_BACKOFF,
             "future http-date should yield a bounded positive delay, got {delay:?}"
         );
+    }
+
+    #[test]
+    fn parse_retry_after_ms_accepts_milliseconds_and_ignores_garbage() {
+        // pi-parity (pass 17): pi's Codex-specific `getRetryAfterDelayMs`
+        // (`openai-codex-responses.ts:130-137`) checks a non-standard `retry-after-ms` header before
+        // falling back to the standard `Retry-After` (seconds/HTTP-date) one — applied generically here
+        // since beyond routes Codex through the same retry path as every other provider.
+        assert_eq!(
+            parse_retry_after_ms("1500", MAX_BACKOFF),
+            Some(Duration::from_millis(1500))
+        );
+        assert_eq!(
+            parse_retry_after_ms(" 250 ", MAX_BACKOFF),
+            Some(Duration::from_millis(250))
+        );
+        // A fractional value is accepted too — JS `Number.isFinite` allows floats same as `f64::parse`.
+        assert_eq!(
+            parse_retry_after_ms("2500.5", MAX_BACKOFF),
+            Some(Duration::from_secs_f64(2.5005))
+        );
+        // A negative value clamps up to zero rather than yielding a negative/underflowing duration.
+        assert_eq!(parse_retry_after_ms("-100", MAX_BACKOFF), Some(Duration::ZERO));
+        // Capped at the caller's `max_backoff`, same as the seconds/date form.
+        assert_eq!(
+            parse_retry_after_ms("999999999", MAX_BACKOFF),
+            Some(MAX_BACKOFF)
+        );
+        // Not a number at all → ignored, letting the caller fall back to the standard header.
+        assert_eq!(parse_retry_after_ms("soon", MAX_BACKOFF), None);
+        assert_eq!(parse_retry_after_ms("", MAX_BACKOFF), None);
+        // Non-finite (`NaN`/`Infinity` both parse as valid `f64` but must still be rejected).
+        assert_eq!(parse_retry_after_ms("NaN", MAX_BACKOFF), None);
+        assert_eq!(parse_retry_after_ms("inf", MAX_BACKOFF), None);
     }
 
     #[test]

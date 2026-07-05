@@ -1180,6 +1180,62 @@ fn smoke_branch_summary_generated_live() {
     }
 }
 
+/// Dedicated, tool-independent regression for the Anthropic dialect's `usage`/`stop_reason` leak: every
+/// real assistant turn `Agent::run_events_steered` produces is stamped with both (`Message::usage`,
+/// `Message::stop_reason`), and until `dialect::anthropic::strip_internal_fields` stripped them too
+/// (it previously only removed `model_id`/`error_message`/`aborted`), replaying that history on turn 2
+/// leaked them onto the wire — Anthropic rejects unknown fields on a message object, so **every**
+/// second turn of **every** Anthropic conversation 400ed: `messages.1.stop_reason: Extra inputs are not
+/// permitted`. No tool use is involved at all; three consecutive plain-text prompts are enough to prove
+/// it, which is deliberate — this is the minimal reproduction for the bug class, independent of
+/// `smoke_tool_round_trip`/`smoke_branch_summary_generated_live` (which happen to also cover it, but
+/// bury it under tool-calling and summarization machinery).
+#[test]
+#[ignore = "live provider smoke; run via `mise run test:smoke:agent` with ANTHROPIC_API_KEY set"]
+fn smoke_anthropic_multi_turn_plain_text_does_not_400_live() {
+    let Some(key) = env_key("ANTHROPIC_API_KEY") else {
+        eprintln!("smoke[anthropic-multi-turn]: ANTHROPIC_API_KEY unset — skipping");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (gw_port, mut gateway) = boot_gateway(dir.path(), "anthropic", &key);
+
+    let mut child = serve_child(gw_port, dir.path(), "claude-haiku-4-5", &[]);
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    let mut responses = Vec::new();
+    for word in ["ONE", "TWO", "THREE"] {
+        writeln!(
+            stdin,
+            "{}",
+            json!({ "type": "prompt", "message": format!("Reply with ONLY the word {word}.") })
+        )
+        .unwrap();
+        stdin.flush().unwrap();
+        let frames = read_until_response(&mut stdout, "prompt");
+        let resp = frames
+            .iter()
+            .rev()
+            .find(|f| f["type"] == "response" && f["command"] == "prompt")
+            .unwrap_or_else(|| panic!("a prompt response for turn {word}: {frames:#?}"))
+            .clone();
+        responses.push((word, resp));
+    }
+    drop(stdin);
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    let _ = child.wait();
+
+    for (word, resp) in &responses {
+        eprintln!("--- anthropic multi-turn [{word}] prompt response ---\n{resp}");
+        assert_eq!(
+            resp["success"], true,
+            "turn {word} must not 400 on replayed usage/stop_reason: {resp}"
+        );
+    }
+}
+
 /// Cross-provider `set_model` scrubs a signed thinking history so the next request doesn't 400 —
 /// live, through one gateway fronting **both** providers. `agent-core/ARCHITECTURE.md` calls this out
 /// as a correctness landmine: a signed thinking/reasoning block is only replayable to the model that

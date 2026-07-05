@@ -88,7 +88,12 @@ fn from_claude_code_name(name: &str, tools: &[ToolDef]) -> String {
 /// third onto the last message to capture the conversation so far. The TTL is 5 min, or 1 hour when
 /// `cache_long` is set (see [`cache_control`]).
 pub fn build_body(req: &ModelRequest, is_oauth: bool) -> Value {
-    let caps = crate::models::capabilities(&req.model);
+    // `is_codex`/`is_azure` are both OpenAI-only route flags (always `false` here, since Anthropic
+    // requests never carry either) — passed through anyway for the same reason every other dialect's
+    // `build_body` does: `capabilities_for_route` is a complete no-op for any non-OpenAI id (see its
+    // own `..._leaves_non_openai_ids_completely_unaffected` test), so this stays a plain
+    // `capabilities(&req.model)` in every real case while keeping one call shape across all dialects.
+    let caps = crate::models::capabilities_for_route(&req.model, req.is_codex, req.is_azure);
     let mut map = Map::new();
     map.insert("model".into(), Value::String(req.model.clone()));
     map.insert(
@@ -108,12 +113,12 @@ pub fn build_body(req: &ModelRequest, is_oauth: bool) -> Value {
     // Rolling breakpoint: cache the conversation prefix (tools + system + every prior message) up to
     // the final block, so next turn the whole accumulated transcript is a cache read, not a re-bill.
     let mut messages = serde_json::to_value(req.messages.as_ref()).unwrap_or(Value::Null);
-    // `Message::model_id` is an internal-only provenance field (which model produced this turn, used
-    // by `Session::scrub_cross_model_state`) — it must never reach the wire. Anthropic's schema is
-    // strict about unknown fields on a message object and 400s the whole request if it leaks through
+    // `Message::model_id`/`usage`/`stop_reason`/etc. are internal-only fields (provenance and
+    // per-turn accounting, not wire schema) — they must never reach the wire. Anthropic's schema is
+    // strict about unknown fields on a message object and 400s the whole request if any leaks through
     // (unlike the OpenAI dialects, which build each wire message from named fields rather than
     // serializing `Message` wholesale, so they never had this exposure).
-    strip_model_id(&mut messages);
+    strip_internal_fields(&mut messages);
     normalize_cross_model_tool_ids(&mut messages, &req.messages, &req.model);
     downgrade_unsigned_thinking(&mut messages);
     downgrade_unsupported_images(&mut messages, caps.supports_vision);
@@ -301,8 +306,11 @@ fn canonicalize_tool_use_names(messages: &mut Value) {
 /// 400 proved it); `error_message`/`aborted` (`Message::error`/`Message::with_aborted`) are the same
 /// leak class — both are `Some`/`true` on exactly the synthetic closing records those constructors
 /// exist to persist, i.e. the ones now most likely to actually reach a real request after a whole-run
-/// retry or a follow-up prompt.
-fn strip_model_id(messages: &mut Value) {
+/// retry or a follow-up prompt. `usage`/`stop_reason` are the same leak class again, but far more
+/// common: `Agent::run_events_steered` stamps *both* onto every real assistant turn (not just a
+/// synthetic error/abort record), so any multi-turn conversation replays them on the very next
+/// request — a live 400 (`messages.1.stop_reason: Extra inputs are not permitted`) proved this too.
+fn strip_internal_fields(messages: &mut Value) {
     let Some(msgs) = messages.as_array_mut() else {
         return;
     };
@@ -310,6 +318,8 @@ fn strip_model_id(messages: &mut Value) {
         m.remove("model_id");
         m.remove("error_message");
         m.remove("aborted");
+        m.remove("usage");
+        m.remove("stop_reason");
     }
 }
 
@@ -1058,6 +1068,39 @@ mod tests {
             assert!(
                 m.get("aborted").is_none(),
                 "aborted must never reach the wire: {m}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_body_never_leaks_usage_or_stop_reason_onto_the_wire() {
+        // CRITICAL regression: `Agent::run_events_steered` stamps `usage` and `stop_reason` onto
+        // *every* real assistant turn (not just a synthetic error/abort record), so any ordinary
+        // multi-turn conversation replays them on the very next request. Empirically confirmed live
+        // against real Anthropic before this fix: `messages.1.stop_reason: Extra inputs are not
+        // permitted` (400). `strip_internal_fields` must remove both.
+        let req = ModelRequest::new(
+            "claude-opus-4-8",
+            vec![
+                Message::user("hi"),
+                Message::assistant(vec![ContentBlock::text("hello")])
+                    .with_model_id("claude-opus-4-8")
+                    .with_usage(TokenUsage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        ..Default::default()
+                    })
+                    .with_stop_reason(StopReason::EndTurn),
+                Message::user("go on"),
+            ],
+            256,
+        );
+        let body = build_body(&req, false);
+        for m in body["messages"].as_array().unwrap() {
+            assert!(m.get("usage").is_none(), "usage must never reach the wire: {m}");
+            assert!(
+                m.get("stop_reason").is_none(),
+                "stop_reason must never reach the wire: {m}"
             );
         }
     }

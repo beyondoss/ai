@@ -793,3 +793,135 @@ fn serve_deny_path_flag_blocks_a_model_invoked_write_end_to_end() {
     );
     assert_eq!(tool_end["event"]["is_error"], true);
 }
+
+#[test]
+fn serve_block_images_flag_forces_a_read_tool_image_to_a_text_placeholder() {
+    // Task #34 (pi-parity fix): `--block-images` reached `run` (`main.rs::run_task`'s own
+    // `Agent::with_block_images` call site) but had no `serve` counterpart at all — `build_agent` never
+    // consulted it. `run`'s identical
+    // `run_binary_block_images_flag_forces_a_read_tool_image_to_a_text_placeholder` proves the same
+    // thing for `run`; this is `serve`'s version: the model calls `read` on a real image, and the
+    // *next* request's tool_result must carry the `read` tool's own non-vision placeholder note
+    // (`tools::read::NON_VISION_IMAGE_NOTE`), proving `--block-images` reached the tool.
+    use base64::Engine as _;
+    const RED_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAIAAADYYG7QAAAANklEQVR42u3OQQ0AAAgAoetfWls4H2wEoKlXEhISEhISEhISEhISEhISEhISEhISEhISEhK6s98T93mKDkyKAAAAAElFTkSuQmCC";
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(RED_PNG_B64)
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("shot.png"), &png).unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+
+    let turn1 = turn_tool_use("toolu_1", "read", &json!({ "path": "shot.png" }).to_string());
+    let (base, bodies) = spawn_model_server(vec![turn1, turn_text("described")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file)
+        .args(["--block-images"])
+        .current_dir(dir.path())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "read shot.png and describe it" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+    drop(stdin);
+    child.wait().unwrap();
+
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[1].contains("does not support images"),
+        "the non-vision placeholder note must reach the follow-up request, proving --block-images's \
+         _model_supports_vision:false reached the read tool: {}",
+        bodies[1]
+    );
+}
+
+#[test]
+fn serve_no_image_auto_resize_flag_skips_downscaling_an_oversized_image() {
+    // Task #34 (pi-parity fix): `--no-image-auto-resize` reached `run` but `serve`'s `build_tools`
+    // always called `tools::default_registry_with_prefix` (hardcoding `image_auto_resize: true`),
+    // never the `_and_image_auto_resize` variant `run` uses — so the flag had no effect on a `serve`
+    // process at all. An oversized image (bigger than `read`'s `MAX_IMAGE_DIMENSION`, 2000px) read via
+    // a model-issued `read` call must ship at its original pixel dimensions once this is wired,
+    // matching `tools::read`'s own
+    // `image_auto_resize_off_ships_an_oversized_image_without_downscaling_it` unit test.
+    use base64::Engine as _;
+    let img = image::RgbImage::from_pixel(2200, 2200, image::Rgb([10, 200, 10]));
+    let mut png_bytes = Vec::new();
+    image::DynamicImage::ImageRgb8(img)
+        .write_to(
+            &mut std::io::Cursor::new(&mut png_bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("big.png"), &png_bytes).unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+
+    let turn1 = turn_tool_use("toolu_1", "read", &json!({ "path": "big.png" }).to_string());
+    let (base, bodies) = spawn_model_server(vec![turn1, turn_text("described")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file)
+        .args(["--no-image-auto-resize"])
+        .current_dir(dir.path())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "read big.png and describe it" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+    drop(stdin);
+    child.wait().unwrap();
+
+    let bodies = bodies.lock().unwrap();
+    // `bodies[1]` is the *whole* raw HTTP request (headers + body — see `common::read_http_request`'s
+    // own doc comment), so the JSON body must be split off the header block first.
+    let (_, json_body) = bodies[1].split_once("\r\n\r\n").unwrap();
+    let body: serde_json::Value = serde_json::from_str(json_body).unwrap();
+    let data_b64 = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|m| {
+            m["content"].as_array().and_then(|blocks| {
+                blocks.iter().find_map(|b| {
+                    (b["type"] == "tool_result")
+                        .then(|| {
+                            b["content"].as_array().and_then(|inner| {
+                                inner
+                                    .iter()
+                                    .find(|c| c["type"] == "image")
+                                    .map(|c| c["source"]["data"].as_str().unwrap().to_string())
+                            })
+                        })
+                        .flatten()
+                })
+            })
+        })
+        .expect("the tool_result must carry the image content block");
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(&data_b64)
+        .unwrap();
+    let dims = image::load_from_memory(&decoded).unwrap();
+    assert_eq!(
+        dims.width(),
+        2200,
+        "--no-image-auto-resize must ship the image at its original width, not downscaled"
+    );
+}

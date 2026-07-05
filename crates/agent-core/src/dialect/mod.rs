@@ -56,11 +56,67 @@ pub enum Dialect {
 /// table — extend it if Copilot ever adds another id with the same native/Copilot split.
 const COPILOT_FORCES_CHAT_COMPLETIONS: &[&str] = &["gpt-4.1"];
 
+/// Bare (unprefixed, no vendor-slug `/`) model ids that pi's own catalogue serves over the Anthropic
+/// wire (`api: "anthropic-messages"`) despite an id that names neither "claude" nor "anthropic" — the
+/// same unroutability [`Dialect::for_model`]'s default heuristic already had a documented, accepted gap
+/// for with Kimi-Coding (fixed there via a per-model `models.json` `dialect` override instead, since
+/// that provider's ids are few and user-configured already). Requiring the identical manual override
+/// for *every one* of these is user-hostile given the scale (MiniMax + MiniMax-CN: all 6 real ids across
+/// both providers, still fully unroutable by default; OpenCode/OpenCode-Go: 5 more) — so these specific
+/// known id patterns get a default instead. Deliberately keyed on the *bare* id (no vendor-slug prefix)
+/// so this never mis-routes an identically-suffixed vendor-slug id another host serves over a genuinely
+/// different (non-Anthropic) wire — e.g. Together's/OpenRouter's/HuggingFace's own `"MiniMax-M3"`-named
+/// ids are always slug-prefixed (`"MiniMaxAI/MiniMax-M3"`, `"minimax/minimax-m3"`) and so never match
+/// this bare-id list at all; only MiniMax's/MiniMax-CN's own native (unprefixed) ids and OpenCode/
+/// OpenCode-Go's own (also unprefixed) aliases do.
+///
+/// - `packages/ai/src/providers/minimax.models.ts` / `minimax-cn.models.ts`: `"MiniMax-M2.7"`,
+///   `"MiniMax-M2.7-highspeed"`, `"MiniMax-M3"` (identical id sets on both providers).
+/// - `packages/ai/src/providers/opencode.models.ts`: `"qwen3.5-plus"`, `"qwen3.6-plus"`.
+/// - `packages/ai/src/providers/opencode-go.models.ts`: `"minimax-m3"`, `"qwen3.7-max"`,
+///   `"qwen3.7-plus"` (this provider's *other* MiniMax/Qwen ids — `"minimax-m2.7"`, `"qwen3.6-plus"` —
+///   are genuinely `openai-completions` there, a within-provider split; not listed here).
+const NATIVE_ANTHROPIC_WIRE_BARE_IDS: &[&str] = &[
+    "minimax-m2.7",
+    "minimax-m2.7-highspeed",
+    "minimax-m3",
+    "qwen3.5-plus",
+    "qwen3.6-plus",
+    "qwen3.7-max",
+    "qwen3.7-plus",
+];
+
+/// Whether `model` is a Fireworks-hosted id (`"accounts/fireworks/…"` — see
+/// `crate::models::is_fireworks_model`) that pi serves over the Anthropic wire. 14 of Fireworks' 16
+/// current ids are `api: "anthropic-messages"` (DeepSeek-V4, GLM-5.1, gpt-oss-120b/20b, Kimi-K2.6/
+/// K2.7-Code and their `-fast`/`-turbo` router variants, MiniMax-M2.7/M3, Qwen3.7-Plus) — only
+/// `"glm-5p2"` and its `"-fast"` router variant are `openai-completions` instead, so those two are the
+/// one exclusion rather than an enumerated allowlist (keeps this in sync with Fireworks' catalogue
+/// without needing a second copy of the same id list `crate::models::capabilities`'s own Fireworks "p"
+/// normalization already matches against).
+fn is_fireworks_anthropic_wire_model(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    crate::models::is_fireworks_model(&m) && !m.contains("glm-5p2")
+}
+
+/// Whether `model` should default to the Anthropic dialect despite naming neither "claude" nor
+/// "anthropic" — the mechanism [`Dialect::for_model`] consults for [`NATIVE_ANTHROPIC_WIRE_BARE_IDS`]
+/// and Fireworks' own Anthropic-wire ids (see [`is_fireworks_anthropic_wire_model`]). Matching is
+/// case-insensitive, mirroring every other id check in this dialect/the capability table.
+fn routes_to_anthropic_by_default(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    (!m.contains('/') && NATIVE_ANTHROPIC_WIRE_BARE_IDS.contains(&m.as_str()))
+        || is_fireworks_anthropic_wire_model(&m)
+}
+
 impl Dialect {
-    /// Pick the dialect for a model id. Claude → Anthropic; a native OpenAI id (per the capability
-    /// table's [`ApiKind`]) → the Responses API; everything else → Chat Completions.
+    /// Pick the dialect for a model id. Claude → Anthropic; a handful of known non-"claude"/
+    /// "anthropic"-named ids pi still serves over the Anthropic wire (MiniMax/MiniMax-CN, OpenCode/
+    /// OpenCode-Go, Fireworks — see [`routes_to_anthropic_by_default`]) → also Anthropic; a native
+    /// OpenAI id (per the capability table's [`ApiKind`]) → the Responses API; everything else → Chat
+    /// Completions.
     pub fn for_model(model: &str) -> Self {
-        if model.starts_with("claude") || model.contains("anthropic") {
+        if model.starts_with("claude") || model.contains("anthropic") || routes_to_anthropic_by_default(model) {
             Dialect::Anthropic
         } else if crate::models::capabilities(model).api == ApiKind::Responses {
             Dialect::OpenAiResponses
@@ -647,6 +703,76 @@ mod tests {
         // Third-party OpenAI-compatible ids stay on Chat Completions.
         assert_eq!(Dialect::for_model("llama-3.1-70b"), Dialect::OpenAi);
         assert_eq!(Dialect::for_model("anthropic/claude"), Dialect::Anthropic);
+    }
+
+    #[test]
+    fn minimax_and_minimax_cn_bare_ids_default_to_anthropic_without_a_config_override() {
+        // pi-parity Tasks 19-21: all 6 real ids across `minimax.models.ts`/`minimax-cn.models.ts` are
+        // `api: "anthropic-messages"` but name neither "claude" nor "anthropic" — previously fully
+        // unroutable by default (silently misrouted to Chat Completions) unless the user configured a
+        // per-model `models.json` `dialect` override.
+        for id in ["MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M3", "minimax-m3"] {
+            assert_eq!(Dialect::for_model(id), Dialect::Anthropic, "{id}");
+        }
+        // Case-insensitive, matching every other id check in this dialect.
+        assert_eq!(Dialect::for_model("MINIMAX-M3"), Dialect::Anthropic);
+    }
+
+    #[test]
+    fn minimax_vendor_slug_ids_on_other_hosts_are_unaffected_by_the_bare_id_default() {
+        // Together's/OpenRouter's/HuggingFace's own "MiniMax-M3"-named ids are always vendor-slug
+        // prefixed and genuinely served over Chat Completions on those hosts — the bare-id-only default
+        // must not misroute them just because they share a suffix with the native id.
+        assert_eq!(Dialect::for_model("MiniMaxAI/MiniMax-M3"), Dialect::OpenAi);
+        assert_eq!(Dialect::for_model("minimax/minimax-m3"), Dialect::OpenAi);
+    }
+
+    #[test]
+    fn opencode_and_opencode_go_bare_ids_default_to_anthropic() {
+        // opencode.models.ts: qwen3.5-plus/qwen3.6-plus; opencode-go.models.ts: minimax-m3/qwen3.7-max/
+        // qwen3.7-plus — all `api: "anthropic-messages"` despite the non-claude/anthropic id.
+        for id in ["qwen3.5-plus", "qwen3.6-plus", "qwen3.7-max", "qwen3.7-plus"] {
+            assert_eq!(Dialect::for_model(id), Dialect::Anthropic, "{id}");
+        }
+        // OpenCode-Go's *other* Qwen id on the same provider is genuinely Chat Completions — the
+        // allowlist is per-exact-id, not a blanket "every qwen3.x-plus" rule.
+        assert_eq!(
+            Dialect::for_model("qwen3.6-plus-go-variant"),
+            Dialect::OpenAi,
+            "an unlisted id must not be swept in by a loose prefix match"
+        );
+    }
+
+    #[test]
+    fn fireworks_anthropic_wire_ids_default_to_anthropic_except_the_openai_completions_glm_5p2() {
+        // 14 of Fireworks' 16 current ids are `api: "anthropic-messages"`.
+        for id in [
+            "accounts/fireworks/models/deepseek-v4-flash",
+            "accounts/fireworks/models/deepseek-v4-pro",
+            "accounts/fireworks/models/glm-5p1",
+            "accounts/fireworks/models/gpt-oss-120b",
+            "accounts/fireworks/models/gpt-oss-20b",
+            "accounts/fireworks/models/kimi-k2p6",
+            "accounts/fireworks/models/kimi-k2p7-code",
+            "accounts/fireworks/models/minimax-m2p7",
+            "accounts/fireworks/models/minimax-m3",
+            "accounts/fireworks/models/qwen3p7-plus",
+            "accounts/fireworks/routers/glm-5p1-fast",
+            "accounts/fireworks/routers/kimi-k2p6-fast",
+            "accounts/fireworks/routers/kimi-k2p6-turbo",
+            "accounts/fireworks/routers/kimi-k2p7-code-fast",
+        ] {
+            assert_eq!(Dialect::for_model(id), Dialect::Anthropic, "{id}");
+        }
+        // The two genuinely `openai-completions` Fireworks ids must NOT default to Anthropic.
+        assert_eq!(
+            Dialect::for_model("accounts/fireworks/models/glm-5p2"),
+            Dialect::OpenAi
+        );
+        assert_eq!(
+            Dialect::for_model("accounts/fireworks/routers/glm-5p2-fast"),
+            Dialect::OpenAi
+        );
     }
 
     #[test]

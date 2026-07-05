@@ -12,14 +12,22 @@
 //!   very first request, folded onto the same user turn as the prompt that starts it. This is how a
 //!   message queued while the agent is idle (no run in flight for either of the other two lanes to
 //!   attach to) still lands on turn 1 of whatever prompt comes next, rather than waiting for a tool
-//!   round-trip or a stop boundary that may never arrive. Mirrors pi's `nextTurnQueue`
-//!   (`agent-harness.ts`'s `executeTurn`, which splices it onto the front of a fresh turn's own
-//!   messages before the first model call).
+//!   round-trip or a stop boundary that may never arrive. A beyond-only capability, not a port of pi:
+//!   `nextTurnQueue`/`executeTurn` exist only in the dead, unshipped
+//!   `packages/agent/src/harness/agent-harness.ts` (zero references from `packages/coding-agent`), not
+//!   anywhere in pi's real product. The closest thing pi's real product has —
+//!   `AgentSession`/`Agent.continue()`'s post-run loop (`packages/coding-agent/src/core/agent-session.ts`'s
+//!   `_handlePostAgentRun`, draining `steerQueue`/`followUpQueue` via `hasQueuedMessages()`) — only
+//!   picks up messages queued *during* the run that just ended, run as a separate follow-up turn; a
+//!   plain `AgentSession.prompt()` call on an idle session never consults either queue at all, so
+//!   content queued before a fresh prompt has no mechanism to ride along with it. This lane exists to
+//!   close that gap for beyond specifically.
 //!
 //! Both the steer and follow-up injection points place messages where the previous message is the
 //! assistant's, so a pushed user turn never lands next to another user turn (which the wire would
 //! reject); the next-turn lane instead folds into the prompt's own user turn for the same reason. The
-//! three lanes mirror pi's separate `steerQueue`, `followUpQueue`, and `nextTurnQueue`.
+//! first two lanes mirror pi's real, separate `steerQueue`/`followUpQueue`; the next-turn lane is
+//! beyond's own addition, with no real-pi-product equivalent (see above).
 //!
 //! A fourth, independent signal lives here too: [`request_stop`](Steering::request_stop) — a graceful,
 //! host-initiated "stop after the current turn" request, mirroring pi's `shouldStopAfterTurn`. Unlike
@@ -35,8 +43,9 @@
 //! separate turns instead of one merged one. The steer and follow-up lanes carry **independent**
 //! `QueueMode` settings (matching pi's own separate `steeringMode`/`followUpMode`) — a client may want,
 //! say, every mid-run redirect folded together while follow-ups still land one at a time, or vice versa.
-//! The next-turn lane has no `QueueMode` of its own — like pi's `nextTurnQueue.splice(0)`, a drain
-//! always takes everything queued; there's no "one at a time" reading of "prepended to the next prompt."
+//! The next-turn lane has no `QueueMode` of its own — a drain always takes everything queued; there's
+//! no "one at a time" reading of "prepended to the next prompt" (this lane has no real pi-product
+//! analog to begin with — see the module doc comment above).
 //!
 //! **Deliberate gap (Task #29, pi-parity, low priority)**: pi's `emitQueueUpdate()` fires synchronously
 //! on every `steer`/follow-up/next-turn push, notifying a subscriber the instant a message lands in a
@@ -306,7 +315,8 @@ impl Steering {
         }
     }
 
-    /// Take every queued **next-turn** message — pi's `nextTurnQueue.splice(0)`. Unlike
+    /// Take every queued **next-turn** message (this crate's own lane — see the module doc comment for
+    /// why it has no real pi-product analog). Unlike
     /// [`drain_steer`](Self::drain_steer)/[`drain_at_stop`](Self::drain_at_stop), this always takes the
     /// whole lane; there's no `QueueMode` for it (see the module doc comment for why).
     pub(crate) fn drain_next_turn(&self) -> Vec<SteeringMessage> {
@@ -337,10 +347,22 @@ impl Steering {
     /// ending because of *cancellation*, not because a different session is about to take over (see
     /// [`clear`](Self::clear) for that case).
     ///
-    /// Mirrors pi's `AgentHarness.abort()` (`agent-harness.ts:970-997`), which explicitly clears only
-    /// `steerQueue`/`followUpQueue` — `nextTurnQueue` is deliberately left alone, because a message
-    /// queued via `nextTurn()` is meant to survive into whatever prompt comes next, aborted or not, not
-    /// be silently dropped by the very cancellation it was queued to outlive. Used by every
+    /// A deliberate beyond design choice, not a port of pi: dropping the steer/follow-up lanes here is
+    /// a conservative safety default (a stale queued message surviving an abort is arguably worse than
+    /// losing it), not a mirror of pi's real headless behavior. pi's actual headless/RPC abort path
+    /// (`AgentSession.abort()`, `packages/coding-agent/src/core/agent-session.ts:1449-1453`, called
+    /// from `packages/coding-agent/src/modes/rpc/rpc-mode.ts:424-426`) does *not* clear queued steer/
+    /// follow-up messages at all — only the TUI's own `clearQueue()` does, and beyond is headless, not
+    /// a TUI. (The unused `packages/agent/src/harness/agent-harness.ts`'s `AgentHarness.abort()`
+    /// (`agent-harness.ts:970-997`) also clears only `steerQueue`/`followUpQueue`, which is where this
+    /// method's shape actually came from, but that harness is dead code — zero references from
+    /// `packages/coding-agent` — not pi's real product.) Whether beyond's stricter behavior is the
+    /// right default, or whether it should instead match pi's real headless behavior and preserve a
+    /// queued message across cancellation, is an open question this comment flags rather than settles.
+    ///
+    /// The next-turn lane is deliberately left alone regardless, because a message queued via
+    /// `push_next_turn` is meant to survive into whatever prompt comes next, aborted or not, not be
+    /// silently dropped by the very cancellation it was queued to outlive. Used by every
     /// cancellation exit path in [`crate::Agent::run_events_steered`]; a genuine session swap
     /// (`new_session`/`switch_session`/`fork`/`switch_branch`) still wants the stronger [`clear`](
     /// Self::clear), since a message queued for the *old* session's next turn must not leak into a
@@ -403,10 +425,12 @@ impl Steering {
     /// Request that every subsequent turn of this run advertise `tools` instead of whatever the
     /// `Agent` was originally configured with — applied at the same turn boundary a model switch is
     /// (see [`request_model_switch`](Self::request_model_switch)), so the change takes effect starting
-    /// the very next turn rather than mid-turn. Mirrors pi's `setTools`/`setActiveTools`
-    /// (`agent-harness.ts:871-928`): a host can add, remove, or swap a run's tool set without stopping
-    /// and restarting the whole call. A second call before the first is observed replaces it outright
-    /// — same "no queue of switches, only the most recent request matters" contract
+    /// the very next turn rather than mid-turn. Mirrors the mechanism behind pi's real shipped
+    /// `setActiveToolsByName` (`packages/coding-agent/src/core/agent-session.ts:840`, wired to the
+    /// extension runtime's `setActiveTools` handler at line 2283, and called internally at line 2428):
+    /// a host can add, remove, or swap a run's tool set without stopping and restarting the whole call.
+    /// A second call before the first is observed replaces it outright — same "no queue of switches,
+    /// only the most recent request matters" contract
     /// [`request_model_switch`](Self::request_model_switch) uses.
     pub fn request_tool_set(&self, tools: ToolRegistry) {
         *lock_opt(&self.tool_switch) = Some(tools);
@@ -821,8 +845,9 @@ mod tests {
 
     #[test]
     fn next_turn_is_a_lane_distinct_from_steer_and_follow_up() {
-        // pi-parity gap: pi's `nextTurnQueue` is a third lane, separate from `steerQueue`/
-        // `followUpQueue` — queuing to it must not drain (or be drained by) either of the other two.
+        // The next-turn lane is a third lane, separate from `steerQueue`/`followUpQueue` (pi's real,
+        // shipped pair) — queuing to it must not drain (or be drained by) either of the other two. No
+        // real pi-product equivalent of this third lane exists (see the module doc comment).
         let s = Steering::new();
         s.push_next_turn("next");
         s.push("follow");
@@ -838,7 +863,8 @@ mod tests {
 
     #[test]
     fn drain_next_turn_always_takes_the_whole_lane() {
-        // No `QueueMode` for this lane — matching pi's unconditional `nextTurnQueue.splice(0)`.
+        // No `QueueMode` for this lane — an unconditional whole-lane drain (this lane has no real
+        // pi-product equivalent to match at all; see the module doc comment).
         let s = Steering::new();
         s.push_next_turn("a");
         s.push_next_turn("b");

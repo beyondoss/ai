@@ -19,6 +19,24 @@ use crate::message::{
 };
 use crate::transport::{ModelRequest, ToolChoice};
 
+/// Whether `model` is a Xiaomi/MiMo id — mirrors `models::capabilities`'s own `"mimo"` branch id-match
+/// (a bare id or a vendor-slug one, e.g. HuggingFace's `"XiaomiMiMo/MiMo-V2.5-Pro"`, matched by the
+/// suffix after the last `/`). `models.rs`'s own comment on that branch already notes pi tags this
+/// family with the identical `compat.requiresReasoningContentOnAssistantMessages: true` flag DeepSeek
+/// carries, but nothing consumed it — [`is_deepseek_model`](crate::models::is_deepseek_model) is the
+/// only family this dialect's assistant-replay backfill (below) actually gated on, so a MiMo turn with
+/// no visible thinking silently skipped the empty `reasoning_content` backfill a DeepSeek turn in the
+/// identical shape got. A small local helper rather than a new `models.rs` export: this dialect is the
+/// only consumer, and the id-match itself is a one-line mirror of the existing branch's own condition.
+fn is_mimo_model(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    let family_id = match m.rfind('/') {
+        Some(idx) => &m[idx + 1..],
+        None => m.as_str(),
+    };
+    m.starts_with("mimo") || family_id.starts_with("mimo")
+}
+
 /// This assistant turn's reasoning text and the wire field name to replay it under, if it carried a
 /// `Thinking` block with a non-empty `signature` (the decoder only ever produces one — see
 /// `Decoder::reasoning_field`; multiple blocks would be joined, matching the reference agent). `None`
@@ -252,18 +270,48 @@ fn normalize_mistral_tool_id(normalizer: &mut Option<MistralToolCallIdNormalizer
     }
 }
 
+/// Normalize a `tool_use`/`tool_call` id produced by a *different* model than `req.model` is about to
+/// see it — this dialect's own version of the defense-in-depth check `dialect::anthropic::build_body`
+/// re-runs on every request (see `anthropic.rs`'s `normalize_cross_model_tool_ids` doc comment for the
+/// full threat model: a same-turn multi-model fan-out, a hand-edited or externally-loaded session, a
+/// future caller building a `ModelRequest` directly — every path besides an explicit `set_model` switch,
+/// which `Session::scrub_cross_model_state` already truncates the same combined id shape at). Mirrors
+/// pi's `openai-completions.ts::normalizeToolCallId`: the OpenAI Responses API's combined
+/// `"call_id|item_id"` shape is the concretely dangerous case (`item_id` can be 400+ chars with
+/// characters — `+`, `/`, `=` — a Chat Completions backend never produces itself, from providers like
+/// GitHub Copilot/OpenAI Codex/opencode per pi's own comment on this exact check) — stripped to just
+/// `call_id`, sanitized to `[a-zA-Z0-9_-]`, and capped at OpenAI's real 40-char tool-call-id limit. A
+/// plain id with no `|` passes through untouched: pi's sibling branch also caps a merely-over-length id
+/// to 40 chars, but only for `model.provider === "openai"` specifically — a case with no reachable
+/// analogue in this dialect, since a native OpenAI id always routes through the Responses dialect
+/// instead (see `crates/agent/tests/smoke.rs`'s own doc comment on that routing split).
+fn normalize_cross_model_tool_id(id: &str) -> String {
+    match id.split_once('|') {
+        Some((call_id, _item_id)) => call_id
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+            .take(40)
+            .collect(),
+        None => id.to_string(),
+    }
+}
+
 /// Build the streaming request body, translating the internal messages into OpenAI's flat shape.
 pub fn build_body(req: &ModelRequest) -> Value {
-    let caps = crate::models::capabilities(&req.model);
+    let caps = crate::models::capabilities_for_route(&req.model, req.is_codex, req.is_azure);
     // pi's `useDeveloperRole = model.reasoning && compat.supportsDeveloperRole` — reuses the OpenAI
     // Responses dialect's identical gating (`super::openai_responses::instruction_role`) rather than a
     // second, drifting copy of the same one-line rule.
-    let instruction_role = super::openai_responses::instruction_role(&caps);
+    let instruction_role = super::openai_responses::instruction_role(&req.model, &caps);
     // Mistral's real API rejects a `tool_call_id` that isn't exactly 9 alphanumeric characters — only
     // built (and only ever `Some`) when this request actually targets a Mistral model, so every other
     // provider's ids pass through `normalize_mistral_tool_id` untouched.
     let mut mistral_ids = crate::models::is_mistral_model(&req.model)
         .then(MistralToolCallIdNormalizer::default);
+    // Defense-in-depth cross-model tool-call-id normalization (see `normalize_cross_model_tool_id`'s own
+    // doc comment) — populated as `tool_use` blocks from a foreign model are visited below, then
+    // consulted when their paired `tool_result` is reached in a later message.
+    let mut cross_model_tool_id_remap: HashMap<String, String> = HashMap::new();
     let mut messages: Vec<Value> = Vec::new();
     if let Some(system) = &req.system {
         messages.push(json!({ "role": instruction_role, "content": system }));
@@ -311,7 +359,16 @@ pub fn build_body(req: &ModelRequest) -> Value {
                         } else {
                             content.as_str()
                         };
-                        let tool_call_id = normalize_mistral_tool_id(&mut mistral_ids, tool_use_id);
+                        // Defense-in-depth: if this id's paired `tool_use` was rewritten (below) because
+                        // it came from a foreign model, replay the *rewritten* id here so the two still
+                        // pair up on the wire — a `tool_result` never carries `model_id` itself, so its
+                        // own foreignness can only be told by whether its id shows up in the remap.
+                        let remapped_tool_use_id = cross_model_tool_id_remap
+                            .get(tool_use_id)
+                            .map(String::as_str)
+                            .unwrap_or(tool_use_id);
+                        let tool_call_id =
+                            normalize_mistral_tool_id(&mut mistral_ids, remapped_tool_use_id);
                         messages.push(json!({ "role": "tool", "tool_call_id": tool_call_id, "content": tool_text }));
                         // The image-attribution label below is human-readable text for the model, not
                         // a validated wire id — kept as the original id, not the Mistral-reshaped one.
@@ -363,14 +420,31 @@ pub fn build_body(req: &ModelRequest) -> Value {
                     .content
                     .iter()
                     .filter_map(|b| match b {
-                        ContentBlock::ToolUse { id, name, input, .. } => Some(json!({
-                            "id": normalize_mistral_tool_id(&mut mistral_ids, id),
-                            "type": "function",
-                            "function": {
-                                "name": name,
-                                "arguments": serde_json::to_string(input).unwrap_or_else(|_| "{}".into()),
-                            },
-                        })),
+                        ContentBlock::ToolUse { id, name, input, .. } => {
+                            // Defense-in-depth: an id from a message produced by a *different* model
+                            // than `req.model` gets cross-model-normalized first (see
+                            // `normalize_cross_model_tool_id`'s own doc comment), *before* any
+                            // Mistral-specific reshaping below — the two compose correctly regardless
+                            // of order since `MistralToolCallIdNormalizer` maps consistently off
+                            // whatever string it's actually given, not the original raw id.
+                            let is_foreign = m.model_id.as_deref() != Some(req.model.as_str());
+                            let normalized = if is_foreign {
+                                normalize_cross_model_tool_id(id)
+                            } else {
+                                id.clone()
+                            };
+                            if is_foreign && &normalized != id {
+                                cross_model_tool_id_remap.insert(id.clone(), normalized.clone());
+                            }
+                            Some(json!({
+                                "id": normalize_mistral_tool_id(&mut mistral_ids, &normalized),
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": serde_json::to_string(input).unwrap_or_else(|_| "{}".into()),
+                                },
+                            }))
+                        }
                         _ => None,
                     })
                     .collect();
@@ -392,13 +466,17 @@ pub fn build_body(req: &ModelRequest) -> Value {
                 // that one field.
                 if let Some((field, text)) = assistant_reasoning(&m.content) {
                     msg.insert(field.to_string(), json!(text));
-                } else if caps.reasoning_effort && crate::models::is_deepseek_model(&req.model) {
-                    // DeepSeek specifically (pi: `compat.requiresReasoningContentOnAssistantMessages`,
-                    // `isDeepSeek`) force-sets an empty `reasoning_content` on replay when this turn
-                    // produced no visible thinking, rather than omitting the field entirely — mirrors
-                    // pi's `openai-completions.ts::convertMessages` unconditionally for this one
-                    // family. The mechanism isn't otherwise documented upstream; ported to match pi's
-                    // behavior exactly regardless.
+                } else if caps.reasoning_effort
+                    && (crate::models::is_deepseek_model(&req.model) || is_mimo_model(&req.model))
+                {
+                    // DeepSeek and Xiaomi/MiMo both carry pi's
+                    // `compat.requiresReasoningContentOnAssistantMessages: true` (`isDeepSeek` — see
+                    // `models.rs`'s own comment on the "mimo" branch for MiMo's identical tagging) —
+                    // force-set an empty `reasoning_content` on replay when this turn produced no
+                    // visible thinking, rather than omitting the field entirely. Mirrors pi's
+                    // `openai-completions.ts::convertMessages` unconditionally for both families. The
+                    // mechanism isn't otherwise documented upstream; ported to match pi's behavior
+                    // exactly regardless.
                     msg.insert("reasoning_content".to_string(), json!(""));
                 }
                 // Replay each tool call's Gemini-style opaque reasoning-continuity data (see
@@ -603,6 +681,19 @@ fn apply_reasoning_wire(
                 map.insert("reasoning".into(), json!({ "effort": wire_str(effort) }));
             } else if caps.reasoning_disableable {
                 map.insert("reasoning".into(), json!({ "effort": "none" }));
+            }
+        }
+        // pi-parity (Ant-Ling, added for the enum variant's own sake — see
+        // `OpenAiReasoningFormat::AntLing`'s doc comment): no current Ant-Ling id is actually reachable
+        // through this dialect's own family dispatch yet (`crate::models`'s Ant-Ling capability branch
+        // doc comment), so this exists only to keep the match exhaustive rather than to be a verified
+        // wire implementation. Intentionally the closest already-verified shape (OpenRouter's: a nested
+        // `reasoning: {"effort"}` sent only when requested, no explicit "off") minus the "off" arm,
+        // since Ant-Ling's real format never sends one at all — left as a follow-up to confirm once a
+        // route actually exercises it.
+        Fmt::AntLing => {
+            if let Some(effort) = requested {
+                map.insert("reasoning".into(), json!({ "effort": wire_str(effort) }));
             }
         }
     }
@@ -2565,6 +2656,91 @@ data: [DONE]
     }
 
     #[test]
+    fn cross_model_tool_call_id_gets_the_combined_openai_responses_shape_stripped_and_sanitized() {
+        // pi-parity (pass 17): `dialect::anthropic::build_body` re-runs
+        // `normalize_cross_model_tool_ids` on every request as a defense-in-depth measure (see its own
+        // doc comment); this dialect had no equivalent call at all. Mirrors pi's own
+        // `openai-completions.ts::normalizeToolCallId`: an id from a foreign model (here, one produced
+        // by an OpenAI-Responses-routed model, tagged via `with_model_id`) carrying the Responses API's
+        // combined `"call_id|item_id"` shape gets stripped to just `call_id`, with any disallowed
+        // character sanitized to `_` — and the paired `tool_result`'s `tool_call_id` follows so the
+        // pairing survives.
+        let req = ModelRequest::new(
+            "deepseek-v4-pro",
+            vec![
+                Message::user("weather?"),
+                Message::assistant(vec![ContentBlock::tool_use(
+                    "call_1|weird id+with/slashes",
+                    "get_weather",
+                    json!({ "city": "SF" }),
+                )])
+                .with_model_id("gpt-5-codex"),
+                Message::tool_result("call_1|weird id+with/slashes", "72F", false),
+            ],
+            64,
+        );
+        let body = build_body(&req);
+        assert_eq!(body["messages"][1]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(body["messages"][2]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn cross_model_tool_call_id_over_40_chars_gets_truncated() {
+        // OpenAI's real tool_call_id limit is 40 chars — the combined-id `item_id` half can run to
+        // 400+ (GitHub Copilot in particular), so the stripped `call_id` itself must still be capped.
+        let long_call_id = "x".repeat(60);
+        let combined = format!("{long_call_id}|item-id-doesnt-matter");
+        let req = ModelRequest::new(
+            "deepseek-v4-pro",
+            vec![
+                Message::user("weather?"),
+                Message::assistant(vec![ContentBlock::tool_use(
+                    combined.clone(),
+                    "get_weather",
+                    json!({ "city": "SF" }),
+                )])
+                .with_model_id("gpt-5-codex"),
+                Message::tool_result(combined, "72F", false),
+            ],
+            64,
+        );
+        let body = build_body(&req);
+        let expected = "x".repeat(40);
+        assert_eq!(body["messages"][1]["tool_calls"][0]["id"], expected);
+        assert_eq!(body["messages"][2]["tool_call_id"], expected);
+    }
+
+    #[test]
+    fn same_model_tool_call_id_is_left_untouched_even_if_it_would_otherwise_normalize() {
+        // A message produced by the very model about to see it again is never "foreign" — its id must
+        // not be rewritten, matching `Session::scrub_cross_model_state`'s identical same-model
+        // exemption and the Anthropic dialect's own `same_model_tool_use_id_is_left_untouched_…` test.
+        let req = ModelRequest::new(
+            "deepseek-v4-pro",
+            vec![
+                Message::user("weather?"),
+                Message::assistant(vec![ContentBlock::tool_use(
+                    "call_1|not really combined",
+                    "get_weather",
+                    json!({ "city": "SF" }),
+                )])
+                .with_model_id("deepseek-v4-pro"),
+                Message::tool_result("call_1|not really combined", "72F", false),
+            ],
+            64,
+        );
+        let body = build_body(&req);
+        assert_eq!(
+            body["messages"][1]["tool_calls"][0]["id"],
+            "call_1|not really combined"
+        );
+        assert_eq!(
+            body["messages"][2]["tool_call_id"],
+            "call_1|not really combined"
+        );
+    }
+
+    #[test]
     fn mistral_tool_call_id_reshaping_keeps_distinct_ids_distinct() {
         let req = ModelRequest::new(
             "mistral-large-latest",
@@ -2763,6 +2939,56 @@ data: [DONE]
     }
 
     #[test]
+    fn mimo_reasoning_content_backfilled_empty_when_the_turn_produced_no_thinking() {
+        // pi-parity (pass 17): pi tags Xiaomi/MiMo with the identical
+        // `compat.requiresReasoningContentOnAssistantMessages: true` flag DeepSeek carries
+        // (`models.rs`'s own comment on its "mimo" branch already noted this without gating on it) —
+        // before this fix, the backfill only checked `is_deepseek_model`, so a MiMo turn with no visible
+        // thinking never got the same empty `reasoning_content` backfill a DeepSeek turn did.
+        let req = ModelRequest::new(
+            "mimo-v2.5",
+            vec![
+                Message::user("hi"),
+                Message::assistant(vec![ContentBlock::text("answer, no thinking")]),
+            ],
+            64,
+        );
+        let body = build_body(&req);
+        assert_eq!(body["messages"][1]["reasoning_content"], "");
+
+        // A turn that DID carry thinking keeps its real captured text — never overwritten to "".
+        let req = ModelRequest::new(
+            "mimo-v2.5",
+            vec![
+                Message::user("hi"),
+                Message::assistant(vec![
+                    ContentBlock::Thinking {
+                        text: "step one".into(),
+                        signature: "reasoning_content".into(),
+                    },
+                    ContentBlock::text("answer"),
+                ]),
+            ],
+            64,
+        );
+        let body = build_body(&req);
+        assert_eq!(body["messages"][1]["reasoning_content"], "step one");
+
+        // A vendor-slug-hosted MiMo id (HuggingFace's `"XiaomiMiMo/MiMo-V2.5-Pro"`) gets the same
+        // backfill via `family_id`, matching how `models::capabilities` itself recognizes the family.
+        let req = ModelRequest::new(
+            "XiaomiMiMo/MiMo-V2.5-Pro",
+            vec![
+                Message::user("hi"),
+                Message::assistant(vec![ContentBlock::text("answer, no thinking")]),
+            ],
+            64,
+        );
+        let body = build_body(&req);
+        assert_eq!(body["messages"][1]["reasoning_content"], "");
+    }
+
+    #[test]
     fn end_finish_reason_maps_to_a_clean_stop() {
         // Some providers spell a clean stop "end" instead of "stop" — pi's `openai-completions.ts`
         // maps both to `stopReason: "stop"`.
@@ -2855,6 +3081,32 @@ data: [DONE]
         let req =
             ModelRequest::new("gpt-4o", vec![Message::user("hi")], 64).with_system("be terse");
         assert_eq!(build_body(&req)["messages"][0]["role"], "system");
+    }
+
+    #[test]
+    fn non_standard_providers_never_get_developer_role_even_when_reasoning_capable() {
+        // pi-parity (pass 17): pi's `supportsDeveloperRole` (`openai-completions.ts:1197-1225`) denies
+        // "developer" to the same `isNonStandard` Chat-Completions-family denylist `supportsStore`
+        // uses, regardless of whether the hosted model itself is reasoning-capable — DeepSeek and
+        // Cerebras's `gpt-oss-120b` both have `reasoning_effort: true` in this table (a real
+        // reasoning-effort knob) but pi still always sends them a plain "system" role, never
+        // "developer". Before this fix, `instruction_role` gated purely on `caps.reasoning_effort` and
+        // sent "developer" to both.
+        for id in ["deepseek-v4-pro", "glm-4.7", "kimi-k2-thinking", "grok-4.3", "gpt-oss-120b"] {
+            let req =
+                ModelRequest::new(id, vec![Message::user("hi")], 64).with_system("be terse");
+            assert_eq!(
+                build_body(&req)["messages"][0]["role"],
+                "system",
+                "{id}: a non-standard Chat Completions provider must never get role:\"developer\", got {:#?}",
+                build_body(&req)["messages"][0]
+            );
+        }
+
+        // A standard reasoning provider (native OpenAI) is unaffected — still "developer".
+        let req =
+            ModelRequest::new("o3-mini", vec![Message::user("hi")], 64).with_system("be terse");
+        assert_eq!(build_body(&req)["messages"][0]["role"], "developer");
     }
 
     #[test]

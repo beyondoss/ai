@@ -112,11 +112,13 @@ pub fn resolve_gateway_credential(key: Option<String>, model: &str) -> Result<Ga
             // `ModelOverride::resolved_api_key`'s own doc comment) rather than used as a raw literal —
             // lets an operator avoid storing a plaintext secret in `models.json`.
             let bearer = over.resolved_api_key(key.as_deref());
+            // Fix 3 (pi-parity, Round 2): computed together so a `deployment_name` override's URL
+            // path segment (Task 46) and the `/v1`-doubling fix (Task 45) never fight each other — see
+            // `direct_route_base_and_path`'s own doc comment.
+            let (base_url, path) =
+                direct_route_base_and_path(&base_url, dialect, over.deployment_name.as_deref());
             let routing = DirectRouting {
-                route: RouteOverride::Direct {
-                    base_url,
-                    path: dialect.endpoint_path(),
-                },
+                route: RouteOverride::Direct { base_url, path },
                 static_headers: Vec::new(),
                 copilot_dynamic_headers: false,
                 // Task #8 (pi-parity: Azure OpenAI routing support) — an operator-configured
@@ -224,6 +226,75 @@ pub fn resolve_gateway_credential(key: Option<String>, model: &str) -> Result<Ga
     ))
 }
 
+/// Whether `base_url` already carries a `/v1` version segment (ignoring a trailing slash) — the signal
+/// [`direct_route_path`] uses to decide whether the dialect's usual `/v1`-prefixed endpoint path would
+/// double up an already-present one.
+fn base_url_has_v1_segment(base_url: &str) -> bool {
+    base_url.trim_end_matches('/').ends_with("/v1")
+}
+
+/// Fix 3 (pi-parity, Round 2 — Task 45): the endpoint path to append to a `models.json` `base_url`
+/// override's own `base_url` for `dialect`'s `RouteOverride::Direct` route — the exact bug class GitHub
+/// Copilot's own routing already worked around (see
+/// [`crate::oauth::github_copilot::copilot_endpoint_path`]'s doc comment): pi's official SDKs set a
+/// vendor client's `baseURL` with no `/v1` of their own, then let the SDK append its own fixed *bare*
+/// relative path (`/chat/completions`, `/responses`) — except the Anthropic SDK, whose default
+/// `baseURL` never carries a version segment either, so it always appends its full `/v1/messages`
+/// verbatim regardless of `base_url`'s own shape. [`agent_core::dialect::Dialect::endpoint_path`]'s own
+/// constant is always `/v1`-prefixed (correct for beyond's *own* default gateway routing convention,
+/// where `base_url` is bare), so appending it verbatim to an already-`/v1`-suffixed BYO `base_url` (a
+/// natural way to configure an Azure-style or OpenAI-API-compatible endpoint, e.g.
+/// `"http://host/openai/v1"`) doubled the segment into `"/v1/v1/…"` — this was the bug.
+///
+/// Detected from `base_url`'s own shape rather than a second `models.json` field: an operator who
+/// already wrote `/v1` into `base_url` almost certainly means it as the version segment the dialect's
+/// own default path would otherwise contribute a second time, so stripping it there is the one reading
+/// that can't produce a broken URL either way — a `base_url` with no such suffix still gets the
+/// dialect's full default path, unchanged, preserving every existing override's behavior exactly as
+/// before this fix. Reuses [`crate::oauth::github_copilot::copilot_endpoint_path`]'s existing per-dialect
+/// bare-path table rather than duplicating it — that function already encodes precisely which dialects
+/// omit `/v1` and which don't, for the identical underlying SDK-convention reason.
+fn direct_route_path(dialect: agent_core::dialect::Dialect, base_url: &str) -> &'static str {
+    if base_url_has_v1_segment(base_url) {
+        crate::oauth::github_copilot::copilot_endpoint_path(dialect)
+    } else {
+        dialect.endpoint_path()
+    }
+}
+
+/// Fix 3 continued (Task 46): the `(base_url, path)` pair for a `models.json` override's
+/// `RouteOverride::Direct` route, folding [`crate::settings::ModelOverride::deployment_name`] in as a
+/// URL path segment when set — Azure's classic dated-`api-version` REST convention
+/// (`/openai/deployments/{name}/chat/completions?api-version=…`) addresses the deployment purely by URL
+/// path segment, never a `/v1` marker (that's the *other*, newer unified-API convention's own signal,
+/// which addresses a deployment purely through the wire body's `"model"` field instead — already
+/// handled independently, and left untouched by this fn, by
+/// `agent_core::client::GatewayClient::stream`'s own `deployment_name` body substitution, Fix 2). So
+/// when `deployment_name` is set, this bypasses [`direct_route_path`]'s `/v1`-detection heuristic
+/// entirely rather than composing with it — there's no `/v1` for it to detect in the classic
+/// convention's own path shape, and the two conventions are never meant to be mixed in one override.
+///
+/// The deployment name is folded into `base_url` (the one field `RouteOverride::Direct` allows to vary
+/// per-override at all — its `path` is a fixed `&'static str` constant, not an interpolated owned
+/// string) rather than `path`, so this composes within `agent_core::client`'s existing types without
+/// needing a change there. Factored out from `resolve_gateway_credential` so both this and
+/// [`direct_route_path`] are unit-testable directly, without touching the real `~/.claude/models.json`
+/// file `ModelOverrides::open_default` reads from.
+fn direct_route_base_and_path(
+    base_url: &str,
+    dialect: agent_core::dialect::Dialect,
+    deployment_name: Option<&str>,
+) -> (String, &'static str) {
+    let trimmed = base_url.trim_end_matches('/');
+    match deployment_name {
+        Some(name) => (
+            format!("{trimmed}/openai/deployments/{name}"),
+            crate::oauth::github_copilot::copilot_endpoint_path(dialect),
+        ),
+        None => (trimmed.to_string(), direct_route_path(dialect, trimmed)),
+    }
+}
+
 /// Build the `api-version=…` query string from a `models.json` override's [`ModelOverride::api_version`]
 /// field (Fix 2, pi-parity Round 2 — Azure OpenAI's dated REST `api-version`), or `None` if unset/empty.
 /// Percent-encoded via [`url::form_urlencoded`] — the same general-purpose query-param encoder any other
@@ -267,5 +338,110 @@ mod tests {
     fn azure_api_version_query_is_none_when_unset_or_empty() {
         assert_eq!(azure_api_version_query(None), None);
         assert_eq!(azure_api_version_query(Some("")), None);
+    }
+
+    // Task 45: `direct_route_path`/`direct_route_base_and_path` fix the `/v1`-doubling bug for a
+    // `models.json` BYO `base_url` pointed at an OpenAI-wire dialect.
+
+    #[test]
+    fn direct_route_path_strips_v1_when_base_url_already_ends_with_it_for_openai_wire_dialects() {
+        use agent_core::dialect::Dialect;
+        assert_eq!(
+            direct_route_path(Dialect::OpenAiResponses, "http://host/openai/v1"),
+            "/responses"
+        );
+        assert_eq!(
+            direct_route_path(Dialect::OpenAi, "http://host/v1/"),
+            "/chat/completions",
+            "a trailing slash on base_url must not defeat the /v1 detection"
+        );
+    }
+
+    #[test]
+    fn direct_route_path_keeps_the_v1_prefixed_default_when_base_url_has_no_v1_segment() {
+        use agent_core::dialect::Dialect;
+        assert_eq!(
+            direct_route_path(Dialect::OpenAiResponses, "http://host"),
+            "/v1/responses"
+        );
+        assert_eq!(
+            direct_route_path(Dialect::OpenAi, "http://host/openai"),
+            "/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn direct_route_path_leaves_the_anthropic_wire_case_unaffected_either_way() {
+        // The Anthropic SDK's own baseURL convention carries no version segment of its own, so it
+        // always appends its full `/v1/messages` verbatim — unlike the OpenAI-wire dialects above,
+        // whether or not base_url itself already ends in `/v1` must never change this.
+        use agent_core::dialect::Dialect;
+        assert_eq!(
+            direct_route_path(Dialect::Anthropic, "http://host/v1"),
+            "/v1/messages"
+        );
+        assert_eq!(direct_route_path(Dialect::Anthropic, "http://host"), "/v1/messages");
+    }
+
+    #[test]
+    fn base_url_ending_in_v1_no_longer_doubles_the_segment_for_an_openai_wire_dialect() {
+        // The exact bug empirically confirmed for Task 45: an Azure-style BYO `base_url` that already
+        // carries `/v1` (a natural way to configure such an endpoint) previously produced a doubled
+        // "/v1/v1/responses" when routed.
+        use agent_core::dialect::Dialect;
+        let (base_url, path) =
+            direct_route_base_and_path("http://host/openai/v1", Dialect::OpenAiResponses, None);
+        assert_eq!(format!("{base_url}{path}"), "http://host/openai/v1/responses");
+    }
+
+    #[test]
+    fn base_url_without_v1_still_gets_the_full_default_path_unchanged() {
+        use agent_core::dialect::Dialect;
+        let (base_url, path) = direct_route_base_and_path("http://host", Dialect::OpenAiResponses, None);
+        assert_eq!(format!("{base_url}{path}"), "http://host/v1/responses");
+    }
+
+    // Task 46: `deployment_name` becomes a URL path segment (Azure's classic dated-`api-version` REST
+    // convention), composing cleanly with Task 45's fix rather than fighting it.
+
+    #[test]
+    fn deployment_name_inserts_a_url_path_segment_and_composes_with_api_version_query() {
+        use agent_core::dialect::Dialect;
+        let (base_url, path) = direct_route_base_and_path(
+            "https://my-resource.openai.azure.com",
+            Dialect::OpenAiResponses,
+            Some("my-deployment"),
+        );
+        let query = azure_api_version_query(Some("2024-08-01-preview")).unwrap();
+        let url = format!("{base_url}{path}?{query}");
+        assert_eq!(
+            url,
+            "https://my-resource.openai.azure.com/openai/deployments/my-deployment/responses\
+             ?api-version=2024-08-01-preview"
+        );
+    }
+
+    #[test]
+    fn deployment_name_bypasses_the_v1_stripping_heuristic_entirely() {
+        // Even when `base_url` happens to end in `/v1`, the classic deployment convention's own path
+        // shape never carries a `/v1` segment at all — this must not try to also strip/detect one.
+        use agent_core::dialect::Dialect;
+        let (base_url, path) =
+            direct_route_base_and_path("https://my-resource.openai.azure.com/v1", Dialect::OpenAi, Some("gpt4"));
+        assert_eq!(
+            format!("{base_url}{path}"),
+            "https://my-resource.openai.azure.com/v1/openai/deployments/gpt4/chat/completions"
+        );
+    }
+
+    #[test]
+    fn deployment_name_trims_a_trailing_slash_on_base_url_before_inserting_the_segment() {
+        use agent_core::dialect::Dialect;
+        let (base_url, path) =
+            direct_route_base_and_path("https://my-resource.openai.azure.com/", Dialect::OpenAi, Some("gpt4"));
+        assert_eq!(
+            format!("{base_url}{path}"),
+            "https://my-resource.openai.azure.com/openai/deployments/gpt4/chat/completions"
+        );
     }
 }

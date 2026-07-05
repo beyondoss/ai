@@ -159,11 +159,19 @@ pub struct Settings {
     /// Used when neither `--idle-timeout-ms` nor `AI_AGENT_IDLE_TIMEOUT_MS` is given — this crate's
     /// "provider timeout": the idle-read timeout between response chunks on the gateway HTTP client (see
     /// `run`'s `--idle-timeout-ms` doc comment, Task #19) — pi-parity fix (Round 3): the last of the
-    /// retry/timeout cluster with no persisted fallback at all. `serve` has no `--idle-timeout-ms` flag
-    /// of its own yet to fall back from (a pre-existing gap, out of this fix's scope — see `ServeConfig`
-    /// in `serve.rs`), so only `run` consults this field today.
+    /// retry/timeout cluster with no persisted fallback at all. Task #38 (pi-parity fix): `serve` gained
+    /// its own `--idle-timeout-ms` flag (`ServeConfig::idle_timeout_ms` in `serve.rs`) falling back to
+    /// this same setting, so both `run` and `serve` consult it now.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_provider_timeout_ms: Option<u64>,
+    /// Used when neither `--retry-max-backoff-ms` nor `AI_AGENT_RETRY_MAX_BACKOFF_MS` is given — Task
+    /// #30 (pi-parity feature): the retry/timeout cluster's third knob, `agent_core::client::
+    /// GatewayClient::with_max_backoff` (`agent_core::client::MAX_BACKOFF`'s own 60s built-in ceiling),
+    /// previously had no CLI flag or persisted override at all, unlike its two siblings
+    /// (`default_retry_max_retries`/`default_retry_base_delay_ms` above). `None` leaves
+    /// `MAX_BACKOFF`/`with_retry`'s own default ceiling in effect, unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_retry_max_backoff_ms: Option<u64>,
     /// Used when neither `--models` nor `AI_AGENT_MODELS` is given — pi-parity fix (Round 3): `serve`'s
     /// `cycle_model` candidate-scoping list previously had no persisted default, unlike `default_model`
     /// itself. An empty/absent explicit `--models` falls back to this list *in full*; a non-empty
@@ -186,6 +194,16 @@ pub struct Settings {
     /// roots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_prompt_template_paths: Option<Vec<String>>,
+    /// Used when neither `--branch-summary-reserve-tokens` nor
+    /// `AI_AGENT_BRANCH_SUMMARY_RESERVE_TOKENS` is given — Task #31 (pi-parity feature):
+    /// `agent_core::Agent::with_branch_summary_reserve_tokens`/`branch_summary_reserve_tokens` existed
+    /// with no caller anywhere in either binary, so a branch summary's own reserve budget was always
+    /// hard-tied to whatever `compaction.reserve_tokens` resolved to, with no way to configure it
+    /// independently — unlike pi's own `branchSummary.reserveTokens` (default 16384), which is a
+    /// wholly separate setting from ordinary compaction's reserve. `None` leaves that hard-tied
+    /// behavior in effect, unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_branch_summary_reserve_tokens: Option<u32>,
 }
 
 impl Settings {
@@ -254,6 +272,9 @@ impl Settings {
             default_provider_timeout_ms: project
                 .default_provider_timeout_ms
                 .or(self.default_provider_timeout_ms),
+            default_retry_max_backoff_ms: project
+                .default_retry_max_backoff_ms
+                .or(self.default_retry_max_backoff_ms),
             default_models_list: project
                 .default_models_list
                 .clone()
@@ -266,6 +287,9 @@ impl Settings {
                 .default_prompt_template_paths
                 .clone()
                 .or_else(|| self.default_prompt_template_paths.clone()),
+            default_branch_summary_reserve_tokens: project
+                .default_branch_summary_reserve_tokens
+                .or(self.default_branch_summary_reserve_tokens),
         }
     }
 }
@@ -419,6 +443,12 @@ impl SettingsStore {
         self.mutate_locked(move |s| s.default_provider_timeout_ms = ms)
     }
 
+    /// Set (`Some`) or clear (`None`) the stored default retry backoff-ceiling override
+    /// (milliseconds), persisting atomically.
+    pub fn set_default_retry_max_backoff_ms(&mut self, ms: Option<u64>) -> std::io::Result<()> {
+        self.mutate_locked(move |s| s.default_retry_max_backoff_ms = ms)
+    }
+
     /// Set (`Some`) or clear (`None`) the stored default `--models` scoping/cycling list, persisting
     /// atomically.
     pub fn set_default_models_list(&mut self, models: Option<Vec<String>>) -> std::io::Result<()> {
@@ -438,6 +468,15 @@ impl SettingsStore {
         paths: Option<Vec<String>>,
     ) -> std::io::Result<()> {
         self.mutate_locked(move |s| s.default_prompt_template_paths = paths)
+    }
+
+    /// Set (`Some`) or clear (`None`) the stored default branch-summary reserve-token override,
+    /// persisting atomically.
+    pub fn set_default_branch_summary_reserve_tokens(
+        &mut self,
+        tokens: Option<u32>,
+    ) -> std::io::Result<()> {
+        self.mutate_locked(move |s| s.default_branch_summary_reserve_tokens = tokens)
     }
 
     /// Acquire the cross-process lock (see [`FileLock`]), re-read the store's *current* on-disk state —
@@ -719,6 +758,15 @@ pub struct ModelOverride {
     /// per-model-id `models.json` field instead of a separate comma-joined map, since this override is
     /// already keyed per model id). `None` (the default) leaves the wire-level `"model"` field as the
     /// app-level id. Threaded to `agent_core::client::DirectRouting::deployment_name`.
+    ///
+    /// Also inserted as a URL path segment — pi-parity Fix 3 (Round 2, Task 46): Azure's *classic*
+    /// dated-`api-version` REST convention addresses the deployment purely by URL
+    /// (`/openai/deployments/{name}/chat/completions?api-version=…`), never through the body's
+    /// `"model"` field at all (that's the *other*, newer unified-`/openai/v1` convention's own
+    /// signal). `gateway_credential::resolve_gateway_credential`'s `direct_route_base_and_path` folds
+    /// this in alongside the body substitution above whenever both this field and [`Self::base_url`]
+    /// are set, so the same field covers both real Azure REST shapes rather than needing a second,
+    /// URL-specific flag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deployment_name: Option<String>,
     /// For a *direct* (`base_url`-set) override: Azure's dated REST `api-version` (e.g.
@@ -1783,6 +1831,52 @@ mod tests {
         assert_eq!(store.get().default_provider_timeout_ms, None);
         let reopened = SettingsStore::open(path);
         assert_eq!(reopened.get().default_provider_timeout_ms, None);
+    }
+
+    #[test]
+    fn set_default_retry_max_backoff_ms_persists_and_reopening_sees_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut store = SettingsStore::open(path.clone());
+        assert_eq!(store.get().default_retry_max_backoff_ms, None);
+
+        store.set_default_retry_max_backoff_ms(Some(30_000)).unwrap();
+        assert_eq!(store.get().default_retry_max_backoff_ms, Some(30_000));
+        let reopened = SettingsStore::open(path.clone());
+        assert_eq!(reopened.get().default_retry_max_backoff_ms, Some(30_000));
+
+        let mut store = SettingsStore::open(path.clone());
+        store.set_default_retry_max_backoff_ms(None).unwrap();
+        assert_eq!(store.get().default_retry_max_backoff_ms, None);
+        let reopened = SettingsStore::open(path);
+        assert_eq!(reopened.get().default_retry_max_backoff_ms, None);
+    }
+
+    #[test]
+    fn set_default_branch_summary_reserve_tokens_persists_and_reopening_sees_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut store = SettingsStore::open(path.clone());
+        assert_eq!(store.get().default_branch_summary_reserve_tokens, None);
+
+        store
+            .set_default_branch_summary_reserve_tokens(Some(16_384))
+            .unwrap();
+        assert_eq!(
+            store.get().default_branch_summary_reserve_tokens,
+            Some(16_384)
+        );
+        let reopened = SettingsStore::open(path.clone());
+        assert_eq!(
+            reopened.get().default_branch_summary_reserve_tokens,
+            Some(16_384)
+        );
+
+        let mut store = SettingsStore::open(path.clone());
+        store.set_default_branch_summary_reserve_tokens(None).unwrap();
+        assert_eq!(store.get().default_branch_summary_reserve_tokens, None);
+        let reopened = SettingsStore::open(path);
+        assert_eq!(reopened.get().default_branch_summary_reserve_tokens, None);
     }
 
     #[test]

@@ -123,10 +123,16 @@ impl Default for CompactionConfig {
     }
 }
 
-/// System prompt for the summarization call. The trailing guardrail matches pi's own
-/// `SUMMARIZATION_SYSTEM_PROMPT` (`compaction.ts`): the rendered transcript embeds real past user
-/// questions, and without an explicit instruction not to, the model can slip into answering one of
-/// them instead of emitting the structured checkpoint format this call actually needs.
+/// System prompt for the summarization call. Only the trailing guardrail sentence is verbatim-shared
+/// with pi's own `SUMMARIZATION_SYSTEM_PROMPT`
+/// (`packages/coding-agent/src/core/compaction/utils.ts:168-170`, not `compaction.ts` — that file only
+/// re-exports/consumes the constant): "Do NOT continue the conversation. Do NOT respond to any
+/// questions in the conversation. ONLY output the structured summary." That guardrail matters because
+/// the rendered transcript embeds real past user questions, and without an explicit instruction not
+/// to, the model can slip into answering one of them instead of emitting the structured checkpoint
+/// format this call actually needs. The opening framing above it is beyond's own wording, not a port of
+/// pi's "You are a context summarization assistant..." opener — functionally equivalent (both frame the
+/// call as compaction, not conversation), just not textually identical.
 pub const SUMMARY_SYSTEM: &str = "You compact a long agent transcript so the agent can keep working \
 with far fewer tokens but no loss of essential context. Be precise, concrete, and information-dense; \
 preserve file paths, identifiers, commands, and decisions exactly. Do NOT continue the conversation. \

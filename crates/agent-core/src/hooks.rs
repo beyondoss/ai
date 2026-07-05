@@ -97,8 +97,14 @@ pub trait AgentHooks: Send + Sync {
     /// tool calls (if any) finished and their results were committed, but before the next model call
     /// would start. Return `true` to end the run here, gracefully (the same shape a `false` from
     /// [`crate::steering::Steering::request_stop`] produces — this is an *additional*, content-aware
-    /// way to request the same stop, not a replacement for it; the loop honors either). Mirrors pi's
-    /// `shouldStopAfterTurn`, which receives the same two arguments.
+    /// way to request the same stop, not a replacement for it; the loop honors either). A beyond-only
+    /// capability, not a literal port: pi's own `shouldStopAfterTurn` config field (`agent-loop.ts`,
+    /// `types.ts`) is real, but it's dropped at the `Agent` wrapper class pi's real shipped product
+    /// actually constructs (`packages/coding-agent/src/core/sdk.ts`'s `new Agent({...})`) — that
+    /// class's `AgentOptions`/`createLoopConfig` never forwards it to `runAgentLoop`, so no post-turn
+    /// stop hook is reachable from pi's real product at all. The only place it's ever wired end-to-end
+    /// is the unused `packages/agent/src/harness/agent-harness.ts` (zero references from
+    /// `packages/coding-agent`), which is not what pi ships.
     ///
     /// `message` is the assistant turn that just completed (its blocks are already committed to
     /// `session`); `tool_results` is that turn's own tool_result blocks, empty when the turn made no
@@ -145,8 +151,15 @@ pub trait AgentHooks: Send + Sync {
     /// inject a per-request header's *logical* equivalent at this layer (a stop sequence, a sampling
     /// tweak — an actual wire header belongs in [`crate::client::GatewayClient::with_extra_headers`],
     /// one layer below where a `ModelRequest` even exists), or otherwise patch what's about to be sent
-    /// before `client.rs` builds the dialect-specific wire body from it. Mirrors pi's
-    /// `beforeProviderRequest` (`agent-harness.ts:251-320`). Mutates `req` in place; defaults to a
+    /// before `client.rs` builds the dialect-specific wire body from it. A beyond-only capability, not
+    /// a literal port: pi's real shipped product (`packages/coding-agent/src/core/sdk.ts:332-338`) has
+    /// exactly one pre-send hook, `onPayload` — wired to the extension event confusingly also named
+    /// `"before_provider_request"` — and it only ever sees the literal dialect-specific wire JSON (the
+    /// same layer [`before_provider_payload`](Self::before_provider_payload) below operates at), never
+    /// an earlier, abstract, dialect-agnostic request. There is no real-product equivalent of this
+    /// method's `ModelRequest`-level seam; the only place one existed was the unused
+    /// `packages/agent/src/harness/agent-harness.ts:251-320`, never wired into anything
+    /// `packages/coding-agent` actually ships. Mutates `req` in place; defaults to a
     /// no-op. A panicking hook has its (possibly partial) mutation discarded — the loop falls back to
     /// the request exactly as it was before this call, the same "fails open" convention
     /// [`on_assistant_message`](Self::on_assistant_message) uses.
@@ -164,13 +177,18 @@ pub trait AgentHooks: Send + Sync {
     /// field `ModelRequest` has no abstraction for — rather than the higher-level request
     /// `before_provider_request` exposes one layer up.
     ///
-    /// Mirrors pi's two-layer version of this seam: the low-level `Agent`'s `onPayload` (passed straight
-    /// to its HTTP-streaming function) and the harness's `beforeProviderPayload`
-    /// (`agent-harness.ts`'s `emitBeforeProviderPayload`, `BeforeProviderPayloadEvent`/
-    /// `BeforeProviderPayloadResult` in `types.ts`), which can replace the payload object wholesale. This
-    /// mutates `payload` in place instead of returning a replacement — matching
-    /// `before_provider_request`'s own convention rather than giving this trait two different "rewrite a
-    /// request" shapes.
+    /// Mirrors pi's real (single-layer) version of this seam: `packages/coding-agent/src/core/sdk.ts`'s
+    /// `onPayload`, passed straight to its HTTP-streaming function and wired to the extension event
+    /// `"before_provider_request"` (`extensions/runner.ts`'s `emitBeforeProviderRequest`) — despite the
+    /// name collision with [`before_provider_request`](Self::before_provider_request) above, `onPayload`
+    /// operates on the literal wire JSON, which is what this method mirrors. The unused
+    /// `packages/agent/src/harness/agent-harness.ts` additionally exposes its own, differently-shaped
+    /// `beforeProviderPayload` (`emitBeforeProviderPayload`, `BeforeProviderPayloadEvent`/
+    /// `BeforeProviderPayloadResult` in `types.ts`, which can replace the payload object wholesale) —
+    /// but that harness is dead code (zero references from `packages/coding-agent`), not a second layer
+    /// pi's real product actually has. This mutates `payload` in place instead of returning a
+    /// replacement — matching `before_provider_request`'s own convention rather than giving this trait
+    /// two different "rewrite a request" shapes.
     ///
     /// Defaults to a no-op. A panicking hook has its (possibly partial) mutation discarded —
     /// [`crate::client::GatewayClient::stream`] falls back to the payload exactly as `build_body` produced
@@ -179,7 +197,8 @@ pub trait AgentHooks: Send + Sync {
     async fn before_provider_payload(&self, _payload: &mut Value) {}
 
     /// Called once a provider response's raw HTTP status and headers are known, before its body starts
-    /// streaming — pi's `afterProviderResponse` (`agent-harness.ts:321-385`). Read-only observability
+    /// streaming — pi's real `onResponse` (`packages/coding-agent/src/core/sdk.ts:340-346`), wired to
+    /// the extension event `"after_provider_response"`. Read-only observability
     /// (a host logging rate-limit headers, say): the response is already normalized into `StreamEvent`s
     /// the loop consumes directly, so this isn't a rewrite seam the way [`after_tool_call`]
     /// (Self::after_tool_call) is. `headers` is `(name, value)` pairs in wire order, a plain,

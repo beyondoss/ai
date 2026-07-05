@@ -142,11 +142,54 @@ fn render_html_inner(
     // they appear so a reader can refer to "branch 2" unambiguously even though they're scattered
     // through the page rather than listed together.
     let mut branch_number = render_branches_diverging_at(&mut out, branches, 0, 1, &index);
+    // Every `ModelChange` event this document can position inline renders as its own small block right
+    // before the assistant turn that actually used the new model — Task #27 (pi-parity fix): pi's own
+    // `template.js` renders `model_change` inline, as part of `renderEntry`'s single chronological walk
+    // over one tree (each entry carrying its own `id`/`parentId`/`timestamp`), instead of a disconnected
+    // trailing dump. `ExportEvent` itself carries no such anchor back to a specific message (see its own
+    // doc comment) — this correlates by value instead: a model switch is always recorded before the next
+    // assistant turn that actually ran under the new model (`Message::model_id`, stamped at the point
+    // that turn is recorded — see `with_model_id`'s own doc comment), so walking `model_changes` in
+    // lockstep with `messages` and matching on that value recovers the same position without needing a
+    // real anchor. `model_change_cursor` only ever advances, never backtracks, so an earlier pending
+    // event can't be skipped in favor of a later one matching sooner (see `render_model_change`'s call
+    // site below for the one pathological case this simplification accepts).
+    let model_changes: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            crate::session_store::ExportEvent::ModelChange(model) => Some(model.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut model_change_cursor = 0usize;
     for (i, message) in messages.iter().enumerate() {
+        if let Some(model_id) = &message.model_id {
+            while model_changes.get(model_change_cursor) == Some(&model_id.as_str()) {
+                render_model_change(&mut out, model_id);
+                model_change_cursor += 1;
+            }
+        }
         render_message(&mut out, message, &index);
         branch_number = render_branches_diverging_at(&mut out, branches, i + 1, branch_number, &index);
     }
-    render_events_section(&mut out, events);
+    // A `ModelChange` that never matched a later message (e.g. the session ended, or was exported,
+    // before another assistant turn ran under the new model) still needs to be visible somewhere —
+    // `model_change_cursor` stops advancing right before it, so it's still present in `events` and falls
+    // through to `render_events_section`'s flat fallback list below, same as every `ModelChange` did
+    // before this fix, rather than being silently dropped now that most of them render inline instead.
+    let mut model_changes_seen = 0usize;
+    let trailing_events: Vec<crate::session_store::ExportEvent> = events
+        .iter()
+        .filter(|e| match e {
+            crate::session_store::ExportEvent::ModelChange(_) => {
+                model_changes_seen += 1;
+                model_changes_seen > model_change_cursor
+            }
+            _ => true,
+        })
+        .cloned()
+        .collect();
+    render_events_section(&mut out, &trailing_events);
     out.push_str("</main>\n");
     out.push_str("</body>\n</html>\n");
     out
@@ -157,6 +200,16 @@ fn render_html_inner(
 /// each event's own position/timestamp threaded all the way through from `SessionStore`, a bigger
 /// change than "currently invisible" calls for). A no-op when `events` is empty, so a plain
 /// [`render_html`] call (which always passes `&[]`) never adds this section at all.
+///
+/// Only ever called today with the *trailing* subset of `events`: every `ModelChange` this document
+/// managed to position inline is filtered out by [`render_html_inner`]'s main loop before reaching here
+/// (Task #27, pi-parity fix) — only one that never matched a later message still shows up in this flat
+/// fallback list. `Label`'s own `target_id` (Task #26, pi-parity fix) still can't become a real
+/// same-document anchor here — a bare `Message` carries no id at all (that lives one layer up, on
+/// `SessionStore`'s own tree-entry wrapper, never threaded into `render_html`'s `messages: &[Message]`)
+/// — so it renders as a plain `<code>` reference instead: enough for a reader to tell which target a
+/// label belongs to even without a clickable link. Cheap fix for a gratuitous extra loss on top of an
+/// already-accepted non-goal (pi's own label rendering is tree-sidebar-only too).
 fn render_events_section(out: &mut String, events: &[crate::session_store::ExportEvent]) {
     if events.is_empty() {
         return;
@@ -174,12 +227,20 @@ fn render_events_section(out: &mut String, events: &[crate::session_store::Expor
                 )
             }
             crate::session_store::ExportEvent::Label {
-                label: Some(label), ..
+                target_id,
+                label: Some(label),
             } => {
-                format!("Labeled: {}", html_escape(label))
+                format!(
+                    "Labeled <code>{}</code>: {}",
+                    html_escape(target_id),
+                    html_escape(label)
+                )
             }
-            crate::session_store::ExportEvent::Label { label: None, .. } => {
-                "Label cleared".to_string()
+            crate::session_store::ExportEvent::Label {
+                target_id,
+                label: None,
+            } => {
+                format!("Label cleared on <code>{}</code>", html_escape(target_id))
             }
             crate::session_store::ExportEvent::Custom { kind, data } => {
                 format!(
@@ -192,6 +253,19 @@ fn render_events_section(out: &mut String, events: &[crate::session_store::Expor
         out.push_str(&format!("<li>{line}</li>\n"));
     }
     out.push_str("</ul>\n</section>\n");
+}
+
+/// Render a single `ModelChange` event inline, right at the point in the transcript
+/// [`render_html_inner`]'s main loop determined it actually landed (Task #27, pi-parity fix) — its own
+/// small block, styled distinctly from a message, rather than a `<li>` in the flat trailing dump
+/// [`render_events_section`] still falls back to for one that couldn't be positioned. Deliberately the
+/// same wording that flat list already used for this variant (`"Model changed to <code>{}</code>"`), so
+/// a reader sees identical phrasing regardless of which of the two ever renders a given switch.
+fn render_model_change(out: &mut String, model: &str) {
+    out.push_str(&format!(
+        "<div class=\"model-change\">Model changed to <code>{}</code></div>\n",
+        html_escape(model)
+    ));
 }
 
 /// Render the session's system prompt as a collapsed-by-default `<details>` block — pi's own
@@ -600,6 +674,9 @@ border-radius: 4px; }\n\
 margin: 0.5rem 0; background: #232323; }\n\
 .summary-marker.compaction { border-left-color: #d0a94c; }\n\
 .summary-marker.branch-summary { border-left-color: #a67ee2; }\n\
+.model-change { font-size: 0.8rem; color: #999; border-left: 3px solid #6cb6ff; padding: 0.3rem 0.75rem; \
+margin: 0.5rem 0; background: #232323; }\n\
+.model-change code { color: #d4d4d4; }\n\
 .stats { display: flex; flex-wrap: wrap; gap: 0.5rem 1.5rem; margin-top: 0.6rem; }\n\
 .stat { font-size: 0.85rem; }\n\
 .stat-label { color: #888; margin-right: 0.35rem; }\n\
@@ -2906,10 +2983,127 @@ mod tests {
         assert!(html.contains("Session Events"));
         assert!(html.contains("Model changed to <code>claude-opus-4-8</code>"));
         assert!(html.contains("Thinking level changed to <code>high</code>"));
-        assert!(html.contains("Labeled: checkpoint"));
-        assert!(html.contains("Label cleared"));
+        assert!(html.contains("Labeled <code>msg-1</code>: checkpoint"), "{html}");
+        assert!(html.contains("Label cleared on <code>msg-1</code>"), "{html}");
         assert!(html.contains("beyond:sync"));
         assert!(html.contains("marker"));
+    }
+
+    #[test]
+    fn label_event_renders_its_target_id_alongside_the_label() {
+        // Task #26 (pi-parity fix): `ExportEvent::Label { target_id, label }`'s render arm used to
+        // discard `target_id` via `..`, so an exported "Labeled: foo" line gave no way to tell which
+        // message it actually pointed to.
+        use crate::session_store::ExportEvent;
+        let events = vec![ExportEvent::Label {
+            target_id: "abc123".to_string(),
+            label: Some("checkpoint".to_string()),
+        }];
+        let html = render_html_with_entries(&meta(), &[Message::user("hi")], &[], None, &events);
+        assert!(html.contains("Labeled <code>abc123</code>: checkpoint"), "{html}");
+    }
+
+    #[test]
+    fn a_cleared_label_event_still_renders_its_target_id() {
+        use crate::session_store::ExportEvent;
+        let events = vec![ExportEvent::Label {
+            target_id: "abc123".to_string(),
+            label: None,
+        }];
+        let html = render_html_with_entries(&meta(), &[Message::user("hi")], &[], None, &events);
+        assert!(html.contains("Label cleared on <code>abc123</code>"), "{html}");
+    }
+
+    #[test]
+    fn label_event_html_escapes_an_adversarial_target_id() {
+        // `target_id` rides straight from session storage — not attacker-controlled in practice, but
+        // it's still untrusted-shaped data reaching an HTML render path, same defensive posture this
+        // module already takes for `Custom`'s `kind`/`data` fields.
+        use crate::session_store::ExportEvent;
+        let events = vec![ExportEvent::Label {
+            target_id: "<script>alert(1)</script>".to_string(),
+            label: Some("x".to_string()),
+        }];
+        let html = render_html_with_entries(&meta(), &[], &[], None, &events);
+        assert!(!html.contains("<script>alert(1)</script>"), "{html}");
+        assert!(html.contains("&lt;script&gt;"), "{html}");
+    }
+
+    #[test]
+    fn model_change_event_renders_inline_before_the_assistant_message_that_first_used_it() {
+        // Task #27 (pi-parity fix): `model_change` events used to always land in a disconnected
+        // trailing list (`render_events_section`, called once after every message) instead of at their
+        // real chronological position, matching pi's own `template.js`, which renders `model_change`
+        // inline as part of `renderEntry`'s single walk over the transcript.
+        use crate::session_store::ExportEvent;
+        let messages = vec![
+            Message::user("hello"),
+            Message::assistant(vec![ContentBlock::text("hi there")]).with_model_id("claude-a"),
+            Message::user("switch models please"),
+            Message::assistant(vec![ContentBlock::text("using claude-b now")])
+                .with_model_id("claude-b"),
+        ];
+        let events = vec![ExportEvent::ModelChange("claude-b".to_string())];
+        let html = render_html_with_entries(&meta(), &messages, &[], None, &events);
+        // Rendered inline, not in the flat trailing dump.
+        assert!(!html.contains("Session Events"), "{html}");
+        assert!(html.contains("class=\"model-change\""), "{html}");
+        assert!(html.contains("Model changed to <code>claude-b</code>"), "{html}");
+        // Positioned between the turn that used the old model and the turn that used the new one, not
+        // before the first assistant turn (which never used `claude-b` at all).
+        let change_pos = html.find("class=\"model-change\"").unwrap();
+        let first_assistant_pos = html.find("hi there").unwrap();
+        let second_assistant_pos = html.find("using claude-b now").unwrap();
+        assert!(change_pos > first_assistant_pos, "{html}");
+        assert!(change_pos < second_assistant_pos, "{html}");
+    }
+
+    #[test]
+    fn multiple_model_change_events_each_render_inline_before_their_own_matching_message() {
+        // Proves the value-matching cursor doesn't just find *any* message sharing a model id — the
+        // first message already uses `model-a` from the very start (before any switch event at all) and
+        // must not be mistaken for the *second* `ModelChange("model-a")` event, which really belongs to
+        // the third message, after the intervening switch to `model-b`.
+        use crate::session_store::ExportEvent;
+        let messages = vec![
+            Message::assistant(vec![ContentBlock::text("first reply")]).with_model_id("model-a"),
+            Message::assistant(vec![ContentBlock::text("second reply")]).with_model_id("model-b"),
+            Message::assistant(vec![ContentBlock::text("third reply")]).with_model_id("model-a"),
+        ];
+        let events = vec![
+            ExportEvent::ModelChange("model-b".to_string()),
+            ExportEvent::ModelChange("model-a".to_string()),
+        ];
+        let html = render_html_with_entries(&meta(), &messages, &[], None, &events);
+        assert!(!html.contains("Session Events"), "{html}");
+        assert_eq!(html.matches("class=\"model-change\"").count(), 2, "{html}");
+        let change_to_b = html.find("Model changed to <code>model-b</code>").unwrap();
+        let change_to_a = html.find("Model changed to <code>model-a</code>").unwrap();
+        let first = html.find("first reply").unwrap();
+        let second = html.find("second reply").unwrap();
+        let third = html.find("third reply").unwrap();
+        assert!(first < change_to_b, "{html}");
+        assert!(change_to_b < second, "{html}");
+        assert!(second < change_to_a, "{html}");
+        assert!(change_to_a < third, "{html}");
+    }
+
+    #[test]
+    fn a_model_change_event_with_no_matching_later_message_falls_back_to_the_trailing_section() {
+        // A switch that never got used by a subsequent assistant turn (e.g. the session was exported
+        // right after the switch) can't be positioned inline — it must still be visible somewhere,
+        // rather than silently dropped now that most `ModelChange` events render inline instead.
+        use crate::session_store::ExportEvent;
+        let messages =
+            vec![Message::assistant(vec![ContentBlock::text("hi")]).with_model_id("claude-a")];
+        let events = vec![ExportEvent::ModelChange("claude-never-used".to_string())];
+        let html = render_html_with_entries(&meta(), &messages, &[], None, &events);
+        assert!(html.contains("Session Events"), "{html}");
+        assert!(
+            html.contains("Model changed to <code>claude-never-used</code>"),
+            "{html}"
+        );
+        assert!(!html.contains("class=\"model-change\""), "{html}");
     }
 
     #[test]

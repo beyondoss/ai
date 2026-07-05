@@ -624,8 +624,10 @@ The harness layers several capabilities over the bare tools + loop:
   (rebuild the `Agent` for subsequent prompts) / `get_available_models`, `list_branches`/`get_tree`/`switch_branch`
   (navigate the session's tree, optionally summarizing the abandoned branch first — a summarization
   failure other than a client-requested abort (`Error::Cancelled`) fails the whole switch rather than
-  logging it and switching anyway, matching pi's own `agent-session.ts`/`agent-harness.ts`, which treat
-  any non-abort summarization error as fatal to the navigation; `get_messages` tags
+  logging it and switching anyway, matching pi's own `packages/coding-agent/src/core/agent-session.ts`'s
+  `navigateTree`, which `throw`s on any non-abort summarization error (backed by `generateBranchSummary`
+  in `packages/coding-agent/src/core/compaction/branch-summarization.ts`), aborting the whole navigation
+  before ever switching the active leaf; `get_messages` tags
   each message with its tree `id` so a client can name any point as a `switch_branch` target, not only a
   branch's leaf, and its response also carries `leaf_id` — the same active-tip id `get_tree`'s own
   response already does, matching pi's own `get_entries({since})` returning `{entries, leafId}` in one

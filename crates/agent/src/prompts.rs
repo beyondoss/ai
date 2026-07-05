@@ -314,7 +314,12 @@ fn discover_with_diagnostics_impl(
 /// character with its continuation lines dropped (LOW pi-parity gap, fixed).
 fn parse(text: &str) -> (Option<String>, String, String) {
     let (frontmatter, body) = crate::skills::parse_frontmatter(text);
-    let body = body.trim_end().to_string();
+    // pi-parity fix (Task #42): pi's own `extractFrontmatter` does a full `.trim()` on the body
+    // (`normalized.slice(endIndex + 4).trim()`) — this used to only `trim_end()`, so a blank line left
+    // after the closing `---` fence (a common formatting habit) leaked a leading `"\n"` into the body
+    // that pi would strip. `skills::expand_if_skill_invocation`'s own equivalent call site already does
+    // the full trim correctly; only prompt templates had this gap.
+    let body = body.trim().to_string();
     let hint = frontmatter
         .get("argument-hint")
         .cloned()
@@ -359,10 +364,11 @@ pub fn expand_if_slash(message: &str, templates: &[PromptTemplate]) -> String {
 
 /// Split an argument string into fields, honoring single and double quotes so `"a b" c` is two args
 /// (`a b`, `c`) rather than three. Mirrors pi's `parseCommandArgs`: a quote starts a span that runs to
-/// the matching quote, and the quote characters themselves are dropped. Unquoted newlines are field
-/// separators too, same as spaces/tabs — a multi-line pasted argument (e.g. `/name label\n\ndescription
-/// text`) splits on every line break, not just the trailing ones; a quoted span still preserves an
-/// embedded newline verbatim.
+/// the matching quote, and the quote characters themselves are dropped. Any unquoted Unicode whitespace
+/// character is a field separator, same as pi's own `/\s/.test(char)` — not just space/tab/`\n`, but
+/// also a bare `\r`, vertical tab, form feed, and Unicode space separators; a multi-line pasted argument
+/// (e.g. `/name label\n\ndescription text`) splits on every line break, not just the trailing ones. A
+/// quoted span still preserves an embedded whitespace character (including a newline) verbatim.
 ///
 /// A field is only ever pushed when non-empty — matching pi's own `if (current) args.push(current)`
 /// (JS truthiness: only `""` is falsy for a string, so `" "` still counts and is kept). This means a
@@ -388,7 +394,15 @@ pub fn parse_command_args(input: &str) -> Vec<String> {
                 '"' | '\'' => {
                     quote = Some(ch);
                 }
-                ' ' | '\t' | '\n' => {
+                // pi-parity fix (Task #44): pi's own `parseCommandArgs` (prompt-templates.ts:40) tests
+                // `/\s/.test(char)`, matching any Unicode whitespace character — a bare `\r` (a
+                // stray carriage return not part of a `\r\n` pair), vertical tab, form feed, or a
+                // Unicode space separator all split fields there too, not just space/tab/`\n`.
+                // `char::is_whitespace()` is Rust's Unicode-whitespace-category equivalent, closely
+                // matching JS's `\s` (the one known gap: JS's `\s` also matches U+FEFF BOM, which isn't
+                // in Unicode's White_Space property and so isn't matched by `is_whitespace()` — a
+                // vanishingly unlikely character to find embedded in a slash-command's arguments).
+                c if c.is_whitespace() => {
                     if !current.is_empty() {
                         args.push(std::mem::take(&mut current));
                     }
@@ -456,17 +470,38 @@ fn substitute(body: &str, args: &[String]) -> String {
 }
 
 /// Expand the contents of a `${...}` placeholder. `inner` is the text between the braces.
+///
+/// Mirrors pi's own substitution regex (`prompt-templates.ts:73`,
+/// `/\$\{(\d+):-([^}]*)\}|\$\{@:(\d+)(?::(\d+))?\}|\$(ARGUMENTS|@|\d+)/g`) exactly: a `${...}` body
+/// only ever means something when it's `@:N`/`@:N:L` (a slice, `N`/`L` pure digits), `N:-default` (`N`
+/// pure digits), or `@`/`ARGUMENTS` alone. Anything else — a non-digit slice/positional index, or a body
+/// pi's regex simply doesn't match at all (e.g. `${HOME}` in a template documenting shell/env-var
+/// syntax) — isn't a match for `.replace()` either, so pi leaves it untouched verbatim. pi-parity fix
+/// (Task #41): this used to fall through to `String::new()` for any unrecognized body, silently deleting
+/// arbitrary template text that merely looked like a placeholder instead of leaving it literal.
 fn expand_brace(inner: &str, args: &[String], all: &str) -> String {
+    // Reconstructs the original `${inner}` text verbatim — what every "doesn't match pi's regex"
+    // fallback below returns instead of deleting the placeholder.
+    let literal = || format!("${{{inner}}}");
+
     if let Some(spec) = inner.strip_prefix("@:") {
-        // `@:N` or `@:N:L` — a bash array slice.
+        // `@:N` or `@:N:L` — a bash array slice. Both `N` and (if present) `L` must be pure digits to
+        // match pi's `\$\{@:(\d+)(?::(\d+))?\}` — e.g. `${@:abc}` or `${@:1:x}` isn't a match at all.
         let (start_str, len_str) = match spec.split_once(':') {
             Some((s, l)) => (s, Some(l)),
             None => (spec, None),
         };
         let Some(start) = parse_slice_start(start_str) else {
-            return String::new();
+            return literal();
         };
-        let slice: &[String] = match len_str.and_then(parse_usize) {
+        let len = match len_str {
+            Some(l) => match parse_usize(l) {
+                Some(len) => Some(len),
+                None => return literal(),
+            },
+            None => None,
+        };
+        let slice: &[String] = match len {
             // `start`/`len` are parsed straight from a `${@:N:L}` placeholder in a project's own
             // `.claude/prompts/*.md` file — untrusted repo content. `saturating_add` so a
             // pathological `N` near `usize::MAX` can't overflow before `.min()` clamps it.
@@ -478,23 +513,29 @@ fn expand_brace(inner: &str, args: &[String], all: &str) -> String {
         return slice.join(" ");
     }
     if let Some((num, default)) = inner.split_once(":-") {
-        // `${N:-default}` — default when the positional is missing or empty.
-        if let Some(idx) = parse_index(num) {
-            if let Some(v) = args.get(idx) {
-                if !v.is_empty() {
-                    return v.clone();
-                }
-            }
+        // `${N:-default}` — default when the positional is missing or empty. `num` must be pure,
+        // non-empty digits to match pi's `\$\{(\d+):-([^}]*)\}` — e.g. `${1x:-default}` isn't a match at
+        // all and must stay literal. A pure-digit `num` that computes to an invalid index (`0`, since
+        // this positional scheme is 1-based; or a value so large it overflows `usize`) is still a regex
+        // match, though — pi's own `args[index]` on an out-of-range index is just `undefined`, which
+        // resolves to the default exactly like a missing positional does, not "no match at all".
+        if num.is_empty() || !num.chars().all(|c| c.is_ascii_digit()) {
+            return literal();
         }
-        return default.to_string();
+        return match parse_index(num).and_then(|idx| args.get(idx)) {
+            Some(v) if !v.is_empty() => v.clone(),
+            _ => default.to_string(),
+        };
     }
     if inner == "@" || inner == "ARGUMENTS" {
         return all.to_string();
     }
-    if inner.chars().all(|c| c.is_ascii_digit()) && !inner.is_empty() {
-        return positional(args, inner).to_string();
-    }
-    String::new()
+    // pi-parity fix (Task #41, minor superset, aligned): a bare `${N}` (no `:-default`) used to be
+    // treated as positional substitution, same as unbraced `$N` — but pi's regex has no alternative for
+    // a braced bare digit at all (only the unbraced `\$(\d+)` form matches that), so pi leaves `${1}`
+    // literal. Falls through to the `literal()` fallback below instead, matching pi exactly; unbraced
+    // `$1` (handled in `substitute`, not here) is unaffected.
+    literal()
 }
 
 /// The 1-based positional `digits` as a `&str` slice into `args`, or `""` if missing/unparsable.
@@ -1032,6 +1073,42 @@ mod tests {
     }
 
     #[test]
+    fn an_unrecognized_brace_placeholder_survives_expansion_literally() {
+        // pi-parity fix (Task #41 — real content-corruption bug): a `${...}` body that isn't
+        // `@:N(:L)?`, `N:-default`, `@`/`ARGUMENTS`, or a bare digit doesn't match pi's own substitution
+        // regex at all (prompt-templates.ts:73), so `.replace()` leaves it untouched. `expand_brace`
+        // used to fall through to `String::new()` for any such body, silently deleting template text
+        // that merely looked like a placeholder — e.g. a template documenting shell/env-var syntax like
+        // `${HOME}` must survive expansion verbatim, not vanish.
+        let t = template("Set ${HOME}/bin in your profile, then: export PATH=${HOME}/bin:$PATH");
+        let expanded = expand_if_slash("/x", &[t]);
+        assert_eq!(
+            expanded,
+            "Set ${HOME}/bin in your profile, then: export PATH=${HOME}/bin:$PATH"
+        );
+    }
+
+    #[test]
+    fn a_bare_braced_positional_with_no_default_stays_literal() {
+        // pi-parity fix (Task #41, minor superset, aligned): pi's regex has no alternative for a braced
+        // bare digit at all — only the unbraced `\$(\d+)` form is a positional substitution. A bare
+        // `${1}` must stay literal, unlike unbraced `$1` which still substitutes normally.
+        let t = template("braced=[${1}] unbraced=[$1]");
+        let expanded = expand_if_slash("/x hello", &[t]);
+        assert_eq!(expanded, "braced=[${1}] unbraced=[hello]");
+    }
+
+    #[test]
+    fn a_non_digit_brace_body_shaped_like_a_default_or_slice_stays_literal() {
+        // Both the `${N:-default}` and `${@:N(:L)?}` forms require `N` (and `L`) to be pure digits to
+        // match pi's regex — a non-digit index isn't a match at all and must stay literal, not silently
+        // resolve to the default text or an empty/partial slice.
+        let t = template("a=[${1x:-default}] b=[${@:abc}] c=[${@:1:x}]");
+        let expanded = expand_if_slash("/x hello", &[t]);
+        assert_eq!(expanded, "a=[${1x:-default}] b=[${@:abc}] c=[${@:1:x}]");
+    }
+
+    #[test]
     fn default_value_substitution() {
         let t = template("name=${2:-anon}");
         assert_eq!(
@@ -1108,10 +1185,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_command_args_splits_on_any_unicode_whitespace_not_just_space_tab_newline() {
+        // pi-parity fix (Task #44): pi's own `parseCommandArgs` tests `/\s/.test(char)`, which matches
+        // any Unicode whitespace character — a bare `\r`, vertical tab (`\u{0B}`), form feed (`\u{0C}`),
+        // and a Unicode space separator (e.g. NBSP `\u{A0}`) must all split fields too, not just
+        // space/tab/`\n`. `char::is_whitespace()` is the natural Rust equivalent.
+        assert_eq!(parse_command_args("a\rb"), vec!["a", "b"]);
+        assert_eq!(parse_command_args("a\u{0B}b"), vec!["a", "b"]);
+        assert_eq!(parse_command_args("a\u{0C}b"), vec!["a", "b"]);
+        assert_eq!(parse_command_args("a\u{A0}b"), vec!["a", "b"]);
+        // A quoted span still preserves an embedded whitespace character verbatim.
+        assert_eq!(parse_command_args("\"a\rb\""), vec!["a\rb"]);
+    }
+
+    #[test]
     fn empty_argument_hint_is_treated_as_absent() {
         // pi: prompt-templates.test.ts, "should ignore empty argument-hint".
         let (hint, _, _) = parse("---\nargument-hint: \"\"\n---\nBody");
         assert_eq!(hint, None);
+    }
+
+    #[test]
+    fn a_blank_line_after_the_closing_fence_does_not_leak_into_the_body() {
+        // pi-parity fix (Task #42): pi's own `extractFrontmatter` does a full `.trim()` on the body
+        // (`normalized.slice(endIndex + 4).trim()`), not just a trailing trim — a blank line left after
+        // the closing `---` fence (a common formatting habit) used to leak a leading `"\n"` into the
+        // body that pi would strip.
+        let (_, _, body) = parse("---\nargument-hint: <x>\n---\n\nFix the bug in $1");
+        assert_eq!(body, "Fix the bug in $1");
     }
 
     #[test]

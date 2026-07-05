@@ -9,6 +9,7 @@
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use agent_core::tool::Tool;
 use agent_core::{ToolError, ToolOutput};
@@ -119,10 +120,21 @@ impl Tool for Find {
         "find"
     }
     fn description(&self) -> &str {
-        "Find files by glob pattern (e.g. \"*.rs\", \"src/**/*.test.ts\"), honoring .gitignore. A \
-         pattern without \"/\" matches the file name; with \"/\" it matches the full path. Results are \
-         sorted by path and truncated to at most 1000 paths or 50.0KB, whichever is hit first; when \
-         truncated, the lexicographically-smallest paths are reported."
+        // Pi-parity fix (task 52): built via `format!` referencing the real constants — like
+        // `bash.rs`'s `describe()` — instead of a hand-typed literal safety-netted only by a unit test
+        // that has to be kept in sync manually. `OnceLock` caches the one-time render since `Find` is a
+        // unit struct with no field to build it into at construction the way `Bash` does.
+        static DESC: OnceLock<String> = OnceLock::new();
+        DESC.get_or_init(|| {
+            format!(
+                "Find files by glob pattern (e.g. \"*.rs\", \"src/**/*.test.ts\"), honoring \
+                 .gitignore. A pattern without \"/\" matches the file name; with \"/\" it matches the \
+                 full path. Results are sorted by path and truncated to at most {DEFAULT_LIMIT} paths \
+                 or {}, whichever is hit first; when truncated, the lexicographically-smallest paths \
+                 are reported.",
+                super::output::format_size(super::output::MAX_LISTING_BYTES as u64)
+            )
+        })
     }
     fn input_schema(&self) -> Value {
         json!({

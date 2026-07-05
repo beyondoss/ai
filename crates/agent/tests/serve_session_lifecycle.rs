@@ -154,9 +154,11 @@ fn serve_export_html_includes_model_change_and_label_events() {
         html.contains("Model changed to <code>claude-other-model</code>"),
         "expected the model change to be visible: {html}"
     );
+    // Task #26 (pi-parity fix): the label's own `target_id` must be visible too, not just the label
+    // text — otherwise there's no way to tell which message it points to.
     assert!(
-        html.contains("Labeled: checkpoint"),
-        "expected the label to be visible: {html}"
+        html.contains(&format!("Labeled <code>{msg_id}</code>: checkpoint")),
+        "expected the label and its target message id to be visible: {html}"
     );
 
     drop(stdin);

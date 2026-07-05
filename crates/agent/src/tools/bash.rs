@@ -170,6 +170,11 @@ impl Bash {
             .get("command")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing `command`".into()))?;
+        // Pi-parity note: `cwd` being a per-call, model-settable field here is a deliberate DIVERGENCE,
+        // not a gap to close. Pi's own bash tool schema has no `cwd` at all — its working directory is
+        // fixed once at construction (the shell config baked in at startup), not choosable per
+        // invocation. Letting the model pick `cwd` per call is a real capability beyond's own, kept as
+        // a plausible enhancement rather than narrowed to match.
         let cwd = input.get("cwd").and_then(Value::as_str);
         // Fail with a clear message instead of the raw spawn-error wrapping ("spawn failed: No such
         // file or directory") a bad `cwd` would otherwise surface as — matches pi's own pre-check.

@@ -1313,6 +1313,86 @@ fn serve_switch_branch_summarizes_abandoned_activity_and_navigates() {
 }
 
 #[test]
+fn serve_branch_summary_reserve_tokens_flag_independently_bounds_the_summarization_window() {
+    // Task #31 (pi-parity feature): `agent_core::Agent::with_branch_summary_reserve_tokens` existed
+    // with no caller in either binary — a branch summary's own input-token budget was always hard-tied
+    // to whatever `--compaction-reserve-tokens` resolved to, with no independent override (matching
+    // pi's own separately-configurable `branchSummary.reserveTokens`). `--compaction-reserve-tokens` is
+    // set small (100) here so the *buggy* fallback path would leave a generous ~19900-token
+    // summarization budget (no windowing needed for this tiny two-message abandoned branch), while
+    // `--branch-summary-reserve-tokens` is set almost equal to `--context-window` so the *fixed* path
+    // leaves only a 1-token budget — forcing `windowed_by_budget` to drop the abandoned branch's older
+    // message and stamp the summarization request with its own "omitted to fit the summarization
+    // budget" note (see `agent_core::branch_summary::branch_summary_request`'s doc comment). Only the
+    // fixed path produces that note, so its presence proves `--branch-summary-reserve-tokens` — not
+    // `--compaction-reserve-tokens`'s own much larger reserve — actually bounded this call.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+
+    let (base, bodies) = spawn_model_server(vec![
+        turn_text("first answer"),
+        turn_text("second answer"),
+        turn_text("recap"),
+    ]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file)
+        .args([
+            "--context-window",
+            "20000",
+            "--compaction-reserve-tokens",
+            "100",
+            "--branch-summary-reserve-tokens",
+            "19999",
+        ])
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "first" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "second" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    let ids = message_ids(&session_file);
+    assert_eq!(ids.len(), 4, "expected 4 persisted messages: {ids:?}");
+    let rewind_to = ids[1].clone();
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "switch_branch", "target_id": rewind_to })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "switch_branch");
+    assert_eq!(frames.last().unwrap()["success"], true, "got: {frames:#?}");
+    drop(stdin);
+    child.wait().unwrap();
+
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(
+        bodies.len(),
+        3,
+        "expected 2 turns + 1 branch-summary call: {bodies:#?}"
+    );
+    assert!(
+        bodies[2].contains("omitted to fit the summarization budget"),
+        "--branch-summary-reserve-tokens=19999 (a 1-token budget out of a 20000 context window) must \
+         force the summarization call to window out the abandoned branch's older message: {}",
+        bodies[2]
+    );
+}
+
+#[test]
 fn serve_switch_branch_abort_cancels_summarization_and_leaves_session_unchanged() {
     use std::time::{Duration, Instant};
 

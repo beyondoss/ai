@@ -140,9 +140,16 @@ pub fn build_static_system_prompt(opts: &PromptOptions) -> String {
 /// The cheap, time-varying tail of the system prompt: the current date and working directory. Does no
 /// filesystem discovery (unlike [`build_static_system_prompt`]), so it's cheap enough to recompute
 /// before every turn — the one part of the prompt that's actually time-varying.
+///
+/// pi-parity fix (Task #43, cosmetic): pi's own `system-prompt.ts` (~168-170) appends these two lines
+/// with a single `\n` each (`prompt += "\nCurrent date: ..."; prompt += "\nCurrent working directory:
+/// ..."`), not a blank-line separator — this used to unconditionally prefix `"\n\n"`, guaranteeing a
+/// blank line before "Current date" no matter what the preceding content ended with. Matching pi exactly
+/// means a blank line only appears here when the preceding content already ends in its own trailing
+/// newline (the same as pi), rather than being forced every time.
 pub fn dynamic_footer(cwd: &Path) -> String {
     format!(
-        "\n\nCurrent date: {}\nCurrent working directory: {}",
+        "\nCurrent date: {}\nCurrent working directory: {}",
         today(),
         cwd.display()
     )

@@ -11,6 +11,8 @@
 //! `DirEntry::file_type`), so a symlink to a directory gets the `/` suffix; and an entry that can't be
 //! stat'd at all (permission race, dangling symlink) is silently skipped rather than guessed at.
 
+use std::sync::OnceLock;
+
 use agent_core::tool::Tool;
 use agent_core::{ToolError, ToolOutput};
 use async_trait::async_trait;
@@ -45,9 +47,19 @@ impl Tool for Ls {
         "ls"
     }
     fn description(&self) -> &str {
-        "List the entries of a directory. Directories are suffixed with `/`. Hidden entries are \
-         shown only when `all` is true. Output is truncated to at most 500 entries or 50.0KB, \
-         whichever is hit first."
+        // Pi-parity fix (task 52): built via `format!` referencing the real constants — like
+        // `bash.rs`'s `describe()` — instead of a hand-typed literal safety-netted only by a unit test
+        // that has to be kept in sync manually. `OnceLock` caches the one-time render since `Ls` is a
+        // unit struct with no field to build it into at construction the way `Bash` does.
+        static DESC: OnceLock<String> = OnceLock::new();
+        DESC.get_or_init(|| {
+            format!(
+                "List the entries of a directory. Directories are suffixed with `/`. Hidden entries \
+                 are shown only when `all` is true. Output is truncated to at most {DEFAULT_LIMIT} \
+                 entries or {}, whichever is hit first.",
+                super::output::format_size(super::output::MAX_LISTING_BYTES as u64)
+            )
+        })
     }
     fn input_schema(&self) -> Value {
         json!({

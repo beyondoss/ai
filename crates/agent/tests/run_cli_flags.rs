@@ -653,6 +653,60 @@ fn run_binary_model_flag_colon_suffix_resolves_the_id_and_sets_reasoning_effort(
 }
 
 #[test]
+fn run_binary_model_flag_off_suffix_disables_reasoning_and_is_not_overridden_by_the_medium_default() {
+    // Task #29 (pi-parity fix): `ThinkingLevel::Off.reasoning_effort()` is `None`, the exact same value
+    // a bare "nothing requested" invocation produces — so `--model claude-haiku-4-5:off` previously
+    // reached the same `default_reasoning_effort_for_model` fallback a plain `--model claude-haiku-4-5`
+    // (no suffix at all) would, silently promoting the explicit "off" request back to Fix 1's own
+    // "medium" default (a numeric `budget_tokens`, since `claude-haiku-4-5` is Budget-shape) instead of
+    // the wire's own explicit `"thinking":{"type":"disabled"}` (`reasoning_disableable`, matching
+    // `thinking_is_explicitly_disabled_when_not_requested_on_a_disable_capable_model` in
+    // `agent-core/src/dialect/anthropic.rs`).
+    let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "hi",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-haiku-4-5:off",
+            "--no-session-persistence",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[0].contains(r#""model":"claude-haiku-4-5""#),
+        "--model claude-haiku-4-5:off must resolve to the bare id: {}",
+        bodies[0]
+    );
+    assert!(
+        bodies[0].contains(r#""thinking":{"type":"disabled"}"#),
+        "--model claude-haiku-4-5:off must send the wire's own explicit disabled-thinking shape: {}",
+        bodies[0]
+    );
+    assert!(
+        !bodies[0].contains(r#""budget_tokens""#),
+        "--model claude-haiku-4-5:off must not be silently promoted to the medium default's numeric \
+         budget: {}",
+        bodies[0]
+    );
+}
+
+#[test]
 fn run_binary_temperature_flag_reaches_the_wire_request() {
     // Pi-parity gap: none of the three dialects exposed a temperature knob at all.
     //
@@ -1027,6 +1081,43 @@ fn run_binary_bash_shell_path_flag_is_used_for_bash_calls() {
         "--bash-shell-path must route the command through the given shell, not the real command's \
          own output: {}",
         bodies[1]
+    );
+}
+
+#[test]
+fn run_binary_fails_fast_when_bash_shell_path_does_not_exist() {
+    // Task #49 (pi-parity fix): `Command::Serve`'s handler already checked `--bash-shell-path` exists
+    // upfront and failed fast (`serve_fails_fast_when_bash_shell_path_does_not_exist` in
+    // `serve_tools_bash.rs`) — `run_task` had no equivalent at all, so a bad path only ever surfaced as
+    // a confusing spawn error on the first `bash` call, potentially well into a multi-step run, rather
+    // than failing the whole invocation immediately at startup.
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "hi",
+            "--gateway-url",
+            "http://127.0.0.1:1",
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--bash-shell-path",
+            "/no/such/shell-binary",
+            "--no-session-persistence",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        !output.status.success(),
+        "a nonexistent --bash-shell-path must fail the run, not silently proceed"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--bash-shell-path"),
+        "must name the flag that failed validation: {stderr}"
     );
 }
 
@@ -2222,6 +2313,111 @@ fn run_binary_idle_timeout_ms_flag_causes_a_stalled_response_to_fail_quickly() {
         "--idle-timeout-ms=200 must cut the stalled read short well before the default ~600s \
          timeout would — took {elapsed:?}. stderr: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn run_binary_retry_max_backoff_ms_flag_caps_the_exponential_backoff_between_retries() {
+    // Task #30 (pi-parity feature): `agent_core::client::GatewayClient::with_max_backoff` had no CLI
+    // flag or persisted override reaching it at all, unlike its two siblings (`--retry-max-retries`/
+    // `--retry-base-delay-ms`). The first two connections answer a retryable 500 immediately; the
+    // third succeeds. With `--retry-base-delay-ms` deliberately large (500ms) but
+    // `--retry-max-backoff-ms` deliberately small (20ms), both waits between attempts must be capped
+    // at ~20ms — total elapsed well under the ~1500ms (500ms + 1000ms) the uncapped schedule would take.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let success_body = turn_text("ok");
+    std::thread::spawn(move || {
+        use std::io::{Read as _, Write as _};
+        // Drain the whole request (headers + declared body) before responding — a partial read can
+        // race the client's own write, aborting the connection with a "transport error: error sending
+        // request" instead of ever reaching this server's response at all. Mirrors
+        // `common::read_http_request`'s own full-body drain.
+        fn drain_request(stream: &mut std::net::TcpStream) {
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            loop {
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&buf[..pos]).to_ascii_lowercase();
+                    let len = headers
+                        .lines()
+                        .find_map(|l| {
+                            l.strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    let need = pos + 4 + len;
+                    while buf.len() < need {
+                        let n = stream.read(&mut tmp).unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                    }
+                    return;
+                }
+                let n = stream.read(&mut tmp).unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+        }
+        for i in 0..3 {
+            if let Ok((mut stream, _)) = listener.accept() {
+                drain_request(&mut stream);
+                if i < 2 {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\
+                          Connection: close\r\n\r\n",
+                    );
+                } else {
+                    let http = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{success_body}"
+                    );
+                    let _ = stream.write_all(http.as_bytes());
+                }
+                let _ = stream.flush();
+            }
+        }
+    });
+    let base = format!("http://{addr}");
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let start = std::time::Instant::now();
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "hi",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--no-session-persistence",
+            "--retry-max-retries",
+            "2",
+            "--retry-base-delay-ms",
+            "500",
+            "--retry-max-backoff-ms",
+            "20",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+    let elapsed = start.elapsed();
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        elapsed < Duration::from_millis(800),
+        "--retry-max-backoff-ms=20 must cap both retry waits well under the uncapped ~1500ms \
+         schedule — took {elapsed:?}"
     );
 }
 

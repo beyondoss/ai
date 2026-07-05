@@ -364,6 +364,14 @@ enum Command {
         /// `CompactionConfig::default()`'s 20,000. `serve`'s identical flag.
         #[arg(long, env = "AI_AGENT_COMPACTION_KEEP_RECENT_TOKENS")]
         compaction_keep_recent_tokens: Option<u32>,
+        /// Token budget reserved below the context window when summarizing an abandoned tree branch —
+        /// independent of `--compaction-reserve-tokens` (ordinary compaction's own reserve). Defaults to
+        /// hard-tying to whatever `--compaction-reserve-tokens` resolves to (this crate's prior
+        /// behavior); pi's own `branchSummary.reserveTokens` default is 16384. `serve`'s identical flag
+        /// (Task #31, pi-parity feature: `agent_core::Agent::with_branch_summary_reserve_tokens`
+        /// previously had no caller in either binary).
+        #[arg(long, env = "AI_AGENT_BRANCH_SUMMARY_RESERVE_TOKENS")]
+        branch_summary_reserve_tokens: Option<u32>,
         /// Disable automatic (threshold-triggered) compaction entirely — the loop only ever compacts on
         /// a genuine overflow (`agent_core::CompactionConfig::enabled`'s own doc comment: manual/overflow
         /// compaction ignores this setting), never proactively. For a caller that would rather fail/see
@@ -378,6 +386,12 @@ enum Command {
         /// `serve`'s identical flag.
         #[arg(long, env = "AI_AGENT_RETRY_BASE_DELAY_MS")]
         retry_base_delay_ms: Option<u64>,
+        /// Ceiling on that exponential backoff, in milliseconds — overrides `agent_core::client::
+        /// GatewayClient::with_max_backoff`'s built-in 60s default (`agent_core::client::MAX_BACKOFF`).
+        /// `serve`'s identical flag (Task #30, pi-parity feature: the retry cluster's third knob,
+        /// previously with no CLI flag or persisted override at all, unlike its two siblings above).
+        #[arg(long, env = "AI_AGENT_RETRY_MAX_BACKOFF_MS")]
+        retry_max_backoff_ms: Option<u64>,
         /// Idle-read timeout between response chunks on the gateway HTTP client, in milliseconds —
         /// overrides `agent_core::client::GatewayClient`'s built-in default, tuned for the gateway's own
         /// upstream assumption. Consulted for every routing path (proxied through the gateway, or a
@@ -675,6 +689,11 @@ enum Command {
         /// `CompactionConfig::default()`'s 20,000.
         #[arg(long, env = "AI_AGENT_COMPACTION_KEEP_RECENT_TOKENS")]
         compaction_keep_recent_tokens: Option<u32>,
+        /// Token budget reserved below the context window when summarizing an abandoned tree branch —
+        /// independent of `--compaction-reserve-tokens`. `run`'s identical flag (Task #31, pi-parity
+        /// feature).
+        #[arg(long, env = "AI_AGENT_BRANCH_SUMMARY_RESERVE_TOKENS")]
+        branch_summary_reserve_tokens: Option<u32>,
         /// Disable automatic (threshold-triggered) compaction entirely — `run`'s identical flag. When
         /// absent (and `AI_AGENT_NO_COMPACTION` unset), falls back to the persisted `agent settings`
         /// `compaction_enabled` override before finally defaulting to enabled — see
@@ -688,6 +707,30 @@ enum Command {
         /// Base of the exponential backoff between those retries, in milliseconds. Defaults to 250.
         #[arg(long, env = "AI_AGENT_RETRY_BASE_DELAY_MS")]
         retry_base_delay_ms: Option<u64>,
+        /// Ceiling on that exponential backoff, in milliseconds. `run`'s identical flag (Task #30,
+        /// pi-parity feature).
+        #[arg(long, env = "AI_AGENT_RETRY_MAX_BACKOFF_MS")]
+        retry_max_backoff_ms: Option<u64>,
+        /// Idle-read timeout between response chunks on the gateway HTTP client, in milliseconds —
+        /// overrides `agent_core::client::GatewayClient`'s built-in default. `run`'s identical flag
+        /// (Task #38, pi-parity fix: `serve` previously had no equivalent at all, so
+        /// `--idle-timeout-ms`/`AI_AGENT_IDLE_TIMEOUT_MS`/the persisted `default_provider_timeout_ms`
+        /// setting had no effect on a `serve` process).
+        #[arg(long, env = "AI_AGENT_IDLE_TIMEOUT_MS")]
+        idle_timeout_ms: Option<u64>,
+        /// Force every image down the same downgrade-to-text-placeholder path a vision-incapable model
+        /// already gets, regardless of the active model's real `supports_vision` capability. Falls back
+        /// to the persisted `agent settings --block-images` default when not explicitly given. `run`'s
+        /// identical flag (Task #34, pi-parity fix: `serve` previously had no equivalent at all).
+        #[arg(long, env = "AI_AGENT_BLOCK_IMAGES", default_value_t = false)]
+        block_images: bool,
+        /// Skip `read`'s resize/downscale path for an oversized image entirely, shipping its
+        /// normalized (format-converted, if needed) bytes as-is regardless of size or pixel dimensions.
+        /// Falls back to the persisted `agent settings --image-auto-resize` default when not explicitly
+        /// given. `run`'s identical flag (Task #34, pi-parity fix: `serve` previously always hardcoded
+        /// image auto-resize on, with no way to turn it off).
+        #[arg(long, env = "AI_AGENT_NO_IMAGE_AUTO_RESIZE", default_value_t = false)]
+        no_image_auto_resize: bool,
         /// Default `bash` command timeout (ms) when the model omits `timeout_ms`. Defaults to 1,800,000
         /// (30 minutes) — see `tools::bash`'s doc comment for why this deliberately deviates from the
         /// reference agent's no-default.
@@ -972,13 +1015,22 @@ enum Command {
         #[arg(long, default_value_t = false)]
         clear_default_retry_base_delay_ms: bool,
         /// Set the stored default provider (idle-read) timeout override, in milliseconds (used when
-        /// neither `--idle-timeout-ms` nor `AI_AGENT_IDLE_TIMEOUT_MS` is given; `run`-only today) —
-        /// Round 3 (pi-parity fix).
+        /// neither `--idle-timeout-ms` nor `AI_AGENT_IDLE_TIMEOUT_MS` is given, for both `run` and
+        /// `serve`) — Round 3 (pi-parity fix); Task #38 extended it to cover `serve` too.
         #[arg(long)]
         default_provider_timeout_ms: Option<u64>,
         /// Clear the stored default provider-timeout override.
         #[arg(long, default_value_t = false)]
         clear_default_provider_timeout_ms: bool,
+        /// Set the stored default retry backoff-ceiling override, in milliseconds (used when neither
+        /// `--retry-max-backoff-ms` nor `AI_AGENT_RETRY_MAX_BACKOFF_MS` is given) — Task #30 (pi-parity
+        /// feature): the retry cluster's third knob, `agent_core::client::GatewayClient::
+        /// with_max_backoff`, previously had no CLI flag or persisted override at all.
+        #[arg(long)]
+        default_retry_max_backoff_ms: Option<u64>,
+        /// Clear the stored default retry backoff-ceiling override.
+        #[arg(long, default_value_t = false)]
+        clear_default_retry_max_backoff_ms: bool,
         /// Set the stored default `--models` scoping/cycling candidate list, comma-separated (used when
         /// neither `--models` nor `AI_AGENT_MODELS` is given; `serve`-only) — Round 3 (pi-parity fix).
         #[arg(long = "default-models", value_delimiter = ',')]
@@ -1001,6 +1053,17 @@ enum Command {
         /// Clear the stored default extra prompt-template-discovery paths.
         #[arg(long, default_value_t = false)]
         clear_default_prompt_template_paths: bool,
+        /// Set the stored default branch-summary reserve-token budget (used when neither
+        /// `--branch-summary-reserve-tokens` nor `AI_AGENT_BRANCH_SUMMARY_RESERVE_TOKENS` is given) —
+        /// Task #31 (pi-parity feature): `agent_core::Agent::with_branch_summary_reserve_tokens`
+        /// previously had no caller at all, so a branch summary's reserve was always hard-tied to
+        /// ordinary compaction's own `--compaction-reserve-tokens`, matching pi's independently
+        /// configurable `branchSummary.reserveTokens` (default 16384).
+        #[arg(long)]
+        default_branch_summary_reserve_tokens: Option<u32>,
+        /// Clear the stored default branch-summary reserve-token budget.
+        #[arg(long, default_value_t = false)]
+        clear_default_branch_summary_reserve_tokens: bool,
     },
     /// Render an existing session's `.jsonl` file as a self-contained HTML transcript and exit — pure
     /// offline rendering of what's already on disk, no gateway/key/model involved at all (unlike `run
@@ -1250,9 +1313,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             context_window,
             compaction_reserve_tokens,
             compaction_keep_recent_tokens,
+            branch_summary_reserve_tokens,
             no_compaction,
             retry_max_retries,
             retry_base_delay_ms,
+            retry_max_backoff_ms,
             idle_timeout_ms,
             block_images,
             no_image_auto_resize,
@@ -1300,9 +1365,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 context_window,
                 compaction_reserve_tokens,
                 compaction_keep_recent_tokens,
+                branch_summary_reserve_tokens,
                 no_compaction,
                 retry_max_retries,
                 retry_base_delay_ms,
+                retry_max_backoff_ms,
                 idle_timeout_ms,
                 block_images,
                 no_image_auto_resize,
@@ -1356,9 +1423,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             force_untrusted,
             compaction_reserve_tokens,
             compaction_keep_recent_tokens,
+            branch_summary_reserve_tokens,
             no_compaction,
             retry_max_retries,
             retry_base_delay_ms,
+            retry_max_backoff_ms,
+            idle_timeout_ms,
+            block_images,
+            no_image_auto_resize,
             bash_timeout_ms,
             bash_shell_path,
             bash_command_prefix,
@@ -1441,9 +1513,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 compaction_reserve_tokens.or(stored_settings.default_compaction_reserve_tokens);
             let compaction_keep_recent_tokens =
                 compaction_keep_recent_tokens.or(stored_settings.default_compaction_keep_recent_tokens);
+            // Task #31 (pi-parity fix): `run_task`'s identical resolution, just below in this file.
+            let branch_summary_reserve_tokens = branch_summary_reserve_tokens
+                .or(stored_settings.default_branch_summary_reserve_tokens);
             let retry_max_retries = retry_max_retries.or(stored_settings.default_retry_max_retries);
             let retry_base_delay_ms =
                 retry_base_delay_ms.or(stored_settings.default_retry_base_delay_ms);
+            // Task #30 (pi-parity fix): `run_task`'s identical resolution, just below in this file.
+            let retry_max_backoff_ms =
+                retry_max_backoff_ms.or(stored_settings.default_retry_max_backoff_ms);
+            // Task #38 (pi-parity fix): `serve` previously had no `--idle-timeout-ms` flag/persisted
+            // fallback at all, unlike `run` — see `run_task`'s identical resolution, just below in this
+            // file.
+            let idle_timeout_ms = idle_timeout_ms.or(stored_settings.default_provider_timeout_ms);
+            // Task #34 (pi-parity fix): `run_task`'s identical "explicit flag, then stored setting,
+            // then built-in default" precedence for both flags — see its own doc comments — previously
+            // had no `serve` counterpart at all: `build_tools`/`build_agent` never consulted either.
+            let block_images = block_images || stored_settings.block_images.unwrap_or(false);
+            let image_auto_resize =
+                !no_image_auto_resize && stored_settings.image_auto_resize.unwrap_or(true);
             let models = models.or_else(|| stored_settings.default_models_list.clone());
             let extra_skill_paths = if extra_skill_paths.is_empty() {
                 stored_settings.default_skill_paths.clone().unwrap_or_default()
@@ -1550,9 +1638,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 force_untrusted,
                 compaction_reserve_tokens,
                 compaction_keep_recent_tokens,
+                branch_summary_reserve_tokens,
                 no_compaction,
                 retry_max_retries,
                 retry_base_delay_ms: retry_base_delay_ms.map(std::time::Duration::from_millis),
+                retry_max_backoff_ms: retry_max_backoff_ms.map(std::time::Duration::from_millis),
+                idle_timeout_ms,
+                block_images,
+                image_auto_resize,
                 bash_timeout_ms,
                 bash_shell_path,
                 bash_command_prefix,
@@ -1752,12 +1845,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             clear_default_retry_base_delay_ms,
             default_provider_timeout_ms,
             clear_default_provider_timeout_ms,
+            default_retry_max_backoff_ms,
+            clear_default_retry_max_backoff_ms,
             default_models,
             clear_default_models,
             default_skill_paths,
             clear_default_skill_paths,
             default_prompt_template_paths,
             clear_default_prompt_template_paths,
+            default_branch_summary_reserve_tokens,
+            clear_default_branch_summary_reserve_tokens,
         } => {
             let mut store = beyond_ai_agent::settings::SettingsStore::open_default();
             let any_write = model.is_some()
@@ -1790,12 +1887,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 || clear_default_retry_base_delay_ms
                 || default_provider_timeout_ms.is_some()
                 || clear_default_provider_timeout_ms
+                || default_retry_max_backoff_ms.is_some()
+                || clear_default_retry_max_backoff_ms
                 || default_models.is_some()
                 || clear_default_models
                 || default_skill_paths.is_some()
                 || clear_default_skill_paths
                 || default_prompt_template_paths.is_some()
-                || clear_default_prompt_template_paths;
+                || clear_default_prompt_template_paths
+                || default_branch_summary_reserve_tokens.is_some()
+                || clear_default_branch_summary_reserve_tokens;
             if model.is_some() || clear_model {
                 store.set_default_model(model)?;
             }
@@ -1863,6 +1964,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if default_provider_timeout_ms.is_some() || clear_default_provider_timeout_ms {
                 store.set_default_provider_timeout_ms(default_provider_timeout_ms)?;
             }
+            if default_retry_max_backoff_ms.is_some() || clear_default_retry_max_backoff_ms {
+                store.set_default_retry_max_backoff_ms(default_retry_max_backoff_ms)?;
+            }
             if default_models.is_some() || clear_default_models {
                 store.set_default_models_list(default_models)?;
             }
@@ -1871,6 +1975,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             if default_prompt_template_paths.is_some() || clear_default_prompt_template_paths {
                 store.set_default_prompt_template_paths(default_prompt_template_paths)?;
+            }
+            if default_branch_summary_reserve_tokens.is_some()
+                || clear_default_branch_summary_reserve_tokens
+            {
+                store.set_default_branch_summary_reserve_tokens(
+                    default_branch_summary_reserve_tokens,
+                )?;
             }
             if any_write {
                 println!("updated settings:");
@@ -1967,6 +2078,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap_or_else(|| "(not set)".to_string())
             );
             println!(
+                "default_retry_max_backoff_ms: {}",
+                s.default_retry_max_backoff_ms
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "(not set)".to_string())
+            );
+            println!(
                 "default_models_list: {}",
                 s.default_models_list
                     .as_ref()
@@ -1988,6 +2105,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .as_ref()
                     .map(|v| v.join(","))
                     .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "(not set)".to_string())
+            );
+            println!(
+                "default_branch_summary_reserve_tokens: {}",
+                s.default_branch_summary_reserve_tokens
+                    .map(|n| n.to_string())
                     .unwrap_or_else(|| "(not set)".to_string())
             );
             // Fix 9's "CLI-visible" requirement: this file is entirely hand-edited (like pi's own
@@ -2115,11 +2238,30 @@ fn looks_like_image(path: &Path) -> bool {
 /// instead of attaching the screenshot). Errors naming the first unreadable (or undecodable) file, so
 /// a typo'd `@path` — or a genuinely corrupt image — fails loudly instead of silently vanishing from
 /// the prompt.
+///
+/// Tasks #35/#36 (pi-parity fix): `block_images`/`image_auto_resize` (the fully-resolved
+/// `--block-images`/`--no-image-auto-resize` flags — explicit flag, then stored `agent settings`
+/// default, then built-in default, exactly like every other such flag) are threaded down to the
+/// `read` tool's own image pipeline for a CLI `@file` attachment, the same way `Agent::block_images`'s
+/// tool-dispatch gate and `default_registry_with_prefix_and_image_auto_resize` already do for a
+/// model-issued `read` tool call. Previously neither flag had any effect at all here: this call site
+/// built a bare `tools::read::Read::default()` with no awareness of either, so a CLI attachment's
+/// images spliced straight into the first `Message` regardless of `--block-images`, at their original
+/// size regardless of `--no-image-auto-resize`.
 async fn read_file_refs(
     file_refs: &[String],
     cwd: &Path,
+    block_images: bool,
+    image_auto_resize: bool,
 ) -> Result<FileRefs, Box<dyn std::error::Error>> {
-    read_file_refs_with_home(file_refs, cwd, std::env::var("HOME").ok().as_deref()).await
+    read_file_refs_with_home(
+        file_refs,
+        cwd,
+        std::env::var("HOME").ok().as_deref(),
+        block_images,
+        image_auto_resize,
+    )
+    .await
 }
 
 /// [`read_file_refs`], with `home` passed explicitly instead of read fresh from `$HOME` — split out
@@ -2130,6 +2272,8 @@ async fn read_file_refs_with_home(
     file_refs: &[String],
     cwd: &Path,
     home: Option<&str>,
+    block_images: bool,
+    image_auto_resize: bool,
 ) -> Result<FileRefs, Box<dyn std::error::Error>> {
     let mut text = String::new();
     let mut images = Vec::new();
@@ -2153,8 +2297,19 @@ async fn read_file_refs_with_home(
         }
         if looks_like_image(&path) {
             let path_str = path.to_string_lossy().into_owned();
+            // Tasks #35/#36: `with_image_auto_resize` matches the registry's own construction
+            // (`tools::default_registry_with_prefix_and_image_auto_resize`); `_model_supports_vision:
+            // !block_images` is the same schema-undocumented input field `agent_core::agent`'s
+            // tool-dispatch loop injects before a model-issued `read` call (see `Read::run`'s own doc
+            // comment) — reused here so `--block-images` downgrades a CLI attachment through the exact
+            // same path (image dropped, `NON_VISION_IMAGE_NOTE` appended) rather than a second,
+            // divergent implementation.
             let out = tools::read::Read::default()
-                .run(serde_json::json!({ "path": path_str }))
+                .with_image_auto_resize(image_auto_resize)
+                .run(serde_json::json!({
+                    "path": path_str,
+                    "_model_supports_vision": !block_images,
+                }))
                 .await
                 .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
             // `out.images` is empty here only when the `read` tool sniffed a real image but couldn't
@@ -2477,9 +2632,11 @@ async fn run_task(
     context_window: Option<u32>,
     compaction_reserve_tokens: Option<u32>,
     compaction_keep_recent_tokens: Option<u32>,
+    branch_summary_reserve_tokens: Option<u32>,
     no_compaction: bool,
     retry_max_retries: Option<u32>,
     retry_base_delay_ms: Option<u64>,
+    retry_max_backoff_ms: Option<u64>,
     idle_timeout_ms: Option<u64>,
     block_images: bool,
     no_image_auto_resize: bool,
@@ -2534,6 +2691,35 @@ async fn run_task(
     let mut timing = beyond_ai_agent::timing::StartupTiming::new();
     let cwd = canonical_cwd(&std::env::current_dir().unwrap_or_default());
 
+    // A stored `agent settings` default sits between an explicit flag/env var and this crate's own
+    // built-in default — checked here, once, rather than threading `SettingsStore` through every
+    // individual flag's own resolution site. Feature 2 (Round 3, pi-parity): merges a trusted project's
+    // own `<cwd>/.claude/settings.json` tier on top of the global one first — see
+    // `settings::effective_settings_for_cwd`'s own doc comment for the trust-gating rationale.
+    //
+    // Task #35/#36 (pi-parity fix): `stored_settings`, `block_images`, and `image_auto_resize` are
+    // resolved here — before the `@file` composition block just below — rather than in their original
+    // spot further down (right before `bash_shell_path`'s own resolution), because `read_file_refs`
+    // needs both flags already resolved to correctly gate a CLI `@file.png` attachment. Previously
+    // `read_file_refs` ran first, using a bare `tools::read::Read::default()` wholly unaware of either
+    // flag — `--block-images`/`agent settings --block-images` had no effect at all on a CLI-attached
+    // image (only on a model-issued `read` tool call, via `Agent::block_images`'s tool-dispatch gate),
+    // and `--no-image-auto-resize` was silently ignored for the same reason. Every other
+    // `stored_settings`-backed fallback stays resolved in its original place below.
+    let stored_settings = beyond_ai_agent::settings::effective_settings_for_cwd(&cwd);
+    // Task #26 (pi-parity feature): an explicit `--block-images` always wins; otherwise fall back to a
+    // persisted `agent settings --block-images` default before finally defaulting to images allowed —
+    // same "explicit flag, then stored setting, then built-in default" precedence every other
+    // `stored_settings`-backed fallback here follows.
+    let block_images = block_images || stored_settings.block_images.unwrap_or(false);
+    // Task #4 (pi-parity feature): same "explicit flag, then stored setting, then built-in default"
+    // precedence as `block_images` above, adapted for a negating `--no-x` flag: an explicit
+    // `--no-image-auto-resize` always forces it off; otherwise fall back to the persisted
+    // `agent settings --image-auto-resize` default; otherwise resize stays on (pi's own
+    // `ImageSettings.autoResize` default).
+    let image_auto_resize =
+        !no_image_auto_resize && stored_settings.image_auto_resize.unwrap_or(true);
+
     // Compose the first message from (in order) piped stdin, `@file` contents, then the first
     // plain-text message argument — mirroring the reference agent's own composition order. At least
     // one source must contribute something; a typo'd invocation with none of the three fails loudly
@@ -2542,7 +2728,7 @@ async fn run_task(
     // invocation like `run @screenshot.png` with no other text still proceeds.
     let (file_refs, mut messages) = partition_tasks(tasks);
     let stdin_content = read_stdin_if_piped();
-    let file_refs = read_file_refs(&file_refs, &cwd).await?;
+    let file_refs = read_file_refs(&file_refs, &cwd, block_images, image_auto_resize).await?;
     let initial_images = file_refs.images;
     let mut parts = Vec::new();
     if let Some(s) = stdin_content {
@@ -2560,39 +2746,40 @@ async fn run_task(
     let initial_message = parts.join("");
     timing.mark("compose initial message");
 
-    // A stored `agent settings` default sits between an explicit flag/env var and this crate's own
-    // built-in default — checked here, once, rather than threading `SettingsStore` through every
-    // individual flag's own resolution site. Feature 2 (Round 3, pi-parity): merges a trusted project's
-    // own `<cwd>/.claude/settings.json` tier on top of the global one first — see
-    // `settings::effective_settings_for_cwd`'s own doc comment for the trust-gating rationale.
-    let stored_settings = beyond_ai_agent::settings::effective_settings_for_cwd(&cwd);
     let gateway = gateway_url
         .or_else(|| stored_settings.default_gateway_url.clone())
         .unwrap_or_else(|| DEFAULT_GATEWAY.to_string());
-    // Task #26 (pi-parity feature): an explicit `--block-images` always wins; otherwise fall back to a
-    // persisted `agent settings --block-images` default before finally defaulting to images allowed —
-    // same "explicit flag, then stored setting, then built-in default" precedence every other
-    // `stored_settings`-backed fallback here follows.
-    let block_images = block_images || stored_settings.block_images.unwrap_or(false);
-    // Task #4 (pi-parity feature): same "explicit flag, then stored setting, then built-in default"
-    // precedence as `block_images` above, adapted for a negating `--no-x` flag: an explicit
-    // `--no-image-auto-resize` always forces it off; otherwise fall back to the persisted
-    // `agent settings --image-auto-resize` default; otherwise resize stays on (pi's own
-    // `ImageSettings.autoResize` default).
-    let image_auto_resize =
-        !no_image_auto_resize && stored_settings.image_auto_resize.unwrap_or(true);
     // Round 3 (pi-parity fix): five more flag/env-only settings gain the same "explicit flag/env, then
     // stored setting, then built-in default" precedence — `serve`'s identical block, in its own command
     // handler above, for the full set (including `--models`, `serve`-only).
     let bash_shell_path = bash_shell_path.or_else(|| stored_settings.default_bash_shell_path.clone());
+    // Task #49 (pi-parity fix): `Command::Serve`'s handler (above in this file) checks this upfront and
+    // fails fast — `run_task` had no equivalent at all, so a bad `--bash-shell-path`/stored default
+    // surfaced only as a confusing spawn error on the first `bash` call, potentially well into a
+    // multi-step run, rather than failing the invocation immediately. Validated once the whole
+    // fallback chain (explicit flag, then stored setting) has resolved, matching `Command::Serve`'s
+    // own identical placement/comment.
+    if let Some(path) = &bash_shell_path {
+        if !std::path::Path::new(path).exists() {
+            return Err(format!("--bash-shell-path not found: {path}").into());
+        }
+    }
     let bash_command_prefix =
         bash_command_prefix.or_else(|| stored_settings.default_bash_command_prefix.clone());
     let compaction_reserve_tokens =
         compaction_reserve_tokens.or(stored_settings.default_compaction_reserve_tokens);
     let compaction_keep_recent_tokens =
         compaction_keep_recent_tokens.or(stored_settings.default_compaction_keep_recent_tokens);
+    // Task #31 (pi-parity feature): independent of `compaction_reserve_tokens` — see
+    // `agent_core::Agent::with_branch_summary_reserve_tokens`'s own doc comment.
+    let branch_summary_reserve_tokens = branch_summary_reserve_tokens
+        .or(stored_settings.default_branch_summary_reserve_tokens);
     let retry_max_retries = retry_max_retries.or(stored_settings.default_retry_max_retries);
     let retry_base_delay_ms = retry_base_delay_ms.or(stored_settings.default_retry_base_delay_ms);
+    // Task #30 (pi-parity feature): the retry cluster's third knob — see
+    // `agent_core::client::GatewayClient::with_max_backoff`'s own doc comment.
+    let retry_max_backoff_ms =
+        retry_max_backoff_ms.or(stored_settings.default_retry_max_backoff_ms);
     let idle_timeout_ms = idle_timeout_ms.or(stored_settings.default_provider_timeout_ms);
     let extra_skill_paths = if extra_skill_paths.is_empty() {
         stored_settings.default_skill_paths.clone().unwrap_or_default()
@@ -2630,16 +2817,22 @@ async fn run_task(
     let (model, model_thinking_level) = serve::resolve_model_id(&model, serve::available_models())
         .map_err(|e| format!("--model {model:?}: {e}"))?;
     let key = resolve_gateway_credential(key, &model)?;
+    // Task #29 (pi-parity fix): whether the operator explicitly requested a specific reasoning depth
+    // for *this* invocation — an explicit `--reasoning-effort` flag, or a `--model <pattern>:<level>`
+    // suffix (`model_thinking_level`, including `:off`) — as opposed to neither ever being given at
+    // all. `ThinkingLevel::Off.reasoning_effort()` is `None`, the exact same value a bare,
+    // nothing-requested invocation produces, so without this flag an explicit `:off` is
+    // indistinguishable from "say nothing" by the time it reaches the `default_reasoning_effort_for_model`
+    // fallback below — which silently overrode it back to a default depth (usually medium) instead of
+    // actually turning reasoning off. Mirrors `Command::Serve`'s identical `reasoning_effort_explicit`
+    // tracking, above in this file.
+    let reasoning_effort_explicit = reasoning_effort.is_some() || model_thinking_level.is_some();
     // Fix 2 (pi-parity gap): `--reasoning-effort` previously had no persisted stored-default fallback at
     // all, unlike `default_model`/`default_gateway_url`/`default_session_dir`. Precedence, in order: an
     // explicit `--reasoning-effort` flag; else a `--model <pattern>:<level>` suffix (this invocation's
     // own model-scoped request, same standing as the flag itself — see `model_thinking_level` above; a
     // `:off` suffix resolves no `ReasoningEffort` here, same as `--reasoning-effort` itself having no
-    // "off" value); else the stored setting; else — Fix 1 (pi-parity gap) — pi's own "medium" default
-    // (`DEFAULT_THINKING_LEVEL`, `packages/coding-agent/src/core/defaults.ts`) whenever the model
-    // supports reasoning at all, so a bare invocation with no flags doesn't silently wire-disable
-    // thinking the way leaving this `None` does (see `serve::default_reasoning_effort_for_model`'s own
-    // doc comment) — finally `None` for a model with no reasoning mechanism to default at all.
+    // "off" value); else the stored setting.
     let reasoning_effort = reasoning_effort
         .or_else(|| model_thinking_level.and_then(|l| l.reasoning_effort()))
         .or_else(|| {
@@ -2647,8 +2840,19 @@ async fn run_task(
                 .default_reasoning_effort
                 .as_deref()
                 .and_then(|s| parse_reasoning_effort(s).ok())
-        })
-        .or_else(|| serve::default_reasoning_effort_for_model(&model));
+        });
+    // Fix 1 (pi-parity gap) — pi's own "medium" default (`DEFAULT_THINKING_LEVEL`,
+    // `packages/coding-agent/src/core/defaults.ts`) whenever the model supports reasoning at all, so a
+    // bare invocation with no flags doesn't silently wire-disable thinking the way leaving this `None`
+    // does (see `serve::default_reasoning_effort_for_model`'s own doc comment) — finally `None` for a
+    // model with no reasoning mechanism to default at all. Task #29: never consulted when the operator
+    // explicitly asked for `:off` above — `reasoning_effort_explicit` guards this fallback so an
+    // explicit "off" stays off instead of being silently promoted to the default depth.
+    let reasoning_effort = if reasoning_effort_explicit {
+        reasoning_effort
+    } else {
+        reasoning_effort.or_else(|| serve::default_reasoning_effort_for_model(&model))
+    };
 
     // Computed once and reused below (rather than called again inside the warning check) — it's a
     // filesystem walk (`has_trust_gated_resources`'s own doc comment), not free.
@@ -2937,6 +3141,12 @@ async fn run_task(
     // outgoing request via the generic `with_extra_headers` mechanism — harmless (a no-op) when no
     // override configured any, since an empty map is also `GatewayClient::new`'s own default.
     .with_extra_headers(model_override_extra_headers(&model));
+    // Task #30 (pi-parity feature): `with_max_backoff` previously had no CLI flag or persisted override
+    // reaching it at all, unlike its two siblings (`retry_max_retries`/`retry_base_delay_ms`) above —
+    // see `agent_core::client::GatewayClient::with_max_backoff`'s own doc comment.
+    if let Some(ms) = retry_max_backoff_ms {
+        client = client.with_max_backoff(std::time::Duration::from_millis(ms));
+    }
     // Task #19 (pi-parity feature): `with_idle_timeout` previously had zero callers anywhere in this
     // codebase. Consulted here for every routing path (proxied through the gateway, or a
     // direct-routed/custom `models.json` `base_url` override that bypasses the gateway's own ~600s
@@ -2989,6 +3199,11 @@ async fn run_task(
         .with_sequential_tools(sequential_tools)
         .with_cache_key(meta.id.clone())
         .with_checkpoint_hook(Arc::new(DirectCheckpoint(store.clone())));
+    // Task #31 (pi-parity feature): independent of `compaction_reserve_tokens` above — see
+    // `agent_core::Agent::with_branch_summary_reserve_tokens`'s own doc comment.
+    if let Some(reserve) = branch_summary_reserve_tokens {
+        agent = agent.with_branch_summary_reserve_tokens(reserve);
+    }
     // Unlike `serve`, `run` has no thinking-level cycling — these are applied as-is, with no per-model
     // default derivation when omitted (matching `run`'s prior behavior of not setting either at all).
     if let Some(budget) = thinking {
@@ -3809,7 +4024,7 @@ mod tests {
     async fn read_file_refs_wraps_contents_in_a_file_tag_with_the_resolved_path() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "hello world").unwrap();
-        let out = read_file_refs(&["a.txt".to_string()], dir.path())
+        let out = read_file_refs(&["a.txt".to_string()], dir.path(), false, true)
             .await
             .unwrap();
         assert!(out.text.contains("hello world"));
@@ -3823,7 +4038,7 @@ mod tests {
     #[tokio::test]
     async fn read_file_refs_errors_naming_the_missing_file() {
         let dir = tempfile::tempdir().unwrap();
-        let err = read_file_refs(&["does-not-exist.txt".to_string()], dir.path())
+        let err = read_file_refs(&["does-not-exist.txt".to_string()], dir.path(), false, true)
             .await
             .unwrap_err()
             .to_string();
@@ -3835,9 +4050,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "AAA").unwrap();
         std::fs::write(dir.path().join("b.txt"), "BBB").unwrap();
-        let out = read_file_refs(&["a.txt".to_string(), "b.txt".to_string()], dir.path())
-            .await
-            .unwrap();
+        let out = read_file_refs(
+            &["a.txt".to_string(), "b.txt".to_string()],
+            dir.path(),
+            false,
+            true,
+        )
+        .await
+        .unwrap();
         assert!(out.text.find("AAA").unwrap() < out.text.find("BBB").unwrap());
     }
 
@@ -3857,7 +4077,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("shot.png"), &png_bytes).unwrap();
 
-        let out = read_file_refs(&["shot.png".to_string()], dir.path())
+        let out = read_file_refs(&["shot.png".to_string()], dir.path(), false, true)
             .await
             .unwrap();
         assert_eq!(
@@ -3867,6 +4087,75 @@ mod tests {
         );
         assert_eq!(out.images[0].media_type, "image/png");
         assert!(!out.images[0].data.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_file_refs_block_images_true_drops_a_cli_attached_image() {
+        // Task #35 (pi-parity fix): `--block-images`/`agent settings --block-images` previously had no
+        // effect on a CLI `@file.png` attachment at all — only on a model-issued `read` tool call
+        // (`Agent::block_images`'s tool-dispatch gate). `read_file_refs`'s own `block_images` parameter
+        // must thread `_model_supports_vision: false` down to the `read` tool the same way, so the
+        // image is dropped and the same non-vision placeholder note appended instead of splicing
+        // straight into the first `Message`.
+        let img = image::RgbImage::from_pixel(4, 4, image::Rgb([200, 10, 10]));
+        let mut png_bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut png_bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("shot.png"), &png_bytes).unwrap();
+
+        let out = read_file_refs(&["shot.png".to_string()], dir.path(), true, true)
+            .await
+            .unwrap();
+        assert!(
+            out.images.is_empty(),
+            "--block-images must drop the image entirely: {out:?}"
+        );
+        assert!(
+            out.text.contains("does not support images"),
+            "--block-images must leave the same non-vision placeholder note `read` uses: {}",
+            out.text
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_refs_image_auto_resize_false_skips_downscaling_an_oversized_cli_image() {
+        // Task #36 (pi-parity fix): `--no-image-auto-resize`/`agent settings --image-auto-resize false`
+        // previously had no effect on a CLI `@file.png` attachment — this call site always built a bare
+        // `tools::read::Read::default()`, which defaults `image_auto_resize` to `true` regardless of
+        // the flag. An oversized image (bigger than `read`'s `MAX_IMAGE_DIMENSION`) must ship at its
+        // original pixel dimensions when the flag disables resizing, matching `tools::read`'s own
+        // `image_auto_resize_off_ships_an_oversized_image_without_downscaling_it` unit test.
+        let img = image::RgbImage::from_pixel(2200, 2200, image::Rgb([10, 200, 10]));
+        let mut png_bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut png_bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("big.png"), &png_bytes).unwrap();
+
+        let out = read_file_refs(&["big.png".to_string()], dir.path(), false, false)
+            .await
+            .unwrap();
+        assert_eq!(out.images.len(), 1, "got: {out:?}");
+        let decoded = image::load_from_memory(&base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            &out.images[0].data,
+        )
+        .unwrap())
+        .unwrap();
+        assert_eq!(
+            decoded.width(),
+            2200,
+            "--no-image-auto-resize must ship the image at its original width, not downscaled"
+        );
     }
 
     #[test]
@@ -3890,6 +4179,8 @@ mod tests {
             &["~/notes.md".to_string()],
             cwd_dir.path(),
             Some(home_dir.path().to_str().unwrap()),
+            false,
+            true,
         )
         .await
         .unwrap();
@@ -3912,6 +4203,8 @@ mod tests {
             &["~/direct.txt".to_string()],
             cwd_dir.path(),
             Some(home_dir.path().to_str().unwrap()),
+            false,
+            true,
         )
         .await
         .unwrap();
@@ -3928,6 +4221,8 @@ mod tests {
             &["plain.txt".to_string()],
             cwd_dir.path(),
             Some(home_dir.path().to_str().unwrap()),
+            false,
+            true,
         )
         .await
         .unwrap();
@@ -3941,7 +4236,7 @@ mod tests {
         // name="...">\n\n</file>` block.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("empty.txt"), b"").unwrap();
-        let out = read_file_refs(&["empty.txt".to_string()], dir.path())
+        let out = read_file_refs(&["empty.txt".to_string()], dir.path(), false, true)
             .await
             .unwrap();
         assert_eq!(out.text, "", "a zero-byte file must contribute nothing at all");
@@ -3961,6 +4256,8 @@ mod tests {
                 "b.txt".to_string(),
             ],
             dir.path(),
+            false,
+            true,
         )
         .await
         .unwrap();
@@ -3974,7 +4271,7 @@ mod tests {
         // A zero-byte skip must not swallow the genuinely-missing-file error — `metadata()` failing
         // falls through to the normal read attempt, which reports the real problem.
         let dir = tempfile::tempdir().unwrap();
-        let err = read_file_refs(&["does-not-exist.txt".to_string()], dir.path())
+        let err = read_file_refs(&["does-not-exist.txt".to_string()], dir.path(), false, true)
             .await
             .unwrap_err()
             .to_string();

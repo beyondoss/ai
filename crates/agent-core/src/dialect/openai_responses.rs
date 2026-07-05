@@ -179,8 +179,23 @@ pub(crate) fn call_id_only(id: &str) -> String {
 /// it whenever the model supports it), `"system"` otherwise. `pub(super)`: shared with
 /// `dialect::openai::build_body`, which needs the identical gating for the Chat Completions dialect's
 /// system-prompt role (pi's `useDeveloperRole = model.reasoning && compat.supportsDeveloperRole`).
-pub(super) fn instruction_role(caps: &crate::models::ModelCaps) -> &'static str {
-    if caps.reasoning_effort {
+///
+/// `compat.supportsDeveloperRole` isn't purely reasoning-gated in pi, though — it's `false` for the
+/// same `isNonStandard` Chat-Completions-family denylist `supportsStore` uses (`openai-completions.ts`
+/// `detectCompat`: DeepSeek, Z.ai/GLM, Moonshot/Kimi, xAI/Grok, Cerebras's native ids, Together, NVIDIA,
+/// Cloudflare, Ant-Ling), regardless of whether the model itself is reasoning-capable — these
+/// non-standard Chat Completions providers reject or misbehave on `role:"developer"` even when their
+/// hosted model has an OpenAI-style reasoning-effort knob (e.g. DeepSeek's/Cerebras's own
+/// `gpt-oss-120b`, `gemma-4-31b`, `zai-glm-4.7`, which get `role:"developer"` today though pi always
+/// sends them `"system"`). `is_non_standard_store_provider` is the same by-id-shape recognition
+/// `supportsStore` already needed for the identical `isNonStandard` boolean — reused rather than
+/// duplicated (its own doc comment notes NVIDIA/Cloudflare/Ant-Ling can't be told apart from a generic
+/// third-party id by shape alone; same known gap here). Only reached through the Chat Completions
+/// dialect in practice — the Responses API (this dialect) only ever routes to OpenAI/Azure/Copilot/
+/// Codex, none of which are in the denylist — but the gate lives here since both dialects share this
+/// one function.
+pub(super) fn instruction_role(model: &str, caps: &crate::models::ModelCaps) -> &'static str {
+    if caps.reasoning_effort && !crate::models::is_non_standard_store_provider(model) {
         "developer"
     } else {
         "system"
@@ -391,7 +406,7 @@ fn push_assistant_content(input: &mut Vec<Value>, blocks: &[ContentBlock], msg_i
 
 /// Build the streaming request body.
 pub fn build_body(req: &ModelRequest) -> Value {
-    let caps = crate::models::capabilities(&req.model);
+    let caps = crate::models::capabilities_for_route(&req.model, req.is_codex, req.is_azure);
     let mut input: Vec<Value> = Vec::new();
 
     // Codex/ChatGPT's own backend wants the system prompt carried in a separate top-level
@@ -399,14 +414,14 @@ pub fn build_body(req: &ModelRequest) -> Value {
     // vanilla native-OpenAI-Responses shape. See `req.is_codex`'s own doc comment.
     if !req.is_codex {
         if let Some(system) = &req.system {
-            input.push(json!({ "role": instruction_role(&caps), "content": system }));
+            input.push(json!({ "role": instruction_role(&req.model, &caps), "content": system }));
         }
     }
     for (msg_index, m) in req.messages.iter().enumerate() {
         match m.role {
             Role::System => {
                 input.push(json!({
-                    "role": instruction_role(&caps),
+                    "role": instruction_role(&req.model, &caps),
                     "content": text_of(&m.content),
                 }));
             }
@@ -444,6 +459,13 @@ pub fn build_body(req: &ModelRequest) -> Value {
         );
         map.insert("parallel_tool_calls".into(), json!(true));
         map.insert("text".into(), json!({ "verbosity": "low" }));
+        // Codex's backend always wants encrypted reasoning content included, whether or not this turn
+        // requested a specific effort — pi's `buildRequestBody` puts `include: ["reasoning.encrypted_
+        // content"]` on the base request object unconditionally (`openai-codex-responses.ts:495`), not
+        // only inside its `reasoningEffort !== undefined` branch. The `reasoning_effort` block below
+        // re-sets the same key/value when an effort *is* requested — a harmless overwrite, not a
+        // second, conflicting source of truth.
+        map.insert("include".into(), json!(["reasoning.encrypted_content"]));
     }
     // A queueing/latency class, not purely a pricing knob — omitted entirely (leaving OpenAI's own
     // default tier) unless the caller explicitly asked for one.
@@ -497,7 +519,7 @@ pub fn build_body(req: &ModelRequest) -> Value {
                 json!({ "effort": effort.as_str(), "summary": summary.as_str() }),
             );
             map.insert("include".into(), json!(["reasoning.encrypted_content"]));
-        } else if caps.reasoning_disableable && !req.is_copilot {
+        } else if caps.reasoning_disableable && !req.is_copilot && !req.is_codex {
             // GitHub Copilot-hosted gpt-5.x ids set `thinkingLevelMap: {"off": null}` in pi's own
             // catalogue (`github-copilot.models.ts`) — no explicit "off" wire shape at all — even
             // though `ModelCaps::reasoning_disableable` (keyed purely by id) reports the *same* id as
@@ -505,6 +527,14 @@ pub fn build_body(req: &ModelRequest) -> Value {
             // (`model.provider !== "github-copilot" && model.thinkingLevelMap?.off !== null`,
             // `openai-responses.ts`). See `ModelRequest::is_copilot`'s own doc comment: nothing sets it
             // to `true` yet — this is the consuming half of that plumbing point.
+            //
+            // Codex is excluded too, but for a different reason than Copilot: pi's Codex-specific
+            // `streamSimple` (`openai-codex-responses.ts:466-467`) maps a clamped "off" effort to
+            // `reasoningEffort: undefined`, and `buildRequestBody` only ever sets `body.reasoning` when
+            // `options?.reasoningEffort !== undefined` — there is no Codex code path that ever sends an
+            // explicit `reasoning: {effort: "none"}` the way the native Responses dialect does. A
+            // no-thinking-requested Codex turn on a reasoning-disableable model must omit `reasoning`
+            // entirely, not send this synthetic "off" beyond invented for the native route.
             map.insert("reasoning".into(), json!({ "effort": "none" }));
         }
     }
@@ -1586,6 +1616,43 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
     }
 
     #[test]
+    fn codex_routed_requests_never_send_reasoning_when_none_was_requested() {
+        // pi-parity (pass 17): pi's Codex-specific `streamSimple` (`openai-codex-responses.ts:466-467`)
+        // maps a clamped "off" effort to `reasoningEffort: undefined`, and `buildRequestBody` only ever
+        // sets `body.reasoning` inside its `options?.reasoningEffort !== undefined` branch — there is no
+        // Codex code path that ever sends the explicit `reasoning: {effort: "none"}` the native
+        // Responses dialect sends a reasoning-disableable model. Beyond's shared reasoning block used to
+        // be unconditional for `is_codex` too, so a no-thinking-requested Codex turn sent a `reasoning`
+        // field pi's own client never sends.
+        let req =
+            ModelRequest::new("gpt-5.3-codex", vec![Message::user("hi")], 64).with_codex(true);
+        let body = build_body(&req);
+        assert!(
+            body.get("reasoning").is_none(),
+            "a Codex request with no reasoning effort requested must omit `reasoning` entirely: {:#?}",
+            body.get("reasoning")
+        );
+        // pi's Codex `buildRequestBody` puts `include: ["reasoning.encrypted_content"]` on the *base*
+        // request object unconditionally — present even when `reasoning` itself is omitted.
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+
+        // Direct (non-Codex) OpenAI routing of the same model id is unaffected — still gets the
+        // explicit "none", and no unconditional `include`.
+        let req = ModelRequest::new("gpt-5.3-codex", vec![Message::user("hi")], 64);
+        let body = build_body(&req);
+        assert_eq!(body["reasoning"]["effort"], "none");
+        assert!(body.get("include").is_none());
+
+        // A Codex request that *does* request an effort still gets `reasoning` (and `include`, as before).
+        let req = ModelRequest::new("gpt-5.3-codex", vec![Message::user("hi")], 64)
+            .with_codex(true)
+            .with_reasoning_effort(crate::transport::ReasoningEffort::Low);
+        let body = build_body(&req);
+        assert_eq!(body["reasoning"]["effort"], "low");
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+    }
+
+    #[test]
     fn codex_routed_requests_send_instructions_field_instead_of_folding_system_into_input() {
         // HIGH pi-parity fix: Codex/ChatGPT's actual backend wants the system prompt in a top-level
         // `instructions` field, with `input` excluding it entirely — unlike every other route, which
@@ -1629,6 +1696,114 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
         let req = ModelRequest::new("gpt-5-codex", vec![Message::user("hi")], 64).with_codex(true);
         let body = build_body(&req);
         assert_eq!(body["instructions"], "You are a helpful assistant.");
+    }
+
+    #[test]
+    fn codex_routed_gpt_5_3_codex_spark_loses_vision_support() {
+        // pi-parity (pass 17 follow-up, task 23): `capabilities_for_route` (`models.rs`) is now wired
+        // into this dialect's `build_body`. `gpt-5.3-codex-spark`'s Codex catalogue entry
+        // (`openai-codex.models.ts`) is genuinely `input: ["text"]` — no vision — even though the
+        // identical id natively (`openai.models.ts`) is vision-capable (`capabilities`'s own gpt-5.3
+        // -codex-spark branch: `supports_vision: true`). Before this call site threaded `req.is_codex`
+        // through, a Codex-routed request for this id got the plain, route-blind `capabilities` lookup's
+        // native (vision-capable) answer regardless of route, silently sending a real `input_image` part
+        // to a backend whose real catalogue can't accept one.
+        let image_message = || Message {
+            role: Role::User,
+            content: vec![ContentBlock::Image {
+                source: ImageSource::base64("image/png", "AAAA"),
+            }],
+            model_id: None,
+            error_message: None,
+            aborted: false,
+            usage: None,
+            stop_reason: None,
+        };
+
+        let native_body = build_body(&ModelRequest::new(
+            "gpt-5.3-codex-spark",
+            vec![image_message()],
+            64,
+        ));
+        assert_eq!(
+            native_body["input"][0]["content"][0]["type"], "input_image",
+            "native routing keeps this id's real vision support: {:#?}",
+            native_body["input"]
+        );
+
+        let codex_body = build_body(
+            &ModelRequest::new("gpt-5.3-codex-spark", vec![image_message()], 64).with_codex(true),
+        );
+        assert_eq!(
+            codex_body["input"][0]["content"][0],
+            json!({ "type": "input_text", "text": USER_IMAGE_PLACEHOLDER }),
+            "Codex routing must lose vision support for this id — a real image must degrade to the \
+             non-vision placeholder, not ride onto the wire as a real input_image part: {:#?}",
+            codex_body["input"]
+        );
+    }
+
+    #[test]
+    fn codex_routed_gpt_5_4_mini_gets_a_lower_effective_output_ceiling_from_its_smaller_context() {
+        // pi-parity (pass 17 follow-up, task 23): "gpt-5.4-mini" is 400_000 context natively/Azure
+        // (`azure-openai-responses.models.ts` matches native here), but only 272_000 on Codex
+        // (`openai-codex.models.ts`) — `capabilities_for_route`'s own doc comment. `max_output_tokens`
+        // itself is unchanged across routes for this id; what changes is `clamp_max_tokens_to_context`'s
+        // *effective* ceiling, which is derived from `context_window` minus the live prompt size. A
+        // 250_000-token prompt (1_000_000 chars, chars/4) leaves native 400_000 - 250_000 - 4_096 =
+        // 145_904 tokens of headroom — comfortably above this request's 50_000 max_tokens, so native
+        // sends it unclamped — but only 272_000 - 250_000 - 4_096 = 17_904 on Codex, clamping the same
+        // request's output down hard. Before this call site threaded `req.is_codex` through to
+        // `capabilities_for_route`, a Codex-routed turn this close to its *real*, smaller context window
+        // was clamped as if it had native's larger one, risking exactly the 400 this clamp exists to
+        // prevent (see `clamp_max_tokens_to_context`'s own doc comment).
+        let big_text = "x".repeat(1_000_000);
+        let native_req =
+            ModelRequest::new("gpt-5.4-mini", vec![Message::user(big_text.as_str())], 50_000);
+        assert_eq!(
+            build_body(&native_req)["max_output_tokens"], 50_000,
+            "native routing's larger real context window leaves enough headroom that this request's \
+             own max_tokens ceiling is unaffected"
+        );
+
+        let codex_req =
+            ModelRequest::new("gpt-5.4-mini", vec![Message::user(big_text.as_str())], 50_000)
+                .with_codex(true);
+        assert_eq!(
+            build_body(&codex_req)["max_output_tokens"], 17_904,
+            "Codex routing's genuinely smaller real context window must clamp this request's output \
+             down further than native's, not send the same unclamped 50_000 ceiling regardless of route"
+        );
+    }
+
+    #[test]
+    fn azure_routed_gpt_5_4_and_5_5_report_the_larger_real_context_window() {
+        // pi-parity (pass 17 follow-up, task 23): "gpt-5.4"/"gpt-5.5" (bare, no mini/nano/pro suffix)
+        // are 272_000 context natively and on Codex, but Azure's own catalogue
+        // (`azure-openai-responses.models.ts`) genuinely ships a 1.05M context for both —
+        // `capabilities_for_route`'s own doc comment. Proven here through `max_output_tokens`'s clamp
+        // (the only observable wire effect of `context_window` in this dialect): a prompt sized to
+        // exhaust the native/Codex 272_000 window entirely (leaving only the `MIN_CLAMPED_MAX_TOKENS`
+        // floor) must still get real, unclamped headroom once Azure's much larger real window is in
+        // play, for both ids.
+        let big_text = "x".repeat(1_100_000); // 275_000 tokens: over even native/Codex's 272_000.
+        for id in ["gpt-5.4", "gpt-5.5"] {
+            let native_req = ModelRequest::new(id, vec![Message::user(big_text.as_str())], 50_000);
+            assert_eq!(
+                build_body(&native_req)["max_output_tokens"], 1_024,
+                "{id}: native's 272_000 context is already exhausted by this prompt, so output must \
+                 clamp all the way down to the floor"
+            );
+
+            let azure_req =
+                ModelRequest::new(id, vec![Message::user(big_text.as_str())], 50_000).with_azure(true);
+            assert_eq!(
+                build_body(&azure_req)["max_output_tokens"], 50_000,
+                "{id}: Azure's real 1.05M context leaves this same prompt with plenty of headroom — \
+                 must send the request's own unclamped 50_000 ceiling, not the native/Codex-derived \
+                 floor"
+            );
+        }
     }
 
     #[test]

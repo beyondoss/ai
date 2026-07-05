@@ -62,13 +62,15 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   original, as-configured model, matching pi's own summarization path (no `nextTurnSnapshot` awareness
   there either). `serve`'s `switch_model` RPC command is the concrete surface for this; `set_model`/
   `set_thinking` are a separate, idle-only mechanism that only takes effect on the *next* `prompt`.
-- **Mid-run tool-set switching** — `Steering::request_tool_set(tools)` (pi's `setTools`/
-  `setActiveTools` equivalent, `agent-harness.ts:871-928`) reconfigures a run's advertised tools —
-  replacing both the wire definitions and the actual `Arc<dyn Tool>` lookup dispatch uses — applied at
-  the exact same turn boundary a mid-run model switch is, so it takes effect starting the very next
-  turn, never mid-turn. A `ToolsUpdated { tool_names }` event fires when it's applied, mirroring pi's own
-  `tools_update`. Before this, the tool set really was fixed for the whole run, not just the `Agent`'s
-  own configured baseline.
+- **Mid-run tool-set switching** — `Steering::request_tool_set(tools)` (mirrors the mechanism behind
+  pi's real shipped `setActiveToolsByName`, `packages/coding-agent/src/core/agent-session.ts:840`, wired
+  to the extension runtime's `setActiveTools` handler at line 2283) reconfigures a run's advertised
+  tools — replacing both the wire definitions and the actual `Arc<dyn Tool>` lookup dispatch uses —
+  applied at the exact same turn boundary a mid-run model switch is, so it takes effect starting the
+  very next turn, never mid-turn. A `ToolsUpdated { tool_names }` event fires when it's applied — pi's
+  own `setActiveToolsByName` has no discrete event of its own; this is this crate's own addition for a
+  streaming client to observe the change. Before this, the tool set really was fixed for the whole run,
+  not just the `Agent`'s own configured baseline.
 - **Per-turn system prompt** — `Agent::with_system_fn(|| String)` installs a callback re-evaluated
   fresh every turn, at the same point the static `with_system` string would otherwise be read — takes
   priority over `with_system` when both are set (mirrors pi's function-valued `systemPrompt`,
@@ -80,9 +82,14 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
 - **Graceful stop** — two independent, OR-combined ways to end a run at a turn boundary rather than a
   hard abort: `Steering::request_stop` — an external flag a host sets from outside the loop (`serve`'s
   `stop_after_turn` RPC command) — and `AgentHooks::should_stop_after_turn` — an in-process,
-  content-aware hook the loop itself calls with the turn's own assistant message and tool results, pi's
-  actual `shouldStopAfterTurn` equivalent (the external flag has no such content access; see the `Hooks`
-  bullet below for why this needed its own seam). Either wanting to stop ends the run. Checked at every
+  content-aware hook the loop itself calls with the turn's own assistant message and tool results (the
+  external flag has no such content access; see the `Hooks` bullet below for why this needed its own
+  seam). A beyond-only capability, not a literal port of anything reachable in pi's real shipped
+  product: pi's own `shouldStopAfterTurn` config field is real (`agent-loop.ts`/`types.ts`), but it's
+  dropped at the `Agent` wrapper class `packages/coding-agent` actually constructs (never forwarded by
+  that class's `AgentOptions`/`createLoopConfig`), so pi's real product has no post-turn stop hook to
+  mirror — the only place it's ever wired end-to-end is the unused
+  `packages/agent/src/harness/agent-harness.ts`. Either wanting to stop ends the run. Checked at every
   turn boundary, *after* that turn's tool calls (if any) have already run and their results are committed
   to the session, but before the next model call would start. Wins over both continuing a tool-call turn
   and draining queued follow-up/steer messages (mirroring the refusal case, those are left queued, not
@@ -122,27 +129,37 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   whose role isn't `Role::Assistant` (a caller bug), for the same reason. Defaults to `NoHooks`.
   `crates/agent`'s own `ToolPolicy` (`--deny-tool`/`--deny-bash-pattern`) is the concrete implementation
   this workspace actually installs; see its `ARCHITECTURE.md`.
-- **Provider request/response hooks** — `AgentHooks::before_provider_request(&mut ModelRequest)` and
-  `after_provider_response(status, headers)` are the raw-HTTP-layer counterpart to the tool-call hooks
-  above — pi's `beforeProviderRequest`/`afterProviderResponse` (`agent-harness.ts:251-385`). The request
-  half is called from `Agent::run_turn_once` (the one place already holding both the configured hooks
-  and the not-yet-sent request) right before `self.transport.stream(req)`, so a host can inject a
-  request-shape tweak that reaches `client.rs`'s dialect/body construction; a panicking hook's partial
-  mutation is discarded, falling back to the request as it was before the call. The response half is
-  instead called from `client.rs::GatewayClient::stream` itself, the instant a response's status/headers
-  are known (before its body starts streaming) — `headers` is a plain `&[(String, String)]`, not a
-  `reqwest`-specific type, so the hook trait stays implementable/testable without depending on `reqwest`,
-  matching `ModelTransport`'s own "the loop never depends on reqwest" contract; a `MockTransport`-driven
-  test never fires it, since there's no real response to report. Both default to no-ops, so an existing
+- **Provider request/response hooks** — `AgentHooks::before_provider_request(&mut ModelRequest)` is a
+  beyond-only capability with no equivalent in pi's real shipped product: pi's real
+  `packages/coding-agent/src/core/sdk.ts:332-338` has exactly one pre-send hook, `onPayload`, and it
+  only ever sees the literal dialect-specific wire JSON (the layer the wire-payload hook below operates
+  at), never an earlier, abstract, dialect-agnostic request — the only place a `ModelRequest`-level
+  pre-send hook ever existed in pi is the unused `packages/agent/src/harness/agent-harness.ts:251-320`
+  (zero references from `packages/coding-agent`). `after_provider_response(status, headers)` *does* have
+  a real counterpart — pi's `onResponse` (`sdk.ts:340-346`), wired to the extension event
+  `"after_provider_response"`. The request-hook half is called from `Agent::run_turn_once` (the one
+  place already holding both the configured hooks and the not-yet-sent request) right before
+  `self.transport.stream(req)`, so a host can inject a request-shape tweak that reaches `client.rs`'s
+  dialect/body construction; a panicking hook's partial mutation is discarded, falling back to the
+  request as it was before the call. The response half is instead called from
+  `client.rs::GatewayClient::stream` itself, the instant a response's status/headers are known (before
+  its body starts streaming) — `headers` is a plain `&[(String, String)]`, not a `reqwest`-specific
+  type, so the hook trait stays implementable/testable without depending on `reqwest`, matching
+  `ModelTransport`'s own "the loop never depends on reqwest" contract; a `MockTransport`-driven test
+  never fires it, since there's no real response to report. Both default to no-ops, so an existing
   `AgentHooks` implementor is unaffected.
-- **Wire-payload hook** — `AgentHooks::before_provider_payload(&mut serde_json::Value)` fills the
-  pi-parity gap between the two hooks above: `before_provider_request` only ever sees the abstract,
-  dialect-agnostic `ModelRequest`, and `after_provider_response` is read-only, so nothing previously
-  exposed the *literal* dialect-specific wire JSON a host might need to inspect or rewrite. Called from
+- **Wire-payload hook** — `AgentHooks::before_provider_payload(&mut serde_json::Value)` fills the gap
+  between the two hooks above: `before_provider_request` only ever sees the abstract, dialect-agnostic
+  `ModelRequest`, and `after_provider_response` is read-only, so nothing previously exposed the
+  *literal* dialect-specific wire JSON a host might need to inspect or rewrite. Called from
   `client.rs::GatewayClient::stream`, once per attempt, immediately after `dialect.build_body(..)` builds
-  the wire body and before it's handed to `send_with_retry` — mirrors pi's low-level `Agent.onPayload`
-  and the harness's `beforeProviderPayload` (`agent-harness.ts`'s `emitBeforeProviderPayload`), except it
-  mutates `payload` in place rather than returning a wholesale replacement, matching
+  the wire body and before it's handed to `send_with_retry` — mirrors pi's real (single-layer) `onPayload`
+  (`sdk.ts:332-338`, wired to the extension event confusingly also named `"before_provider_request"` —
+  despite the name collision, it operates on the literal wire JSON, matching this hook, not the
+  `ModelRequest`-level hook above). The unused `agent-harness.ts` additionally exposes its own,
+  differently-shaped `beforeProviderPayload` (`emitBeforeProviderPayload`, which can replace the payload
+  object wholesale), but that harness is dead code, not a second layer pi's real product actually has.
+  This hook mutates `payload` in place rather than returning a wholesale replacement, matching
   `before_provider_request`'s own convention. Same "fails open" panic handling as the other two: a
   panicking hook's partial mutation is discarded and the payload falls back to exactly what `build_body`
   produced. Defaults to a no-op, so an existing `AgentHooks` implementor is unaffected.
@@ -294,17 +311,23 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   sub-branch — a known limitation of a table keyed on model id alone, with no route/provider context to
   disambiguate by. That same limitation caps `models::is_non_standard_store_provider` (which providers
   withhold `store:false` — see `dialect/openai.rs` below): it recognizes DeepSeek/Zai/Kimi/Grok/
-  Together-Qwen/Cerebras-native by id, but can't recognize NVIDIA/Cloudflare/Ant-Ling at all (no id
-  shape of their own). MiniMax is a special case: pi serves it over the Anthropic wire, but this crate's
-  `Dialect::for_model` only recognizes a `claude`/`anthropic`-named id as Anthropic, so a `minimax-*`
-  request is routed through the OpenAI Chat Completions dialect regardless — its capability entry fixes
-  the context/output-ceiling numbers `Agent::new` reads either way, but doesn't attempt an OpenAI-shaped
-  reasoning toggle a real MiniMax endpoint wouldn't understand; fixing the underlying dialect-routing
-  gap is `dialect/mod.rs`'s call, not this table's. Mistral has the identical dialect-routing gap for a
-  different reason (it has no bespoke wire client in this crate at all, unlike pi's own
+  Together-Qwen/Ant-Ling/Cerebras-native by id, but can't recognize NVIDIA/Cloudflare at all (no id
+  shape of their own — `nvidia.models.ts`'s ids are ordinary `org/model` vendor slugs a NIM proxy can
+  serve arbitrarily, not a fixed prefix, though the *capability numbers* for its current catalogue are
+  ported id-for-id regardless, `models::nvidia_caps`). MiniMax/MiniMax-CN, OpenCode/OpenCode-Go, and
+  Fireworks were all the identical dialect-routing gap as each other: pi serves several of their ids over
+  the Anthropic wire, but `Dialect::for_model` only recognized a `claude`/`anthropic`-named id as
+  Anthropic by default, silently misrouting the rest through Chat Completions. Fixed (not just
+  documented) for these three: `dialect::routes_to_anthropic_by_default` now recognizes MiniMax's/
+  MiniMax-CN's/OpenCode's/OpenCode-Go's own known bare (unprefixed) Anthropic-wire ids, and Fireworks'
+  own distinctive `"accounts/fireworks/"`-prefixed ids (all but its two genuinely-`openai-completions`
+  `glm-5p2` ids), by default — no per-model `models.json` override required for any of them. Kimi-Coding
+  keeps the config-override path instead (few ids, already user-configured); Mistral has the identical
+  gap for a different reason (no bespoke wire client in this crate at all, unlike pi's own
   `mistral-conversations.ts`): every Mistral id is routed through the generic Chat Completions dialect,
   which can approximate its reasoning toggle (via `reasoning_wire_override`, above) and its
-  tool-call-id shape (below) but not its real `promptMode` field.
+  tool-call-id shape (below) but not its real `promptMode` field — that one remains an accepted,
+  documented gap, not a default-routing candidate the way the other three were.
 - **Thinking-budget overrides** — [`models::budget_for_effort_with_override`](src/models.rs) is the
   same fixed effort→token-budget ladder [`models::budget_for_effort`] uses (itself unchanged, and still
   the only path `thinking_for_level` calls), but takes an optional
@@ -482,16 +505,21 @@ directly against this project's minimum-effective-abstraction bias. If a genuine
 extensibility ever appears, revisit this as a deliberate, scoped addition rather than bolting hooks on
 piecemeal.
 
-Two specific extension points pi's harness has and this crate deliberately doesn't: an ephemeral
+One specific extension point pi's real product has and this crate deliberately doesn't: an ephemeral
 per-request context transform (rewrite/prune the outbound message list for one call without persisting
-the change — pi's `transformContext`) and a before/after-provider-request seam (patch headers/timeout
-per call, mutate the raw wire payload, observe raw response status/headers). Both are real seams in
-pi's *extension* system specifically — they exist to let a runtime-loaded, third-party plugin reach
+the change — pi's `transformContext`, `packages/coding-agent/src/core/sdk.ts:351`). This is a real seam
+in pi's *extension* system specifically — it exists to let a runtime-loaded, third-party plugin reach
 into the request pipeline. Since this crate has no such plugin system (see above) and no first-party
-caller has ever needed either seam, adding them now would be exactly the same mistake: machinery with
-no concrete consumer. If a real need appears — a caller that wants to inject transient context, or
-observe/rewrite the wire below `ModelRequest`/`StreamEvent` — add the narrowest seam that call actually
-needs then, not a general-purpose hook ahead of time.
+caller has ever needed it, adding it now would be exactly the same mistake: machinery with no concrete
+consumer. If a real need appears — a caller that wants to inject transient context for one call without
+persisting it — add the narrowest seam that call actually needs then, not a general-purpose hook ahead
+of time.
+
+(The before/after-provider-request seam — patch headers/timeout per call, mutate the raw wire payload,
+observe raw response status/headers — used to belong in this "doesn't have" list too, but this crate
+has since grown exactly that seam: see `AgentHooks::before_provider_request`/`before_provider_payload`/
+`after_provider_response` in the "Hooks"/"Provider request/response hooks"/"Wire-payload hook" bullets
+above and the `hooks.rs` row in the Package Structure table below.)
 
 ## Data Flow
 

@@ -1066,3 +1066,67 @@ fn serve_auto_retry_exhausts_all_attempts_and_reports_failure() {
     drop(stdin);
     child.wait().unwrap();
 }
+
+#[test]
+fn serve_idle_timeout_ms_flag_causes_a_stalled_response_to_fail_quickly() {
+    // Task #38 (pi-parity fix): `--idle-timeout-ms` reached `run` (`main.rs::run_task`'s own
+    // `GatewayClient::with_idle_timeout` call site) but `serve`'s `build_gateway_client` never called
+    // it at all — `ServeConfig` didn't even have the field. A server that answers headers plus one
+    // partial event, then goes silent well past a deliberately shrunk `--idle-timeout-ms`, must fail
+    // the `prompt` quickly instead of hanging on the default (~600s) read timeout — `run`'s identical
+    // `run_binary_idle_timeout_ms_flag_causes_a_stalled_response_to_fail_quickly`.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        use std::io::Read as _;
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100000\r\n\r\n\
+                  data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n",
+            );
+            let _ = stream.flush();
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
+    });
+    let base = format!("http://{addr}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file)
+        .args(["--idle-timeout-ms", "200", "--retry-max-retries", "0"])
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    // Whole-run auto-retry defaults on; disable it too so a single failed attempt surfaces
+    // immediately instead of being retried (this test is about the idle timeout firing at all, not
+    // about how many times the retry layers wrap around it).
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_auto_retry", "enabled": false })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "set_auto_retry");
+
+    let start = std::time::Instant::now();
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "prompt");
+    let elapsed = start.elapsed();
+    drop(stdin);
+    child.wait().unwrap();
+
+    let response = frames.last().unwrap();
+    assert_eq!(response["success"], false, "frames: {frames:#?}");
+    assert!(
+        elapsed < std::time::Duration::from_secs(4),
+        "--idle-timeout-ms=200 must cut the stalled read short well before the default ~600s timeout \
+         would — took {elapsed:?}"
+    );
+}
