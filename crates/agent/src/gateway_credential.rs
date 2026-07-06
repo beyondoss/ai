@@ -27,6 +27,7 @@
 use std::sync::Arc;
 
 use agent_core::client::{Credential, CredentialSource, DirectRouting, RouteOverride};
+use agent_core::models::AggregatorHost;
 
 use crate::oauth::{OAuthCredential, OAuthProviderId};
 
@@ -116,13 +117,34 @@ pub fn resolve_gateway_credential_with_identity(
     key: Option<String>,
     model: &str,
 ) -> Result<(GatewayCredential, GatewayCredentialIdentity), String> {
+    // Opened unconditionally, up front: both the `base_url`-override branch below (its own OAuth
+    // fallback, pi-parity remediation pass 19 Task 2) and the plain non-override branches further down
+    // need a stored-credential lookup, and a missing file is the cheap, ordinary case either way (see
+    // `AuthStore::open_default`'s own doc comment).
+    let store = crate::auth_store::AuthStore::open_default();
+    let oauth_source = |provider: OAuthProviderId| {
+        Arc::new(crate::auth_credential_source::OAuthCredentialSource::new(
+            provider,
+            crate::auth_store::default_path(),
+        )) as Arc<dyn CredentialSource>
+    };
+
     // Fix 9 (pi-parity feature): a `models.json` override naming a `base_url` for this exact model id
-    // wins outright, regardless of whether `--key`/`AI_AGENT_KEY` was also given — the override
     // redirects *where* the request goes (a locally-hosted or alternate-provider endpoint, entirely
-    // bypassing the gateway), which is orthogonal to *how* it authenticates. Reuses the same
-    // `DirectRouting`/`RouteOverride::Direct` mechanism the GitHub-Copilot OAuth routing below already
-    // relies on, rather than duplicating it — see `settings::ModelOverride`'s own doc comment for the
-    // on-disk schema.
+    // bypassing the gateway) — reusing the same `DirectRouting`/`RouteOverride::Direct` mechanism the
+    // GitHub-Copilot OAuth routing below already relies on, rather than duplicating it (see
+    // `settings::ModelOverride`'s own doc comment for the on-disk schema). *How* it authenticates is a
+    // genuinely separate, unconditional question, resolved the same way whether or not an override is in
+    // play (pi-parity remediation pass 19, Task 2): an override with no `api_key`/`auth_header` of its
+    // own still falls through to `--key`/`AI_AGENT_KEY`, then a stored OAuth login (Anthropic/OpenAI
+    // Codex — see [`oauth_fallback_provider`]'s own doc comment for why not GitHub Copilot too), exactly
+    // as if there were no override at all — only when *none* of those resolve anything does this override
+    // finally send an empty bearer (many self-hosted OpenAI-compatible servers ignore `Authorization`
+    // entirely, so that's a usable default, not a hard failure). This doc comment used to claim exactly
+    // this ("orthogonal to how it authenticates") without the implementation actually delivering it —
+    // OAuth was never consulted at all for an override, silently going bearer-less for a model an
+    // operator had a perfectly good subscription login for; this fix (and the paragraph above) make the
+    // two agree.
     if let Some(over) = crate::settings::ModelOverrides::open_default().get(model) {
         if let Some(base_url) = over.base_url.clone() {
             // Fix #39 (pi-parity audit, judgment call): a handful of third-party-aggregator model ids
@@ -144,10 +166,15 @@ pub fn resolve_gateway_credential_with_identity(
             // name heuristic — consulted here (to pick the right endpoint path for a provider whose
             // model ids don't match the heuristic, e.g. Kimi-Coding's `kimi-k2-thinking`) AND threaded
             // into `DirectRouting::dialect_override` below (for the actual body-building/decoding
-            // dialect `GatewayClient::stream` picks), so the two never disagree.
-            let dialect = over
-                .dialect
-                .unwrap_or_else(|| agent_core::dialect::Dialect::for_model(model));
+            // dialect `GatewayClient::stream` picks), so the two never disagree. Failing that, a handful
+            // of OpenCode Zen/OpenCode-Go id/host combinations need a *different* default than
+            // `Dialect::for_model`'s own generic bare-id table (`NATIVE_ANTHROPIC_WIRE_BARE_IDS`)
+            // provides (pi-parity remediation pass 19, Task 1) — see [`opencode_dialect_override`]'s own
+            // doc comment.
+            let dialect = over.dialect.unwrap_or_else(|| {
+                opencode_dialect_override(model, &base_url)
+                    .unwrap_or_else(|| agent_core::dialect::Dialect::for_model(model))
+            });
             // Task #11 (pi-parity feature): resolved through `!command`/`$VAR`/literal syntax (see
             // `ModelOverride::resolved_api_key`'s own doc comment) rather than used as a raw literal —
             // lets an operator avoid storing a plaintext secret in `models.json`.
@@ -165,6 +192,10 @@ pub fn resolve_gateway_credential_with_identity(
             // up an unsolicited `?api-version=v1` it never asked for.
             let is_azure = over.deployment_name.is_some() || is_azure_host(&base_url);
             let query = azure_api_version_query(over.api_version.as_deref(), is_azure);
+            // pi-parity remediation pass 19, Task 3: which known third-party aggregator (if any) this
+            // override's `base_url` names — see [`aggregator_host_for_base_url`]'s own doc comment for
+            // what this does (and doesn't yet) close the loop on.
+            let aggregator_host = aggregator_host_for_base_url(&base_url);
             let routing = DirectRouting {
                 route: RouteOverride::Direct {
                     base_url: base_url.clone(),
@@ -189,6 +220,35 @@ pub fn resolve_gateway_credential_with_identity(
                 // Fix 2 (pi-parity, Round 2): Azure's dated `api-version` query param.
                 query: query.clone(),
             };
+            // pi-parity remediation pass 19, Task 2: the fallback tier below both this override's own
+            // credential (`bearer`, just above) and `--key`/`AI_AGENT_KEY` — a stored OAuth login, still
+            // routed to this override's own `base_url`/`routing` rather than the provider's usual
+            // endpoint. Reuses `DirectRoutedCredentialSource` (already used for Codex's own fixed
+            // routing further below) rather than inventing a second wrapper — the only thing that
+            // differs per call site is which `DirectRouting` it carries.
+            if let Some(provider) = oauth_fallback_provider(model, over, key.as_deref()) {
+                if let Some(stored) = store.get(provider.store_key()) {
+                    if stored.credential.provider() == provider {
+                        let identity = GatewayCredentialIdentity::DirectOverrideOauth {
+                            base_url: base_url.clone(),
+                            path,
+                            auth_header: over.auth_header.clone(),
+                            auth_header_prefix: over.auth_header_prefix.clone(),
+                            deployment_name: over.deployment_name.clone(),
+                            query: query.clone(),
+                            aggregator_host,
+                            provider,
+                        };
+                        return Ok((
+                            GatewayCredential::Oauth(Arc::new(DirectRoutedCredentialSource {
+                                inner: oauth_source(provider),
+                                routing: routing.clone(),
+                            })),
+                            identity,
+                        ));
+                    }
+                }
+            }
             let identity = GatewayCredentialIdentity::DirectOverride {
                 base_url,
                 path,
@@ -197,6 +257,7 @@ pub fn resolve_gateway_credential_with_identity(
                 auth_header_prefix: over.auth_header_prefix.clone(),
                 deployment_name: over.deployment_name.clone(),
                 query,
+                aggregator_host,
             };
             return Ok((
                 GatewayCredential::Oauth(Arc::new(StaticDirectCredentialSource { bearer, routing })),
@@ -209,14 +270,6 @@ pub fn resolve_gateway_credential_with_identity(
         let identity = GatewayCredentialIdentity::StaticKey(key.clone());
         return Ok((GatewayCredential::Static(key), identity));
     }
-
-    let store = crate::auth_store::AuthStore::open_default();
-    let oauth_source = |provider: OAuthProviderId| {
-        Arc::new(crate::auth_credential_source::OAuthCredentialSource::new(
-            provider,
-            crate::auth_store::default_path(),
-        )) as Arc<dyn CredentialSource>
-    };
 
     if agent_core::dialect::Dialect::for_model(model) == agent_core::dialect::Dialect::Anthropic
         && store.get("anthropic").is_some()
@@ -330,6 +383,164 @@ fn unsupported_wire_format_reason(model: &str) -> Option<String> {
         })
 }
 
+/// Which OpenCode aggregator a `models.json` override's `base_url` names, if either (pi-parity
+/// remediation pass 19, Task 1). pi's own `packages/ai/src/providers/opencode.models.ts` (OpenCode Zen)
+/// and `opencode-go.models.ts` (OpenCode-Go) are two distinct aggregators nested under the same
+/// registered domain — `opencode.ai/zen`(`/v1`) vs. `opencode.ai/zen/go`(`/v1`) — each with its own
+/// catalogue and, for a handful of ids, a genuinely different real wire dialect than the identical bare
+/// id gets on the other. A host-only check (à la [`is_azure_host`]) can't distinguish the two — they
+/// share the same registered domain — so this also inspects the path's `/go` segment. See
+/// [`opencode_dialect_override`]'s own doc comment for the concrete id/host combinations this exists to
+/// resolve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenCodeHost {
+    /// `opencode.ai/zen`(`/v1`) — `opencode.models.ts`.
+    Zen,
+    /// `opencode.ai/zen/go`(`/v1`) — `opencode-go.models.ts`.
+    Go,
+}
+
+fn opencode_host(base_url: &str) -> Option<OpenCodeHost> {
+    let url = url::Url::parse(base_url).ok()?;
+    if url.host_str() != Some("opencode.ai") {
+        return None;
+    }
+    let path = url.path().trim_end_matches('/');
+    if path == "/zen/go" || path.starts_with("/zen/go/") {
+        Some(OpenCodeHost::Go)
+    } else if path == "/zen" || path.starts_with("/zen/") {
+        Some(OpenCodeHost::Zen)
+    } else {
+        None
+    }
+}
+
+/// The 4 known id/host combinations (pi-parity remediation pass 19, Task 1) where
+/// `agent_core::dialect::NATIVE_ANTHROPIC_WIRE_BARE_IDS`'s otherwise-correct generic bare-id default
+/// (Anthropic wire) is wrong for one *specific* OpenCode Zen/OpenCode-Go host, because that id is
+/// genuinely served over OpenAI Chat Completions there instead — a `models.json` override naming one of
+/// these exact ids on the matching host, with no explicit `dialect` of its own, would otherwise silently
+/// build an Anthropic-shaped body and send it to an endpoint that speaks Chat Completions.
+///
+/// Verified against pi's real catalogues:
+/// - `packages/ai/src/providers/opencode.models.ts` (OpenCode Zen): `"minimax-m2.7"`/`"minimax-m3"` are
+///   `api: "openai-completions"` there (`NATIVE_ANTHROPIC_WIRE_BARE_IDS` lists both only for *native*
+///   MiniMax's/MiniMax-CN's sake — genuinely Anthropic-wire on those hosts, not on OpenCode Zen).
+/// - `packages/ai/src/providers/opencode-go.models.ts` (OpenCode-Go): `"minimax-m2.7"`/`"qwen3.6-plus"`
+///   are `api: "openai-completions"` there too — a *different* split again from OpenCode Zen, where
+///   `"qwen3.6-plus"` is genuinely Anthropic-wire. `dialect/mod.rs`'s own `NATIVE_ANTHROPIC_WIRE_BARE_IDS`
+///   doc comment already flagged both of OpenCode-Go's ids as "genuinely `openai-completions`" there —
+///   this is that flag finally acted on.
+///
+/// OpenCode Zen's own `qwen3.5-plus`/`qwen3.6-plus` and OpenCode-Go's own `minimax-m3`/`qwen3.7-max`/
+/// `qwen3.7-plus` are deliberately *not* in this table: those are genuinely Anthropic-wire on their
+/// respective host, so `NATIVE_ANTHROPIC_WIRE_BARE_IDS`'s existing default is already correct for them
+/// and this function returns `None`, falling through unchanged.
+///
+/// Unlike [`unsupported_wire_format_reason`]'s sibling fix for OpenCode Zen's 3 Gemini-hosted ids, this
+/// resolves to a *supported* dialect (OpenAI Chat Completions) rather than a hard failure: beyond has a
+/// perfectly good dialect for these 4 combinations, so silently defaulting to the wrong one had a real,
+/// avoidable fix available — unlike the Gemini case, where no dialect exists for that wire format at all
+/// and failing loudly is the only honest option.
+fn opencode_dialect_override(model: &str, base_url: &str) -> Option<agent_core::dialect::Dialect> {
+    let m = model.to_ascii_lowercase();
+    match (opencode_host(base_url)?, m.as_str()) {
+        (OpenCodeHost::Zen, "minimax-m2.7" | "minimax-m3") => Some(agent_core::dialect::Dialect::OpenAi),
+        (OpenCodeHost::Go, "minimax-m2.7" | "qwen3.6-plus") => Some(agent_core::dialect::Dialect::OpenAi),
+        _ => None,
+    }
+}
+
+/// Which OAuth provider (if any) a `models.json` `base_url` override for `model` should fall through to
+/// when it supplies no bearer credential of its own (pi-parity remediation pass 19, Task 2). `over`'s own
+/// explicit `api_key`/`auth_header`, and `key` (`--key`/`AI_AGENT_KEY`, already resolved by the caller),
+/// all take priority over OAuth when set — mirrors pi's real precedence (`model-registry.ts`/
+/// `auth-storage.ts`: CLI flag → stored `api_key` → OAuth → env var; `key` here already folds pi's
+/// separate CLI-flag/env-var tiers into the one value this crate resolves them to). Uses the exact same
+/// id heuristics [`resolve_gateway_credential_with_identity`]'s own non-override OAuth branches use
+/// further below (a Claude-dialect id ⇒ Anthropic; an id containing `"codex"` ⇒ OpenAI Codex) so a
+/// `base_url` override never gets a second, diverging notion of "which provider does this model belong
+/// to".
+///
+/// GitHub Copilot is deliberately excluded, matching pi's own documented exception (its OAuth provider's
+/// `modifyModels` hook unconditionally rewrites `baseUrl` for Copilot-hosted ids, so OAuth already wins
+/// there by construction — untouched by this fix): Copilot's model set is dynamic, matched only via a
+/// stored credential's own `available_model_ids`, which is meaningless once the request's destination has
+/// *already* been redirected by an arbitrary operator-authored `base_url` — there's no way to tell whether
+/// that endpoint is even reachable through Copilot's dynamically-issued proxy host at all.
+///
+/// Factored out from [`resolve_gateway_credential_with_identity`] so this eligibility decision is unit
+/// testable directly, without touching the real stored OAuth credential file `AuthStore::open_default`
+/// reads from — mirrors [`direct_route_base_and_path`]'s identical reasoning for the same
+/// file-avoidance goal. Whether a credential is actually *stored* for the returned provider is a separate
+/// question the caller still has to check (`AuthStore::get`) — this only decides eligibility/precedence.
+fn oauth_fallback_provider(
+    model: &str,
+    over: &crate::settings::ModelOverride,
+    key: Option<&str>,
+) -> Option<OAuthProviderId> {
+    if over.api_key.is_some() || over.auth_header.is_some() || key.is_some() {
+        return None;
+    }
+    if agent_core::dialect::Dialect::for_model(model) == agent_core::dialect::Dialect::Anthropic {
+        return Some(OAuthProviderId::Anthropic);
+    }
+    if model.contains("codex") {
+        return Some(OAuthProviderId::OpenaiCodex);
+    }
+    None
+}
+
+/// Which of the 7 known third-party aggregator platforms (`agent_core::models::AggregatorHost`) a
+/// `models.json` override's (already-normalized) `base_url` names, if any (pi-parity remediation pass 19,
+/// Task 3) — the "BYO/direct-routed" half of the host signal
+/// `agent_core::models::capabilities_for_route_with_host` exists to consume; see
+/// `agent_core::transport::ModelRequest::host`'s own doc comment for the full mechanism this is meant to
+/// close the loop on. Matched by parsed hostname (see [`is_azure_host`]'s identical reasoning for why not
+/// a raw substring check), against each aggregator's real, documented base authority — pi's own
+/// `huggingface.models.ts`/`nvidia.models.ts`/`kimi-coding.models.ts`/`together.models.ts`/
+/// `groq.models.ts`/`openrouter.models.ts` `baseUrl`s. Fireworks is deliberately excluded:
+/// `agent_core::client::GatewayClient::stream` already resolves it unconditionally from the model id's
+/// own shape (`is_fireworks_model`) before this signal would ever be consulted, so there's no
+/// base_url-matching case to add for it here.
+///
+/// **This only ever covers a `base_url`-carrying override.** A plain gateway-routed request (a
+/// `bai_v1…` virtual key, no override) genuinely has no client-visible signal of which
+/// `crates/gateway::route::KNOWN_PROVIDERS` row will actually serve it: the request forwards the model id
+/// verbatim to the gateway's bare-path default route (dialect-keyed, not provider-keyed —
+/// `agent_core::client::GatewayClient::stream`'s `None => format!("{}{}", self.base_url,
+/// dialect.endpoint_path())` branch), with no explicit `/{provider}/…` path segment, no `--provider`
+/// flag anywhere in this crate, and no provider name recoverable from the opaque
+/// `bai_v1.{kid}.{payload}.{sig}` virtual key (`crates/gateway/src/key.rs`) for the client to read back
+/// out. So `AggregatorHost::{Together,Groq,OpenRouter}`'s *gateway*-routed case genuinely can't be
+/// resolved from `crates/agent` as it exists today — it would need either a gateway-side change (echoing
+/// the resolved provider back to the client) or a new client-side provider-pinning surface, neither of
+/// which exists yet. Left unaddressed here rather than guessed at; this function only ever returns one of
+/// those 3 variants for the (also legitimate) case where an operator's `base_url` override points
+/// directly at that provider's own official endpoint, bypassing the gateway entirely — the identical
+/// shape this function already handles for the 3 BYO-only hosts (HuggingFace/NVIDIA/Kimi-Coding, which
+/// have no gateway route at all).
+///
+/// Not yet threaded any further than this file's own [`GatewayCredentialIdentity`] — see that type's
+/// `DirectOverride`/`DirectOverrideOauth` variants. Actually reaching `ModelRequest::host` would need
+/// either a new field on `agent_core::client::DirectRouting` (agent-core, unowned this round) for
+/// `GatewayClient::stream` to read back out, or `crates/agent/src/serve.rs` (a sibling agent's file this
+/// round) calling this function directly when it builds a `ModelRequest` — this module lands the
+/// detection primitive itself, matching the precedent [`GatewayCredentialIdentity`] (Fix #36) already set
+/// for landing an unwired primitive when the consuming call site belongs to someone else this round.
+pub(crate) fn aggregator_host_for_base_url(base_url: &str) -> Option<AggregatorHost> {
+    let host = url::Url::parse(base_url).ok()?.host_str()?.to_ascii_lowercase();
+    match host.as_str() {
+        "router.huggingface.co" => Some(AggregatorHost::HuggingFace),
+        "integrate.api.nvidia.com" => Some(AggregatorHost::Nvidia),
+        "api.kimi.com" => Some(AggregatorHost::KimiCoding),
+        "api.together.ai" | "api.together.xyz" => Some(AggregatorHost::Together),
+        "api.groq.com" => Some(AggregatorHost::Groq),
+        "openrouter.ai" => Some(AggregatorHost::OpenRouter),
+        _ => None,
+    }
+}
+
 /// A cheap, `PartialEq`-comparable summary of *which upstream* a resolved [`GatewayCredential`] talks
 /// to — deliberately not the credential/token value's own identity in every case (an OAuth token's
 /// bearer content can rotate independently of "is this still the same provider relationship", and
@@ -369,6 +580,29 @@ pub enum GatewayCredentialIdentity {
         auth_header_prefix: Option<String>,
         deployment_name: Option<String>,
         query: Option<String>,
+        /// See [`aggregator_host_for_base_url`]'s own doc comment (pi-parity remediation pass 19,
+        /// Task 3) — derived purely from `base_url`, so it never changes the equality this type already
+        /// gets from that field; carried here just so a caller inspecting this identity doesn't have to
+        /// re-derive it.
+        aggregator_host: Option<AggregatorHost>,
+    },
+    /// A `models.json` `base_url` override for a model with an active OAuth login and no
+    /// override-supplied bearer of its own (pi-parity remediation pass 19, Task 2) — the override still
+    /// redirects *where* the request goes (exactly like [`Self::DirectOverride`]), but *how* it
+    /// authenticates is a live, auto-refreshed OAuth token rather than a fixed string, so (unlike
+    /// `DirectOverride`) there is no `bearer` field to compare or redact: two resolutions for the same
+    /// override configuration are the same upstream relationship regardless of the live token's current
+    /// value — the same reasoning [`Self::Anthropic`]/[`Self::OpenaiCodex`] already rely on for their own
+    /// OAuth-backed variants.
+    DirectOverrideOauth {
+        base_url: String,
+        path: &'static str,
+        auth_header: Option<String>,
+        auth_header_prefix: Option<String>,
+        deployment_name: Option<String>,
+        query: Option<String>,
+        aggregator_host: Option<AggregatorHost>,
+        provider: OAuthProviderId,
     },
     /// A stored Anthropic OAuth subscription login — a fixed relationship to a fixed backend, so no
     /// further distinguishing fields are needed (unlike GitHub Copilot's own dynamically-hosted proxy;
@@ -401,6 +635,7 @@ impl std::fmt::Debug for GatewayCredentialIdentity {
                 auth_header_prefix,
                 deployment_name,
                 query,
+                aggregator_host,
                 ..
             } => f
                 .debug_struct("DirectOverride")
@@ -411,6 +646,27 @@ impl std::fmt::Debug for GatewayCredentialIdentity {
                 .field("auth_header_prefix", auth_header_prefix)
                 .field("deployment_name", deployment_name)
                 .field("query", query)
+                .field("aggregator_host", aggregator_host)
+                .finish(),
+            Self::DirectOverrideOauth {
+                base_url,
+                path,
+                auth_header,
+                auth_header_prefix,
+                deployment_name,
+                query,
+                aggregator_host,
+                provider,
+            } => f
+                .debug_struct("DirectOverrideOauth")
+                .field("base_url", base_url)
+                .field("path", path)
+                .field("auth_header", auth_header)
+                .field("auth_header_prefix", auth_header_prefix)
+                .field("deployment_name", deployment_name)
+                .field("query", query)
+                .field("aggregator_host", aggregator_host)
+                .field("provider", provider)
                 .finish(),
             Self::Anthropic => f.write_str("Anthropic"),
             Self::OpenaiCodex { account_id } => {
@@ -914,6 +1170,197 @@ mod tests {
         assert!(reason.contains("dialect"), "got: {reason}");
     }
 
+    // pi-parity remediation pass 19, Task 1: `opencode_host`/`opencode_dialect_override` fix 4 known
+    // id/host combinations where OpenCode Zen/OpenCode-Go serve a bare id (already in
+    // `NATIVE_ANTHROPIC_WIRE_BARE_IDS` for another host's sake) over OpenAI Chat Completions instead of
+    // the generic Anthropic-wire default.
+
+    #[test]
+    fn opencode_host_recognizes_zen_with_or_without_the_v1_suffix() {
+        for url in [
+            "https://opencode.ai/zen",
+            "https://opencode.ai/zen/v1",
+            "https://opencode.ai/zen/",
+        ] {
+            assert_eq!(opencode_host(url), Some(OpenCodeHost::Zen), "{url}");
+        }
+    }
+
+    #[test]
+    fn opencode_host_recognizes_go_with_or_without_the_v1_suffix() {
+        for url in [
+            "https://opencode.ai/zen/go",
+            "https://opencode.ai/zen/go/v1",
+            "https://opencode.ai/zen/go/",
+        ] {
+            assert_eq!(opencode_host(url), Some(OpenCodeHost::Go), "{url}");
+        }
+    }
+
+    #[test]
+    fn opencode_host_is_none_for_an_unrelated_host_an_unrelated_path_or_an_unparsable_url() {
+        assert_eq!(opencode_host("https://api.together.ai/v1"), None);
+        assert_eq!(opencode_host("https://opencode.ai/other"), None);
+        assert_eq!(opencode_host("not a url at all"), None);
+    }
+
+    #[test]
+    fn opencode_dialect_override_forces_openai_for_all_4_known_mis_dialected_combinations() {
+        use agent_core::dialect::Dialect;
+        // OpenCode Zen: minimax-m2.7/minimax-m3 are `api: "openai-completions"` there
+        // (opencode.models.ts), despite both being in `NATIVE_ANTHROPIC_WIRE_BARE_IDS` for native
+        // MiniMax's/MiniMax-CN's sake.
+        assert_eq!(
+            opencode_dialect_override("minimax-m2.7", "https://opencode.ai/zen/v1"),
+            Some(Dialect::OpenAi)
+        );
+        assert_eq!(
+            opencode_dialect_override("minimax-m3", "https://opencode.ai/zen/v1"),
+            Some(Dialect::OpenAi)
+        );
+        // OpenCode-Go: minimax-m2.7/qwen3.6-plus are `api: "openai-completions"` there too
+        // (opencode-go.models.ts) — a different split again from OpenCode Zen, where qwen3.6-plus is
+        // genuinely Anthropic-wire.
+        assert_eq!(
+            opencode_dialect_override("minimax-m2.7", "https://opencode.ai/zen/go/v1"),
+            Some(Dialect::OpenAi)
+        );
+        assert_eq!(
+            opencode_dialect_override("qwen3.6-plus", "https://opencode.ai/zen/go/v1"),
+            Some(Dialect::OpenAi)
+        );
+    }
+
+    #[test]
+    fn opencode_dialect_override_is_case_insensitive_on_the_model_id() {
+        use agent_core::dialect::Dialect;
+        assert_eq!(
+            opencode_dialect_override("MiniMax-M3", "https://opencode.ai/zen/v1"),
+            Some(Dialect::OpenAi)
+        );
+    }
+
+    #[test]
+    fn opencode_dialect_override_is_none_for_ids_that_are_already_correctly_anthropic_on_their_host() {
+        // OpenCode Zen's own qwen3.6-plus is genuinely Anthropic-wire — the existing
+        // `NATIVE_ANTHROPIC_WIRE_BARE_IDS` default is already correct, so this must not override it.
+        assert_eq!(opencode_dialect_override("qwen3.6-plus", "https://opencode.ai/zen"), None);
+        // OpenCode-Go's own minimax-m3/qwen3.7-max are also genuinely Anthropic-wire there.
+        assert_eq!(opencode_dialect_override("minimax-m3", "https://opencode.ai/zen/go"), None);
+        assert_eq!(opencode_dialect_override("qwen3.7-max", "https://opencode.ai/zen/go"), None);
+    }
+
+    #[test]
+    fn opencode_dialect_override_is_none_for_an_unrelated_host() {
+        assert_eq!(
+            opencode_dialect_override("minimax-m3", "https://api.together.ai/v1"),
+            None
+        );
+    }
+
+    // pi-parity remediation pass 19, Task 2: `oauth_fallback_provider` decides whether a `models.json`
+    // `base_url` override with no bearer of its own should still authenticate via a stored OAuth login.
+
+    #[test]
+    fn oauth_fallback_provider_picks_anthropic_for_a_claude_dialect_model_with_no_credential_of_its_own() {
+        let over = crate::settings::ModelOverride::default();
+        assert_eq!(
+            oauth_fallback_provider("claude-opus-4-8", &over, None),
+            Some(OAuthProviderId::Anthropic)
+        );
+    }
+
+    #[test]
+    fn oauth_fallback_provider_picks_codex_for_a_codex_named_model() {
+        let over = crate::settings::ModelOverride::default();
+        assert_eq!(
+            oauth_fallback_provider("gpt-5.1-codex", &over, None),
+            Some(OAuthProviderId::OpenaiCodex)
+        );
+    }
+
+    #[test]
+    fn oauth_fallback_provider_is_none_when_the_override_has_its_own_api_key() {
+        let over = crate::settings::ModelOverride {
+            api_key: Some("sk-my-own-key".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(oauth_fallback_provider("claude-opus-4-8", &over, None), None);
+    }
+
+    #[test]
+    fn oauth_fallback_provider_is_none_when_the_override_has_its_own_auth_header() {
+        let over = crate::settings::ModelOverride {
+            auth_header: Some("api-key".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(oauth_fallback_provider("gpt-5.1-codex", &over, None), None);
+    }
+
+    #[test]
+    fn oauth_fallback_provider_is_none_when_a_key_flag_or_env_var_was_given() {
+        let over = crate::settings::ModelOverride::default();
+        assert_eq!(
+            oauth_fallback_provider("claude-opus-4-8", &over, Some("bai_v1_abc")),
+            None
+        );
+    }
+
+    #[test]
+    fn oauth_fallback_provider_is_none_for_a_third_party_model_that_is_neither_anthropic_nor_codex() {
+        let over = crate::settings::ModelOverride::default();
+        assert_eq!(oauth_fallback_provider("llama-3.1-70b", &over, None), None);
+    }
+
+    // pi-parity remediation pass 19, Task 3: `aggregator_host_for_base_url` recognizes a `models.json`
+    // override's `base_url` naming a known third-party aggregator's real host.
+
+    #[test]
+    fn aggregator_host_for_base_url_recognizes_the_byo_only_hosts() {
+        assert_eq!(
+            aggregator_host_for_base_url("https://router.huggingface.co/v1"),
+            Some(AggregatorHost::HuggingFace)
+        );
+        assert_eq!(
+            aggregator_host_for_base_url("https://integrate.api.nvidia.com/v1"),
+            Some(AggregatorHost::Nvidia)
+        );
+        assert_eq!(
+            aggregator_host_for_base_url("https://api.kimi.com/coding"),
+            Some(AggregatorHost::KimiCoding)
+        );
+    }
+
+    #[test]
+    fn aggregator_host_for_base_url_recognizes_a_direct_routed_gateway_native_provider() {
+        // A `models.json` override can also point directly at a gateway-native provider's own official
+        // endpoint (bypassing the gateway entirely) — this is the one shape this file has any
+        // visibility into for those hosts at all (see this function's own doc comment for why the
+        // plain gateway-routed case can't be resolved here).
+        assert_eq!(
+            aggregator_host_for_base_url("https://api.together.ai/v1"),
+            Some(AggregatorHost::Together)
+        );
+        assert_eq!(
+            aggregator_host_for_base_url("https://api.together.xyz/v1"),
+            Some(AggregatorHost::Together)
+        );
+        assert_eq!(
+            aggregator_host_for_base_url("https://api.groq.com/openai/v1"),
+            Some(AggregatorHost::Groq)
+        );
+        assert_eq!(
+            aggregator_host_for_base_url("https://openrouter.ai/api/v1"),
+            Some(AggregatorHost::OpenRouter)
+        );
+    }
+
+    #[test]
+    fn aggregator_host_for_base_url_is_none_for_an_unrelated_host_or_an_unparsable_url() {
+        assert_eq!(aggregator_host_for_base_url("https://my-ollama-box.example.com"), None);
+        assert_eq!(aggregator_host_for_base_url("not a url at all"), None);
+    }
+
     // Fix #36 (pi-parity audit): `GatewayCredentialIdentity` compares equal for two credentials that
     // resolve to the same upstream/config, and unequal for ones that don't — the property a future
     // `build_gateway_client` skip-rebuild check would rely on.
@@ -937,6 +1384,7 @@ mod tests {
             auth_header_prefix: None,
             deployment_name: deployment.map(str::to_string),
             query: None,
+            aggregator_host: None,
         };
         assert_eq!(make("https://host/openai/v1", None), make("https://host/openai/v1", None));
         assert_ne!(
@@ -961,6 +1409,7 @@ mod tests {
             auth_header_prefix: None,
             deployment_name: None,
             query: None,
+            aggregator_host: None,
         };
         let static_key = GatewayCredentialIdentity::StaticKey("same-value".to_string());
         assert_ne!(direct, static_key);
@@ -1023,6 +1472,7 @@ mod tests {
             auth_header_prefix: None,
             deployment_name: None,
             query: None,
+            aggregator_host: None,
         };
         let debug = format!("{direct:?}");
         assert!(
@@ -1036,5 +1486,96 @@ mod tests {
             !debug.contains("another-secret"),
             "Debug must redact the static key value, got: {debug}"
         );
+    }
+
+    // pi-parity remediation pass 19, Task 2: `GatewayCredentialIdentity::DirectOverrideOauth` — an
+    // override with no bearer of its own, falling through to a stored OAuth login.
+
+    #[test]
+    fn identity_direct_override_oauth_is_equal_only_when_every_distinguishing_field_matches() {
+        let make = |base_url: &str, provider: OAuthProviderId| GatewayCredentialIdentity::DirectOverrideOauth {
+            base_url: base_url.to_string(),
+            path: "/v1/messages",
+            auth_header: None,
+            auth_header_prefix: None,
+            deployment_name: None,
+            query: None,
+            aggregator_host: None,
+            provider,
+        };
+        assert_eq!(
+            make("https://host", OAuthProviderId::Anthropic),
+            make("https://host", OAuthProviderId::Anthropic)
+        );
+        assert_ne!(
+            make("https://host-a", OAuthProviderId::Anthropic),
+            make("https://host-b", OAuthProviderId::Anthropic),
+            "a different base_url must be a different identity"
+        );
+        assert_ne!(
+            make("https://host", OAuthProviderId::Anthropic),
+            make("https://host", OAuthProviderId::OpenaiCodex),
+            "a different provider must be a different identity even with the same base_url"
+        );
+    }
+
+    #[test]
+    fn identity_direct_override_oauth_differs_from_a_static_bearer_direct_override() {
+        // The two variants exist precisely because a live OAuth token isn't comparable the same way a
+        // fixed bearer string is — they must never compare equal to each other even when every other
+        // field lines up.
+        let oauth = GatewayCredentialIdentity::DirectOverrideOauth {
+            base_url: "https://host".to_string(),
+            path: "/v1/messages",
+            auth_header: None,
+            auth_header_prefix: None,
+            deployment_name: None,
+            query: None,
+            aggregator_host: None,
+            provider: OAuthProviderId::Anthropic,
+        };
+        let static_bearer = GatewayCredentialIdentity::DirectOverride {
+            base_url: "https://host".to_string(),
+            path: "/v1/messages",
+            bearer: String::new(),
+            auth_header: None,
+            auth_header_prefix: None,
+            deployment_name: None,
+            query: None,
+            aggregator_host: None,
+        };
+        assert_ne!(oauth, static_bearer);
+    }
+
+    #[test]
+    fn identity_direct_override_oauth_debug_shows_the_provider_and_never_panics() {
+        let oauth = GatewayCredentialIdentity::DirectOverrideOauth {
+            base_url: "https://host".to_string(),
+            path: "/v1/messages",
+            auth_header: None,
+            auth_header_prefix: None,
+            deployment_name: None,
+            query: None,
+            aggregator_host: None,
+            provider: OAuthProviderId::OpenaiCodex,
+        };
+        let debug = format!("{oauth:?}");
+        assert!(debug.contains("OpenaiCodex"), "got: {debug}");
+    }
+
+    #[test]
+    fn identity_direct_override_carries_the_aggregator_host_it_was_built_with() {
+        let direct = GatewayCredentialIdentity::DirectOverride {
+            base_url: "https://api.together.ai/v1".to_string(),
+            path: "/chat/completions",
+            bearer: "key".to_string(),
+            auth_header: None,
+            auth_header_prefix: None,
+            deployment_name: None,
+            query: None,
+            aggregator_host: Some(AggregatorHost::Together),
+        };
+        let debug = format!("{direct:?}");
+        assert!(debug.contains("Together"), "got: {debug}");
     }
 }

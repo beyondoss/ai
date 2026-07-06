@@ -157,6 +157,69 @@ pub fn spawn_model_server(responses: Vec<String>) -> (String, Arc<Mutex<Vec<Stri
     (format!("http://{addr}"), requests)
 }
 
+/// A model server whose first `fast.len()` requests get an instant response, and whose next request
+/// (e.g. the summarization call a `switch_branch{summarize:true}` triggers, or a plain `prompt`'s own
+/// model call) sends only a partial SSE body — proving the request genuinely reached the server and
+/// started streaming — then stalls for `stall` before completing, giving a test a reliable window to
+/// `abort` (or, for pi-parity Task 4's busy-then-self-abort commands, send `compact`/`switch_session`/
+/// `fork`/`clone`/`new_session` mid-run) a provably in-flight call instead of racing a near-instant
+/// local round trip. Every request in `after` then gets its own instant response too, in order — for a
+/// test whose busy-time command itself makes a further model call once it resumes idle (e.g. `compact`,
+/// when the session has enough content to attempt a real summarization rather than short-circuiting as
+/// too small).
+pub fn spawn_model_server_with_stalled_response(
+    fast: Vec<String>,
+    stall: std::time::Duration,
+    after: Vec<String>,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for resp in fast {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let http = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{resp}"
+                );
+                let _ = stream.write_all(http.as_bytes());
+                let _ = stream.flush();
+            }
+        }
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let preamble = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
+                data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n";
+            let _ = stream.write_all(preamble.as_bytes());
+            let _ = stream.flush();
+            thread::sleep(stall);
+            // Finishes the turn normally as a fallback safety net in case a test using this doesn't
+            // interrupt it before `stall` elapses — a silently-hanging server would fail such a test
+            // far more confusingly than a completed-but-too-late response would.
+            let rest = "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+                data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"recap\"}}\n\n\
+                data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+                data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n\
+                data: {\"type\":\"message_stop\"}\n\n";
+            let _ = stream.write_all(rest.as_bytes());
+            let _ = stream.flush();
+        }
+        for resp in after {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let http = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{resp}"
+                );
+                let _ = stream.write_all(http.as_bytes());
+                let _ = stream.flush();
+            }
+        }
+    });
+    format!("http://{addr}")
+}
+
 /// A free localhost port (bind `:0`, read it back, release). A subprocess must bind it promptly;
 /// there's a small TOCTOU window, acceptable for tests.
 pub fn free_port() -> u16 {

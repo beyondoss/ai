@@ -70,13 +70,16 @@ pub struct Settings {
     /// Used when neither `--reasoning-effort`/`--thinking` nor `AI_AGENT_REASONING_EFFORT` is given —
     /// pi-parity fix: `--reasoning-effort` was the only numeric/string CLI tunable with no persisted
     /// stored-default fallback at all (unlike `default_model`/`default_gateway_url`/
-    /// `default_session_dir` above). One of `agent_core::ReasoningEffort::as_str`'s wire vocabulary
-    /// (minimal/low/medium/high/xhigh) — stored as a plain string (not the enum itself) so this crate's
-    /// settings file doesn't take a hard dependency on `agent_core`'s exact type layout, matching how
-    /// every other field here is a primitive; validated through the same `parse_reasoning_effort`
-    /// `--reasoning-effort` itself uses at both write time (`agent settings --default-reasoning-effort`)
-    /// and read time (`main.rs`'s fallback chain), so a corrupt/hand-edited value degrades to "not set"
-    /// rather than a panic or a silently-wrong effort reaching the wire.
+    /// `default_session_dir` above). One of `agent_core::ThinkingLevel::as_str`'s wire vocabulary
+    /// (off/minimal/low/medium/high/xhigh — Task 2, pi-parity fix pass 19: `"off"` is now a legal value
+    /// here too, matching pi's own `--thinking off` and this crate's RPC-facing `set_reasoning_effort`,
+    /// both of which already treated "explicitly disable reasoning" as a first-class request rather than
+    /// a parse error) — stored as a plain string (not the enum itself) so this crate's settings file
+    /// doesn't take a hard dependency on `agent_core`'s exact type layout, matching how every other field
+    /// here is a primitive; validated through the same `parse_reasoning_effort` `--reasoning-effort`
+    /// itself uses at both write time (`agent settings --default-reasoning-effort`) and read time
+    /// (`main.rs`'s fallback chain), so a corrupt/hand-edited value degrades to "not set" rather than a
+    /// panic or a silently-wrong effort reaching the wire.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_reasoning_effort: Option<String>,
     /// A persisted, cross-session override for whether every image is forced down the same
@@ -204,6 +207,29 @@ pub struct Settings {
     /// behavior in effect, unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_branch_summary_reserve_tokens: Option<u32>,
+    /// A persisted, cross-session override for the mid-run *steer* lane's drain granularity — pi's own
+    /// persisted `steeringMode` (pi-parity gap, pass 19): `agent_core::steering::QueueMode::{OneAtATime,
+    /// All}` already existed and was already reachable at runtime via `serve`'s `set_steering_mode` RPC
+    /// command, but nothing durable backed it — an operator wanting a standing default had to re-issue
+    /// that RPC call at the start of every `serve` session. One of `"one_at_a_time"`/`"all"` (the exact
+    /// wire vocabulary `set_steering_mode`'s own `mode` argument already uses — see `serve.rs`'s module
+    /// doc comment), stored as a plain string rather than the enum itself, matching
+    /// [`Self::default_reasoning_effort`]'s own "no hard dependency on `agent_core`'s exact type layout"
+    /// convention. `None` defaults to `one_at_a_time`, matching both this crate's and pi's own default.
+    /// Mirrors [`Self::compaction_enabled`]'s identical persist-on-RPC-toggle model rather than
+    /// `default_reasoning_effort`'s CLI-mutated one: like auto-compaction, this only ever changes for the
+    /// life of a running `serve` session (there's no `run`/`serve` one-shot analogue to a live toggle), so
+    /// `serve`'s own `set_steering_mode` handler is expected to persist here itself (the way
+    /// `set_auto_compaction` already calls [`SettingsStore::set_compaction_enabled`]), not a dedicated
+    /// `agent settings` CLI flag. `run`'s and `serve`'s own `--steering-mode`/`AI_AGENT_STEERING_MODE`
+    /// flags read this as their own stored-default fallback, same as any other persisted setting here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steering_mode: Option<String>,
+    /// Same idea as [`Self::steering_mode`], for the follow-up lane drained at a stop boundary (plus any
+    /// stranded steer messages swept in there) — matches pi's own separate `followUpMode`. Persisted (or
+    /// not) independently of `steering_mode`, via `serve`'s own `set_follow_up_mode` RPC command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_up_mode: Option<String>,
 }
 
 impl Settings {
@@ -290,6 +316,11 @@ impl Settings {
             default_branch_summary_reserve_tokens: project
                 .default_branch_summary_reserve_tokens
                 .or(self.default_branch_summary_reserve_tokens),
+            steering_mode: project.steering_mode.clone().or_else(|| self.steering_mode.clone()),
+            follow_up_mode: project
+                .follow_up_mode
+                .clone()
+                .or_else(|| self.follow_up_mode.clone()),
         }
     }
 }
@@ -477,6 +508,22 @@ impl SettingsStore {
         tokens: Option<u32>,
     ) -> std::io::Result<()> {
         self.mutate_locked(move |s| s.default_branch_summary_reserve_tokens = tokens)
+    }
+
+    /// Set (`Some`) or clear (`None`) the persisted steer-lane `QueueMode` default, persisting
+    /// atomically. Takes the already-validated wire string (`"one_at_a_time"`/`"all"`) — mirrors
+    /// `set_default_reasoning_effort`'s identical shape (a plain string, validated by the caller, whether
+    /// that's `main.rs`'s CLI parsing or `serve`'s own `set_steering_mode` RPC handler, before it ever
+    /// reaches here).
+    pub fn set_steering_mode(&mut self, mode: Option<String>) -> std::io::Result<()> {
+        self.mutate_locked(move |s| s.steering_mode = mode)
+    }
+
+    /// Set (`Some`) or clear (`None`) the persisted follow-up-lane `QueueMode` default, persisting
+    /// atomically. [`Self::set_steering_mode`]'s identical shape/rationale, for `serve`'s
+    /// `set_follow_up_mode` RPC command.
+    pub fn set_follow_up_mode(&mut self, mode: Option<String>) -> std::io::Result<()> {
+        self.mutate_locked(move |s| s.follow_up_mode = mode)
     }
 
     /// Acquire the cross-process lock (see [`FileLock`]), re-read the store's *current* on-disk state —
@@ -1178,6 +1225,47 @@ mod tests {
         assert_eq!(store.get().compaction_enabled, None);
         let reopened = SettingsStore::open(path);
         assert_eq!(reopened.get().compaction_enabled, None);
+    }
+
+    #[test]
+    fn set_steering_mode_and_set_follow_up_mode_persist_independently_and_reopening_sees_both() {
+        // Task 1 (pi-parity fix, pass 19): `steering_mode`/`follow_up_mode` are a new persisted pair,
+        // each independently settable/clearable — mirrors `set_compaction_enabled`'s identical
+        // persist-on-RPC-toggle round-trip above, but for two sibling fields at once, proving neither
+        // setter clobbers the other's stored value.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut store = SettingsStore::open(path.clone());
+        assert_eq!(store.get().steering_mode, None, "no stored override by default");
+        assert_eq!(store.get().follow_up_mode, None, "no stored override by default");
+
+        store.set_steering_mode(Some("all".to_string())).unwrap();
+        assert_eq!(store.get().steering_mode.as_deref(), Some("all"));
+        assert_eq!(
+            store.get().follow_up_mode,
+            None,
+            "setting steering_mode must not touch follow_up_mode"
+        );
+        let reopened = SettingsStore::open(path.clone());
+        assert_eq!(reopened.get().steering_mode.as_deref(), Some("all"));
+
+        store
+            .set_follow_up_mode(Some("one_at_a_time".to_string()))
+            .unwrap();
+        assert_eq!(store.get().follow_up_mode.as_deref(), Some("one_at_a_time"));
+        assert_eq!(
+            store.get().steering_mode.as_deref(),
+            Some("all"),
+            "setting follow_up_mode must not clobber the already-stored steering_mode"
+        );
+
+        // Clearing one back to `None` must also round-trip, independent of the other.
+        store.set_steering_mode(None).unwrap();
+        assert_eq!(store.get().steering_mode, None);
+        assert_eq!(store.get().follow_up_mode.as_deref(), Some("one_at_a_time"));
+        let reopened = SettingsStore::open(path);
+        assert_eq!(reopened.get().steering_mode, None);
+        assert_eq!(reopened.get().follow_up_mode.as_deref(), Some("one_at_a_time"));
     }
 
     #[test]

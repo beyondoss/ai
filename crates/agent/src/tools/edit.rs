@@ -101,14 +101,26 @@ impl Tool for Edit {
         // once per edit — a multi-edit call used to renormalize the whole file from scratch for every
         // element of `edits`, even though the input to that normalization was always identical.
         let (norm_working, working_map) = normalize_with_map(&working);
-        let mut ranges: Vec<(usize, usize, String)> = Vec::new();
-        for (old, new) in &edits {
+        let total_edits = edits.len();
+        // `(start, end, replacement, edit_index)` — `edit_index` rides along purely so the overlap
+        // check below can name which `edits[i]`/`edits[j]` collided (pi-parity fix: matching pi's own
+        // `edit-diff.ts`, which tracks each resolved edit's `editIndex` for exactly this).
+        let mut ranges: Vec<(usize, usize, String, usize)> = Vec::new();
+        for (i, (old, new)) in edits.iter().enumerate() {
             let old = old.replace("\r\n", "\n");
             let new = new.replace("\r\n", "\n");
-            for (start, end) in find_spans(&working, &norm_working, &working_map, &old, replace_all)
-                .map_err(|msg| ToolError::InvalidInput(format!("{msg} in {path}")))?
+            for (start, end) in find_spans(
+                &working,
+                &norm_working,
+                &working_map,
+                &old,
+                replace_all,
+                i,
+                total_edits,
+            )
+            .map_err(|msg| ToolError::InvalidInput(format!("{msg} in {path}")))?
             {
-                ranges.push((start, end, new.clone()));
+                ranges.push((start, end, new.clone(), i));
             }
         }
 
@@ -116,9 +128,19 @@ impl Tool for Edit {
         ranges.sort_by_key(|r| r.0);
         for pair in ranges.windows(2) {
             if pair[0].1 > pair[1].0 {
-                return Err(ToolError::InvalidInput(format!(
-                    "edits overlap in {path}; they must touch disjoint regions"
-                )));
+                // pi-parity fix: pi's own overlap error names the two colliding `edits[i]`/`edits[j]`
+                // indices ("edits[${previous.editIndex}] and edits[${current.editIndex}] overlap in
+                // ${path}...") whenever there's more than one edit to disambiguate between — with only
+                // a single edit in the call, naming an index nobody asked for would just be noise.
+                let msg = if total_edits > 1 {
+                    format!(
+                        "edits[{}] and edits[{}] overlap in {path}; they must touch disjoint regions",
+                        pair[0].3, pair[1].3
+                    )
+                } else {
+                    format!("edits overlap in {path}; they must touch disjoint regions")
+                };
+                return Err(ToolError::InvalidInput(msg));
             }
         }
 
@@ -127,7 +149,7 @@ impl Tool for Edit {
         // lines keep their exact original ending rather than being reconstructed from LF space.
         let mut out = String::with_capacity(body.len());
         let mut cursor = 0usize;
-        for (start, end, new) in &ranges {
+        for (start, end, new, _edit_index) in &ranges {
             out.push_str(&body[body_map[cursor] as usize..body_map[*start] as usize]);
             if is_pure_crlf {
                 out.push_str(&new.replace('\n', "\r\n"));
@@ -237,12 +259,19 @@ fn write_if_unchanged(
 /// `norm_work`/`map` are `working`'s own normalization, computed once by the caller (`run`) outside its
 /// per-edit loop rather than recomputed here on every call — `working` is the same text for every edit
 /// in a multi-edit call, so normalizing it again per edit was pure repeated work.
+///
+/// `edit_index`/`total_edits` identify which element of a multi-edit `edits` array this call is
+/// resolving — threaded through only so a "not found" error (see [`not_found_message`]) can name the
+/// specific `edits[i]` that failed, matching pi's `edit-diff.ts` (`getNotFoundError(path, editIndex,
+/// totalEdits)`); they otherwise play no role in the matching logic itself.
 fn find_spans(
     working: &str,
     norm_work: &str,
     map: &[u32],
     old: &str,
     replace_all: bool,
+    edit_index: usize,
+    total_edits: usize,
 ) -> Result<Vec<(usize, usize)>, String> {
     if old.is_empty() {
         return Err("`old_string` is empty".into());
@@ -268,20 +297,33 @@ fn find_spans(
         } else {
             norm_work.matches(norm_old.as_str()).count()
         };
-        return disambiguate(exact, fuzzy_count, old, replace_all);
+        return disambiguate(exact, fuzzy_count, old, replace_all, edit_index, total_edits);
     }
 
     // Fuzzy fallback: no exact match anywhere, so search — and splice — in normalized space, mapping
     // matches back via the normalized→original byte-offset table.
     if norm_old.is_empty() {
-        return Err(format!("`old_string` not found: {old:?}"));
+        return Err(not_found_message(old, edit_index, total_edits));
     }
     let fuzzy: Vec<(usize, usize)> = norm_work
         .match_indices(&norm_old)
         .map(|(i, _)| (map[i] as usize, map[i + norm_old.len()] as usize))
         .collect();
     let count = fuzzy.len();
-    disambiguate(fuzzy, count, old, replace_all)
+    disambiguate(fuzzy, count, old, replace_all, edit_index, total_edits)
+}
+
+/// pi's `getNotFoundError` (`edit-diff.ts`): the plain "not found" wording when there's only one edit
+/// in the call (the common case, where "which edit" is already unambiguous — naming an index nobody
+/// asked for would just be noise), or a wording that names the specific `edits[i]` when the call has
+/// more than one, so the model doesn't have to guess which of several `old_string`s in the batch is the
+/// one that didn't match.
+fn not_found_message(old: &str, edit_index: usize, total_edits: usize) -> String {
+    if total_edits > 1 {
+        format!("`old_string` not found in edits[{edit_index}]: {old:?}")
+    } else {
+        format!("`old_string` not found: {old:?}")
+    }
 }
 
 /// Apply the uniqueness/absence rules shared by the exact and fuzzy passes. `spans` is what would
@@ -292,9 +334,11 @@ fn disambiguate(
     fuzzy_count: usize,
     old: &str,
     replace_all: bool,
+    edit_index: usize,
+    total_edits: usize,
 ) -> Result<Vec<(usize, usize)>, String> {
     match spans.len() {
-        0 => Err(format!("`old_string` not found: {old:?}")),
+        0 => Err(not_found_message(old, edit_index, total_edits)),
         _ if fuzzy_count > 1 && !replace_all => Err(format!(
             "`old_string` is not unique ({fuzzy_count} matches): {old:?}; add surrounding context"
         )),
@@ -592,6 +636,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_single_edit_not_found_error_omits_the_edit_index() {
+        // The index (`edits[i]`) is only useful — and, matching pi's own `totalEdits <= 1` cutoff, only
+        // added — once a call has more than one edit to disambiguate between. A lone edit's error
+        // (single old_string/new_string form here) must read exactly as it did before this fix, with no
+        // "edits[" noise about an array the caller never even sent.
+        let f = write_tmp("hello");
+        let err = Edit
+            .run(json!({ "path": f.path().to_str().unwrap(), "old_string": "zzz", "new_string": "x" }))
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::InvalidInput(msg) => assert!(!msg.contains("edits["), "got: {msg}"),
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn matches_across_crlf_line_endings() {
         // A CRLF file edited with an `\n`-joined `old_string` must still match, and the file must keep
         // its CRLF endings after the edit.
@@ -636,6 +697,69 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn overlap_error_names_the_colliding_edit_indices_in_a_three_edit_batch() {
+        // pi-parity fix: pi's own overlap error (`edit-diff.ts`) names which two `edits[i]`/`edits[j]`
+        // collided ("edits[${previous.editIndex}] and edits[${current.editIndex}] overlap in
+        // ${path}..."). A 2-edit batch can't distinguish "names the real colliding pair" from "always
+        // prints edits[0]/edits[1]", so this uses 3 edits with a non-colliding first edit — proving the
+        // reported indices (1 and 2) are the actual overlapping pair, not just the first two entries.
+        let f = write_tmp("abcdefghij");
+        let err = Edit
+            .run(json!({
+                "path": f.path().to_str().unwrap(),
+                "edits": [
+                    { "old_string": "a", "new_string": "A" },
+                    { "old_string": "cde", "new_string": "X" },
+                    { "old_string": "def", "new_string": "Y" }
+                ]
+            }))
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::InvalidInput(msg) => {
+                assert!(
+                    msg.contains("edits[1]") && msg.contains("edits[2]"),
+                    "got: {msg}"
+                );
+                assert!(
+                    !msg.contains("edits[0]"),
+                    "the non-colliding edit must not be named: {msg}"
+                );
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_two_edit_overlap_error_has_no_index_when_it_would_be_the_only_pair_possible() {
+        // Sibling to the single-edit "no index" case below: with exactly 2 edits there's only ever one
+        // possible colliding pair, so — matching pi's own `totalEdits <= 1` cutoff being about "is
+        // there more than one edit", not "more than one candidate pair" — this still surfaces
+        // `edits[0]`/`edits[1]` rather than reverting to the bare "edits overlap" wording, since
+        // `total_edits > 1` is what actually gates it, not a distinct-pair count.
+        let f = write_tmp("abcdef");
+        let err = Edit
+            .run(json!({
+                "path": f.path().to_str().unwrap(),
+                "edits": [
+                    { "old_string": "abcd", "new_string": "X" },
+                    { "old_string": "cdef", "new_string": "Y" }
+                ]
+            }))
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::InvalidInput(msg) => {
+                assert!(
+                    msg.contains("edits[0]") && msg.contains("edits[1]"),
+                    "got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -887,6 +1011,42 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput(_)));
+        assert_eq!(std::fs::read_to_string(p).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn not_found_error_names_the_specific_edit_index_in_a_three_edit_batch() {
+        // pi-parity fix: pi's own not-found error (`edit-diff.ts`'s `getNotFoundError`) names which
+        // `edits[i]` failed ("Could not find edits[${editIndex}] in ${path}...") once a batch has more
+        // than one edit — otherwise the model has no way to tell which of several `old_string`s in the
+        // call didn't match. Three edits (not two) so the reported index (2) is pinned as the actual
+        // failing position, not just "the last of two".
+        let original = "foo and bar and baz";
+        let f = write_tmp(original);
+        let p = f.path().to_str().unwrap();
+        let err = Edit
+            .run(json!({
+                "path": p,
+                "edits": [
+                    { "old_string": "foo", "new_string": "FOO" },
+                    { "old_string": "bar", "new_string": "BAR" },
+                    { "old_string": "does not exist", "new_string": "X" }
+                ]
+            }))
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::InvalidInput(msg) => {
+                assert!(msg.contains("edits[2]"), "got: {msg}");
+                assert!(
+                    !msg.contains("edits[0]") && !msg.contains("edits[1]"),
+                    "only the actually-failing edit should be named: {msg}"
+                );
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+        // Every edit's span is resolved before any write happens — no partial application even though
+        // this failure is now reported with an index instead of the old, index-free wording.
         assert_eq!(std::fs::read_to_string(p).unwrap(), original);
     }
 

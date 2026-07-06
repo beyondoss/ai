@@ -245,8 +245,16 @@ impl Tool for Find {
         if !byte_capped {
             let mut notices = Vec::new();
             if truncated {
+                // pi-parity fix: pi's own `find.ts` truncation message names a concrete next value to
+                // try ("${effectiveLimit} results limit reached. Use limit=${effectiveLimit * 2} for
+                // more, or refine pattern") rather than just gesturing at "raise `limit`" with no
+                // number. `saturating_mul`, not plain `*`: a model-supplied `limit` has no upper bound
+                // here (`find`'s own `limit` deliberately has no floor either — see the call site above
+                // — nor a ceiling), and this crate runs with `overflow-checks = true` in release — an
+                // adversarial/huge `limit` must degrade to `usize::MAX`, never panic.
                 notices.push(format!(
-                    "result limit {limit} reached; raise `limit` for more"
+                    "result limit {limit} reached; narrow the pattern or use limit={} for more",
+                    limit.saturating_mul(2)
                 ));
             }
             if let Some(err) = walk_error {
@@ -567,7 +575,7 @@ mod tests {
             .await
             .unwrap()
             .text;
-        assert!(out.contains("[result limit 3 reached; raise `limit` for more]"));
+        assert!(out.contains("[result limit 3 reached; narrow the pattern or use limit=6 for more]"));
         assert!(out.contains("f00.rs") && out.contains("f01.rs") && out.contains("f02.rs"));
         assert!(!out.contains("f03.rs"));
     }

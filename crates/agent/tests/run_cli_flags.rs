@@ -3,10 +3,14 @@
 
 mod common;
 
+use std::io::{BufReader, Write};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use common::{run_cmd, spawn_model_server, sse, turn_text, turn_text_responses, turn_tool_use};
+use common::{
+    read_until_response, run_cmd, serve_cmd, spawn_model_server, sse, turn_text,
+    turn_text_responses, turn_tool_use,
+};
 use serde_json::json;
 
 #[test]
@@ -707,6 +711,138 @@ fn run_binary_model_flag_off_suffix_disables_reasoning_and_is_not_overridden_by_
 }
 
 #[test]
+fn run_binary_reasoning_effort_off_flag_disables_reasoning_and_is_not_overridden_by_the_medium_default()
+ {
+    // Task 2 (pi-parity fix, pass 19): `--reasoning-effort` previously only accepted
+    // minimal/low/medium/high/xhigh — passing `off` was a hard clap error, even though pi's own
+    // `--thinking off` and this crate's own RPC-facing `set_reasoning_effort`/`set_thinking` already
+    // treat it as a first-class request. The only workaround was the unrelated `--model <pattern>:off`
+    // colon-suffix shorthand (see the sibling
+    // `run_binary_model_flag_off_suffix_disables_reasoning_and_is_not_overridden_by_the_medium_default`
+    // test just above, whose wire-shape assertions this test mirrors exactly, but reached via the flag
+    // itself rather than the suffix).
+    let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "hi",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-haiku-4-5",
+            "--reasoning-effort",
+            "off",
+            "--no-session-persistence",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[0].contains(r#""thinking":{"type":"disabled"}"#),
+        "--reasoning-effort off must send the wire's own explicit disabled-thinking shape: {}",
+        bodies[0]
+    );
+    assert!(
+        !bodies[0].contains(r#""budget_tokens""#),
+        "--reasoning-effort off must not be silently promoted to the medium default's numeric budget: {}",
+        bodies[0]
+    );
+}
+
+#[test]
+fn serve_binary_reasoning_effort_off_flag_starts_with_reasoning_off_not_the_medium_default() {
+    // `serve`'s counterpart to `run_binary_reasoning_effort_off_flag_disables_reasoning_and_is_not_
+    // overridden_by_the_medium_default` just above — mirrors `serve_models_thinking.rs`'s own
+    // `serve_model_flag_off_suffix_starts_with_reasoning_off_not_the_medium_default` (same assertion,
+    // reached via `--reasoning-effort off` directly rather than the `--model <pattern>:off` suffix).
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    // `serve_cmd`'s own fixed `--model claude-test` (disable-capable, unlike some reasoning models —
+    // see `serve_starts_clamped_not_off_for_a_model_that_cannot_disable_reasoning` in
+    // `serve_models_thinking.rs`) is left as-is rather than overridden: clap rejects a repeated
+    // single-value `--model` outright ("cannot be used multiple times"), so this only ever adds
+    // `--reasoning-effort off` on top of `serve_cmd`'s own args, never a second `--model`.
+    let mut child = serve_cmd(bin, &base, &session_file)
+        .args(["--reasoning-effort", "off"])
+        .spawn()
+        .expect("spawn binary");
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_state");
+    let data = &frames.last().unwrap()["data"];
+    assert_eq!(data["model"], "claude-test", "got: {data:#?}");
+    assert_eq!(
+        data["thinking_level"], "off",
+        "--reasoning-effort off must start with reasoning off, not silently promoted to the medium \
+         default: got {data:#?}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn agent_settings_accepts_off_as_the_default_reasoning_effort() {
+    // Task 2 (pi-parity fix, pass 19): `agent settings --default-reasoning-effort` previously rejected
+    // `off` outright (the same underlying `parse_reasoning_effort` clap `value_parser` `--reasoning-effort`
+    // itself uses) — this only lives here rather than in `settings_store.rs` (the usual home for
+    // `agent settings` CLI e2e tests) because of this remediation pass's per-agent file-ownership split;
+    // `settings_store.rs` wasn't this agent's to touch this round.
+    let dir = tempfile::tempdir().unwrap();
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+
+    let output = run_cmd(bin)
+        .current_dir(dir.path())
+        .env("HOME", dir.path())
+        .args(["settings", "--default-reasoning-effort", "off"])
+        .output()
+        .expect("spawn binary");
+    assert!(
+        output.status.success(),
+        "agent settings --default-reasoning-effort off must be accepted, not a clap error.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("default_reasoning_effort: off"),
+        "the stored value must round-trip as \"off\", not be silently dropped: {stdout}"
+    );
+
+    // Reopening the store (a fresh invocation, no flags) must still report the persisted "off".
+    let output = run_cmd(bin)
+        .current_dir(dir.path())
+        .env("HOME", dir.path())
+        .arg("settings")
+        .output()
+        .expect("spawn binary");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("default_reasoning_effort: off"),
+        "a persisted \"off\" default must survive being reopened: {stdout}"
+    );
+}
+
+#[test]
 fn run_binary_temperature_flag_reaches_the_wire_request() {
     // Pi-parity gap: none of the three dialects exposed a temperature knob at all.
     //
@@ -791,12 +927,15 @@ fn run_binary_max_tokens_flag_reaches_the_wire_request() {
 
 #[test]
 fn run_binary_carries_a_stable_prompt_cache_affinity_key_on_the_wire() {
-    // Pi-parity audit: `serve` pins every request to a stable per-session `prompt_cache_key` (and
-    // OpenAI session-affinity headers) via `Agent::with_cache_key`, so repeated turns keep landing on
-    // the same cache-warmed backend node — but `run_task` never called `with_cache_key` at all, so a
-    // `run` invocation's requests carried no affinity key whatsoever. Anthropic's dialect has no wire
-    // manifestation of `cache_key` at all (it's an OpenAI-only concept), so this needs an OpenAI
-    // Responses-dialect turn (`gpt-4o`) to actually observe the field on the wire.
+    // Pi-parity audit: `serve` pins every request to a stable per-session `prompt_cache_key` via
+    // `Agent::with_cache_key`, so repeated turns keep landing on the same cache-warmed backend node —
+    // but `run_task` never called `with_cache_key` at all, so a `run` invocation's requests carried no
+    // affinity key whatsoever. Anthropic's dialect has no wire manifestation of `cache_key` at all (it's
+    // an OpenAI-only concept), so this needs an OpenAI Responses-dialect turn (`gpt-4o`) to actually
+    // observe the field on the wire. See the sibling
+    // `run_binary_omits_session_affinity_header_for_a_non_fireworks_model` test just below for this same
+    // request's `x-client-request-id` header, split out separately since it's gated on a wholly
+    // different condition (Fireworks-hosted or not) than this plain body-field check.
     let (base, bodies) = spawn_model_server(vec![turn_text_responses("ok")]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
@@ -828,11 +967,58 @@ fn run_binary_carries_a_stable_prompt_cache_affinity_key_on_the_wire() {
         "run's request must carry a stable prompt_cache_key: {}",
         bodies[0]
     );
+}
+
+#[test]
+fn run_binary_omits_session_affinity_header_for_a_non_fireworks_model() {
+    // pi-parity (models/dialects pass, Task D) correction: session-affinity headers
+    // (`x-client-request-id`/`session_id`/`x-session-affinity`) are gated to Fireworks-hosted models
+    // specifically (pi's own `compat.sendSessionAffinityHeaders` is a per-provider catalogue flag), not
+    // sent unconditionally to every OpenAI-wire request — this test used to assert the *opposite* (that
+    // a native `gpt-4o` request got `x-client-request-id` unconditionally), which was exactly the
+    // over-broad behavior that fix closed. Mirrors
+    // `client_socket.rs`'s `gateway_client_omits_session_affinity_headers_for_a_non_fireworks_responses_request`
+    // — no current Fireworks id reaches the Responses dialect at all (`is_fireworks_anthropic_wire_model`
+    // routes almost every Fireworks id to Anthropic instead), so this `run` binary e2e, like that lower-level
+    // test, only ever has the negative case to prove at this dialect; see
+    // `client.rs`'s `session_affinity_headers_are_sent_for_a_fireworks_chat_completions_request`/
+    // `..._are_absent_for_a_non_fireworks_chat_completions_request` for the positive/negative pair on the
+    // Chat Completions dialect instead.
+    let (base, bodies) = spawn_model_server(vec![turn_text_responses("ok")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "hi",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "gpt-4o",
+            "--no-session-persistence",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
     assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = bodies.lock().unwrap();
+    let lower = bodies[0].to_ascii_lowercase();
+    assert!(
+        !lower.contains("x-client-request-id:"),
+        "native (non-Fireworks) gpt-4o must not get the session-affinity header: {}",
         bodies[0]
-            .to_ascii_lowercase()
-            .contains("x-client-request-id:"),
-        "run's request must carry the x-client-request-id session-affinity header: {}",
+    );
+    assert!(
+        !lower.contains("session_id:"),
+        "native (non-Fireworks) gpt-4o must not get the session_id header either: {}",
         bodies[0]
     );
 }

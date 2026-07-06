@@ -190,7 +190,9 @@ impl Bash {
                 let msg = if p.exists() {
                     format!("Working directory is not a directory: {dir}")
                 } else {
-                    format!("Working directory does not exist: {dir}")
+                    // pi-parity fix: pi's own bash.ts message is two lines — the plain fact, plus this
+                    // explanatory second line stating the consequence — not just the first on its own.
+                    format!("Working directory does not exist: {dir}\nCannot execute bash commands.")
                 };
                 return Err(ToolError::InvalidInput(msg));
             }
@@ -1033,10 +1035,13 @@ mod tests {
             .await
             .unwrap_err();
         match err {
-            ToolError::InvalidInput(msg) => assert!(
-                msg.contains("Working directory does not exist"),
-                "got: {msg}"
-            ),
+            ToolError::InvalidInput(msg) => {
+                assert!(msg.contains("Working directory does not exist"), "got: {msg}");
+                // pi-parity fix: pi's own bash.ts message is two lines — the plain fact, plus this
+                // explanatory second line stating the consequence ("Cannot execute bash commands.") —
+                // not just the first line on its own.
+                assert!(msg.contains("Cannot execute bash commands."), "got: {msg}");
+            }
             other => panic!("expected InvalidInput, got {other:?}"),
         }
         // Must fail before ever reaching the runner.

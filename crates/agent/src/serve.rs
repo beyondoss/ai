@@ -532,6 +532,16 @@ pub struct ServeConfig {
     /// `TrustStore` entry (`agent trust`/`agent untrust <path>`) wins next; only when neither applies
     /// does this blanket policy take effect.
     pub default_project_trust: Option<crate::settings::TrustPolicy>,
+    /// The initial steer-lane drain mode (`agent_core::QueueMode`) — pi's own `steeringMode`. Applied
+    /// once, at startup, via `steering.set_steering_mode` right after `Steering::new()`; the
+    /// `set_steering_mode` RPC command can still change it at runtime afterward. `main.rs` resolves
+    /// this the same "explicit flag/env, then stored `agent settings --steering-mode`, then
+    /// `QueueMode::default()`" precedence `run_task` uses for its own one-shot `Steering` (see that
+    /// call site's doc comment) before ever constructing this config.
+    pub steering_mode: agent_core::QueueMode,
+    /// Same idea as [`Self::steering_mode`], for the follow-up lane (`set_follow_up_mode`) — pi's own
+    /// `followUpMode`.
+    pub follow_up_mode: agent_core::QueueMode,
 }
 
 /// Resolve whether a project is trusted for this session, from already-gathered inputs — shared by
@@ -1915,6 +1925,15 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
     // command. Cleared on every session switch (`new_session`/`switch_session`/`fork`/`switch_branch`)
     // so a message meant for the old session's next turn can't leak into the newly switched-to one.
     let steering = agent_core::Steering::new();
+    // Task 1 (pi-parity fix, pass 19): the persisted `agent settings --steering-mode`/
+    // `--follow-up-mode` defaults (or an explicit `serve --steering-mode`/`--follow-up-mode` flag),
+    // already resolved by `main.rs` into `cfg.steering_mode`/`cfg.follow_up_mode` — previously only
+    // `run_task` applied its own equivalent resolution to its one-shot `Steering`; a `serve` process
+    // silently ignored both and always started at `QueueMode::default()` regardless of what was
+    // configured, until `set_steering_mode`/`set_follow_up_mode` was called at runtime. The `set_*` RPC
+    // commands still change this afterward, same as before.
+    steering.set_steering_mode(cfg.steering_mode);
+    steering.set_follow_up_mode(cfg.follow_up_mode);
     // The `bash` tool, looked up once from the same (possibly filtered) registry `build_agent` builds —
     // `None` when `bash` was excluded (`--exclude-tools bash` / `--no-tools`), which the `bash` RPC
     // command below reports as a clean error rather than a side door around that restriction. A direct
@@ -1980,6 +1999,391 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                 break;
             }
         };
+    }
+
+    // pi-parity (Task 4, serve pass 19): the ordinary idle-path logic for `new_session`/
+    // `switch_session`/`fork`/`clone`/`compact`, each extracted into a macro rather than a function —
+    // `session`/`persistence`/`agent`/`client`/`current_model`/etc. are all plain local variables of
+    // this one giant `serve` function body, and a macro lets each expansion reference them directly
+    // (exactly like `emit!` already references `out_tx`) with no 15-parameter function signature. Each
+    // is callable from two places: its ordinary top-level command-match arm below, and the `"prompt"`
+    // arm's busy-loop deferred-until-idle path (`pending_deferred`, see its own doc comment) once a run
+    // one of these commands interrupted has actually gone idle — see the module's own `serve` doc
+    // comment / Task 4 for why these five self-abort-and-proceed instead of being rejected as busy.
+    // `$cmd`/`$id` stand in for whichever command `Value`/response-id are in play: the outer `cmd`/`id`
+    // when idle, or a deferred command's own stored `Value`/id once its abort has resolved.
+    //
+    // Responses are sent via a bare `out_tx.send` rather than `emit!`: `emit!`'s bare `break` breaks
+    // whichever loop *textually* encloses the macro invocation, which differs between the idle call
+    // site (the outer per-command loop, where breaking on a dead writer is exactly `emit!`'s intended
+    // behavior) and the deferred call site (a `for` loop over `pending_deferred`, where the same bare
+    // `break` would only end that short-lived drain loop instead). A bare send whose failure is
+    // ignored is the same idiom `pending_abort_acks`'s own drain loop (and every other busy-mode
+    // response in the `"prompt"` arm) already uses for exactly this reason.
+    macro_rules! do_new_session {
+        ($cmd:expr, $id:expr) => {{
+            match persistence.new_session(
+                &current_model,
+                $cmd.get("parent_session").and_then(Value::as_str),
+            ) {
+                Ok(s) => {
+                    session = s;
+                    steering.clear();
+                    let _ = out_tx.send(response(
+                        $id,
+                        "new_session",
+                        true,
+                        Some(json!({
+                            "session_id": persistence.session_id(),
+                            "cwd_stale": cwd_is_stale(&persistence.meta.cwd, &cwd),
+                            "parent": persistence.meta.parent,
+                        })),
+                        None,
+                    ));
+                }
+                Err(e) => {
+                    let _ = out_tx.send(response(
+                        $id,
+                        "new_session",
+                        false,
+                        None,
+                        Some(&e.to_string()),
+                    ));
+                }
+            }
+        }};
+    }
+    macro_rules! do_switch_session {
+        ($cmd:expr, $id:expr) => {{
+            match $cmd.get("session_id").and_then(Value::as_str) {
+                Some(target) => match persistence.switch(target) {
+                    Ok(s) => {
+                        session = s;
+                        steering.clear();
+                        // Restore whichever model/thinking-level this session was actually last
+                        // running on, the same way `switch_branch` already does — without this, the
+                        // process's current global model/level (possibly set on a *different* session
+                        // entirely) silently bled into the reattached session. See
+                        // `model_and_level_at_active`'s doc comment.
+                        let (restored_model, restored_level) =
+                            persistence.model_and_level_at_active(starting_level);
+                        let restored_level = agent_core::clamp_thinking_level(
+                            &agent_core::capabilities(&restored_model),
+                            restored_level,
+                        );
+                        let mut rebuild_needed = false;
+                        if restored_model != current_model {
+                            session.scrub_cross_model_state(&restored_model);
+                            match build_gateway_client(&cfg, &restored_model) {
+                                Ok(new_client) => client = Arc::new(new_client),
+                                Err(e) => eprintln!(
+                                    "serve: could not resolve a gateway credential for restored model {restored_model:?}: \
+                                     {e} — keeping the previous client"
+                                ),
+                            }
+                            current_model = restored_model;
+                            rebuild_needed = true;
+                        }
+                        if restored_level != current_level {
+                            current_level = restored_level;
+                            current_thinking = None;
+                            rebuild_needed = true;
+                        }
+                        if rebuild_needed {
+                            agent = build_agent(
+                                client.clone(),
+                                &full_system(&static_system, &cwd),
+                                &cfg,
+                                &current_model,
+                                current_thinking,
+                                current_level,
+                                current_auto_compaction,
+                                current_auto_retry,
+                                persistence.session_id(),
+                                &write_locks,
+                                &checkpoint,
+                            );
+                        }
+                        let _ = out_tx.send(response(
+                            $id,
+                            "switch_session",
+                            true,
+                            Some(json!({
+                                "session_id": persistence.session_id(),
+                                "cwd_stale": cwd_is_stale(&persistence.meta.cwd, &cwd),
+                                "model": current_model,
+                                // Task 3 (pi-parity fix, serve pass 19): matches `switch_branch`/`fork`/
+                                // `clone`'s own response shape — previously omitted here, forcing a
+                                // client to make a separate `get_state` round trip after every
+                                // `switch_session` its 3 sibling commands don't need.
+                                "reasoning_effort": current_level.as_str(),
+                            })),
+                            None,
+                        ));
+                    }
+                    Err(e) => {
+                        let _ = out_tx.send(response(
+                            $id,
+                            "switch_session",
+                            false,
+                            None,
+                            Some(&e.to_string()),
+                        ));
+                    }
+                },
+                None => {
+                    let _ = out_tx.send(response(
+                        $id,
+                        "switch_session",
+                        false,
+                        None,
+                        Some("missing `session_id`"),
+                    ));
+                }
+            }
+        }};
+    }
+    macro_rules! do_fork {
+        ($cmd:expr, $id:expr) => {{
+            // `upto` messages to copy into the new session; absent = clone the whole session.
+            // `target_id`, when given, forks at that specific tree entry instead — anywhere in the
+            // whole tree, not just a message-count prefix of the active path (`before` excludes the
+            // entry itself); wins over `upto` if both are present.
+            let upto = $cmd
+                .get("upto")
+                .and_then(Value::as_u64)
+                .map(|n| n as usize)
+                .unwrap_or(usize::MAX);
+            let target_id = $cmd.get("target_id").and_then(Value::as_str);
+            // Defaults to `true` (excluding the target entry itself), matching pi's real production
+            // client convention.
+            let before = $cmd.get("before").and_then(Value::as_bool).unwrap_or(true);
+            // Resolved *before* `persistence.fork` below swaps `self.store` onto the freshly created
+            // session — `target_id` can name an entry that isn't even on the copied prefix (an
+            // off-active-path fork point, or one `before` excludes), so it wouldn't survive into the
+            // new tree to look up afterward.
+            let fork_text = match target_id {
+                Some(tid) => persistence
+                    .store
+                    .as_ref()
+                    .and_then(|s| s.message_at(tid))
+                    .and_then(message_text),
+                None => upto
+                    .min(session.messages.len())
+                    .checked_sub(1)
+                    .and_then(|i| session.messages.get(i))
+                    .and_then(message_text),
+            };
+            match persistence.fork(upto, target_id, before, starting_level) {
+                Ok((s, restored_model, restored_level)) => {
+                    session = s;
+                    steering.clear();
+                    // Restore whichever model/thinking-level was actually active at the forked-from
+                    // point, the same way `switch_session`/`switch_branch` already do.
+                    let restored_level = agent_core::clamp_thinking_level(
+                        &agent_core::capabilities(&restored_model),
+                        restored_level,
+                    );
+                    let mut rebuild_needed = false;
+                    if restored_model != current_model {
+                        session.scrub_cross_model_state(&restored_model);
+                        match build_gateway_client(&cfg, &restored_model) {
+                            Ok(new_client) => client = Arc::new(new_client),
+                            Err(e) => eprintln!(
+                                "serve: could not resolve a gateway credential for restored model {restored_model:?}: \
+                                 {e} — keeping the previous client"
+                            ),
+                        }
+                        current_model = restored_model;
+                        rebuild_needed = true;
+                    }
+                    if restored_level != current_level {
+                        current_level = restored_level;
+                        current_thinking = None;
+                        rebuild_needed = true;
+                    }
+                    if rebuild_needed {
+                        agent = build_agent(
+                            client.clone(),
+                            &full_system(&static_system, &cwd),
+                            &cfg,
+                            &current_model,
+                            current_thinking,
+                            current_level,
+                            current_auto_compaction,
+                            current_auto_retry,
+                            persistence.session_id(),
+                            &write_locks,
+                            &checkpoint,
+                        );
+                    }
+                    let _ = out_tx.send(response(
+                        $id,
+                        "fork",
+                        true,
+                        Some(json!({
+                            "session_id": persistence.session_id(),
+                            "cwd_stale": cwd_is_stale(&persistence.meta.cwd, &cwd),
+                            "model": current_model,
+                            "reasoning_effort": current_level.as_str(),
+                            "text": fork_text,
+                        })),
+                        None,
+                    ));
+                }
+                Err(e) => {
+                    let _ = out_tx.send(response($id, "fork", false, None, Some(&e.to_string())));
+                }
+            }
+        }};
+    }
+    macro_rules! do_clone {
+        ($cmd:expr, $id:expr) => {{
+            // pi's own `clone` — fork the current session at its current tip, with no arguments.
+            match persistence.fork(usize::MAX, None, false, starting_level) {
+                Ok((s, restored_model, restored_level)) => {
+                    session = s;
+                    steering.clear();
+                    let restored_level = agent_core::clamp_thinking_level(
+                        &agent_core::capabilities(&restored_model),
+                        restored_level,
+                    );
+                    let mut rebuild_needed = false;
+                    if restored_model != current_model {
+                        session.scrub_cross_model_state(&restored_model);
+                        match build_gateway_client(&cfg, &restored_model) {
+                            Ok(new_client) => client = Arc::new(new_client),
+                            Err(e) => eprintln!(
+                                "serve: could not resolve a gateway credential for restored model {restored_model:?}: \
+                                 {e} — keeping the previous client"
+                            ),
+                        }
+                        current_model = restored_model;
+                        rebuild_needed = true;
+                    }
+                    if restored_level != current_level {
+                        current_level = restored_level;
+                        current_thinking = None;
+                        rebuild_needed = true;
+                    }
+                    if rebuild_needed {
+                        agent = build_agent(
+                            client.clone(),
+                            &full_system(&static_system, &cwd),
+                            &cfg,
+                            &current_model,
+                            current_thinking,
+                            current_level,
+                            current_auto_compaction,
+                            current_auto_retry,
+                            persistence.session_id(),
+                            &write_locks,
+                            &checkpoint,
+                        );
+                    }
+                    let _ = out_tx.send(response(
+                        $id,
+                        "clone",
+                        true,
+                        Some(json!({
+                            "session_id": persistence.session_id(),
+                            "cwd_stale": cwd_is_stale(&persistence.meta.cwd, &cwd),
+                            "model": current_model,
+                            "reasoning_effort": current_level.as_str(),
+                        })),
+                        None,
+                    ));
+                }
+                Err(e) => {
+                    let _ = out_tx.send(response($id, "clone", false, None, Some(&e.to_string())));
+                }
+            }
+        }};
+    }
+    macro_rules! do_compact {
+        ($cmd:expr, $id:expr) => {{
+            // Manual compaction (no run in flight here). Streams a `compacted` event if it cuts.
+            // `custom_instructions`, when given, steers what the summary emphasizes.
+            let custom_instructions = $cmd.get("custom_instructions").and_then(Value::as_str);
+            let tx = out_tx.clone();
+            let mut compacted_tokens_before: Option<u32> = None;
+            let mut compacted_summary: Option<String> = None;
+            let mut compacted_tokens_after: Option<u32> = None;
+            let mut compacted_first_kept: Option<usize> = None;
+            let result = agent
+                .compact(
+                    &mut session,
+                    agent_core::CompactionReason::Manual,
+                    &CancellationToken::new(),
+                    &mut |ev| {
+                        if let AgentEvent::Compacted {
+                            tokens_before,
+                            summary,
+                            tokens_after,
+                            first_kept,
+                            ..
+                        } = &ev
+                        {
+                            compacted_tokens_before = Some(*tokens_before);
+                            compacted_summary = Some(summary.clone());
+                            compacted_tokens_after = Some(*tokens_after);
+                            compacted_first_kept = Some(*first_kept);
+                        }
+                        if let Some(frame) = event_frame(ev) {
+                            let _ = tx.send(frame);
+                        }
+                    },
+                    custom_instructions,
+                )
+                .await;
+            match result {
+                Ok(outcome) => {
+                    // The tree entry that begins the retained (post-compaction) portion of history —
+                    // resolved *before* `persist_blocking` below rewrites `persistence`'s own store.
+                    let first_kept_entry_id = compacted_first_kept.and_then(|first_kept| {
+                        persistence
+                            .store
+                            .as_ref()
+                            .and_then(|s| s.active_ids().get(first_kept).cloned())
+                    });
+                    while checkpoint_rx.try_recv().is_ok() {}
+                    let (p, persist_result) =
+                        persist_blocking(persistence, session.clone(), compacted_tokens_before)
+                            .await;
+                    persistence = p;
+                    match persist_result {
+                        Ok(()) => {
+                            let _ = out_tx.send(response(
+                                $id,
+                                "compact",
+                                true,
+                                Some(json!({
+                                    "compacted": outcome.compacted(),
+                                    "reason": outcome.reason(),
+                                    "summary": compacted_summary,
+                                    "tokens_before": compacted_tokens_before,
+                                    "tokens_after": compacted_tokens_after,
+                                    "first_kept_entry_id": first_kept_entry_id,
+                                })),
+                                None,
+                            ));
+                        }
+                        Err(e) => {
+                            let _ = out_tx.send(response(
+                                $id,
+                                "compact",
+                                false,
+                                None,
+                                Some(&format!("compacted but failed to persist: {e}")),
+                            ));
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = out_tx.send(response($id, "compact", false, None, Some(&e.to_string())));
+                }
+            }
+        }};
     }
 
     timing.print();
@@ -2146,10 +2550,25 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                 // comment below) — a checkpoint that failed but was then followed by a successful final
                 // persist must report success, not a stale failure the superseding write already fixed.
                 let mut persist_error: Option<String>;
+                // pi-parity (Task 4, serve pass 19): `compact`/`switch_session`/`fork`/`clone`/
+                // `new_session` received while this run (or its auto-retry backoff wait) is in flight
+                // self-abort-and-proceed instead of being rejected as busy — cancelled via the exact
+                // same `cancel.cancel()`/deferred-until-idle discipline `abort` itself already uses
+                // (see `pending_abort_acks` just below), then queued here (raw command + its own `id`)
+                // to run their ordinary idle-path logic once this attempt has actually gone idle, in
+                // the order received. Declared outside the loop (not inside, like `pending_abort_acks`)
+                // and `clear()`-reset every attempt, not re-declared: a deferred command always forces
+                // this attempt to end via cancellation (a cancelled/aborted result is never itself
+                // retryable — see the match on `attempt_result` below), so it's always populated and
+                // drained within the very same iteration, but the drain happens *after* this loop
+                // returns, once `session`/`persistence` are no longer borrowed by `run` — a variable
+                // declared inside the loop body would be dropped at `break` and unreachable there.
+                let mut pending_deferred: Vec<(Option<String>, Value)> = Vec::new();
                 let result = 'retry: loop {
                     tokens_before.store(0, Ordering::Relaxed);
                     refused.store(false, Ordering::Relaxed);
                     is_compacting.store(false, Ordering::Relaxed);
+                    pending_deferred.clear();
                     // `abort` command ids received while this run is still unwinding — acked only once
                     // the run has actually gone idle (see the flush right after `attempt_result` below,
                     // and that ack's own doc comment for why it's deferred rather than sent the instant
@@ -2514,8 +2933,25 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                                             "abort_retry" => {
                                                 let _ = out_tx.send(response(cid, "abort_retry", true, None, None));
                                             }
+                                            // pi-parity (Task 4): pi's real product has no busy/idle
+                                            // gating at all for these — `compact()`/`switchSession`/
+                                            // `newSession`/`fork` all call `abort()` unconditionally
+                                            // before replacing the session, with no check for whether a
+                                            // prompt is currently streaming. Mirrored here: cancel this
+                                            // run exactly like an explicit `abort` (same token), then
+                                            // queue the raw command to run its ordinary idle-path logic
+                                            // once the run has actually gone idle — see
+                                            // `pending_deferred`'s own doc comment above. No ack is sent
+                                            // here; the command's own idle-path response (sent once
+                                            // idle, below) doubles as it, same as `abort`'s own deferred
+                                            // ack just above.
+                                            "compact" | "switch_session" | "fork" | "clone"
+                                            | "new_session" => {
+                                                cancel.cancel();
+                                                pending_deferred.push((cid, c.clone()));
+                                            }
                                             other => {
-                                                let _ = out_tx.send(response(cid, other, false, None, Some("busy: a prompt is running; only `abort`/`abort_retry`/`steer`/`follow_up`, or a handful of read-only commands (get_state/get_session_stats/get_commands/list_branches/get_tree/list_sessions/list_all_sessions/get_available_models), are accepted")));
+                                                let _ = out_tx.send(response(cid, other, false, None, Some("busy: a prompt is running; only `abort`/`abort_retry`/`steer`/`follow_up`, `compact`/`switch_session`/`fork`/`clone`/`new_session` (which self-abort-and-proceed), or a handful of read-only commands (get_state/get_session_stats/get_commands/list_branches/get_tree/list_sessions/list_all_sessions/get_available_models), are accepted")));
                                             }
                                         }
                                     }
@@ -2628,8 +3064,21 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                                                     let _ = out_tx.send(response(cid, cmd_type, true, None, None));
                                                     break;
                                                 }
+                                                // pi-parity (Task 4): same self-abort-and-proceed
+                                                // treatment as the live-run busy-loop's own arm above —
+                                                // this backoff wait is still "a prompt is running" from
+                                                // the client's point of view. Ends the retry sequence
+                                                // (like `abort_retry`) and queues the command to run
+                                                // once idle, via the same `pending_deferred` drained
+                                                // right after this whole retry loop.
+                                                "compact" | "switch_session" | "fork" | "clone"
+                                                | "new_session" => {
+                                                    retry_cancelled = true;
+                                                    pending_deferred.push((cid, c.clone()));
+                                                    break;
+                                                }
                                                 other => {
-                                                    let _ = out_tx.send(response(cid, other, false, None, Some("busy: retrying after a transient error; only `abort`/`abort_retry` are accepted until the retry starts")));
+                                                    let _ = out_tx.send(response(cid, other, false, None, Some("busy: retrying after a transient error; only `abort`/`abort_retry`/`compact`/`switch_session`/`fork`/`clone`/`new_session` are accepted")));
                                                 }
                                             }
                                         }
@@ -2703,6 +3152,22 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                     Err(e) => response(id.clone(), "prompt", false, None, Some(&e.to_string())),
                 };
                 emit!(frame);
+                // pi-parity (Task 4): this run has now actually gone idle (same guarantee
+                // `pending_abort_acks` relies on above) and its own terminal response has just been
+                // sent — run each command that arrived mid-run and self-aborted-and-proceeded through
+                // its ordinary idle-path logic now, in the order received. Exactly what a client
+                // manually sending `abort`, waiting for the response, then retrying the command would
+                // have produced, minus the extra round trip.
+                for (dcid, dcmd) in pending_deferred.drain(..) {
+                    match dcmd.get("type").and_then(Value::as_str).unwrap_or("") {
+                        "new_session" => do_new_session!(dcmd, dcid),
+                        "switch_session" => do_switch_session!(dcmd, dcid),
+                        "fork" => do_fork!(dcmd, dcid),
+                        "clone" => do_clone!(dcmd, dcid),
+                        "compact" => do_compact!(dcmd, dcid),
+                        _ => {}
+                    }
+                }
                 if !stdin_open {
                     break;
                 }
@@ -2862,33 +3327,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                     None,
                 ));
             }
-            "new_session" => match persistence.new_session(
-                &current_model,
-                cmd.get("parent_session").and_then(Value::as_str),
-            ) {
-                Ok(s) => {
-                    session = s;
-                    steering.clear();
-                    emit!(response(
-                        id,
-                        "new_session",
-                        true,
-                        Some(json!({
-                            "session_id": persistence.session_id(),
-                            "cwd_stale": cwd_is_stale(&persistence.meta.cwd, &cwd),
-                            "parent": persistence.meta.parent,
-                        })),
-                        None,
-                    ));
-                }
-                Err(e) => emit!(response(
-                    id,
-                    "new_session",
-                    false,
-                    None,
-                    Some(&e.to_string())
-                )),
-            },
+            "new_session" => do_new_session!(cmd, id),
             "list_sessions" => {
                 let progress_id = id.clone();
                 let progress_tx = out_tx.clone();
@@ -2956,90 +3395,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                     )),
                 }
             }
-            "switch_session" => match cmd.get("session_id").and_then(Value::as_str) {
-                Some(target) => match persistence.switch(target) {
-                    Ok(s) => {
-                        session = s;
-                        steering.clear();
-                        // Restore whichever model/thinking-level this session was actually last
-                        // running on, the same way `switch_branch` already does — without this, the
-                        // process's current global model/level (possibly set on a *different* session
-                        // entirely) silently bled into the reattached session: reopening a session last
-                        // driven on `gpt-5` without re-passing `--model` would continue it on whatever
-                        // the process happened to be running, with no warning. See
-                        // `model_and_level_at_active`'s doc comment.
-                        let (restored_model, restored_level) =
-                            persistence.model_and_level_at_active(starting_level);
-                        let restored_level = agent_core::clamp_thinking_level(
-                            &agent_core::capabilities(&restored_model),
-                            restored_level,
-                        );
-                        let mut rebuild_needed = false;
-                        if restored_model != current_model {
-                            session.scrub_cross_model_state(&restored_model);
-                            // The restored model can be on a different OAuth provider than whatever was
-                            // active before this switch — best-effort, matching this restore path's existing
-                            // "recorded state wins" philosophy: a failure here leaves `client` on the previous
-                            // (now-wrong-for-`current_model`) credential rather than aborting the whole switch,
-                            // so the next `prompt` surfaces its own clear transport-level error instead.
-                            match build_gateway_client(&cfg, &restored_model) {
-                                Ok(new_client) => client = Arc::new(new_client),
-                                Err(e) => eprintln!(
-                                    "serve: could not resolve a gateway credential for restored model {restored_model:?}: \
-                                     {e} — keeping the previous client"
-                                ),
-                            }
-                            current_model = restored_model;
-                            rebuild_needed = true;
-                        }
-                        if restored_level != current_level {
-                            current_level = restored_level;
-                            current_thinking = None;
-                            rebuild_needed = true;
-                        }
-                        if rebuild_needed {
-                            agent = build_agent(
-                                client.clone(),
-                                &full_system(&static_system, &cwd),
-                                &cfg,
-                                &current_model,
-                                current_thinking,
-                                current_level,
-                                current_auto_compaction,
-                                current_auto_retry,
-                                persistence.session_id(),
-                                &write_locks,
-                                &checkpoint,
-                            );
-                        }
-                        emit!(response(
-                            id,
-                            "switch_session",
-                            true,
-                            Some(json!({
-                                "session_id": persistence.session_id(),
-                                "cwd_stale": cwd_is_stale(&persistence.meta.cwd, &cwd),
-                                "model": current_model,
-                            })),
-                            None,
-                        ));
-                    }
-                    Err(e) => emit!(response(
-                        id,
-                        "switch_session",
-                        false,
-                        None,
-                        Some(&e.to_string())
-                    )),
-                },
-                None => emit!(response(
-                    id,
-                    "switch_session",
-                    false,
-                    None,
-                    Some("missing `session_id`")
-                )),
-            },
+            "switch_session" => do_switch_session!(cmd, id),
             // Soft-deletes (moves to `.trash`) another session — never the one currently active, see
             // `Persistence::delete`'s doc comment. Idempotent: deleting an absent (or already-deleted)
             // session id is a successful no-op.
@@ -3104,178 +3460,13 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                     Some("missing `session_id`")
                 )),
             },
-            "fork" => {
-                // `upto` messages to copy into the new session; absent = clone the whole session.
-                // `target_id`, when given, forks at that specific tree entry instead — anywhere in the
-                // whole tree, not just a message-count prefix of the active path (`before` excludes the
-                // entry itself); wins over `upto` if both are present.
-                let upto = cmd
-                    .get("upto")
-                    .and_then(Value::as_u64)
-                    .map(|n| n as usize)
-                    .unwrap_or(usize::MAX);
-                let target_id = cmd.get("target_id").and_then(Value::as_str);
-                // Defaults to `true` (excluding the target entry itself), matching pi's real
-                // production client convention — pi-parity fix; previously defaulted to including it.
-                let before = cmd.get("before").and_then(Value::as_bool).unwrap_or(true);
-                // Fix 3 (pi-parity gap): pi's own `{success, data:{text, cancelled}}` shape — `text` is
-                // the forked-from message's own content (pi's `selectedText`, `extractUserMessageText`
-                // on the entry the caller picked), not anything derived from the *copied* prefix. Must be
-                // resolved *before* `persistence.fork` below swaps `self.store` onto the freshly created
-                // session: `target_id` can name an entry that isn't even on the copied prefix at all (an
-                // off-active-path fork point, or one `before` excludes), so it wouldn't survive into the
-                // new tree to look up afterward. `target_id` resolves directly against the *current*
-                // (pre-fork) store; bare `upto` resolves against the still-current `session.messages`
-                // (parallel to the active path by construction), matching `fork_target_model_and_level`'s
-                // own `active[n - 1]` indexing for the same no-`target_id` case.
-                let fork_text = match target_id {
-                    Some(tid) => persistence
-                        .store
-                        .as_ref()
-                        .and_then(|s| s.message_at(tid))
-                        .and_then(message_text),
-                    None => upto
-                        .min(session.messages.len())
-                        .checked_sub(1)
-                        .and_then(|i| session.messages.get(i))
-                        .and_then(message_text),
-                };
-                match persistence.fork(upto, target_id, before, starting_level) {
-                    Ok((s, restored_model, restored_level)) => {
-                        session = s;
-                        steering.clear();
-                        // Task #2 (pi-parity fix): restore whichever model/thinking-level was actually
-                        // active at the forked-from point, the same way `switch_session`/`switch_branch`
-                        // already do — see `Persistence::fork`'s own doc comment for why the process's
-                        // current global model/level must not silently bleed into a fork landing on an
-                        // entry recorded under a *different* one.
-                        let restored_level = agent_core::clamp_thinking_level(
-                            &agent_core::capabilities(&restored_model),
-                            restored_level,
-                        );
-                        let mut rebuild_needed = false;
-                        if restored_model != current_model {
-                            session.scrub_cross_model_state(&restored_model);
-                            // The restored model can be on a different OAuth provider than whatever was
-                            // active before this switch — best-effort, matching this restore path's existing
-                            // "recorded state wins" philosophy: a failure here leaves `client` on the previous
-                            // (now-wrong-for-`current_model`) credential rather than aborting the whole switch,
-                            // so the next `prompt` surfaces its own clear transport-level error instead.
-                            match build_gateway_client(&cfg, &restored_model) {
-                                Ok(new_client) => client = Arc::new(new_client),
-                                Err(e) => eprintln!(
-                                    "serve: could not resolve a gateway credential for restored model {restored_model:?}: \
-                                     {e} — keeping the previous client"
-                                ),
-                            }
-                            current_model = restored_model;
-                            rebuild_needed = true;
-                        }
-                        if restored_level != current_level {
-                            current_level = restored_level;
-                            current_thinking = None;
-                            rebuild_needed = true;
-                        }
-                        if rebuild_needed {
-                            agent = build_agent(
-                                client.clone(),
-                                &full_system(&static_system, &cwd),
-                                &cfg,
-                                &current_model,
-                                current_thinking,
-                                current_level,
-                                current_auto_compaction,
-                                current_auto_retry,
-                                persistence.session_id(),
-                                &write_locks,
-                                &checkpoint,
-                            );
-                        }
-                        emit!(response(
-                            id,
-                            "fork",
-                            true,
-                            Some(json!({
-                                "session_id": persistence.session_id(),
-                                "cwd_stale": cwd_is_stale(&persistence.meta.cwd, &cwd),
-                                "model": current_model,
-                                "reasoning_effort": current_level.as_str(),
-                                "text": fork_text,
-                            })),
-                            None,
-                        ));
-                    }
-                    Err(e) => emit!(response(id, "fork", false, None, Some(&e.to_string()))),
-                }
-            }
+            "fork" => do_fork!(cmd, id),
             // pi's own `clone` — fork the current session at its current tip, with no arguments —
             // exists there because pi's `fork` *requires* an explicit `entryId`; this crate's `fork`
             // already defaults to exactly that (no `upto`/`target_id` given), so `clone` is a thin,
             // deliberately-argument-free alias over the same call for a client speaking pi's protocol
             // shape, not a second code path.
-            "clone" => match persistence.fork(usize::MAX, None, false, starting_level) {
-                Ok((s, restored_model, restored_level)) => {
-                    session = s;
-                    steering.clear();
-                    // Task #2 (pi-parity fix): same restoration `fork` just above applies — see its
-                    // comment there.
-                    let restored_level = agent_core::clamp_thinking_level(
-                        &agent_core::capabilities(&restored_model),
-                        restored_level,
-                    );
-                    let mut rebuild_needed = false;
-                    if restored_model != current_model {
-                        session.scrub_cross_model_state(&restored_model);
-                        // The restored model can be on a different OAuth provider than whatever was
-                        // active before this switch — best-effort, matching this restore path's existing
-                        // "recorded state wins" philosophy: a failure here leaves `client` on the previous
-                        // (now-wrong-for-`current_model`) credential rather than aborting the whole switch,
-                        // so the next `prompt` surfaces its own clear transport-level error instead.
-                        match build_gateway_client(&cfg, &restored_model) {
-                            Ok(new_client) => client = Arc::new(new_client),
-                            Err(e) => eprintln!(
-                                "serve: could not resolve a gateway credential for restored model {restored_model:?}: \
-                                 {e} — keeping the previous client"
-                            ),
-                        }
-                        current_model = restored_model;
-                        rebuild_needed = true;
-                    }
-                    if restored_level != current_level {
-                        current_level = restored_level;
-                        current_thinking = None;
-                        rebuild_needed = true;
-                    }
-                    if rebuild_needed {
-                        agent = build_agent(
-                            client.clone(),
-                            &full_system(&static_system, &cwd),
-                            &cfg,
-                            &current_model,
-                            current_thinking,
-                            current_level,
-                            current_auto_compaction,
-                            current_auto_retry,
-                            persistence.session_id(),
-                            &write_locks,
-                            &checkpoint,
-                        );
-                    }
-                    emit!(response(
-                        id,
-                        "clone",
-                        true,
-                        Some(json!({
-                            "session_id": persistence.session_id(),
-                            "cwd_stale": cwd_is_stale(&persistence.meta.cwd, &cwd),
-                            "model": current_model,
-                            "reasoning_effort": current_level.as_str(),
-                        })),
-                        None,
-                    ));
-                }
-                Err(e) => emit!(response(id, "clone", false, None, Some(&e.to_string()))),
-            },
+            "clone" => do_clone!(cmd, id),
             "get_fork_messages" => {
                 // pi-compatible contract: no parameters, every user-turn entry across the WHOLE session
                 // tree — every branch, not just the active path — as a flat `{entry_id, text}` candidate
@@ -3521,109 +3712,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                     Some("missing `kind`")
                 )),
             },
-            "compact" => {
-                // Manual compaction (no run in flight here). Streams a `compacted` event if it cuts.
-                // `custom_instructions`, when given, steers what the summary emphasizes — pi's own
-                // `compact(customInstructions)` — rather than replacing the structured template.
-                let custom_instructions = cmd.get("custom_instructions").and_then(Value::as_str);
-                let tx = out_tx.clone();
-                let mut compacted_tokens_before: Option<u32> = None;
-                let mut compacted_summary: Option<String> = None;
-                let mut compacted_tokens_after: Option<u32> = None;
-                // Fix 2 (pi-parity gap): pi's own `CompactionResult.firstKeptEntryId`, minus its unit —
-                // agent-core's `AgentEvent::Compacted::first_kept` is a plain pre-compaction message
-                // index, since the tree/entry-id layer lives one level up in this crate (`SessionStore`).
-                let mut compacted_first_kept: Option<usize> = None;
-                let result = agent
-                    .compact(
-                        &mut session,
-                        agent_core::CompactionReason::Manual,
-                        &CancellationToken::new(),
-                        &mut |ev| {
-                            // Matched by reference: `summary` is owned (`String`), and binding it by
-                            // value here would partially move `ev` out from under the `event_frame(ev)`
-                            // call just below, which still needs the whole event intact to forward.
-                            if let AgentEvent::Compacted {
-                                tokens_before,
-                                summary,
-                                tokens_after,
-                                first_kept,
-                                ..
-                            } = &ev
-                            {
-                                compacted_tokens_before = Some(*tokens_before);
-                                compacted_summary = Some(summary.clone());
-                                compacted_tokens_after = Some(*tokens_after);
-                                compacted_first_kept = Some(*first_kept);
-                            }
-                            if let Some(frame) = event_frame(ev) {
-                                let _ = tx.send(frame);
-                            }
-                        },
-                        custom_instructions,
-                    )
-                    .await;
-                match result {
-                    Ok(outcome) => {
-                        // Fix 2 (pi-parity gap): the tree entry that begins the retained (post-
-                        // compaction) portion of history — pi's own `firstKeptEntryId` — resolved
-                        // *before* `persist_blocking` below rewrites `persistence`'s own store (which
-                        // mints a fresh id for every entry on the new active path, kept suffix included —
-                        // see `SessionStore::rewrite_compacted`'s doc comment): at this point
-                        // `persistence`'s `active_ids()` still mirrors the *pre*-compaction
-                        // `session.messages` exactly (nothing has touched the store yet this round), so
-                        // indexing it at `first_kept` recovers the id a tree-aware client already knows
-                        // from an earlier `get_tree`/`get_fork_messages` call. `None` when persistence
-                        // isn't configured (no tree to resolve against) or no compaction actually fired.
-                        let first_kept_entry_id = compacted_first_kept.and_then(|first_kept| {
-                            persistence
-                                .store
-                                .as_ref()
-                                .and_then(|s| s.active_ids().get(first_kept).cloned())
-                        });
-                        // `agent.compact` can itself fire a mid-compaction `CheckpointHook` call (see
-                        // `agent_core::Agent::compact`'s own doc comment) — swept up here for the same
-                        // reason the `prompt` handler's own inner run-loop does, right before its
-                        // identical `persist_blocking` call: left in the channel, it would otherwise only
-                        // ever be drained by some later, unrelated turn's inner loop, by which point
-                        // `persistence` may already be pointed at a different session entirely.
-                        while checkpoint_rx.try_recv().is_ok() {}
-                        let (p, persist_result) =
-                            persist_blocking(persistence, session.clone(), compacted_tokens_before)
-                                .await;
-                        persistence = p;
-                        match persist_result {
-                            Ok(()) => emit!(response(
-                                id,
-                                "compact",
-                                true,
-                                Some(json!({
-                                    "compacted": outcome.compacted(),
-                                    // Task #26 (pi-parity fix): `null` on a real compaction, else
-                                    // `"too_small"`/`"already_compacted"` — previously both no-op cases
-                                    // collapsed to the same bare `compacted:false` with no way for a
-                                    // client to tell "nothing to compact yet" apart from "already
-                                    // compacted", unlike pi's own two distinct thrown errors.
-                                    "reason": outcome.reason(),
-                                    "summary": compacted_summary,
-                                    "tokens_before": compacted_tokens_before,
-                                    "tokens_after": compacted_tokens_after,
-                                    "first_kept_entry_id": first_kept_entry_id,
-                                })),
-                                None
-                            )),
-                            Err(e) => emit!(response(
-                                id,
-                                "compact",
-                                false,
-                                None,
-                                Some(&format!("compacted but failed to persist: {e}"))
-                            )),
-                        }
-                    }
-                    Err(e) => emit!(response(id, "compact", false, None, Some(&e.to_string()))),
-                }
-            }
+            "compact" => do_compact!(cmd, id),
             "get_last_assistant_text" => {
                 let text = last_assistant_text(&session);
                 emit!(response(
@@ -4225,23 +4314,24 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
             // `Steering` handle itself (shared with the loop, no `Agent` rebuild needed), so this takes
             // effect immediately, including mid-run.
             "set_steering_mode" => match cmd.get("mode").and_then(Value::as_str) {
-                Some("one_at_a_time") => {
-                    steering.set_steering_mode(agent_core::QueueMode::OneAtATime);
+                Some(mode @ ("one_at_a_time" | "all")) => {
+                    steering.set_steering_mode(if mode == "all" {
+                        agent_core::QueueMode::All
+                    } else {
+                        agent_core::QueueMode::OneAtATime
+                    });
+                    // Same "best-effort, in-memory toggle already took effect either way" persistence
+                    // `set_auto_compaction` above uses — a failed write just won't survive a restart.
+                    // See `settings::Settings::steering_mode`'s own doc comment: this RPC handler is
+                    // exactly where that persistence is expected to happen.
+                    if let Err(e) = settings_store.set_steering_mode(Some(mode.to_string())) {
+                        eprintln!("serve: failed to persist steering_mode setting: {e}");
+                    }
                     emit!(response(
                         id,
                         "set_steering_mode",
                         true,
-                        Some(json!({ "mode": "one_at_a_time" })),
-                        None,
-                    ));
-                }
-                Some("all") => {
-                    steering.set_steering_mode(agent_core::QueueMode::All);
-                    emit!(response(
-                        id,
-                        "set_steering_mode",
-                        true,
-                        Some(json!({ "mode": "all" })),
+                        Some(json!({ "mode": mode })),
                         None,
                     ));
                 }
@@ -4256,23 +4346,20 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
             // Same idea, for the follow-up lane drained at a stop boundary (plus any stranded steer
             // messages swept in there — see `Steering::drain_at_stop`).
             "set_follow_up_mode" => match cmd.get("mode").and_then(Value::as_str) {
-                Some("one_at_a_time") => {
-                    steering.set_follow_up_mode(agent_core::QueueMode::OneAtATime);
+                Some(mode @ ("one_at_a_time" | "all")) => {
+                    steering.set_follow_up_mode(if mode == "all" {
+                        agent_core::QueueMode::All
+                    } else {
+                        agent_core::QueueMode::OneAtATime
+                    });
+                    if let Err(e) = settings_store.set_follow_up_mode(Some(mode.to_string())) {
+                        eprintln!("serve: failed to persist follow_up_mode setting: {e}");
+                    }
                     emit!(response(
                         id,
                         "set_follow_up_mode",
                         true,
-                        Some(json!({ "mode": "one_at_a_time" })),
-                        None,
-                    ));
-                }
-                Some("all") => {
-                    steering.set_follow_up_mode(agent_core::QueueMode::All);
-                    emit!(response(
-                        id,
-                        "set_follow_up_mode",
-                        true,
-                        Some(json!({ "mode": "all" })),
+                        Some(json!({ "mode": mode })),
                         None,
                     ));
                 }
@@ -5020,6 +5107,22 @@ fn full_system(static_system: &str, cwd: &std::path::Path) -> String {
     format!("{static_system}{}", crate::resources::dynamic_footer(cwd))
 }
 
+/// The extra per-request headers a `models.json` override configures for this model id, if any (Task
+/// #11 pi-parity feature) — the lib-crate-side twin of `main.rs::model_override_extra_headers`. Not
+/// literally shared with it: `main.rs` is a separate binary crate over this library (see
+/// `beyond-ai-agent`'s `Cargo.toml` `[[bin]]` target), so a `pub(crate)` there still wouldn't be
+/// visible here, and vice versa — the two must each call through to
+/// `settings::ModelOverrides::open_default()`/`ModelOverride::resolved_headers` (the one real shared
+/// primitive both live in this same library crate and already depend on) rather than one calling the
+/// other. Kept to the same trivial one-lookup shape as `main.rs`'s copy so the two can't drift on
+/// anything but this wrapper itself.
+fn model_override_extra_headers(model: &str) -> std::collections::HashMap<String, String> {
+    crate::settings::ModelOverrides::open_default()
+        .get(model)
+        .map(|over| over.resolved_headers())
+        .unwrap_or_default()
+}
+
 /// Resolve `model`'s gateway credential/routing ([`resolve_gateway_credential`]) and build a
 /// ready-to-use [`GatewayClient`] for it, applying the process's fixed retry policy. Called once at
 /// `serve` startup and again every time the active model changes at runtime (`set_model`,
@@ -5044,7 +5147,18 @@ fn build_gateway_client(cfg: &ServeConfig, model: &str) -> Result<GatewayClient,
             .unwrap_or(agent_core::client::MAX_RETRIES),
         cfg.retry_base_delay_ms
             .unwrap_or(agent_core::client::BASE_BACKOFF),
-    );
+    )
+    // pi-parity (Task 2, serve pass 19): `main.rs::run_task`'s identical `with_extra_headers` wiring
+    // (Task #11) had no `serve` counterpart — every `serve` entrypoint that (re)builds a gateway client
+    // (startup, `set_model`, `cycle_model`, `fork`, `clone`, `switch_session`, `switch_branch`) went
+    // through this one function, so a `models.json` `ModelOverride.headers` override (and the
+    // auto-seeded NVIDIA `NVCF-POLL-SECONDS` / Kimi-Coding `User-Agent` defaults —
+    // `ModelOverride::resolved_headers`'s own doc comment) silently never reached the wire under
+    // `serve`, even though it did under `run`. Fixed once, here, rather than at each of those 8+ call
+    // sites: chained right after `with_retry`, matching `run_task`'s own ordering — harmless (a no-op)
+    // when no override configures any headers, since an empty map is also `GatewayClient::new`'s own
+    // default.
+    .with_extra_headers(model_override_extra_headers(model));
     // Task #30 (pi-parity feature): `run`'s identical `--retry-max-backoff-ms` wiring (`main.rs::
     // run_task`'s own `with_max_backoff` call site) previously had no `serve` counterpart — called on
     // every model switch, same as `with_retry` above, so the override survives a mid-run switch.

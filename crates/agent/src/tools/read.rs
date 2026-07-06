@@ -2,6 +2,7 @@
 
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader};
+use std::sync::OnceLock;
 
 use agent_core::message::ImageSource;
 use agent_core::tool::Tool;
@@ -131,6 +132,47 @@ fn resolve_read_path(path: &str) -> String {
     path.to_string()
 }
 
+/// Reject any resolved path that isn't a regular file or a directory, *before* this tool ever opens it
+/// for image-sniffing or content — unlike `grep`'s walk, which already filters candidates to
+/// `entry.file_type().is_some_and(|t| t.is_file())` before opening any of them, `read` had no equivalent
+/// gate: [`sniff_image_format`] and the streaming text path both call straight through to `File::open`/
+/// `read` on whatever path resolution handed them.
+///
+/// That gap is a real hang, not just a theoretical one: opening a FIFO for reading blocks until a
+/// writer shows up on the other end (a bare `mkfifo` with no writer wedges the very first
+/// `sniff_image_format` open forever), and a character device like `/dev/zero` opens and reads
+/// immediately but never signals EOF or contains a newline byte — this tool's line-scanning loop would
+/// spin forever waiting for either. Neither has a timeout or kill-on-drop the way `bash`'s child
+/// processes do, so either one wedges the whole tool call — and, since dispatch awaits each call in
+/// turn, the entire turn — forever.
+///
+/// There's no legitimate use for reading a FIFO/socket/device through this tool (a named pipe's "read"
+/// isn't a stable, replayable value the way a regular file's bytes are, and images are never any of
+/// these), so this simply refuses all of them with one clear error rather than trying to special-case
+/// any as safe. A directory is let through unmolested — opening one for reading already fails cleanly a
+/// few lines later (an `EISDIR`-style OS error wrapped into a plain `ToolError::Execution` by the
+/// existing `File::open` calls), so it needs no separate gate here.
+///
+/// Uses `std::fs::metadata` (follows symlinks, like the `File::open` calls further down this module
+/// already do) rather than `symlink_metadata`, so a symlink pointing *at* a FIFO/device is caught too,
+/// not just a bare one. A path whose metadata can't be read at all (most commonly: doesn't exist) is
+/// let through here — that already has its own clear "missing file" error at the real `File::open`
+/// call below, and duplicating it here under a different wording would just be a second, inconsistent
+/// failure mode for the same cause.
+fn reject_non_regular_file(path: &str) -> Result<(), ToolError> {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Ok(());
+    };
+    let file_type = meta.file_type();
+    if file_type.is_file() || file_type.is_dir() {
+        return Ok(());
+    }
+    Err(ToolError::Execution(format!(
+        "{path} is not a regular file (it's a FIFO, socket, or device); `read` can only read regular \
+         files"
+    )))
+}
+
 /// Read one line into `buf` (without the trailing newline), keeping at most `cap` bytes; bytes beyond
 /// `cap` are consumed from the stream but discarded, so a single huge line can't balloon memory.
 /// Returns `(bytes_consumed, truncated)`; `bytes_consumed == 0` means EOF.
@@ -176,11 +218,27 @@ impl Tool for Read {
         "read"
     }
     fn description(&self) -> &str {
-        "Read a file: text or image (png, jpeg, gif, webp, bmp). Images are sent as attachments the \
-         model can see; a model without vision support gets a text note instead. For text files, \
-         output is line-numbered and truncated to at most 2000 lines or 50.0KB, whichever is hit \
-         first. Use `offset`/`limit` to continue reading a large file from where a truncated call \
-         left off."
+        // Pi-parity fix: the image-format list here used to be its own hand-typed literal, independent
+        // of (and only coincidentally in sync with) `extension_image_format`/`media_type_of`'s own hand-
+        // typed match arms — see `SUPPORTED_IMAGE_FORMATS`'s doc comment. Built via `format!`/`OnceLock`
+        // like `bash`/`grep`/`find`'s own descriptions, so a format added to that one shared array shows
+        // up here automatically instead of needing this literal updated by hand too.
+        static DESC: OnceLock<String> = OnceLock::new();
+        DESC.get_or_init(|| {
+            let formats = SUPPORTED_IMAGE_FORMATS
+                .iter()
+                .map(|&(_, name, _, _)| name)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "Read a file: text or image ({formats}). Images are sent as attachments the model \
+                 can see; a model without vision support gets a text note instead. For text files, \
+                 output is line-numbered and truncated to at most {DEFAULT_LIMIT} lines or {}, \
+                 whichever is hit first. Use `offset`/`limit` to continue reading a large file from \
+                 where a truncated call left off.",
+                super::output::format_size(MAX_OUTPUT_BYTES as u64)
+            )
+        })
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -200,6 +258,7 @@ impl Tool for Read {
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing `path`".into()))?;
         let path = resolve_read_path(&super::normalize_path(path));
+        reject_non_regular_file(&path)?;
 
         // Whether the active model can accept image input at all. `agent_core::tool::Tool::run` takes
         // only a bare `Value` — unlike pi's `execute(..., ctx)`, there's no separate model-capability
@@ -278,11 +337,17 @@ impl Tool for Read {
             .and_then(Value::as_u64)
             .unwrap_or(1)
             .max(1) as usize;
+        // Floored at 1 — matches `grep`'s own `limit` floor (`Math.max(1, limit ?? DEFAULT_LIMIT)` in
+        // pi's `grep.ts`). Without this, `limit: 0` makes `shown` stay `0` forever, and the truncation
+        // branch below computes `last = offset + shown - 1` — with `shown == 0` that's `offset - 1`,
+        // one line *before* the window even started (e.g. "showing lines 1-0", or with an `offset` of
+        // 2, an inverted "showing lines 2-1") instead of a sensible, non-empty range.
         let limit = input
             .get("limit")
             .and_then(Value::as_u64)
             .map(|n| (n as usize).min(DEFAULT_LIMIT))
-            .unwrap_or(DEFAULT_LIMIT);
+            .unwrap_or(DEFAULT_LIMIT)
+            .max(1);
 
         // Stream the file line-by-line rather than slurping it whole: a windowed read
         // (`offset`/`limit`) into a huge file shouldn't allocate the entire file first — we hold at
@@ -574,6 +639,23 @@ fn read_u32_le(buf: &[u8], offset: usize) -> u32 {
     })
 }
 
+/// The image formats `read` can sniff, decode, and serve as an attachment — each format's
+/// [`image::ImageFormat`] value, the name used in the tool [`description`](Read::description), its IANA
+/// media type (used verbatim by [`media_type_of`], not re-derived), and the lowercase file extensions
+/// [`extension_image_format`] maps to it. Single source of truth for `description()`,
+/// [`extension_image_format`], and [`media_type_of`] — previously all three independently hand-typed the
+/// same five formats in their own match arms/literal string, so a 6th format added to one wouldn't
+/// necessarily get the other two updated to match; the old test also only re-asserted the same
+/// hardcoded description literal rather than deriving it from real format-detection code, so it
+/// couldn't have caught that drift either.
+const SUPPORTED_IMAGE_FORMATS: &[(image::ImageFormat, &str, &str, &[&str])] = &[
+    (image::ImageFormat::Png, "png", "image/png", &["png"]),
+    (image::ImageFormat::Jpeg, "jpeg", "image/jpeg", &["jpg", "jpeg"]),
+    (image::ImageFormat::Gif, "gif", "image/gif", &["gif"]),
+    (image::ImageFormat::WebP, "webp", "image/webp", &["webp"]),
+    (image::ImageFormat::Bmp, "bmp", "image/bmp", &["bmp"]),
+];
+
 /// The image format implied by a path's extension, or `None` if it isn't a recognized one. Used only
 /// as a fallback when [`sniff_image_format`] can't identify a format at all (a truncated/corrupt file);
 /// the actual format sent on the wire comes from sniffing the real magic bytes (see [`read_image`]).
@@ -582,27 +664,21 @@ fn extension_image_format(path: &str) -> Option<image::ImageFormat> {
         .extension()
         .and_then(|e| e.to_str())?
         .to_ascii_lowercase();
-    Some(match ext.as_str() {
-        "png" => image::ImageFormat::Png,
-        "jpg" | "jpeg" => image::ImageFormat::Jpeg,
-        "gif" => image::ImageFormat::Gif,
-        "webp" => image::ImageFormat::WebP,
-        "bmp" => image::ImageFormat::Bmp,
-        _ => return None,
-    })
+    SUPPORTED_IMAGE_FORMATS
+        .iter()
+        .find(|(_, _, _, exts)| exts.contains(&ext.as_str()))
+        .map(|&(format, _, _, _)| format)
 }
 
-/// The IANA media type for an [`image::ImageFormat`] this tool supports (the five extensions
-/// [`extension_image_format`] recognizes).
+/// The IANA media type for an [`image::ImageFormat`] this tool supports — looked up straight from
+/// [`SUPPORTED_IMAGE_FORMATS`], not an independently hand-typed match arm per format.
 fn media_type_of(format: image::ImageFormat) -> &'static str {
-    match format {
-        image::ImageFormat::Png => "image/png",
-        image::ImageFormat::Jpeg => "image/jpeg",
-        image::ImageFormat::Gif => "image/gif",
-        image::ImageFormat::WebP => "image/webp",
-        image::ImageFormat::Bmp => "image/bmp",
-        _ => "application/octet-stream",
-    }
+    SUPPORTED_IMAGE_FORMATS
+        .iter()
+        .find(|(f, _, _, _)| *f == format)
+        .map_or("application/octet-stream", |&(_, _, media_type, _)| {
+            media_type
+        })
 }
 
 /// The base64-encoded length of `n` raw bytes, without actually encoding — 4 output chars per 3 input
@@ -2541,10 +2617,15 @@ mod tests {
         // Matches pi's `read.ts` description, which states both the supported formats and the
         // text-truncation budget numerically (mirroring `bash`'s own numeric description).
         let desc = Read::default().description().to_string();
-        for format in ["png", "jpeg", "gif", "webp", "bmp"] {
+        // Derived from `SUPPORTED_IMAGE_FORMATS` — the single source of truth `extension_image_format`/
+        // `media_type_of` also draw from (pi-parity fix) — rather than a hardcoded literal list of
+        // format names, so this test actually catches the description going stale if a 6th format is
+        // ever added to that table and not reflected here, instead of just re-asserting the same fixed
+        // set both places happen to agree on today.
+        for &(_, name, _, _) in SUPPORTED_IMAGE_FORMATS {
             assert!(
-                desc.contains(format),
-                "description should list {format} as a supported image format, got: {desc}"
+                desc.contains(name),
+                "description should list {name} as a supported image format, got: {desc}"
             );
         }
         assert!(
@@ -2556,5 +2637,123 @@ mod tests {
                 && desc.contains(&super::super::output::format_size(MAX_OUTPUT_BYTES as u64)),
             "description should state the line/byte truncation budget numerically, got: {desc}"
         );
+    }
+
+    #[test]
+    fn extension_image_format_and_media_type_of_agree_with_the_shared_format_table() {
+        // Direct pin on the drift-proofing itself (pi-parity fix): every extension in
+        // `SUPPORTED_IMAGE_FORMATS` must route `extension_image_format` to that same row's format, and
+        // `media_type_of` must report that same row's media type for it — checked against the shared
+        // table itself, not a second, independently hand-typed list that could silently drift from it.
+        for &(format, _, media_type, extensions) in SUPPORTED_IMAGE_FORMATS {
+            for ext in extensions {
+                let path = format!("file.{ext}");
+                assert_eq!(
+                    extension_image_format(&path),
+                    Some(format),
+                    "extension {ext:?} should map to {format:?}"
+                );
+            }
+            assert_eq!(media_type_of(format), media_type);
+        }
+    }
+
+    #[tokio::test]
+    async fn limit_zero_is_floored_to_one_not_an_inverted_truncation_message() {
+        // Pi-parity fix: with `limit: 0`, `shown` stayed `0` forever, so the truncation branch's
+        // `last = offset + shown - 1` underflowed the intended meaning — a nonsensical "showing lines
+        // 1-0 of N total" instead of a sensible, non-empty range. Flooring `limit` at 1 (matching
+        // `grep`'s own `limit: 0` floor) guarantees at least one line is always shown before truncation
+        // fires, so the reported range can never invert.
+        let f = tmp_file("a\nb\nc\n");
+        let out = Read::default()
+            .run(json!({ "path": f.path().to_str().unwrap(), "limit": 0 }))
+            .await
+            .unwrap()
+            .text;
+        assert!(
+            out.contains("showing lines 1-1 of 3 total; use offset=2 to continue"),
+            "got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn limit_zero_with_a_nonzero_offset_is_floored_too_not_an_inverted_range() {
+        // The other half of the same bug: with a non-zero `offset` and `limit: 0`, the un-floored
+        // `last = offset + shown - 1` would compute `offset - 1` — a range that reads backwards (e.g.
+        // "showing lines 3-2") since `last < offset`.
+        let f = tmp_file("a\nb\nc\nd\ne\n");
+        let out = Read::default()
+            .run(json!({ "path": f.path().to_str().unwrap(), "offset": 3, "limit": 0 }))
+            .await
+            .unwrap()
+            .text;
+        assert!(
+            out.contains("showing lines 3-3 of 5 total; use offset=4 to continue"),
+            "got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fifo_is_rejected_immediately_instead_of_hanging_the_tool_call_forever() {
+        // Regression: `read` previously had no file-type gate before opening a path for image-sniffing
+        // or content — a bare FIFO with no writer on the other end blocks `File::open`'s read forever,
+        // wedging this tool call (and, since dispatch awaits each call in turn, the whole turn) with no
+        // timeout to save it, unlike `bash` (30-minute timeout, kill-on-drop). `tokio::time::timeout`
+        // here is a *test* safety net, not the fix itself: if `reject_non_regular_file` ever regresses,
+        // this test fails fast in seconds instead of hanging CI indefinitely.
+        let dir = tempfile::tempdir().unwrap();
+        let fifo_path = dir.path().join("a.fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status()
+            .expect("mkfifo must be available to run this test");
+        assert!(status.success(), "mkfifo failed to create the test fixture");
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            Read::default().run(json!({ "path": fifo_path.to_str().unwrap() })),
+        )
+        .await
+        .expect("read must reject a FIFO immediately, not hang");
+        let err = result.expect_err("a FIFO must be rejected, not read");
+        assert!(matches!(err, ToolError::Execution(_)), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_character_device_is_rejected_immediately_instead_of_hanging_the_tool_call_forever() {
+        // `/dev/zero` streams infinite zero bytes and contains no newline byte at all — `read`'s
+        // line-scanning loop (`read_line_capped`) would spin forever waiting for a `\n` or an EOF that
+        // never comes. Same regression class as the FIFO case above, guarded the same way.
+        if !std::path::Path::new("/dev/zero").exists() {
+            return; // this environment has no /dev/zero (unusual, but not worth failing the suite over)
+        }
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            Read::default().run(json!({ "path": "/dev/zero" })),
+        )
+        .await
+        .expect("read must reject a character device immediately, not hang");
+        let err = result.expect_err("a character device must be rejected, not read");
+        assert!(matches!(err, ToolError::Execution(_)), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn dev_null_is_rejected_immediately_not_read_as_an_empty_file() {
+        // `/dev/null` is also a character device, not a regular file — the gate rejects it uniformly
+        // with every other non-regular-file type rather than special-casing it as "safe because it's
+        // empty". The important property pinned here is the same as the other two device/FIFO tests:
+        // it returns immediately (an error), never hangs.
+        if !std::path::Path::new("/dev/null").exists() {
+            return;
+        }
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            Read::default().run(json!({ "path": "/dev/null" })),
+        )
+        .await
+        .expect("read must reject a character device immediately, not hang");
+        let err = result.expect_err("a character device must be rejected, not read");
+        assert!(matches!(err, ToolError::Execution(_)), "got: {err:?}");
     }
 }

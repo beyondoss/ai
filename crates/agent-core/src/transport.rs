@@ -12,6 +12,7 @@ use futures::stream::BoxStream;
 
 use crate::error::Result;
 use crate::message::{Message, StreamEvent, ToolDef};
+use crate::models::AggregatorHost;
 
 /// Extended-thinking request config. Presence asks the model to think before answering; `budget_tokens`
 /// caps the thinking spend (and must be below `max_tokens`).
@@ -222,13 +223,20 @@ pub struct ModelRequest {
     /// rejects it is a caller error, same as pi's.
     pub temperature: Option<f64>,
     /// Whether this request is being routed to Azure OpenAI specifically, rather than native OpenAI or
-    /// another OpenAI-Responses-compatible host. Only the OpenAI Responses dialect reads this (pi's
+    /// another OpenAI-Responses-compatible host. The OpenAI Responses dialect reads this directly (pi's
     /// `azure-openai-responses.ts` never calls `resolveCacheRetention`/`getPromptCacheRetention` at
-    /// all — unlike the direct `openai-responses.ts` dialect, it never sends `prompt_cache_retention`).
-    /// `false` by default: routing is resolved downstream of where a [`ModelRequest`] is built. Set by
-    /// `GatewayClient::stream` once the credential is resolved, from the same `auth_header ==
-    /// Some("api-key")` signal `client::DirectRouting::auth_header` already uses to distinguish Azure's
-    /// wire shape (see that method's doc comment) — not a second, independent detection path.
+    /// all — unlike the direct `openai-responses.ts` dialect, it never sends `prompt_cache_retention`);
+    /// `crate::models::capabilities_for_route` also reads it to suppress the native explicit
+    /// reasoning-"off" wire value for the 7 ids Azure's own catalogue doesn't support it on, feeding
+    /// both OpenAI-wire dialects and `client.rs`'s own eager-tool-streaming gate. `false` by default:
+    /// routing is resolved downstream of where a [`ModelRequest`] is built. Set by `GatewayClient::
+    /// stream` once the credential is resolved, from **either** of two signals a Bearer-token-based
+    /// Entra ID/Azure AD config can't express through the first alone: `auth_header == Some("api-key")`
+    /// (`client::DirectRouting::auth_header`, a static-API-key Azure config — see that method's own doc
+    /// comment) **or** `DirectRouting::deployment_name.is_some()` (an Entra ID config sends a real
+    /// Bearer token, correctly leaving `auth_header` unset, but still names a `deployment_name`) — not
+    /// a third, independent detection path; both signals are ones `client.rs` already resolves for
+    /// other reasons.
     pub is_azure: bool,
     /// Whether this request is being routed through a GitHub Copilot OAuth credential. Only the OpenAI
     /// Responses dialect reads this: Copilot-hosted gpt-5.x ids set `thinkingLevelMap: {"off": null}`
@@ -248,6 +256,53 @@ pub struct ModelRequest {
     /// `RouteOverride::Prefixed` signal that already picks Codex's own URL/path — not a second,
     /// independent detection path.
     pub is_codex: bool,
+    /// Which third-party aggregator platform this request is routed through, when that's a
+    /// client-known fact — the aggregator analogue of `is_codex`/`is_azure`/`is_copilot` above, for
+    /// the identical "same bare/vendor-slug model id, different real numbers depending on which host
+    /// actually serves it" problem [`crate::models::capabilities_for_route_with_host`] exists to
+    /// resolve (e.g. OpenRouter's and HuggingFace's own `"qwen/qwen3-235b-a22b-thinking-2507"` are the
+    /// identical id string with a real `max_output` that differs 32x between the two). `None` (the
+    /// default) means no host signal is available — every call site falls back to the host-agnostic
+    /// numbers [`crate::models::capabilities`]/`capabilities_for_route_with_copilot` already return,
+    /// unchanged from before this field existed.
+    ///
+    /// **Only partially populated by `GatewayClient::stream` today.** Fireworks is self-identifying
+    /// purely from the model id's own shape (`"accounts/fireworks/…"`,
+    /// [`crate::models::is_fireworks_model`]) — genuinely free, already-known information the same way
+    /// `is_codex`/`is_azure`/`is_copilot` are, so `client.rs` sets this to
+    /// `Some(AggregatorHost::Fireworks)` unconditionally whenever the id matches. Every other
+    /// aggregator is **not yet wired**: a `KNOWN_PROVIDERS`-routed request (Together/HuggingFace/Groq/
+    /// NVIDIA/OpenRouter — `crates/gateway/src/route.rs`) picks its `/{provider}/…` path segment
+    /// somewhere in `crates/agent` (not yet — see that crate's own routing code once it exists), and a
+    /// BYO-only aggregator (HuggingFace/NVIDIA/Kimi-Coding) is only named today as a host string inside
+    /// `crates/agent::settings::ModelOverride::base_url` — neither fact is visible to this crate yet.
+    /// **Next round's wiring** (owned by whichever agent next touches
+    /// `crates/agent/src/gateway_credential.rs`/`serve.rs`): when resolving a model's route, determine
+    /// which aggregator (if any) is serving it — from the provider name chosen for a `KNOWN_PROVIDERS`
+    /// row, or by matching `ModelOverride::base_url`'s host against each BYO-only aggregator's known
+    /// authority — and set this field the same way `req.is_copilot`/`req.is_azure`/`req.is_codex` are
+    /// set today in `GatewayClient::stream` (`client.rs`).
+    pub host: Option<AggregatorHost>,
+    /// Strip/downgrade every image in this request at the wire layer, regardless of the active
+    /// model's own vision support — the wire-level enforcement half of the `--block-images`/
+    /// `image_auto_resize`-adjacent safety feature (`crates/agent`'s `Agent.block_images`, which today
+    /// only gates the `read` tool and CLI `@file` attachments at *ingestion* time). `false` by default:
+    /// every existing caller keeps building requests exactly as before this field existed. `true` ORs
+    /// into each dialect's own `supports_vision`-based image-downgrade gate (`dialect::anthropic`'s
+    /// `downgrade_unsupported_images`, and the analogous logic in `dialect::openai`/
+    /// `dialect::openai_responses`) — so an image is stripped/downgraded to a text placeholder when
+    /// *either* the model can't see it *or* the request explicitly blocks images, closing two real
+    /// gaps an ingestion-only gate can't: an RPC client pushing an image directly into a running
+    /// session bypasses ingestion entirely, and an image already persisted in session history before
+    /// the flag was toggled on would otherwise still get resent on a resumed session.
+    ///
+    /// **Not yet populated by any real caller.** The next round's wiring (`crates/agent/src/serve.rs`/
+    /// `main.rs`, wherever a `ModelRequest` is actually built for a turn) should set this to the
+    /// session/agent's current `block_images` setting on every request, the same way `Agent::new`
+    /// already reads that setting for the ingestion-time gate — this field is the wire-layer twin of
+    /// that existing flag, not a replacement for it (ingestion-time gating still avoids doing the work
+    /// of reading/encoding an image that will just be stripped again here).
+    pub block_images: bool,
 }
 
 impl ModelRequest {
@@ -276,6 +331,8 @@ impl ModelRequest {
             is_azure: false,
             is_copilot: false,
             is_codex: false,
+            host: None,
+            block_images: false,
         }
     }
 
@@ -388,6 +445,21 @@ impl ModelRequest {
     /// See [`is_codex`](Self::is_codex)'s own doc comment for what this does (and doesn't yet) wire up.
     pub fn with_codex(mut self, is_codex: bool) -> Self {
         self.is_codex = is_codex;
+        self
+    }
+
+    /// Builder-style: mark this request as routed through a specific aggregator platform. See
+    /// [`host`](Self::host)'s own doc comment for what this does (and doesn't yet) wire up.
+    pub fn with_host(mut self, host: AggregatorHost) -> Self {
+        self.host = Some(host);
+        self
+    }
+
+    /// Builder-style: block every image in this request at the wire layer. See
+    /// [`block_images`](Self::block_images)'s own doc comment for what this does (and doesn't yet)
+    /// wire up.
+    pub fn with_block_images(mut self, block_images: bool) -> Self {
+        self.block_images = block_images;
         self
     }
 }

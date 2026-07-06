@@ -612,6 +612,17 @@ impl Agent {
     where
         F: FnMut(AgentEvent),
     {
+        // Every other interception point in this file (`before_tool_call`, `after_tool_call`,
+        // `on_assistant_message`, `should_stop_after_turn`, `before_provider_request`/
+        // `before_provider_payload`, `after_provider_response`) is wrapped in `catch_tool_panic` so a
+        // bug in caller-supplied code degrades one call instead of killing the run. `sink` is the same
+        // kind of caller-supplied code — this run's whole reason for existing is to report progress to
+        // it — so it gets the same fails-open treatment here, once, before the first event goes out:
+        // every `sink(...)` call for the rest of this function (and everything it calls transitively,
+        // e.g. `emit_tool_update`, `run_tool_calls_interleaved`) goes through this wrapped closure
+        // instead of the raw one. `catch_sink_panic` is `catch_tool_panic`'s sync sibling — `sink`
+        // itself isn't a future, so there's nothing to `.await` here.
+        let mut sink = move |ev: AgentEvent| catch_sink_panic(|| sink(ev));
         // Clears any pending stop request when this call returns, by whatever path — normal
         // completion, an early `?`/`return Err`, cancellation, or a refusal — so a request this call
         // never got around to consuming can't leak into a later call that reuses `steering`.
@@ -832,6 +843,13 @@ impl Agent {
             )
             .with_tools(current_tool_defs.clone())
             .with_cache_long(self.cache_long);
+            // pi-parity (Task 1, serve pass 19): wire-layer enforcement twin of the ingestion-time
+            // `block_images` gate — see `ModelRequest::block_images`'s doc comment. Setting this here,
+            // on every turn built from `session.messages`, closes both gaps an ingestion-only gate
+            // can't: an RPC client pushing an image directly into a running session, and an image
+            // already persisted in session history before the flag was toggled on getting resent on a
+            // resumed session.
+            req.block_images = self.block_images;
             // Task #15 (pi-parity): a per-turn callback (`with_system_fn`) is re-evaluated fresh here,
             // every turn — the seam a long-running call (which holds `&self` for its whole span, so
             // `set_system`'s `&mut self` is unavailable mid-run) uses to keep a time-varying prompt (a
@@ -2090,6 +2108,13 @@ impl Agent {
         sink: &mut dyn FnMut(AgentEvent),
         custom_instructions: Option<&str>,
     ) -> Result<CompactOutcome> {
+        // `compact` is a public entry point in its own right (the manual `compact` RPC command calls
+        // it directly, not just `run_events_steered`'s own auto-compaction path), so it needs its own
+        // copy of the same fails-open `sink` guard `run_events_steered` wraps at its top — see that
+        // wrap's doc comment. Harmless to re-wrap when this *is* reached through `run_events_steered`
+        // (via `compact_or_report`): the inner layer already caught, so the outer one never has
+        // anything left to catch.
+        let mut sink = move |ev: AgentEvent| catch_sink_panic(|| sink(ev));
         let Some(cut) =
             compaction::find_split_cut(&session.messages, self.compaction.keep_recent_tokens)
         else {
@@ -2420,14 +2445,39 @@ where
     std::panic::AssertUnwindSafe(fut)
         .catch_unwind()
         .await
-        .map_err(|payload| {
-            let msg = payload
-                .downcast_ref::<&str>()
-                .map(|s| s.to_string())
-                .or_else(|| payload.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "panicked with a non-string payload".to_string());
-            format!("panicked: {msg}")
-        })
+        .map_err(|payload| format!("panicked: {}", panic_message(payload)))
+}
+
+/// Shared by [`catch_tool_panic`] and [`catch_sink_panic`]: turns a `catch_unwind` payload into a
+/// human-readable message. `panic!`'s two common payload shapes are `&'static str` (a string-literal
+/// message, the overwhelmingly common case) and `String` (a formatted one, e.g. via `panic!("{e}")`);
+/// anything else (a caller doing `std::panic::panic_any(42)`) has no sensible rendering.
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "panicked with a non-string payload".to_string())
+}
+
+/// Sync sibling of [`catch_tool_panic`], for the one interception point in this file that's a plain
+/// call rather than a future: the caller-supplied event `sink`, invoked directly (no `Result` to
+/// redirect a failure through) at every streamed event, tool boundary, turn boundary, and compaction
+/// milestone. Same fails-open rationale as every hook `catch_tool_panic` already guards — a bug in a
+/// UI/log callback wired up purely to *observe* the run shouldn't be able to unwind through and kill
+/// the run itself. There's nothing for this crate's own logic to do with a dropped event beyond note
+/// it happened: logged, then swallowed, and the run proceeds as if the sink had simply declined to act
+/// on that one event.
+///
+/// `AssertUnwindSafe`: same reasoning as `catch_tool_panic`'s own doc comment, just for a plain closure
+/// call instead of a future.
+fn catch_sink_panic(f: impl FnOnce()) {
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        tracing::warn!(
+            panic = %panic_message(payload),
+            "event sink panicked; dropping this event"
+        );
+    }
 }
 
 /// Resolve a per-call dispatch result, synthesizing an error placeholder for a call whose group never
@@ -10583,6 +10633,97 @@ mod tests {
             sent[0].system.as_deref(),
             Some("base prompt"),
             "a panicking hook must fail open to the request exactly as it was"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_panicking_sink_does_not_unwind_out_of_the_run_events_loop() {
+        // The event `sink` was the one interception point in this file still called bare: every hook
+        // above it (`before_tool_call`, `after_tool_call`, `should_stop_after_turn`,
+        // `on_assistant_message`, `before_provider_request`) already fails open via `catch_tool_panic`.
+        // A caller's own render/log callback panicking on one event (a bad match arm, an unwrap on an
+        // unexpected variant) must degrade to a dropped event, not take the whole run down with it.
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        let mock = Arc::new(MockTransport::new(vec![
+            turn::tool_call("tu_1", "echo", r#"{"text":"hi"}"#),
+            turn::text("recovered"),
+        ]));
+        let agent = Agent::new(mock, "claude-opus-4-8")
+            .with_tools(tools)
+            .with_max_steps(8);
+        let mut session = Session::new();
+        session.user("go");
+
+        let mut agent_end_seen = false;
+        agent
+            .run_events(&mut session, |ev| {
+                if let AgentEvent::ToolStart { .. } = &ev {
+                    panic!("boom: sink always panics on ToolStart");
+                }
+                if let AgentEvent::AgentEnd { .. } = &ev {
+                    agent_end_seen = true;
+                }
+            })
+            .await
+            .expect("a panicking sink must not crash the run");
+
+        assert!(
+            agent_end_seen,
+            "events after the panicking one must still reach the sink"
+        );
+        // The run itself completed normally — the tool call still ran and the model still got to
+        // reply — proof the panic never unwound past the sink boundary.
+        let last = session.messages.last().unwrap();
+        assert_eq!(last.role, Role::Assistant);
+        assert!(!last.content.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_panicking_sink_does_not_unwind_out_of_a_direct_compact_call() {
+        // `compact` is a public entry point reachable independent of `run_events_steered` — the manual
+        // `compact` RPC command (`crates/agent/src/serve.rs`) calls it directly with its own raw sink
+        // closure, so it needs its own copy of the fails-open guard, not just borrowed protection from
+        // the main loop's own wrap.
+        let session_messages = vec![
+            Message::user("look at this"),
+            Message::assistant(vec![ContentBlock::text("ok, looking")]),
+            Message::user("now something else"),
+            Message::assistant(vec![ContentBlock::text("done")]),
+        ];
+        let mut session = Session::new();
+        session.messages = Arc::new(session_messages);
+
+        let mock = Arc::new(MockTransport::new(vec![turn::text("a real summary")]));
+        let agent = Agent::new(mock, "claude-opus-4-8").with_compaction(CompactionConfig {
+            keep_recent_tokens: 1,
+            ..CompactionConfig::default()
+        });
+        let cancel = CancellationToken::new();
+
+        let mut compacted_event_seen = false;
+        let compacted = agent
+            .compact(
+                &mut session,
+                CompactionReason::Manual,
+                &cancel,
+                &mut |ev| {
+                    if let AgentEvent::CompactionStart { .. } = &ev {
+                        panic!("boom: sink always panics on CompactionStart");
+                    }
+                    if let AgentEvent::Compacted { .. } = &ev {
+                        compacted_event_seen = true;
+                    }
+                },
+                None,
+            )
+            .await
+            .expect("a panicking sink must not crash a direct compact() call");
+
+        assert!(compacted.compacted());
+        assert!(
+            compacted_event_seen,
+            "the Compacted event after the panicking CompactionStart must still reach the sink"
         );
     }
 }

@@ -1,9 +1,13 @@
 //! Beyond agent harness — core.
 //!
-//! A runtime-agnostic, network-agnostic agent loop, modeled on Pi (`pi-agent-core` + the dialect
-//! half of `pi-ai`). The pieces here are deliberately free of HTTP, providers, and any executor so
-//! they unit-test without a network or a live model — the same split the gateway uses to keep its
-//! load-bearing logic testable without Pingora.
+//! A network-agnostic agent loop, modeled on Pi (`pi-agent-core` + the dialect half of `pi-ai`). The
+//! loop itself (`agent`, `session`, `tool`, `compaction`, …) is deliberately free of HTTP, providers,
+//! and any executor so it unit-tests without a network or a live model — the same split the gateway
+//! uses to keep its load-bearing logic testable without Pingora. `client::GatewayClient`'s Codex
+//! WebSocket transport (`codex_websocket`) is the one exception: a live, persistent socket genuinely
+//! needs a bound async runtime the way a per-request `reqwest` call never did, so this crate now
+//! depends on `tokio` directly rather than only through dev-dependencies — see that module's own doc
+//! comment.
 //!
 //! Two seams keep everything above the wire testable with mocks:
 //! - [`Tool`] — capabilities are values in a [`ToolRegistry`]; tests register a mock tool.
@@ -21,6 +25,9 @@
 pub mod agent;
 pub mod branch_summary;
 pub mod client;
+// Internal to `client.rs`'s `GatewayClient` — the live Codex WebSocket transport has no public seam
+// of its own (see the module doc comment); nothing outside this crate names its types directly.
+mod codex_websocket;
 pub mod compaction;
 pub mod dialect;
 pub mod error;

@@ -281,10 +281,16 @@ fn spawn_request_capturing_server() -> (String, std::sync::Arc<std::sync::Mutex<
 }
 
 #[tokio::test]
-async fn gateway_client_sends_x_client_request_id_for_openai_responses_with_a_cache_key() {
-    // "gpt-5" is a native OpenAI id — routes through the Responses dialect per `Dialect::for_model`.
-    // Matches pi's own `openai-responses.ts`, which sends this header for connection-level
-    // session-affinity routing whenever a session id is available.
+async fn gateway_client_omits_session_affinity_headers_for_a_non_fireworks_responses_request() {
+    // pi-parity (models/dialects pass, Task D) correction: these headers are gated to Fireworks-hosted
+    // models specifically (pi's own `compat.sendSessionAffinityHeaders` is a per-provider catalogue
+    // flag, not a blanket "every OpenAI-wire dialect" rule) — this test used to assert the *opposite*
+    // (that native "gpt-5" got the header unconditionally), which was the exact over-broad behavior
+    // this fix closed. See `client::tests::session_affinity_headers_are_sent_for_a_fireworks_chat_
+    // completions_request`/`..._are_absent_for_a_non_fireworks_chat_completions_request` (`client.rs`)
+    // for the Fireworks-positive/negative pair on the Chat Completions dialect — no current Fireworks
+    // id reaches the Responses dialect at all (`is_fireworks_anthropic_wire_model` routes almost every
+    // Fireworks id to Anthropic instead), so this dialect only ever has the negative case to prove.
     let (base, captured) = spawn_request_capturing_server();
     let client = GatewayClient::new(base, "bai_v1.test").expect("client");
     let req =
@@ -293,41 +299,25 @@ async fn gateway_client_sends_x_client_request_id_for_openai_responses_with_a_ca
     let _ = stream.next().await;
 
     let request = captured.lock().unwrap().clone();
+    let lower = request.to_ascii_lowercase();
     assert!(
-        request
-            .to_ascii_lowercase()
-            .contains("x-client-request-id: session-abc"),
-        "the OpenAI Responses dialect must send the session-affinity header: {request}"
+        !lower.contains("x-client-request-id"),
+        "native (non-Fireworks) gpt-5 must not get the session-affinity header: {request}"
     );
-}
-
-#[tokio::test]
-async fn gateway_client_sends_session_id_header_alongside_x_client_request_id() {
-    // MEDIUM pi-parity gap (fixed): pi sends *both* `session_id` (`compat.sendSessionIdHeader`, true
-    // by default for native OpenAI) and `x-client-request-id`, carrying the same value — ours only
-    // ever sent the latter, risking cache/session-affinity routing landing on a different backend node
-    // per turn even though `x-client-request-id` was already correct.
-    let (base, captured) = spawn_request_capturing_server();
-    let client = GatewayClient::new(base, "bai_v1.test").expect("client");
-    let req =
-        ModelRequest::new("gpt-5", vec![Message::user("hi")], 64).with_cache_key("session-abc");
-    let mut stream = client.stream(req).await.expect("stream");
-    let _ = stream.next().await;
-
-    let request = captured.lock().unwrap().clone();
     assert!(
-        request
-            .to_ascii_lowercase()
-            .contains("session_id: session-abc"),
-        "the OpenAI Responses dialect must also send the session_id header: {request}"
+        !lower.contains("session_id:"),
+        "native (non-Fireworks) gpt-5 must not get the session_id header either: {request}"
     );
 }
 
 #[tokio::test]
 async fn gateway_client_omits_x_client_request_id_without_a_cache_key() {
+    // Fireworks-hosted (`glm-5p2` is the one current Fireworks id on the Chat Completions dialect —
+    // see the test above) but no `cache_key`: still nothing to route by, so the headers must stay
+    // omitted even on an otherwise-eligible route.
     let (base, captured) = spawn_request_capturing_server();
     let client = GatewayClient::new(base, "bai_v1.test").expect("client");
-    let req = ModelRequest::new("gpt-5", vec![Message::user("hi")], 64); // no cache_key
+    let req = ModelRequest::new("accounts/fireworks/models/glm-5p2", vec![Message::user("hi")], 64); // no cache_key
     let mut stream = client.stream(req).await.expect("stream");
     let _ = stream.next().await;
 

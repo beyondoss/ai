@@ -407,12 +407,17 @@ fn push_assistant_content(input: &mut Vec<Value>, blocks: &[ContentBlock], msg_i
 
 /// Build the streaming request body.
 pub fn build_body(req: &ModelRequest) -> Value {
-    let caps = crate::models::capabilities_for_route_with_copilot(
+    let caps = crate::models::capabilities_for_route_with_host(
         &req.model,
         req.is_codex,
         req.is_azure,
         req.is_copilot,
+        req.host,
     );
+    // Vision is gated on *both* the model's own real support and the request's explicit
+    // wire-level opt-out (`ModelRequest::block_images`) — an image is downgraded to a text
+    // placeholder when either is unsupported/blocked, regardless of when/how it entered history.
+    let supports_vision = caps.supports_vision && !req.block_images;
     let mut input: Vec<Value> = Vec::new();
 
     // Codex/ChatGPT's own backend wants the system prompt carried in a separate top-level
@@ -432,8 +437,8 @@ pub fn build_body(req: &ModelRequest) -> Value {
                 }));
             }
             Role::User => {
-                push_user_content(&mut input, &m.content, caps.supports_vision);
-                push_tool_results(&mut input, &m.content, caps.supports_vision);
+                push_user_content(&mut input, &m.content, supports_vision);
+                push_tool_results(&mut input, &m.content, supports_vision);
             }
             Role::Assistant => push_assistant_content(&mut input, &m.content, msg_index),
         }
@@ -1601,6 +1606,44 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
         );
 
         // A vision-capable model is unaffected.
+        let req = ModelRequest::new(
+            "gpt-4o",
+            vec![Message::user_with_images(
+                "what is this?",
+                vec![ImageSource::base64("image/png", "AAAA")],
+            )],
+            64,
+        );
+        let body = build_body(&req);
+        assert_eq!(body["input"][0]["content"][1]["type"], "input_image");
+    }
+
+    /// pi-parity (models/dialects pass, Task E): `ModelRequest::block_images` must strip/downgrade
+    /// images at the wire layer regardless of the active model's own vision support.
+    #[test]
+    fn block_images_downgrades_images_even_for_a_vision_capable_model() {
+        let req = ModelRequest::new(
+            "gpt-4o", // vision-capable — would normally get an `input_image` part
+            vec![Message::user_with_images(
+                "what is this?",
+                vec![ImageSource::base64("image/png", "AAAA")],
+            )],
+            64,
+        )
+        .with_block_images(true);
+        let body = build_body(&req);
+        let content = &body["input"][0]["content"];
+        assert_eq!(
+            content[1],
+            json!({ "type": "input_text", "text": "(image omitted: model does not support images)" }),
+            "block_images must downgrade the image even though gpt-4o supports vision"
+        );
+        assert!(
+            !content.as_array().unwrap().iter().any(|c| c["type"] == "input_image"),
+            "no input_image part should reach the wire when block_images is set"
+        );
+
+        // Unset (the default), the same request keeps its real image.
         let req = ModelRequest::new(
             "gpt-4o",
             vec![Message::user_with_images(

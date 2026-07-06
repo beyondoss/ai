@@ -3,10 +3,15 @@
 `agent_core` (package `beyond-ai-agent-core`) takes a [`Session`](src/session.rs) (message history)
 and an [`Agent`](src/agent.rs) config (model, tools, transport) and drives the model-turn / tool-call
 loop to completion, mutating the session in place and emitting an [`AgentEvent`](src/agent.rs) per
-streamed token, tool boundary, and turn boundary. It contains no HTTP server, no provider SDK, and no
-executor — its only network dependency is a `ModelTransport` trait it never implements itself in
-production except via the included `GatewayClient`, an HTTP client that speaks OpenAI/Anthropic wire to
-a Beyond gateway base URL.
+streamed token, tool boundary, and turn boundary. It contains no HTTP server and no provider SDK — its
+only network dependency is a `ModelTransport` trait it never implements itself in production except via
+the included `GatewayClient`, an HTTP client that speaks OpenAI/Anthropic wire to a Beyond gateway base
+URL. The loop itself is still executor-agnostic (no `tokio`/executor dependency in `agent.rs`, `session.rs`,
+`tool.rs`, `compaction.rs`, …); `GatewayClient`'s one Codex-specific live WebSocket connection
+([`codex_websocket`](src/codex_websocket.rs), see the `Codex live WebSocket transport` capability below)
+is this crate's sole exception — a persistent socket genuinely needs a bound async runtime the way a
+per-request `reqwest` call never did, so this crate now depends on `tokio` directly rather than only
+through `dev-dependencies`.
 
 ## Capabilities at a glance
 
@@ -483,6 +488,25 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   `apply_summary` resets to point past the rebuilt list's end, so it would report 0 immediately after a
   compaction); `crates/agent`'s `serve.rs` threads both straight into the `compact` RPC's own response,
   which previously exposed neither.
+- **Codex live WebSocket transport** — [`codex_websocket`](src/codex_websocket.rs) gives a
+  `RouteOverride::Prefixed`-routed (OpenAI-Codex-Responses/ChatGPT-subscription) request a live,
+  persistent WebSocket alternative to the ordinary HTTP/SSE path, mirroring pi's real shipped
+  `openai-codex-responses.ts`: one connection is reused across turns of the same session (keyed by
+  `ModelRequest::cache_key`, the same stable id already sent as `prompt_cache_key`), and every turn
+  after the first sends only the *delta* of new conversation items via `previous_response_id` instead
+  of resending the whole transcript. Always attempted first for an eligible request (matching pi's
+  `"auto"` transport default — no `"websocket"`/`"websocket-cached"`/`"sse"` mode selector, since
+  nothing in this codebase needs to pin one explicitly yet), with a transparent, silent fallback to the
+  existing HTTP/SSE path — unchanged, still the correctness-preserving default — on any connect
+  failure, send failure, or pre-first-event transport error; a session sticks to SSE for the rest of
+  the process once its WebSocket has genuinely failed once (pi's own `websocketSseFallbackSessions`).
+  `GatewayClient::with_codex_websocket(false)` is the (currently CLI-unwired) escape hatch back to
+  HTTP/SSE-only behavior. Reuses `dialect::openai_responses::build_body`/`Decoder` entirely rather than
+  duplicating the wire shape — this module only adds the connection lifecycle and the delta-diffing
+  logic on top. See that module's own doc comment for the full design, including where it deliberately
+  diverges from pi (no proactive idle-connection sweep timer; the delta baseline is built by harvesting
+  each turn's own `response.output_item.done` wire events directly, not by reconstructing them from a
+  live `AssistantMessage` object the transport layer here doesn't hold).
 
 ## What this crate is not
 
@@ -505,15 +529,18 @@ directly against this project's minimum-effective-abstraction bias. If a genuine
 extensibility ever appears, revisit this as a deliberate, scoped addition rather than bolting hooks on
 piecemeal.
 
-One specific extension point pi's real product has and this crate deliberately doesn't: an ephemeral
+Two specific extension points pi's real product has and this crate deliberately doesn't: an ephemeral
 per-request context transform (rewrite/prune the outbound message list for one call without persisting
-the change — pi's `transformContext`, `packages/coding-agent/src/core/sdk.ts:351`). This is a real seam
-in pi's *extension* system specifically — it exists to let a runtime-loaded, third-party plugin reach
-into the request pipeline. Since this crate has no such plugin system (see above) and no first-party
-caller has ever needed it, adding it now would be exactly the same mistake: machinery with no concrete
-consumer. If a real need appears — a caller that wants to inject transient context for one call without
-persisting it — add the narrowest seam that call actually needs then, not a general-purpose hook ahead
-of time.
+the change — pi's `transformContext`, `packages/coding-agent/src/core/sdk.ts:351`), and a once-per-prompt
+pre-flight hook fired after the user submits a fresh prompt but before the run starts, letting an
+extension inspect/rewrite the raw prompt text, attached images, and assembled system prompt (pi's
+`before_agent_start`, `packages/coding-agent/src/core/extensions/types.ts:675`). Both are real seams in
+pi's *extension* system specifically — they exist to let a runtime-loaded, third-party plugin reach into
+the request pipeline before it's built. Since this crate has no such plugin system (see above) and no
+first-party caller has ever needed either, adding them now would be exactly the same mistake: machinery
+with no concrete consumer. If a real need appears — a caller that wants to inject transient context for
+one call, or rewrite a prompt/system-prompt before a run starts, without persisting it — add the
+narrowest seam that call actually needs then, not a general-purpose hook ahead of time.
 
 (The before/after-provider-request seam — patch headers/timeout per call, mutate the raw wire payload,
 observe raw response status/headers — used to belong in this "doesn't have" list too, but this crate
@@ -983,6 +1010,7 @@ both fields `None` and never reads them.
 | `dialect/anthropic.rs`        | `/v1/messages` body builder (three prompt-cache breakpoints, capability-gated 1h TTL, per-model thinking shape, `tool_choice`, tool-result image rewrite, `normalize_cross_model_tool_ids` — disallowed-character/length normalization of a foreign-model tool-call id at the point a request reaches the wire) + decoder (text/thinking/tool/cache-usage, reasoning-token breakout, `pause_turn`/refusal-explanation, in-band error + truncation detection)                                                                                     |
 | `dialect/openai.rs`           | `/v1/chat/completions` body builder + decoder — real translation: flattened messages, string-encoded tool args, `image_url` data-URIs (user + fanned-out tool-result images), `max_completion_tokens` vs `max_tokens`, `reasoning_effort`, `tool_choice`, synthesized block-stop events. System-prompt role is `"developer"`/`"system"` per `dialect::openai_responses::instruction_role` (shared, not duplicated); `store:false` sent except for `models::is_non_standard_store_provider`'s denylist; Mistral ids get their `tool_calls[].id`/`tool_call_id` reshaped to exactly 9 alphanumeric characters (`MistralToolCallIdNormalizer`, request-scoped) since Mistral's real API rejects any other shape; `finish_reason:"end"` is a "stop" synonym; DeepSeek assistant replay backfills an empty `reasoning_content` when a turn carried no thinking                                                                                                    |
 | `dialect/openai_responses.rs` | `/v1/responses` body builder (flat `input` array of typed items, flat tool defs, `max_output_tokens`, `reasoning.effort` + `reasoning.summary` (`ModelRequest::reasoning_summary`, defaults to `ReasoningSummary::Auto`) + `include:["reasoning.encrypted_content"]`, `service_tier` (`ModelRequest::service_tier`, omitted unless set — a queueing/latency class, not just pricing), `store:false`; the explicit `reasoning:{"effort":"none"}` disable is withheld when `ModelRequest::is_copilot` (GitHub Copilot-hosted gpt-5.x ids have no "off" wire shape at all, unlike the same id direct from OpenAI); `prompt_cache_retention` is withheld entirely when `ModelRequest::is_azure` (pi's Azure dialect never sends it)) + decoder — genuine item-boundary events (`output_item.added`/`.done`), not implicit index-keyed deltas; every event carries its own true `output_index` and is emitted immediately, live, in real arrival order — no buffering, no "focus" item — since `Accumulator` natively tracks as many concurrently-open indices as the wire actually has (genuinely interleaved items, e.g. concurrent tool calls, stream live rather than one being buffered and replayed as a burst once the other closes); `function_call_arguments.done`/`output_item.done`'s own `arguments`/`content` resync (replace, not append) whatever the streamed deltas produced, so a single dropped/duplicated delta can't silently corrupt the final block; a `message`-type item's `id`/`phase` are captured off that same `output_item.done` and restamped verbatim on replay (`push_assistant_content`/`fallback_message_id`) |
+| `codex_websocket.rs`          | The live Codex WebSocket transport (see the `Codex live WebSocket transport` capability above): `CodexWebSocketCache` (per-`GatewayClient` connection cache, keyed by `cache_key`), `Continuation`/`build_wire_body` (the delta-diffing logic, pure and unit-tested standalone), `try_stream`/`Attempt` (the connect-or-reuse/send/first-event orchestration `client.rs::GatewayClient::stream` calls into)                                                                                                                                                                                       |
 | `branch_summary.rs`           | `branch_summary_request`: the (network-free) prompt builder for summarizing an abandoned tree branch on navigation — reuses `compaction`'s `SUMMARY_SYSTEM`/`extract_file_ops` unchanged and its `render_prefix` in spirit but not verbatim (`render_prefix_without_tool_results` drops tool-result content entirely rather than truncating it, matching pi's `getMessageFromEntry` returning `undefined` for a tool-result-role entry — a branch summary is read once on return, not carried forward as live context, so terseness matters more than detail here), rendered transcript wrapped in `<conversation>` tags (matching pi's `generateBranchSummary` and this crate's own compaction summary-request path), framed by its own instruction (no incremental-update path; a branch is summarized once), fixed `BRANCH_SUMMARY_MAX_TOKENS` (2048) output budget — matching pi's own hardcoded `generateBranchSummary` constant, deliberately independent of `CompactionConfig::summary_max_tokens`'s `reserve_tokens`-scaled budget, since a branch recap has no incremental-update path to size for; `windowed_by_budget` trims the rendered tail to fit the summarization call's own context, privileging a nested compaction/branch-summary entry (a dense recap, not raw conversation) past the ordinary cutoff as long as the accumulated tail is still under 90% of budget, matching pi's `prepareBranchEntries` |
 | `session.rs`                  | `Session`: Arc-shared copy-on-write message history + step/token counters + `last_usage_message_count`, serde round-trippable; `scrub_cross_model_state(new_model)` downgrades a non-empty signed `Thinking` block to `Text` (drops it only if empty), drops `RedactedThinking`, and truncates a combined tool-call id — all from any message not stamped with `new_model`                                                                                                                |
 | `error.rs`                    | `Error` (loop/transport, aborts the run) and `ToolError` (tool failure, becomes an error `tool_result`)                                                                                                                                                                                                                                                                                    |

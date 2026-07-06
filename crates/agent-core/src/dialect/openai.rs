@@ -299,12 +299,17 @@ fn normalize_cross_model_tool_id(id: &str) -> String {
 
 /// Build the streaming request body, translating the internal messages into OpenAI's flat shape.
 pub fn build_body(req: &ModelRequest) -> Value {
-    let caps = crate::models::capabilities_for_route_with_copilot(
+    let caps = crate::models::capabilities_for_route_with_host(
         &req.model,
         req.is_codex,
         req.is_azure,
         req.is_copilot,
+        req.host,
     );
+    // Vision is gated on *both* the model's own real support and the request's explicit
+    // wire-level opt-out (`ModelRequest::block_images`) — an image is downgraded to a text
+    // placeholder when either is unsupported/blocked, regardless of when/how it entered history.
+    let supports_vision = caps.supports_vision && !req.block_images;
     // pi's `useDeveloperRole = model.reasoning && compat.supportsDeveloperRole` — reuses the OpenAI
     // Responses dialect's identical gating (`super::openai_responses::instruction_role`) rather than a
     // second, drifting copy of the same one-line rule.
@@ -331,7 +336,7 @@ pub fn build_body(req: &ModelRequest) -> Value {
             Role::User => {
                 // Text + image blocks form the user message (a multimodal parts array when any image
                 // is present); tool results fan out into individual `role:"tool"` messages below.
-                if let Some(content) = user_content(&m.content, caps.supports_vision) {
+                if let Some(content) = user_content(&m.content, supports_vision) {
                     messages.push(json!({ "role": "user", "content": content }));
                 }
                 // Every tool result in this turn is emitted first, contiguously (`tool`, `tool`, …).
@@ -382,7 +387,7 @@ pub fn build_body(req: &ModelRequest) -> Value {
                     }
                 }
                 if !pending_images.is_empty() {
-                    if !caps.supports_vision {
+                    if !supports_vision {
                         // The model can't accept images at all — a plain text placeholder per tool
                         // call, one line each, folded into a single trailing message.
                         let text = pending_images
@@ -689,14 +694,13 @@ fn apply_reasoning_wire(
                 map.insert("reasoning".into(), json!({ "effort": "none" }));
             }
         }
-        // pi-parity (Ant-Ling, added for the enum variant's own sake — see
-        // `OpenAiReasoningFormat::AntLing`'s doc comment): no current Ant-Ling id is actually reachable
-        // through this dialect's own family dispatch yet (`crate::models`'s Ant-Ling capability branch
-        // doc comment), so this exists only to keep the match exhaustive rather than to be a verified
-        // wire implementation. Intentionally the closest already-verified shape (OpenRouter's: a nested
-        // `reasoning: {"effort"}` sent only when requested, no explicit "off") minus the "off" arm,
-        // since Ant-Ling's real format never sends one at all — left as a follow-up to confirm once a
-        // route actually exercises it.
+        // pi-parity (Ant-Ling — see `OpenAiReasoningFormat::AntLing`'s doc comment): a `ling-`/`ring-`
+        // id isn't Anthropic-named and reports `ApiKind::ChatCompletions`, so `Dialect::for_model`
+        // already routes it to this dialect by default — reachable without any manual `models.json`
+        // override, unlike an earlier version of this comment claimed. Intentionally the closest
+        // already-verified shape (OpenRouter's: a nested `reasoning: {"effort"}` sent only when
+        // requested, no explicit "off") minus the "off" arm, since Ant-Ling's real format never sends
+        // one at all.
         Fmt::AntLing => {
             if let Some(effort) = requested {
                 map.insert("reasoning".into(), json!({ "effort": wire_str(effort) }));
@@ -1786,6 +1790,43 @@ mod tests {
         );
 
         // A vision-capable model is unaffected.
+        let req = ModelRequest::new(
+            "gpt-4o",
+            vec![Message::user_with_images(
+                "what is this?",
+                vec![ImageSource::base64("image/png", "AAAA")],
+            )],
+            64,
+        );
+        let body = build_body(&req);
+        assert_eq!(body["messages"][0]["content"][1]["type"], "image_url");
+    }
+
+    /// pi-parity (models/dialects pass, Task E): `ModelRequest::block_images` must strip/downgrade
+    /// images at the wire layer regardless of the active model's own vision support — the genuine
+    /// wire-level choke point `--block-images` needs (an RPC client pushing an image directly, or one
+    /// already persisted in history before the flag was toggled on, both bypass an ingestion-time-only
+    /// gate).
+    #[test]
+    fn block_images_downgrades_images_even_for_a_vision_capable_model() {
+        use crate::message::ImageSource;
+        let req = ModelRequest::new(
+            "gpt-4o", // vision-capable — would normally get a multimodal parts array
+            vec![Message::user_with_images(
+                "what is this?",
+                vec![ImageSource::base64("image/png", "AAAA")],
+            )],
+            64,
+        )
+        .with_block_images(true);
+        let body = build_body(&req);
+        assert_eq!(
+            body["messages"][0]["content"],
+            "what is this?\n(image omitted: model does not support images)",
+            "block_images must downgrade the image even though gpt-4o supports vision"
+        );
+
+        // Unset (the default), the same request keeps its real image.
         let req = ModelRequest::new(
             "gpt-4o",
             vec![Message::user_with_images(

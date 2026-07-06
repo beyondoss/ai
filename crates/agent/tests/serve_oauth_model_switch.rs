@@ -55,7 +55,19 @@ fn set_model_across_oauth_providers_rederives_credential_and_routing() {
     // `gpt-5-codex` (an OpenAI-Responses-dialect model), must be shaped for that dialect instead —
     // crossing dialects mid-test needs a dialect-matched mock response, same as
     // `serve_max_tokens_flag_reaches_the_wire_request_and_survives_a_model_switch`'s own note.
-    let (base, bodies) = spawn_model_server(vec![turn_text("first"), turn_text_responses("second")]);
+    //
+    // A Codex-OAuth-routed turn now makes TWO physical connections, not one: `gpt-5-codex` is
+    // `is_codex`-routed, so beyond always attempts the Codex WebSocket transport first (matching pi's
+    // real "auto" default). This plain mock server never speaks WebSocket, so that attempt's upgrade
+    // handshake gets a bare `200 OK` back — not the `101 Switching Protocols` it needs — which is
+    // correctly classified as a connect failure and falls through to the existing HTTP/SSE path for
+    // the same turn, but the fallback is a *second*, separate connection. The mock's `responses` list
+    // is consumed one-per-`accept()`, so it needs a third entry to cover that extra connection.
+    let (base, bodies) = spawn_model_server(vec![
+        turn_text("first"),
+        turn_text_responses("ws-preflight-rejected"),
+        turn_text_responses("second"),
+    ]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = Command::new(bin)
@@ -113,9 +125,10 @@ fn set_model_across_oauth_providers_rederives_credential_and_routing() {
     child.wait().unwrap();
 
     let recorded = bodies.lock().unwrap();
-    assert_eq!(recorded.len(), 2, "{recorded:#?}");
+    assert_eq!(recorded.len(), 3, "{recorded:#?}");
     let first = recorded[0].to_lowercase();
-    let second = recorded[1].to_lowercase();
+    let ws_preflight = recorded[1].to_lowercase();
+    let second = recorded[2].to_lowercase();
 
     assert!(
         first.contains("authorization: bearer anthropic-test-token"),
@@ -124,6 +137,24 @@ fn set_model_across_oauth_providers_rederives_credential_and_routing() {
     assert!(
         first.starts_with("post /v1/messages"),
         "the first turn must hit the default Anthropic path: {first}"
+    );
+
+    // The rejected WebSocket pre-flight for the second turn already carries the re-derived Codex
+    // credential/routing — it's a real attempted connection, not a stale reuse of the Anthropic
+    // client, it just doesn't speak this mock's plain-HTTP dialect.
+    assert!(
+        ws_preflight.contains("connection: upgrade") && ws_preflight.contains("upgrade: websocket"),
+        "the second turn's first connection must be the Codex WebSocket pre-flight attempt: \
+         {ws_preflight}"
+    );
+    assert!(
+        ws_preflight.contains("authorization: bearer codex-test-token"),
+        "the Codex websocket pre-flight must already carry the re-derived codex OAuth credential: \
+         {ws_preflight}"
+    );
+    assert!(
+        ws_preflight.starts_with("get /openai-codex/backend-api/codex/responses"),
+        "the Codex websocket pre-flight must target the Codex backend path: {ws_preflight}"
     );
 
     assert!(

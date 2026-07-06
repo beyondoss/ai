@@ -26,9 +26,11 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as SyncMutex};
 
-// This crate is runtime-agnostic (no executor dependency in production code — see the crate doc
-// comment's "no tokio in the library" note), so the per-key lock is `futures::lock::Mutex`, not
-// `tokio::sync::Mutex`: it's a pure `Future`-based mutex with no ties to any particular executor.
+// This registry has nothing to do with any one connection or executor (unlike `codex_websocket`,
+// this crate's one exception to being otherwise executor-agnostic — see the crate doc comment), so
+// the per-key lock stays `futures::lock::Mutex`, not `tokio::sync::Mutex`: a pure `Future`-based mutex
+// with no ties to any particular executor, sharable across any caller regardless of what runtime (if
+// any beyond tokio) drives it.
 use futures::lock::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 type LockMap = Arc<SyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>;

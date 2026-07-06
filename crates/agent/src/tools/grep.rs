@@ -489,8 +489,16 @@ impl Tool for Grep {
         if !byte_capped {
             let mut notices = Vec::new();
             if truncated {
+                // pi-parity fix: pi's own `grep.ts` truncation message names a concrete next value to
+                // try ("${effectiveLimit} matches limit reached. Use limit=${effectiveLimit * 2} for
+                // more, or refine pattern") rather than just gesturing at "raise `limit`" with no number
+                // — the model had to guess how much higher to go. `saturating_mul`, not plain `*`: a
+                // model-supplied `limit` has no upper bound here (only a floor of 1), and this crate
+                // runs with `overflow-checks = true` in release — an adversarial/huge `limit` must
+                // degrade to `usize::MAX`, never panic.
                 notices.push(format!(
-                    "match limit {limit} reached; narrow the pattern or raise `limit`"
+                    "match limit {limit} reached; narrow the pattern or use limit={} for more",
+                    limit.saturating_mul(2)
                 ));
             }
             if lines_truncated {
@@ -1081,7 +1089,7 @@ mod tests {
             .text;
         assert!(
             out.contains(
-                "[match limit 5 reached; narrow the pattern or raise `limit`. some lines \
+                "[match limit 5 reached; narrow the pattern or use limit=10 for more. some lines \
                  truncated; use the read tool to see them in full]"
             ),
             "joined notice missing or in the wrong order: {out}"
@@ -1142,7 +1150,7 @@ mod tests {
             .await
             .unwrap()
             .text;
-        assert!(out.contains("[match limit 3 reached; narrow the pattern or raise `limit`]"));
+        assert!(out.contains("[match limit 3 reached; narrow the pattern or use limit=6 for more]"));
         let match_lines = out.lines().filter(|l| l.contains("needle")).count();
         assert_eq!(
             match_lines, 3,

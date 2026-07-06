@@ -30,6 +30,11 @@ memchr = "2"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# Was dev-only (the loop itself pulled in no executor — see the crate/`write_lock.rs` doc comments).
+# `codex_websocket`'s live WebSocket connection is the first production code path that genuinely needs
+# a bound runtime (socket read/write, connect/idle timeouts), not just a `Future` any executor can
+# drive — promoted here rather than added as a second, redundant dependency line.
+tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 
@@ -49,9 +54,18 @@ httpdate = "1"
 # is the same crate/version the gateway's own `Secret` type already uses for the identical purpose.
 zeroize = "1"
 
+# `codex_websocket`'s live WebSocket transport for the OpenAI-Codex-Responses/ChatGPT-subscription
+# backend (pi's `openai-codex-responses.ts`): a persistent connection, unlike `reqwest`'s per-request
+# HTTP, genuinely needs a bound async runtime to drive its socket read/write — this is the one place
+# this crate can no longer honestly claim to be executor-agnostic in production code (see
+# `write_lock.rs`'s and this crate's own doc comments, updated alongside this). `rustls-tls-native-
+# roots` mirrors the workspace's existing rustls-only TLS policy (no OpenSSL — see `reqwest`'s own
+# comment above) while reusing the OS trust store via `rustls-native-certs`, already resolved in the
+# dependency graph through `reqwest`'s own `rustls-platform-verifier` — not a second, independent
+# bundled root store (`webpki-roots`) alongside it.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots"] }
+
 [dev-dependencies]
-# Async test runtime for the `Tool`/loop tests. The library itself is runtime-agnostic — it pulls in
-# no executor, only the `futures` stream traits — so the runtime lives in dev-deps.
 # Bench harness for the streaming decode hot path. `divan` (the workspace's `bench:unit` pin, matching
 # gateway/agent) measures **allocations** natively via its `AllocProfiler` global allocator alongside
 # timing — so the per-SSE-event allocation cost the decode findings target is visible, not inferred.
@@ -61,7 +75,6 @@ divan = "0.1"
 # (flattens the curve) or CPU-side SMT/turbo/bandwidth (doesn't). Gated behind `bench-mimalloc` so the
 # default build/bench stays on the production system allocator; only the control run opts in.
 mimalloc = "0.1"
-tokio.workspace = true
 
 [features]
 # Install mimalloc as the global allocator in `decode_concurrent` — the allocator-contention control

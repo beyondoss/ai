@@ -113,16 +113,34 @@ pub fn build_body(req: &ModelRequest, is_oauth: bool) -> Value {
 
     // Rolling breakpoint: cache the conversation prefix (tools + system + every prior message) up to
     // the final block, so next turn the whole accumulated transcript is a cache read, not a re-bill.
-    let mut messages = serde_json::to_value(req.messages.as_ref()).unwrap_or(Value::Null);
-    // `Message::model_id`/`usage`/`stop_reason`/etc. are internal-only fields (provenance and
-    // per-turn accounting, not wire schema) — they must never reach the wire. Anthropic's schema is
-    // strict about unknown fields on a message object and 400s the whole request if any leaks through
-    // (unlike the OpenAI dialects, which build each wire message from named fields rather than
-    // serializing `Message` wholesale, so they never had this exposure).
-    strip_internal_fields(&mut messages);
+    //
+    // Built field-by-field (`role`/`content` only) rather than `serde_json::to_value`-ing the whole
+    // `Message` struct — `Message` also carries several internal-only provenance/accounting fields
+    // (`model_id`/`error_message`/`aborted`/`usage`/`stop_reason`) that must never reach the wire:
+    // Anthropic's schema is strict about unknown fields on a message object and 400s the entire
+    // request if any leaks through. An earlier version of this dialect instead serialized the whole
+    // `Message` and hand-stripped each internal field by name afterward (a `strip_internal_fields`
+    // blocklist) — that mechanism already caused one live production Critical bug (two fields shipped
+    // several passes before the strip list caught up to them) and has no way to catch a *future* field
+    // addition the same way. Building the wire shape from exactly these two fields instead makes an
+    // unlisted field structurally unreachable, matching the OpenAI/OpenAI-Responses dialects' own
+    // field-by-field construction (see this module's own doc comment) rather than relying on a
+    // hand-maintained blocklist staying in sync with `Message`'s field list forever. See
+    // `build_body_wire_messages_never_carry_any_field_besides_role_and_content` for the canary test
+    // this shape is designed to keep passing even if `Message` gains a field this dialect forgets to
+    // account for.
+    let mut messages = Value::Array(
+        req.messages
+            .iter()
+            .map(|m| json!({ "role": m.role, "content": m.content }))
+            .collect(),
+    );
     normalize_cross_model_tool_ids(&mut messages, &req.messages, &req.model);
     downgrade_unsigned_thinking(&mut messages);
-    downgrade_unsupported_images(&mut messages, caps.supports_vision);
+    // Vision is gated on *both* the model's own real support and the request's explicit
+    // wire-level opt-out (`ModelRequest::block_images`) — an image is downgraded to a text
+    // placeholder when either is unsupported/blocked, regardless of when/how it entered history.
+    downgrade_unsupported_images(&mut messages, caps.supports_vision && !req.block_images);
     encode_tool_result_images(&mut messages);
     if is_oauth {
         // Replayed assistant tool_use blocks in history need the same canonical casing the live model
@@ -299,30 +317,6 @@ fn canonicalize_tool_use_names(messages: &mut Value) {
                 obj.insert("name".into(), Value::String(canonical));
             }
         }
-    }
-}
-
-/// Remove every internal-only key from each message object — `Message` derives `Serialize` directly
-/// (for session persistence), so a straight `serde_json::to_value` of the whole history carries all of
-/// them along unless stripped here first. Anthropic rejects a message object with any field outside
-/// its schema, so leaking any one of these 400s the entire request. `model_id` was the first (a live
-/// 400 proved it); `error_message`/`aborted` (`Message::error`/`Message::with_aborted`) are the same
-/// leak class — both are `Some`/`true` on exactly the synthetic closing records those constructors
-/// exist to persist, i.e. the ones now most likely to actually reach a real request after a whole-run
-/// retry or a follow-up prompt. `usage`/`stop_reason` are the same leak class again, but far more
-/// common: `Agent::run_events_steered` stamps *both* onto every real assistant turn (not just a
-/// synthetic error/abort record), so any multi-turn conversation replays them on the very next
-/// request — a live 400 (`messages.1.stop_reason: Extra inputs are not permitted`) proved this too.
-fn strip_internal_fields(messages: &mut Value) {
-    let Some(msgs) = messages.as_array_mut() else {
-        return;
-    };
-    for m in msgs.iter_mut().filter_map(Value::as_object_mut) {
-        m.remove("model_id");
-        m.remove("error_message");
-        m.remove("aborted");
-        m.remove("usage");
-        m.remove("stop_reason");
     }
 }
 
@@ -1120,7 +1114,9 @@ mod tests {
     fn build_body_never_leaks_model_id_onto_the_wire() {
         // `Message::model_id` is internal-only provenance for `Session::scrub_cross_model_state` — a
         // live 400 (`messages.N.model_id: Extra inputs are not permitted`) proved this was leaking
-        // straight through `serde_json::to_value(req.messages)` before `strip_model_id` was added.
+        // straight through `serde_json::to_value(req.messages)` before this dialect stripped it (now
+        // structurally unreachable — see `build_body`'s own doc comment on its field-by-field
+        // `{role, content}` message construction).
         let req = ModelRequest::new(
             "claude-opus-4-8",
             vec![
@@ -1176,7 +1172,7 @@ mod tests {
         // *every* real assistant turn (not just a synthetic error/abort record), so any ordinary
         // multi-turn conversation replays them on the very next request. Empirically confirmed live
         // against real Anthropic before this fix: `messages.1.stop_reason: Extra inputs are not
-        // permitted` (400). `strip_internal_fields` must remove both.
+        // permitted` (400). `build_body`'s field-by-field message construction must never carry either.
         let req = ModelRequest::new(
             "claude-opus-4-8",
             vec![
@@ -1199,6 +1195,45 @@ mod tests {
             assert!(
                 m.get("stop_reason").is_none(),
                 "stop_reason must never reach the wire: {m}"
+            );
+        }
+    }
+
+    /// Generic safety-net canary (pi-parity, Task B): unlike the three tests above, which each name a
+    /// specific field, this asserts the wire message object's key *set* is exactly `{role, content}` —
+    /// so a future field added to `Message` (that this dialect's `build_body` doesn't explicitly thread
+    /// through) fails this test immediately instead of silently reaching the wire and 400ing in
+    /// production, the way `usage`/`stop_reason` did for two whole passes before anyone noticed. Builds
+    /// a message with every current optional field populated to prove the field-by-field
+    /// `{role, content}` construction really does exclude all of them, not just the three already
+    /// covered above.
+    #[test]
+    fn build_body_wire_messages_never_carry_any_field_besides_role_and_content() {
+        let req = ModelRequest::new(
+            "claude-opus-4-8",
+            vec![
+                Message::user("hi"),
+                Message::assistant(vec![ContentBlock::text("hello")])
+                    .with_model_id("claude-opus-4-8")
+                    .with_aborted()
+                    .with_usage(TokenUsage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        ..Default::default()
+                    })
+                    .with_stop_reason(StopReason::EndTurn),
+                Message::error("transport error: boom"),
+            ],
+            256,
+        );
+        let body = build_body(&req, false);
+        for m in body["messages"].as_array().unwrap() {
+            let keys: std::collections::BTreeSet<&str> =
+                m.as_object().unwrap().keys().map(String::as_str).collect();
+            assert_eq!(
+                keys,
+                std::collections::BTreeSet::from(["role", "content"]),
+                "a wire message must carry exactly role/content, got: {m}"
             );
         }
     }
@@ -1891,6 +1926,45 @@ data: {"type":"message_stop"}
 
         // A vision-capable model is unaffected (existing image tests already cover the positive case,
         // but assert it here too for a direct before/after contrast in one place).
+        let req = ModelRequest::new(
+            "claude-opus-4-8",
+            vec![Message::user_with_images(
+                "what is this?",
+                vec![ImageSource::base64("image/png", "AAAA")],
+            )],
+            256,
+        );
+        let body = build_body(&req, false);
+        assert_eq!(body["messages"][0]["content"][1]["type"], "image");
+    }
+
+    /// pi-parity (models/dialects pass, Task E): `ModelRequest::block_images` must strip/downgrade
+    /// images at the wire layer regardless of the active model's own vision support.
+    #[test]
+    fn block_images_downgrades_images_even_for_a_vision_capable_model() {
+        use crate::message::ImageSource;
+        let req = ModelRequest::new(
+            "claude-opus-4-8", // vision-capable — would normally keep the real image block
+            vec![Message::user_with_images(
+                "what is this?",
+                vec![ImageSource::base64("image/png", "AAAA")],
+            )],
+            256,
+        )
+        .with_block_images(true);
+        let body = build_body(&req, false);
+        let content = &body["messages"][0]["content"];
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(
+            content[1]["text"], "(image omitted: model does not support images)",
+            "block_images must downgrade the image even though claude-opus-4-8 supports vision"
+        );
+        assert!(
+            !content.as_array().unwrap().iter().any(|b| b["type"] == "image"),
+            "no image block should reach the wire when block_images is set"
+        );
+
+        // Unset (the default), the same request keeps its real image.
         let req = ModelRequest::new(
             "claude-opus-4-8",
             vec![Message::user_with_images(

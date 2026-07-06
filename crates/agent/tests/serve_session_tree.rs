@@ -3,59 +3,14 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 
 use common::{
-    message_ids, read_until_response, serve_cmd, serve_dir_cmd, spawn_model_server, turn_text,
+    message_ids, read_until_response, serve_cmd, serve_dir_cmd, spawn_model_server,
+    spawn_model_server_with_stalled_response, turn_text,
 };
 use serde_json::{Value, json};
-
-/// A model server whose first `fast.len()` requests get an instant response, and whose next request
-/// (the summarization call a `switch_branch{summarize:true}` triggers) sends only a partial SSE body —
-/// proving the request genuinely reached the server and started streaming — then stalls for `stall`
-/// before completing, giving a test a reliable window to `abort` a provably in-flight call instead of
-/// racing a near-instant local round trip.
-fn spawn_model_server_with_stalled_response(
-    fast: Vec<String>,
-    stall: std::time::Duration,
-) -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    std::thread::spawn(move || {
-        for resp in fast {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf);
-                let http = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{resp}"
-                );
-                let _ = stream.write_all(http.as_bytes());
-                let _ = stream.flush();
-            }
-        }
-        if let Ok((mut stream, _)) = listener.accept() {
-            let mut buf = [0u8; 4096];
-            let _ = stream.read(&mut buf);
-            let preamble = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
-                data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n";
-            let _ = stream.write_all(preamble.as_bytes());
-            let _ = stream.flush();
-            std::thread::sleep(stall);
-            // Finishes the turn normally as a fallback safety net in case a test using this doesn't
-            // abort before `stall` elapses — a silently-hanging server would fail such a test far more
-            // confusingly than a completed-but-too-late response would.
-            let rest = "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
-                data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"recap\"}}\n\n\
-                data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
-                data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n\
-                data: {\"type\":\"message_stop\"}\n\n";
-            let _ = stream.write_all(rest.as_bytes());
-            let _ = stream.flush();
-        }
-    });
-    format!("http://{addr}")
-}
 
 #[test]
 fn serve_get_messages_since_returns_only_what_was_appended_after_a_known_id() {
@@ -1517,6 +1472,7 @@ fn serve_switch_branch_abort_cancels_summarization_and_leaves_session_unchanged(
     let base = spawn_model_server_with_stalled_response(
         vec![turn_text("first answer"), turn_text("second answer")],
         Duration::from_secs(5),
+        Vec::new(),
     );
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
@@ -2502,6 +2458,97 @@ fn serve_switch_session_rejects_an_ambiguous_prefix_naming_every_candidate() {
             .contains("more than one"),
         "{response:#?}"
     );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_switch_session_response_carries_reasoning_effort_like_its_three_siblings() {
+    // Task 3 (pi-parity fix, serve pass 19): `switch_branch`/`fork`/`clone` all restore whichever
+    // model/thinking-level the target point actually last recorded and echo the result as
+    // `data.reasoning_effort` on their own response — `switch_session` runs the identical restoration
+    // logic (see `Persistence::model_and_level_at_active`) but previously omitted the field from its
+    // response entirely, forcing a client to make a separate `get_state` round trip after
+    // `switch_session` alone. This proves the restored (non-default) level round-trips through the
+    // response directly.
+    let dir = tempfile::tempdir().unwrap();
+    let session_dir = dir.path().join("sessions").to_string_lossy().into_owned();
+    let (base, _bodies) =
+        spawn_model_server(vec![turn_text("first answer"), turn_text("second answer")]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_dir_cmd(bin, &base, &session_dir).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_state");
+    let first_id = frames.last().unwrap()["data"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // `claude-test` supports reasoning and starts at "medium" (see
+    // `serve_switch_branch_resets_thinking_level_instead_of_bleeding_a_sibling_branchs_setting`) — bump
+    // it to a non-default rung, anchored (per `SessionStore::record_thinking_level_change`) at the tip
+    // as of right now.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_reasoning_effort", "effort": "high" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "set_reasoning_effort");
+    assert_eq!(frames.last().unwrap()["success"], true, "{frames:#?}");
+    assert_eq!(frames.last().unwrap()["data"]["level"], "high");
+
+    // A change is anchored *at* the tip it was recorded at, not retroactively covering it
+    // (`SessionStore::change_at` deliberately excludes `target_id` itself — a change takes effect for
+    // whatever comes *after* it, not the point it was recorded at) — so a second turn is needed here to
+    // give the "high" change a real descendant to be visible *at*, the same way
+    // `serve_switch_branch_restores_the_model_active_on_that_branch` does for `switch_branch`.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "confirm" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    // Switch away to a fresh session (starts at the process's own default level, not "high") …
+    writeln!(stdin, "{}", json!({ "type": "new_session" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "new_session");
+    assert_eq!(frames.last().unwrap()["success"], true, "{frames:#?}");
+
+    // … then back to the first session: its own recorded "high" must be restored and echoed directly
+    // on the `switch_session` response, matching `fork`/`clone`/`switch_branch`'s exact response shape.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "switch_session", "session_id": first_id })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "switch_session");
+    let resp = frames.last().unwrap();
+    assert_eq!(resp["success"], true, "{resp:#?}");
+    assert_eq!(
+        resp["data"]["reasoning_effort"], "high",
+        "switch_session must restore and echo the session's own recorded thinking level, matching \
+         fork/clone/switch_branch, without a separate get_state round trip: {resp:#?}"
+    );
+    // The pre-existing fields must still be there too — this is additive, not a replacement.
+    assert_eq!(resp["data"]["session_id"], first_id, "{resp:#?}");
+    assert_eq!(resp["data"]["model"], "claude-test", "{resp:#?}");
+    assert!(resp["data"]["cwd_stale"].is_boolean(), "{resp:#?}");
 
     drop(stdin);
     child.wait().unwrap();

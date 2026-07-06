@@ -294,6 +294,11 @@ pub struct GatewayClient {
     /// ever called from here (see [`with_hooks`](Self::with_hooks)'s doc comment for why the request-side
     /// half of the pair, `before_provider_request`, is instead called from `Agent::run_turn_once`).
     hooks: Option<Arc<dyn AgentHooks>>,
+    /// The live Codex WebSocket transport's connection cache — `Some` for the client's whole lifetime
+    /// unless disabled via [`with_codex_websocket`](Self::with_codex_websocket). One per client (not
+    /// one per request), so a connection persists and gets reused across turns of the same session —
+    /// see `codex_websocket`'s module doc comment.
+    codex_websocket: Option<Arc<crate::codex_websocket::CodexWebSocketCache>>,
 }
 
 impl GatewayClient {
@@ -326,6 +331,7 @@ impl GatewayClient {
             max_backoff: MAX_BACKOFF,
             extra_headers: Arc::new(HashMap::new()),
             hooks: None,
+            codex_websocket: Some(Arc::new(crate::codex_websocket::CodexWebSocketCache::new())),
         })
     }
 
@@ -375,6 +381,24 @@ impl GatewayClient {
     pub fn with_idle_timeout(mut self, timeout: Duration) -> Result<Self> {
         self.http = build_http(timeout)?;
         Ok(self)
+    }
+
+    /// Builder-style: enable/disable the live Codex WebSocket transport for
+    /// `RouteOverride::Prefixed`-routed (OpenAI-Codex-Responses/ChatGPT-subscription) requests — see
+    /// `codex_websocket`'s module doc comment. Defaults to enabled: every Codex-routed turn attempts
+    /// the WebSocket first, transparently falling back to the existing HTTP/SSE path on any
+    /// unavailability or failure (matching pi's own `"auto"` transport default), so an existing caller
+    /// is unaffected either way beyond the (best-case) request-size/latency win. Disabling it here
+    /// only ever restores the exact pre-existing HTTP/SSE-only behavior.
+    ///
+    /// This is an escape hatch, not a supported day-to-day setting — **no CLI/settings surface wires
+    /// it up yet** (out of scope for this round, which doesn't touch `crates/agent`). A later round
+    /// should add one (e.g. a `--codex-transport sse` flag or a `settings.toml` key) only if a real
+    /// operator need for pinning this off by default appears; until then every caller gets the
+    /// WebSocket attempt by default, same as pi's own shipped client.
+    pub fn with_codex_websocket(mut self, enabled: bool) -> Self {
+        self.codex_websocket = enabled.then(|| Arc::new(crate::codex_websocket::CodexWebSocketCache::new()));
+        self
     }
 }
 
@@ -467,7 +491,23 @@ impl ModelTransport for GatewayClient {
         // know (gpt-5.x reasoning-disable suppression, Azure's prompt_cache_retention suppression) —
         // reuses the same signals already computed above rather than adding a third detection path.
         req.is_copilot = via_copilot;
-        req.is_azure = auth_header.as_deref() == Some("api-key");
+        // pi-parity (models/dialects pass, Task C): a static-API-key Azure config sends `auth_header:
+        // "api-key"` (checked first, unchanged), but Entra ID / Azure AD Bearer-token auth configures
+        // `base_url` + `deployment_name` and correctly leaves `auth_header` unset (Bearer *is* the
+        // right scheme there) — the narrower check alone missed that shape entirely, so those requests
+        // never got Azure's own reasoning-disable/prompt-cache-retention suppression at all. Reuses
+        // `DirectRouting::deployment_name` (already populated by `crates/agent/src/gateway_credential
+        // .rs`'s BYO-override branch whenever `ModelOverride::deployment_name` is set — read here via
+        // `credential.direct`, not a new field) rather than adding a second, independent detection path:
+        // `gateway_credential.rs`'s own `is_azure_host`/`over.deployment_name.is_some()` primitive (used
+        // only for its `api-version` query-param gating today) was never reconciled with this flag
+        // until now — this *is* that reconciliation, entirely on the already-existing `DirectRouting`
+        // shape.
+        req.is_azure = auth_header.as_deref() == Some("api-key")
+            || credential
+                .direct
+                .as_ref()
+                .is_some_and(|d| d.deployment_name.is_some());
         // Same `RouteOverride::Prefixed` signal that already picked Codex's own URL/path above — not
         // a second, independent detection path. See `ModelRequest::is_codex`'s own doc comment for the
         // dialect-body branch this feeds.
@@ -475,6 +515,14 @@ impl ModelTransport for GatewayClient {
             credential.direct.as_ref().map(|d| &d.route),
             Some(RouteOverride::Prefixed { .. })
         );
+        // pi-parity (models/dialects pass, Task A): `ModelRequest::host` is the aggregator-platform
+        // analogue of the three flags above — see its own doc comment for why most aggregators (Together/
+        // HuggingFace/Groq/NVIDIA/OpenRouter) aren't wired here yet. Fireworks is the one exception:
+        // it's self-identifying purely from the model id's own shape, already known at this point the
+        // same way `is_codex`/`is_azure`/`is_copilot` are, so there's no reason to wait for the
+        // `crates/agent`-side routing work the other aggregators need.
+        req.host = crate::models::is_fireworks_model(&req.model.to_ascii_lowercase())
+            .then_some(crate::models::AggregatorHost::Fireworks);
         // Anthropic's own OAuth identity-spoofing headers (`CLAUDE_CODE_BETA`/`CLAUDE_CLI_IDENTITY`
         // etc., below) and body shape (Claude Code's identity system prompt, canonical tool-name
         // casing — `dialect::anthropic::build_body`) only apply to a genuine direct-to-Anthropic
@@ -512,6 +560,47 @@ impl ModelTransport for GatewayClient {
                 body = before_hook;
             }
         }
+
+        // Codex-routed requests get one shot at the live WebSocket transport before falling through
+        // to the ordinary HTTP/SSE path below — see `codex_websocket`'s module doc comment for the
+        // full design (connection cache, delta diffing, failure classification). Eager (awaited here,
+        // not deferred into the lazy `try_stream!` below): unlike the SSE path's own laziness, actually
+        // deciding whether to fall back requires knowing the outcome of a real connect/send/first-event
+        // attempt, which `ModelTransport::stream`'s own doc comment already allows ("errors here are
+        // connection/setup failures"). `dialect == Dialect::OpenAiResponses` is a defensive
+        // belt-and-suspenders check alongside `req.is_codex` — every real Codex route is this dialect,
+        // and the module hard-depends on its specific wire/decoder shape.
+        if req.is_codex && dialect == Dialect::OpenAiResponses {
+            if let Some(cache) = self.codex_websocket.clone() {
+                if let Some(ws_url) = crate::codex_websocket::to_ws_url(&url) {
+                    let request_id = req
+                        .cache_key
+                        .clone()
+                        .unwrap_or_else(crate::codex_websocket::generate_request_id);
+                    let ws_headers = crate::codex_websocket::build_headers(
+                        credential.key.expose(),
+                        &direct_headers,
+                        &request_id,
+                    );
+                    match crate::codex_websocket::try_stream(
+                        cache,
+                        ws_url,
+                        ws_headers,
+                        req.cache_key.clone(),
+                        body.clone(),
+                    )
+                    .await
+                    {
+                        crate::codex_websocket::Attempt::Started(stream) => return Ok(stream),
+                        crate::codex_websocket::Attempt::Failed(e) => return Err(e),
+                        // Nothing streamed yet — fall through to the existing HTTP/SSE path below,
+                        // completely unchanged, exactly as if this block didn't exist.
+                        crate::codex_websocket::Attempt::Fallback => {}
+                    }
+                }
+            }
+        }
+
         let tools_for_decoder = req.tools.clone();
         let http = self.http.clone();
         let max_retries = self.max_retries;
@@ -520,6 +609,13 @@ impl ModelTransport for GatewayClient {
         let extra_headers = self.extra_headers.clone();
 
         let is_anthropic = dialect == Dialect::Anthropic;
+        // pi-parity (models/dialects pass, Task D): gated to Fireworks-hosted models specifically, not
+        // every OpenAI-wire-routed request — pi's own `compat.sendSessionAffinityHeaders` is a
+        // per-provider catalogue flag that's only ever `true` for Fireworks (and Cloudflare-related
+        // catalogues, deliberately out of scope — see `is_fireworks_model`'s own callers), never for
+        // native OpenAI/Groq/Together/every other OpenAI-wire provider. Reuses `req.host` (set above
+        // from the same `is_fireworks_model` check) rather than a second, independent detection path.
+        let is_fireworks = req.host == Some(crate::models::AggregatorHost::Fireworks);
         // Both OpenAI wire dialects use this for connection-level session-affinity routing, distinct
         // from `prompt_cache_key`'s cache-node affinity in the body — matches pi's
         // `openai-responses.ts` (`headers["x-client-request-id"] = sessionId`) and
@@ -528,15 +624,16 @@ impl ModelTransport for GatewayClient {
         // opted out of caching (`no_cache`): pinning a one-off request to a specific gateway/cache node
         // makes no sense when it's explicitly not trying to read a cache back, and pi's own dialects
         // gate this the same way `no_cache` gates the body's own `prompt_cache_key`/`cache_control`.
-        let session_affinity_header =
-            (matches!(dialect, Dialect::OpenAiResponses | Dialect::OpenAi) && !req.no_cache)
-                .then_some(req.cache_key.as_deref())
-                .flatten()
-                .map(str::to_string);
+        let session_affinity_header = (matches!(dialect, Dialect::OpenAiResponses | Dialect::OpenAi)
+            && !req.no_cache
+            && is_fireworks)
+            .then_some(req.cache_key.as_deref())
+            .flatten()
+            .map(str::to_string);
         // pi's Chat Completions dialect additionally sends `x-session-affinity` alongside `session_id`
         // and `x-client-request-id` (`openai-completions.ts`'s `compat.sendSessionAffinityHeaders`
         // branch); the Responses dialect never sends it.
-        let send_x_session_affinity = dialect == Dialect::OpenAi;
+        let send_x_session_affinity = dialect == Dialect::OpenAi && is_fireworks;
         let needs_interleaved_beta = needs_interleaved_thinking_beta(&req.model);
         let needs_fine_grained_tool_streaming_beta = !req.tools.is_empty()
             && !crate::models::capabilities_for_route(&req.model, req.is_codex, req.is_azure)
@@ -2326,12 +2423,67 @@ mod tests {
 
     /// A real TCP peer captures the raw request bytes so the test can inspect headers directly — proves
     /// pi's session-affinity headers (`session_id`/`x-client-request-id`/`x-session-affinity`) go out on
-    /// a Chat Completions dialect request too, not just OpenAI Responses. Matches
-    /// `openai-completions.ts`'s `compat.sendSessionAffinityHeaders` branch, exercised by
+    /// a Chat Completions dialect request too, not just OpenAI Responses — but **only for a
+    /// Fireworks-hosted model** (pi-parity, Task D): pi's own `compat.sendSessionAffinityHeaders` is a
+    /// per-provider catalogue flag, true only for Fireworks (and Cloudflare-related catalogues,
+    /// deliberately out of scope), never for every OpenAI-wire provider indiscriminately — see the
+    /// sibling `session_affinity_headers_are_absent_for_a_non_fireworks_chat_completions_request` test
+    /// below for the negative case this fix actually closed. Matches `openai-completions.ts`'s
+    /// `compat.sendSessionAffinityHeaders` branch, exercised by
     /// `packages/ai/test/openai-completions-prompt-cache.test.ts`'s "sends known session-affinity
     /// headers when compat.sendSessionAffinityHeaders is enabled" case.
     #[tokio::test]
-    async fn session_affinity_headers_are_sent_for_chat_completions_dialect_too() {
+    async fn session_affinity_headers_are_sent_for_a_fireworks_chat_completions_request() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let captured_clone = captured.clone();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap();
+            *captured_clone.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let sse = "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                sse.len(),
+                sse
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        });
+
+        let client = GatewayClient::new(format!("http://{addr}"), "test-key").unwrap();
+        // Fireworks' own "glm-5p2" is the one Fireworks id that stays on the Chat Completions dialect
+        // (`Dialect::for_model`'s `is_fireworks_anthropic_wire_model` routes every other current
+        // Fireworks id to the Anthropic dialect instead).
+        let req = ModelRequest::new("accounts/fireworks/models/glm-5p2", Vec::new(), 100)
+            .with_cache_key("session-affinity-test");
+        let mut events = client.stream(req).await.unwrap();
+        let _ = events.next().await;
+        server.join().unwrap();
+
+        let request = captured.lock().unwrap().clone();
+        assert!(
+            request.contains("session_id: session-affinity-test"),
+            "expected a `session_id` header on a Fireworks Chat Completions request, got:\n{request}"
+        );
+        assert!(
+            request.contains("x-client-request-id: session-affinity-test"),
+            "expected an `x-client-request-id` header on a Fireworks Chat Completions request, got:\n{request}"
+        );
+        assert!(
+            request.contains("x-session-affinity: session-affinity-test"),
+            "expected an `x-session-affinity` header on a Fireworks Chat Completions request, got:\n{request}"
+        );
+    }
+
+    /// pi-parity (models/dialects pass, Task D): the headers must be gated to Fireworks specifically —
+    /// a plain OpenAI-compatible provider (Groq, here) must never get them, even with an otherwise
+    /// identical cache key and no `no_cache` opt-out. Before this fix, every Chat-Completions-routed
+    /// provider got these headers indiscriminately.
+    #[tokio::test]
+    async fn session_affinity_headers_are_absent_for_a_non_fireworks_chat_completions_request() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
@@ -2353,7 +2505,7 @@ mod tests {
 
         let client = GatewayClient::new(format!("http://{addr}"), "test-key").unwrap();
         // `llama-3.1-70b` resolves to `Dialect::OpenAi` (Chat Completions) — a third-party
-        // OpenAI-compatible provider, not native OpenAI Responses.
+        // OpenAI-compatible provider (Groq), not Fireworks.
         let req = ModelRequest::new("llama-3.1-70b", Vec::new(), 100)
             .with_cache_key("session-affinity-test");
         let mut events = client.stream(req).await.unwrap();
@@ -2362,16 +2514,16 @@ mod tests {
 
         let request = captured.lock().unwrap().clone();
         assert!(
-            request.contains("session_id: session-affinity-test"),
-            "expected a `session_id` header on a Chat Completions request, got:\n{request}"
+            !request.contains("session_id:"),
+            "expected no `session_id` header on a non-Fireworks request, got:\n{request}"
         );
         assert!(
-            request.contains("x-client-request-id: session-affinity-test"),
-            "expected an `x-client-request-id` header on a Chat Completions request, got:\n{request}"
+            !request.contains("x-client-request-id:"),
+            "expected no `x-client-request-id` header on a non-Fireworks request, got:\n{request}"
         );
         assert!(
-            request.contains("x-session-affinity: session-affinity-test"),
-            "expected an `x-session-affinity` header on a Chat Completions request, got:\n{request}"
+            !request.contains("x-session-affinity:"),
+            "expected no `x-session-affinity` header on a non-Fireworks request, got:\n{request}"
         );
     }
 
@@ -2379,7 +2531,9 @@ mod tests {
     /// the cache-control blocks — otherwise a request that explicitly opted out of prompt caching still
     /// pins itself to a specific backend session, defeating the purpose of the opt-out. Matches pi's
     /// `compat.sendSessionAffinityHeaders` gating, which never fires when caching is disabled for the
-    /// request.
+    /// request. Uses a Fireworks-hosted id so this test proves genuine `no_cache` suppression on an
+    /// otherwise-eligible route, not just "a non-Fireworks route never gets them anyway" (see the
+    /// dedicated negative test above for that).
     #[tokio::test]
     async fn session_affinity_headers_are_suppressed_when_no_cache_is_set() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2402,7 +2556,7 @@ mod tests {
         });
 
         let client = GatewayClient::new(format!("http://{addr}"), "test-key").unwrap();
-        let req = ModelRequest::new("llama-3.1-70b", Vec::new(), 100)
+        let req = ModelRequest::new("accounts/fireworks/models/glm-5p2", Vec::new(), 100)
             .with_cache_key("session-affinity-test")
             .with_no_cache(true);
         let mut events = client.stream(req).await.unwrap();
@@ -2545,7 +2699,13 @@ mod tests {
             format!("http://{addr}"),
             Arc::new(DirectTestCredential(routing)),
         )
-        .unwrap();
+        .unwrap()
+        // This test's one-shot mock server only ever accepts a single plain-HTTP connection and
+        // asserts on the exact request line/headers it receives — it has nothing to do with the
+        // Codex WebSocket transport (a separate, dedicated suite covers that in
+        // `tests/codex_websocket_socket.rs`), so disable it here rather than let an eager WS connect
+        // attempt consume this listener's only accepted connection before the real HTTP request does.
+        .with_codex_websocket(false);
         // `gpt-5-codex` is `Dialect::OpenAiResponses` — its bare default path is `/v1/responses`,
         // which must NOT be what actually goes out.
         let req = ModelRequest::new("gpt-5-codex", Vec::new(), 100);
@@ -2916,6 +3076,69 @@ mod tests {
         );
     }
 
+    /// pi-parity (models/dialects pass, Task C): an Entra ID / Azure AD Bearer-token config sends a
+    /// real Bearer token (`auth_header: None` — Bearer *is* correct there) but still names a
+    /// `deployment_name`, unlike the static-API-key Azure shape the sibling test above exercises
+    /// (`auth_header: Some("api-key")`). Before this fix, `req.is_azure` stayed `false` for this shape
+    /// entirely, so `gpt-5.1` (one of the 7 ids Azure's own catalogue doesn't support an explicit
+    /// reasoning-"off" wire value for) would incorrectly send the native `{"effort":"none"}` signal.
+    #[tokio::test]
+    async fn entra_id_shaped_config_with_only_deployment_name_still_suppresses_reasoning_disable() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+            drop(stream);
+            request
+        });
+
+        let routing = DirectRouting {
+            route: RouteOverride::Direct {
+                base_url: format!("http://{addr}/openai/v1"),
+                path: "/responses",
+            },
+            static_headers: Vec::new(),
+            copilot_dynamic_headers: false,
+            // Entra ID's real shape: a Bearer token (no `auth_header` override) plus a deployment name
+            // — the signal `is_azure` used to miss entirely.
+            auth_header: None,
+            auth_header_prefix: None,
+            dialect_override: None,
+            deployment_name: Some("my-gpt-5-1-deployment".to_string()),
+            query: None,
+        };
+        let client = GatewayClient::with_credential_source(
+            "http://127.0.0.1:1".to_string(),
+            Arc::new(DirectTestCredential(routing)),
+        )
+        .unwrap();
+        // gpt-5.1 is one of the 7 `NOT_DISABLEABLE_OFF_NATIVE_ROUTE` ids (`models.rs`) — natively
+        // disable-capable, but Azure's own catalogue doesn't support an explicit "off" wire value.
+        let req = ModelRequest::new("gpt-5.1", vec![crate::message::Message::user("hi")], 100);
+        let mut events = client.stream(req).await.unwrap();
+        while events.next().await.is_some() {}
+
+        let request = server.join().unwrap();
+        assert!(
+            !request.contains("\"reasoning\""),
+            "Entra-ID-routed gpt-5.1 must not get an explicit reasoning-disable signal at all, got:\n{request}"
+        );
+        // Sanity check: the Bearer header is still sent as normal (Entra ID's real auth scheme,
+        // unaffected by the `is_azure` fix — only `DirectRouting::auth_header` controls that).
+        assert!(
+            request.to_ascii_lowercase().contains("authorization: bearer"),
+            "Entra ID auth must still use a normal Bearer header, got:\n{request}"
+        );
+    }
+
     /// Proves the [`DirectRouting::auth_header`] mechanism (Task #8, pi-parity: Azure OpenAI
     /// routing support). A route that sets `auth_header: Some("api-key")` must send the credential's
     /// key verbatim in that header, with **no** `Authorization` header at all — Azure's
@@ -3095,7 +3318,11 @@ mod tests {
             format!("http://{addr}"),
             Arc::new(DirectTestCredential(routing)),
         )
-        .unwrap();
+        .unwrap()
+        // Same reason as `prefixed_route_override_reaches_the_gateway_under_the_provider_prefix_with_
+        // static_headers` above: a one-shot mock server with no WS handling of its own, testing the
+        // HTTP/SSE wire shape specifically.
+        .with_codex_websocket(false);
         let req = ModelRequest::new("gpt-5-codex", vec![crate::message::Message::user("hi")], 100)
             .with_system("be terse");
         let mut events = client.stream(req).await.unwrap();

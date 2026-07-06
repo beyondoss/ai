@@ -1161,3 +1161,104 @@ fn run_binary_project_settings_missing_or_malformed_degrades_to_global_only() {
         "a malformed project settings.json must degrade to global-only: {bodies2:#?}"
     );
 }
+
+#[test]
+fn serve_binary_stored_steering_mode_and_follow_up_mode_seed_a_fresh_processs_initial_state() {
+    // Task 1 (pi-parity fix, pass 19): `steering_mode`/`follow_up_mode` have no `agent settings`
+    // CLI-flag setter of their own — they're persisted by `serve`'s own `set_steering_mode`/
+    // `set_follow_up_mode` RPC commands (`settings::Settings::steering_mode`'s own doc comment) — but
+    // until this pass, nothing on `serve`'s *startup* path ever read that persisted value back: every
+    // fresh `serve` process silently started at `QueueMode::default()` (`one_at_a_time` for both lanes)
+    // regardless of what a previous session had persisted. Reproduced here as two successive `serve`
+    // processes sharing the same `HOME` (so they share the same settings store): the first persists
+    // non-default modes for both lanes via the RPC commands; the second, started with neither
+    // `--steering-mode` nor `--follow-up-mode`, must start already reflecting them.
+    let home = tempfile::tempdir().unwrap();
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let session_file = dir.path().join("s1.jsonl").to_string_lossy().into_owned();
+        let (base, _bodies) = spawn_model_server(vec![]);
+        let mut child = Command::new(bin)
+            .args([
+                "serve",
+                "--gateway-url",
+                &base,
+                "--key",
+                "bai_v1.test",
+                "--session-file",
+                &session_file,
+            ])
+            .env("HOME", home.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+        writeln!(
+            stdin,
+            "{}",
+            json!({ "type": "set_steering_mode", "mode": "all" })
+        )
+        .unwrap();
+        stdin.flush().unwrap();
+        let frames = common::read_until_response(&mut stdout, "set_steering_mode");
+        assert_eq!(frames.last().unwrap()["success"], true, "{frames:#?}");
+
+        writeln!(
+            stdin,
+            "{}",
+            json!({ "type": "set_follow_up_mode", "mode": "all" })
+        )
+        .unwrap();
+        stdin.flush().unwrap();
+        let frames = common::read_until_response(&mut stdout, "set_follow_up_mode");
+        assert_eq!(frames.last().unwrap()["success"], true, "{frames:#?}");
+
+        drop(stdin);
+        child.wait().unwrap();
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s2.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![]);
+    let mut child = Command::new(bin)
+        .args([
+            "serve",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--session-file",
+            &session_file,
+        ])
+        .env("HOME", home.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = common::read_until_response(&mut stdout, "get_state");
+    let data = &frames.last().unwrap()["data"];
+    assert_eq!(
+        data["steering_mode"], "all",
+        "a fresh serve process must start from the persisted steering_mode default, not \
+         QueueMode::default(): {data:#?}"
+    );
+    assert_eq!(
+        data["follow_up_mode"], "all",
+        "a fresh serve process must start from the persisted follow_up_mode default too: {data:#?}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}

@@ -24,6 +24,12 @@ clap.workspace = true
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# `skills.rs`'s `SKILL.md`/prompt-template frontmatter parsing — a real YAML parser instead of a
+# hand-rolled subset, so quoting/escaping/comments/flow-collections/anchors are handled the way the
+# YAML spec (and every other tool reading these files) actually defines them. Already resolved
+# transitively at this exact version (pingora-core → crates/gateway) — this crate depending on it
+# directly adds nothing to the build graph.
+serde_yaml = "0.9"
 thiserror.workspace = true
 tokio.workspace = true
 # Login cancellation (`oauth`'s device-code poll / callback-server wait) — same primitive `agent_core`

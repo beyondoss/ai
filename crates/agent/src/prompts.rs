@@ -614,12 +614,29 @@ fn parse_index(s: &str) -> Option<usize> {
 /// [`parse_index`] (used for `$N`/`${N:-default}`, where a positional `$0` has no meaning and stays
 /// empty), a slice start is always a valid index, so `saturating_sub` clamps instead of failing.
 fn parse_slice_start(s: &str) -> Option<usize> {
-    let n: usize = s.parse().ok()?;
-    Some(n.saturating_sub(1))
+    Some(parse_digits_saturating(s)?.saturating_sub(1))
 }
 
 fn parse_usize(s: &str) -> Option<usize> {
-    s.parse().ok()
+    parse_digits_saturating(s)
+}
+
+/// Parse a pure-ASCII-digit string into a `usize`, saturating to `usize::MAX` on overflow instead of
+/// failing outright. `${@:N}`/`${@:N:L}` is untrusted `.claude/prompts/*.md` content, and a pathological
+/// N/L (≥20 digits — more than even `u64::MAX`) used to make `.parse::<usize>()` return `Err`, which
+/// `expand_brace` treated as "not a match at all", leaving the whole `${@:N}` placeholder as literal
+/// text. pi's own `parseInt` never fails on a huge (if precision-lossy) digit string, and
+/// `Array.prototype.slice` clamps a huge index to "past the end" naturally — a `${@:N}` this huge is
+/// never a real argument count, so clamping to `usize::MAX` here (the largest index [`expand_brace`]'s
+/// own `.get(start..)`/`.min(args.len())` calls can see, i.e. "past the end of any real `args`") mirrors
+/// that clamp instead of leaving the placeholder untouched. A string that isn't purely ASCII digits at
+/// all (empty, or containing a non-digit byte) still returns `None`, unchanged from before — this only
+/// changes the *overflow* case, not what counts as digits in the first place.
+fn parse_digits_saturating(s: &str) -> Option<usize> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(s.parse().unwrap_or(usize::MAX))
 }
 
 /// The run of leading ASCII digits in `s`, or `None` if it doesn't start with a digit.
@@ -1194,6 +1211,21 @@ mod tests {
         let t = template("slice=[${@:1:18446744073709551615}]");
         let expanded = expand_if_slash("/x a b c", &[t]);
         assert_eq!(expanded, "slice=[a b c]");
+    }
+
+    #[test]
+    fn array_slice_start_with_an_overflowing_digit_string_clamps_to_empty_not_literal() {
+        // pi-parity fix (found pass 19): a ≥20-digit `${@:N}` index overflows even `u64`/`usize`
+        // (`u64::MAX` is a 20-digit number), so `s.parse::<usize>()` returned `Err` — `parse_slice_start`
+        // treated that as "not a match at all", falling through to `expand_brace`'s literal-placeholder
+        // fallback and leaving the whole `${@:N}` placeholder as untouched text. pi's own `parseInt` on
+        // the same input yields a large-but-finite (if precision-lossy) JS number, and
+        // `args.slice(hugeNumber)` clamps naturally to an empty slice — this matches that effective
+        // behavior (clamping to `usize::MAX`, "larger than any real arg count") instead of leaving the
+        // placeholder literal.
+        let t = template("slice=[${@:99999999999999999999}]");
+        let expanded = expand_if_slash("/x a b c", &[t]);
+        assert_eq!(expanded, "slice=[]");
     }
 
     #[test]

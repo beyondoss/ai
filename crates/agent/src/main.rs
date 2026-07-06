@@ -133,17 +133,32 @@ fn default_system_prompt(
     )
 }
 
-/// Parse `--reasoning-effort`'s value into the wire-neutral [`agent_core::ReasoningEffort`] enum.
-fn parse_reasoning_effort(s: &str) -> Result<agent_core::ReasoningEffort, String> {
-    use agent_core::ReasoningEffort::*;
+/// Parse `--reasoning-effort`'s value into the wire-neutral [`agent_core::ThinkingLevel`] — the same
+/// off-inclusive portable depth `--model <pattern>:<level>`'s suffix and the RPC-facing
+/// `set_reasoning_effort`/`set_thinking` commands already parse via `ThinkingLevel::parse`. Task 2
+/// (pi-parity fix, pass 19): previously returned `agent_core::ReasoningEffort` (no `Off` variant at
+/// all), so `"off"` was a hard clap error here even though pi's own `--thinking off` and this crate's
+/// own RPC toggle both already treat it as a first-class, explicit "disable reasoning" request — the
+/// only workaround was the unrelated `--model <pattern>:off` colon-suffix shorthand. A caller that needs
+/// the wire-level `ReasoningEffort` (`None` for `Off`) converts via `ThinkingLevel::reasoning_effort`
+/// once every other candidate source (CLI flag, model suffix, stored setting) has had its turn — see
+/// `run_task`'s/`Command::Serve`'s own resolution chains.
+fn parse_reasoning_effort(s: &str) -> Result<agent_core::ThinkingLevel, String> {
+    agent_core::ThinkingLevel::parse(s).ok_or_else(|| {
+        format!("invalid reasoning effort {s:?}; expected one of off/minimal/low/medium/high/xhigh")
+    })
+}
+
+/// Parse `--steering-mode`/`--follow-up-mode`'s value into [`agent_core::QueueMode`] — the exact same
+/// wire vocabulary (`"one_at_a_time"`/`"all"`) `serve`'s own `set_steering_mode`/`set_follow_up_mode` RPC
+/// commands already accept (see `serve.rs`'s module doc comment), reused here rather than inventing a
+/// second, divergent spelling for the same setting.
+fn parse_queue_mode(s: &str) -> Result<agent_core::QueueMode, String> {
     match s {
-        "minimal" => Ok(Minimal),
-        "low" => Ok(Low),
-        "medium" => Ok(Medium),
-        "high" => Ok(High),
-        "xhigh" => Ok(XHigh),
+        "one_at_a_time" => Ok(agent_core::QueueMode::OneAtATime),
+        "all" => Ok(agent_core::QueueMode::All),
         other => Err(format!(
-            "invalid reasoning effort {other:?}; expected one of minimal/low/medium/high/xhigh"
+            "invalid queue mode {other:?}; expected one of one_at_a_time/all"
         )),
     }
 }
@@ -153,14 +168,24 @@ fn parse_reasoning_effort(s: &str) -> Result<agent_core::ReasoningEffort, String
 /// needs (Task #36, pi-parity feature) — an unrecognized key (a hand-edited typo in `settings.json`) is
 /// skipped rather than failing the whole lookup, matching this crate's usual "corrupt/unknown persisted
 /// value degrades to not-set" convention (see `default_reasoning_effort`'s identical precedent above).
-/// `None` when no table is configured at all, or every entry in it was unrecognized.
+/// `None` when no table is configured at all, or every entry in it was unrecognized. `parse_reasoning_effort`
+/// now also accepts `"off"` (Task 2, pi-parity fix) — an `off=<tokens>` entry parses fine but is dropped
+/// here (`ThinkingLevel::Off.reasoning_effort()` is `None`, filtered out by the trailing `and_then`) since
+/// a token-budget override keyed on "no reasoning at all" has nothing to ever apply to; harmless, and
+/// consistent with this same "unrecognized/inapplicable degrades to not-set" convention rather than a
+/// second, diverging validator.
 fn resolve_thinking_budget_overrides(
     settings: &beyond_ai_agent::settings::Settings,
 ) -> Option<std::collections::HashMap<agent_core::ReasoningEffort, u32>> {
     let table = settings.thinking_budget_overrides.as_ref()?;
     let map: std::collections::HashMap<agent_core::ReasoningEffort, u32> = table
         .iter()
-        .filter_map(|(k, v)| parse_reasoning_effort(k).ok().map(|effort| (effort, *v)))
+        .filter_map(|(k, v)| {
+            parse_reasoning_effort(k)
+                .ok()
+                .and_then(|level| level.reasoning_effort())
+                .map(|effort| (effort, *v))
+        })
         .collect();
     (!map.is_empty()).then_some(map)
 }
@@ -315,13 +340,33 @@ enum Command {
         thinking: Option<u32>,
         /// Reasoning effort for models driven by an effort level rather than a token budget (OpenAI
         /// reasoning models via `reasoning_effort`; Anthropic adaptive-thinking models via
-        /// `output_config.effort`). One of minimal/low/medium/high/xhigh — see `--thinking` for a raw
-        /// token-budget override instead. Ignored by models that take neither shape. Falls back to
+        /// `output_config.effort`). One of off/minimal/low/medium/high/xhigh — see `--thinking` for a
+        /// raw token-budget override instead. Ignored by models that take neither shape. Falls back to
         /// `AI_AGENT_REASONING_EFFORT`, then the stored `agent settings --default-reasoning-effort`
         /// default (Fix 2 — pi-parity gap: previously the only numeric/string CLI tunable with no
-        /// persisted-default fallback at all), before finally leaving it unset. `serve`'s identical flag.
+        /// persisted-default fallback at all), before finally leaving it unset. Task 2 (pi-parity fix,
+        /// pass 19): `off` is now accepted too, explicitly disabling reasoning — previously the only way
+        /// to do that from a startup flag was the unrelated `--model <pattern>:off` colon-suffix
+        /// shorthand. `serve`'s identical flag.
         #[arg(long, env = "AI_AGENT_REASONING_EFFORT", value_parser = parse_reasoning_effort)]
-        reasoning_effort: Option<agent_core::ReasoningEffort>,
+        reasoning_effort: Option<agent_core::ThinkingLevel>,
+        /// How much of the mid-run *steer* lane a single drain point consumes per turn boundary
+        /// (`agent_core::QueueMode`) — `one_at_a_time` (the default, matching pi) injects only the oldest
+        /// queued message per drain, leaving the rest queued for the next one; `all` folds everything
+        /// queued into a single injection (this crate's original behavior). Task 1 (pi-parity fix, pass
+        /// 19): `run` has no way to actually queue a steer message mid-invocation today (its `tasks` list
+        /// runs as separate, sequential turns — see `tasks`'s own doc comment — not steer injections), so
+        /// this has no observable effect yet; wired through anyway for parity with `serve`'s identical
+        /// flag and pi's own persisted `steeringMode`, which applies at agent/session construction time
+        /// in every mode, not just its TUI. Falls back to the persisted setting `serve`'s own
+        /// `set_steering_mode` RPC command maintains (`settings::Settings::steering_mode`), before
+        /// finally defaulting to `one_at_a_time`.
+        #[arg(long, env = "AI_AGENT_STEERING_MODE", value_parser = parse_queue_mode)]
+        steering_mode: Option<agent_core::QueueMode>,
+        /// Same idea as `--steering-mode`, for the follow-up lane drained at a stop boundary (plus any
+        /// stranded steer messages swept in there) — matches pi's own separate `followUpMode`.
+        #[arg(long, env = "AI_AGENT_FOLLOW_UP_MODE", value_parser = parse_queue_mode)]
+        follow_up_mode: Option<agent_core::QueueMode>,
         /// Sampling temperature. Omitted (leaving the provider default) unless set. Silently ignored by
         /// Anthropic while `--thinking` is set (Anthropic forbids the two together). `serve`'s identical
         /// flag.
@@ -673,12 +718,27 @@ enum Command {
         thinking: Option<u32>,
         /// Reasoning effort for models driven by an effort level rather than a token budget (OpenAI
         /// reasoning models via `reasoning_effort`; Anthropic adaptive-thinking models via
-        /// `output_config.effort`). One of minimal/low/medium/high/xhigh — see `--thinking` for a raw
-        /// token-budget override instead. Ignored by models that take neither shape. Falls back to
+        /// `output_config.effort`). One of off/minimal/low/medium/high/xhigh — see `--thinking` for a
+        /// raw token-budget override instead. Ignored by models that take neither shape. Falls back to
         /// `AI_AGENT_REASONING_EFFORT`, then the stored `agent settings --default-reasoning-effort`
-        /// default, before finally leaving it unset. `run`'s identical flag.
+        /// default, before finally leaving it unset. Task 2 (pi-parity fix, pass 19): `off` is now
+        /// accepted too, explicitly disabling reasoning. `run`'s identical flag.
         #[arg(long, env = "AI_AGENT_REASONING_EFFORT", value_parser = parse_reasoning_effort)]
-        reasoning_effort: Option<agent_core::ReasoningEffort>,
+        reasoning_effort: Option<agent_core::ThinkingLevel>,
+        /// How much of the mid-run *steer* lane a single drain point consumes per turn boundary
+        /// (`agent_core::QueueMode`) — `one_at_a_time` (the default, matching pi) injects only the oldest
+        /// queued message per drain, leaving the rest queued for the next one; `all` folds everything
+        /// queued into a single injection (this crate's original behavior). Falls back to the persisted
+        /// setting `serve`'s own `set_steering_mode` RPC command maintains
+        /// (`settings::Settings::steering_mode`), before finally defaulting to `one_at_a_time`. `run`'s
+        /// identical flag.
+        #[arg(long, env = "AI_AGENT_STEERING_MODE", value_parser = parse_queue_mode)]
+        steering_mode: Option<agent_core::QueueMode>,
+        /// Same idea as `--steering-mode`, for the follow-up lane drained at a stop boundary (plus any
+        /// stranded steer messages swept in there) — matches pi's own separate `followUpMode`. `run`'s
+        /// identical flag.
+        #[arg(long, env = "AI_AGENT_FOLLOW_UP_MODE", value_parser = parse_queue_mode)]
+        follow_up_mode: Option<agent_core::QueueMode>,
         /// Sampling temperature. Omitted (leaving the provider default) unless set. Silently ignored by
         /// Anthropic while `--thinking` is set (Anthropic forbids the two together). `run`'s identical
         /// flag.
@@ -946,12 +1006,14 @@ enum Command {
         /// Clear the stored default project-trust policy.
         #[arg(long, default_value_t = false)]
         clear_default_project_trust: bool,
-        /// Set the stored default reasoning effort — one of minimal/low/medium/high/xhigh (used when
-        /// neither `--reasoning-effort` nor `AI_AGENT_REASONING_EFFORT` is given). Fix 2 (pi-parity
-        /// gap): previously the only numeric/string CLI tunable with no persisted-default surface at
-        /// all, unlike `--model`/`--gateway-url`/`--session-dir` above.
+        /// Set the stored default reasoning effort — one of off/minimal/low/medium/high/xhigh (used when
+        /// neither `--reasoning-effort` nor `AI_AGENT_REASONING_EFFORT` is given; Task 2, pi-parity fix,
+        /// pass 19: `off` is now accepted here too, explicitly persisting "no reasoning" as the default
+        /// rather than a parse error). Fix 2 (pi-parity gap): previously the only numeric/string CLI
+        /// tunable with no persisted-default surface at all, unlike `--model`/`--gateway-url`/
+        /// `--session-dir` above.
         #[arg(long, value_parser = parse_reasoning_effort)]
-        default_reasoning_effort: Option<agent_core::ReasoningEffort>,
+        default_reasoning_effort: Option<agent_core::ThinkingLevel>,
         /// Clear the stored default reasoning effort.
         #[arg(long, default_value_t = false)]
         clear_default_reasoning_effort: bool,
@@ -1320,6 +1382,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cache_long,
             thinking,
             reasoning_effort,
+            steering_mode,
+            follow_up_mode,
             temperature,
             system_prompt,
             append_system_prompt,
@@ -1373,6 +1437,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cache_long,
                 thinking,
                 reasoning_effort,
+                steering_mode,
+                follow_up_mode,
                 temperature,
                 system_prompt,
                 append_system_prompt,
@@ -1435,6 +1501,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cache_long,
             thinking,
             reasoning_effort,
+            steering_mode,
+            follow_up_mode,
             temperature,
             trust_project,
             force_untrusted,
@@ -1611,18 +1679,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut reasoning_effort = reasoning_effort;
             if !reasoning_effort_explicit {
                 if let Some(level) = model_thinking_level {
-                    reasoning_effort = level.reasoning_effort();
+                    reasoning_effort = Some(level);
                     reasoning_effort_explicit = true;
                 }
             }
             // Fix 2 (pi-parity gap): `run`'s identical stored-default fallback for `--reasoning-effort`
-            // — see that call site's doc comment.
-            let reasoning_effort = reasoning_effort.or_else(|| {
-                stored_settings
-                    .default_reasoning_effort
-                    .as_deref()
-                    .and_then(|s| parse_reasoning_effort(s).ok())
-            });
+            // — see that call site's doc comment. Converted from the portable `ThinkingLevel` (off
+            // included) down to the wire-level `ReasoningEffort` (`None` for `Off`) only at the very
+            // end, once every candidate source (flag, model suffix, stored setting) has had its turn —
+            // Task 2 (pi-parity fix, pass 19): `off` is now a legal value at each of those layers, not
+            // just the `--model <pattern>:off` suffix.
+            let reasoning_effort = reasoning_effort
+                .or_else(|| {
+                    stored_settings
+                        .default_reasoning_effort
+                        .as_deref()
+                        .and_then(|s| parse_reasoning_effort(s).ok())
+                })
+                .and_then(|level| level.reasoning_effort());
+            // Task 1 (pi-parity fix, pass 19): same "explicit flag/env, then stored setting, then
+            // built-in default" precedence as every other `stored_settings`-backed fallback here —
+            // matches `run_task`'s identical resolution just below in this file (which does construct a
+            // `Steering` with it, since `run` — unlike `serve` — has no live RPC to (re)apply it later).
+            // `ServeConfig::steering_mode`/`follow_up_mode` carry these through to `serve()`, which
+            // applies them via `steering.set_steering_mode`/`set_follow_up_mode` right after
+            // `Steering::new()` — the `set_steering_mode`/`set_follow_up_mode` RPC commands can still
+            // change them at runtime afterward, same as before.
+            let steering_mode = steering_mode
+                .or_else(|| {
+                    stored_settings
+                        .steering_mode
+                        .as_deref()
+                        .and_then(|s| parse_queue_mode(s).ok())
+                })
+                .unwrap_or_default();
+            let follow_up_mode = follow_up_mode
+                .or_else(|| {
+                    stored_settings
+                        .follow_up_mode
+                        .as_deref()
+                        .and_then(|s| parse_queue_mode(s).ok())
+                })
+                .unwrap_or_default();
             let resolved_session_dir = session_dir.or_else(|| {
                 // Only synthesize a stored default when *neither* explicit flag was given —
                 // `Persistence::open` checks `session_dir` before `session_file`, so filling in a
@@ -1689,6 +1787,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // though `run` above already partially honored it — see `serve::resolve_project_trust`,
                 // the shared precedence both now consult.
                 default_project_trust: stored_settings.default_project_trust,
+                steering_mode,
+                follow_up_mode,
             })
             .await?;
             // `serve` reads stdin via `tokio::io::stdin()`, which parks a dedicated blocking OS
@@ -2270,11 +2370,23 @@ fn looks_like_image(path: &Path) -> bool {
 /// built a bare `tools::read::Read::default()` with no awareness of either, so a CLI attachment's
 /// images spliced straight into the first `Message` regardless of `--block-images`, at their original
 /// size regardless of `--no-image-auto-resize`.
+///
+/// `model_supports_vision` (Task 3, pi-parity fix, pass 19) is the active model's real
+/// `agent_core::models::capabilities(&model).supports_vision`, resolved by the caller (`run_task`
+/// resolves it before this is ever called — see that call site's own doc comment for why the model must
+/// be resolved first). ANDed with `!block_images` below, exactly like the model-issued `read` tool-call
+/// dispatch path in `agent_core::agent` already does — previously this omitted the real capability
+/// entirely (`_model_supports_vision: !block_images`), so a non-vision model with `block_images` left at
+/// its default (`false`) got a CLI attachment dispatched claiming vision support it didn't have, and
+/// `read.rs` never appended its non-vision-image explanatory note the way an equivalent model-issued call
+/// would have (cosmetic only: the wire-level dialect filter still stripped the image correctly before it
+/// ever reached the provider).
 async fn read_file_refs(
     file_refs: &[String],
     cwd: &Path,
     block_images: bool,
     image_auto_resize: bool,
+    model_supports_vision: bool,
 ) -> Result<FileRefs, Box<dyn std::error::Error>> {
     read_file_refs_with_home(
         file_refs,
@@ -2282,6 +2394,7 @@ async fn read_file_refs(
         std::env::var("HOME").ok().as_deref(),
         block_images,
         image_auto_resize,
+        model_supports_vision,
     )
     .await
 }
@@ -2296,6 +2409,7 @@ async fn read_file_refs_with_home(
     home: Option<&str>,
     block_images: bool,
     image_auto_resize: bool,
+    model_supports_vision: bool,
 ) -> Result<FileRefs, Box<dyn std::error::Error>> {
     let mut text = String::new();
     let mut images = Vec::new();
@@ -2320,17 +2434,21 @@ async fn read_file_refs_with_home(
         if looks_like_image(&path) {
             let path_str = path.to_string_lossy().into_owned();
             // Tasks #35/#36: `with_image_auto_resize` matches the registry's own construction
-            // (`tools::default_registry_with_prefix_and_image_auto_resize`); `_model_supports_vision:
-            // !block_images` is the same schema-undocumented input field `agent_core::agent`'s
-            // tool-dispatch loop injects before a model-issued `read` call (see `Read::run`'s own doc
-            // comment) — reused here so `--block-images` downgrades a CLI attachment through the exact
-            // same path (image dropped, `NON_VISION_IMAGE_NOTE` appended) rather than a second,
-            // divergent implementation.
+            // (`tools::default_registry_with_prefix_and_image_auto_resize`); `_model_supports_vision` is
+            // the same schema-undocumented input field `agent_core::agent`'s tool-dispatch loop injects
+            // before a model-issued `read` call (see `Read::run`'s own doc comment) — reused here so
+            // `--block-images` downgrades a CLI attachment through the exact same path (image dropped,
+            // `NON_VISION_IMAGE_NOTE` appended) rather than a second, divergent implementation. Task 3
+            // (pi-parity fix, pass 19): ANDs in the real `model_supports_vision` capability too, matching
+            // the model-issued dispatch path's own `capabilities(&self.model).supports_vision &&
+            // !this.block_images` — previously this was `!block_images` alone, so a non-vision model
+            // (with `block_images` at its default `false`) got a CLI attachment dispatched as if the
+            // model supported vision.
             let out = tools::read::Read::default()
                 .with_image_auto_resize(image_auto_resize)
                 .run(serde_json::json!({
                     "path": path_str,
-                    "_model_supports_vision": !block_images,
+                    "_model_supports_vision": model_supports_vision && !block_images,
                 }))
                 .await
                 .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
@@ -2447,10 +2565,11 @@ async fn run_turn(
     cancel: &agent_core::CancellationToken,
     retry_policy: &beyond_ai_agent::retry::RunRetryPolicy,
     broken_pipe: &AtomicBool,
+    steering: &agent_core::Steering,
 ) -> agent_core::Result<agent_core::StopReason> {
     let mut attempt = 0u32;
     loop {
-        let result = run_turn_once(agent, session, json, cancel, broken_pipe).await;
+        let result = run_turn_once(agent, session, json, cancel, broken_pipe, steering).await;
         match &result {
             Err(e)
                 if attempt < retry_policy.max_retries
@@ -2538,11 +2657,12 @@ async fn run_turn_once(
     json: bool,
     cancel: &agent_core::CancellationToken,
     broken_pipe: &AtomicBool,
+    steering: &agent_core::Steering,
 ) -> agent_core::Result<agent_core::StopReason> {
     let mut stop_reason = agent_core::StopReason::default();
     if json {
         agent
-            .run_events_cancellable(
+            .run_events_steered(
                 session,
                 |ev| {
                     if let agent_core::AgentEvent::TurnEnd { stop_reason: r, .. } = &ev {
@@ -2554,33 +2674,45 @@ async fn run_turn_once(
                     }
                 },
                 cancel.clone(),
+                steering.clone(),
             )
             .await?;
         return Ok(stop_reason);
     }
+    // Task 1 (pi-parity fix, pass 19): `run_events_steered` directly (rather than the plain
+    // `run_cancellable`, which always builds its own default `Steering::new()` internally), so `run`'s
+    // own resolved `steering_mode`/`follow_up_mode` (see `run_task`'s construction of `steering`) is
+    // actually in effect at agent/session construction time, matching pi's own agent construction in
+    // every mode — same `AgentEvent::Stream` filter `Agent::run_cancellable` itself applies internally.
     agent
-        .run_cancellable(
+        .run_events_steered(
             session,
-            |ev| match ev {
-                StreamEvent::TextDelta { text, .. } => {
-                    write_stdout_or_exit(text, cancel, broken_pipe);
+            |ev| {
+                let agent_core::AgentEvent::Stream(ev) = &ev else {
+                    return;
+                };
+                match ev {
+                    StreamEvent::TextDelta { text, .. } => {
+                        write_stdout_or_exit(text, cancel, broken_pipe);
+                    }
+                    StreamEvent::ToolUseStart { name, .. } => {
+                        // No trailing newline: `InputJsonDelta` fragments print immediately after, live,
+                        // on this same line — a growing preview of the call's arguments as they stream
+                        // in, rather than the model appearing to hang until the whole call (and its
+                        // result) land.
+                        write_stdout_or_exit(&format!("\n[tool: {name}] "), cancel, broken_pipe);
+                    }
+                    StreamEvent::InputJsonDelta { partial_json, .. } => {
+                        write_stdout_or_exit(partial_json, cancel, broken_pipe);
+                    }
+                    StreamEvent::MessageStop { stop_reason: r } => {
+                        stop_reason = *r;
+                    }
+                    _ => {}
                 }
-                StreamEvent::ToolUseStart { name, .. } => {
-                    // No trailing newline: `InputJsonDelta` fragments print immediately after, live,
-                    // on this same line — a growing preview of the call's arguments as they stream in,
-                    // rather than the model appearing to hang until the whole call (and its result)
-                    // land.
-                    write_stdout_or_exit(&format!("\n[tool: {name}] "), cancel, broken_pipe);
-                }
-                StreamEvent::InputJsonDelta { partial_json, .. } => {
-                    write_stdout_or_exit(partial_json, cancel, broken_pipe);
-                }
-                StreamEvent::MessageStop { stop_reason: r } => {
-                    stop_reason = *r;
-                }
-                _ => {}
             },
             cancel.clone(),
+            steering.clone(),
         )
         .await?;
     write_stdout_or_exit("\n", cancel, broken_pipe);
@@ -2672,7 +2804,9 @@ async fn run_task(
     max_tokens: Option<u32>,
     cache_long: bool,
     thinking: Option<u32>,
-    reasoning_effort: Option<agent_core::ReasoningEffort>,
+    reasoning_effort: Option<agent_core::ThinkingLevel>,
+    steering_mode: Option<agent_core::QueueMode>,
+    follow_up_mode: Option<agent_core::QueueMode>,
     temperature: Option<f64>,
     system_prompt: Option<String>,
     append_system_prompt: Vec<String>,
@@ -2774,6 +2908,43 @@ async fn run_task(
     // `ImageSettings.autoResize` default).
     let image_auto_resize =
         !no_image_auto_resize && stored_settings.image_auto_resize.unwrap_or(true);
+    // Whether the operator explicitly passed `--model`, as opposed to `run` falling back to a stored
+    // default or `DEFAULT_MODEL` — the distinction a reopened `--session`/`--continue` needs below to
+    // know whether to keep going on the model the session was actually last driven on instead of
+    // quietly switching it, the same bug class `switch_session` had (see
+    // `Persistence::model_and_level_at_active` in `serve.rs`). A merely-stored default counts as *not*
+    // explicit here — same as an unset flag — since the operator didn't ask for this specific
+    // invocation to use it.
+    //
+    // Task 3 (pi-parity fix, pass 19): resolved here, before the `@file` composition block just below —
+    // same reasoning as `block_images`/`image_auto_resize` above — rather than in this block's original
+    // spot further down (right before `key`'s own resolution): `read_file_refs` needs the model's real
+    // `supports_vision` capability to correctly gate a CLI `@file.png` attachment's
+    // `_model_supports_vision` field, exactly like the model-issued `read` tool-call dispatch path in
+    // `agent_core::agent` already does (`capabilities(&self.model).supports_vision && !this.block_images`)
+    // — previously this call site only ANDed in `!block_images`, omitting the model's real capability
+    // entirely, so a non-vision model with `--block-images` left at its default (`false`) got a CLI
+    // attachment dispatched with `_model_supports_vision: true`, and `read.rs` never appended its
+    // non-vision-image explanatory note the way an equivalent model-issued call would have.
+    let model_explicit = model.is_some();
+    let model = model
+        .or_else(|| stored_settings.default_model.clone())
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+    // Fix 10 (pi-parity feature): resolve a partial/fuzzy `--model` id against the known-model hint list
+    // before it's used for anything else — dialect inference, OAuth-provider inference, and the model
+    // itself all key off the *resolved* id, so this must happen before `resolve_gateway_credential`
+    // below. An ambiguous partial match fails the whole invocation clearly (naming every candidate)
+    // rather than guessing; a genuinely unrecognized id (no partial match at all) is forwarded
+    // unchanged — see `serve::resolve_model_id`'s own doc comment. Fix 2 (pi-parity gap): `model` may
+    // also carry a trailing `:<level>` suffix (e.g. `sonnet:high`, pi's own `--model
+    // <pattern>:<thinking-level>` shorthand) — `resolve_model_id` returns it separately, applied to
+    // `reasoning_effort` further below.
+    let (model, model_thinking_level) = serve::resolve_model_id(&model, serve::available_models())
+        .map_err(|e| format!("--model {model:?}: {e}"))?;
+    // Task 3 (pi-parity fix, pass 19): the exact capability the model-issued `read` tool-call dispatch
+    // path already ANDs into `_model_supports_vision` (see this block's own doc comment above) — computed
+    // once here, now that `model` is fully resolved, and threaded down to `read_file_refs` below.
+    let model_supports_vision = agent_core::capabilities(&model).supports_vision;
 
     // Compose the first message from (in order) piped stdin, `@file` contents, then the first
     // plain-text message argument — mirroring the reference agent's own composition order. At least
@@ -2783,7 +2954,14 @@ async fn run_task(
     // invocation like `run @screenshot.png` with no other text still proceeds.
     let (file_refs, mut messages) = partition_tasks(tasks);
     let stdin_content = read_stdin_if_piped();
-    let file_refs = read_file_refs(&file_refs, &cwd, block_images, image_auto_resize).await?;
+    let file_refs = read_file_refs(
+        &file_refs,
+        &cwd,
+        block_images,
+        image_auto_resize,
+        model_supports_vision,
+    )
+    .await?;
     let initial_images = file_refs.images;
     let mut parts = Vec::new();
     if let Some(s) = stdin_content {
@@ -2849,28 +3027,9 @@ async fn run_task(
     } else {
         extra_prompt_template_paths
     };
-    // Whether the operator explicitly passed `--model`, as opposed to `run` falling back to a stored
-    // default or `DEFAULT_MODEL` — the distinction a reopened `--session`/`--continue` needs below to
-    // know whether to keep going on the model the session was actually last driven on instead of
-    // quietly switching it, the same bug class `switch_session` had (see
-    // `Persistence::model_and_level_at_active` in `serve.rs`). A merely-stored default counts as *not*
-    // explicit here — same as an unset flag — since the operator didn't ask for this specific
-    // invocation to use it.
-    let model_explicit = model.is_some();
-    let model = model
-        .or_else(|| stored_settings.default_model.clone())
-        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
-    // Fix 10 (pi-parity feature): resolve a partial/fuzzy `--model` id against the known-model hint list
-    // before it's used for anything else — dialect inference, OAuth-provider inference, and the model
-    // itself all key off the *resolved* id, so this must happen before `resolve_gateway_credential`
-    // below. An ambiguous partial match fails the whole invocation clearly (naming every candidate)
-    // rather than guessing; a genuinely unrecognized id (no partial match at all) is forwarded
-    // unchanged — see `serve::resolve_model_id`'s own doc comment. Fix 2 (pi-parity gap): `model` may
-    // also carry a trailing `:<level>` suffix (e.g. `sonnet:high`, pi's own `--model
-    // <pattern>:<thinking-level>` shorthand) — `resolve_model_id` returns it separately, applied to
-    // `reasoning_effort` just below.
-    let (model, model_thinking_level) = serve::resolve_model_id(&model, serve::available_models())
-        .map_err(|e| format!("--model {model:?}: {e}"))?;
+    // `model`/`model_thinking_level` were already fully resolved above (before the `@file` composition
+    // block), so `read_file_refs` could see the model's real `supports_vision` capability — see that
+    // resolution's own doc comment (Task 3, pi-parity fix, pass 19).
     let key = resolve_gateway_credential(key, &model)?;
     // Task #29 (pi-parity fix): whether the operator explicitly requested a specific reasoning depth
     // for *this* invocation — an explicit `--reasoning-effort` flag, or a `--model <pattern>:<level>`
@@ -2885,17 +3044,20 @@ async fn run_task(
     // Fix 2 (pi-parity gap): `--reasoning-effort` previously had no persisted stored-default fallback at
     // all, unlike `default_model`/`default_gateway_url`/`default_session_dir`. Precedence, in order: an
     // explicit `--reasoning-effort` flag; else a `--model <pattern>:<level>` suffix (this invocation's
-    // own model-scoped request, same standing as the flag itself — see `model_thinking_level` above; a
-    // `:off` suffix resolves no `ReasoningEffort` here, same as `--reasoning-effort` itself having no
-    // "off" value); else the stored setting.
+    // own model-scoped request, same standing as the flag itself — see `model_thinking_level` above);
+    // else the stored setting. Converted from the portable `ThinkingLevel` (off included) down to the
+    // wire-level `ReasoningEffort` (`None` for `Off`) only at the very end, once every candidate source
+    // has had its turn — Task 2 (pi-parity fix, pass 19): `off` is now a legal value at each of those
+    // layers (flag, model suffix, stored setting), not just the `--model <pattern>:off` suffix.
     let reasoning_effort = reasoning_effort
-        .or_else(|| model_thinking_level.and_then(|l| l.reasoning_effort()))
+        .or(model_thinking_level)
         .or_else(|| {
             stored_settings
                 .default_reasoning_effort
                 .as_deref()
                 .and_then(|s| parse_reasoning_effort(s).ok())
-        });
+        })
+        .and_then(|level| level.reasoning_effort());
     // Fix 1 (pi-parity gap) — pi's own "medium" default (`DEFAULT_THINKING_LEVEL`,
     // `packages/coding-agent/src/core/defaults.ts`) whenever the model supports reasoning at all, so a
     // bare invocation with no flags doesn't silently wire-disable thinking the way leaving this `None`
@@ -2908,6 +3070,43 @@ async fn run_task(
     } else {
         reasoning_effort.or_else(|| serve::default_reasoning_effort_for_model(&model))
     };
+
+    // Task 1 (pi-parity fix, pass 19): `steering_mode`/`follow_up_mode` previously had no persisted
+    // stored-default fallback at all — pi's own persisted `steeringMode`/`followUpMode` apply at
+    // agent/session construction time in every mode, not just its TUI, but this crate only ever exposed
+    // them as `serve`-only runtime RPC commands (`set_steering_mode`/`set_follow_up_mode`); an operator
+    // wanting a standing default had to re-issue that RPC call at the start of every `serve` session, and
+    // `run` had no way to request either at all. Same "explicit flag/env, then stored setting, then
+    // built-in default" precedence as every other `stored_settings`-backed fallback above.
+    let steering_mode = steering_mode
+        .or_else(|| {
+            stored_settings
+                .steering_mode
+                .as_deref()
+                .and_then(|s| parse_queue_mode(s).ok())
+        })
+        .unwrap_or_default();
+    let follow_up_mode = follow_up_mode
+        .or_else(|| {
+            stored_settings
+                .follow_up_mode
+                .as_deref()
+                .and_then(|s| parse_queue_mode(s).ok())
+        })
+        .unwrap_or_default();
+    // `run` has no live control channel to change either mode mid-invocation the way `serve`'s RPC
+    // commands do, so this is applied once, up front, and never revisited — still enough to give an
+    // operator-configured standing default (via `agent settings`'s persisted `steering_mode`/
+    // `follow_up_mode`, written by `serve`'s own RPC handlers) actual effect on a `run` invocation, which
+    // is the whole point of this fix. `run` currently has no mechanism that ever queues a steer/follow-up
+    // message mid-invocation either (its `tasks` list runs as separate, sequential turns — see `tasks`'s
+    // own doc comment — not steer injections), so this has no observable effect on today's behavior; it
+    // establishes correct, real construction-time wiring — matching pi's own agent/session construction
+    // in every mode — rather than leaving `run` on `Steering::new()`'s bare built-in defaults regardless
+    // of what the operator configured.
+    let steering = agent_core::Steering::new();
+    steering.set_steering_mode(steering_mode);
+    steering.set_follow_up_mode(follow_up_mode);
 
     // Computed once and reused below (rather than called again inside the warning check) — it's a
     // filesystem walk (`has_trust_gated_resources`'s own doc comment), not free.
@@ -3377,6 +3576,7 @@ async fn run_task(
         &cancel,
         &retry_policy,
         &broken_pipe,
+        &steering,
     )
     .await;
     // Persist whatever's in `session` regardless of outcome: `run_events_cancellable` mutates
@@ -3399,6 +3599,7 @@ async fn run_task(
             &cancel,
             &retry_policy,
             &broken_pipe,
+            &steering,
         )
         .await;
         persist_run_tail(&store, &session)?;
@@ -3737,6 +3938,7 @@ mod tests {
             &agent_core::CancellationToken::new(),
             &beyond_ai_agent::retry::RunRetryPolicy::default(),
             &AtomicBool::new(false),
+            &agent_core::Steering::new(),
         )
         .await
         .unwrap();
@@ -3988,6 +4190,7 @@ mod tests {
             &agent_core::CancellationToken::new(),
             &beyond_ai_agent::retry::RunRetryPolicy::default(),
             &AtomicBool::new(false),
+            &agent_core::Steering::new(),
         )
         .await
         .expect("the whole-run retry must recover once a real turn is finally scripted");
@@ -4024,6 +4227,7 @@ mod tests {
             &agent_core::CancellationToken::new(),
             &beyond_ai_agent::retry::RunRetryPolicy::default(),
             &AtomicBool::new(false),
+            &agent_core::Steering::new(),
         )
         .await
         .expect_err("must eventually give up, not retry forever");
@@ -4063,6 +4267,7 @@ mod tests {
             &agent_core::CancellationToken::new(),
             &policy,
             &AtomicBool::new(false),
+            &agent_core::Steering::new(),
         )
         .await
         .expect_err("a disabled whole-run retry policy must never retry, even a recoverable failure");
@@ -4205,7 +4410,7 @@ mod tests {
     async fn read_file_refs_wraps_contents_in_a_file_tag_with_the_resolved_path() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "hello world").unwrap();
-        let out = read_file_refs(&["a.txt".to_string()], dir.path(), false, true)
+        let out = read_file_refs(&["a.txt".to_string()], dir.path(), false, true, true)
             .await
             .unwrap();
         assert!(out.text.contains("hello world"));
@@ -4219,7 +4424,7 @@ mod tests {
     #[tokio::test]
     async fn read_file_refs_errors_naming_the_missing_file() {
         let dir = tempfile::tempdir().unwrap();
-        let err = read_file_refs(&["does-not-exist.txt".to_string()], dir.path(), false, true)
+        let err = read_file_refs(&["does-not-exist.txt".to_string()], dir.path(), false, true, true)
             .await
             .unwrap_err()
             .to_string();
@@ -4235,6 +4440,7 @@ mod tests {
             &["a.txt".to_string(), "b.txt".to_string()],
             dir.path(),
             false,
+            true,
             true,
         )
         .await
@@ -4258,7 +4464,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("shot.png"), &png_bytes).unwrap();
 
-        let out = read_file_refs(&["shot.png".to_string()], dir.path(), false, true)
+        let out = read_file_refs(&["shot.png".to_string()], dir.path(), false, true, true)
             .await
             .unwrap();
         assert_eq!(
@@ -4289,7 +4495,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("shot.png"), &png_bytes).unwrap();
 
-        let out = read_file_refs(&["shot.png".to_string()], dir.path(), true, true)
+        let out = read_file_refs(&["shot.png".to_string()], dir.path(), true, true, true)
             .await
             .unwrap();
         assert!(
@@ -4299,6 +4505,46 @@ mod tests {
         assert!(
             out.text.contains("does not support images"),
             "--block-images must leave the same non-vision placeholder note `read` uses: {}",
+            out.text
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_refs_appends_the_non_vision_note_for_a_real_non_vision_model_even_with_block_images_false()
+     {
+        // Task 3 (pi-parity fix, pass 19): `read_file_refs_with_home` used to pass
+        // `"_model_supports_vision": !block_images` — omitting `&& caps.supports_vision` — unlike the
+        // model-issued `read` tool-call dispatch path in `agent_core::agent`, which correctly ANDs in the
+        // real model capability. So a genuinely non-vision model, with `--block-images` left at its
+        // default (`false`), got a CLI `@screenshot.png` attachment dispatched with
+        // `_model_supports_vision: true` — `read.rs` never appended its non-vision-image explanatory note
+        // the way an equivalent model-issued call would have. This test passes `model_supports_vision:
+        // false` (simulating a real non-vision model) with `block_images: false` (the default, NOT
+        // forcing the downgrade) — the exact combination the bug missed — and asserts the note still
+        // appears, matching `read_file_refs_block_images_true_drops_a_cli_attached_image`'s identical
+        // assertion for the other (operator-forced) path to the same note.
+        let img = image::RgbImage::from_pixel(4, 4, image::Rgb([200, 10, 10]));
+        let mut png_bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut png_bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("shot.png"), &png_bytes).unwrap();
+
+        let out = read_file_refs(&["shot.png".to_string()], dir.path(), false, true, false)
+            .await
+            .unwrap();
+        assert!(
+            out.images.is_empty(),
+            "a non-vision model must not get the image spliced in: {out:?}"
+        );
+        assert!(
+            out.text.contains("does not support images"),
+            "a non-vision model must get the same non-vision placeholder note `read` uses even when \
+             --block-images is false: {}",
             out.text
         );
     }
@@ -4322,7 +4568,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("big.png"), &png_bytes).unwrap();
 
-        let out = read_file_refs(&["big.png".to_string()], dir.path(), false, false)
+        let out = read_file_refs(&["big.png".to_string()], dir.path(), false, false, true)
             .await
             .unwrap();
         assert_eq!(out.images.len(), 1, "got: {out:?}");
@@ -4362,6 +4608,7 @@ mod tests {
             Some(home_dir.path().to_str().unwrap()),
             false,
             true,
+            true,
         )
         .await
         .unwrap();
@@ -4386,6 +4633,7 @@ mod tests {
             Some(home_dir.path().to_str().unwrap()),
             false,
             true,
+            true,
         )
         .await
         .unwrap();
@@ -4404,6 +4652,7 @@ mod tests {
             Some(home_dir.path().to_str().unwrap()),
             false,
             true,
+            true,
         )
         .await
         .unwrap();
@@ -4417,7 +4666,7 @@ mod tests {
         // name="...">\n\n</file>` block.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("empty.txt"), b"").unwrap();
-        let out = read_file_refs(&["empty.txt".to_string()], dir.path(), false, true)
+        let out = read_file_refs(&["empty.txt".to_string()], dir.path(), false, true, true)
             .await
             .unwrap();
         assert_eq!(out.text, "", "a zero-byte file must contribute nothing at all");
@@ -4439,6 +4688,7 @@ mod tests {
             dir.path(),
             false,
             true,
+            true,
         )
         .await
         .unwrap();
@@ -4452,7 +4702,7 @@ mod tests {
         // A zero-byte skip must not swallow the genuinely-missing-file error — `metadata()` failing
         // falls through to the normal read attempt, which reports the real problem.
         let dir = tempfile::tempdir().unwrap();
-        let err = read_file_refs(&["does-not-exist.txt".to_string()], dir.path(), false, true)
+        let err = read_file_refs(&["does-not-exist.txt".to_string()], dir.path(), false, true, true)
             .await
             .unwrap_err()
             .to_string();

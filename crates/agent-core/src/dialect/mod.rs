@@ -718,7 +718,10 @@ fn repair_and_parse(decoder: &dyn StreamDecoder, payload: &str) -> Option<Value>
 /// "message":…}` (no nested `error` object — a genuinely different shape from the other two, since
 /// Responses streams a top-level `error` *event* rather than an in-band error field). Returns `None`
 /// for ordinary stream events.
-fn sse_error(v: &Value) -> Option<String> {
+// `pub(crate)`: also reused by `codex_websocket`'s WebSocket receive loop, which decodes the exact
+// same event JSON this dialect's SSE path does (same backend, same event shapes) and needs the
+// identical in-band-error detection rather than a second copy of it.
+pub(crate) fn sse_error(v: &Value) -> Option<String> {
     let is_typed_error = v.get("type").and_then(Value::as_str) == Some("error");
     if is_typed_error {
         // Anthropic's nested shape, if present; otherwise fall through to the Responses flat shape.

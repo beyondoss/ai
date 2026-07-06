@@ -741,22 +741,32 @@ fn validate_skill_description(description: &str) -> Vec<String> {
 /// remaining body text (everything after the closing `---` fence — used to expand a `/skill:name`
 /// invocation without leaking the raw YAML into the model-facing text; `\r\n`/`\r` are normalized to
 /// `\n` throughout, matching pi's own `normalizeNewlines`, applied unconditionally before any fence
-/// detection). Dependency-free (no `serde_yaml`): enough of YAML for the Agent Skills spec — quoted
-/// values (with double-quoted backslash-escape processing — Task #43), block scalars (`key: |` /
-/// `key: >`) whose value spans the following more-indented lines, and a plain (unquoted, non-block-scalar)
-/// value that itself wraps across more-indented continuation lines with no `|`/`>` indicator at all —
-/// ordinary YAML line folding, the way most hand-written frontmatter actually wraps a long `description:`
-/// (Task #40).
+/// detection).
 ///
-/// A `>` (folded) block is joined with spaces, a `|` (literal) block with newlines; both let a long
-/// value wrap across lines. Chomping (Task #42): a `-` (strip) or `+` (keep) modifier right after the
-/// `|`/`>` indicator is honored — `-` drops the trailing newline entirely, `+` preserves every trailing
-/// blank line in the block as its own newline, and the default ("clip", no modifier) keeps exactly one
-/// trailing `\n`, matching a real parser (pi's) applied to either block style, not just `|`. An
-/// indentation-indicator digit (`|2`) is not handled — rare enough in practice not to be worth the added
-/// complexity here. A plain value's own continuation lines are folded with a single space per YAML's
-/// line-folding rule (no chomping modifier applies — chomping is a block-scalar-only concept). Anything
-/// fancier (anchors, nested maps, multi-line quoted scalars) is out of scope and ignored.
+/// Fence extraction (finding the `---` pair and slicing out the body) is still hand-rolled here — the
+/// same split of concerns pi's own `extractFrontmatter` (`frontmatter.ts`) has, which does its own
+/// `indexOf("\n---", 3)` fence search before ever touching a YAML library. What's *between* the fences
+/// used to be hand-scanned line by line — a dependency-free subset of YAML (quoted scalars, block
+/// scalars, plain-scalar line folding, …) that, across three consecutive pi-parity audit passes,
+/// produced three separate silent-content-corruption bugs (an unrecognized `${...}`-shaped value, a
+/// wrapped plain scalar, and a wrapped *quoted* scalar each lost content in a different way), plus no
+/// comment-stripping at all, no `''`-escape support, and flow-style collections/anchors/aliases treated
+/// as opaque literal text or left unresolved. It's now handed to `serde_yaml` — a real, spec-compliant
+/// parser — instead, which gets every one of those right by construction rather than by an ever-growing
+/// pile of hand-rolled special cases (see [`parse_yaml_block`]).
+///
+/// The parsed top-level YAML mapping is flattened into a `HashMap<String, String>` — the shape every
+/// consumer of frontmatter already expects (`parse_skill` here, and `crate::prompts::parse`, which
+/// reuses this function): both only ever read a handful of known keys (`name`, `description`,
+/// `disable-model-invocation`, `argument-hint`) as plain scalar text, so there's no reason to thread a
+/// richer `serde_yaml::Value` through the rest of this file for what only needs to be a parser swap.
+///
+/// Invalid YAML between the fences (an unterminated flow collection, a quoted value directly followed
+/// by unexpected indented content, …) degrades to an empty map — the same "no usable frontmatter"
+/// outcome a manifest with no `description:` at all already produces via `parse_skill`'s existing
+/// missing-description diagnostic, matching pi's own real behavior of skipping the skill with a
+/// diagnostic (`skills.ts::loadSkillFromFile`'s `try`/`catch` around `parseFrontmatter`) rather than this
+/// module needing its own separate YAML-error-reporting path.
 ///
 /// No opening fence at all (the first line isn't `---`) *or* an unterminated one (no closing `---`
 /// found before EOF) both return an empty map and the **entire original input**, verbatim, as the body
@@ -771,114 +781,83 @@ fn validate_skill_description(description: &str) -> Vec<String> {
 /// `argument-hint:`) is the exact same shape — one parser rather than two so a fix (or a future
 /// format extension) doesn't have to land twice.
 pub(crate) fn parse_frontmatter(text: &str) -> (HashMap<String, String>, String) {
-    let mut map = HashMap::new();
     // Iterate raw, newline-inclusive lines and track how many bytes have been consumed, so the body can
     // be sliced out byte-exact once the closing fence is found — `Lines` alone discards that offset.
-    let mut lines = text.split_inclusive('\n').peekable();
+    let mut lines = text.split_inclusive('\n');
     let Some(first) = lines.next() else {
-        return (map, normalize_newlines(text));
+        return (HashMap::new(), normalize_newlines(text));
     };
     if first.trim_end_matches(['\n', '\r']) != "---" {
-        return (map, normalize_newlines(text));
+        return (HashMap::new(), normalize_newlines(text));
     }
     let mut consumed = first.len();
+    // The YAML block's own lines, gathered verbatim (newline-normalized) as we scan for the closing
+    // fence — handed to `serde_yaml` below (see `parse_yaml_block`) instead of parsed key-by-key here.
+    let mut yaml_block = String::new();
     let mut closed = false;
-    while let Some(line) = lines.next() {
+    for line in lines {
         consumed += line.len();
-        let line = line.trim_end_matches(['\n', '\r']);
-        if line.trim() == "---" {
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        // A closing fence must be unindented and contain nothing but the three dashes — an indented
+        // `---`-only line (e.g. a markdown rule inside a `description: |` block scalar's own body) is
+        // YAML content, not a fence, matching pi's own `indexOf("\n---", …)` (only a newline immediately
+        // followed by `-` counts at all; an indented line's newline is followed by whitespace instead).
+        if !trimmed.starts_with([' ', '\t']) && trimmed.trim() == "---" {
             closed = true;
             break;
         }
-        // Top-level keys are unindented; an indented line is a continuation already consumed by the
-        // block-scalar branch below, so skip any that reach here.
-        if line.starts_with([' ', '\t']) {
-            continue;
-        }
-        let Some((key, raw)) = line.split_once(':') else {
-            continue;
-        };
-        let key = key.trim().to_string();
-        let raw = raw.trim();
-        let value = match raw.chars().next() {
-            // Block scalar: gather the lines indented under this key until a dedent or closing `---`.
-            Some(folded @ ('|' | '>')) => {
-                // pi-parity fix (Task #42): honor a chomping modifier (`-` strip, `+` keep) right after
-                // the block-scalar indicator — see this function's doc comment. `raw.chars().nth(1)`
-                // reads the character immediately after `|`/`>`, if any (an indentation-indicator digit
-                // lands here too; it's simply not matched below, falling through to default "clip").
-                let chomp = raw.chars().nth(1);
-                let mut parts: Vec<String> = Vec::new();
-                while let Some(next) = lines.peek() {
-                    let next_trimmed = next.trim_end_matches(['\n', '\r']);
-                    if next_trimmed.trim() == "---" {
-                        break;
-                    }
-                    if !next_trimmed.trim().is_empty() && !next_trimmed.starts_with([' ', '\t']) {
-                        break; // dedent to another top-level key ends the block
-                    }
-                    parts.push(next_trimmed.trim().to_string());
-                    consumed += next.len();
-                    lines.next();
-                }
-                // "Keep" (`+`) preserves every trailing blank line collected above as its own newline in
-                // the final value; "clip" (default) and "strip" (`-`) both discard trailing blank lines
-                // before deciding the value's own trailing newline(s) below.
-                if chomp != Some('+') {
-                    while parts.last().is_some_and(String::is_empty) {
-                        parts.pop();
-                    }
-                }
-                let joined = if folded == '>' {
-                    parts.join(" ")
-                } else {
-                    parts.join("\n")
-                };
-                match chomp {
-                    // Strip: no trailing newline at all.
-                    Some('-') => joined,
-                    // Clip (default) and keep: exactly one more trailing `\n` than `joined` already
-                    // ends with — for "keep" that's on top of whatever trailing blank lines survived
-                    // above (each already contributing its own `\n` via `parts.join`), reproducing
-                    // every trailing blank line as a newline; for "clip" the trailing blanks were
-                    // already dropped, so this is the single newline real YAML's default chomping keeps.
-                    _ => format!("{joined}\n"),
-                }
-            }
-            _ => {
-                // pi-parity fix (Task #40): fold a plain (unquoted, non-block-scalar) value's own
-                // continuation lines — see this function's doc comment. Scoped to unquoted values only:
-                // a quoted scalar is expected to close on its own line, so an indented line following one
-                // is left alone for the top-of-loop "indented line" skip above, unchanged.
-                let quoted = matches!(raw.chars().next(), Some('"') | Some('\''));
-                let mut value = unquote(raw);
-                if !quoted {
-                    while let Some(next) = lines.peek() {
-                        let next_trimmed = next.trim_end_matches(['\n', '\r']);
-                        if next_trimmed.trim() == "---" || next_trimmed.trim().is_empty() {
-                            break; // closing fence, or a blank line, ends the wrapped value
-                        }
-                        if !next_trimmed.starts_with([' ', '\t']) {
-                            break; // dedent to another top-level key ends the continuation
-                        }
-                        value.push(' ');
-                        value.push_str(next_trimmed.trim());
-                        consumed += next.len();
-                        lines.next();
-                    }
-                }
-                value
-            }
-        };
-        map.insert(key, value);
+        yaml_block.push_str(trimmed);
+        yaml_block.push('\n');
     }
     if !closed {
         // pi-parity fix (M4): an unterminated fence is "no frontmatter", full stop — see this
-        // function's doc comment. Discard whatever key/value pairs were greedily parsed above; they
-        // were never really frontmatter, just text that happened to look like it.
+        // function's doc comment. Discard whatever looked like YAML above; it was never really
+        // frontmatter, just text that happened to look like it.
         return (HashMap::new(), normalize_newlines(text));
     }
-    (map, normalize_newlines(text.get(consumed..).unwrap_or("")))
+    (
+        parse_yaml_block(&yaml_block),
+        normalize_newlines(text.get(consumed..).unwrap_or("")),
+    )
+}
+
+/// Parse the raw text between the `---` fences as real YAML, flattening its top-level mapping into
+/// [`parse_frontmatter`]'s `HashMap<String, String>` shape. A non-mapping top level (a bare scalar, a
+/// top-level sequence, an empty block) and a genuine YAML parse error both produce an empty map — a
+/// frontmatter block is defined as key/value pairs, so anything else is, for this purpose, "no usable
+/// frontmatter" (see [`parse_frontmatter`]'s doc comment for why that's the right degradation).
+fn parse_yaml_block(yaml: &str) -> HashMap<String, String> {
+    let Ok(serde_yaml::Value::Mapping(mapping)) = serde_yaml::from_str::<serde_yaml::Value>(yaml)
+    else {
+        return HashMap::new();
+    };
+    mapping
+        .into_iter()
+        .map(|(k, v)| (yaml_scalar_to_string(&k), yaml_scalar_to_string(&v)))
+        .collect()
+}
+
+/// Render a parsed YAML value as the plain string every frontmatter consumer expects. A scalar renders
+/// as its natural text form — a bare `true`/`42`/`null` behaves the same as the quoted string
+/// `"true"`/`"42"`/`""` would (matching every consumer's UTF-8-string-only worldview: e.g.
+/// `disable-model-invocation: true`, unquoted — a YAML bool, not a string — still compares equal to
+/// `"true"` downstream via `eq_ignore_ascii_case`). A flow-style collection (`[a, b]`, `{a: 1}`) or a
+/// `!Tag`ged value has no live consumer among today's known frontmatter keys, but re-serializing it
+/// through the same library that parsed it keeps it a lossless, deterministic round-trip instead of
+/// Rust's `Debug` output or silently dropping the field.
+fn yaml_scalar_to_string(value: &serde_yaml::Value) -> String {
+    match value {
+        serde_yaml::Value::Null => String::new(),
+        serde_yaml::Value::Bool(b) => b.to_string(),
+        serde_yaml::Value::Number(n) => n.to_string(),
+        serde_yaml::Value::String(s) => s.clone(),
+        serde_yaml::Value::Sequence(_) | serde_yaml::Value::Mapping(_) | serde_yaml::Value::Tagged(_) => {
+            serde_yaml::to_string(value)
+                .unwrap_or_default()
+                .trim_end()
+                .to_string()
+        }
+    }
 }
 
 /// `\r\n` → `\n` (and a bare `\r` → `\n`), matching pi's own `normalizeNewlines`. Applied to whatever
@@ -887,69 +866,6 @@ pub(crate) fn parse_frontmatter(text: &str) -> (HashMap<String, String>, String)
 /// source file used CRLF line endings (pi-parity fix, L2).
 fn normalize_newlines(s: &str) -> String {
     s.replace("\r\n", "\n").replace('\r', "\n")
-}
-
-/// Strip matching surrounding single or double quotes. For a double-quoted value, also interprets
-/// backslash escapes (Task #43) — a single-quoted YAML scalar supports no escapes at all per the YAML
-/// spec (its only special case, `''` for a literal quote, is out of scope here, same as before), so only
-/// the double-quoted path needs this.
-fn unquote(s: &str) -> String {
-    let bytes = s.as_bytes();
-    if bytes.len() >= 2 && bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"' {
-        return unescape_double_quoted(&s[1..s.len() - 1]);
-    }
-    if bytes.len() >= 2 && bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'' {
-        return s[1..s.len() - 1].to_string();
-    }
-    s.to_string()
-}
-
-/// Interpret the backslash escapes a double-quoted YAML scalar supports that actually show up in
-/// practice — `\n`/`\t`/`\r`/`\"`/`\\`/`\/`/`\0`, plus `\xHH`/`\uHHHH` hex escapes — rather than the full
-/// YAML-spec escape table (`\a`/`\b`/`\e`/`\N`/`\_`/`\L`/`\P`/`\UHHHHHHHH`/etc. are far rarer in a
-/// frontmatter `description:`/`name:` than worth the added complexity here). An escape this doesn't
-/// recognize, or a `\x`/`\u` whose following hex digits are missing or invalid, is passed through
-/// literally (backslash and all) rather than erroring — this parser has no error path by design (see
-/// [`parse_frontmatter`]'s doc comment on malformed input), so degrading gracefully beats panicking or
-/// silently eating a character.
-fn unescape_double_quoted(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('n') => out.push('\n'),
-            Some('t') => out.push('\t'),
-            Some('r') => out.push('\r'),
-            Some('"') => out.push('"'),
-            Some('\\') => out.push('\\'),
-            Some('/') => out.push('/'),
-            Some('0') => out.push('\0'),
-            Some(hex_kind @ ('x' | 'u')) => {
-                let hex_len = if hex_kind == 'x' { 2 } else { 4 };
-                let hex: String = chars.by_ref().take(hex_len).collect();
-                match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
-                    Some(decoded) => out.push(decoded),
-                    None => {
-                        // Malformed/incomplete escape: keep what was actually consumed, literally.
-                        out.push('\\');
-                        out.push(hex_kind);
-                        out.push_str(&hex);
-                    }
-                }
-            }
-            Some(other) => {
-                // Unrecognized escape: keep it literal rather than silently dropping the backslash.
-                out.push('\\');
-                out.push(other);
-            }
-            None => out.push('\\'), // trailing lone backslash at end of value
-        }
-    }
-    out
 }
 
 /// Look up a discovered skill by exact name — used to resolve an explicit `/skill:name` invocation,
@@ -1830,34 +1746,39 @@ mod tests {
 
     #[test]
     fn malformed_frontmatter_degrades_gracefully_without_panicking() {
-        // The hand-rolled parser has no real YAML error path by design (see `parse_frontmatter`'s doc
-        // comment) — pi's real YAML parser would throw and skip the skill with a diagnostic (see
-        // `discover_with_diagnostics_accepts_malformed_yaml_values_silently_by_design` below for that
-        // documented deviation); ours instead accepts the value as a literal string. The guarantee this
-        // test pins isn't a specific error shape, it's that adversarial/malformed input can't panic
-        // discovery.
+        // pi-parity fix: the hand-rolled parser used to have no real YAML error path at all (it hand-
+        // scanned lines, so `[unclosed` — an unterminated flow sequence — was just accepted as the
+        // literal string `"[unclosed"`). Now that a real YAML parser (`serde_yaml`) is doing the
+        // parsing, this is a genuine parse error, degrading to "no frontmatter at all" (see
+        // `parse_frontmatter`'s doc comment) rather than a panic *or* silently-corrupted content — the
+        // guarantee this test pins isn't a specific error shape, it's that adversarial/malformed input
+        // can't panic discovery.
         let (fm, _) = parse_frontmatter("---\nname: x\ndescription: [unclosed\n---\nBody");
-        assert_eq!(fm.get("description").map(String::as_str), Some("[unclosed"));
+        assert!(fm.is_empty(), "invalid YAML must yield no frontmatter, not a corrupted value: {fm:?}");
     }
 
     #[test]
-    fn discover_with_diagnostics_accepts_malformed_yaml_values_silently_by_design() {
+    fn discover_with_diagnostics_skips_a_skill_with_invalid_yaml_frontmatter() {
         // pi: frontmatter.test.ts, "throws on invalid YAML frontmatter" / skills.test.ts, "should warn
         // and skip skill when YAML frontmatter is invalid" — pi's real YAML parser throws on `[unclosed`
-        // (an unterminated flow sequence) and the skill is skipped with an `invalid_metadata`-shaped
-        // diagnostic. Ours has no real YAML error path (a documented, deliberate simplification — see
-        // `parse_frontmatter`'s doc comment): the value is accepted as the literal string `"[unclosed"`,
-        // so the skill still discovers successfully instead of being skipped. Pinning this as *known*,
-        // not silently regressable, rather than a gap to close.
+        // (an unterminated flow sequence) and the skill is skipped with a diagnostic. This used to be a
+        // documented pi-parity gap: the hand-rolled parser had no real YAML error path, so the skill
+        // still discovered successfully with the literal string `"[unclosed"` as its description. Now
+        // that frontmatter parsing goes through `serde_yaml`, invalid YAML degrades to an empty
+        // frontmatter map, which trips `parse_skill`'s existing missing-description check — closing the
+        // gap as a natural consequence of the parser swap, not a separate fix.
         let tmp = tempfile::tempdir().unwrap();
         write_skill(
             tmp.path(),
             "shrug",
             "---\nname: shrug\ndescription: [unclosed\n---\nBody.",
         );
-        let skills = discover_in(tmp.path());
-        assert_eq!(skills.len(), 1, "got: {skills:?}");
-        assert_eq!(skills[0].description, "[unclosed");
+        let (skills, diagnostics) = discover_in_with_diagnostics(tmp.path());
+        assert!(skills.is_empty(), "got: {skills:?}");
+        assert!(
+            diagnostics.iter().any(|d| d.contains("description")),
+            "got: {diagnostics:?}"
+        );
     }
 
     #[test]
@@ -2125,12 +2046,32 @@ mod tests {
     }
 
     #[test]
-    fn a_quoted_scalar_is_not_folded_with_a_following_indented_line() {
-        // Folding (Task #40) is scoped to *unquoted* plain scalars — a quoted value is expected to
-        // close on its own line; an indented line after one is left alone (matching prior behavior)
-        // rather than being appended onto an already-terminated quoted string.
+    fn a_quoted_scalar_closed_on_its_own_line_followed_by_a_stray_indented_line_is_invalid_yaml() {
+        // A quoted scalar that closes on the same line it starts, followed by an unexpected indented
+        // line, isn't valid YAML at all (real YAML has no notion of "append a stray line onto an
+        // already-terminated string") — a real parser rejects it outright rather than the hand-rolled
+        // predecessor's guess of silently keeping just the first line. Degrades to no frontmatter at all
+        // (see `parse_frontmatter`'s doc comment on invalid YAML), not a truncated value.
         let (fm, _) = parse_frontmatter("---\ndescription: \"first line\"\n  second line\n---\n");
-        assert_eq!(fm.get("description").map(String::as_str), Some("first line"));
+        assert!(fm.is_empty(), "got: {fm:?}");
+    }
+
+    #[test]
+    fn a_quoted_scalar_left_open_across_a_line_break_folds_correctly() {
+        // pi-parity fix (found pass 19, empirically reproduced): a *genuinely* multi-line double-quoted
+        // scalar — the quote deliberately left open, closing on a later, more-indented line — is valid
+        // YAML that folds the same way a plain scalar does (line break → single space, leading
+        // whitespace on the continuation stripped). The hand-rolled predecessor only ever scanned one
+        // line at a time, so it lost everything after the first line and left a stray literal `"`
+        // behind; a real YAML parser gets this right by construction.
+        let (fm, _) = parse_frontmatter(
+            "---\ndescription: \"Handles config: keys, values, and\n  arbitrary nesting.\"\n---\n",
+        );
+        assert_eq!(
+            fm.get("description").map(String::as_str),
+            Some("Handles config: keys, values, and arbitrary nesting."),
+            "got: {fm:?}"
+        );
     }
 
     #[test]
@@ -2204,6 +2145,57 @@ name: "caf\x65 é"
             Some("literal\\nbackslash-n"),
             "a single-quoted scalar must keep the backslash literally, not interpret it as an escape"
         );
+    }
+
+    #[test]
+    fn single_quoted_doubled_quote_escape_resolves_to_one_literal_quote() {
+        // pi-parity fix (found pass 19): `''` is a single-quoted YAML scalar's *only* escape (a literal
+        // `'`) — the hand-rolled predecessor didn't unescape anything for the single-quoted path, so this
+        // rendered as a literal doubled quote (`it''s here`) instead of one.
+        let (fm, _) = parse_frontmatter("---\ndescription: 'it''s here'\n---\n");
+        assert_eq!(fm.get("description").map(String::as_str), Some("it's here"));
+    }
+
+    #[test]
+    fn a_trailing_comment_does_not_corrupt_a_value_or_the_skills_own_name() {
+        // pi-parity fix (found pass 19): the hand-rolled predecessor did no comment-stripping at all —
+        // a trailing `# comment` was swallowed straight into the value, including a skill's own
+        // `name:`, silently changing its `/skill:name` invocation. Real YAML strips a `#` that follows
+        // whitespace outside a quoted scalar.
+        let (fm, _) = parse_frontmatter(
+            "---\nname: my-skill # trailing comment\ndescription: something useful # another comment\n---\n",
+        );
+        assert_eq!(fm.get("name").map(String::as_str), Some("my-skill"));
+        assert_eq!(
+            fm.get("description").map(String::as_str),
+            Some("something useful")
+        );
+
+        // End-to-end: the skill's own invocation name must not be corrupted by a trailing comment.
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(
+            tmp.path(),
+            "commented",
+            "---\nname: my-skill # trailing comment\ndescription: something useful\n---\n",
+        );
+        let skills = discover_in(tmp.path());
+        assert_eq!(skills.len(), 1, "got: {skills:?}");
+        assert_eq!(skills[0].name, "my-skill");
+    }
+
+    #[test]
+    fn a_flow_style_collection_field_round_trips_without_corruption() {
+        // No frontmatter key in this file is ever list- or map-shaped today (`name`/`description`/
+        // `argument-hint`/`disable-model-invocation` are always plain scalars), so there's no live
+        // consumer of this — but a flow-style YAML collection value must not corrupt or vanish either.
+        // The hand-rolled predecessor stored `[a, b]`/`{a: 1}` as an opaque literal string (including the
+        // brackets/braces themselves); this pins that a real parsed collection instead re-serializes
+        // deterministically through the same YAML library, rather than Rust's `Debug` output.
+        let (fm, _) = parse_frontmatter("---\nname: x\ndescription: y\ntags: [a, b, c]\n---\n");
+        assert_eq!(fm.get("tags").map(String::as_str), Some("- a\n- b\n- c"));
+
+        let (fm, _) = parse_frontmatter("---\nname: x\ndescription: y\nmeta: {a: 1, b: 2}\n---\n");
+        assert_eq!(fm.get("meta").map(String::as_str), Some("a: 1\nb: 2"));
     }
 
     #[test]
