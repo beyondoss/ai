@@ -2761,12 +2761,19 @@ pub fn is_retryable_mid_stream(e: &Error) -> bool {
             .any(|p| m.contains(p))
 }
 
-/// Exponential backoff for a mid-stream retry: `MID_STREAM_BASE_BACKOFF · 2^(attempt-1)`, capped at
-/// `MID_STREAM_MAX_BACKOFF`. `attempt` is 1-based (the first retry backs off by the base amount).
+/// Exponential backoff for a mid-stream retry: `MID_STREAM_BASE_BACKOFF · 2^(attempt-1)` (±
+/// [`crate::client::jitter`]), capped at `MID_STREAM_MAX_BACKOFF`. `attempt` is 1-based (the first
+/// retry backs off by the base amount).
+///
+/// Finding #32 (pi-parity/consistency fix): this is one of the crate's two *inner* retry layers
+/// (alongside `client::backoff`) that fire far more often than the outer, whole-run retry layer
+/// (`crates/agent::retry`, a separate crate) — every stream, not just after a whole run has already
+/// exhausted both inner layers — making an unjittered exponential here the bigger thundering-herd risk
+/// of the two. See [`crate::client::jitter`]'s doc comment for the mechanism and rationale.
 fn mid_stream_backoff(attempt: u32) -> Duration {
-    MID_STREAM_BASE_BACKOFF
-        .saturating_mul(1u32 << attempt.saturating_sub(1).min(16))
-        .min(MID_STREAM_MAX_BACKOFF)
+    let exp_uncapped =
+        MID_STREAM_BASE_BACKOFF.saturating_mul(1u32 << attempt.saturating_sub(1).min(16));
+    crate::client::jitter(exp_uncapped, attempt).min(MID_STREAM_MAX_BACKOFF)
 }
 
 /// Best-effort repair for streamed tool-call JSON that fails to parse on the first attempt, fixing two
@@ -4310,12 +4317,44 @@ mod tests {
         )));
     }
 
+    /// Asserts `actual` falls within the +/-20% jitter band around `nominal` (the unjittered
+    /// exponential value), inclusive. Mirrors `client::tests::assert_within_jitter` — jitter (Finding
+    /// #32: a pi-parity/consistency fix so this inner retry layer doesn't thundering-herd the same way
+    /// the outer whole-run layer's own jitter already guards against) means the exact value is no
+    /// longer deterministic, only its range is.
+    fn assert_within_jitter(actual: Duration, nominal: Duration) {
+        let lo = nominal.mul_f64(0.8);
+        let hi = nominal.mul_f64(1.2);
+        assert!(
+            actual >= lo && actual <= hi,
+            "expected {actual:?} within +/-20% of {nominal:?} (i.e. [{lo:?}, {hi:?}])"
+        );
+    }
+
     #[test]
     fn mid_stream_backoff_is_exponential_and_capped() {
-        assert_eq!(mid_stream_backoff(1), MID_STREAM_BASE_BACKOFF);
-        assert_eq!(mid_stream_backoff(2), MID_STREAM_BASE_BACKOFF * 2);
-        assert_eq!(mid_stream_backoff(3), MID_STREAM_BASE_BACKOFF * 4);
+        assert_within_jitter(mid_stream_backoff(1), MID_STREAM_BASE_BACKOFF);
+        assert_within_jitter(mid_stream_backoff(2), MID_STREAM_BASE_BACKOFF * 2);
+        assert_within_jitter(mid_stream_backoff(3), MID_STREAM_BASE_BACKOFF * 4);
         assert_eq!(mid_stream_backoff(20), MID_STREAM_MAX_BACKOFF); // saturates, never overflows
+    }
+
+    #[test]
+    fn mid_stream_backoff_jitter_varies_across_calls_but_stays_in_range() {
+        // Finding #32 (pi-parity/consistency fix): proves jitter is actually applied, not just
+        // structurally present — the same attempt number, computed repeatedly, must not always
+        // produce the identical duration (the thundering-herd scenario this fix closes), while every
+        // value still lands within the documented +/-20% band around the unjittered exponential value.
+        let nominal = MID_STREAM_BASE_BACKOFF * 2; // attempt 2's unjittered value.
+        let samples: Vec<_> = (0..50).map(|_| mid_stream_backoff(2)).collect();
+        for &s in &samples {
+            assert_within_jitter(s, nominal);
+        }
+        assert!(
+            samples.windows(2).any(|w| w[0] != w[1]),
+            "expected varying backoff durations across repeated calls for the same attempt, got \
+             identical values every time: {samples:?}"
+        );
     }
 
     #[tokio::test]

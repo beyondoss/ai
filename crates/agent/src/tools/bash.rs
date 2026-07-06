@@ -177,12 +177,22 @@ impl Bash {
         // a plausible enhancement rather than narrowed to match.
         let cwd = input.get("cwd").and_then(Value::as_str);
         // Fail with a clear message instead of the raw spawn-error wrapping ("spawn failed: No such
-        // file or directory") a bad `cwd` would otherwise surface as — matches pi's own pre-check.
+        // file or directory") a bad `cwd` would otherwise surface as — matches pi's own pre-check, plus
+        // a stricter, more accurate rejection: pi only checks existence, so it would happily hand a
+        // *file* path to the shell as `cwd` and let the spawn itself fail with a confusing "Not a
+        // directory" OS error. `.is_dir()` rejects that up front too — but that means "does not exist"
+        // and "exists but isn't a directory" must be told apart explicitly (pi-parity task 51): a path
+        // that exists (a file, a broken permission on an ancestor notwithstanding) must not be reported
+        // as nonexistent.
         if let Some(dir) = cwd {
-            if !Path::new(dir).is_dir() {
-                return Err(ToolError::InvalidInput(format!(
-                    "Working directory does not exist: {dir}"
-                )));
+            let p = Path::new(dir);
+            if !p.is_dir() {
+                let msg = if p.exists() {
+                    format!("Working directory is not a directory: {dir}")
+                } else {
+                    format!("Working directory does not exist: {dir}")
+                };
+                return Err(ToolError::InvalidInput(msg));
             }
         }
         // A present `timeout_ms` must be a positive integer no larger than `MAX_TIMEOUT_MS` — 0 would
@@ -1027,6 +1037,36 @@ mod tests {
                 msg.contains("Working directory does not exist"),
                 "got: {msg}"
             ),
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+        // Must fail before ever reaching the runner.
+        assert!(runner.last.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_cwd_that_is_a_file_not_a_directory_gets_its_own_distinct_message() {
+        // Pi-parity fix (task 51): `.is_dir()` correctly rejects a non-directory `cwd` up front (this
+        // is actually stricter than pi's own existence-only check), but the error message previously
+        // always said "does not exist" even when the path exists and is simply a file. This must be
+        // told apart from the genuinely-missing case exercised by
+        // `nonexistent_cwd_is_a_clear_invalid_input_error_not_a_raw_spawn_failure` above.
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("not-a-directory.txt");
+        std::fs::write(&file_path, "x").unwrap();
+
+        let runner = recording(ExecResult {
+            code: Some(0),
+            ..Default::default()
+        });
+        let err = Bash::with_runner(runner.clone())
+            .run(json!({ "command": "echo hi", "cwd": file_path.to_str().unwrap() }))
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::InvalidInput(msg) => {
+                assert!(msg.contains("is not a directory"), "got: {msg}");
+                assert!(!msg.contains("does not exist"), "got: {msg}");
+            }
             other => panic!("expected InvalidInput, got {other:?}"),
         }
         // Must fail before ever reaching the runner.

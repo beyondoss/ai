@@ -9,6 +9,20 @@
 //! model changes rather than resolved once at process start and frozen for the rest of the process's
 //! life — see `crate::serve::build_gateway_client`, the one place both the initial `serve` startup and
 //! every later model-switch RPC command call back into this function.
+//!
+//! Fix #36 (pi-parity audit — perf, not correctness): `build_gateway_client` currently rebuilds a
+//! brand-new [`agent_core::client::GatewayClient`] (and the `reqwest::Client`/connection pool that
+//! construction always creates) on *every* call, even when the newly-resolved credential is for the
+//! exact same upstream as the one already in use — a same-provider model switch (Claude Opus →
+//! Claude Sonnet, say) discards a warm TCP/TLS connection for no reason. [`GatewayCredentialIdentity`]
+//! is the primitive a fix would build on: a cheap, `PartialEq`-comparable summary of which upstream a
+//! resolved [`GatewayCredential`] talks to, returned alongside it by
+//! [`resolve_gateway_credential_with_identity`]. A future `build_gateway_client` could keep its
+//! existing `Arc<GatewayClient>` across a model switch whenever the newly-resolved identity equals the
+//! previous one, instead of rebuilding unconditionally — see that type's own doc comment for exactly
+//! what such a caller would need to store and compare. Not yet wired into `serve.rs` (a sibling
+//! agent's file this round); this module only lands the identity-computation primitive itself, plus a
+//! unit test proving it distinguishes different upstreams and treats equivalent ones as equal.
 
 use std::sync::Arc;
 
@@ -91,6 +105,17 @@ impl CredentialSource for StaticDirectCredentialSource {
 /// includes `model`) are stored, the direct credential wins — checked first below, preferring the
 /// more specific, directly-authenticated relationship over a proxy.
 pub fn resolve_gateway_credential(key: Option<String>, model: &str) -> Result<GatewayCredential, String> {
+    resolve_gateway_credential_with_identity(key, model).map(|(credential, _identity)| credential)
+}
+
+/// [`resolve_gateway_credential`], additionally returning a [`GatewayCredentialIdentity`] alongside
+/// the resolved credential — see that type's own doc comment (Fix #36, pi-parity audit). The sole
+/// source of truth for both: [`resolve_gateway_credential`] is a thin wrapper around this function that
+/// discards the identity half, so the two can never drift out of sync with each other.
+pub fn resolve_gateway_credential_with_identity(
+    key: Option<String>,
+    model: &str,
+) -> Result<(GatewayCredential, GatewayCredentialIdentity), String> {
     // Fix 9 (pi-parity feature): a `models.json` override naming a `base_url` for this exact model id
     // wins outright, regardless of whether `--key`/`AI_AGENT_KEY` was also given — the override
     // redirects *where* the request goes (a locally-hosted or alternate-provider endpoint, entirely
@@ -100,6 +125,21 @@ pub fn resolve_gateway_credential(key: Option<String>, model: &str) -> Result<Ga
     // on-disk schema.
     if let Some(over) = crate::settings::ModelOverrides::open_default().get(model) {
         if let Some(base_url) = over.base_url.clone() {
+            // Fix #39 (pi-parity audit, judgment call): a handful of third-party-aggregator model ids
+            // (OpenCode Zen's `gemini-3-flash`/`gemini-3.1-pro`/`gemini-3.5-flash`) speak Google's own
+            // Generative AI wire format, which `agent_core::dialect::Dialect` has no variant for (the
+            // standing "Gemini-direct native dialect" deferral — out of scope to build here). Left
+            // unchecked, a BYO override naming one of these ids with no explicit `dialect` would
+            // silently fall back to `Dialect::for_model`'s OpenAI-family default and send an
+            // OpenAI-shaped body to an endpoint that doesn't understand it — a confusing *provider*-side
+            // failure instead of a clear one from us. An explicit `dialect` on the override is the
+            // escape hatch (e.g. an operator fronting Gemini with an OpenAI-compatible proxy of their
+            // own) — this only fires when that's genuinely unset.
+            if over.dialect.is_none() {
+                if let Some(reason) = unsupported_wire_format_reason(model) {
+                    return Err(reason);
+                }
+            }
             // Fix 1 (pi-parity, Round 2): an explicit `dialect` override wins over `Dialect::for_model`'s
             // name heuristic — consulted here (to pick the right endpoint path for a provider whose
             // model ids don't match the heuristic, e.g. Kimi-Coding's `kimi-k2-thinking`) AND threaded
@@ -114,11 +154,22 @@ pub fn resolve_gateway_credential(key: Option<String>, model: &str) -> Result<Ga
             let bearer = over.resolved_api_key(key.as_deref());
             // Fix 3 (pi-parity, Round 2): computed together so a `deployment_name` override's URL
             // path segment (Task 46) and the `/v1`-doubling fix (Task 45) never fight each other — see
-            // `direct_route_base_and_path`'s own doc comment.
+            // `direct_route_base_and_path`'s own doc comment. Fix #33/#34 (pi-parity audit): also skips
+            // the deployment-segment insertion for the Responses dialect, and auto-normalizes a bare/
+            // partial Azure `base_url` to the canonical `/openai/v1` — see that function's own doc
+            // comment for both.
             let (base_url, path) =
                 direct_route_base_and_path(&base_url, dialect, over.deployment_name.as_deref());
+            // Fix #35 (pi-parity audit): whether this override is genuinely an Azure endpoint at all —
+            // gates `azure_api_version_query`'s default so a plain (non-Azure) BYO override never picks
+            // up an unsolicited `?api-version=v1` it never asked for.
+            let is_azure = over.deployment_name.is_some() || is_azure_host(&base_url);
+            let query = azure_api_version_query(over.api_version.as_deref(), is_azure);
             let routing = DirectRouting {
-                route: RouteOverride::Direct { base_url, path },
+                route: RouteOverride::Direct {
+                    base_url: base_url.clone(),
+                    path,
+                },
                 static_headers: Vec::new(),
                 copilot_dynamic_headers: false,
                 // Task #8 (pi-parity: Azure OpenAI routing support) — an operator-configured
@@ -136,17 +187,27 @@ pub fn resolve_gateway_credential(key: Option<String>, model: &str) -> Result<Ga
                 // instead of `model` as the wire-level `"model"` field.
                 deployment_name: over.deployment_name.clone(),
                 // Fix 2 (pi-parity, Round 2): Azure's dated `api-version` query param.
-                query: azure_api_version_query(over.api_version.as_deref()),
+                query: query.clone(),
             };
-            return Ok(GatewayCredential::Oauth(Arc::new(StaticDirectCredentialSource {
-                bearer,
-                routing,
-            })));
+            let identity = GatewayCredentialIdentity::DirectOverride {
+                base_url,
+                path,
+                bearer: bearer.clone(),
+                auth_header: over.auth_header.clone(),
+                auth_header_prefix: over.auth_header_prefix.clone(),
+                deployment_name: over.deployment_name.clone(),
+                query,
+            };
+            return Ok((
+                GatewayCredential::Oauth(Arc::new(StaticDirectCredentialSource { bearer, routing })),
+                identity,
+            ));
         }
     }
 
     if let Some(key) = key {
-        return Ok(GatewayCredential::Static(key));
+        let identity = GatewayCredentialIdentity::StaticKey(key.clone());
+        return Ok((GatewayCredential::Static(key), identity));
     }
 
     let store = crate::auth_store::AuthStore::open_default();
@@ -160,7 +221,10 @@ pub fn resolve_gateway_credential(key: Option<String>, model: &str) -> Result<Ga
     if agent_core::dialect::Dialect::for_model(model) == agent_core::dialect::Dialect::Anthropic
         && store.get("anthropic").is_some()
     {
-        return Ok(GatewayCredential::Oauth(oauth_source(OAuthProviderId::Anthropic)));
+        return Ok((
+            GatewayCredential::Oauth(oauth_source(OAuthProviderId::Anthropic)),
+            GatewayCredentialIdentity::Anthropic,
+        ));
     }
     if model.contains("codex") {
         if let Some(stored) = store.get("openai-codex") {
@@ -185,10 +249,16 @@ pub fn resolve_gateway_credential(key: Option<String>, model: &str) -> Result<Ga
                     deployment_name: None,
                     query: None,
                 };
-                return Ok(GatewayCredential::Oauth(Arc::new(DirectRoutedCredentialSource {
-                    inner: oauth_source(OAuthProviderId::OpenaiCodex),
-                    routing,
-                })));
+                let identity = GatewayCredentialIdentity::OpenaiCodex {
+                    account_id: c.account_id.clone(),
+                };
+                return Ok((
+                    GatewayCredential::Oauth(Arc::new(DirectRoutedCredentialSource {
+                        inner: oauth_source(OAuthProviderId::OpenaiCodex),
+                        routing,
+                    })),
+                    identity,
+                ));
             }
         }
     }
@@ -208,14 +278,22 @@ pub fn resolve_gateway_credential(key: Option<String>, model: &str) -> Result<Ga
                 // baked-in `path` below, so getting it wrong here would send that id's Chat-Completions
                 // body to a `/responses` path.
                 let dialect = agent_core::dialect::Dialect::for_model_via_copilot(model, true);
-                return Ok(GatewayCredential::Oauth(Arc::new(
-                    crate::oauth::github_copilot::CopilotRoutedCredentialSource {
-                        inner: oauth_source(OAuthProviderId::GithubCopilot),
-                        store_path: crate::auth_store::default_path(),
-                        enterprise_url: c.enterprise_url.clone(),
-                        path: crate::oauth::github_copilot::copilot_endpoint_path(dialect),
-                    },
-                )));
+                let path = crate::oauth::github_copilot::copilot_endpoint_path(dialect);
+                let identity = GatewayCredentialIdentity::GithubCopilot {
+                    enterprise_url: c.enterprise_url.clone(),
+                    path,
+                };
+                return Ok((
+                    GatewayCredential::Oauth(Arc::new(
+                        crate::oauth::github_copilot::CopilotRoutedCredentialSource {
+                            inner: oauth_source(OAuthProviderId::GithubCopilot),
+                            store_path: crate::auth_store::default_path(),
+                            enterprise_url: c.enterprise_url.clone(),
+                            path,
+                        },
+                    )),
+                    identity,
+                ));
             }
         }
     }
@@ -224,6 +302,127 @@ pub fn resolve_gateway_credential(key: Option<String>, model: &str) -> Result<Ga
         "no gateway key: pass --key or set AI_AGENT_KEY (a bai_v1… virtual key), or run `agent login \
          <provider>` to use a subscription for model {model:?}"
     ))
+}
+
+/// Model ids that speak a wire format `agent_core::dialect::Dialect` has no variant for — currently
+/// only OpenCode Zen's 3 Gemini-hosted ids (Fix #39, pi-parity audit): pi's own `opencode.models.ts`
+/// declares these with `api: "google-generative-ai"`. Neither `opencode` nor `opencode-go`'s *own*
+/// default catalog routes here — this only ever fires for an operator-authored `models.json` override
+/// that names one of these exact ids with no explicit `dialect`, a narrow, opt-out-respecting guard
+/// rather than a broad heuristic.
+const UNSUPPORTED_GOOGLE_GENERATIVE_AI_MODEL_IDS: &[&str] =
+    &["gemini-3-flash", "gemini-3.1-pro", "gemini-3.5-flash"];
+
+/// `Some(reason)` if `model` is a known-unroutable id (see
+/// [`UNSUPPORTED_GOOGLE_GENERATIVE_AI_MODEL_IDS`]), else `None` — factored out so
+/// [`resolve_gateway_credential_with_identity`]'s call site reads as a plain early-return and this is
+/// independently unit-testable.
+fn unsupported_wire_format_reason(model: &str) -> Option<String> {
+    UNSUPPORTED_GOOGLE_GENERATIVE_AI_MODEL_IDS
+        .contains(&model)
+        .then(|| {
+            format!(
+                "model {model:?} speaks Google's own Generative AI wire format (e.g. via OpenCode \
+                 Zen), which beyond has no native dialect for — set an explicit `dialect` on this \
+                 model's models.json override to pick a supported wire shape instead of silently \
+                 sending a mis-shapen request body"
+            )
+        })
+}
+
+/// A cheap, `PartialEq`-comparable summary of *which upstream* a resolved [`GatewayCredential`] talks
+/// to — deliberately not the credential/token value's own identity in every case (an OAuth token's
+/// bearer content can rotate independently of "is this still the same provider relationship", and
+/// GitHub Copilot's own proxy host is *known* to rotate mid-session on the same stored login — see
+/// `crate::oauth::github_copilot::CopilotRoutedCredentialSource`'s own doc comment), just the shape of
+/// the connection: which provider, and (for a direct-routed credential) which
+/// base_url/dialect/deployment/auth-header combination it resolved to.
+///
+/// Fix #36 (pi-parity audit, perf primitive): two calls to [`resolve_gateway_credential_with_identity`]
+/// for different models that produce `==` identities are safe to keep serving from the same
+/// already-built `agent_core::client::GatewayClient` (and its `reqwest::Client` connection pool)
+/// instead of tearing one down and building a fresh one on every model switch — see this module's own
+/// doc comment for `crate::serve::build_gateway_client`'s current unconditional-rebuild behavior. A
+/// future `build_gateway_client` would need to: (1) store the `GatewayCredentialIdentity` alongside
+/// the `Arc<GatewayClient>` it currently caches per-process, (2) call
+/// `resolve_gateway_credential_with_identity` instead of `resolve_gateway_credential`, and (3) only
+/// rebuild when the new identity differs from the stored one — reusing the existing `Arc<GatewayClient>`
+/// (still re-applying `with_retry`/`with_max_backoff`/`with_idle_timeout` from the *current* `cfg`,
+/// since those can change independently of the credential) otherwise. Not wired in this round — see
+/// this module's own doc comment.
+///
+/// No `Debug` derive: [`Self::DirectOverride`]'s `bearer` field is a live, resolved API key — this type
+/// implements [`std::fmt::Debug`] by hand instead, redacting only that field, matching
+/// `agent_core::client::ApiKey`'s own redaction convention.
+#[derive(Clone, PartialEq, Eq)]
+pub enum GatewayCredentialIdentity {
+    /// `GatewayCredential::Static` — a fixed `--key`/`AI_AGENT_KEY` string.
+    StaticKey(String),
+    /// A `models.json` `base_url` override's resolved `StaticDirectCredentialSource` — every field of
+    /// the resolved route that changes what's actually sent on the wire (see
+    /// `resolve_gateway_credential_with_identity`'s BYO-override branch for where each comes from).
+    DirectOverride {
+        base_url: String,
+        path: &'static str,
+        bearer: String,
+        auth_header: Option<String>,
+        auth_header_prefix: Option<String>,
+        deployment_name: Option<String>,
+        query: Option<String>,
+    },
+    /// A stored Anthropic OAuth subscription login — a fixed relationship to a fixed backend, so no
+    /// further distinguishing fields are needed (unlike GitHub Copilot's own dynamically-hosted proxy;
+    /// see [`Self::GithubCopilot`]).
+    Anthropic,
+    /// A stored OpenAI Codex OAuth subscription login, distinguished by the account id the backend
+    /// requires (not a secret — see `crate::oauth::openai_codex::OpenaiCodexCredential`'s own doc
+    /// comment; safe to hold and compare directly here).
+    OpenaiCodex { account_id: String },
+    /// A stored GitHub Copilot OAuth subscription login. Deliberately excludes the resolved proxy host:
+    /// it's re-derived fresh from the current access token on every request and can rotate mid-session
+    /// on the exact same stored login (see `CopilotRoutedCredentialSource`'s own doc comment) — treating
+    /// a host change alone as "a different upstream" would defeat the whole point of this type, forcing
+    /// a client rebuild on a rotation that isn't actually a provider switch. `enterprise_url` and `path`
+    /// are the two inputs that genuinely are fixed for a given stored login/model pairing.
+    GithubCopilot {
+        enterprise_url: Option<String>,
+        path: &'static str,
+    },
+}
+
+impl std::fmt::Debug for GatewayCredentialIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StaticKey(_) => f.write_str("StaticKey(***)"),
+            Self::DirectOverride {
+                base_url,
+                path,
+                auth_header,
+                auth_header_prefix,
+                deployment_name,
+                query,
+                ..
+            } => f
+                .debug_struct("DirectOverride")
+                .field("base_url", base_url)
+                .field("path", path)
+                .field("bearer", &"***")
+                .field("auth_header", auth_header)
+                .field("auth_header_prefix", auth_header_prefix)
+                .field("deployment_name", deployment_name)
+                .field("query", query)
+                .finish(),
+            Self::Anthropic => f.write_str("Anthropic"),
+            Self::OpenaiCodex { account_id } => {
+                f.debug_struct("OpenaiCodex").field("account_id", account_id).finish()
+            }
+            Self::GithubCopilot { enterprise_url, path } => f
+                .debug_struct("GithubCopilot")
+                .field("enterprise_url", enterprise_url)
+                .field("path", path)
+                .finish(),
+        }
+    }
 }
 
 /// Whether `base_url` already carries a `/v1` version segment (ignoring a trailing slash) — the signal
@@ -280,6 +479,27 @@ fn direct_route_path(dialect: agent_core::dialect::Dialect, base_url: &str) -> &
 /// needing a change there. Factored out from `resolve_gateway_credential` so both this and
 /// [`direct_route_path`] are unit-testable directly, without touching the real `~/.claude/models.json`
 /// file `ModelOverrides::open_default` reads from.
+///
+/// Fix #33 (pi-parity audit): the deployment-segment insertion above is skipped for
+/// [`agent_core::dialect::Dialect::OpenAiResponses`] — verified against both the `openai` npm package's
+/// `AzureOpenAI` client and Microsoft's Azure OpenAI OpenAPI spec, the Responses API never takes a
+/// deployment-prefixed URL segment at all; a deployment is addressed purely through the request body's
+/// `"model"` field there (already handled independently by `GatewayClient::stream`'s own substitution,
+/// untouched by this fn). Folding `deployment_name` into the URL unconditionally for every dialect
+/// previously produced `.../openai/deployments/{name}/responses`, a path the Responses API doesn't
+/// recognize. So a Responses-dialect request with `deployment_name` set now falls through to the same
+/// branch a `deployment_name`-unset request takes below — including Fix #34's Azure host
+/// auto-normalization, which is exactly the URL shape Azure's Responses API actually expects.
+///
+/// Fix #34 (pi-parity audit): when there's no deployment segment to insert (either because
+/// `deployment_name` is unset, or because it's a Responses-dialect request per Fix #33 above),
+/// [`normalize_azure_base_url`] gets first look at `base_url` — an operator pasting a bare/partial Azure
+/// Portal endpoint (`https://my-resource.openai.azure.com`, or that plus a stray `/openai` or
+/// `/openai/v1/responses`) is auto-rewritten to Azure's canonical `/openai/v1`, mirroring pi's own
+/// `normalizeAzureBaseUrl` (`azure-openai-responses.ts`). A non-Azure `base_url` (or an Azure one whose
+/// path doesn't match a recognized shape — see that function's own doc comment) is returned unchanged,
+/// falling through to [`direct_route_path`]'s existing `/v1`-detection heuristic exactly as before this
+/// fix.
 fn direct_route_base_and_path(
     base_url: &str,
     dialect: agent_core::dialect::Dialect,
@@ -287,24 +507,87 @@ fn direct_route_base_and_path(
 ) -> (String, &'static str) {
     let trimmed = base_url.trim_end_matches('/');
     match deployment_name {
-        Some(name) => (
+        Some(name) if dialect != agent_core::dialect::Dialect::OpenAiResponses => (
             format!("{trimmed}/openai/deployments/{name}"),
             crate::oauth::github_copilot::copilot_endpoint_path(dialect),
         ),
-        None => (trimmed.to_string(), direct_route_path(dialect, trimmed)),
+        _ => match normalize_azure_base_url(trimmed) {
+            Some(normalized) => {
+                let path = direct_route_path(dialect, &normalized);
+                (normalized, path)
+            }
+            None => (trimmed.to_string(), direct_route_path(dialect, trimmed)),
+        },
     }
 }
 
+/// Azure OpenAI hostnames [`normalize_azure_base_url`]/[`is_azure_host`] recognize — mirrors pi's own
+/// `normalizeAzureBaseUrl` host detection (`azure-openai-responses.ts`): the classic Azure OpenAI
+/// resource domain, Azure AI's newer Cognitive Services umbrella domain, and Azure AI Foundry's own
+/// domain — all three are real, current hostnames Azure-hosted OpenAI deployments are reachable under.
+const AZURE_HOST_SUFFIXES: &[&str] = &[".openai.azure.com", ".cognitiveservices.azure.com", ".ai.azure.com"];
+
+/// Fix #34 (pi-parity audit): whether `base_url`'s host is a recognized Azure OpenAI hostname (see
+/// [`AZURE_HOST_SUFFIXES`]) — used both by [`normalize_azure_base_url`] and, independently, by
+/// [`resolve_gateway_credential_with_identity`] to gate [`azure_api_version_query`]'s Fix #35 default
+/// (an unparsable `base_url`, or one with no host at all, is never treated as Azure).
+fn is_azure_host(base_url: &str) -> bool {
+    url::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .is_some_and(|host| AZURE_HOST_SUFFIXES.iter().any(|suffix| host.ends_with(suffix)))
+}
+
+/// Fix #34 (pi-parity audit): if `base_url`'s host is Azure-shaped (see [`is_azure_host`]) *and* its
+/// path is one of the handful of shapes an operator pasting a Azure Portal endpoint actually produces —
+/// bare root, `/openai`, or the full `/openai/v1/responses` (each with or without a trailing slash;
+/// query strings are always dropped/rebuilt, matching the "with/without trailing query" cases pi's own
+/// `normalizeAzureBaseUrl` also collapses) — rewrite it to Azure's canonical unified `/openai/v1`.
+/// Returns `None` for a non-Azure host, an unparsable `base_url`, or an Azure host whose path doesn't
+/// match one of those recognized shapes (e.g. the classic per-deployment path `direct_route_base_and_path`
+/// already builds itself, or some genuinely custom proxy path an operator set up on purpose) — in every
+/// `None` case the caller falls through to its own existing behavior, unchanged.
+fn normalize_azure_base_url(base_url: &str) -> Option<String> {
+    let url = url::Url::parse(base_url).ok()?;
+    let host = url.host_str()?;
+    if !AZURE_HOST_SUFFIXES.iter().any(|suffix| host.ends_with(suffix)) {
+        return None;
+    }
+    let path = url.path().trim_end_matches('/');
+    if !matches!(path, "" | "/openai" | "/openai/v1" | "/openai/v1/responses") {
+        return None;
+    }
+    let authority = match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    };
+    Some(format!("{}://{authority}/openai/v1", url.scheme()))
+}
+
+/// Default `api-version` (Fix #35, pi-parity audit) sent whenever a request is genuinely Azure-routed
+/// (see [`is_azure_host`]/`ModelOverride::deployment_name`) and the operator left
+/// [`crate::settings::ModelOverride::api_version`] unset — pi's own `DEFAULT_AZURE_API_VERSION`
+/// (`azure-openai-responses.ts`). Harmless for the recommended unified `/openai/v1` endpoint (Fix #34
+/// routes most bare Azure configs there by default, and that surface doesn't require `api-version` at
+/// all) — better than silently sending no query string at all for an operator on the classic
+/// dated-`api-version` endpoint (via `deployment_name`) who forgot to set this field explicitly.
+const DEFAULT_AZURE_API_VERSION: &str = "v1";
+
 /// Build the `api-version=…` query string from a `models.json` override's [`ModelOverride::api_version`]
-/// field (Fix 2, pi-parity Round 2 — Azure OpenAI's dated REST `api-version`), or `None` if unset/empty.
+/// field (Fix 2, pi-parity Round 2 — Azure OpenAI's dated REST `api-version`), or `None` if unset/empty
+/// and `is_azure` is `false`. `is_azure` (Fix #35, pi-parity audit) gates [`DEFAULT_AZURE_API_VERSION`]'s
+/// default: `true` for a `deployment_name`-carrying override or one whose `base_url` is a recognized
+/// Azure host (see [`is_azure_host`]) — a plain non-Azure BYO override (Ollama, Kimi-Coding, Cloudflare
+/// AI Gateway, …) must never pick up an unsolicited `?api-version=v1` query string it never asked for.
 /// Percent-encoded via [`url::form_urlencoded`] — the same general-purpose query-param encoder any other
 /// query value would go through, rather than a hand-rolled `format!("api-version={v}")` that would
 /// silently misbuild the URL if an operator's value ever contained a character needing escaping.
-fn azure_api_version_query(api_version: Option<&str>) -> Option<String> {
-    let version = api_version?;
-    if version.is_empty() {
-        return None;
-    }
+fn azure_api_version_query(api_version: Option<&str>, is_azure: bool) -> Option<String> {
+    let version = match api_version {
+        Some(v) if !v.is_empty() => v,
+        _ if is_azure => DEFAULT_AZURE_API_VERSION,
+        _ => return None,
+    };
     Some(
         url::form_urlencoded::Serializer::new(String::new())
             .append_pair("api-version", version)
@@ -319,7 +602,12 @@ mod tests {
     #[test]
     fn azure_api_version_query_builds_the_expected_query_string() {
         assert_eq!(
-            azure_api_version_query(Some("2024-08-01-preview")),
+            azure_api_version_query(Some("2024-08-01-preview"), true),
+            Some("api-version=2024-08-01-preview".to_string())
+        );
+        // An explicit value wins even for a non-Azure route — `is_azure` only gates the *default*.
+        assert_eq!(
+            azure_api_version_query(Some("2024-08-01-preview"), false),
             Some("api-version=2024-08-01-preview".to_string())
         );
     }
@@ -329,15 +617,120 @@ mod tests {
         // A defensive check, not a realistic input: Azure's own api-version strings never carry a
         // space, but the encoder must still do the right thing rather than build a broken URL.
         assert_eq!(
-            azure_api_version_query(Some("2024 08 01")),
+            azure_api_version_query(Some("2024 08 01"), true),
             Some("api-version=2024+08+01".to_string())
         );
     }
 
     #[test]
-    fn azure_api_version_query_is_none_when_unset_or_empty() {
-        assert_eq!(azure_api_version_query(None), None);
-        assert_eq!(azure_api_version_query(Some("")), None);
+    fn azure_api_version_query_is_none_when_unset_or_empty_and_not_azure() {
+        assert_eq!(azure_api_version_query(None, false), None);
+        assert_eq!(azure_api_version_query(Some(""), false), None);
+    }
+
+    // Fix #35 (pi-parity audit): an Azure-routed request whose `api_version` was left unset defaults
+    // to pi's own `DEFAULT_AZURE_API_VERSION` ("v1") rather than sending no query string at all.
+
+    #[test]
+    fn azure_api_version_query_defaults_to_v1_when_azure_and_unset() {
+        assert_eq!(
+            azure_api_version_query(None, true),
+            Some("api-version=v1".to_string())
+        );
+    }
+
+    #[test]
+    fn azure_api_version_query_defaults_to_v1_when_azure_and_empty() {
+        assert_eq!(
+            azure_api_version_query(Some(""), true),
+            Some("api-version=v1".to_string())
+        );
+    }
+
+    #[test]
+    fn azure_api_version_query_never_defaults_for_a_non_azure_route() {
+        // A plain BYO override (Ollama, Kimi-Coding, Cloudflare AI Gateway, ...) must never pick up an
+        // unsolicited `?api-version=v1` query string it never asked for.
+        assert_eq!(azure_api_version_query(None, false), None);
+    }
+
+    // Fix #34 (pi-parity audit): `normalize_azure_base_url`/`is_azure_host` auto-detect an Azure OpenAI
+    // host and rewrite any of the shapes an operator pasting the bare Azure Portal endpoint would
+    // actually produce to Azure's canonical unified `/openai/v1`.
+
+    #[test]
+    fn is_azure_host_recognizes_all_three_documented_azure_domains() {
+        assert!(is_azure_host("https://my-resource.openai.azure.com"));
+        assert!(is_azure_host("https://my-resource.cognitiveservices.azure.com"));
+        assert!(is_azure_host("https://my-resource.ai.azure.com"));
+    }
+
+    #[test]
+    fn is_azure_host_is_false_for_a_non_azure_host_or_an_unparsable_url() {
+        assert!(!is_azure_host("https://api.openai.com"));
+        assert!(!is_azure_host("not a url at all"));
+    }
+
+    #[test]
+    fn normalize_azure_base_url_rewrites_a_bare_azure_root_to_the_canonical_v1_path() {
+        assert_eq!(
+            normalize_azure_base_url("https://my-resource.openai.azure.com"),
+            Some("https://my-resource.openai.azure.com/openai/v1".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_azure_base_url_rewrites_a_bare_openai_segment_to_the_canonical_v1_path() {
+        assert_eq!(
+            normalize_azure_base_url("https://my-resource.openai.azure.com/openai"),
+            Some("https://my-resource.openai.azure.com/openai/v1".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_azure_base_url_rewrites_the_full_v1_responses_shape_dropping_the_bare_path_suffix() {
+        assert_eq!(
+            normalize_azure_base_url("https://my-resource.openai.azure.com/openai/v1/responses"),
+            Some("https://my-resource.openai.azure.com/openai/v1".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_azure_base_url_ignores_a_trailing_slash_and_a_query_string() {
+        assert_eq!(
+            normalize_azure_base_url("https://my-resource.openai.azure.com/openai/v1/responses/?api-version=v1"),
+            Some("https://my-resource.openai.azure.com/openai/v1".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_azure_base_url_recognizes_the_cognitiveservices_and_ai_azure_domains_too() {
+        assert_eq!(
+            normalize_azure_base_url("https://my-resource.cognitiveservices.azure.com"),
+            Some("https://my-resource.cognitiveservices.azure.com/openai/v1".to_string())
+        );
+        assert_eq!(
+            normalize_azure_base_url("https://my-resource.ai.azure.com/openai"),
+            Some("https://my-resource.ai.azure.com/openai/v1".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_azure_base_url_returns_none_for_a_non_azure_host() {
+        assert_eq!(
+            normalize_azure_base_url("https://my-ollama-box.example.com"),
+            None
+        );
+    }
+
+    #[test]
+    fn normalize_azure_base_url_returns_none_for_an_azure_host_with_an_unrecognized_path() {
+        // The classic per-deployment path shape (`direct_route_base_and_path` builds this one itself)
+        // and any other genuinely custom proxy path an operator set up on purpose must not be rewritten.
+        assert_eq!(
+            normalize_azure_base_url("https://my-resource.openai.azure.com/openai/deployments/my-deployment"),
+            None
+        );
     }
 
     // Task 45: `direct_route_path`/`direct_route_base_and_path` fix the `/v1`-doubling bug for a
@@ -405,19 +798,66 @@ mod tests {
     // convention), composing cleanly with Task 45's fix rather than fighting it.
 
     #[test]
-    fn deployment_name_inserts_a_url_path_segment_and_composes_with_api_version_query() {
+    fn deployment_name_inserts_a_url_path_segment_for_chat_completions_and_composes_with_api_version_query() {
+        use agent_core::dialect::Dialect;
+        let (base_url, path) = direct_route_base_and_path(
+            "https://my-resource.openai.azure.com",
+            Dialect::OpenAi,
+            Some("my-deployment"),
+        );
+        let query = azure_api_version_query(Some("2024-08-01-preview"), true).unwrap();
+        let url = format!("{base_url}{path}?{query}");
+        assert_eq!(
+            url,
+            "https://my-resource.openai.azure.com/openai/deployments/my-deployment/chat/completions\
+             ?api-version=2024-08-01-preview"
+        );
+    }
+
+    // Fix #33 (pi-parity audit): the Responses API never takes a deployment-prefixed URL segment at
+    // all — a deployment is addressed purely through the request body's own `"model"` field there
+    // (`agent_core::client::GatewayClient::stream`'s independent `deployment_name` substitution). This
+    // used to be the exact regression: `deployment_name` set + `Dialect::OpenAiResponses` previously
+    // produced `.../openai/deployments/{name}/responses`, a path the Responses API doesn't recognize.
+
+    #[test]
+    fn deployment_name_is_not_folded_into_the_url_for_the_responses_dialect() {
         use agent_core::dialect::Dialect;
         let (base_url, path) = direct_route_base_and_path(
             "https://my-resource.openai.azure.com",
             Dialect::OpenAiResponses,
             Some("my-deployment"),
         );
-        let query = azure_api_version_query(Some("2024-08-01-preview")).unwrap();
+        assert!(
+            !base_url.contains("deployments"),
+            "the Responses dialect must never get a /openai/deployments/{{name}} URL segment, got: \
+             {base_url}"
+        );
+        // Falls through to Fix #34's Azure host auto-normalization instead, since this base_url is a
+        // bare Azure root with no deployment-specific path to preserve.
+        assert_eq!(
+            format!("{base_url}{path}"),
+            "https://my-resource.openai.azure.com/openai/v1/responses"
+        );
+    }
+
+    #[test]
+    fn deployment_name_and_responses_dialect_together_compose_with_the_api_version_default() {
+        use agent_core::dialect::Dialect;
+        let (base_url, path) = direct_route_base_and_path(
+            "https://my-resource.openai.azure.com",
+            Dialect::OpenAiResponses,
+            Some("my-deployment"),
+        );
+        // The deployment is still addressed — just via the body's "model" field (Fix 2, handled
+        // independently by `GatewayClient::stream`), not this URL — so `is_azure` must still be `true`
+        // for the api-version default (Fix #35) to apply, exactly as if a bare Azure host were used
+        // with no `deployment_name` at all.
+        let query = azure_api_version_query(None, true).unwrap();
         let url = format!("{base_url}{path}?{query}");
         assert_eq!(
             url,
-            "https://my-resource.openai.azure.com/openai/deployments/my-deployment/responses\
-             ?api-version=2024-08-01-preview"
+            "https://my-resource.openai.azure.com/openai/v1/responses?api-version=v1"
         );
     }
 
@@ -442,6 +882,159 @@ mod tests {
         assert_eq!(
             format!("{base_url}{path}"),
             "https://my-resource.openai.azure.com/openai/deployments/gpt4/chat/completions"
+        );
+    }
+
+    // Fix #39 (pi-parity audit, judgment call): OpenCode Zen's 3 Gemini-hosted ids speak a wire format
+    // this crate has no dialect for — `unsupported_wire_format_reason` is the narrow, opt-out-respecting
+    // guard `resolve_gateway_credential_with_identity` consults before silently mis-routing one.
+
+    #[test]
+    fn unsupported_wire_format_reason_flags_all_three_known_opencode_zen_gemini_ids() {
+        for model in ["gemini-3-flash", "gemini-3.1-pro", "gemini-3.5-flash"] {
+            assert!(
+                unsupported_wire_format_reason(model).is_some(),
+                "expected {model:?} to be flagged as an unsupported wire format"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_wire_format_reason_is_none_for_an_ordinary_model_id() {
+        assert_eq!(unsupported_wire_format_reason("gpt-5"), None);
+        assert_eq!(unsupported_wire_format_reason("claude-opus-4-8"), None);
+        // Not an exact match for any of the 3 known ids — must not false-positive on a substring.
+        assert_eq!(unsupported_wire_format_reason("gemini-3-flash-preview"), None);
+    }
+
+    #[test]
+    fn unsupported_wire_format_reason_message_names_the_model_and_suggests_the_escape_hatch() {
+        let reason = unsupported_wire_format_reason("gemini-3-flash").unwrap();
+        assert!(reason.contains("gemini-3-flash"), "got: {reason}");
+        assert!(reason.contains("dialect"), "got: {reason}");
+    }
+
+    // Fix #36 (pi-parity audit): `GatewayCredentialIdentity` compares equal for two credentials that
+    // resolve to the same upstream/config, and unequal for ones that don't — the property a future
+    // `build_gateway_client` skip-rebuild check would rely on.
+
+    #[test]
+    fn identity_static_key_is_equal_for_the_same_key_and_differs_for_a_different_one() {
+        let a = GatewayCredentialIdentity::StaticKey("bai_v1_abc".to_string());
+        let b = GatewayCredentialIdentity::StaticKey("bai_v1_abc".to_string());
+        let c = GatewayCredentialIdentity::StaticKey("bai_v1_xyz".to_string());
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn identity_direct_override_is_equal_only_when_every_distinguishing_field_matches() {
+        let make = |base_url: &str, deployment: Option<&str>| GatewayCredentialIdentity::DirectOverride {
+            base_url: base_url.to_string(),
+            path: "/chat/completions",
+            bearer: "key-1".to_string(),
+            auth_header: None,
+            auth_header_prefix: None,
+            deployment_name: deployment.map(str::to_string),
+            query: None,
+        };
+        assert_eq!(make("https://host/openai/v1", None), make("https://host/openai/v1", None));
+        assert_ne!(
+            make("https://host-a/openai/v1", None),
+            make("https://host-b/openai/v1", None),
+            "a different base_url must be a different identity"
+        );
+        assert_ne!(
+            make("https://host/openai/v1", Some("dep-a")),
+            make("https://host/openai/v1", Some("dep-b")),
+            "a different deployment_name must be a different identity"
+        );
+    }
+
+    #[test]
+    fn identity_direct_override_differs_from_a_static_key_even_with_the_same_bearer_value() {
+        let direct = GatewayCredentialIdentity::DirectOverride {
+            base_url: "https://host".to_string(),
+            path: "/chat/completions",
+            bearer: "same-value".to_string(),
+            auth_header: None,
+            auth_header_prefix: None,
+            deployment_name: None,
+            query: None,
+        };
+        let static_key = GatewayCredentialIdentity::StaticKey("same-value".to_string());
+        assert_ne!(direct, static_key);
+    }
+
+    #[test]
+    fn identity_anthropic_is_a_singleton_equal_to_itself_and_unequal_to_every_other_variant() {
+        assert_eq!(GatewayCredentialIdentity::Anthropic, GatewayCredentialIdentity::Anthropic);
+        assert_ne!(
+            GatewayCredentialIdentity::Anthropic,
+            GatewayCredentialIdentity::StaticKey("anthropic".to_string())
+        );
+    }
+
+    #[test]
+    fn identity_openai_codex_differs_by_account_id() {
+        let a = GatewayCredentialIdentity::OpenaiCodex {
+            account_id: "acct_1".to_string(),
+        };
+        let b = GatewayCredentialIdentity::OpenaiCodex {
+            account_id: "acct_1".to_string(),
+        };
+        let c = GatewayCredentialIdentity::OpenaiCodex {
+            account_id: "acct_2".to_string(),
+        };
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn identity_github_copilot_differs_by_enterprise_url_and_path_but_not_by_anything_else() {
+        let a = GatewayCredentialIdentity::GithubCopilot {
+            enterprise_url: Some("company.ghe.com".to_string()),
+            path: "/chat/completions",
+        };
+        let same_as_a = GatewayCredentialIdentity::GithubCopilot {
+            enterprise_url: Some("company.ghe.com".to_string()),
+            path: "/chat/completions",
+        };
+        let different_enterprise = GatewayCredentialIdentity::GithubCopilot {
+            enterprise_url: Some("other.ghe.com".to_string()),
+            path: "/chat/completions",
+        };
+        let different_path = GatewayCredentialIdentity::GithubCopilot {
+            enterprise_url: Some("company.ghe.com".to_string()),
+            path: "/responses",
+        };
+        assert_eq!(a, same_as_a);
+        assert_ne!(a, different_enterprise);
+        assert_ne!(a, different_path);
+    }
+
+    #[test]
+    fn identity_debug_never_prints_the_raw_bearer_value() {
+        let direct = GatewayCredentialIdentity::DirectOverride {
+            base_url: "https://host".to_string(),
+            path: "/chat/completions",
+            bearer: "super-secret-value".to_string(),
+            auth_header: None,
+            auth_header_prefix: None,
+            deployment_name: None,
+            query: None,
+        };
+        let debug = format!("{direct:?}");
+        assert!(
+            !debug.contains("super-secret-value"),
+            "Debug must redact the bearer value, got: {debug}"
+        );
+
+        let static_key = GatewayCredentialIdentity::StaticKey("another-secret".to_string());
+        let debug = format!("{static_key:?}");
+        assert!(
+            !debug.contains("another-secret"),
+            "Debug must redact the static key value, got: {debug}"
         );
     }
 }

@@ -407,7 +407,12 @@ fn push_assistant_content(input: &mut Vec<Value>, blocks: &[ContentBlock], msg_i
 
 /// Build the streaming request body.
 pub fn build_body(req: &ModelRequest) -> Value {
-    let caps = crate::models::capabilities_for_route(&req.model, req.is_codex, req.is_azure);
+    let caps = crate::models::capabilities_for_route_with_copilot(
+        &req.model,
+        req.is_codex,
+        req.is_azure,
+        req.is_copilot,
+    );
     let mut input: Vec<Value> = Vec::new();
 
     // Codex/ChatGPT's own backend wants the system prompt carried in a separate top-level
@@ -512,12 +517,23 @@ pub fn build_body(req: &ModelRequest) -> Value {
     if caps.reasoning_effort {
         if let Some(effort) = req.reasoning_effort {
             let effort = crate::models::clamp_reasoning_effort(&caps, effort);
+            // Codex's (`openai-codex.models.ts`) and GitHub Copilot's (`github-copilot.models.ts`) own
+            // `thinkingLevelMap`s remap a "minimal" request to the wire value "low" for a handful of
+            // gpt-5 ids that have no literal "minimal" tier in either catalogue at all, unlike native
+            // OpenAI's own map — see `responses_minimal_effort_wire_override`'s own doc comment.
+            let wire_effort = crate::models::responses_minimal_effort_wire_override(
+                &req.model,
+                req.is_codex,
+                req.is_copilot,
+                effort,
+            )
+            .unwrap_or_else(|| effort.as_str());
             let summary = req
                 .reasoning_summary
                 .unwrap_or(crate::transport::ReasoningSummary::Auto);
             map.insert(
                 "reasoning".into(),
-                json!({ "effort": effort.as_str(), "summary": summary.as_str() }),
+                json!({ "effort": wire_effort, "summary": summary.as_str() }),
             );
             map.insert("include".into(), json!(["reasoning.encrypted_content"]));
         } else if caps.reasoning_disableable && !req.is_copilot && !req.is_codex {
@@ -541,13 +557,17 @@ pub fn build_body(req: &ModelRequest) -> Value {
     }
 
     // Prompt-cache affinity, same as the Chat Completions dialect: OpenAI caches prefixes
-    // automatically, so this is only a routing hint. Still gated on `!req.no_cache`, though —
-    // `ModelRequest::no_cache`'s own doc comment promises to skip OpenAI's
+    // automatically, so this is only a routing hint. Gated on `!req.no_cache` for the native/Azure
+    // routes — `ModelRequest::no_cache`'s own doc comment promises to skip OpenAI's
     // `prompt_cache_key`/`prompt_cache_retention` too (equivalently to Anthropic's `cache_control`),
     // matching pi's `cacheRetention === "none"` check (`openai-completions.ts`): a genuinely one-off
     // request has no follow-up turn to route back to the same cache node, so the affinity hint is
-    // pointless even though sending it wouldn't itself cost a cache-write premium here.
-    if !req.no_cache {
+    // pointless even though sending it wouldn't itself cost a cache-write premium here. Codex is the one
+    // exception: pi's `openai-codex-responses.ts` sends `prompt_cache_key: clampOpenAIPromptCacheKey(
+    // options?.sessionId)` completely unconditionally — there's no `no_cache`-equivalent gate on that
+    // backend's own `buildRequestBody` at all, so Codex must send its cache key regardless (latent today
+    // since nothing sets `no_cache: true` in production yet, but a real divergence if that changes).
+    if req.is_codex || !req.no_cache {
         if let Some(key) = &req.cache_key {
             map.insert(
                 "prompt_cache_key".into(),
@@ -1254,6 +1274,22 @@ mod tests {
     }
 
     #[test]
+    fn max_output_tokens_never_drops_below_the_absolute_floor_of_16() {
+        // pi-parity: OpenAI/Azure Responses hard-400s any `max_output_tokens` below 16 (pi's real
+        // minimum, just fixed upstream). `clamp_max_tokens_to_context`'s `.min(...)` can only ever
+        // *shrink* `req.max_tokens` toward `available`/`floor` — a caller's own `max_tokens` already
+        // below 16 (reachable via `--max-tokens`/`AI_AGENT_MAX_TOKENS` with no minimum validation, or a
+        // computed split-turn compaction-summary budget) would otherwise pass straight through
+        // unclamped and reach the wire as a sub-16 value.
+        let req = ModelRequest::new("gpt-5", vec![Message::user("hi")], 5);
+        let body = build_body(&req);
+        assert_eq!(
+            body["max_output_tokens"], 16,
+            "a caller-supplied max_tokens below 16 must be floored, not sent verbatim"
+        );
+    }
+
+    #[test]
     fn reasoning_model_uses_developer_role_and_emits_reasoning_config() {
         use crate::transport::ReasoningEffort;
         let req = ModelRequest::new("o3-mini", vec![Message::user("hi")], 64)
@@ -1893,6 +1929,29 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
     }
 
     #[test]
+    fn copilot_routed_gpt_5_mini_reports_its_own_smaller_real_context_window() {
+        // pi-parity Task #10: "gpt-5-mini" is 400_000 context/128_000 max_output natively, but
+        // Copilot's own catalogue reports smaller real numbers (264_000/64_000,
+        // `github-copilot.models.ts`) — `capabilities_for_route_with_copilot`'s own doc comment. Proven
+        // through `max_output_tokens`'s clamp (the only observable wire effect of `context_window` in
+        // this dialect, same technique as the Codex/Azure tests above): a ~350_000-token prompt leaves
+        // native 400_000 - 350_000 - 4_096 = 45_904 tokens of headroom (comfortably above this
+        // request's own 40_000 max_tokens, so native sends it unclamped) but exhausts Copilot's smaller
+        // 264_000 window entirely, clamping down to the floor.
+        let big_text = "x".repeat(1_400_000);
+        let native_req = ModelRequest::new("gpt-5-mini", vec![Message::user(big_text.as_str())], 40_000);
+        assert_eq!(build_body(&native_req)["max_output_tokens"], 40_000);
+
+        let copilot_req =
+            ModelRequest::new("gpt-5-mini", vec![Message::user(big_text.as_str())], 40_000)
+                .with_copilot(true);
+        assert_eq!(
+            build_body(&copilot_req)["max_output_tokens"], 1_024,
+            "Copilot's genuinely smaller real context window must clamp harder than native's"
+        );
+    }
+
+    #[test]
     fn prompt_cache_key_is_clamped_to_64_chars() {
         let long_key = "k".repeat(200);
         let req =
@@ -1922,6 +1981,68 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
             "got: {:#?}",
             body.get("prompt_cache_retention")
         );
+    }
+
+    #[test]
+    fn codex_sends_prompt_cache_key_even_when_no_cache_is_set() {
+        // pi-parity (Task #3): pi's `openai-codex-responses.ts` sends `prompt_cache_key` completely
+        // unconditionally (`clampOpenAIPromptCacheKey(options?.sessionId)`, no `no_cache`-equivalent
+        // gate at all on that backend's own `buildRequestBody`) — unlike the native/Azure routes, which
+        // both skip it under `no_cache`. Latent in production today (nothing sets `no_cache: true` yet)
+        // but must still hold for correctness.
+        let req = ModelRequest::new("gpt-5.1-codex", vec![Message::user("hi")], 64)
+            .with_cache_key("session-abc")
+            .with_no_cache(true)
+            .with_codex(true);
+        let body = build_body(&req);
+        assert_eq!(
+            body["prompt_cache_key"], "session-abc",
+            "Codex must send prompt_cache_key regardless of no_cache: {body:#?}"
+        );
+
+        // The native (non-Codex) route is unaffected — still skips it under no_cache.
+        let native_req = ModelRequest::new("gpt-5.1", vec![Message::user("hi")], 64)
+            .with_cache_key("session-abc")
+            .with_no_cache(true);
+        assert!(build_body(&native_req).get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn codex_and_copilot_remap_minimal_reasoning_effort_to_low() {
+        use crate::transport::ReasoningEffort;
+        // pi-parity (Task #13): both `openai-codex.models.ts` and `github-copilot.models.ts` map
+        // `"minimal"` to the wire value `"low"` for these gpt-5 ids — neither catalogue has a literal
+        // "minimal" tier at all, unlike native OpenAI's own `thinkingLevelMap`.
+        for id in ["gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5"] {
+            let codex_req = ModelRequest::new(id, vec![Message::user("hi")], 64)
+                .with_reasoning_effort(ReasoningEffort::Minimal)
+                .with_codex(true);
+            assert_eq!(
+                build_body(&codex_req)["reasoning"]["effort"],
+                "low",
+                "{id}: Codex must remap minimal to low"
+            );
+
+            let copilot_req = ModelRequest::new(id, vec![Message::user("hi")], 64)
+                .with_reasoning_effort(ReasoningEffort::Minimal)
+                .with_copilot(true);
+            assert_eq!(
+                build_body(&copilot_req)["reasoning"]["effort"],
+                "low",
+                "{id}: Copilot must remap minimal to low"
+            );
+        }
+
+        // The native (non-Codex, non-Copilot) route sends "minimal" literally, unchanged.
+        let native_req = ModelRequest::new("gpt-5.4", vec![Message::user("hi")], 64)
+            .with_reasoning_effort(ReasoningEffort::Minimal);
+        assert_eq!(build_body(&native_req)["reasoning"]["effort"], "minimal");
+
+        // A non-minimal effort is never remapped, even on Codex/Copilot.
+        let high_req = ModelRequest::new("gpt-5.4", vec![Message::user("hi")], 64)
+            .with_reasoning_effort(ReasoningEffort::High)
+            .with_codex(true);
+        assert_eq!(build_body(&high_req)["reasoning"]["effort"], "high");
     }
 
     // A recorded text-then-tool-call Responses stream: reasoning summary, then a message, then a

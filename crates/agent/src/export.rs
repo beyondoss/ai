@@ -843,11 +843,28 @@ fn render_tool_result_content(
     content: &str,
     tool_info: Option<(&str, &serde_json::Value)>,
 ) {
+    let lang = tool_info.and_then(|(name, input)| language_class_for_tool_result(name, input));
+    let threshold = tool_info
+        .map(|(name, _)| tool_result_line_threshold(name))
+        .unwrap_or(DEFAULT_TOOL_RESULT_LINE_THRESHOLD);
+    render_collapsible_output(out, content, lang, threshold);
+}
+
+/// The actual `<pre>`/`<details>` construction shared by every call site that needs pi's
+/// `formatExpandableOutput` collapse affordance (Fix 3) — [`render_tool_result_content`] (a tool's
+/// result content), [`render_write_call`] (a `write` call's own content preview, pi-parity Task #46:
+/// previously rendered unconditionally with no collapse at all), and [`render_host_bash_marker`] (a
+/// host-run bash command's output, pi-parity Task #47: same previously-missing collapse). Pulled out
+/// as its own function rather than left inline in `render_tool_result_content` because none of these
+/// three callers otherwise share a `(tool_name, input)` pair to look up a language/threshold from — a
+/// host-bash command has no originating `ToolUse` at all, and a `write` call's own threshold (see
+/// [`tool_result_line_threshold`]) needs to apply even though it's rendering the call's *input*, not a
+/// `ToolResult` block.
+fn render_collapsible_output(out: &mut String, content: &str, lang: Option<&str>, threshold: usize) {
     let cleaned = strip_control_chars(content);
     let body = if looks_like_diff(&cleaned) {
         diff_html(&cleaned)
     } else {
-        let lang = tool_info.and_then(|(name, input)| language_class_for_tool_result(name, input));
         match lang {
             Some(lang) => format!(
                 "<pre><code class=\"language-{lang}\">{}</code></pre>\n",
@@ -856,9 +873,6 @@ fn render_tool_result_content(
             None => format!("<pre>{}</pre>", html_escape(&cleaned)),
         }
     };
-    let threshold = tool_info
-        .map(|(name, _)| tool_result_line_threshold(name))
-        .unwrap_or(DEFAULT_TOOL_RESULT_LINE_THRESHOLD);
     let line_count = cleaned.lines().count();
     if line_count > threshold {
         out.push_str(&format!(
@@ -870,15 +884,15 @@ fn render_tool_result_content(
     }
 }
 
-/// Per-tool line-count threshold past which [`render_tool_result_content`] collapses a result behind
-/// `<details>` — matching pi's own per-tool thresholds (`template.js:848-902`: `bash` calls
-/// `formatExpandableOutput(output, 5)`, `read` calls it with `10`; everything else, including `ls`,
-/// falls back to [`DEFAULT_TOOL_RESULT_LINE_THRESHOLD`], which happens to equal pi's own `ls` threshold
-/// of `20` too).
+/// Per-tool line-count threshold past which [`render_tool_result_content`]/[`render_write_call`]
+/// collapse content behind `<details>` — matching pi's own per-tool thresholds (`template.js:848-902`,
+/// `967-988`: `bash` calls `formatExpandableOutput(output, 5)`, `read` and `write` each call it with
+/// `10`; everything else, including `ls`, falls back to [`DEFAULT_TOOL_RESULT_LINE_THRESHOLD`], which
+/// happens to equal pi's own `ls` threshold of `20` too).
 fn tool_result_line_threshold(tool_name: &str) -> usize {
     match tool_name {
         "bash" => 5,
-        "read" => 10,
+        "read" | "write" => 10,
         _ => DEFAULT_TOOL_RESULT_LINE_THRESHOLD,
     }
 }
@@ -1132,10 +1146,16 @@ fn lcs_diff<'a>(old: &[&'a str], new: &[&'a str]) -> Vec<LineDiffOp<'a>> {
     ops
 }
 
-/// Render a `write` call: the target path as the title, full content in a `<pre>` (not markdown — it's
-/// raw file content) — pi-parity Fix 2: tagged `<code class="language-{ext}">` from the write's own
+/// Render a `write` call: the target path as the title, content behind the same collapse affordance a
+/// tool result gets — pi-parity Fix 2: tagged `<code class="language-{ext}">` from the write's own
 /// `path` argument when the extension is recognized (see [`language_from_path`]), same as pi's own
-/// `write.ts` tagging its content preview the same way.
+/// `write.ts` tagging its content preview the same way. Pi-parity Task #46: content used to render
+/// unconditionally in a single `<pre>`, so a large file write dumped unbounded raw content inline —
+/// pi's own `template.js:967-988` runs the write case through the same `formatExpandableOutput(content,
+/// 10, lang)` helper used for `read`/`bash`/`ls`, so this now reuses [`render_tool_result_content`] (the
+/// same collapse-past-a-threshold `<details>` mechanism, and the same `language_class_for_tool_result`
+/// tagging, since `"write"` is one of its recognized tool names) rather than building its own bespoke
+/// `<pre>` here.
 fn render_write_call(out: &mut String, input: &serde_json::Value) {
     let path = input.get("path").and_then(serde_json::Value::as_str);
     let content = input.get("content").and_then(serde_json::Value::as_str);
@@ -1147,13 +1167,7 @@ fn render_write_call(out: &mut String, input: &serde_json::Value) {
         "<div class=\"tool-call\"><div class=\"tool-title\">{title}</div>\n"
     ));
     if let Some(content) = content {
-        match path.and_then(language_from_path) {
-            Some(lang) => out.push_str(&format!(
-                "<pre><code class=\"language-{lang}\">{}</code></pre>",
-                html_escape(content)
-            )),
-            None => out.push_str(&format!("<pre>{}</pre>", html_escape(content))),
-        }
+        render_tool_result_content(out, content, Some(("write", input)));
     }
     out.push_str("</div>\n");
 }
@@ -1523,6 +1537,16 @@ fn format_thousands(n: u64) -> String {
 /// the bracketed marker line verbatim, as if the model itself had written it. `tokens_before`, when
 /// present, appends a "Compacted from N tokens" note to the label — always present for a real
 /// compaction, `None` for a branch summary (see [`parse_compaction_tokens_before`]).
+///
+/// Pi-parity Task #49: a `class == "compaction"` marker renders collapsed by default — pi's own
+/// `.compaction` entry (`template.js:1294-1300`) starts collapsed behind a `.compaction-collapsed`
+/// one-liner ("Compacted from N tokens") and reveals the full summary on an `onclick` toggle. This crate
+/// renders exported HTML with no client-side JS at all (a deliberate choice — see every other collapse
+/// affordance in this module, e.g. [`render_tool_result_content`]'s `<details class="collapsible-output">`),
+/// so a `<details>`/`<summary>` element replaces pi's onclick toggle here too: same one-line collapsed
+/// summary, full markdown body revealed on click, no information lost — just a different default
+/// density. A branch summary (the other [`parse_summary_marker`] class) is never collapsed in pi either,
+/// so it keeps the plain, always-expanded `<div>` rendering unchanged.
 fn render_summary_marker(
     out: &mut String,
     class: &str,
@@ -1530,6 +1554,20 @@ fn render_summary_marker(
     tokens_before: Option<u64>,
     body: &str,
 ) {
+    let rendered_body = render_markdown(body);
+    if class == "compaction" {
+        let summary_line = match tokens_before {
+            Some(n) => format!("Compacted from {} tokens", format_thousands(n)),
+            None => label.to_string(),
+        };
+        out.push_str(&format!(
+            "<details class=\"summary-marker {class} collapsible-output\">\
+             <summary>{}</summary>\n{}</details>\n",
+            html_escape(&summary_line),
+            rendered_body
+        ));
+        return;
+    }
     let tokens_note = match tokens_before {
         Some(n) => format!(" &middot; Compacted from {} tokens", format_thousands(n)),
         None => String::new(),
@@ -1537,7 +1575,7 @@ fn render_summary_marker(
     out.push_str(&format!(
         "<div class=\"summary-marker {class}\"><div class=\"tool-title\">{}{tokens_note}</div>\n{}</div>\n",
         html_escape(label),
-        render_markdown(body)
+        rendered_body
     ));
 }
 
@@ -1559,6 +1597,11 @@ struct HostBashBlock<'a> {
     /// exactly as before this fix.
     status: Option<HostBashStatus>,
 }
+
+/// The line-count threshold past which [`render_host_bash_marker`] collapses `output` behind
+/// `<details>` (pi-parity Task #47) — matches pi's own `formatExpandableOutput(msg.output, 10)` call for
+/// its `bashExecution` role (`template.js:1285`).
+const HOST_BASH_OUTPUT_LINE_THRESHOLD: usize = 10;
 
 /// The exact literal prefix `serve.rs` tags a host-run bash command with (`~serve.rs:HOST_BASH_LABEL`),
 /// immediately followed by the command itself.
@@ -1669,7 +1712,13 @@ fn parse_host_bash_status(rest: &str) -> (Option<HostBashStatus>, &str) {
 /// pi-parity gap) gets its own note in the title — still visible here, just never sent to the model.
 /// `status` (Fix 3, pi-parity gap), when present, renders as its own row of distinctly-styled badges
 /// (see [`render_host_bash_status`]) rather than only ever being visible as the border-color `is_error`
-/// already drove.
+/// already drove. `output` (pi-parity Task #47) renders behind the same collapse-past-a-threshold
+/// `<details>` affordance a tool result gets (see [`render_collapsible_output`]) instead of always
+/// dumping unbounded raw output into a single `<pre>` — pi's own `template.js:1273-1285` runs its
+/// `bashExecution` role's output through `formatExpandableOutput(msg.output, 10)` (no language tag,
+/// hence [`HOST_BASH_OUTPUT_LINE_THRESHOLD`] rather than reusing `tool_result_line_threshold("bash")`'s
+/// unrelated threshold of `5`, which is for a model-issued `bash` tool call's result, a different pi
+/// call site with its own lower threshold).
 fn render_host_bash_marker(out: &mut String, block: &HostBashBlock) {
     let class = if block.is_error {
         "tool-call host-bash error"
@@ -1692,7 +1741,7 @@ fn render_host_bash_marker(out: &mut String, block: &HostBashBlock) {
         html_escape(block.command)
     ));
     if !block.output.is_empty() {
-        out.push_str(&format!("<pre>{}</pre>", html_escape(block.output)));
+        render_collapsible_output(out, block.output, None, HOST_BASH_OUTPUT_LINE_THRESHOLD);
     }
     out.push_str("</div>\n");
 }
@@ -2553,7 +2602,7 @@ mod tests {
         ))];
         let html = render_html(&meta(), &messages, &[], None);
         assert!(
-            html.contains("class=\"summary-marker compaction\""),
+            html.contains("class=\"summary-marker compaction collapsible-output\""),
             "{html}"
         );
         assert!(html.contains(">Compaction<"), "{html}");
@@ -2562,6 +2611,51 @@ mod tests {
             !html.contains(agent_core::compaction::SUMMARY_MARKER),
             "the bracketed marker line must not appear verbatim: {html}"
         );
+    }
+
+    #[test]
+    fn compaction_block_collapses_behind_details_with_a_one_line_summary() {
+        // Task #49 (pi-parity gap): pi's `.compaction` entry starts collapsed behind a one-line
+        // `.compaction-collapsed` summary ("Compacted from N tokens") and reveals the full body on
+        // click (`template.js:1294-1300`); this crate has no client-side JS, so a `<details>`/
+        // `<summary>` element (the same zero-JS pattern as `render_tool_result_content`'s
+        // `<details class="collapsible-output">`) replaces pi's onclick toggle. No information is
+        // lost — the full summary is still present in the static HTML, just behind `<details>`.
+        let messages = vec![Message::user(format!(
+            "{}\n\nCompacted from 12345 tokens\n\n{}",
+            agent_core::compaction::SUMMARY_MARKER,
+            "Refactored the auth module and fixed three bugs."
+        ))];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(
+            html.contains("<details class=\"summary-marker compaction collapsible-output\">"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<summary>Compacted from 12,345 tokens</summary>"),
+            "the collapsed one-liner must match pi's own collapsed summary text: {html}"
+        );
+        // The full body must still be present in the static HTML (just behind `<details>`, not
+        // client-side-JS-gated) — an artifact viewer or `grep` over the exported file must still see it.
+        assert!(html.contains("Refactored the auth module and fixed three bugs."));
+    }
+
+    #[test]
+    fn branch_summary_block_is_never_collapsed_unlike_compaction() {
+        // Pi never collapses `.branch-summary` entries, only `.compaction` ones — this must stay a
+        // plain, always-expanded `<div>`, not gain a `<details>` wrapper too.
+        let messages = vec![Message::user(format!(
+            "{}\n\n{}",
+            agent_core::BRANCH_SUMMARY_MARKER,
+            "Explored using a cache; reverted since it added complexity."
+        ))];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(
+            !html.contains("<details"),
+            "a branch summary must not collapse: {html}"
+        );
+        assert!(html.contains("class=\"summary-marker branch-summary\""), "{html}");
+        assert!(html.contains("Explored using a cache"));
     }
 
     #[test]
@@ -2785,6 +2879,34 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("<code>/tmp/out.txt</code>"), "{html}");
+    }
+
+    #[test]
+    fn a_long_host_bash_output_is_collapsed_behind_a_details_element() {
+        // Task #47 (pi-parity gap): a host-run bash command's output used to render unconditionally in
+        // a single `<pre>`, no threshold/collapse — same missed pattern as write (Task #46). Matches
+        // pi's own `formatExpandableOutput(msg.output, 10)` call for its `bashExecution` role
+        // (`template.js:1273-1285`).
+        let long_output: String = (1..=20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let messages = vec![Message::user(format!(
+            "[Host bash command, run outside the model's own turn]\n$ seq 20\n\n{long_output}"
+        ))];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(html.contains("class=\"collapsible-output\""), "{html}");
+        assert!(html.contains("20 lines (click to expand)"), "{html}");
+        assert!(html.contains("line 1"), "{html}");
+        assert!(html.contains("line 20"), "{html}");
+    }
+
+    #[test]
+    fn a_short_host_bash_output_is_not_collapsed() {
+        let messages = vec![Message::user(
+            "[Host bash command, run outside the model's own turn]\n$ ls -la\n\n\
+             file1.txt\nfile2.txt\ndrwxr-xr-x  dir",
+        )];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(!html.contains("class=\"collapsible-output\""), "{html}");
+        assert!(html.contains("file1.txt"));
     }
 
     #[test]
@@ -3321,6 +3443,42 @@ mod tests {
             html.contains("<pre><code class=\"language-markdown\">"),
             "{html}"
         );
+    }
+
+    #[test]
+    fn a_long_write_call_content_is_collapsed_behind_a_details_element() {
+        // Task #46 (pi-parity gap): a `write` call's content used to render unconditionally in a
+        // single `<pre>`, with only language tagging applied — no collapse of any kind, unlike
+        // `read`/`bash`/`ls` tool results, which already collapsed past their own thresholds. Matches
+        // pi's own `formatExpandableOutput(content, 10, lang)` call for the write case
+        // (`template.js:967-988`) — same threshold as `read`'s.
+        let long_content: String = (1..=15).map(|i| format!("line {i}\n")).collect();
+        let messages = vec![Message::assistant(vec![ContentBlock::ToolUse {
+            id: "1".into(),
+            name: "write".into(),
+            input: serde_json::json!({ "path": "big.rs", "content": long_content }),
+            thought_signature: None,
+        }])];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(html.contains("class=\"collapsible-output\""), "{html}");
+        assert!(html.contains("15 lines (click to expand)"), "{html}");
+        // Still tagged with the write's own path language, even collapsed.
+        assert!(html.contains("<code class=\"language-rust\">"), "{html}");
+        assert!(html.contains("line 1\n"), "{html}");
+        assert!(html.contains("line 15"), "{html}");
+    }
+
+    #[test]
+    fn a_short_write_call_content_is_not_collapsed() {
+        let messages = vec![Message::assistant(vec![ContentBlock::ToolUse {
+            id: "1".into(),
+            name: "write".into(),
+            input: serde_json::json!({ "path": "notes.md", "content": "hello world" }),
+            thought_signature: None,
+        }])];
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(!html.contains("class=\"collapsible-output\""), "{html}");
+        assert!(html.contains("hello world"));
     }
 
     #[test]

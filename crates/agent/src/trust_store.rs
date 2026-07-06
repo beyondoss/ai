@@ -43,7 +43,16 @@ pub fn has_trust_gated_resources(cwd: &Path) -> bool {
         || cwd.join(".claude/skills").is_dir()
         || cwd.join(".claude/prompts").is_dir()
         || cwd.join(".claude/settings.json").is_file()
-        || crate::skills::collect_ancestor_agents_skill_dirs(cwd)
+        // pi-parity fix (Task #45): the operator's own `~/.agents/skills` (pi's documented,
+        // always-trusted personal-skills convention) must not itself count as a project-controlled,
+        // trust-gated resource — `collect_ancestor_agents_skill_dirs` alone has no notion of "this
+        // ancestor happens to be the user's home skills dir, not the project's", so for a `cwd` with no
+        // enclosing git repo (the ancestor walk then reaches all the way to `/`) an operator who has
+        // ever created `~/.agents/skills` would otherwise always trip this, even though the project
+        // itself defines nothing that actually needs gating. Matches the same exclusion the actual
+        // skill-*loading* path already applies (`skills::discover_with_diagnostics_impl`) and pi's own
+        // `hasTrustRequiringProjectResources` (`trust-manager.ts:184-206`).
+        || crate::skills::collect_ancestor_agents_skill_dirs_excluding_user_dir(cwd)
             .iter()
             .any(|dir| dir.is_dir())
 }

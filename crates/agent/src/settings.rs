@@ -845,6 +845,11 @@ impl ModelOverride {
     /// empty value, as a header — same empty-string guard as
     /// [`Self::resolved_api_key_with_env`], just dropping the entry outright instead of falling back
     /// (there's no per-header fallback value to fall back to).
+    ///
+    /// Seeded first with [`default_headers_for_base_url`]'s provider-mandatory defaults (Fixes #37/#38,
+    /// pi-parity audit — NVIDIA's `NVCF-POLL-SECONDS`, Kimi-Coding's `User-Agent`), which
+    /// `self.headers`'s own resolved entries are then layered on top of: a user-supplied value for the
+    /// same header name always wins over the seeded default, never the other way around.
     pub fn resolved_headers(&self) -> std::collections::HashMap<String, String> {
         self.resolved_headers_with_env(None)
     }
@@ -856,14 +861,51 @@ impl ModelOverride {
         &self,
         env_overrides: Option<&std::collections::HashMap<String, String>>,
     ) -> std::collections::HashMap<String, String> {
-        self.headers
+        let mut resolved: std::collections::HashMap<String, String> = self
+            .base_url
+            .as_deref()
+            .map(default_headers_for_base_url)
+            .unwrap_or(&[])
             .iter()
-            .filter_map(|(k, v)| {
-                resolve_config_value(v, env_overrides)
-                    .filter(|v| !v.is_empty())
-                    .map(|v| (k.clone(), v))
-            })
-            .collect()
+            .map(|&(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        resolved.extend(self.headers.iter().filter_map(|(k, v)| {
+            resolve_config_value(v, env_overrides)
+                .filter(|v| !v.is_empty())
+                .map(|v| (k.clone(), v))
+        }));
+        resolved
+    }
+}
+
+/// Provider-mandatory default headers seeded automatically for a BYO [`ModelOverride::base_url`]
+/// pointing at a known host that requires them at the HTTP layer — headers a `dialect` override alone
+/// (which only fixes the wire *body* shape) can't cover. Additive with, and always overridden by, any
+/// user-supplied [`ModelOverride::headers`] entry for the same name (see
+/// [`ModelOverride::resolved_headers_with_env`]) — this only fills a gap the operator would otherwise
+/// have to independently discover and hand-author from the provider's own docs.
+///
+/// - NVIDIA Cloud Functions-backed endpoints (Fix #37, pi-parity audit): `integrate.api.nvidia.com`
+///   (pi's own `nvidia.models.ts` `baseUrl`) — NIM-backed endpoints can answer a request with an async
+///   202 + poll URL instead of a synchronous stream; `NVCF-POLL-SECONDS` tells the server to long-poll
+///   instead, mirroring pi's own catalog, which sets this header unconditionally on every entry.
+/// - Kimi-Coding (Fix #38, pi-parity audit): `api.kimi.com/coding` (pi's own `kimi-coding.models.ts`
+///   `baseUrl`) is an official-CLI-only endpoint that appears to gate on `User-Agent`; pi's own catalog
+///   sets this unconditionally on every entry too. A prior pass's `ModelOverride::dialect` fix only
+///   addressed the wire *body* shape (Anthropic vs. OpenAI) — without this header, requests may still
+///   fail at the HTTP layer even with a correctly-shaped body.
+///
+/// Matched by a plain substring check against `base_url` (not a parsed-host equality check, unlike
+/// `gateway_credential::is_azure_host`): both hosts here are always used with a fixed, single-segment
+/// path baked into pi's own catalog (`/v1`, `/coding`), so there's no meaningfully different shape an
+/// operator's own `base_url` could take that would make host-parsing worth the extra complexity.
+fn default_headers_for_base_url(base_url: &str) -> &'static [(&'static str, &'static str)] {
+    if base_url.contains("integrate.api.nvidia.com") {
+        &[("NVCF-POLL-SECONDS", "3600")]
+    } else if base_url.contains("api.kimi.com") {
+        &[("User-Agent", "KimiCLI/1.5")]
+    } else {
+        &[]
     }
 }
 
@@ -1541,6 +1583,88 @@ mod tests {
         let resolved = over.resolved_headers_with_env(Some(&env));
         assert_eq!(resolved.get("X-Empty"), None, "got: {resolved:?}");
         assert_eq!(resolved.get("X-Present").map(String::as_str), Some("literal"));
+    }
+
+    // Fixes #37/#38 (pi-parity audit): a BYO `base_url` pointed at a known provider host that requires
+    // a mandatory HTTP-layer header gets it seeded automatically, without the operator having to
+    // discover and hand-author it themselves.
+
+    #[test]
+    fn resolved_headers_seeds_the_nvidia_poll_seconds_header_for_the_nvidia_hosted_base_url() {
+        let over = ModelOverride {
+            base_url: Some("https://integrate.api.nvidia.com/v1".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            over.resolved_headers().get("NVCF-POLL-SECONDS").map(String::as_str),
+            Some("3600")
+        );
+    }
+
+    #[test]
+    fn resolved_headers_seeds_the_kimi_coding_user_agent_header_for_the_kimi_hosted_base_url() {
+        let over = ModelOverride {
+            base_url: Some("https://api.kimi.com/coding".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            over.resolved_headers().get("User-Agent").map(String::as_str),
+            Some("KimiCLI/1.5")
+        );
+    }
+
+    #[test]
+    fn resolved_headers_seeds_no_default_header_for_an_unrelated_base_url() {
+        let over = ModelOverride {
+            base_url: Some("https://my-ollama-box.example.com".to_string()),
+            ..Default::default()
+        };
+        assert!(over.resolved_headers().is_empty());
+    }
+
+    #[test]
+    fn resolved_headers_seeds_no_default_header_when_base_url_is_unset() {
+        let over = ModelOverride {
+            headers: {
+                let mut h = std::collections::BTreeMap::new();
+                h.insert("X-Custom".to_string(), "value".to_string());
+                h
+            },
+            ..Default::default()
+        };
+        let resolved = over.resolved_headers();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved.get("X-Custom").map(String::as_str), Some("value"));
+    }
+
+    #[test]
+    fn resolved_headers_a_user_supplied_value_overrides_the_seeded_nvidia_default() {
+        // Additive, never overriding, per this fn's own doc comment: an operator explicitly setting
+        // `headers` for the same name must win over the auto-seeded default.
+        let mut over = ModelOverride {
+            base_url: Some("https://integrate.api.nvidia.com/v1".to_string()),
+            ..Default::default()
+        };
+        over.headers
+            .insert("NVCF-POLL-SECONDS".to_string(), "60".to_string());
+        assert_eq!(
+            over.resolved_headers().get("NVCF-POLL-SECONDS").map(String::as_str),
+            Some("60")
+        );
+    }
+
+    #[test]
+    fn resolved_headers_combines_the_seeded_default_with_other_user_supplied_headers() {
+        let mut over = ModelOverride {
+            base_url: Some("https://api.kimi.com/coding".to_string()),
+            ..Default::default()
+        };
+        over.headers
+            .insert("X-Extra".to_string(), "extra-value".to_string());
+        let resolved = over.resolved_headers();
+        assert_eq!(resolved.get("User-Agent").map(String::as_str), Some("KimiCLI/1.5"));
+        assert_eq!(resolved.get("X-Extra").map(String::as_str), Some("extra-value"));
+        assert_eq!(resolved.len(), 2);
     }
 
     #[test]

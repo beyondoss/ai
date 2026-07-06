@@ -132,6 +132,81 @@ fn serve_get_state_and_get_session_stats_answer_live_during_a_prompt() {
 }
 
 #[test]
+fn serve_get_tree_since_works_from_the_busy_loop_mid_prompt() {
+    use std::time::Duration;
+
+    // Task #48 (pi-parity gap): `get_tree`'s new `since` filtering is wired into two separate call
+    // sites — the busy-loop arm (exercised here, answered live mid-run, same as `get_state`/
+    // `get_session_stats` above) and the idle-loop arm (see
+    // `serve_get_tree_since_returns_only_what_was_appended_after_a_known_id` in
+    // `serve_session_tree.rs`) — both must actually filter, not just whichever one is easier to test.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let turn2 = turn_tool_use(
+        "toolu_tree_since",
+        "bash",
+        &json!({ "command": "sleep 0.5" }).to_string(),
+    );
+    let (base, _bodies) =
+        spawn_model_server(vec![turn_text("first answer"), turn2, turn_text("done")]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "first" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    writeln!(stdin, "{}", json!({ "type": "get_tree" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_tree");
+    let nodes = frames.last().unwrap()["data"]["nodes"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let baseline_id = nodes.iter().find(|n| n["role"] == "assistant").unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "second" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(150)); // mid the tool call's own `sleep 0.5`
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "get_tree", "id": "mid", "since": baseline_id })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+
+    let frames = read_until_response(&mut stdout, "prompt");
+    drop(stdin);
+    child.wait().unwrap();
+
+    let mid_resp = frames
+        .iter()
+        .find(|f| f["command"] == "get_tree" && f["id"] == "mid")
+        .unwrap_or_else(|| panic!("no busy-loop get_tree response: {frames:#?}"));
+    assert_eq!(mid_resp["success"], true, "{mid_resp:#?}");
+    let since_nodes = mid_resp["data"]["nodes"].as_array().unwrap();
+    assert!(
+        since_nodes.iter().any(|n| n["role"] == "user"
+            && n["preview"]
+                .as_str()
+                .is_some_and(|p| p.contains("second"))),
+        "the second turn's user message should already be visible mid-run: {since_nodes:#?}"
+    );
+    assert!(!since_nodes.iter().any(|n| n["id"] == baseline_id));
+}
+
+#[test]
 fn serve_get_state_reports_pending_tool_ids_while_a_tool_is_running() {
     use std::time::Duration;
 

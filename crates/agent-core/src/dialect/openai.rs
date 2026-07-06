@@ -299,7 +299,12 @@ fn normalize_cross_model_tool_id(id: &str) -> String {
 
 /// Build the streaming request body, translating the internal messages into OpenAI's flat shape.
 pub fn build_body(req: &ModelRequest) -> Value {
-    let caps = crate::models::capabilities_for_route(&req.model, req.is_codex, req.is_azure);
+    let caps = crate::models::capabilities_for_route_with_copilot(
+        &req.model,
+        req.is_codex,
+        req.is_azure,
+        req.is_copilot,
+    );
     // pi's `useDeveloperRole = model.reasoning && compat.supportsDeveloperRole` — reuses the OpenAI
     // Responses dialect's identical gating (`super::openai_responses::instruction_role`) rather than a
     // second, drifting copy of the same one-line rule.
@@ -1882,6 +1887,33 @@ mod tests {
         let req = ModelRequest::new("gpt-4o", vec![Message::user("hi")], 8_192);
         let body = build_body(&req);
         assert_eq!(body["max_tokens"], 8_192);
+    }
+
+    #[test]
+    fn copilot_routed_gpt_4_1_reports_its_own_much_smaller_real_context_window() {
+        // pi-parity Task #9: native gpt-4.1 is a ~1.05M-token context (routed through the Responses
+        // dialect); Copilot's own catalogue (`github-copilot.models.ts`) reports a much smaller real
+        // 128_000/16_384 — Copilot's proxy also forces this one id onto Chat Completions specifically
+        // (`dialect::COPILOT_FORCES_CHAT_COMPLETIONS`), so this dialect's own clamp must reflect that
+        // smaller number too, not native's. Proven through `max_tokens`'s clamp (the only observable
+        // wire effect of `context_window` here, same technique as the other clamp tests in this file):
+        // a ~100_000-token prompt leaves native plenty of headroom but exhausts Copilot's much smaller
+        // window.
+        let big_text = "x".repeat(400_000);
+        let native_req =
+            ModelRequest::new("gpt-4.1", vec![Message::user(big_text.as_str())], 50_000);
+        assert_eq!(
+            build_body(&native_req)["max_tokens"], 50_000,
+            "native's ~1.05M context leaves plenty of headroom for this prompt"
+        );
+
+        let copilot_req =
+            ModelRequest::new("gpt-4.1", vec![Message::user(big_text.as_str())], 50_000)
+                .with_copilot(true);
+        assert_eq!(
+            build_body(&copilot_req)["max_tokens"], 23_904,
+            "Copilot's genuinely smaller real context window (128_000) must clamp harder than native's"
+        );
     }
 
     #[test]

@@ -157,6 +157,15 @@ pub struct ModelCaps {
     /// [`crate::dialect::openai::build_body`]; every other dialect ignores it. See
     /// [`OpenAiReasoningFormat`].
     pub openai_reasoning_format: OpenAiReasoningFormat,
+    /// Whether the Anthropic dialect may stamp a `cache_control` breakpoint on the last tool definition
+    /// (`dialect::anthropic::mark_last_tool`). `true` for every current Anthropic-wire model except the
+    /// 14 Fireworks ids `Dialect::for_model`'s `is_fireworks_anthropic_wire_model` routes through this
+    /// dialect (DeepSeek-V4, GLM-5.1, gpt-oss-120b/20b, Kimi-K2.6/K2.7-Code + their `-fast`/`-turbo`
+    /// router variants, MiniMax-M2.7/M3, Qwen3.7-Plus) — pi's `fireworks.models.ts` sets
+    /// `supportsCacheControlOnTools: false` on all of them (mirroring pi's own per-model
+    /// `compat.supportsCacheControlOnTools` gate, `anthropic-messages.ts`). Ignored outside the
+    /// Anthropic dialect.
+    pub supports_cache_control_on_tools: bool,
 }
 
 impl ModelCaps {
@@ -180,6 +189,7 @@ impl ModelCaps {
             supports_xhigh_reasoning: true,
             adaptive_xhigh_effort_wire: "xhigh",
             openai_reasoning_format: OpenAiReasoningFormat::Standard,
+            supports_cache_control_on_tools: true,
         }
     }
 }
@@ -369,6 +379,7 @@ fn github_copilot_claude_overrides(m: &str) -> Option<ModelCaps> {
         supports_xhigh_reasoning: true,
         adaptive_xhigh_effort_wire,
         openai_reasoning_format: OpenAiReasoningFormat::Standard,
+        supports_cache_control_on_tools: true,
     })
 }
 
@@ -389,6 +400,19 @@ fn github_copilot_claude_overrides(m: &str) -> Option<ModelCaps> {
 /// because NVIDIA happens to reuse an org-slug shape another aggregator also uses. Left to the
 /// Kimi/MiniMax branches instead; NVIDIA's own real numbers for these two ids remain unrepresented,
 /// same as any other cross-host collision this table can't disambiguate.
+///
+/// A third, converse case is investigated (pi-parity Task #21) but deliberately left as-is rather than
+/// "fixed": `"nvidia/nemotron-3-ultra-550b-a55b"` below is *also* re-hosted, id-for-id, on Together
+/// (`together.models.ts:268`: real 512300/512300, vs NVIDIA's own real and already-tested 1,000,000/
+/// 65,536 asserted by `nvidia_nemotron_ids_get_their_real_numbers`). Since this function runs first and
+/// matches purely on the id string, a Together request for this exact id silently gets NVIDIA's numbers
+/// instead of its own — the max_output direction is safe (NVIDIA's 65,536 is *smaller* than Together's
+/// real 512,300 — a usability loss, not a 400), but there is no other family branch a la Kimi/MiniMax
+/// that this one could be excluded in favor of ("nemotron" matches no other host's naming convention at
+/// all) — excluding it here would only lose NVIDIA's own correct, tested numbers for the far more common
+/// native case in exchange for a same-string collision this table still couldn't resolve for Together
+/// either. Left unfixed: the same "one id, several real hosts, no route signal" limitation as every
+/// other documented collision in this file, one level less tractable than the two ids just above.
 fn nvidia_caps(m: &str) -> Option<ModelCaps> {
     use crate::transport::ReasoningEffort as RE;
     // (context_window, max_output, supports_vision) — reasoning/thinking fields are uniform "no
@@ -436,6 +460,7 @@ fn nvidia_caps(m: &str) -> Option<ModelCaps> {
         supports_xhigh_reasoning: false,
         adaptive_xhigh_effort_wire: "xhigh",
         openai_reasoning_format: OpenAiReasoningFormat::Standard,
+        supports_cache_control_on_tools: true,
     })
 }
 
@@ -447,7 +472,21 @@ fn nvidia_caps(m: &str) -> Option<ModelCaps> {
 /// (`packages/ai/src/providers/{anthropic,openai}.models.ts` in `badlogic/pi-mono`) rather than
 /// invented — re-check that catalogue when adding a new model family, since it's regenerated upstream
 /// and may have moved on by the time you read this.
+///
+/// A thin wrapper around [`capabilities_impl`] (which does the actual per-family lookup, unchanged):
+/// applies the one post-hoc override every one of that function's ~30 return sites would otherwise
+/// need to remember individually — [`ModelCaps::supports_cache_control_on_tools`] is `false` for the 14
+/// Fireworks ids [`crate::dialect::is_fireworks_anthropic_wire_model`] routes through the Anthropic
+/// dialect (pi's `fireworks.models.ts` sets `supportsCacheControlOnTools: false` on all of them).
 pub fn capabilities(model: &str) -> ModelCaps {
+    let mut caps = capabilities_impl(model);
+    if crate::dialect::is_fireworks_anthropic_wire_model(model) {
+        caps.supports_cache_control_on_tools = false;
+    }
+    caps
+}
+
+fn capabilities_impl(model: &str) -> ModelCaps {
     use crate::transport::ReasoningEffort as RE;
     let m = model.to_ascii_lowercase();
     // Fireworks spells its models' version separator as the letter "p", not "." (`"glm-5p1"`,
@@ -579,6 +618,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
                 supports_xhigh_reasoning,
                 adaptive_xhigh_effort_wire,
                 openai_reasoning_format: OpenAiReasoningFormat::Standard,
+                supports_cache_control_on_tools: true,
             };
         }
 
@@ -618,12 +658,59 @@ pub fn capabilities(model: &str) -> ModelCaps {
                 supports_xhigh_reasoning: true,
                 adaptive_xhigh_effort_wire: "xhigh",
                 openai_reasoning_format: OpenAiReasoningFormat::Standard,
+                supports_cache_control_on_tools: true,
+            };
+        }
+
+        // GitHub Copilot's own bare "claude-sonnet-4" (no version-dot at all, unlike every other
+        // Copilot Claude id — `github-copilot.models.ts`) has no native Anthropic-catalogue equivalent
+        // to collide with (`anthropic.models.ts` has no bare "claude-sonnet-4" entry at all), so this is
+        // a safe, unconditional exact-id override. The `is_dot_spelled` gate a few lines above (and
+        // `github_copilot_claude_overrides` itself) can never catch this id — it has no "." to detect —
+        // so it silently fell through to this generic bucket's `sonnet` default (64_000) instead of
+        // Copilot's real, much smaller 16_000 ceiling (a 4x over-report) and 216_000 context (vs
+        // 200_000) — pi-parity Task #5. Scoped to the bare (non-vendor-slug) form, matching the same
+        // disambiguation discipline `github_copilot_claude_overrides` uses for its own four ids — a
+        // same-suffix vendor-slug id (were one ever to exist) must not inherit Copilot's number.
+        if m == "claude-sonnet-4" && !is_vendor_slug {
+            return ModelCaps {
+                context_window: 216_000,
+                max_output: 16_000,
+                max_tokens_field: MaxTokensField::MaxTokens,
+                supports_long_cache: true,
+                supports_vision: true,
+                supports_temperature: true,
+                thinking: ThinkingShape::Budget,
+                reasoning_effort: false,
+                reasoning_disableable: true,
+                supports_eager_tool_streaming: true,
+                supports_tool_stream: false,
+                api: ApiKind::ChatCompletions,
+                min_reasoning_effort: crate::transport::ReasoningEffort::Minimal,
+                supports_xhigh_reasoning: false,
+                adaptive_xhigh_effort_wire: "xhigh",
+                openai_reasoning_format: OpenAiReasoningFormat::Standard,
+                supports_cache_control_on_tools: true,
             };
         }
 
         // Everything else current (opus-4-0/4-1/4-5, sonnet-3-7/4-0/4-5, haiku-4-5, and future ids we
         // haven't special-cased above): `Budget`-shape extended thinking, 200k context.
-        let max_output = if m.contains("sonnet") || m.contains("haiku") || m.contains("opus-4-5") {
+        //
+        // GitHub Copilot's own opus-4.5/sonnet-4.5 (dot-spelled, unprefixed — the same detection
+        // `github_copilot_claude_overrides` uses for its own four ids) cap output at Copilot's real,
+        // smaller 32_000 ceiling (vs this bucket's generic 64_000 — pi-parity Tasks #6/#7). Unlike those
+        // four gen6+ ids, though, opus-4.5/sonnet-4.5 aren't Adaptive-shape on Copilot at all (no
+        // `forceAdaptiveThinking`/`thinkingLevelMap` for either in `github-copilot.models.ts`), so they
+        // can't simply be added to `github_copilot_claude_overrides`'s allowlist — that would also
+        // wrongly switch their wire shape to Adaptive. Context stays 200_000 either way (Copilot's real
+        // number already matches this bucket's own default for both ids).
+        let copilot_smaller_output = is_dot_spelled
+            && !is_vendor_slug
+            && (m.starts_with("claude-opus-4-5") || m.starts_with("claude-sonnet-4-5"));
+        let max_output = if copilot_smaller_output {
+            32_000
+        } else if m.contains("sonnet") || m.contains("haiku") || m.contains("opus-4-5") {
             64_000
         } else {
             32_000 // opus-4-0 / opus-4-1 / generic opus and fable ids
@@ -654,6 +741,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
             supports_xhigh_reasoning: false,
             adaptive_xhigh_effort_wire: "xhigh",
             openai_reasoning_format: OpenAiReasoningFormat::Standard,
+            supports_cache_control_on_tools: true,
         };
     }
 
@@ -710,6 +798,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
             supports_xhigh_reasoning: false,
             adaptive_xhigh_effort_wire: "xhigh", // unread: o-series never uses Adaptive shape.
             openai_reasoning_format: OpenAiReasoningFormat::Standard,
+            supports_cache_control_on_tools: true,
         };
         return openai_family_caps_for_vendor_slug(caps, is_vendor_slug);
     }
@@ -747,6 +836,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
                 supports_xhigh_reasoning: gpt5_supports_xhigh(m),
                 adaptive_xhigh_effort_wire: "xhigh", // unread: this bucket never uses Adaptive shape.
                 openai_reasoning_format: OpenAiReasoningFormat::Standard,
+                supports_cache_control_on_tools: true,
             };
             return openai_family_caps_for_vendor_slug(caps, is_vendor_slug);
         }
@@ -773,6 +863,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
                 supports_xhigh_reasoning: true,
                 adaptive_xhigh_effort_wire: "xhigh",
                 openai_reasoning_format: OpenAiReasoningFormat::Standard,
+                supports_cache_control_on_tools: true,
             };
             return openai_family_caps_for_vendor_slug(caps, is_vendor_slug);
         }
@@ -829,6 +920,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
             supports_xhigh_reasoning: gpt5_supports_xhigh(m),
             adaptive_xhigh_effort_wire: "xhigh", // unread: this bucket never uses Adaptive shape.
             openai_reasoning_format: OpenAiReasoningFormat::Standard,
+            supports_cache_control_on_tools: true,
         };
         return openai_family_caps_for_vendor_slug(caps, is_vendor_slug);
     }
@@ -860,6 +952,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
                 supports_xhigh_reasoning: true,
                 adaptive_xhigh_effort_wire: "xhigh",
                 openai_reasoning_format: OpenAiReasoningFormat::Standard,
+                supports_cache_control_on_tools: true,
             };
             return openai_family_caps_for_vendor_slug(caps, is_vendor_slug);
         }
@@ -883,6 +976,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
                 supports_xhigh_reasoning: true,
                 adaptive_xhigh_effort_wire: "xhigh",
                 openai_reasoning_format: OpenAiReasoningFormat::Standard,
+                supports_cache_control_on_tools: true,
             };
             return openai_family_caps_for_vendor_slug(caps, is_vendor_slug);
         }
@@ -916,6 +1010,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
             supports_xhigh_reasoning: true,
             adaptive_xhigh_effort_wire: "xhigh",
             openai_reasoning_format: OpenAiReasoningFormat::Standard,
+            supports_cache_control_on_tools: true,
         };
         return openai_family_caps_for_vendor_slug(caps, is_vendor_slug);
     }
@@ -979,6 +1074,14 @@ pub fn capabilities(model: &str) -> ModelCaps {
             "deepseek-ai/deepseek-r1" => Some((64_000, 32_768)),
             "deepseek-ai/deepseek-r1-0528" => Some((163_840, 163_840)),
             "deepseek-ai/deepseek-v3.2" => Some((163_840, 65_536)),
+            // pi-parity Task #20: unlike the three ids above (HuggingFace-only, no collision), this
+            // exact id is *also* served by Together with the same real max_output (384000, already
+            // matching the family-wide default below) but a real context of only 512000
+            // (`together.models.ts:156`) — half the generic bucket's 1,000,000, which is near-correct
+            // for HuggingFace's own real 1,048,576 (`huggingface.models.ts:475`) but a 2x over-report
+            // for Together. Together's smaller, safer number wins here (the accepted cost: HuggingFace's
+            // real, larger context is now under-reported instead of Together's being over-reported).
+            "deepseek-ai/deepseek-v4-pro" => Some((512_000, 384_000)),
             _ => None,
         } {
             return ModelCaps {
@@ -998,6 +1101,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
                 supports_xhigh_reasoning: true,
                 adaptive_xhigh_effort_wire: "max",
                 openai_reasoning_format: OpenAiReasoningFormat::DeepSeek,
+                supports_cache_control_on_tools: true,
             };
         }
         return ModelCaps {
@@ -1017,6 +1121,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
             supports_xhigh_reasoning: true,
             adaptive_xhigh_effort_wire: "max",
             openai_reasoning_format: OpenAiReasoningFormat::DeepSeek,
+            supports_cache_control_on_tools: true,
         };
     }
 
@@ -1077,6 +1182,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
             supports_xhigh_reasoning: true,
             adaptive_xhigh_effort_wire: "xhigh",
             openai_reasoning_format: OpenAiReasoningFormat::DeepSeek,
+            supports_cache_control_on_tools: true,
         };
     }
 
@@ -1125,6 +1231,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
             } else {
                 OpenAiReasoningFormat::Standard
             },
+            supports_cache_control_on_tools: true,
         };
     }
 
@@ -1195,6 +1302,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
             supports_xhigh_reasoning: false,
             adaptive_xhigh_effort_wire: "xhigh", // unread: Mistral never uses Adaptive shape.
             openai_reasoning_format: OpenAiReasoningFormat::Standard,
+            supports_cache_control_on_tools: true,
         };
     }
 
@@ -1209,8 +1317,29 @@ pub fn capabilities(model: &str) -> ModelCaps {
         // slug happens to collide with the literal prefix "glm" the way MiniMax's does.
         let g = if m.contains('/') { family_id } else { m.as_str() };
         let (context_window, max_output, reasoning_effort) = if g.starts_with("glm-5.2") {
-            (1_000_000, 131_072, true)
-        } else if g.starts_with("glm-4.5-air") {
+            // pi-parity Task #15: Together's and HuggingFace's own vendor-slug "zai-org/GLM-5.2"
+            // (`together.models.ts:363`, `huggingface.models.ts:853`) both report a real context of
+            // 262144, far smaller than NVIDIA's/native's own 1,000,000 this branch otherwise returns —
+            // checked against the *full* id (not just the `family_id` suffix both share with native),
+            // so Fireworks' differently-prefixed "glm-5p2" (normalized to the same "glm-5.2" suffix
+            // but under `accounts/fireworks/models/glm-5p2`) is unaffected. The two hosts disagree with
+            // each other on max_output (164000 vs 131072) — out of scope for this fix; only context
+            // (which they *do* agree on) is corrected here.
+            if m == "zai-org/glm-5.2" {
+                (262_144, 131_072, true)
+            } else if m == "zai/glm-5.2" {
+                // pi-parity Task #30: Vercel AI Gateway's own vendor-slug spelling ("zai/glm-5.2", no
+                // "-org" — distinct from Together's/HuggingFace's "zai-org/glm-5.2" just above) reports
+                // a real context of 1,040,000, not native's/NVIDIA's 1,000,000 — a negligible ~4%
+                // under-report, fixed here for completeness. The sibling "zai/glm-5.2-fast" id already
+                // matches its own real 1,000,000 via the `else` branch below and is left unaffected.
+                (1_040_000, 131_072, true)
+            } else {
+                (1_000_000, 131_072, true)
+            }
+        } else if g.starts_with("glm-4.5-air") || g == "glm-4.5" {
+            // Bare "glm-4.5" (HuggingFace's own id, `huggingface.models.ts:709`) reports identical real
+            // numbers to the already-correct "glm-4.5-air" bucket (131072/98304) — pi-parity Task #23.
             (131_072, 98_304, false)
         } else if g.starts_with("glm-4.7") {
             (204_800, 131_072, false)
@@ -1252,6 +1381,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
             supports_xhigh_reasoning: reasoning_effort,
             adaptive_xhigh_effort_wire: "max",
             openai_reasoning_format: OpenAiReasoningFormat::Zai,
+            supports_cache_control_on_tools: true,
         };
     }
 
@@ -1279,13 +1409,22 @@ pub fn capabilities(model: &str) -> ModelCaps {
     // ordinary prefix check.
     if m.starts_with("kimi") || family_id.starts_with("kimi") || m == "k2p7" {
         // Keyed on whether `m` is slug-shaped at all — same reasoning as the MiniMax/GLM branches.
-        let k = if m.contains('/') { family_id } else { m.as_str() };
-        // Kimi-Coding (`api.kimi.com/coding`, pi's `kimi-coding.models.ts`) hosts two ids with a much
-        // smaller real `maxTokens` (32_768) than this bucket's generic 262_144 default: its own
-        // "k2p7" alias, and "kimi-for-coding" — an id that doesn't collide with any moonshotai-native
-        // id at all (unlike "kimi-k2-thinking" below), so it's safe to correct outright rather than
-        // just document.
-        let is_kimi_coding_smaller_output = k == "k2p7" || k == "kimi-for-coding";
+        let is_vendor_slug = m.contains('/');
+        let k = if is_vendor_slug { family_id } else { m.as_str() };
+        // Kimi-Coding (`api.kimi.com/coding`, pi's `kimi-coding.models.ts`) hosts three ids with a much
+        // smaller real `maxTokens` (32_768) than this bucket's generic 262_144 default: its own "k2p7"
+        // alias and "kimi-for-coding" (neither collides with any moonshotai-native id at all), plus
+        // bare "kimi-k2-thinking" — which *does* collide with moonshotai-native's own identically-
+        // spelled bare id (262_144/262_144 there, matching this branch's own "else" default; pi-parity
+        // Task #14, same bug class as the documented kimi-k2.7-code/Copilot collision below). Scoped to
+        // the bare (non-vendor-slug) id specifically: HuggingFace's own vendor-slug
+        // "moonshotai/Kimi-K2-Thinking" reports the *native* (larger) numbers for this exact suffix
+        // (`huggingface.models.ts:583`: 262144/262144), not Kimi-Coding's, so only the bare form should
+        // take Kimi-Coding's smaller number — the safe-direction choice for the unresolvable bare-id
+        // collision (an 8x max_output under-report for moonshotai-native is far safer than an 8x
+        // over-report for Kimi-Coding).
+        let is_kimi_coding_smaller_output =
+            k == "k2p7" || k == "kimi-for-coding" || (!is_vendor_slug && k == "kimi-k2-thinking");
         // HuggingFace's own bare naming for the (non-reasoning) Instruct release — "Kimi-K2-Instruct"/
         // "-0905", no version-dot at all — drifted badly under the generic "else" bucket below (context
         // over-reported 2x for the plain Instruct id; max_output over-reported ~16x for both).
@@ -1294,6 +1433,15 @@ pub fn capabilities(model: &str) -> ModelCaps {
             || k.starts_with("kimi-k2-0905")
             || k.starts_with("kimi-k2-turbo-preview")
             || is_hf_bare_instruct;
+        // Together hosts its own vendor-slug "moonshotai/Kimi-K2.6"/"moonshotai/Kimi-K2.7-Code" with a
+        // real max_output smaller than this bucket's generic 262_144 (`together.models.ts:230,249`:
+        // 131000/131072 respectively) — a dangerous ~2x over-report for that host (pi-parity Task #22).
+        // HuggingFace serves the *identical* vendor-slug id strings at the generic bucket's own 262144
+        // (`huggingface.models.ts:619,637`) — another same-string, no-host-signal collision; Together's
+        // smaller, safer numbers win here, matching this table's established tradeoff elsewhere (e.g.
+        // the llama-3.3-70b-instruct HuggingFace/OpenRouter collision further below).
+        let together_vendor_slug_k2_6 = is_vendor_slug && k == "kimi-k2.6";
+        let together_vendor_slug_k2_7_code = is_vendor_slug && k == "kimi-k2.7-code";
         let (context_window, max_output) = if k.starts_with("kimi-k2-0711") {
             (131_072, 16_384)
         } else if is_kimi_coding_smaller_output {
@@ -1302,13 +1450,26 @@ pub fn capabilities(model: &str) -> ModelCaps {
             (131_072, 16_384)
         } else if k == "kimi-k2-instruct-0905" {
             (262_144, 16_384)
+        } else if together_vendor_slug_k2_6 {
+            (262_144, 131_000)
+        } else if together_vendor_slug_k2_7_code {
+            (262_144, 131_072)
         } else {
             (262_144, 262_144)
         };
-        let supports_vision = k.starts_with("kimi-k2.5")
+        let supports_vision = (k.starts_with("kimi-k2.5")
             || k.starts_with("kimi-k2.6")
             || k.starts_with("kimi-k2.7")
-            || is_kimi_coding_smaller_output;
+            || is_kimi_coding_smaller_output)
+            // "kimi-k2-thinking" has no vision on either host (Kimi-Coding's and moonshotai-native's
+            // catalogues both list `input: ["text"]`) — excluded even though it's now folded into
+            // `is_kimi_coding_smaller_output` above (which otherwise correctly grants vision for the
+            // genuinely vision-capable k2p7/kimi-for-coding). Together's own "moonshotai/Kimi-K2.7-Code"
+            // is also text-only (`together.models.ts:249`), unlike the bare native id and HuggingFace's
+            // identically-spelled vendor-slug entry (both real vision models) — the safe
+            // (false-positive-avoiding) choice when the two hosts' identical id strings disagree.
+            && k != "kimi-k2-thinking"
+            && !together_vendor_slug_k2_7_code;
         return ModelCaps {
             context_window,
             max_output,
@@ -1330,6 +1491,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
             } else {
                 OpenAiReasoningFormat::DeepSeek
             },
+            supports_cache_control_on_tools: true,
         };
     }
 
@@ -1384,6 +1546,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
             supports_xhigh_reasoning: false,
             adaptive_xhigh_effort_wire: "xhigh",
             openai_reasoning_format: OpenAiReasoningFormat::Standard,
+            supports_cache_control_on_tools: true,
         };
     }
 
@@ -1459,6 +1622,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
             supports_xhigh_reasoning: false,
             adaptive_xhigh_effort_wire: "xhigh",
             openai_reasoning_format: OpenAiReasoningFormat::Standard,
+            supports_cache_control_on_tools: true,
         };
     }
 
@@ -1467,10 +1631,16 @@ pub fn capabilities(model: &str) -> ModelCaps {
     // default of the plain OpenAI shape). Hosted on Together — the more common route for this family
     // in pi's catalogue — every entry is `compat.thinkingFormat: "together"` instead. Matched by exact
     // id first so the one Groq case doesn't get swallowed by the generic Together-shaped default below.
+    //
+    // pi-parity Task #18: HuggingFace hosts the *identically-spelled* id (`huggingface.models.ts:133`)
+    // with a real max_output of 16384, not Groq's 40960 — a same-string, no-host-signal collision this
+    // table can't resolve any further (context_window agrees at 131072 on both hosts, so only
+    // max_output is affected). Groq's real, larger ceiling loses here: the smaller HuggingFace number is
+    // the safe direction for both (an under-report is merely a lost-capability, not a 400).
     if m == "qwen/qwen3-32b" {
         return ModelCaps {
             context_window: 131_072,
-            max_output: 40_960,
+            max_output: 16_384,
             max_tokens_field: MaxTokensField::MaxCompletionTokens,
             supports_long_cache: true,
             supports_vision: false,
@@ -1485,6 +1655,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
             supports_xhigh_reasoning: false,
             adaptive_xhigh_effort_wire: "xhigh",
             openai_reasoning_format: OpenAiReasoningFormat::Standard,
+            supports_cache_control_on_tools: true,
         };
     }
     // In practice every Together/HuggingFace-hosted Qwen id's own org slug is literally "qwen/…", so
@@ -1493,6 +1664,31 @@ pub fn capabilities(model: &str) -> ModelCaps {
     // *doesn't* happen to start with "qwen" isn't silently missed the way Kimi/GLM/MiniMax/DeepSeek's
     // vendor-slug ids used to be.
     if m.starts_with("qwen") || family_id.starts_with("qwen") {
+        // HuggingFace's own bare "Qwen/Qwen3-235B-A22B" (no additional suffix — Together's own entry
+        // for this same base model is a differently-suffixed "...-Instruct-2507-tput" id, so there's no
+        // collision) is far smaller than the generic bucket's 200k/40960 default
+        // (`huggingface.models.ts:97`: real 40960/16384) — pi-parity Task #16.
+        if m == "qwen/qwen3-235b-a22b" {
+            return ModelCaps {
+                context_window: 40_960,
+                max_output: 16_384,
+                max_tokens_field: MaxTokensField::MaxTokens,
+                supports_long_cache: false,
+                supports_vision: false,
+                supports_temperature: true,
+                thinking: ThinkingShape::None,
+                reasoning_effort: true,
+                reasoning_disableable: true,
+                supports_eager_tool_streaming: false,
+                supports_tool_stream: false,
+                api: ApiKind::ChatCompletions,
+                min_reasoning_effort: RE::Minimal,
+                supports_xhigh_reasoning: true,
+                adaptive_xhigh_effort_wire: "xhigh",
+                openai_reasoning_format: OpenAiReasoningFormat::Standard,
+                supports_cache_control_on_tools: true,
+            };
+        }
         let q = if m.contains('/') { family_id } else { m.as_str() };
         // Together's current Qwen lineup varies too much (context from 32_768 to 1_000_000, max_output
         // from 32_768 to 500_000 — up to ~12x either direction) for the generic 200k/40960 default
@@ -1505,7 +1701,13 @@ pub fn capabilities(model: &str) -> ModelCaps {
         let together_match = match q {
             "qwen2.5-7b-instruct-turbo" => Some((32_768, 32_768, false, false)),
             "qwen3-235b-a22b-instruct-2507-tput" => Some((262_144, 262_144, false, false)),
-            "qwen3.5-397b-a17b" => Some((262_144, 130_000, true, true)),
+            // pi-parity Task #17: this exact vendor-slug id is *also* served by HuggingFace under the
+            // identical full string, with the same context (262144) but a real max_output of only 32768
+            // (`huggingface.models.ts:295`) vs Together's own 130000 (`together.models.ts:81`) — a
+            // same-string, no-host-signal collision (this table has no route/provider context to
+            // disambiguate by). HuggingFace's smaller number wins: Together's real, larger ceiling is
+            // now safely under-reported instead of HuggingFace's being dangerously over-reported.
+            "qwen3.5-397b-a17b" => Some((262_144, 32_768, true, true)),
             "qwen3.5-9b" => Some((262_144, 65_536, true, true)),
             "qwen3.6-plus" => Some((1_000_000, 500_000, false, true)),
             "qwen3.7-max" => Some((1_000_000, 500_000, false, false)),
@@ -1537,11 +1739,17 @@ pub fn capabilities(model: &str) -> ModelCaps {
                 } else {
                     OpenAiReasoningFormat::Standard
                 },
+                supports_cache_control_on_tools: true,
             };
         }
+        // pi-parity Task #28: pi's current catalogue lists ~7 more recent ids (Qwen3-Coder-30B/480B/
+        // Next, Qwen3-Next-80B-A3B-Instruct/-Thinking, Qwen3.5-27B, Qwen3.6-27B/35B-A3B —
+        // `huggingface.models.ts`) consistently at ~262144/65536, not this bucket's older 200000/40960
+        // default — a systematic, safe-direction (under-report) refresh with no known collision (none
+        // of these ids appear in `together.models.ts` under the same suffix).
         return ModelCaps {
-            context_window: 200_000,
-            max_output: 40_960,
+            context_window: 262_144,
+            max_output: 65_536,
             max_tokens_field: MaxTokensField::MaxTokens,
             supports_long_cache: false,
             // HuggingFace's Qwen3.5/3.6 lineup (`huggingface.models.ts`) is real vision-capable —
@@ -1560,6 +1768,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
             supports_xhigh_reasoning: true,
             adaptive_xhigh_effort_wire: "xhigh",
             openai_reasoning_format: OpenAiReasoningFormat::Together,
+            supports_cache_control_on_tools: true,
         };
     }
 
@@ -1589,6 +1798,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
             supports_xhigh_reasoning: true,
             adaptive_xhigh_effort_wire: "xhigh",
             openai_reasoning_format: OpenAiReasoningFormat::Standard,
+            supports_cache_control_on_tools: true,
         };
     }
 
@@ -1615,12 +1825,30 @@ pub fn capabilities(model: &str) -> ModelCaps {
             supports_xhigh_reasoning: false,
             adaptive_xhigh_effort_wire: "xhigh",
             openai_reasoning_format: OpenAiReasoningFormat::Standard,
+            supports_cache_control_on_tools: true,
         };
     }
 
     // Groq-hosted open models under the vendor's own OpenAI-compatible endpoint. `openai/gpt-oss-*`
     // (Groq's id, vendor-prefixed — distinct from Cerebras's un-prefixed "gpt-oss-*" above) is
     // reasoning-capable; every Llama id on Groq is not.
+    //
+    // pi-parity Task #19, investigated and left as-is: "openai/gpt-oss-120b" specifically is a real id
+    // on (at least) 4 providers with 4 different numbers — NVIDIA (128000/8192, `nvidia_caps` above,
+    // which runs *before* this branch and unconditionally wins for this exact string — see its own
+    // "must not inherit Groq's identically-named id's 65_536" regression test), Groq (real 65536,
+    // `groq.models.ts:58`, this branch's own default below), Together (real 131072,
+    // `together.models.ts:287`), and HuggingFace (real 32768, `huggingface.models.ts:655`). Since
+    // `nvidia_caps` already intercepts this exact string unconditionally (a deliberate, tested
+    // disambiguation for the NVIDIA-native case), a Groq/Together/HuggingFace request for the identical
+    // id today actually gets NVIDIA's 8192 ceiling, not this branch's 65536 — already the *smallest* (and
+    // therefore safest) of all four real numbers, not a dangerous over-report. Making this branch's own
+    // default host-aware wouldn't even be reachable without first un-teaching `nvidia_caps` its own
+    // correct, tested number for the NVIDIA-native case — the identical "one id, several real hosts, no
+    // route signal to disambiguate" limitation documented throughout this table (see e.g. the
+    // `nvidia/nemotron-3-ultra-550b-a55b` case in `nvidia_caps`'s own doc comment), just one level
+    // deeper. Left unfixed rather than papering over it with a same-string check that would never
+    // actually execute.
     if m.contains("gpt-oss") {
         return ModelCaps {
             context_window: 131_072,
@@ -1639,6 +1867,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
             supports_xhigh_reasoning: true,
             adaptive_xhigh_effort_wire: "xhigh",
             openai_reasoning_format: OpenAiReasoningFormat::Standard,
+            supports_cache_control_on_tools: true,
         };
     }
     if m.starts_with("llama") || m.contains("/llama") {
@@ -1668,6 +1897,78 @@ pub fn capabilities(model: &str) -> ModelCaps {
                 supports_xhigh_reasoning: false,
                 adaptive_xhigh_effort_wire: "xhigh",
                 openai_reasoning_format: OpenAiReasoningFormat::Standard,
+                supports_cache_control_on_tools: true,
+            };
+        }
+        // pi-parity Task #26: the `-Turbo` suffixed Together id is a *different* string entirely from
+        // the bare-native/OpenRouter-shaped exact match just above — no collision — and its real
+        // numbers (131072/131072, `together.models.ts:212`) are much larger than this branch's generic
+        // 32_768 default (a safe-direction under-report, fixed here for accuracy).
+        if m == "meta-llama/llama-3.3-70b-instruct-turbo" {
+            return ModelCaps {
+                context_window: 131_072,
+                max_output: 131_072,
+                max_tokens_field: MaxTokensField::MaxCompletionTokens,
+                supports_long_cache: true,
+                supports_vision: false,
+                supports_temperature: true,
+                thinking: ThinkingShape::None,
+                reasoning_effort: false,
+                reasoning_disableable: false,
+                supports_eager_tool_streaming: false,
+                supports_tool_stream: false,
+                api: ApiKind::ChatCompletions,
+                min_reasoning_effort: RE::Minimal,
+                supports_xhigh_reasoning: false,
+                adaptive_xhigh_effort_wire: "xhigh",
+                openai_reasoning_format: OpenAiReasoningFormat::Standard,
+                supports_cache_control_on_tools: true,
+            };
+        }
+        // pi-parity Task #24/#25: Groq's own bare ids, no collision with any other host's spelling.
+        // "llama-4-scout-17b-16e-instruct" real max_output is 8192 (`groq.models.ts:41`) vs this
+        // branch's generic 32_768 (a dangerous 4x over-report); "llama-3.1-8b-instant" real is 131072
+        // (`groq.models.ts:7`), a safe-direction under-report fixed here for accuracy.
+        if m == "meta-llama/llama-4-scout-17b-16e-instruct" {
+            return ModelCaps {
+                context_window: 131_072,
+                max_output: 8_192,
+                max_tokens_field: MaxTokensField::MaxCompletionTokens,
+                supports_long_cache: true,
+                supports_vision: true,
+                supports_temperature: true,
+                thinking: ThinkingShape::None,
+                reasoning_effort: false,
+                reasoning_disableable: false,
+                supports_eager_tool_streaming: false,
+                supports_tool_stream: false,
+                api: ApiKind::ChatCompletions,
+                min_reasoning_effort: RE::Minimal,
+                supports_xhigh_reasoning: false,
+                adaptive_xhigh_effort_wire: "xhigh",
+                openai_reasoning_format: OpenAiReasoningFormat::Standard,
+                supports_cache_control_on_tools: true,
+            };
+        }
+        if m == "llama-3.1-8b-instant" {
+            return ModelCaps {
+                context_window: 131_072,
+                max_output: 131_072,
+                max_tokens_field: MaxTokensField::MaxCompletionTokens,
+                supports_long_cache: true,
+                supports_vision: false,
+                supports_temperature: true,
+                thinking: ThinkingShape::None,
+                reasoning_effort: false,
+                reasoning_disableable: false,
+                supports_eager_tool_streaming: false,
+                supports_tool_stream: false,
+                api: ApiKind::ChatCompletions,
+                min_reasoning_effort: RE::Minimal,
+                supports_xhigh_reasoning: false,
+                adaptive_xhigh_effort_wire: "xhigh",
+                openai_reasoning_format: OpenAiReasoningFormat::Standard,
+                supports_cache_control_on_tools: true,
             };
         }
         return ModelCaps {
@@ -1687,6 +1988,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
             supports_xhigh_reasoning: false,
             adaptive_xhigh_effort_wire: "xhigh",
             openai_reasoning_format: OpenAiReasoningFormat::Standard,
+            supports_cache_control_on_tools: true,
         };
     }
 
@@ -1738,6 +2040,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
             supports_xhigh_reasoning: false,
             adaptive_xhigh_effort_wire: "xhigh",
             openai_reasoning_format: OpenAiReasoningFormat::Standard,
+            supports_cache_control_on_tools: true,
         };
     }
 
@@ -1751,6 +2054,14 @@ pub fn capabilities(model: &str) -> ModelCaps {
     // have the identical collision with HuggingFace (both real, different numbers, no distinguishing
     // prefix) — left at `nvidia_caps`'s existing, tested numbers rather than re-litigated here, since
     // that branch runs first and already wins the tie-break for those two ids specifically.
+    //
+    // pi-parity Task #27 (investigated, kept as-is): Together *also* hosts the identical vendor-slug
+    // "google/gemma-4-31B-it" string, with a real max_output of 131072 (`together.models.ts:193`) — 4x
+    // HuggingFace's 32768 below. Since this table has no route/host signal to disambiguate Together
+    // from HuggingFace/OpenRouter for this exact string (the same limitation as every other same-string
+    // collision documented in this file), keeping HuggingFace's smaller number is the safe-direction
+    // choice: Together's real, larger ceiling is under-reported (a usability loss, not a 400) rather
+    // than HuggingFace's/OpenRouter's smaller ones being dangerously over-reported.
     if m == "google/gemma-4-26b-a4b-it" || m == "google/gemma-4-31b-it" {
         return ModelCaps {
             context_window: 262_144,
@@ -1773,6 +2084,33 @@ pub fn capabilities(model: &str) -> ModelCaps {
             supports_xhigh_reasoning: false,
             adaptive_xhigh_effort_wire: "xhigh",
             openai_reasoning_format: OpenAiReasoningFormat::Standard,
+            supports_cache_control_on_tools: true,
+        };
+    }
+
+    // pi-parity Task #29: Together's "essentialai/Rnj-1-Instruct" (`together.models.ts:175`) is a
+    // brand-new model family with no other branch above recognizing it at all — falls to the generic
+    // vendor-slug fallback below (128000/32000), a ~4x context over-report of its real, much smaller
+    // 32768/32768. No collision with any other host's id.
+    if m == "essentialai/rnj-1-instruct" {
+        return ModelCaps {
+            context_window: 32_768,
+            max_output: 32_768,
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+            supports_long_cache: false,
+            supports_vision: false,
+            supports_temperature: true,
+            thinking: ThinkingShape::None,
+            reasoning_effort: false,
+            reasoning_disableable: false,
+            supports_eager_tool_streaming: false,
+            supports_tool_stream: false,
+            api: ApiKind::ChatCompletions,
+            min_reasoning_effort: RE::Minimal,
+            supports_xhigh_reasoning: false,
+            adaptive_xhigh_effort_wire: "xhigh",
+            openai_reasoning_format: OpenAiReasoningFormat::Standard,
+            supports_cache_control_on_tools: true,
         };
     }
 
@@ -1803,6 +2141,7 @@ pub fn capabilities(model: &str) -> ModelCaps {
             supports_xhigh_reasoning: true,
             adaptive_xhigh_effort_wire: "xhigh",
             openai_reasoning_format: OpenAiReasoningFormat::OpenRouter,
+            supports_cache_control_on_tools: true,
         };
     }
 
@@ -1876,6 +2215,58 @@ pub fn capabilities_for_route(model: &str, is_codex: bool, is_azure: bool) -> Mo
     caps
 }
 
+/// Same as [`capabilities_for_route`], additionally threading `is_copilot` for the handful of ids
+/// GitHub Copilot's own proxy serves with real numbers that diverge from every other route
+/// (`packages/ai/src/providers/github-copilot.models.ts`) — mirrors that function's own `is_codex`/
+/// `is_azure` shape (and `Dialect::for_model_via_copilot`'s identical idea on the dialect side). A
+/// separate function, rather than a 4th parameter on `capabilities_for_route` itself, so `client.rs`'s
+/// existing 3-arg call site (which has no `is_copilot` in scope to thread through) is unaffected; only
+/// the two callers that already hold `req.is_copilot` (`dialect::openai_responses::build_body`,
+/// `dialect::openai::build_body`) need this variant.
+///
+/// Currently overrides 7 ids (pi-parity Tasks #8, #9, #10, #11): `gpt-4.1` (Copilot's own dialect
+/// routing already forces Chat Completions for this one — see
+/// [`crate::dialect`]'s `COPILOT_FORCES_CHAT_COMPLETIONS` — with a real 128k/16384 ceiling vs native's
+/// ~1.05M/32768), `gpt-5-mini` (264000/64000 vs native's 400000/128000), `gpt-5.4`/`gpt-5.5` (400000
+/// context, not native's 272000), and the 4 Copilot-hosted Gemini ids: `gemini-2.5-pro`/
+/// `gemini-3-flash-preview` (128000/64000) and `gemini-3.1-pro-preview`/`gemini-3.5-flash`
+/// (200000/64000), vs native Google's 1,048,576/65,536 — [`capabilities`]'s own Gemini branch has zero
+/// Copilot-route awareness at all otherwise (no dialect actually serves Gemini's wire yet, so this is
+/// data-only, same as every other Gemini entry in that branch — see its own doc comment).
+pub fn capabilities_for_route_with_copilot(
+    model: &str,
+    is_codex: bool,
+    is_azure: bool,
+    is_copilot: bool,
+) -> ModelCaps {
+    let mut caps = capabilities_for_route(model, is_codex, is_azure);
+    if !is_copilot {
+        return caps;
+    }
+    let m = model.to_ascii_lowercase();
+    match m.as_str() {
+        "gpt-4.1" => {
+            caps.context_window = 128_000;
+            caps.max_output = 16_384;
+        }
+        "gpt-5-mini" => {
+            caps.context_window = 264_000;
+            caps.max_output = 64_000;
+        }
+        "gpt-5.4" | "gpt-5.5" => caps.context_window = 400_000,
+        "gemini-2.5-pro" | "gemini-3-flash-preview" => {
+            caps.context_window = 128_000;
+            caps.max_output = 64_000;
+        }
+        "gemini-3.1-pro-preview" | "gemini-3.5-flash" => {
+            caps.context_window = 200_000;
+            caps.max_output = 64_000;
+        }
+        _ => {}
+    }
+    caps
+}
+
 /// Per-model reasoning-effort wire-string remap for the OpenAI Chat-Completions dialect's third-party
 /// reasoning-toggle shapes (`dialect::openai::apply_reasoning_wire`) — mirrors pi's per-model
 /// `thinkingLevelMap` (`packages/ai/src/providers/*.models.ts`), which several providers use to spell a
@@ -1941,6 +2332,32 @@ pub fn reasoning_wire_override(
         return Some("high");
     }
     None
+}
+
+/// Per-model "minimal"-effort wire remap for the OpenAI **Responses** dialect's Codex/Copilot routes
+/// (`dialect::openai_responses::build_body`) — the Responses-dialect sibling of
+/// [`reasoning_wire_override`] (which only covers the Chat-Completions dialect's third-party toggle
+/// shapes). pi's `openai-codex.models.ts` and `github-copilot.models.ts` both set
+/// `thinkingLevelMap: {"minimal":"low", …}` for these 4 gpt-5 ids — neither catalogue defines a literal
+/// "minimal" tier at all, unlike native OpenAI's own map (pi-parity Task #13).
+///
+/// `effort` is the *already-clamped* [`crate::transport::ReasoningEffort`] ([`clamp_reasoning_effort`]'s
+/// output), matching [`reasoning_wire_override`]'s own contract. `None` — the overwhelming common
+/// case (a non-"minimal" effort, a route that's neither Codex nor Copilot, or any other model) — leaves
+/// the caller to fall back to the clamped effort's own literal name unchanged.
+pub fn responses_minimal_effort_wire_override(
+    model: &str,
+    is_codex: bool,
+    is_copilot: bool,
+    effort: crate::transport::ReasoningEffort,
+) -> Option<&'static str> {
+    use crate::transport::ReasoningEffort as RE;
+    if effort != RE::Minimal || !(is_codex || is_copilot) {
+        return None;
+    }
+    const REMAPPED_IDS: &[&str] = &["gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5"];
+    let m = model.to_ascii_lowercase();
+    REMAPPED_IDS.contains(&m.as_str()).then_some("low")
 }
 
 /// A portable thinking-depth level, independent of which wire mechanism the active model actually uses
@@ -3196,6 +3613,17 @@ mod tests {
     }
 
     #[test]
+    fn qwen3_32b_uses_huggingfaces_smaller_real_max_output_for_this_shared_exact_id() {
+        // pi-parity Task #18: "qwen/qwen3-32b" is served identically-spelled by both Groq (real
+        // max_output 40960, `groq.models.ts:109`) and HuggingFace (real 16384,
+        // `huggingface.models.ts:133`) — a same-string collision with no host signal to disambiguate
+        // (context_window agrees at 131072 on both). HuggingFace's smaller, safer number wins.
+        let c = capabilities("qwen/qwen3-32b");
+        assert_eq!(c.context_window, 131_072);
+        assert_eq!(c.max_output, 16_384, "was 40_960, over-reporting HuggingFace's real ceiling 2.5x");
+    }
+
+    #[test]
     fn generic_vendor_slug_fallback_beats_the_flat_unknown_default() {
         // An uncatalogued vendor/model-shaped id (most commonly OpenRouter) still gets meaningfully
         // better numbers than `ModelCaps::unknown()`'s flat 128k/4096.
@@ -3208,6 +3636,37 @@ mod tests {
         let bare = capabilities("some-future-model-x");
         assert_eq!(bare.openai_reasoning_format, OpenAiReasoningFormat::Standard);
         assert_eq!(bare.max_output, 4_096);
+    }
+
+    #[test]
+    fn essentialai_rnj_1_instruct_gets_its_real_capabilities_not_the_generic_vendor_slug_fallback() {
+        // pi-parity Task #29: a brand-new Together model family with zero prior coverage — real
+        // numbers (`together.models.ts:175`): 32768/32768, a ~4x smaller context than the generic
+        // vendor-slug fallback's 128000.
+        let c = capabilities("essentialai/Rnj-1-Instruct");
+        assert_eq!(c.context_window, 32_768);
+        assert_eq!(c.max_output, 32_768);
+        assert!(!c.supports_vision);
+        assert!(!c.reasoning_effort);
+        assert_ne!(
+            c.openai_reasoning_format,
+            OpenAiReasoningFormat::OpenRouter,
+            "must not land on the generic vendor-slug fallback"
+        );
+    }
+
+    #[test]
+    fn vercel_ai_gateway_zai_glm_5_2_gets_its_real_slightly_larger_context() {
+        // pi-parity Task #30: Vercel AI Gateway's own vendor-slug spelling "zai/glm-5.2" (no "-org")
+        // reports a real context of 1,040,000, not native's/NVIDIA's 1,000,000 — negligible (~4%) but
+        // fixed for completeness.
+        let c = capabilities("zai/glm-5.2");
+        assert_eq!(c.context_window, 1_040_000);
+        // The sibling "-fast" id is unaffected — its own real number already matches native's.
+        assert_eq!(capabilities("zai/glm-5.2-fast").context_window, 1_000_000);
+        // The Together/HuggingFace vendor-slug spelling ("zai-org/…") is a different string entirely,
+        // unaffected by this one.
+        assert_eq!(capabilities("zai-org/GLM-5.2").context_window, 262_144);
     }
 
     // ---- Vendor-slug family matching + MiMo (pi-parity remediation) ----
@@ -3229,11 +3688,39 @@ mod tests {
             "must not land on the generic vendor-slug fallback"
         );
 
+        // pi-parity Task #22: Together's real max_output for this exact vendor-slug id (131000,
+        // `together.models.ts:230`) is much smaller than the generic "else" bucket's 262144, which
+        // HuggingFace's identically-spelled entry legitimately matches (`huggingface.models.ts:619`).
+        assert_eq!(kimi.max_output, 131_000, "was 262_144, a dangerous 2x over-report for Together");
+
+        // "moonshotai/Kimi-K2.7-Code" on Together is real max_output 131072 (`together.models.ts:249`)
+        // and, uniquely among every other vision-capable id in this family (including the bare native
+        // id and HuggingFace's own identically-spelled vendor-slug entry), text-only on Together
+        // specifically (`input: ["text"]`) — both the number and the vision flag must reflect that.
+        let code = capabilities("moonshotai/Kimi-K2.7-Code");
+        assert_eq!(code.context_window, 262_144);
+        assert_eq!(code.max_output, 131_072, "was 262_144, a dangerous 2x over-report for Together");
+        assert!(!code.supports_vision, "Together's own K2.7-Code entry is text-only");
+
+        // The bare native id is unaffected — still the family default (262144/262144), vision-capable.
+        // (HuggingFace's own real entry for "moonshotai/Kimi-K2.7-Code" is identically spelled to
+        // Together's — the same same-string collision `together_vendor_slug_k2_7_code` accepts;
+        // Together's smaller, safer number and text-only flag win for this one shared string.)
+        let native_code = capabilities("kimi-k2.7-code");
+        assert_eq!(native_code.max_output, 262_144);
+        assert!(native_code.supports_vision);
+
+        // pi-parity Task #15: this exact vendor-slug id's real context (262144, both
+        // `together.models.ts:363` and `huggingface.models.ts:853`) is far smaller than NVIDIA's/
+        // native's own 1,000,000 the bare "glm-5.2" id gets.
         let glm = capabilities("zai-org/GLM-5.2");
-        assert_eq!(glm.context_window, 1_000_000);
+        assert_eq!(glm.context_window, 262_144, "Together/HuggingFace's real context, not native's 1M");
         assert_eq!(glm.max_output, 131_072);
         assert!(glm.reasoning_effort, "glm-5.2 has a real effort vocabulary");
         assert_eq!(glm.openai_reasoning_format, OpenAiReasoningFormat::Zai);
+
+        // The native (bare) id is completely unaffected — still the larger 1,000,000.
+        assert_eq!(capabilities("glm-5.2").context_window, 1_000_000);
     }
 
     #[test]
@@ -3270,8 +3757,13 @@ mod tests {
         // These two already matched correctly before `family_id` existed (DeepSeek's org slug
         // "deepseek-ai" itself starts with "deepseek"; Groq's real qwen id already carries its own
         // slash). Regression guard that the refactor didn't change either.
+        //
+        // pi-parity Task #20: this exact id now gets its own real (smaller) context — see
+        // `deepseek_ai_deepseek_v4_pro_gets_togethers_smaller_real_context` below — rather than the
+        // family-wide 1,000,000 default; max_output is unaffected (Together's real number already
+        // matches that default).
         let ds = capabilities("deepseek-ai/DeepSeek-V4-Pro");
-        assert_eq!(ds.context_window, 1_000_000);
+        assert_eq!(ds.context_window, 512_000);
         assert_eq!(ds.max_output, 384_000);
 
         let groq = capabilities("qwen/qwen3-32b");
@@ -3413,6 +3905,49 @@ mod tests {
     }
 
     #[test]
+    fn copilot_bare_claude_sonnet_4_gets_its_own_real_numbers_not_the_generic_bucket() {
+        // pi-parity Task #5: unlike every other Copilot Claude id, "claude-sonnet-4" has no
+        // version-dot at all — `is_dot_spelled` can never catch it — so it used to fall through to the
+        // generic Budget-shape bucket's `sonnet` default (context 200_000/max_output 64_000) instead of
+        // Copilot's real, much smaller numbers (`github-copilot.models.ts`: 216_000/16_000, a 4x
+        // max_output over-report).
+        let c = capabilities("claude-sonnet-4");
+        assert_eq!(c.context_window, 216_000);
+        assert_eq!(c.max_output, 16_000);
+        assert_eq!(c.thinking, ThinkingShape::Budget);
+
+        // No native/OpenRouter id of this exact bare spelling exists — a vendor-slug id sharing the
+        // same suffix is unaffected (falls to the generic bucket, not this exact-id override).
+        let vendor_slug = capabilities("anthropic/claude-sonnet-4");
+        assert_ne!(vendor_slug.max_output, 16_000);
+    }
+
+    #[test]
+    fn copilot_opus_4_5_and_sonnet_4_5_get_copilots_smaller_max_output_but_stay_budget_shaped() {
+        // pi-parity Tasks #6/#7: Copilot's own "claude-opus-4.5"/"claude-sonnet-4.5" cap max_output at
+        // 32_000 (`github-copilot.models.ts`), not this bucket's generic 64_000 — but, unlike
+        // opus-4-6/4-7/4-8/sonnet-4-6, neither is Adaptive-shape on Copilot (no `forceAdaptiveThinking`/
+        // `thinkingLevelMap` for either), so they must NOT be added to
+        // `github_copilot_claude_overrides`'s allowlist (which would incorrectly also switch them to
+        // the Adaptive wire shape) — they stay in this generic Budget-shape bucket, just with a smaller
+        // max_output.
+        for id in ["claude-opus-4.5", "claude-sonnet-4.5"] {
+            let c = capabilities(id);
+            assert_eq!(c.context_window, 200_000, "{id}: Copilot's context matches this bucket already");
+            assert_eq!(c.max_output, 32_000, "{id}: Copilot's real, smaller ceiling");
+            assert_eq!(c.thinking, ThinkingShape::Budget, "{id}: must stay Budget-shape, not Adaptive");
+        }
+
+        // The native, dash-spelled ids are completely unaffected — still the generic 64_000.
+        assert_eq!(capabilities("claude-opus-4-5").max_output, 64_000);
+        assert_eq!(capabilities("claude-sonnet-4-5").max_output, 64_000);
+
+        // A vendor-slug dot-spelled id (OpenRouter) is also unaffected — the override is bare-id-only.
+        let vendor_slug = capabilities("anthropic/claude-opus-4.5");
+        assert_eq!(vendor_slug.max_output, 64_000);
+    }
+
+    #[test]
     fn copilot_mai_code_1_flash_picker_gets_real_capabilities_not_the_unknown_default() {
         let c = capabilities("mai-code-1-flash-picker");
         assert_eq!(c.context_window, 256_000);
@@ -3446,6 +3981,26 @@ mod tests {
         assert_eq!(c.context_window, 262_144);
         assert_eq!(c.max_output, 32_768);
         assert!(c.supports_vision);
+    }
+
+    #[test]
+    fn kimi_coding_kimi_k2_thinking_gets_kimi_codings_smaller_real_max_output() {
+        // pi-parity Task #14: unlike "k2p7"/"kimi-for-coding", bare "kimi-k2-thinking" *does* collide
+        // with moonshotai-native's own identically-spelled id (which correctly gets 262144/262144 via
+        // this bucket's "else" default) — same bug class as the documented kimi-k2.7-code/Copilot
+        // collision. Kimi-Coding's smaller, safer max_output (32768) wins here: an 8x over-report for
+        // Kimi-Coding (dangerous) is worse than an 8x under-report for moonshotai-native (safe).
+        // Neither host reports vision for this id, unlike k2p7/kimi-for-coding.
+        let c = capabilities("kimi-k2-thinking");
+        assert_eq!(c.context_window, 262_144);
+        assert_eq!(c.max_output, 32_768, "was 262_144, a dangerous 8x over-report for Kimi-Coding");
+        assert!(!c.supports_vision, "neither Kimi-Coding nor moonshotai-native report vision for this id");
+
+        // HuggingFace's own vendor-slug spelling of this id reports the *native* (larger) numbers, not
+        // Kimi-Coding's — the bare-id-only scoping must not affect it.
+        let hf = capabilities("moonshotai/Kimi-K2-Thinking");
+        assert_eq!(hf.context_window, 262_144);
+        assert_eq!(hf.max_output, 262_144, "HuggingFace's real number, not Kimi-Coding's");
     }
 
     // ---- Task 25: Google/Gemini capability data ----
@@ -3600,6 +4155,118 @@ mod tests {
         }
     }
 
+    #[test]
+    fn capabilities_for_route_with_copilot_is_a_no_op_when_not_copilot_routed() {
+        for id in ["gpt-4.1", "gpt-5-mini", "gpt-5.4", "gpt-5.5", "gemini-2.5-pro", "gpt-4o"] {
+            assert_eq!(
+                capabilities_for_route_with_copilot(id, false, false, false),
+                capabilities_for_route(id, false, false),
+                "{id}: is_copilot=false must be a complete no-op"
+            );
+        }
+    }
+
+    #[test]
+    fn capabilities_for_route_with_copilot_gpt_4_1_gets_copilots_real_numbers() {
+        // pi-parity Task #9: native gpt-4.1 is ~1.05M/32768; Copilot's real numbers are a much smaller
+        // 128000/16384 — an 8x context over-report was the single largest miss this pass.
+        let native = capabilities_for_route_with_copilot("gpt-4.1", false, false, false);
+        assert_eq!(native.context_window, 1_047_576);
+        assert_eq!(native.max_output, 32_768);
+
+        let copilot = capabilities_for_route_with_copilot("gpt-4.1", false, false, true);
+        assert_eq!(copilot.context_window, 128_000, "Copilot's real, much smaller context");
+        assert_eq!(copilot.max_output, 16_384, "Copilot's real, much smaller output ceiling");
+    }
+
+    #[test]
+    fn capabilities_for_route_with_copilot_gpt_5_mini_gets_copilots_real_numbers() {
+        // pi-parity Task #10.
+        let native = capabilities_for_route_with_copilot("gpt-5-mini", false, false, false);
+        assert_eq!(native.context_window, 400_000);
+        assert_eq!(native.max_output, 128_000);
+
+        let copilot = capabilities_for_route_with_copilot("gpt-5-mini", false, false, true);
+        assert_eq!(copilot.context_window, 264_000);
+        assert_eq!(copilot.max_output, 64_000);
+    }
+
+    #[test]
+    fn capabilities_for_route_with_copilot_gpt_5_4_and_5_5_get_copilots_larger_context() {
+        // pi-parity Task #11: bare gpt-5.4/gpt-5.5 report 272000 context natively; Copilot's real
+        // number is the larger 400000 (a safe-direction under-report before this fix, not a hard bug,
+        // but still worth correcting for accuracy).
+        for id in ["gpt-5.4", "gpt-5.5"] {
+            let native = capabilities_for_route_with_copilot(id, false, false, false);
+            assert_eq!(native.context_window, 272_000, "{id}");
+            let copilot = capabilities_for_route_with_copilot(id, false, false, true);
+            assert_eq!(copilot.context_window, 400_000, "{id}: Copilot's real, larger context");
+        }
+    }
+
+    #[test]
+    fn capabilities_for_route_with_copilot_gemini_ids_get_copilots_real_numbers() {
+        // pi-parity Task #8: native Google numbers are 1,048,576/65,536 for every current Gemini id;
+        // Copilot's real numbers are much smaller and split into two pairs.
+        for id in ["gemini-2.5-pro", "gemini-3-flash-preview"] {
+            let native = capabilities_for_route_with_copilot(id, false, false, false);
+            assert_eq!(native.context_window, 1_048_576, "{id}");
+            let copilot = capabilities_for_route_with_copilot(id, false, false, true);
+            assert_eq!(copilot.context_window, 128_000, "{id}");
+            assert_eq!(copilot.max_output, 64_000, "{id}");
+        }
+        for id in ["gemini-3.1-pro-preview", "gemini-3.5-flash"] {
+            let copilot = capabilities_for_route_with_copilot(id, false, false, true);
+            assert_eq!(copilot.context_window, 200_000, "{id}");
+            assert_eq!(copilot.max_output, 64_000, "{id}");
+        }
+    }
+
+    #[test]
+    fn capabilities_for_route_with_copilot_leaves_unrelated_ids_and_codex_azure_overrides_intact() {
+        // Copilot-awareness must compose with, not replace, the existing Codex/Azure overrides.
+        let codex = capabilities_for_route_with_copilot("gpt-5.3-codex-spark", true, false, false);
+        assert_eq!(codex.max_output, 128_000, "Codex's own override must still apply");
+
+        // An id Copilot never serves is untouched even if (hypothetically) is_copilot were true.
+        let unaffected = capabilities_for_route_with_copilot("deepseek-v4-pro", false, false, true);
+        assert_eq!(unaffected, capabilities("deepseek-v4-pro"));
+    }
+
+    #[test]
+    fn responses_minimal_effort_wire_override_remaps_only_on_codex_or_copilot_routes() {
+        use crate::transport::ReasoningEffort as RE;
+        for id in ["gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5"] {
+            assert_eq!(
+                responses_minimal_effort_wire_override(id, true, false, RE::Minimal),
+                Some("low"),
+                "{id}: Codex must remap minimal to low"
+            );
+            assert_eq!(
+                responses_minimal_effort_wire_override(id, false, true, RE::Minimal),
+                Some("low"),
+                "{id}: Copilot must remap minimal to low"
+            );
+            // Neither route: no remap.
+            assert_eq!(
+                responses_minimal_effort_wire_override(id, false, false, RE::Minimal),
+                None,
+                "{id}: native route must not remap"
+            );
+            // A non-minimal effort is never remapped, even on Codex/Copilot.
+            assert_eq!(
+                responses_minimal_effort_wire_override(id, true, false, RE::High),
+                None,
+                "{id}: only minimal is remapped"
+            );
+        }
+        // An id not in the remap list is unaffected even on Codex/Copilot.
+        assert_eq!(
+            responses_minimal_effort_wire_override("gpt-5.2", true, false, RE::Minimal),
+            None
+        );
+    }
+
     // ---- Task 22: HuggingFace fresh gaps ----
 
     #[test]
@@ -3640,6 +4307,22 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_ai_deepseek_v4_pro_gets_togethers_smaller_real_context() {
+        // pi-parity Task #20: this exact id is served by both Together (real context 512000,
+        // `together.models.ts:156`, max_output 384000 already matching the family default) and
+        // HuggingFace (real context 1048576, `huggingface.models.ts:475`, near enough to the family
+        // default's 384000 max_output too) — a same-string collision with no host signal to
+        // disambiguate. Together's smaller, safer context wins: the family-wide 1,000,000 default was a
+        // 2x over-report for Together.
+        let c = capabilities("deepseek-ai/DeepSeek-V4-Pro");
+        assert_eq!(c.context_window, 512_000, "was 1_000_000 under the flat family bucket");
+        assert_eq!(c.max_output, 384_000, "unaffected — already matched the family default");
+
+        // The bare native id (not this exact vendor-slug string) is unaffected.
+        assert_eq!(capabilities("deepseek-v4-pro").context_window, 1_000_000);
+    }
+
+    #[test]
     fn huggingface_glm_4_5v_gets_vision_and_its_own_much_smaller_numbers() {
         let c = capabilities("zai-org/GLM-4.5V");
         assert!(c.supports_vision, "\"glm-4.5v\".starts_with(\"glm-5v\") is false; needs its own check");
@@ -3648,6 +4331,19 @@ mod tests {
         // Every other current GLM id is unaffected.
         assert!(!capabilities("glm-4.7").supports_vision);
         assert!(capabilities("glm-5v-turbo").supports_vision);
+    }
+
+    #[test]
+    fn huggingface_bare_glm_4_5_gets_the_same_real_numbers_as_glm_4_5_air() {
+        // pi-parity Task #23: bare "zai-org/GLM-4.5" (no "-air"/"-v" suffix — `huggingface.models.ts:
+        // 709`) used to fall to the 200000/131072 else-bucket; its real numbers (131072/98304) are
+        // identical to the already-correct "glm-4.5-air" special case.
+        let c = capabilities("zai-org/GLM-4.5");
+        assert_eq!(c.context_window, 131_072);
+        assert_eq!(c.max_output, 98_304);
+        // The "-air" and "-v" variants are unaffected — still their own distinct cases.
+        assert_eq!(capabilities("glm-4.5-air").max_output, 98_304);
+        assert!(capabilities("zai-org/GLM-4.5V").supports_vision);
     }
 
     #[test]
@@ -3678,6 +4374,41 @@ mod tests {
     }
 
     #[test]
+    fn together_llama_3_3_70b_instruct_turbo_gets_its_real_larger_max_output() {
+        // pi-parity Task #26: the `-Turbo` suffixed Together id (`together.models.ts:212`) is a
+        // *different* string entirely from the bare-native/OpenRouter-shaped exact match just above —
+        // no collision — real numbers 131072/131072, vs the generic llama branch's smaller 32_768
+        // default (a safe-direction under-report, fixed here for accuracy).
+        let c = capabilities("meta-llama/Llama-3.3-70B-Instruct-Turbo");
+        assert_eq!(c.context_window, 131_072);
+        assert_eq!(c.max_output, 131_072, "was 32_768 under the generic llama branch's default");
+        // The non-Turbo HuggingFace id is unaffected — still its own, much smaller real number.
+        assert_eq!(capabilities("meta-llama/Llama-3.3-70B-Instruct").max_output, 4_096);
+    }
+
+    #[test]
+    fn groq_llama_4_scout_and_llama_3_1_8b_instant_get_their_real_numbers() {
+        // pi-parity Tasks #24/#25: both are Groq-exclusive spellings, no collision with any other
+        // host's id.
+        let scout = capabilities("meta-llama/llama-4-scout-17b-16e-instruct");
+        assert_eq!(scout.context_window, 131_072);
+        assert_eq!(
+            scout.max_output, 8_192,
+            "was 32_768 under the generic llama branch's default — a dangerous 4x over-report"
+        );
+        assert!(scout.supports_vision, "llama-4 ids are vision-capable");
+
+        let instant = capabilities("llama-3.1-8b-instant");
+        assert_eq!(instant.context_window, 131_072);
+        assert_eq!(
+            instant.max_output, 131_072,
+            "was 32_768 under the generic llama branch's default — a safe-direction under-report, \
+             fixed for accuracy"
+        );
+        assert!(!instant.supports_vision);
+    }
+
+    #[test]
     fn huggingface_mimo_v2_flash_vendor_slug_gets_its_real_smaller_max_output() {
         let hf = capabilities("XiaomiMiMo/MiMo-V2-Flash");
         assert_eq!(hf.context_window, 262_144);
@@ -3702,6 +4433,19 @@ mod tests {
                 "{id}: must not land on the generic vendor-slug fallback"
             );
         }
+    }
+
+    #[test]
+    fn google_gemma_4_31b_it_keeps_huggingfaces_smaller_safe_max_output_despite_togethers_larger_real_one() {
+        // pi-parity Task #27 (investigated, kept as-is — documented, not a new numeric fix): Together
+        // also hosts this exact vendor-slug id with a real max_output of 131072
+        // (`together.models.ts:193`), 4x HuggingFace's 32768. No route/host signal exists to
+        // disambiguate the two for this same-string collision, so the smaller (safe-direction) number
+        // stays — this pins down the current, deliberate behavior so a future route-aware fix changes
+        // it on purpose, not by accident.
+        let c = capabilities("google/gemma-4-31b-it");
+        assert_eq!(c.max_output, 32_768, "HuggingFace's smaller, safe-direction number");
+        assert_ne!(c.max_output, 131_072, "not Together's real, larger ceiling");
     }
 
     // ---- Task 17: Together Qwen precision + Together/Fireworks MiniMax-M3 ----
@@ -3737,9 +4481,24 @@ mod tests {
         assert!(vision_9b.supports_vision);
         assert_eq!(vision_9b.max_output, 65_536);
 
-        // An uncatalogued Together-shaped Qwen id still falls back to the generic bucket unchanged.
+        // pi-parity Task #17: this exact vendor-slug id is *also* served by HuggingFace under the
+        // identical full string, with the same context (262144) but a real max_output of only 32768
+        // (`huggingface.models.ts:295`) vs Together's own 130000 (`together.models.ts:81`) — a
+        // same-string collision with no host signal to disambiguate. HuggingFace's smaller number wins.
+        let vision_397b = capabilities("Qwen/Qwen3.5-397B-A17B");
+        assert_eq!(vision_397b.context_window, 262_144);
+        assert_eq!(
+            vision_397b.max_output, 32_768,
+            "was 130_000, a dangerous 4x over-report for HuggingFace"
+        );
+        assert!(vision_397b.supports_vision);
+
+        // An uncatalogued Together-shaped Qwen id still falls back to the generic bucket, refreshed
+        // (pi-parity Task #28) to match pi's current catalogue's ~262144/65536 default rather than the
+        // older, stale 200000/40960.
         let uncatalogued = capabilities("Qwen/Qwen4-Hypothetical-Future-Id");
-        assert_eq!(uncatalogued.context_window, 200_000);
+        assert_eq!(uncatalogued.context_window, 262_144);
+        assert_eq!(uncatalogued.max_output, 65_536);
         assert_eq!(uncatalogued.openai_reasoning_format, OpenAiReasoningFormat::Together);
     }
 
@@ -3803,6 +4562,35 @@ mod tests {
         // distinctive Fireworks path prefix.
         assert!(!is_fireworks_model("some-vendor/model-5p1"));
         assert!(is_fireworks_model("accounts/fireworks/models/glm-5p1"));
+    }
+
+    #[test]
+    fn fireworks_anthropic_wire_ids_never_support_cache_control_on_tools() {
+        // pi-parity Task #2: pi's `fireworks.models.ts` sets `supportsCacheControlOnTools: false` on
+        // all 14 of its Anthropic-wire ids — a later routing change
+        // (`dialect::is_fireworks_anthropic_wire_model`) now sends exactly these ids through the
+        // Anthropic dialect, which used to stamp `cache_control` on the last tool unconditionally.
+        for id in [
+            "accounts/fireworks/models/deepseek-v4-pro",
+            "accounts/fireworks/models/glm-5p1",
+            "accounts/fireworks/models/gpt-oss-120b",
+            "accounts/fireworks/models/kimi-k2p6",
+            "accounts/fireworks/models/minimax-m3",
+            "accounts/fireworks/models/qwen3p7-plus",
+            "accounts/fireworks/routers/kimi-k2p6-fast",
+        ] {
+            assert!(
+                !capabilities(id).supports_cache_control_on_tools,
+                "{id} must not support cache_control on tools"
+            );
+        }
+        // The two genuinely `openai-completions` Fireworks ids (never reached through the Anthropic
+        // dialect at all) are unaffected — `true`, matching every other model's default.
+        assert!(capabilities("accounts/fireworks/models/glm-5p2").supports_cache_control_on_tools);
+        // Every non-Fireworks id, including plain Claude, defaults to `true` too.
+        assert!(capabilities("claude-opus-4-8").supports_cache_control_on_tools);
+        assert!(capabilities("deepseek-v4-pro").supports_cache_control_on_tools);
+        assert!(ModelCaps::unknown().supports_cache_control_on_tools);
     }
 
     // ---- Task 16: NVIDIA id-for-id table ----
@@ -3880,6 +4668,20 @@ mod tests {
         assert_eq!(omni.context_window, 256_000);
         assert_eq!(omni.max_output, 65_536);
         assert!(omni.supports_vision);
+    }
+
+    #[test]
+    fn nvidia_nemotron_3_ultra_keeps_nvidias_native_numbers_pending_route_awareness() {
+        // pi-parity Task #21, investigated and deliberately left as-is (see `nvidia_caps`'s own doc
+        // comment): Together re-hosts this exact id with real numbers (512300/512300,
+        // `together.models.ts:268`) that `nvidia_caps` — checked first, unconditionally, on the id
+        // string alone — can't ever see, since it always wins for this literal string. The direction is
+        // safe (NVIDIA's 65_536 max_output is smaller than Together's real 512_300), just a usability
+        // loss for Together specifically. This pins down the current, documented behavior so a future
+        // route-aware fix changes it on purpose.
+        let c = capabilities("nvidia/nemotron-3-ultra-550b-a55b");
+        assert_eq!(c.context_window, 1_000_000, "NVIDIA's own real, tested number");
+        assert_eq!(c.max_output, 65_536, "NVIDIA's own real, tested number");
     }
 
     #[test]

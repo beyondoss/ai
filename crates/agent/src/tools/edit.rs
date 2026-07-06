@@ -70,14 +70,13 @@ impl Tool for Edit {
         }
 
         let (raw, initial_mtime) = read_with_mtime(path)?;
-        // Fail fast on a read-only file before spending any match/diff work on it (fuzzy matching
-        // does NFKC normalization + ambiguity resolution — real CPU work, not free) — pi's own
-        // `access(path, W_OK)` pre-check, just via a metadata read instead of a syscall that doesn't
-        // exist on every platform Rust targets.
-        let writable = std::fs::metadata(path)
-            .map(|m| !m.permissions().readonly())
-            .unwrap_or(true); // a metadata read failing here is surfaced by the write attempt below
-        if !writable {
+        // Fail fast on a file this process can't actually write before spending any match/diff work on
+        // it (fuzzy matching does NFKC normalization + ambiguity resolution — real CPU work, not free)
+        // — pi's own `access(path, W_OK)` pre-check. `super::is_writable` performs a real access check
+        // (open-for-write, then close without touching content) rather than inspecting the file's mode
+        // bits, which — unlike a real `access(2)` — say nothing about *this process's* actual uid/gid
+        // (see that function's own doc comment for the gap this closes: pi-parity task 50).
+        if !super::is_writable(path) {
             return Err(ToolError::Execution(format!("{path} is not writable")));
         }
         // Match in a normalized LF space with the BOM stripped, then restore the file's original

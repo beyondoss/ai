@@ -47,14 +47,22 @@ pub enum Dialect {
 }
 
 /// Model ids GitHub Copilot's own proxy insists on Chat Completions for, even though the same id
-/// natively classifies as `ApiKind::Responses` (`models::capabilities`) — see
-/// [`Dialect::for_model_via_copilot`]'s doc comment. Currently just `gpt-4.1`: pi's
-/// `github-copilot.models.ts` sets `api: "openai-completions"` for the Copilot-hosted id, vs
-/// `openai.models.ts`'s `api: "openai-responses"` for the same id natively — Copilot's proxy wants the
-/// older wire shape for this one model specifically (Copilot's own gpt-5.x family is
-/// `"openai-responses"` there too). A short exception list is all this needs, not a second capability
-/// table — extend it if Copilot ever adds another id with the same native/Copilot split.
-const COPILOT_FORCES_CHAT_COMPLETIONS: &[&str] = &["gpt-4.1"];
+/// natively classifies differently — see [`Dialect::for_model_via_copilot`]'s doc comment.
+///
+/// - `gpt-4.1`: natively classifies as `ApiKind::Responses` (`models::capabilities`). pi's
+///   `github-copilot.models.ts` sets `api: "openai-completions"` for the Copilot-hosted id, vs
+///   `openai.models.ts`'s `api: "openai-responses"` for the same id natively — Copilot's proxy wants
+///   the older wire shape for this one model specifically (Copilot's own gpt-5.x family is
+///   `"openai-responses"` there too).
+/// - `claude-fable-5`: natively an Anthropic-wire id (`Dialect::for_model` routes every `claude`-named
+///   id there unconditionally). pi's `github-copilot.models.ts` uniquely sets `api:
+///   "openai-completions"` for this one Claude id — every *other* Copilot-hosted Claude id in that same
+///   catalogue (`claude-opus-4.6`, `claude-sonnet-4.5`, …) is `"anthropic-messages"`, matching this
+///   crate's default.
+///
+/// A short exception list is all this needs, not a second capability table — extend it if Copilot ever
+/// adds another id with the same native/Copilot split.
+const COPILOT_FORCES_CHAT_COMPLETIONS: &[&str] = &["gpt-4.1", "claude-fable-5"];
 
 /// Bare (unprefixed, no vendor-slug `/`) model ids that pi's own catalogue serves over the Anthropic
 /// wire (`api: "anthropic-messages"`) despite an id that names neither "claude" nor "anthropic" — the
@@ -94,7 +102,12 @@ const NATIVE_ANTHROPIC_WIRE_BARE_IDS: &[&str] = &[
 /// one exclusion rather than an enumerated allowlist (keeps this in sync with Fireworks' catalogue
 /// without needing a second copy of the same id list `crate::models::capabilities`'s own Fireworks "p"
 /// normalization already matches against).
-fn is_fireworks_anthropic_wire_model(model: &str) -> bool {
+///
+/// `pub(crate)`: also consulted by `crate::models::capabilities` to set
+/// [`crate::models::ModelCaps::supports_cache_control_on_tools`] `false` for these same 14 ids (pi's
+/// `fireworks.models.ts` sets `supportsCacheControlOnTools: false` on all of them) — the identical id
+/// set, so it's reused rather than re-derived a second time.
+pub(crate) fn is_fireworks_anthropic_wire_model(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
     crate::models::is_fireworks_model(&m) && !m.contains("glm-5p2")
 }
@@ -176,6 +189,16 @@ impl Dialect {
 /// reduce `maxTokens`, and a near-zero `available` there is already a sign compaction is badly overdue
 /// — this floor is a defensive addition, not a divergence from its behavior in practice).
 const MIN_CLAMPED_MAX_TOKENS: u32 = 1_024;
+/// The absolute floor on the final clamped result — pi's real minimum for `max_output_tokens` (recently
+/// fixed upstream). Unlike [`MIN_CLAMPED_MAX_TOKENS`] (which only ever raises `available`, the ceiling
+/// [`ModelRequest::max_tokens`] gets clamped *down to*), this applies to the clamp's actual output: a
+/// caller's own `max_tokens` below this floor — reachable via `--max-tokens`/`AI_AGENT_MAX_TOKENS` with
+/// no minimum validation of its own, or a computed split-turn compaction-summary budget — would
+/// otherwise pass straight through the `.min(...)` below untouched, since `min` can only shrink toward a
+/// too-small value, never raise one. The OpenAI/Azure Responses API hard-400s any `max_output_tokens`
+/// below 16 (`dialect::openai_responses::build_body`); this floor keeps that unreachable regardless of
+/// what a caller asks for.
+const ABSOLUTE_MIN_MAX_TOKENS: u32 = 16;
 /// Held back below `context_window` on top of the estimated prompt size — matches pi's
 /// `clampMaxTokensToContext` margin (`packages/ai/src/api/simple-options.ts`). Token *estimates* (ours:
 /// chars/4, see [`crate::compaction::estimate_tokens`]) are approximate; this absorbs that slop so the
@@ -218,7 +241,9 @@ pub(crate) fn clamp_max_tokens_to_context(req: &ModelRequest, caps: &ModelCaps) 
         .map(|t| t.budget_tokens.saturating_add(1))
         .unwrap_or(0)
         .max(MIN_CLAMPED_MAX_TOKENS);
-    req.max_tokens.min(available.max(floor))
+    req.max_tokens
+        .min(available.max(floor))
+        .max(ABSOLUTE_MIN_MAX_TOKENS)
 }
 
 /// Ensure every `tool_use` block reaches the wire with a matching `tool_result` immediately following
@@ -579,10 +604,23 @@ pub fn push_sse_line(
         buf.set_event(event.trim());
         return Ok(Vec::new());
     }
-    let Some(payload) = line.strip_prefix("data:") else {
+    // A colonless line (no `:` anywhere in it) matches neither `strip_prefix` above nor below — per
+    // the SSE spec (and pi's own `decodeSseLine`, which computes `fieldName = delimiterIndex === -1 ?
+    // line : line.slice(0, delimiterIndex)`), the *whole line* is the field name in that case, with an
+    // empty value, rather than an unrecognized line to drop outright. Only `"event"`/`"data"` bare
+    // field names are meaningful here; any other colonless field name (e.g. a bare `"id"`/`"retry"`)
+    // falls through the `data` check below unchanged and is correctly ignored, same as before this fix.
+    if line == "event" {
+        buf.set_event("");
+        return Ok(Vec::new());
+    }
+    let payload = if let Some(payload) = line.strip_prefix("data:") {
+        payload.trim()
+    } else if line == "data" {
+        ""
+    } else {
         return Ok(Vec::new());
     };
-    let payload = payload.trim();
     if payload.is_empty() || payload == "[DONE]" {
         return Ok(Vec::new());
     }
@@ -833,6 +871,25 @@ mod tests {
     }
 
     #[test]
+    fn copilot_routing_forces_claude_fable_5_onto_chat_completions() {
+        // pi-parity (Task #12): `github-copilot.models.ts` uniquely sets `api: "openai-completions"`
+        // for Copilot's own "claude-fable-5" — every other Copilot-hosted Claude id in that same
+        // catalogue is "anthropic-messages", matching this crate's default (Anthropic wire for any
+        // "claude"-named id). Without this, a Copilot-hosted claude-fable-5 request would wrongly speak
+        // the Anthropic wire against an endpoint that expects Chat Completions.
+        assert_eq!(
+            Dialect::for_model_via_copilot("claude-fable-5", true),
+            Dialect::OpenAi
+        );
+        // Native (non-Copilot) routing is unaffected — still the Anthropic wire.
+        assert_eq!(
+            Dialect::for_model_via_copilot("claude-fable-5", false),
+            Dialect::Anthropic
+        );
+        assert_eq!(Dialect::for_model("claude-fable-5"), Dialect::Anthropic);
+    }
+
+    #[test]
     fn endpoint_paths_by_dialect() {
         assert_eq!(Dialect::Anthropic.endpoint_path(), "/v1/messages");
         assert_eq!(Dialect::OpenAi.endpoint_path(), "/v1/chat/completions");
@@ -1003,6 +1060,47 @@ data: {"type":"message_stop"}
             !events.is_empty(),
             "ordinary message_start must still decode: {events:?}"
         );
+    }
+
+    #[test]
+    fn push_sse_line_treats_a_colonless_line_as_the_whole_field_name_with_an_empty_value() {
+        // pi-parity: a line with no `:` at all matches neither the `"event:"` nor `"data:"` prefix
+        // check, so before this fix it was silently dropped instead of being treated — per the SSE
+        // spec and pi's own `decodeSseLine` (`delimiterIndex === -1 ? line : line.slice(0,
+        // delimiterIndex)`) — as that whole line being the field name, with an empty value.
+        let mut buf = SseEventBuffer::new();
+        let mut dec = anthropic::Decoder::default();
+        // A bare "event" (no colon) sets the SSE-level event field to "" — verified indirectly via the
+        // `event: error` unconditional-error path: an empty-string event name must NOT be treated as
+        // "error", so an ordinary payload flushed after it still decodes normally rather than erroring.
+        assert!(push_sse_line(&mut dec, &mut buf, "event").unwrap().is_empty());
+        assert!(
+            push_sse_line(
+                &mut dec,
+                &mut buf,
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}"
+            )
+            .unwrap()
+            .is_empty()
+        );
+        let events = push_sse_line(&mut dec, &mut buf, "").unwrap();
+        assert!(
+            !events.is_empty(),
+            "a colonless \"event\" line must not be mistaken for an error event: {events:?}"
+        );
+
+        // A bare "data" (no colon) is the field name "data" with an empty value — an empty payload, the
+        // same as an ordinary "data:" line with nothing after the colon (already dropped, not a new
+        // behavior change), so it must not itself cause an error or a spurious event.
+        let mut buf2 = SseEventBuffer::new();
+        assert!(push_sse_line(&mut dec, &mut buf2, "data").unwrap().is_empty());
+        assert!(push_sse_line(&mut dec, &mut buf2, "").unwrap().is_empty());
+
+        // A colonless field name other than "event"/"data" (e.g. a bare "id") is still correctly
+        // ignored, matching pre-fix behavior for every field this decoder doesn't track.
+        let mut buf3 = SseEventBuffer::new();
+        assert!(push_sse_line(&mut dec, &mut buf3, "retry").unwrap().is_empty());
+        assert!(push_sse_line(&mut dec, &mut buf3, "").unwrap().is_empty());
     }
 
     #[test]

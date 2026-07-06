@@ -393,6 +393,20 @@ enum Command {
         /// previously with no CLI flag or persisted override at all, unlike its two siblings above).
         #[arg(long, env = "AI_AGENT_RETRY_MAX_BACKOFF_MS")]
         retry_max_backoff_ms: Option<u64>,
+        /// Disable the whole-run auto-retry-after-error loop outright — pi's `RetrySettings.enabled:
+        /// false` (`settings-manager.ts:28`). Matches this codebase's own `--no-x` convention for
+        /// negating an on-by-default behavior (`--no-compaction`, `--no-skills`, ...). Only gates the
+        /// whole-run retry-after-error loop (a run that already exhausted every within-turn retry and
+        /// still ended in a transient-looking error, re-invoked from scratch — see
+        /// `beyond_ai_agent::retry`'s own module doc comment); the separate pre-connect/mid-stream layer
+        /// just above (`--retry-max-retries`/`--retry-base-delay-ms`, `agent_core::client`) is
+        /// unaffected either way — matches pi's own `RetrySettings.enabled`, which gates only its
+        /// equivalent whole-run loop. Functionally equivalent to `--retry-max-retries 0` (Task #52,
+        /// pi-parity fix: previously the only discoverable spelling of "never retry a whole run"), just
+        /// under a name that says what it means without requiring the operator to already know `0` has
+        /// this effect.
+        #[arg(long, env = "AI_AGENT_NO_RETRY", default_value_t = false)]
+        no_retry: bool,
         /// Idle-read timeout between response chunks on the gateway HTTP client, in milliseconds —
         /// overrides `agent_core::client::GatewayClient`'s built-in default, tuned for the gateway's own
         /// upstream assumption. Consulted for every routing path (proxied through the gateway, or a
@@ -1319,6 +1333,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             retry_max_retries,
             retry_base_delay_ms,
             retry_max_backoff_ms,
+            no_retry,
             idle_timeout_ms,
             block_images,
             no_image_auto_resize,
@@ -1371,6 +1386,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 retry_max_retries,
                 retry_base_delay_ms,
                 retry_max_backoff_ms,
+                no_retry,
                 idle_timeout_ms,
                 block_images,
                 no_image_auto_resize,
@@ -2670,6 +2686,7 @@ async fn run_task(
     retry_max_retries: Option<u32>,
     retry_base_delay_ms: Option<u64>,
     retry_max_backoff_ms: Option<u64>,
+    no_retry: bool,
     idle_timeout_ms: Option<u64>,
     block_images: bool,
     no_image_auto_resize: bool,
@@ -3196,7 +3213,12 @@ async fn run_task(
     // Task #50: the same two operator-supplied overrides also drive the *whole-run* retry layer
     // (`retry::RunRetryPolicy`), not just the pre-connect/mid-stream layer just above — previously
     // `--retry-max-retries`/`--retry-base-delay-ms` silently had no effect on `run_turn`'s own retry loop.
-    let retry_policy = beyond_ai_agent::retry::RunRetryPolicy::from_overrides(
+    // Task #52 (pi-parity fix): `--no-retry` wins outright over `retry_max_retries` here — but only for
+    // this whole-run layer, not `client`'s own pre-connect/mid-stream retry configured just above, which
+    // stays governed by `--retry-max-retries`/`--retry-base-delay-ms` alone (matches pi's own
+    // `RetrySettings.enabled`, which gates only its equivalent whole-run loop).
+    let retry_policy = beyond_ai_agent::retry::RunRetryPolicy::from_overrides_with_enabled(
+        !no_retry,
         retry_max_retries,
         retry_base_delay_ms.map(std::time::Duration::from_millis),
     );
@@ -4007,6 +4029,47 @@ mod tests {
         .expect_err("must eventually give up, not retry forever");
         assert!(matches!(err, Error::Transport(_)));
         assert_eq!(transport.calls(), total_attempts);
+    }
+
+    #[tokio::test]
+    async fn a_no_retry_disabled_policy_never_retries_a_whole_run_transient_failure() {
+        // Task #52 (pi-parity fix): `--no-retry` must reach `run_turn`'s own whole-run retry gate and
+        // actually stop it from retrying — not just theoretically compute `max_retries: 0` somewhere
+        // unused. Same failure shape as `run_turn_recovers_from_a_whole_run_transient_failure` above
+        // (which proves the *enabled* case recovers), but built via
+        // `RunRetryPolicy::from_overrides_with_enabled(false, ..)` (what `--no-retry` actually
+        // constructs in `main`) with a real would-have-recovered turn scripted right after the failing
+        // ones — proving the recovery opportunity was skipped specifically because retry is disabled,
+        // not because none was scripted.
+        let mut turns: Vec<Vec<Result<StreamEvent, Error>>> = (0..INNER_RETRY_ATTEMPTS)
+            .map(|_| vec![Err(Error::Transport("overloaded_error: overloaded".into()))])
+            .collect();
+        turns.push(turn::text("would have recovered").into_iter().map(Ok).collect());
+        let transport = std::sync::Arc::new(MockTransport::scripted(turns));
+        let agent = Agent::new(transport.clone(), "claude-test");
+        let mut session = Session::new();
+        session.user("hi");
+
+        // Mirrors `--no-retry` alongside a nonzero `--retry-max-retries`: disabled must win outright.
+        let policy = beyond_ai_agent::retry::RunRetryPolicy::from_overrides_with_enabled(
+            false,
+            Some(99),
+            None,
+        );
+        let err = run_turn(
+            &agent,
+            &mut session,
+            false,
+            &agent_core::CancellationToken::new(),
+            &policy,
+            &AtomicBool::new(false),
+        )
+        .await
+        .expect_err("a disabled whole-run retry policy must never retry, even a recoverable failure");
+        assert!(matches!(err, Error::Transport(_)));
+        // Only agent_core's own internal (mid-stream) retries ran; our whole-run wrapper made no
+        // second attempt at all, so the final scripted (would-have-succeeded) turn was never reached.
+        assert_eq!(transport.calls(), INNER_RETRY_ATTEMPTS);
     }
 
     #[test]

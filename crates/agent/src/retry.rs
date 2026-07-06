@@ -137,6 +137,34 @@ impl RunRetryPolicy {
             .saturating_mul(1u32 << attempt.saturating_sub(1).min(16));
         jitter(exp, attempt).min(RUN_RETRY_MAX_BACKOFF)
     }
+
+    /// Like [`from_overrides`](Self::from_overrides), but `enabled: false` wins outright — pi's
+    /// `RetrySettings.enabled: false` (`settings-manager.ts:28`) gates its own whole-run
+    /// auto-retry-after-error loop entirely, independent of whatever retry *count* is separately
+    /// configured. This is the concrete backing for `main.rs`'s `--no-retry` CLI flag (Task #52,
+    /// pi-parity fix): a clearer, more discoverable alias for `max_retries: 0` — which already fully
+    /// disables this loop today (`run_turn`'s own `attempt < max_retries` gate never lets a single
+    /// retry through when the ceiling is zero — see `run_retry_policy_disabling_forces_zero_max_retries_
+    /// regardless_of_max_retries_override` below) — rather than a wholly separate boolean the rest of
+    /// this module, and every caller reading `max_retries`, would need to keep in sync with it.
+    ///
+    /// `max_retries` is still consulted when `enabled` is `true` (ordinary `from_overrides` behavior);
+    /// `base_backoff` is always honored either way, since a disabled policy's `backoff` is never
+    /// actually called (nothing here ever retries), but keeping it set is simpler than special-casing a
+    /// bogus value nothing reads.
+    pub fn from_overrides_with_enabled(
+        enabled: bool,
+        max_retries: Option<u32>,
+        base_backoff: Option<std::time::Duration>,
+    ) -> Self {
+        if !enabled {
+            return Self {
+                max_retries: 0,
+                base_backoff: base_backoff.unwrap_or(RUN_RETRY_BASE_BACKOFF),
+            };
+        }
+        Self::from_overrides(max_retries, base_backoff)
+    }
 }
 
 /// Whether a whole run that ended in `Err` is worth automatically re-invoking from scratch — a superset
@@ -261,6 +289,45 @@ mod tests {
     fn run_retry_policy_from_overrides_falls_back_to_defaults_when_absent() {
         let policy = RunRetryPolicy::from_overrides(None, None);
         assert_eq!(policy, RunRetryPolicy::default());
+    }
+
+    #[test]
+    fn from_overrides_with_enabled_true_behaves_exactly_like_from_overrides() {
+        // Task #52: `--no-retry` absent (`enabled: true`) must be a complete no-op over the existing
+        // `from_overrides` behavior — no new precedence or defaulting quirks introduced for the common
+        // case.
+        assert_eq!(
+            RunRetryPolicy::from_overrides_with_enabled(true, Some(5), None),
+            RunRetryPolicy::from_overrides(Some(5), None)
+        );
+        assert_eq!(
+            RunRetryPolicy::from_overrides_with_enabled(true, None, None),
+            RunRetryPolicy::default()
+        );
+    }
+
+    #[test]
+    fn from_overrides_with_enabled_false_forces_zero_max_retries_regardless_of_max_retries_override() {
+        // Task #52 (pi-parity feature): `--no-retry` must win outright even if `--retry-max-retries 7`
+        // (or a stored `default_retry_max_retries`) was *also* given — matching pi's own
+        // `RetrySettings.enabled: false` precedence, an explicit "off" always means off.
+        let disabled = RunRetryPolicy::from_overrides_with_enabled(
+            false,
+            Some(7),
+            Some(std::time::Duration::from_millis(500)),
+        );
+        assert_eq!(disabled.max_retries, 0);
+    }
+
+    #[test]
+    fn a_disabled_run_retry_policy_never_lets_run_turns_own_gate_retry_once() {
+        // Confirms the mechanism `from_overrides_with_enabled(false, ..)`'s doc comment relies on:
+        // `main.rs::run_turn`'s own retry loop gates on `attempt < policy.max_retries` starting from
+        // `attempt == 0` — a zero ceiling means that check is `0 < 0`, always false, so the loop's
+        // first (and only) attempt is never retried, for any error, retryable-looking or not.
+        let disabled = RunRetryPolicy::from_overrides_with_enabled(false, Some(99), None);
+        let attempt = 0u32;
+        assert!(attempt >= disabled.max_retries);
     }
 
     #[test]

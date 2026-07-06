@@ -216,7 +216,9 @@ pub fn build_body(req: &ModelRequest, is_oauth: bool) -> Value {
             mark_eager_tool_streaming(&mut tools);
         }
         if let Some(cc) = &cc {
-            mark_last_tool(&mut tools, cc);
+            if caps.supports_cache_control_on_tools {
+                mark_last_tool(&mut tools, cc);
+            }
         }
         map.insert("tools".into(), tools);
     }
@@ -624,17 +626,9 @@ fn mark_eager_tool_streaming(tools: &mut Value) {
     }
 }
 
-/// Stamp a cache breakpoint onto the last tool definition.
-///
-/// pi-parity note (Task #30, checked and closed as a non-issue): pi gates this per-model via
-/// `compat.supportsCacheControlOnTools` (`anthropic-messages.ts:177`, default `true`). This dialect
-/// stamps unconditionally instead. That's safe today because every id this dialect's `build_body` ever
-/// serves is a `claude`/`fable` id (`Dialect::for_model` in `dialect/mod.rs` only routes those two
-/// prefixes here) — and no entry in `models::capabilities`'s Anthropic branches needs this disabled;
-/// pi's own catalogue only sets it `false` for Fireworks-hosted DeepSeek-on-Anthropic-wire, a
-/// provider/model pair this crate doesn't (and, per `Dialect::for_model`'s current routing, can't)
-/// reach through this dialect. Revisit if a future model reachable here ever needs it off — don't add
-/// a `ModelCaps` flag for it until then.
+/// Stamp a cache breakpoint onto the last tool definition. Only called by [`build_body`] when
+/// [`crate::models::ModelCaps::supports_cache_control_on_tools`] is `true` for the active model — see
+/// that field's own doc comment for why this is no longer unconditional.
 fn mark_last_tool(tools: &mut Value, cc: &Value) {
     if let Some(tool) = tools
         .as_array_mut()
@@ -1265,6 +1259,47 @@ mod tests {
             body["messages"][1]["content"][0]["cache_control"]["type"],
             "ephemeral"
         );
+    }
+
+    #[test]
+    fn fireworks_anthropic_wire_models_never_get_a_tool_cache_breakpoint() {
+        // pi-parity (Task #2): pi's `fireworks.models.ts` sets `supportsCacheControlOnTools: false` on
+        // every one of its 14 Anthropic-wire ids (DeepSeek-V4, GLM-5.1, gpt-oss-120b/20b, Kimi-K2.6/
+        // K2.7-Code + fast/turbo variants, MiniMax-M2.7/M3, Qwen3.7-Plus) — a later routing change
+        // (`is_fireworks_anthropic_wire_model`) now sends exactly these ids through this dialect, so
+        // stamping `cache_control` on their last tool unconditionally (as this dialect used to) would
+        // diverge from pi and risk a 400 Fireworks doesn't accept a `cache_control` breakpoint for.
+        let req = ModelRequest::new(
+            "accounts/fireworks/models/deepseek-v4-pro",
+            vec![Message::user("hi")],
+            256,
+        )
+        .with_tools(vec![ToolDef {
+            name: "read".into(),
+            description: "read a file".into(),
+            input_schema: json!({ "type": "object" }),
+        }]);
+        let body = build_body(&req, false);
+        assert!(
+            body["tools"][0].get("cache_control").is_none(),
+            "a Fireworks Anthropic-wire model must never get a tool cache breakpoint: {body:?}"
+        );
+        // The rolling message breakpoint is untouched by this gate — only tools are affected.
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+
+        // An ordinary Claude id is completely unaffected — still gets its tool breakpoint.
+        let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 256).with_tools(
+            vec![ToolDef {
+                name: "read".into(),
+                description: "read a file".into(),
+                input_schema: json!({ "type": "object" }),
+            }],
+        );
+        let body = build_body(&req, false);
+        assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
     }
 
     #[test]

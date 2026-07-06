@@ -190,12 +190,10 @@ fn discover_with_diagnostics_impl(
             // `.claude/skills` already has between user and project. Deduped against the user root
             // above (pi's own `collectAncestorAgentsSkillDirs(...).filter(dir => dir !== userAgentsSkillsDir)`)
             // so a `cwd` under `$HOME` itself (no enclosing git repo) doesn't double-count it.
-            let mut ancestors = collect_ancestor_agents_skill_dirs(cwd);
+            let mut ancestors = collect_ancestor_agents_skill_dirs_excluding_user_dir(cwd);
             ancestors.reverse();
             for dir in ancestors {
-                if user_agents_skills.as_deref() != Some(dir.as_path()) {
-                    push_scoped(&mut agents_roots, &mut seen_roots, dir, "project");
-                }
+                push_scoped(&mut agents_roots, &mut seen_roots, dir, "project");
             }
         }
         if let Some(home) = home_dir() {
@@ -469,6 +467,35 @@ pub(crate) fn collect_ancestor_agents_skill_dirs(start: &Path) -> Vec<PathBuf> {
     dirs
 }
 
+/// Like [`collect_ancestor_agents_skill_dirs`], but excludes the user's own `~/.agents/skills` — pi's
+/// documented always-trusted personal-skills convention (`userAgentsSkillsDir` in pi's `trust-manager.ts`)
+/// — from the result. `discover_with_diagnostics_impl` needs this exclusion because it already lists the
+/// user root separately (once, unconditionally); [`crate::trust_store::has_trust_gated_resources`] needs
+/// the same exclusion for a different reason (pi-parity fix, Task #45): without it, an ancestor walk with
+/// no enclosing git repo — so it reaches all the way to `/` — treats an operator's own
+/// `~/.agents/skills` (which every `cwd` under `$HOME` sees as an "ancestor") as if it were a
+/// project-controlled, trust-gated resource, wrongly forcing an untrusted verdict (and its accompanying
+/// "resources were skipped" warning) even when the project itself defines nothing that actually needs
+/// gating. Matches pi's own `hasTrustRequiringProjectResources` (`trust-manager.ts:184-206`), which
+/// explicitly filters out `userAgentsSkillsDir` before checking whether any ancestor `.agents/skills`
+/// exists.
+pub(crate) fn collect_ancestor_agents_skill_dirs_excluding_user_dir(start: &Path) -> Vec<PathBuf> {
+    let user_agents_skills = home_dir().map(|h| h.join(".agents/skills"));
+    collect_ancestor_agents_skill_dirs_excluding(start, user_agents_skills.as_deref())
+}
+
+/// Test seam for [`collect_ancestor_agents_skill_dirs_excluding_user_dir`]: takes the directory to
+/// exclude explicitly rather than reading `$HOME` from the process environment, so the exclusion itself
+/// can be exercised deterministically without mutating global process state — `std::env::set_var` is
+/// unsafe to call from a test that may run concurrently with others reading `$HOME`/calling `home_dir()`
+/// (see `resources.rs`'s `tz_string_offset` for the same established pattern in this codebase).
+fn collect_ancestor_agents_skill_dirs_excluding(start: &Path, exclude: Option<&Path>) -> Vec<PathBuf> {
+    collect_ancestor_agents_skill_dirs(start)
+        .into_iter()
+        .filter(|dir| exclude != Some(dir.as_path()))
+        .collect()
+}
+
 /// Walk `root` for `SKILL.md` manifests, gitignore-aware — reuses the same `ignore` crate `grep`/`find`
 /// already depend on, rather than hand-rolling `.gitignore`/`.ignore` parsing, so a vendored or fixture
 /// directory carrying its own ignore file doesn't leak a stray `SKILL.md` into the prompt.
@@ -692,12 +719,19 @@ const MAX_SKILL_DESCRIPTION_LEN: usize = 1024;
 /// Non-fatal length check on a skill's declared `description`. A skill failing this is still discovered
 /// and usable — the description is truncated nowhere; this only warns an operator that something's
 /// probably wrong with the `SKILL.md`, mirroring [`validate_skill_name`]'s same non-fatal shape.
+///
+/// pi-parity fix (Task #44): pi's own `skills.ts` measures `description.length` — JS UTF-16 code units,
+/// equivalent to a Unicode scalar/char count for the BMP characters a description realistically contains
+/// — against this same 1024 limit. Counting `.len()` (Rust's UTF-8 *byte* length) instead means a
+/// description containing multi-byte characters (CJK, etc. — 3 bytes/char in UTF-8) fires this warning
+/// up to ~3x earlier than it should, while also mislabeling a byte count as a "characters" count in the
+/// message itself.
 fn validate_skill_description(description: &str) -> Vec<String> {
     let mut issues = Vec::new();
-    if description.len() > MAX_SKILL_DESCRIPTION_LEN {
+    let char_count = description.chars().count();
+    if char_count > MAX_SKILL_DESCRIPTION_LEN {
         issues.push(format!(
-            "skill description exceeds {MAX_SKILL_DESCRIPTION_LEN} characters ({})",
-            description.len()
+            "skill description exceeds {MAX_SKILL_DESCRIPTION_LEN} characters ({char_count})"
         ));
     }
     issues
@@ -708,11 +742,21 @@ fn validate_skill_description(description: &str) -> Vec<String> {
 /// invocation without leaking the raw YAML into the model-facing text; `\r\n`/`\r` are normalized to
 /// `\n` throughout, matching pi's own `normalizeNewlines`, applied unconditionally before any fence
 /// detection). Dependency-free (no `serde_yaml`): enough of YAML for the Agent Skills spec — quoted
-/// values, and block scalars (`key: |` / `key: >`) whose value spans the following more-indented lines.
+/// values (with double-quoted backslash-escape processing — Task #43), block scalars (`key: |` /
+/// `key: >`) whose value spans the following more-indented lines, and a plain (unquoted, non-block-scalar)
+/// value that itself wraps across more-indented continuation lines with no `|`/`>` indicator at all —
+/// ordinary YAML line folding, the way most hand-written frontmatter actually wraps a long `description:`
+/// (Task #40).
+///
 /// A `>` (folded) block is joined with spaces, a `|` (literal) block with newlines; both let a long
-/// `description:` wrap across lines, and both keep exactly one trailing `\n` on the joined value —
-/// real YAML's default "clip" chomping, which a real parser (pi's) applies to either block style, not
-/// just `|`. Anything fancier (anchors, nested maps) is out of scope and ignored.
+/// value wrap across lines. Chomping (Task #42): a `-` (strip) or `+` (keep) modifier right after the
+/// `|`/`>` indicator is honored — `-` drops the trailing newline entirely, `+` preserves every trailing
+/// blank line in the block as its own newline, and the default ("clip", no modifier) keeps exactly one
+/// trailing `\n`, matching a real parser (pi's) applied to either block style, not just `|`. An
+/// indentation-indicator digit (`|2`) is not handled — rare enough in practice not to be worth the added
+/// complexity here. A plain value's own continuation lines are folded with a single space per YAML's
+/// line-folding rule (no chomping modifier applies — chomping is a block-scalar-only concept). Anything
+/// fancier (anchors, nested maps, multi-line quoted scalars) is out of scope and ignored.
 ///
 /// No opening fence at all (the first line isn't `---`) *or* an unterminated one (no closing `---`
 /// found before EOF) both return an empty map and the **entire original input**, verbatim, as the body
@@ -759,6 +803,11 @@ pub(crate) fn parse_frontmatter(text: &str) -> (HashMap<String, String>, String)
         let value = match raw.chars().next() {
             // Block scalar: gather the lines indented under this key until a dedent or closing `---`.
             Some(folded @ ('|' | '>')) => {
+                // pi-parity fix (Task #42): honor a chomping modifier (`-` strip, `+` keep) right after
+                // the block-scalar indicator — see this function's doc comment. `raw.chars().nth(1)`
+                // reads the character immediately after `|`/`>`, if any (an indentation-indicator digit
+                // lands here too; it's simply not matched below, falling through to default "clip").
+                let chomp = raw.chars().nth(1);
                 let mut parts: Vec<String> = Vec::new();
                 while let Some(next) = lines.peek() {
                     let next_trimmed = next.trim_end_matches(['\n', '\r']);
@@ -772,17 +821,54 @@ pub(crate) fn parse_frontmatter(text: &str) -> (HashMap<String, String>, String)
                     consumed += next.len();
                     lines.next();
                 }
+                // "Keep" (`+`) preserves every trailing blank line collected above as its own newline in
+                // the final value; "clip" (default) and "strip" (`-`) both discard trailing blank lines
+                // before deciding the value's own trailing newline(s) below.
+                if chomp != Some('+') {
+                    while parts.last().is_some_and(String::is_empty) {
+                        parts.pop();
+                    }
+                }
                 let joined = if folded == '>' {
                     parts.join(" ")
                 } else {
                     parts.join("\n")
                 };
-                // pi-parity fix (L9): real YAML's default "clip" chomping keeps exactly one trailing
-                // newline on a block scalar's value — ours used to `.trim()` it away entirely. Applies
-                // to both `|` and `>`; only the *internal* line joining differs between them.
-                format!("{joined}\n")
+                match chomp {
+                    // Strip: no trailing newline at all.
+                    Some('-') => joined,
+                    // Clip (default) and keep: exactly one more trailing `\n` than `joined` already
+                    // ends with — for "keep" that's on top of whatever trailing blank lines survived
+                    // above (each already contributing its own `\n` via `parts.join`), reproducing
+                    // every trailing blank line as a newline; for "clip" the trailing blanks were
+                    // already dropped, so this is the single newline real YAML's default chomping keeps.
+                    _ => format!("{joined}\n"),
+                }
             }
-            _ => unquote(raw),
+            _ => {
+                // pi-parity fix (Task #40): fold a plain (unquoted, non-block-scalar) value's own
+                // continuation lines — see this function's doc comment. Scoped to unquoted values only:
+                // a quoted scalar is expected to close on its own line, so an indented line following one
+                // is left alone for the top-of-loop "indented line" skip above, unchanged.
+                let quoted = matches!(raw.chars().next(), Some('"') | Some('\''));
+                let mut value = unquote(raw);
+                if !quoted {
+                    while let Some(next) = lines.peek() {
+                        let next_trimmed = next.trim_end_matches(['\n', '\r']);
+                        if next_trimmed.trim() == "---" || next_trimmed.trim().is_empty() {
+                            break; // closing fence, or a blank line, ends the wrapped value
+                        }
+                        if !next_trimmed.starts_with([' ', '\t']) {
+                            break; // dedent to another top-level key ends the continuation
+                        }
+                        value.push(' ');
+                        value.push_str(next_trimmed.trim());
+                        consumed += next.len();
+                        lines.next();
+                    }
+                }
+                value
+            }
         };
         map.insert(key, value);
     }
@@ -803,17 +889,67 @@ fn normalize_newlines(s: &str) -> String {
     s.replace("\r\n", "\n").replace('\r', "\n")
 }
 
-/// Strip matching surrounding single or double quotes.
+/// Strip matching surrounding single or double quotes. For a double-quoted value, also interprets
+/// backslash escapes (Task #43) — a single-quoted YAML scalar supports no escapes at all per the YAML
+/// spec (its only special case, `''` for a literal quote, is out of scope here, same as before), so only
+/// the double-quoted path needs this.
 fn unquote(s: &str) -> String {
     let bytes = s.as_bytes();
-    if bytes.len() >= 2
-        && (bytes[0] == b'"' || bytes[0] == b'\'')
-        && bytes[bytes.len() - 1] == bytes[0]
-    {
-        s[1..s.len() - 1].to_string()
-    } else {
-        s.to_string()
+    if bytes.len() >= 2 && bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"' {
+        return unescape_double_quoted(&s[1..s.len() - 1]);
     }
+    if bytes.len() >= 2 && bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'' {
+        return s[1..s.len() - 1].to_string();
+    }
+    s.to_string()
+}
+
+/// Interpret the backslash escapes a double-quoted YAML scalar supports that actually show up in
+/// practice — `\n`/`\t`/`\r`/`\"`/`\\`/`\/`/`\0`, plus `\xHH`/`\uHHHH` hex escapes — rather than the full
+/// YAML-spec escape table (`\a`/`\b`/`\e`/`\N`/`\_`/`\L`/`\P`/`\UHHHHHHHH`/etc. are far rarer in a
+/// frontmatter `description:`/`name:` than worth the added complexity here). An escape this doesn't
+/// recognize, or a `\x`/`\u` whose following hex digits are missing or invalid, is passed through
+/// literally (backslash and all) rather than erroring — this parser has no error path by design (see
+/// [`parse_frontmatter`]'s doc comment on malformed input), so degrading gracefully beats panicking or
+/// silently eating a character.
+fn unescape_double_quoted(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some('/') => out.push('/'),
+            Some('0') => out.push('\0'),
+            Some(hex_kind @ ('x' | 'u')) => {
+                let hex_len = if hex_kind == 'x' { 2 } else { 4 };
+                let hex: String = chars.by_ref().take(hex_len).collect();
+                match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                    Some(decoded) => out.push(decoded),
+                    None => {
+                        // Malformed/incomplete escape: keep what was actually consumed, literally.
+                        out.push('\\');
+                        out.push(hex_kind);
+                        out.push_str(&hex);
+                    }
+                }
+            }
+            Some(other) => {
+                // Unrecognized escape: keep it literal rather than silently dropping the backslash.
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'), // trailing lone backslash at end of value
+        }
+    }
+    out
 }
 
 /// Look up a discovered skill by exact name — used to resolve an explicit `/skill:name` invocation,
@@ -865,22 +1001,36 @@ pub fn expand_if_skill_invocation(message: &str, skills: &[Skill]) -> String {
     }
 }
 
-/// Render skills into the `<available_skills>` block injected into the system prompt. Tells the model
-/// each skill's name, what it's for, and where to read the full instructions when a task matches.
-/// Skills flagged `disable-model-invocation` are omitted here (the model must not auto-select them);
-/// they stay reachable via [`find_by_name`] for an explicit `/skill:name` invocation.
+/// Render skills into the guidance-plus-`<available_skills>` block injected into the system prompt.
+/// Tells the model each skill's name, what it's for, and where to read the full instructions when a
+/// task matches. Skills flagged `disable-model-invocation` are omitted here (the model must not
+/// auto-select them); they stay reachable via [`find_by_name`] for an explicit `/skill:name` invocation.
 ///
-/// Each entry is a nested `<skill><name>…</name><description>…</description><location>…</location>
-/// </skill>`, matching the public Agent Skills spec pi's own `formatSkillsForPrompt`/
-/// `formatSkillsForSystemPrompt` emit (`https://agentskills.io/integrate-skills`) — not a flat bullet
-/// line of this crate's own invention.
+/// pi-parity fix (Task #41): both the guidance prose and its placement relative to the tag now match
+/// pi's own `formatSkillsForPrompt` (`coding-agent/src/core/skills.ts:335-361`) exactly, not just the
+/// nested-`<skill>` element skeleton inside the tag (which already matched):
+/// - **Wording**: pi's three guidance lines are "The following skills provide specialized instructions
+///   for specific tasks." / "Use the read tool to load a skill's file when the task matches its
+///   description." / "When a skill file references a relative path, resolve it against the skill
+///   directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands." —
+///   this used to paraphrase all three into a single sentence with different wording.
+/// - **Placement**: pi emits its guidance lines, then a blank line, then `<available_skills>` — the
+///   prose sits *before and outside* the tag, a plain sibling of it in the prompt, not inside it. This
+///   used to put the guidance as the tag's own first text content, mixed alongside the `<skill>`
+///   children — a structural deviation from the public Agent Skills spec's shape (free prose belongs
+///   outside the element the spec defines, not folded into it as pseudo-content).
 ///
-/// Returns `""` — no wrapper at all, not an empty `<available_skills>…</available_skills>` shell — when
-/// every skill is `disable-model-invocation` (or `skills` is empty): pi's own
-/// `formatSkillsForPrompt`/`formatSkillsForSystemPrompt` do the same (pi-parity fix, M1). An empty
-/// wrapper isn't just wasted tokens; it actively misleads the model into thinking "no skills apply here"
-/// was a considered judgment about *these* skills, rather than every one of them being invocation-hidden
-/// by configuration.
+/// Each `<skill>` entry is still the nested `<skill><name>…</name><description>…</description>
+/// <location>…</location></skill>` shape, matching the public Agent Skills spec pi's own
+/// `formatSkillsForPrompt` emits (`https://agentskills.io/integrate-skills`) — not a flat bullet line of
+/// this crate's own invention.
+///
+/// Returns `""` — no guidance, no wrapper, nothing at all — when every skill is `disable-model-invocation`
+/// (or `skills` is empty): pi's own `formatSkillsForPrompt` does the same (pi-parity fix, M1). Emitting
+/// either the guidance prose or an empty `<available_skills>…</available_skills>` shell in that case isn't
+/// just wasted tokens; it actively misleads the model into thinking "no skills apply here" was a
+/// considered judgment about *these* skills, rather than every one of them being invocation-hidden by
+/// configuration.
 ///
 /// `name`/`description` (and, in principle, `path`) come from a `SKILL.md`'s YAML frontmatter — once a
 /// repo is merely *trusted* (not necessarily authored by the operator), that's attacker-controlled text
@@ -896,10 +1046,12 @@ pub fn format_available(skills: &[Skill]) -> String {
         return String::new();
     }
     let mut out = String::from(
-        "<available_skills>\nThese skills extend your capabilities. When a task matches a skill's \
-         description, read its file for the full instructions before proceeding. When a skill file \
-         references a relative path, resolve it against the skill directory (the parent of SKILL.md, \
-         or the loose skill file's own directory) and use that absolute path in tool commands.\n",
+        "The following skills provide specialized instructions for specific tasks.\n\
+         Use the read tool to load a skill's file when the task matches its description.\n\
+         When a skill file references a relative path, resolve it against the skill directory \
+         (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.\n\
+         \n\
+         <available_skills>\n",
     );
     for s in visible {
         out.push_str("  <skill>\n");
@@ -1127,6 +1279,63 @@ mod tests {
             Some(&PathBuf::from("/.agents/skills")),
             "with no enclosing git repo, the walk must reach the filesystem root, matching pi's \
              own collectAncestorAgentsSkillDirs: {dirs:?}"
+        );
+    }
+
+    #[test]
+    fn collect_ancestor_agents_skill_dirs_excluding_drops_only_the_named_dir() {
+        // pi-parity fix (Task #45): the trust *gate* (`trust_store::has_trust_gated_resources`) needs
+        // the exact same "don't count the operator's own ~/.agents/skills as a project-controlled
+        // resource" exclusion the actual skill-*loading* path already applies — this is the underlying
+        // filter both now share. Tested via the explicit-exclude seam (not the env-`$HOME`-reading
+        // wrapper) so it's deterministic and doesn't mutate global process state.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let start = repo.join("a/b");
+        fs::create_dir_all(&start).unwrap();
+
+        let all = collect_ancestor_agents_skill_dirs(&start);
+        assert_eq!(
+            all,
+            vec![
+                start.join(".agents/skills"),
+                repo.join("a/.agents/skills"),
+                repo.join(".agents/skills"),
+            ]
+        );
+
+        // Excluding a directory that isn't in the list at all changes nothing.
+        let excluding_none = collect_ancestor_agents_skill_dirs_excluding(
+            &start,
+            Some(&tmp.path().join("unrelated/.agents/skills")),
+        );
+        assert_eq!(excluding_none, all);
+
+        // Excluding the middle entry drops only that one, leaving the nearest and furthest untouched.
+        let excluding_middle =
+            collect_ancestor_agents_skill_dirs_excluding(&start, Some(&repo.join("a/.agents/skills")));
+        assert_eq!(
+            excluding_middle,
+            vec![start.join(".agents/skills"), repo.join(".agents/skills")]
+        );
+    }
+
+    #[test]
+    fn collect_ancestor_agents_skill_dirs_excluding_user_dir_matches_the_unfiltered_walk_when_home_is_unset()
+     {
+        // A basic sanity check on the production (env-reading) entry point itself: whatever the test
+        // process's real `$HOME` happens to be, filtering it out of an ancestor walk that doesn't pass
+        // through `$HOME` at all must be a no-op.
+        let tmp = tempfile::tempdir().unwrap();
+        let start = tmp.path().join("a/b");
+        fs::create_dir_all(&start).unwrap();
+        let all = collect_ancestor_agents_skill_dirs(&start);
+        let filtered = collect_ancestor_agents_skill_dirs_excluding_user_dir(&start);
+        assert_eq!(
+            filtered, all,
+            "a tempdir-rooted ancestor walk never passes through the real $HOME, so excluding it \
+             changes nothing: {filtered:?} vs {all:?}"
         );
     }
 
@@ -1505,6 +1714,37 @@ mod tests {
     }
 
     #[test]
+    fn validate_skill_description_counts_characters_not_utf8_bytes() {
+        // pi-parity fix (Task #44): pi's own `skills.ts` measures `description.length` (JS UTF-16 code
+        // units — a char count for BMP characters), matched here by `.chars().count()`. Counting `.len()`
+        // (UTF-8 byte length) instead means a description made of 3-byte-per-char CJK text trips this
+        // warning at ~1/3 the actual character count, and the number in the message is a byte count
+        // mislabeled as "characters".
+        let cjk_at_limit = "字".repeat(MAX_SKILL_DESCRIPTION_LEN); // exactly at the char limit
+        assert_eq!(cjk_at_limit.chars().count(), MAX_SKILL_DESCRIPTION_LEN);
+        assert!(
+            cjk_at_limit.len() > MAX_SKILL_DESCRIPTION_LEN,
+            "sanity check: this string's byte length must exceed the char limit, or the test proves \
+             nothing"
+        );
+        assert!(
+            validate_skill_description(&cjk_at_limit).is_empty(),
+            "a description exactly at the char limit must not warn, even though its byte length is \
+             far larger"
+        );
+
+        let cjk_over_limit = "字".repeat(MAX_SKILL_DESCRIPTION_LEN + 1);
+        let issues = validate_skill_description(&cjk_over_limit);
+        assert!(!issues.is_empty());
+        assert!(
+            issues[0].contains(&(MAX_SKILL_DESCRIPTION_LEN + 1).to_string()),
+            "the reported count must be the char count ({}), not the byte count ({}): {issues:?}",
+            MAX_SKILL_DESCRIPTION_LEN + 1,
+            cjk_over_limit.len()
+        );
+    }
+
+    #[test]
     fn a_skill_with_a_pathologically_long_description_is_still_discovered() {
         // Non-fatal, mirroring `validate_skill_name`'s own shape: the skill still surfaces and is
         // usable, only warn!-logged.
@@ -1854,6 +2094,115 @@ mod tests {
         assert_eq!(
             fm.get("description").map(String::as_str),
             Some("Line one\nLine two\n")
+        );
+    }
+
+    #[test]
+    fn a_plain_scalar_value_wrapped_across_two_lines_is_folded_not_dropped() {
+        // pi-parity fix (Task #40): the wording the audit called out verbatim — an ordinary wrapped
+        // `description:` with no `|`/`>` block-scalar indicator at all, the way most people actually
+        // write YAML. Previously the continuation line was silently discarded (the "indented line" skip
+        // at the top of the loop), leaving just the first line.
+        let (fm, _) = parse_frontmatter(
+            "---\ndescription: This is a long\n  description that wraps across two lines.\nname: \
+             foo\n---\n",
+        );
+        assert_eq!(
+            fm.get("description").map(String::as_str),
+            Some("This is a long description that wraps across two lines."),
+            "a wrapped plain scalar must be space-joined (YAML line folding), not truncated to its \
+             first line"
+        );
+        assert_eq!(fm.get("name").map(String::as_str), Some("foo"));
+    }
+
+    #[test]
+    fn a_plain_scalar_folds_multiple_continuation_lines_and_stops_at_a_blank_line_or_dedent() {
+        let (fm, _) =
+            parse_frontmatter("---\ndescription: one\n  two\n  three\n\nname: after-blank\n---\n");
+        assert_eq!(fm.get("description").map(String::as_str), Some("one two three"));
+        assert_eq!(fm.get("name").map(String::as_str), Some("after-blank"));
+    }
+
+    #[test]
+    fn a_quoted_scalar_is_not_folded_with_a_following_indented_line() {
+        // Folding (Task #40) is scoped to *unquoted* plain scalars — a quoted value is expected to
+        // close on its own line; an indented line after one is left alone (matching prior behavior)
+        // rather than being appended onto an already-terminated quoted string.
+        let (fm, _) = parse_frontmatter("---\ndescription: \"first line\"\n  second line\n---\n");
+        assert_eq!(fm.get("description").map(String::as_str), Some("first line"));
+    }
+
+    #[test]
+    fn block_scalar_strip_chomping_drops_the_trailing_newline_entirely() {
+        // pi-parity fix (Task #42): a `-` (strip) modifier right after `|`/`>` means the joined value
+        // ends with no trailing newline at all, unlike the default "clip" (exactly one).
+        let (fm, _) = parse_frontmatter("---\ndescription: |-\n  Line one\n  Line two\n---\n");
+        assert_eq!(
+            fm.get("description").map(String::as_str),
+            Some("Line one\nLine two")
+        );
+        let (fm, _) = parse_frontmatter("---\ndescription: >-\n  first\n  second\n---\n");
+        assert_eq!(fm.get("description").map(String::as_str), Some("first second"));
+    }
+
+    #[test]
+    fn block_scalar_keep_chomping_preserves_trailing_blank_lines() {
+        // pi-parity fix (Task #42): a `+` (keep) modifier preserves every trailing blank line in the
+        // block as its own newline in the value, rather than clipping down to exactly one.
+        let (fm, _) = parse_frontmatter("---\ndescription: |+\n  Line one\n\n\n---\n");
+        assert_eq!(
+            fm.get("description").map(String::as_str),
+            Some("Line one\n\n\n"),
+            "keep chomping must preserve both trailing blank lines as newlines"
+        );
+    }
+
+    #[test]
+    fn block_scalar_default_clip_chomping_is_unaffected_by_the_chomping_fix() {
+        // Regression guard: the no-modifier ("clip") case must still behave exactly as before —
+        // exactly one trailing newline, no more, no less — now that `-`/`+` are also recognized.
+        let (fm, _) = parse_frontmatter("---\ndescription: |\n  Line one\n  Line two\n---\n");
+        assert_eq!(
+            fm.get("description").map(String::as_str),
+            Some("Line one\nLine two\n")
+        );
+    }
+
+    #[test]
+    fn double_quoted_scalar_interprets_backslash_escapes() {
+        // pi-parity fix (Task #43): `unquote` used to only strip the surrounding quote characters,
+        // leaving `\n`/`\"`/`\\` etc. as literal two-character sequences instead of the characters they
+        // actually represent inside a double-quoted YAML scalar.
+        let (fm, _) =
+            parse_frontmatter(r#"---
+description: "line one\nline two\ttabbed \"quoted\" and \\backslash\\"
+---
+"#);
+        assert_eq!(
+            fm.get("description").map(String::as_str),
+            Some("line one\nline two\ttabbed \"quoted\" and \\backslash\\")
+        );
+    }
+
+    #[test]
+    fn double_quoted_scalar_interprets_hex_and_unicode_escapes() {
+        let (fm, _) = parse_frontmatter(r#"---
+name: "caf\x65 é"
+---
+"#);
+        assert_eq!(fm.get("name").map(String::as_str), Some("cafe é"));
+    }
+
+    #[test]
+    fn single_quoted_scalar_does_not_interpret_backslash_escapes() {
+        // Per the YAML spec, a single-quoted scalar supports no escapes at all — only the
+        // double-quoted path should process `\n`/`\\`/etc.
+        let (fm, _) = parse_frontmatter("---\ndescription: 'literal\\nbackslash-n'\n---\n");
+        assert_eq!(
+            fm.get("description").map(String::as_str),
+            Some("literal\\nbackslash-n"),
+            "a single-quoted scalar must keep the backslash literally, not interpret it as an escape"
         );
     }
 
@@ -2221,6 +2570,48 @@ mod tests {
         // The model needs to be told how to resolve a relative path a skill file references, or it
         // may hand a tool a path relative to the wrong directory.
         assert!(rendered.contains("resolve it against the skill directory"));
+    }
+
+    #[test]
+    fn format_available_matches_pis_exact_guidance_wording_and_places_it_outside_the_tag() {
+        // pi-parity fix (Task #41): both the wording of the guidance prose and its placement relative
+        // to `<available_skills>` must match pi's own `formatSkillsForPrompt`
+        // (coding-agent/src/core/skills.ts:335-361) — three specific guidance lines, then a blank line,
+        // then the tag, with the prose a sibling of the tag rather than folded inside it as the tag's
+        // own first text content.
+        let skills = vec![Skill {
+            name: "lint".into(),
+            description: "Run the linter".into(),
+            path: PathBuf::from("/x/.claude/skills/lint/SKILL.md"),
+            disable_model_invocation: false,
+            scope: "user",
+        }];
+        let rendered = format_available(&skills);
+        let expected_guidance = "The following skills provide specialized instructions for specific \
+                                  tasks.\nUse the read tool to load a skill's file when the task \
+                                  matches its description.\nWhen a skill file references a relative \
+                                  path, resolve it against the skill directory (parent of SKILL.md / \
+                                  dirname of the path) and use that absolute path in tool commands.";
+        assert!(
+            rendered.starts_with(expected_guidance),
+            "guidance text must match pi's exact wording and come first: {rendered}"
+        );
+        // A blank line, then the tag — the guidance is *outside* the tag, not its first child.
+        let expected_prefix = format!("{expected_guidance}\n\n<available_skills>\n");
+        assert!(
+            rendered.starts_with(&expected_prefix),
+            "guidance must be separated from <available_skills> by a blank line, outside the tag: \
+             {rendered}"
+        );
+        // The tag's own first line of content must be a `<skill>` element, not leftover guidance text.
+        let tag_body = rendered
+            .split_once("<available_skills>\n")
+            .expect("tag must be present")
+            .1;
+        assert!(
+            tag_body.trim_start().starts_with("<skill>"),
+            "the tag's first child must be a <skill> element, not guidance prose: {rendered}"
+        );
     }
 
     #[test]

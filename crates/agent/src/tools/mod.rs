@@ -267,6 +267,35 @@ pub(crate) fn canonical_write_target(path: &str) -> String {
     normalized.display().to_string()
 }
 
+/// Whether `path` is actually writable by *this process* — a real access check, not an inspection of
+/// the file's mode bits. On Unix, `std::fs::Permissions::readonly()` means "no write bit set for
+/// *anyone*" (`mode & 0o222 == 0`): a file owned by a different uid/gid than this process (a build
+/// artifact left by another user/container) can report `readonly() == false` — "writable" — even
+/// though this process's actual credentials can't write it, so a pre-check built on it can pass right
+/// before the real write fails with a generic OS error. pi's own `edit.ts` pre-check calls the real
+/// `access(2)` syscall (`fsAccess(path, R_OK|W_OK)`), which the OS evaluates against the *calling
+/// process's* credentials, not just the file's mode bits.
+///
+/// Neither `rustix` nor `nix` (the two crates that would wrap `access(2)` directly) is a dependency
+/// anywhere in this workspace — checked every `Cargo.toml`, not just this crate's; `rustix` appears in
+/// `Cargo.lock` only transitively, several layers deep, via other crates' own dependencies — so this
+/// uses the simplest portable equivalent instead: actually open the file for write access, then
+/// immediately drop the handle without writing or truncating a single byte. `OpenOptions::write(true)`
+/// with `truncate`/`create` left at their defaults (`false`) makes the OS itself evaluate the *real*
+/// permission check — the same uid/gid-aware answer `access(2)` would give — and closing without ever
+/// calling `write` means this can't corrupt, truncate, or even touch the file's mtime.
+///
+/// A missing file (`NotFound`) is treated as "writable": callers that need the file to already exist
+/// (`edit`) fail on that separately, with a clearer message, before ever reaching this check; a caller
+/// that creates new files (`write`) must not be blocked by this pre-check just because the file isn't
+/// there yet.
+pub(crate) fn is_writable(path: &str) -> bool {
+    match std::fs::OpenOptions::new().write(true).open(path) {
+        Ok(_) => true,
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
 /// The default tool set: pi's seven coding tools (read, write, edit, bash, ls, grep, find) plus the
 /// Beyond platform tools (fork, sync, logs).
 pub fn default_registry() -> ToolRegistry {
@@ -745,5 +774,90 @@ mod tests {
         ] {
             assert!(default_registry_with(None, None).get(name).is_some());
         }
+    }
+
+    #[test]
+    fn is_writable_is_true_for_an_ordinary_writable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "x").unwrap();
+        assert!(is_writable(path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn is_writable_is_true_for_a_nonexistent_path() {
+        // `write` creates new files; this pre-check must not block that just because nothing is
+        // there yet.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.txt");
+        assert!(is_writable(path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn is_writable_is_false_for_a_file_with_no_write_bit_for_anyone() {
+        // The ordinary case `Permissions::readonly()` also catches — kept as a baseline so a future
+        // change to `is_writable` can't silently regress the common case while only fixing the uid
+        // edge case below.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("locked.txt");
+        std::fs::write(&path, "x").unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        assert!(!is_writable(path.to_str().unwrap()));
+
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn is_writable_is_false_when_the_owner_triad_denies_write_even_though_another_triad_allows_it() {
+        // Pi-parity fix (task 50): `Permissions::readonly()` on Unix checks whether *any* of the three
+        // permission triads (owner/group/other) has a write bit set (`mode & 0o222 == 0`) — but the
+        // kernel's real access decision for a given caller only ever consults *one* triad: the owner
+        // triad, in full, whenever the caller owns the file (this test process does, having just
+        // created it), never falling through to group/other bits just because the owner triad denies.
+        // Mode `026` (owner: none; group: write; other: read+write) is exactly that mismatch: `026 &
+        // 0o222 == 0o022 != 0`, so the old bits-only check reported "writable", while the real access
+        // decision (owner triad is all zero) denies it — the same class of gap as pi's own scenario (a
+        // file whose *effective* permission for this process doesn't match what its raw mode bits
+        // suggest), reproduced here via the owner/other split instead of a cross-process uid mismatch
+        // (which a test can't set up without already running as root).
+        //
+        // Root (and anything else with `CAP_DAC_OVERRIDE`, common in a container-based CI runner)
+        // bypasses this decision entirely — detected via a `mode 0` probe file (unreadable/unwritable
+        // by absolutely anyone if DAC is actually enforced) rather than guessed from `$USER`/a uid
+        // syscall, and skipped in that case since the scenario genuinely can't be demonstrated there.
+        let dir = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+
+        let probe = dir.path().join("probe.txt");
+        std::fs::write(&probe, "x").unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let dac_bypassed = std::fs::read(&probe).is_ok();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o600)).unwrap();
+        if dac_bypassed {
+            return;
+        }
+
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "x").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o026)).unwrap();
+        let old_readonly = std::fs::metadata(&path).unwrap().permissions().readonly();
+        assert!(
+            !old_readonly,
+            "sanity: the old mode-bits-only check would have reported this file as writable"
+        );
+
+        let result = is_writable(path.to_str().unwrap());
+        // Restore so the tempdir can clean itself up on drop regardless of the assertion below.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            !result,
+            "the owner triad denies write; the real access check must reflect that even though \
+             another triad's bits happen to allow it"
+        );
     }
 }

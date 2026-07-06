@@ -1150,6 +1150,113 @@ fn serve_get_tree_reports_every_node_not_just_leaves() {
 }
 
 #[test]
+fn serve_get_tree_since_returns_only_what_was_appended_after_a_known_id() {
+    // Task #48 (pi-parity gap): `get_tree`'s own `since` mirrors `get_messages`'s (see
+    // `serve_get_messages_since_returns_only_what_was_appended_after_a_known_id` above), but scoped to
+    // *every* entry type, not just plain LLM messages — pi's own `SessionManager.getEntries({since})`
+    // backs both commands the same way. Proven here with a `custom` entry (a different `entry_kind`
+    // than an ordinary message) appended between the two turns: a `since` that only ever walked
+    // `Session.messages` would miss it entirely.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) =
+        spawn_model_server(vec![turn_text("first answer"), turn_text("second answer")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "first" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    writeln!(stdin, "{}", json!({ "type": "get_tree" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_tree");
+    let nodes = frames.last().unwrap()["data"]["nodes"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(nodes.len(), 2, "expected [user, assistant]: {nodes:#?}");
+    let baseline_id = nodes.iter().find(|n| n["role"] == "assistant").unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A custom entry — a different entry type than an ordinary message — appended after the baseline.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "append_custom", "kind": "checkpoint-marker" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "append_custom");
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "second" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    // Only what's new since the first turn's assistant reply: the custom entry, plus the second turn's
+    // user + assistant.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "get_tree", "since": baseline_id })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_tree");
+    let resp = frames.last().unwrap();
+    assert_eq!(resp["success"], true, "{resp:#?}");
+    let since_nodes = resp["data"]["nodes"].as_array().unwrap();
+    assert_eq!(since_nodes.len(), 3, "{since_nodes:#?}");
+    assert!(
+        since_nodes.iter().any(|n| n["entry_kind"] == "custom"),
+        "a custom entry must be included, not just plain messages: {since_nodes:#?}"
+    );
+    assert!(
+        since_nodes.iter().any(|n| n["role"] == "user"
+            && n["preview"]
+                .as_str()
+                .is_some_and(|p| p.contains("second"))),
+        "{since_nodes:#?}"
+    );
+    assert!(
+        since_nodes.iter().any(|n| n["role"] == "assistant"
+            && n["preview"]
+                .as_str()
+                .is_some_and(|p| p.contains("second answer"))),
+        "{since_nodes:#?}"
+    );
+    // Nothing from before (or at) the baseline leaks through.
+    assert!(!since_nodes.iter().any(|n| n["id"] == baseline_id));
+    // `get_tree`'s own `leaf_id` still reports the *current* active tip, not the `since`-filtered one.
+    assert!(resp["data"]["leaf_id"].as_str().is_some());
+
+    // An unknown `since` id is an error, not a silent full re-fetch — same contract as `get_messages`.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "get_tree", "since": "does-not-exist" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_tree");
+    let resp = frames.last().unwrap();
+    assert_eq!(resp["success"], false, "{resp:#?}");
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
 fn serve_get_tree_leaf_id_is_null_without_persistence_configured() {
     // Mirrors `serve_get_fork_messages_is_empty_without_persistence_configured`'s reasoning: pure
     // in-memory mode has no `SessionStore` to track an active tip at all.

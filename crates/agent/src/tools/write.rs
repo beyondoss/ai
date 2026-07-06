@@ -48,11 +48,10 @@ impl Tool for Write {
         // directory's* write permission — the target file's own mode bits are never checked, so a
         // `chmod 444` file was silently overwritten. pi's `fs.writeFile` opens the existing path
         // directly, so the OS itself enforces the file's own write-permission bit (EACCES). Same
-        // pre-check `edit.rs` already makes (see its own doc comment) before doing any work.
-        let writable = std::fs::metadata(path)
-            .map(|m| !m.permissions().readonly())
-            .unwrap_or(true); // a metadata read failing here is surfaced by the write attempt below
-        if !writable {
+        // pre-check `edit.rs` already makes: `super::is_writable` performs a real access check
+        // (open-for-write, then close without touching content) rather than inspecting mode bits,
+        // which say nothing about *this process's* actual uid/gid (pi-parity task 50).
+        if !super::is_writable(path) {
             return Err(ToolError::Execution(format!("{path} is not writable")));
         }
         if let Some(parent) = std::path::Path::new(path).parent() {

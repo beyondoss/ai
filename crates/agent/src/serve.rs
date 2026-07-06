@@ -188,9 +188,15 @@
 //!     already consults (pi's own structured `Model<any>`, minus pricing — gateway-owned, out of scope
 //!     here)
 //!   - `{type:"list_branches"}`          → `data: {branches: [BranchInfo…]}` (the session's *leaves*)
-//!   - `{type:"get_tree"}`               → `data: {nodes: [TreeNode…], leaf_id}` (every message on
+//!   - `{type:"get_tree", since?}`       → `data: {nodes: [TreeNode…], leaf_id}` (every message on
 //!     every branch, not just the leaves `list_branches` reports; `leaf_id` is the active path's own
-//!     tip — `null` in pure in-memory mode — pi's own `get_tree`'s `leafId`)
+//!     tip — `null` in pure in-memory mode — pi's own `get_tree`'s `leafId`). `since` (Task #48,
+//!     pi-parity gap — a tree id the client already has, same contract as `get_messages`'s own `since`
+//!     above) returns only the entries appended after it, across every entry type (message,
+//!     branch_summary, compaction, custom — unlike `get_messages`'s `since`, which only ever sees plain
+//!     LLM messages on the active path) — pi's own `SessionManager.getEntries({since})` backs both its
+//!     `get_tree` and its dedicated `get_entries` RPC command the same way; an error, not a silent full
+//!     re-fetch, when `since` names no known id (see `nodes_since`)
 //!   - `{type:"switch_branch", target_id, before?, summarize?, custom_instructions?,
 //!     replace_instructions?}` navigate to another point in the tree — or, when `before:true`, to
 //!     `target_id`'s own *parent* instead, which is the tree's own root (before any message) when
@@ -2444,7 +2450,21 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                                                 let _ = out_tx.send(response(cid, "list_branches", true, Some(json!({ "branches": persistence.list_branches() })), None));
                                             }
                                             "get_tree" => {
-                                                let _ = out_tx.send(response(cid, "get_tree", true, Some(json!({ "nodes": persistence.tree(), "leaf_id": persistence.active_ids().last() })), None));
+                                                // Same `since` handling as the idle-loop arm below — see
+                                                // `nodes_since`'s own doc comment (Task #48, pi-parity gap).
+                                                match c.get("since").and_then(Value::as_str) {
+                                                    Some(since) => match nodes_since(persistence.tree(), since) {
+                                                        Ok(nodes) => {
+                                                            let _ = out_tx.send(response(cid, "get_tree", true, Some(json!({ "nodes": nodes, "leaf_id": persistence.active_ids().last() })), None));
+                                                        }
+                                                        Err(e) => {
+                                                            let _ = out_tx.send(response(cid, "get_tree", false, None, Some(&e)));
+                                                        }
+                                                    },
+                                                    None => {
+                                                        let _ = out_tx.send(response(cid, "get_tree", true, Some(json!({ "nodes": persistence.tree(), "leaf_id": persistence.active_ids().last() })), None));
+                                                    }
+                                                }
                                             }
                                             "list_sessions" => {
                                                 let progress_id = cid.clone();
@@ -4289,13 +4309,24 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                 ));
             }
             "get_tree" => {
+                // `since` (Task #48, pi-parity gap): return only entries appended after a tree id the
+                // client already has, across every entry type — see [`nodes_since`]. Unmatched is an
+                // error, not a silent full re-fetch, mirroring `get_messages`'s own `since` above.
+                let nodes = match cmd.get("since").and_then(Value::as_str) {
+                    Some(since) => match nodes_since(persistence.tree(), since) {
+                        Ok(nodes) => nodes,
+                        Err(e) => {
+                            emit!(response(id, "get_tree", false, None, Some(&e)));
+                            continue;
+                        }
+                    },
+                    None => persistence.tree(),
+                };
                 emit!(response(
                     id,
                     "get_tree",
                     true,
-                    Some(
-                        json!({ "nodes": persistence.tree(), "leaf_id": persistence.active_ids().last() })
-                    ),
+                    Some(json!({ "nodes": nodes, "leaf_id": persistence.active_ids().last() })),
                     None,
                 ));
             }
@@ -6205,6 +6236,28 @@ fn session_info_changed_frame(id: Option<String>, title: Option<String>) -> Valu
     m.insert("command".into(), json!("set_session_name"));
     m.insert("title".into(), json!(title));
     Value::Object(m)
+}
+
+/// Filter `nodes` (the full, chronologically ordered [`crate::session_store::TreeNode`] list — see
+/// `SessionStore::tree`'s own doc comment: every node, every branch, sorted by `(timestamp, id)`) down
+/// to only the entries appended after `since`, a tree id the caller already has. Task #48 (pi-parity
+/// gap): pi's own `SessionManager.getEntries({since})` backs both its `get_tree` and its dedicated
+/// `get_entries` RPC command (`rpc-types.ts:63`, `rpc-mode.ts:609-620`), letting a client fetch only
+/// what's new across *every* entry type (message/branch_summary/compaction/custom — `tree()` already
+/// folds all of these into one list, unlike `get_messages`'s own `since`, which only ever sees the
+/// active path's plain LLM messages). Since `tree()` is already in append order, finding `since`'s own
+/// position in that same list and returning everything after it is enough — no separate incremental
+/// index needed. `Err` (not a silent full re-fetch) when `since` matches no node in `nodes` — the same
+/// "surface the bug, don't mask it" contract `get_messages`'s own `since` already established, rather
+/// than silently returning everything a naive fallback would.
+fn nodes_since(
+    mut nodes: Vec<crate::session_store::TreeNode>,
+    since: &str,
+) -> Result<Vec<crate::session_store::TreeNode>, String> {
+    match nodes.iter().position(|n| n.id == since) {
+        Some(idx) => Ok(nodes.split_off(idx + 1)),
+        None => Err(format!("no entry with id {since} in this session")),
+    }
 }
 
 /// Build a `response` frame.

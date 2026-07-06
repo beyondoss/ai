@@ -940,8 +940,8 @@ async fn send_with_retry(
                     // for genuine rate limiting (worth retrying — the request will likely succeed once
                     // the window resets) and others for quota/billing exhaustion (retrying only delays
                     // an unavoidable failure while burning the retry budget on it). The status code
-                    // alone can't tell the two apart. Every other retryable status (408/409/5xx/529) is
-                    // a pure infra hiccup, never a billing signal, so it skips this check.
+                    // alone can't tell the two apart. Every other retryable status (5xx/529) is a pure
+                    // infra hiccup, never a billing signal, so it skips this check.
                     if status.as_u16() == 429 {
                         let detail = read_error_body_capped(resp).await;
                         if is_quota_exhausted(&detail) {
@@ -1014,8 +1014,17 @@ async fn send_with_retry(
 /// — pi's `packages/ai/src/utils/retry.ts:36` treats `"524"` as its only retry signal for that status,
 /// matched here too since a `524` is exactly the same transient-infra-hiccup class as the other 5xx
 /// entries. A 4xx other than 429 is the caller's fault — don't retry.
+///
+/// pi-parity fix: `408` (Request Timeout) and `409` (Conflict) were previously included here too, but
+/// neither appears anywhere in pi's own retry classifiers (`openai-codex-responses.ts`,
+/// `utils/retry.ts`) — there's no pi source justifying either, and both directly contradict this
+/// function's own "a 4xx other than 429 is the caller's fault" rule above. Dropping them also restores
+/// consistency with the outer whole-run retry layer (`agent::retry::WHOLE_RUN_RETRYABLE_STATUS_DIGITS`
+/// in the `agent` crate), which never treated 408/409 as retryable — a persistent 408/409 exhausting
+/// this function's pre-connect budget previously had nowhere else to be retried, unlike every other
+/// status in this set.
 fn is_retryable_status(status: u16) -> bool {
-    matches!(status, 408 | 409 | 429 | 500 | 502 | 503 | 504 | 524 | 529)
+    matches!(status, 429 | 500 | 502 | 503 | 504 | 524 | 529)
 }
 
 /// Phrases seen in a 429 body when the rejection is quota/billing exhaustion rather than transient
@@ -1218,8 +1227,55 @@ fn parse_retry_after(raw: &str, max_backoff: Duration) -> Option<Duration> {
     Some(delay.min(max_backoff))
 }
 
+/// Applies +/-20% jitter to a computed exponential-backoff duration so a fleet of concurrent `beyond`
+/// processes hitting the same transient failure (429/5xx) don't retry in perfect lockstep against an
+/// already-degraded backend (thundering herd). `crates/agent::retry`'s outer, whole-run retry layer
+/// already jitters for exactly this reason — but this crate's two *inner* layers ([`backoff`], here,
+/// and `agent::mid_stream_backoff`) fire far more often (every turn / every stream, vs. only after a
+/// whole run has already exhausted both inner layers), making them the bigger thundering-herd risk of
+/// the two. Implemented independently rather than adding a cross-crate dependency on `crates/agent`.
+///
+/// Applied to the *uncapped* exponential value, before the caller's own `.min(max_backoff)` — a
+/// saturated attempt (well past the cap) still collapses to exactly the cap after jitter, same as
+/// before jitter existed, since even a -20% jittered value there is still far above the cap.
+///
+/// No `rand` crate dependency in this crate (checked `Cargo.toml`) — reuses the same zero-dependency
+/// salt-plus-counter trick `crates/agent::retry::jitter` uses: a `RandomState`-seeded salt (draws OS
+/// entropy once, fixed for the rest of the process's life) plus a monotonic per-call counter, hashed
+/// together with `DefaultHasher` (fixed key, so the *only* source of variance is the salt/counter/
+/// attempt inputs, not the hasher itself) and mapped onto `[0.8, 1.2]`. Salt gives cross-process
+/// variance (two fleet processes at the same attempt number don't jitter identically); the counter
+/// gives cross-call variance (the *same* attempt number, computed twice in one process, doesn't
+/// jitter identically either — see `backoff_jitter_varies_across_calls` below).
+///
+/// `pub(crate)`: also reused by `agent::mid_stream_backoff`, this crate's other inner retry layer.
+pub(crate) fn jitter(d: Duration, attempt: u32) -> Duration {
+    use std::collections::hash_map::{DefaultHasher, RandomState};
+    use std::hash::{BuildHasher, Hash, Hasher};
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SALT: OnceLock<u64> = OnceLock::new();
+    let salt = *SALT.get_or_init(|| RandomState::new().hash_one(0xC0FFEEu64));
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+
+    let mut hasher = DefaultHasher::new();
+    salt.hash(&mut hasher);
+    seq.hash(&mut hasher);
+    attempt.hash(&mut hasher);
+    let hashed = hasher.finish();
+
+    // Map the hash's top 32 bits onto [0.8, 1.2] (+/-20%, symmetric around the unjittered value).
+    let unit = (hashed >> 32) as f64 / u32::MAX as f64; // [0, 1]
+    let factor = 0.8 + unit * 0.4;
+    d.mul_f64(factor)
+}
+
 /// The wait before the next attempt (0-indexed): the larger of the server's `Retry-After` hint and
-/// our exponential backoff `base_backoff · 2^attempt`, capped at `max_backoff`.
+/// our exponential backoff `base_backoff · 2^attempt` (± [`jitter`]), capped at `max_backoff`. The
+/// server's own hint is honored exactly, unjittered — jitter only hedges against *our own* guess.
 fn backoff(
     attempt: u32,
     retry_after: Option<Duration>,
@@ -1228,9 +1284,8 @@ fn backoff(
 ) -> Duration {
     // `min(16)` keeps the shift well within `u32` (and `saturating_mul` mops up the rest); by then the
     // result has long since hit `max_backoff`.
-    let exp = base_backoff
-        .saturating_mul(1u32 << attempt.min(16))
-        .min(max_backoff);
+    let exp_uncapped = base_backoff.saturating_mul(1u32 << attempt.min(16));
+    let exp = jitter(exp_uncapped, attempt).min(max_backoff);
     match retry_after {
         Some(hint) => hint.max(exp).min(max_backoff),
         None => exp,
@@ -1356,12 +1411,23 @@ mod tests {
 
     #[test]
     fn retryable_status_classification() {
-        for s in [429, 500, 502, 503, 504, 524, 529, 408, 409] {
+        for s in [429, 500, 502, 503, 504, 524, 529] {
             assert!(is_retryable_status(s), "{s} should be retryable");
         }
-        for s in [200, 400, 401, 403, 404, 422] {
+        for s in [200, 400, 401, 403, 404, 408, 409, 422] {
             assert!(!is_retryable_status(s), "{s} should not be retryable");
         }
+    }
+
+    #[test]
+    fn retryable_status_excludes_408_and_409() {
+        // pi-parity fix: pi's own retry classifiers never treat 408 (Request Timeout) or 409
+        // (Conflict) as retryable — there's no pi source for either — and including them
+        // contradicted this function's own "a 4xx other than 429 is the caller's fault" doc comment.
+        // Also restores consistency with `agent::retry::WHOLE_RUN_RETRYABLE_STATUS_DIGITS`, which
+        // never included 408/409 either.
+        assert!(!is_retryable_status(408));
+        assert!(!is_retryable_status(409));
     }
 
     #[test]
@@ -1470,19 +1536,35 @@ mod tests {
         assert!(msg.starts_with("You have hit your ChatGPT usage limit."));
     }
 
+    /// Asserts `actual` falls within the +/-20% jitter band around `nominal` (the unjittered
+    /// exponential value), inclusive. Used everywhere a test previously asserted an exact backoff
+    /// value — jitter (added as a pi-parity/consistency fix so this inner retry layer doesn't
+    /// thundering-herd the same way the outer whole-run layer's own jitter already guards against)
+    /// means the exact value is no longer deterministic, only its range is.
+    fn assert_within_jitter(actual: Duration, nominal: Duration) {
+        let lo = nominal.mul_f64(0.8);
+        let hi = nominal.mul_f64(1.2);
+        assert!(
+            actual >= lo && actual <= hi,
+            "expected {actual:?} within +/-20% of {nominal:?} (i.e. [{lo:?}, {hi:?}])"
+        );
+    }
+
     #[test]
     fn backoff_is_exponential_and_capped() {
-        assert_eq!(backoff(0, None, BASE_BACKOFF, MAX_BACKOFF), BASE_BACKOFF);
-        assert_eq!(
+        assert_within_jitter(backoff(0, None, BASE_BACKOFF, MAX_BACKOFF), BASE_BACKOFF);
+        assert_within_jitter(
             backoff(1, None, BASE_BACKOFF, MAX_BACKOFF),
-            BASE_BACKOFF * 2
+            BASE_BACKOFF * 2,
         );
-        assert_eq!(
+        assert_within_jitter(
             backoff(2, None, BASE_BACKOFF, MAX_BACKOFF),
-            BASE_BACKOFF * 4
+            BASE_BACKOFF * 4,
         );
         assert_eq!(backoff(20, None, BASE_BACKOFF, MAX_BACKOFF), MAX_BACKOFF); // saturates, never overflows
-        // A server hint wins when larger, but is still capped.
+        // A server hint wins when larger, but is still capped. The hint itself is never jittered —
+        // both hints here are far outside the unjittered exponential's +/-20% band, so the result
+        // stays exact regardless of jitter.
         assert_eq!(
             backoff(0, Some(Duration::from_secs(2)), BASE_BACKOFF, MAX_BACKOFF),
             Duration::from_secs(2)
@@ -1494,10 +1576,30 @@ mod tests {
     }
 
     #[test]
+    fn backoff_jitter_varies_across_calls_but_stays_in_range() {
+        // Finding #32 (pi-parity/consistency fix): proves jitter is actually applied, not just
+        // structurally present — the same attempt number, computed repeatedly, must not always
+        // produce the identical duration (the thundering-herd scenario this fix closes), while every
+        // value still lands within the documented +/-20% band around the unjittered exponential value.
+        let nominal = BASE_BACKOFF * 4; // attempt 2's unjittered value.
+        let samples: Vec<_> = (0..50)
+            .map(|_| backoff(2, None, BASE_BACKOFF, MAX_BACKOFF))
+            .collect();
+        for &s in &samples {
+            assert_within_jitter(s, nominal);
+        }
+        assert!(
+            samples.windows(2).any(|w| w[0] != w[1]),
+            "expected varying backoff durations across repeated calls for the same attempt, got \
+             identical values every time: {samples:?}"
+        );
+    }
+
+    #[test]
     fn backoff_honors_a_custom_base() {
         let custom = Duration::from_millis(1000);
-        assert_eq!(backoff(0, None, custom, MAX_BACKOFF), custom);
-        assert_eq!(backoff(1, None, custom, MAX_BACKOFF), custom * 2);
+        assert_within_jitter(backoff(0, None, custom, MAX_BACKOFF), custom);
+        assert_within_jitter(backoff(1, None, custom, MAX_BACKOFF), custom * 2);
         assert_eq!(backoff(20, None, custom, MAX_BACKOFF), MAX_BACKOFF); // still saturates at the shared cap
     }
 
@@ -1507,7 +1609,7 @@ mod tests {
         // a caller who wants a *tighter* cap than the new 60s default (e.g. reverting to the old 10s
         // behavior) must be able to get it via `GatewayClient::with_max_backoff`.
         let tight = Duration::from_secs(10);
-        assert_eq!(backoff(0, None, BASE_BACKOFF, tight), BASE_BACKOFF);
+        assert_within_jitter(backoff(0, None, BASE_BACKOFF, tight), BASE_BACKOFF);
         assert_eq!(backoff(20, None, BASE_BACKOFF, tight), tight);
         assert_eq!(
             backoff(0, Some(Duration::from_secs(3600)), BASE_BACKOFF, tight),
