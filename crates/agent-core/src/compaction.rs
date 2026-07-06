@@ -357,6 +357,17 @@ pub fn is_hard_overflow(
 /// Returns `None` when there isn't a worthwhile prefix to summarize (too short, or no clean
 /// boundary at all) — the caller then leaves the conversation untouched.
 pub fn find_cut(messages: &[Message], keep_recent_tokens: u32) -> Option<usize> {
+    // Debug-only, not a runtime check on untrusted input: the tool_use/tool_result-pairing safety
+    // argument above depends on `messages` strictly alternating roles. Nothing enforces that at the
+    // type level — `Session::push` is a bare append — so this catches a violation at the one call
+    // site whose correctness actually depends on it, rather than gatekeeping `Session` itself (which
+    // is also used as a generic bulk-append container by the storage/persistence layer's own tests,
+    // unrelated to conversation shape, so a push-time check there is the wrong place for this).
+    debug_assert!(
+        messages.windows(2).all(|w| w[0].role != w[1].role),
+        "find_cut: messages must strictly alternate roles — a violation here means the \
+         tool_use/tool_result-pairing safety argument this function relies on no longer holds"
+    );
     let n = messages.len();
     // Need at least a couple of turns to bother — a summary plus a kept suffix.
     if n < 4 {
@@ -1280,6 +1291,21 @@ mod tests {
     #[test]
     fn find_cut_declines_short_conversations() {
         assert!(find_cut(&convo()[..3], 1).is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "must strictly alternate roles")]
+    fn find_cut_rejects_two_consecutive_same_role_messages() {
+        // This function's whole tool_use/tool_result-pairing safety argument (see its own doc
+        // comment) depends on strict role alternation — this is a debug-only invariant check (not a
+        // runtime check on untrusted input), so it only fires in test/debug builds.
+        let messages = vec![
+            Message::user("one"),
+            Message::assistant(vec![ContentBlock::text("two")]),
+            Message::assistant(vec![ContentBlock::text("three")]),
+            Message::user("four"),
+        ];
+        find_cut(&messages, 1);
     }
 
     #[test]

@@ -7094,6 +7094,9 @@ mod tests {
                 json!({ "path": "src/lib.rs" }),
             )]),
             Message::tool_result("1", "contents", false),
+            // A real conversation always has the assistant reply to its own tool result before the
+            // next user turn arrives — roles strictly alternate.
+            Message::assistant(vec![ContentBlock::text("okay, done reading")]),
             Message::user("ok now something else"),
             Message::assistant(vec![ContentBlock::text("done")]),
         ];
@@ -7717,21 +7720,22 @@ mod tests {
 
     #[tokio::test]
     async fn compact_is_a_no_op_when_new_content_since_the_prior_summary_still_fits_the_budget() {
-        // Broader than the `first_kept == 1` test above (pi-parity gap, second pass): with the real
-        // default `keep_recent_tokens` (20k), `[summary, user, assistant, user, assistant]` lands
-        // `find_split_cut`'s `first_kept` at 2, not 1 — the old narrower guard only checked for
-        // exactly 1 and would have re-summarized here even though none of the new content is remotely
-        // close to the recent-token budget. Verified empirically before the fix: this exact fixture
-        // produced `first_kept == 2` and slipped past the guard.
+        // Broader than the `first_kept == 1` test above (pi-parity gap, second pass): even with
+        // several real exchanges since the prior summary — not just the bare-minimum single exchange
+        // the sibling test above covers — the guard must still recognize the total is under the real
+        // default `keep_recent_tokens` (20k) and skip re-summarizing, rather than only ever catching
+        // the single-exchange case. The old narrower guard only checked `first_kept == 1` and would
+        // have re-summarized here even though none of the new content is remotely close to the budget.
         let session_messages = vec![
             Message::user(format!(
                 "{}\n\nprior summary body",
                 compaction::SUMMARY_MARKER
             )),
-            Message::user("first question"),
             Message::assistant(vec![ContentBlock::text("first reply")]),
             Message::user("second question"),
             Message::assistant(vec![ContentBlock::text("second reply")]),
+            Message::user("third question"),
+            Message::assistant(vec![ContentBlock::text("third reply")]),
         ];
         let mut session = Session::new();
         session.messages = Arc::new(session_messages.clone());
@@ -7810,8 +7814,10 @@ mod tests {
                 "{}\n\nprior summary body",
                 compaction::SUMMARY_MARKER
             )),
-            Message::user("a".repeat(400_000)), // ~100k estimated tokens, well over any tiny budget
-            Message::assistant(vec![ContentBlock::text("interim reply")]),
+            // ~100k estimated tokens, well over any tiny budget — the role doesn't matter for token
+            // estimation, only that it's the real conversation's first message after the summary
+            // (always assistant, per `find_cut`'s own doc comment on the post-compaction shape).
+            Message::assistant(vec![ContentBlock::text("a".repeat(400_000))]),
             Message::user("second question"),
             Message::assistant(vec![ContentBlock::text("reply")]),
         ];
