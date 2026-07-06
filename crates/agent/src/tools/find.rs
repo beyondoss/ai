@@ -89,14 +89,18 @@ pub fn search(job: &FindJob) -> (Vec<(PathBuf, bool)>, bool, Option<String>) {
         if path == job.root {
             continue;
         }
+        // `to_string_lossy()` returns a borrowed `Cow` for the (overwhelmingly common) valid-UTF-8
+        // path case — `.into_owned()` used to force an allocation for every walked entry regardless,
+        // not just matches. `GlobMatcher::is_match` only needs `AsRef<Path>`, which a borrowed `&str`
+        // already satisfies, so there's nothing to own here.
         let candidate = if job.basename_only {
             path.file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or(std::borrow::Cow::Borrowed(""))
         } else {
-            path.to_string_lossy().into_owned()
+            path.to_string_lossy()
         };
-        if job.matcher.is_match(candidate.as_str()) {
+        if job.matcher.is_match(&*candidate) {
             // `entry.file_type()` is the type already cached from the directory read that produced
             // this entry — cheaper than a fresh `stat`, and matches real `fd`'s own default of
             // appending "/" to a directory match (pi's `find` tool post-processes `fd`'s output as-is,

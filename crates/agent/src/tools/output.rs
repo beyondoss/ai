@@ -562,12 +562,13 @@ struct TailTruncation {
 fn truncate_tail(content: &str, max_lines: usize, max_bytes: usize) -> TailTruncation {
     let total_bytes = content.len(); // Rust `str` length is already the UTF-8 byte length.
 
-    let mut lines: Vec<&str> = content.split('\n').collect();
-    // A trailing '\n' yields a spurious empty final element — drop it so "a\nb\n" is two lines.
-    if lines.len() > 1 && lines.last() == Some(&"") {
-        lines.pop();
+    // A trailing '\n' yields a spurious empty final element from `split`/`rsplit` — drop it so "a\nb\n"
+    // is two lines, matching a bare "a\nb" (no accompanying trailing element to skip).
+    let ends_with_nl = content.ends_with('\n');
+    let mut total_lines = content.split('\n').count();
+    if ends_with_nl {
+        total_lines -= 1;
     }
-    let total_lines = lines.len();
 
     if total_lines <= max_lines && total_bytes <= max_bytes {
         return TailTruncation {
@@ -580,16 +581,23 @@ fn truncate_tail(content: &str, max_lines: usize, max_bytes: usize) -> TailTrunc
     }
 
     // Walk backward, prepending whole lines until we'd blow the byte budget or fill the line budget.
+    // `rsplit` walks from the end lazily — unlike collecting every line into a `Vec` first (the prior
+    // approach), this never materializes more than `collected`'s own bounded (`<= max_lines`) entries,
+    // even when `content` holds far more lines than either budget allows.
     let mut collected: Vec<&str> = Vec::new(); // in reverse order
     let mut output_bytes_count: usize = 0;
     let mut truncated_by = TruncatedBy::Lines;
     let mut last_line_partial = false;
     let mut partial: Option<String> = None;
 
-    let mut i = lines.len();
-    while i > 0 && collected.len() < max_lines {
-        i -= 1;
-        let line = lines[i];
+    let mut rev_lines = content.rsplit('\n');
+    if ends_with_nl {
+        rev_lines.next(); // skip the same spurious trailing empty element `total_lines` already dropped
+    }
+    for line in rev_lines {
+        if collected.len() >= max_lines {
+            break;
+        }
         // +1 for the '\n' that will rejoin this line to the one already collected below it.
         let line_bytes = line.len() + if collected.is_empty() { 0 } else { 1 };
         if output_bytes_count + line_bytes > max_bytes {

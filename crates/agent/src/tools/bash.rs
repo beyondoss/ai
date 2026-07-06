@@ -401,8 +401,13 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// Emit one streamed progress snapshot: the cleaned output so far, plus truncation + full-output-path
 /// details when the output has overflowed (pi's `onUpdate({content, details})`).
+///
+/// Uses [`clean_str`] (borrowing) rather than [`clean`] (owning): `snap` only ever arrives by reference
+/// here, so `clean` would need a `.clone()` of the whole accumulated content on every throttled tick just
+/// to have something to hand it — `clean_str` reads `&snap.content` directly and only allocates when the
+/// content actually needs stripping, same as `clean` already did internally.
 fn emit_update(p: &ToolProgress, snap: &OutputSnapshot) {
-    p.emit(clean(snap.content.clone()), truncation_details(snap));
+    p.emit(clean_str(&snap.content), truncation_details(snap));
 }
 
 /// The `details` payload for a progress update: nested `{truncation: {...}, full_output_path}` —
@@ -480,17 +485,24 @@ fn is_keepable(c: char) -> bool {
 /// rather than reallocating. (pi sanitizes binary output too; we also drop ANSI, which the model can't
 /// use — a small, deliberate step past pi that only ever removes noise.)
 fn clean(s: String) -> String {
+    match clean_str(&s) {
+        Cow::Borrowed(_) => s,
+        Cow::Owned(owned) => owned,
+    }
+}
+
+/// [`clean`]'s own logic, borrowing: returns `s` itself (via `Cow::Borrowed`) when nothing needed
+/// stripping, so a caller that only has `&str` (e.g. [`emit_update`], reading a snapshot it doesn't own)
+/// isn't forced to clone the whole input up front just to satisfy an owned-`String` signature.
+fn clean_str(s: &str) -> Cow<'_, str> {
     let stripped = match ansi_re() {
-        Some(re) => re.replace_all(&s, ""),
-        None => Cow::Borrowed(s.as_str()),
+        Some(re) => re.replace_all(s, ""),
+        None => Cow::Borrowed(s),
     };
     if stripped.chars().all(is_keepable) {
-        return match stripped {
-            Cow::Owned(owned) => owned,
-            Cow::Borrowed(_) => s,
-        };
+        return stripped;
     }
-    stripped.chars().filter(|&c| is_keepable(c)).collect()
+    Cow::Owned(stripped.chars().filter(|&c| is_keepable(c)).collect())
 }
 
 #[cfg(test)]

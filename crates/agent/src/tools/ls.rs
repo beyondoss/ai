@@ -156,16 +156,26 @@ impl Tool for Ls {
         // would expect). Falls back to a case-sensitive compare only to break an exact tie (e.g.
         // "Foo"/"foo" coexisting in one directory), so the order stays deterministic instead of
         // depending on the OS's arbitrary `readdir` order.
-        entries.sort_by(|(a_name, a_dir), (b_name, b_dir)| {
-            b_dir.cmp(a_dir).then_with(|| {
-                collation_key(a_name)
-                    .cmp(&collation_key(b_name))
-                    .then_with(|| a_name.cmp(b_name))
+        //
+        // The key is computed once per entry up front (a Schwartzian transform), not inside the
+        // comparator: `collation_key` allocates (lowercase + NFD + collect), and a comparator recomputes
+        // its arguments on every one of the sort's O(n log n) comparisons — recomputing it there turned a
+        // 500-entry listing into ~4,500 allocations instead of 500.
+        let mut entries: Vec<(String, bool, String)> = entries
+            .into_iter()
+            .map(|(name, is_dir)| {
+                let key = collation_key(&name);
+                (name, is_dir, key)
             })
+            .collect();
+        entries.sort_by(|(a_name, a_dir, a_key), (b_name, b_dir, b_key)| {
+            b_dir
+                .cmp(a_dir)
+                .then_with(|| a_key.cmp(b_key).then_with(|| a_name.cmp(b_name)))
         });
         let mut entries: Vec<String> = entries
             .into_iter()
-            .map(|(name, is_dir)| {
+            .map(|(name, is_dir, _key)| {
                 // Built with room for the trailing `/` so a directory entry doesn't allocate a second
                 // String beyond this one.
                 let mut display = String::with_capacity(name.len() + usize::from(is_dir));

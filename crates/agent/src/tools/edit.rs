@@ -96,11 +96,17 @@ impl Tool for Edit {
         // Resolve every edit to byte ranges against the *original* text (not the running result), so
         // multi-edit semantics are order-independent and an earlier edit's output can't accidentally
         // match a later `old_string`.
+        //
+        // `working` itself never changes across this loop, so its normalized form (needed by
+        // `find_spans`'s ambiguity check on every edit, fuzzy or not) is computed once here rather than
+        // once per edit — a multi-edit call used to renormalize the whole file from scratch for every
+        // element of `edits`, even though the input to that normalization was always identical.
+        let (norm_working, working_map) = normalize_with_map(&working);
         let mut ranges: Vec<(usize, usize, String)> = Vec::new();
         for (old, new) in &edits {
             let old = old.replace("\r\n", "\n");
             let new = new.replace("\r\n", "\n");
-            for (start, end) in find_spans(&working, &old, replace_all)
+            for (start, end) in find_spans(&working, &norm_working, &working_map, &old, replace_all)
                 .map_err(|msg| ToolError::InvalidInput(format!("{msg} in {path}")))?
             {
                 ranges.push((start, end, new.clone()));
@@ -228,7 +234,17 @@ fn write_if_unchanged(
 /// (without `replace_all`) ambiguous. Spans can be wider than `old` when the file's bytes differ from
 /// the normalized needle (e.g. a 3-byte em-dash matched by a 1-byte `-`), which is why this returns
 /// real end offsets rather than `start + old.len()`.
-fn find_spans(working: &str, old: &str, replace_all: bool) -> Result<Vec<(usize, usize)>, String> {
+///
+/// `norm_work`/`map` are `working`'s own normalization, computed once by the caller (`run`) outside its
+/// per-edit loop rather than recomputed here on every call — `working` is the same text for every edit
+/// in a multi-edit call, so normalizing it again per edit was pure repeated work.
+fn find_spans(
+    working: &str,
+    norm_work: &str,
+    map: &[u32],
+    old: &str,
+    replace_all: bool,
+) -> Result<Vec<(usize, usize)>, String> {
     if old.is_empty() {
         return Err("`old_string` is empty".into());
     }
@@ -237,9 +253,7 @@ fn find_spans(working: &str, old: &str, replace_all: bool) -> Result<Vec<(usize,
         .map(|(i, _)| (i, i + old.len()))
         .collect();
 
-    // Normalize both sides once, up front — the ambiguity check below needs it even when an exact
-    // match wins, not only on the fuzzy-fallback path.
-    let (norm_work, map) = normalize_with_map(working);
+    // `old` still needs normalizing per call — it's small and changes on every edit, unlike `working`.
     let norm_old = normalize_with_map(old).0;
 
     if !exact.is_empty() {
