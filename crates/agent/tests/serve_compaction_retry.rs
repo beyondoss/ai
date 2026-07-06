@@ -285,6 +285,10 @@ fn serve_compact_reports_already_compacted_reason_when_nothing_new_followed_the_
         seed.push(Message::user(format!(
             "{SUMMARY_MARKER}\n\nprior summary body"
         )));
+        // Roles strictly alternate — the message right after a summary is always the assistant's own
+        // reply (see `compaction::find_cut`'s doc comment on the post-compaction shape), matching the
+        // agent-core sibling fixture this seed is meant to mirror.
+        seed.push(Message::assistant(vec![ContentBlock::text("first reply")]));
         seed.user("second question");
         seed.push(Message::assistant(vec![ContentBlock::text("second reply")]));
         seed.user("third question");
