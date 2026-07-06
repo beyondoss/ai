@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use super::StreamDecoder;
@@ -884,7 +885,81 @@ impl Decoder {
     }
 }
 
+/// Typed shape of this wire's simplest, by far most common chunk: a single choice carrying a plain
+/// text fragment, nothing else. Deserializing directly into this instead of a generic `Value` skips
+/// the AST allocation for the common case; see `StreamDecoder::try_fast_path`'s doc comment.
+///
+/// Unlike Anthropic's/Responses' fast paths (an unambiguous `type` tag), Chat Completions chunks have
+/// no discriminant at all — shape is everything, and this dialect's `push` handles real per-provider
+/// quirks (reasoning content under any of [`REASONING_FIELDS`], multi-call tool-argument streaming,
+/// a `usage` object nested under either the chunk or the choice, `null`-vs-absent `usage` on every
+/// chunk). `#[serde(deny_unknown_fields)]` on every level here is load-bearing, not decoration: it's
+/// what makes this struct fail closed — reject the payload and fall back to `push`'s full handling —
+/// the instant a chunk carries *anything* this fast lane doesn't explicitly enumerate (a `role` key on
+/// the stream's opening chunk, a reasoning field, `tool_calls`, `finish_reason`), rather than silently
+/// discarding a field this fast lane doesn't know how to honor.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FastTextChunk {
+    choices: Vec<FastTextChoice>,
+    /// Declared (not denied) rather than omitted: some providers send a `usage` key — `null` — on
+    /// every single chunk, not just the trailing summary one (see `push`'s own `.filter(|u|
+    /// !u.is_null())` handling below). Denying it outright would silently disable this fast lane for
+    /// every chunk of theirs; capturing it lets `try_fast_path` fall back only when it's genuinely
+    /// non-null (real usage data the slow path's `usage` handling needs to fold in).
+    #[serde(default)]
+    usage: Option<Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FastTextChoice {
+    /// Present on every real chunk but not otherwise needed here — declared (under a leading
+    /// underscore, so it's exempt from the dead-code lint) so `deny_unknown_fields` doesn't reject an
+    /// ordinary chunk over it.
+    #[serde(default, rename = "index")]
+    _index: Option<u64>,
+    delta: FastTextDelta,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FastTextDelta {
+    content: String,
+}
+
 impl StreamDecoder for Decoder {
+    fn try_fast_path(&mut self, payload: &str) -> Option<Vec<StreamEvent>> {
+        let parsed: FastTextChunk = serde_json::from_str(payload).ok()?;
+        // Real usage data (not a per-chunk `null` placeholder) needs `push`'s own extraction logic.
+        if parsed.usage.as_ref().is_some_and(|u| !u.is_null()) {
+            return None;
+        }
+        // Exactly one choice, matching the single-choice assumption `push` itself already makes
+        // (`choices.get(0)`) — zero choices is the trailing usage-only chunk (handled above/by the
+        // slow path), more than one is outside what this harness ever requests.
+        let [choice] = <[FastTextChoice; 1]>::try_from(parsed.choices).ok()?;
+        // A reasoning block is still open — only `push`'s `close_text_or_thinking` transition handles
+        // that correctly; this fast lane only ever matches the steady-state (no reasoning / already
+        // in a text block) case.
+        if self.open == Open::Thinking {
+            return None;
+        }
+        let mut out = Vec::with_capacity(2);
+        if !self.started {
+            self.started = true;
+            out.push(StreamEvent::MessageStart);
+        }
+        let text = choice.delta.content;
+        if !text.is_empty() {
+            if self.open == Open::None {
+                self.open = Open::Text;
+            }
+            out.push(StreamEvent::TextDelta { index: 0, text });
+        }
+        Some(out)
+    }
+
     fn push(&mut self, data: &Value) -> Vec<StreamEvent> {
         let mut out = Vec::new();
         if !self.started {
@@ -3123,5 +3198,98 @@ data: [DONE]
         let req =
             ModelRequest::new("gpt-4o", vec![Message::user("hi")], 64).with_cache_key("short-id");
         assert_eq!(build_body(&req)["prompt_cache_key"], "short-id");
+    }
+
+    #[test]
+    fn fast_path_handles_plain_text_content_and_opens_message_start_once() {
+        let mut dec = Decoder::default();
+        assert_eq!(
+            dec.try_fast_path(r#"{"choices":[{"index":0,"delta":{"content":"hi "}}]}"#),
+            Some(vec![
+                StreamEvent::MessageStart,
+                StreamEvent::TextDelta {
+                    index: 0,
+                    text: "hi ".into()
+                },
+            ])
+        );
+        assert!(dec.open == Open::Text);
+        // Second call: `started` already true, no repeated `MessageStart`.
+        assert_eq!(
+            dec.try_fast_path(r#"{"choices":[{"index":0,"delta":{"content":"there"}}]}"#),
+            Some(vec![StreamEvent::TextDelta {
+                index: 0,
+                text: "there".into()
+            }])
+        );
+    }
+
+    #[test]
+    fn fast_path_handles_an_empty_content_delta_as_a_no_op() {
+        let mut dec = Decoder::default();
+        assert_eq!(
+            dec.try_fast_path(r#"{"choices":[{"index":0,"delta":{"content":""}}]}"#),
+            Some(vec![StreamEvent::MessageStart])
+        );
+        // An empty delta must not flip `open` to `Text` — matches `push`'s own `!text.is_empty()` guard.
+        assert!(dec.open == Open::None);
+    }
+
+    #[test]
+    fn fast_path_declines_anything_outside_the_plain_text_shape() {
+        let mut dec = Decoder::default();
+        for payload in [
+            // A `role` on the opening chunk — a real shape some providers send.
+            r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}"#,
+            // Tool calls.
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"bash","arguments":""}}]}}]}"#,
+            // A reasoning field instead of plain content.
+            r#"{"choices":[{"index":0,"delta":{"reasoning_content":"hmm"}}]}"#,
+            // A `finish_reason` chunk.
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+            // The trailing usage-only chunk (real, non-null usage; zero choices).
+            r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2}}"#,
+            // `[DONE]`-adjacent malformed/empty shape.
+            r#"{"choices":[{"index":0,"delta":{}}]}"#,
+        ] {
+            assert_eq!(
+                dec.try_fast_path(payload),
+                None,
+                "expected fast path to decline: {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn fast_path_declines_content_while_a_reasoning_block_is_still_open() {
+        // Mirrors `push`'s own thinking-then-text transition (`close_text_or_thinking`) — the fast
+        // lane only handles the steady-state case (no reasoning ever open, or already in a text
+        // block), leaving this one real transition to the general path.
+        let mut dec = Decoder {
+            open: Open::Thinking,
+            ..Decoder::default()
+        };
+        assert_eq!(
+            dec.try_fast_path(r#"{"choices":[{"index":0,"delta":{"content":"hi"}}]}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn fast_path_declines_a_per_chunk_null_usage_field_but_not_real_usage() {
+        // Some providers send `"usage": null` on every chunk, not just the trailing summary one —
+        // the fast lane must still fire for those (see `FastTextChunk::usage`'s doc comment), but
+        // decline the instant `usage` is genuinely non-null.
+        let mut dec = Decoder::default();
+        assert!(
+            dec.try_fast_path(r#"{"choices":[{"index":0,"delta":{"content":"hi"}}],"usage":null}"#)
+                .is_some()
+        );
+        assert_eq!(
+            dec.try_fast_path(
+                r#"{"choices":[{"index":0,"delta":{"content":"hi"}}],"usage":{"prompt_tokens":1}}"#
+            ),
+            None
+        );
     }
 }

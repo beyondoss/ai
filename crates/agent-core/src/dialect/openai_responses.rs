@@ -38,6 +38,7 @@
 //! single dropped or duplicated mid-stream delta (a relay hiccup with no transport-level error —
 //! nothing else would ever catch it) from silently corrupting the final block.
 
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use super::StreamDecoder;
@@ -808,7 +809,70 @@ impl Decoder {
     }
 }
 
+/// Typed shape shared by this wire's five per-token delta events — every one is a flat `{type,
+/// output_index, delta}` object, unlike Anthropic's nested `delta.type`/`delta.text` shape (see
+/// `anthropic.rs`'s own `FastContentBlockDelta`). Deserializing directly into this instead of a
+/// generic `Value` skips the AST allocation entirely for the common case; see
+/// `StreamDecoder::try_fast_path`'s doc comment. Everything else on this wire (`output_item.added`/
+/// `.done`, `response.completed`, tool-call-argument resyncs, failures) keeps going through the
+/// general `Value`-based `push` below unchanged — those are once-or-twice-per-turn events, not the
+/// per-token hot path this exists for.
+#[derive(Deserialize)]
+struct FastDeltaEvent {
+    #[serde(rename = "type")]
+    kind: FastDeltaKind,
+    output_index: i64,
+    delta: String,
+}
+
+#[derive(Deserialize)]
+enum FastDeltaKind {
+    #[serde(rename = "response.output_text.delta")]
+    OutputText,
+    #[serde(rename = "response.refusal.delta")]
+    Refusal,
+    #[serde(rename = "response.function_call_arguments.delta")]
+    FunctionCallArguments,
+    #[serde(rename = "response.reasoning_summary_text.delta")]
+    ReasoningSummaryText,
+    #[serde(rename = "response.reasoning_text.delta")]
+    ReasoningText,
+}
+
 impl StreamDecoder for Decoder {
+    fn try_fast_path(&mut self, payload: &str) -> Option<Vec<StreamEvent>> {
+        let parsed: FastDeltaEvent = serde_json::from_str(payload).ok()?;
+        let index = parsed.output_index;
+        let ev = match parsed.kind {
+            FastDeltaKind::OutputText | FastDeltaKind::Refusal => StreamEvent::TextDelta {
+                index: index as usize,
+                text: parsed.delta,
+            },
+            FastDeltaKind::FunctionCallArguments => StreamEvent::InputJsonDelta {
+                index: index as usize,
+                partial_json: parsed.delta,
+            },
+            FastDeltaKind::ReasoningSummaryText | FastDeltaKind::ReasoningText => {
+                StreamEvent::ThinkingDelta {
+                    index: index as usize,
+                    text: parsed.delta,
+                }
+            }
+        };
+        // `push`'s own `!self.started` prelude fires on the very first event of the stream regardless
+        // of its type; the real wire always opens an index (`response.output_item.added`, not one of
+        // this fast lane's shapes) before ever streaming that index's deltas, so in practice this
+        // never fires here — kept anyway so this fast lane stays correct on its own, not dependent on
+        // an ordering guarantee enforced elsewhere.
+        let mut out = Vec::with_capacity(2);
+        if !self.started {
+            self.started = true;
+            out.push(StreamEvent::MessageStart);
+        }
+        self.emit(&mut out, index, ev);
+        Some(out)
+    }
+
     fn push(&mut self, data: &Value) -> Vec<StreamEvent> {
         let mut out = Vec::new();
         if !self.started {
@@ -2712,5 +2776,78 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
         assert_ne!(hashed.as_ref(), item_id);
         assert!(hashed.starts_with("fc_"));
         assert!(hashed.len() <= MAX_ITEM_ID_LEN);
+    }
+
+    #[test]
+    fn fast_path_handles_every_delta_kind_and_opens_the_index() {
+        let mut dec = Decoder::default();
+        let events = dec
+            .try_fast_path(
+                r#"{"type":"response.output_text.delta","output_index":0,"delta":"hi"}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::MessageStart,
+                StreamEvent::TextDelta {
+                    index: 0,
+                    text: "hi".into()
+                },
+            ]
+        );
+        assert!(dec.open_indices.contains(&0));
+
+        // `started` is already true — no second `MessageStart` — and a distinct index opens too.
+        assert_eq!(
+            dec.try_fast_path(
+                r#"{"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"a\":"}"#
+            ),
+            Some(vec![StreamEvent::InputJsonDelta {
+                index: 1,
+                partial_json: "{\"a\":".into()
+            }])
+        );
+        assert!(dec.open_indices.contains(&1));
+
+        assert_eq!(
+            dec.try_fast_path(
+                r#"{"type":"response.reasoning_text.delta","output_index":2,"delta":"thinking"}"#
+            ),
+            Some(vec![StreamEvent::ThinkingDelta {
+                index: 2,
+                text: "thinking".into()
+            }])
+        );
+        assert_eq!(
+            dec.try_fast_path(
+                r#"{"type":"response.refusal.delta","output_index":0,"delta":"no"}"#
+            ),
+            Some(vec![StreamEvent::TextDelta {
+                index: 0,
+                text: "no".into()
+            }])
+        );
+    }
+
+    #[test]
+    fn fast_path_declines_item_boundary_and_terminal_events() {
+        let mut dec = Decoder::default();
+        for payload in [
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message"}}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message"}}"#,
+            r#"{"type":"response.function_call_arguments.done","output_index":0,"arguments":"{}"}"#,
+            r#"{"type":"response.completed","response":{"status":"completed","usage":{}}}"#,
+            r#"{"type":"response.reasoning_summary_part.done","output_index":0}"#,
+            // A genuinely unrecognized event type — must decline so `push`'s own warn-and-drop
+            // (and any future event type) still gets the general handling.
+            r#"{"type":"response.some_future_event","output_index":0}"#,
+        ] {
+            assert_eq!(
+                dec.try_fast_path(payload),
+                None,
+                "expected fast path to decline: {payload}"
+            );
+        }
     }
 }

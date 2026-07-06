@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use super::StreamDecoder;
@@ -714,7 +715,56 @@ impl Decoder {
     }
 }
 
+/// Typed shape of a `content_block_delta` event — the crate's single highest-frequency SSE event
+/// (hundreds to thousands per turn: every streamed text/thinking token and every tool-argument
+/// fragment). Deserializing directly into this instead of a generic `Value` skips the AST allocation
+/// entirely for the common case; see `StreamDecoder::try_fast_path`'s doc comment. The `#[serde(tag =
+/// "type")]` on `FastDelta` makes the whole parse fail (falling back to the general path) for any
+/// `delta.type` this crate doesn't recognize — the same "unrecognized delta type; dropping" case
+/// `Decoder::push`'s own `content_block_delta` arm already warns and drops, so a future Anthropic
+/// delta kind added to the wire degrades to the slow path's existing warning rather than being
+/// silently misparsed here.
+#[derive(Deserialize)]
+struct FastContentBlockDelta {
+    index: usize,
+    delta: FastDelta,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum FastDelta {
+    #[serde(rename = "text_delta")]
+    Text { text: String },
+    #[serde(rename = "thinking_delta")]
+    Thinking { thinking: String },
+    #[serde(rename = "signature_delta")]
+    Signature { signature: String },
+    #[serde(rename = "input_json_delta")]
+    InputJson { partial_json: String },
+}
+
 impl StreamDecoder for Decoder {
+    fn try_fast_path(&mut self, payload: &str) -> Option<Vec<StreamEvent>> {
+        // A bare, top-level `#[serde(tag = "type")]` enum (no wrapper struct) would also happily
+        // accept a payload whose `type` is `"text_delta"` etc. with no outer `content_block_delta`
+        // envelope at all — never a real shape on this wire, but cheap to rule out precisely by
+        // requiring the outer `FastContentBlockDelta`'s own fields (`index`/`delta`) instead of
+        // trusting the inner tag alone.
+        let parsed: FastContentBlockDelta = serde_json::from_str(payload).ok()?;
+        let index = parsed.index;
+        Some(vec![match parsed.delta {
+            FastDelta::Text { text } => StreamEvent::TextDelta { index, text },
+            FastDelta::Thinking { thinking } => StreamEvent::ThinkingDelta {
+                index,
+                text: thinking,
+            },
+            FastDelta::Signature { signature } => StreamEvent::SignatureDelta { index, signature },
+            FastDelta::InputJson { partial_json } => {
+                StreamEvent::InputJsonDelta { index, partial_json }
+            }
+        }])
+    }
+
     fn push(&mut self, data: &Value) -> Vec<StreamEvent> {
         let kind = data.get("type").and_then(Value::as_str).unwrap_or("");
         match kind {
@@ -2778,5 +2828,72 @@ data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use"
                 name: "Read".into(),
             }]
         );
+    }
+
+    #[test]
+    fn fast_path_handles_every_content_block_delta_kind() {
+        let mut dec = Decoder::default();
+        assert_eq!(
+            dec.try_fast_path(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#
+            ),
+            Some(vec![StreamEvent::TextDelta {
+                index: 0,
+                text: "hi".into()
+            }])
+        );
+        assert_eq!(
+            dec.try_fast_path(
+                r#"{"type":"content_block_delta","index":2,"delta":{"type":"thinking_delta","thinking":"hmm"}}"#
+            ),
+            Some(vec![StreamEvent::ThinkingDelta {
+                index: 2,
+                text: "hmm".into()
+            }])
+        );
+        assert_eq!(
+            dec.try_fast_path(
+                r#"{"type":"content_block_delta","index":2,"delta":{"type":"signature_delta","signature":"sig"}}"#
+            ),
+            Some(vec![StreamEvent::SignatureDelta {
+                index: 2,
+                signature: "sig".into()
+            }])
+        );
+        assert_eq!(
+            dec.try_fast_path(
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"a\":"}}"#
+            ),
+            Some(vec![StreamEvent::InputJsonDelta {
+                index: 1,
+                partial_json: "{\"a\":".into()
+            }])
+        );
+    }
+
+    #[test]
+    fn fast_path_declines_every_non_delta_event_and_malformed_deltas() {
+        let mut dec = Decoder::default();
+        // Every other real event type — must fall through to `push`'s general handling.
+        for payload in [
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}"#,
+            r#"{"type":"message_stop"}"#,
+            r#"{"type":"ping"}"#,
+            // A missing index — the malformed-input case
+            // `content_block_delta_with_missing_index_is_dropped_not_misattributed_to_index_0` exercises
+            // end-to-end; confirms the fast lane itself declines rather than silently defaulting.
+            r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"x"}}"#,
+            // An unrecognized delta kind — must decline so `push`'s own warn-and-drop still applies.
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"citations_delta","citation":{}}}"#,
+        ] {
+            assert_eq!(
+                dec.try_fast_path(payload),
+                None,
+                "expected fast path to decline: {payload}"
+            );
+        }
     }
 }

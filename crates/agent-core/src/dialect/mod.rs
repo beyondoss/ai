@@ -413,6 +413,22 @@ pub trait StreamDecoder: Send {
     /// Feed one parsed SSE `data:` JSON object; return any events it produced.
     fn push(&mut self, data: &Value) -> Vec<StreamEvent>;
 
+    /// Opt-in fast lane for a decoder's own highest-frequency event shape, tried against the raw
+    /// `data:` payload *before* [`parse_and_push`] parses it into a generic [`Value`] — the crate's
+    /// measured hot path (`benches/decode.rs`): a real streamed turn is ~97%+ plain content/thinking/
+    /// tool-argument deltas, and building a full `serde_json::Value` tree for one of those (a `Map`
+    /// allocation plus one heap `String` per object key, for envelope fields — `"type"`, `"index"`,
+    /// `"delta"` — that never need to be individually owned) costs far more than the few bytes of
+    /// actual delta text being carried. Returns `None` for anything outside the exact narrow shape it
+    /// recognizes (including a genuinely malformed payload, an in-band provider error, or a rarer
+    /// event this decoder doesn't fast-path), in which case the caller falls through to the ordinary,
+    /// fully general `Value`-based `push` below unchanged. This is why a decoder that implements this
+    /// can afford to be conservative/exact about the shape it matches — every escape hatch is a no-op
+    /// past this point, not a behavior change. Default: no fast lane.
+    fn try_fast_path(&mut self, _payload: &str) -> Option<Vec<StreamEvent>> {
+        None
+    }
+
     /// Called once at end-of-stream. Flushes any held terminal event (OpenAI defers `MessageStop`
     /// until the stream closes so it can land after the trailing usage chunk), and is the decoder's
     /// chance to reject a stream that ended *before* its terminal marker — a truncated stream
@@ -499,7 +515,16 @@ impl SseEventBuffer {
             self.event = None;
             return None;
         }
-        let data = std::mem::take(&mut self.data).join("\n");
+        // Real Anthropic/OpenAI traffic sends exactly one `data:` line per event (see this struct's
+        // own doc comment) — `Vec<String>::join` always allocates and copies a fresh `String` even
+        // for a length-1 slice, so the overwhelmingly common case would otherwise pay for a join it
+        // doesn't need. Popping the sole buffered line instead reuses its existing allocation.
+        let mut data = std::mem::take(&mut self.data);
+        let data = if data.len() == 1 {
+            data.pop().unwrap_or_default()
+        } else {
+            data.join("\n")
+        };
         let event = self.event.take();
         Some((event, data))
     }
@@ -582,6 +607,13 @@ fn parse_and_push(
     // falling through to `decoder.push` and ending the turn as a successful-looking, empty `EndTurn`.
     if event == Some("error") {
         return Err(Error::Transport(format!("provider stream error: {payload}")));
+    }
+    // Try the decoder's own fast lane first — see `StreamDecoder::try_fast_path`'s doc comment. A hit
+    // skips building a `Value` for this payload entirely (this crate's per-token hot path); a miss
+    // (rare event shape, or genuinely malformed JSON) falls through to the general path below exactly
+    // as if this fast lane didn't exist.
+    if let Some(events) = decoder.try_fast_path(payload) {
+        return Ok(events);
     }
     // LOW pi-parity gap, deliberately not fixed: pi's `JSON.parse` accepts a JSON string containing a
     // lone (unpaired) `\uD800`-`\uDFFF` escape — JS strings are UTF-16 code-unit sequences that can
