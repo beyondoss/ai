@@ -463,7 +463,10 @@ mod tests {
             let text = String::from_utf8_lossy(&out.stdout);
             eprintln!("=== DIAG ps snapshot right after run() returned (needle={needle}) ===");
             for line in text.lines() {
-                if line.contains(&needle) || line.contains("pgid") || line.to_lowercase().contains("pid") {
+                if line.contains(&needle)
+                    || line.contains("pgid")
+                    || line.to_lowercase().contains("pid")
+                {
                     eprintln!("{line}");
                 }
             }
