@@ -3,6 +3,12 @@
 // See `lib.rs`: deny the panic surface in production, allow it in `#[cfg(test)]` assertions.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+// jemalloc (not mimalloc) for the gateway: under a memory cgroup it returns reclaimed pages via
+// MADV_DONTNEED so the cgroup uncharges them immediately, whereas mimalloc's MADV_FREE leaves freed
+// pages charged — the same reason `compute/instd` runs jemalloc. The rest of the fleet uses mimalloc.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use beyond_ai::admin::AdminApp;
 use beyond_ai::config::AiConfig;
 use beyond_ai::doctor;

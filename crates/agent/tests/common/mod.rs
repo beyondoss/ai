@@ -2,10 +2,10 @@
 //! the gateway binary.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, dead_code)]
 
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -15,6 +15,16 @@ use serde_json::{Value, json};
 pub const DEV_PUBKEY_B64: &str = "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=";
 /// The matching dev `bai_v1` token (tenant 1 / vpc 1, kid 1).
 pub const DEV_TOKEN: &str = "bai_v1.1.AQAAAAAAAAABAAAAAAAAAA.WrWcPbklu91PS-4WuR6GnBNF3h4nROpH0EQQlfJf06f7_lEnlQOCSBimhH2JMwXFJgw40BniTB7-yIdFnpldDw";
+
+/// A `HOME` that deliberately doesn't exist on disk. `serve`/`run` read `~/.claude/skills` and
+/// `~/.claude/trusted-projects.json` unconditionally (skill discovery is no longer gated on project
+/// trust — an untrusted project must not blank out the user's own global skills), and every codepath
+/// that reads under `HOME` already treats a missing file/directory as "nothing there" rather than an
+/// error, so this keeps a test hermetic (never sees, and can't pollute, the actual developer's real
+/// `~/.claude/`) without needing a `TempDir` guard kept alive for the spawned process's lifetime. A test
+/// that specifically wants real HOME-relative behavior (trust store writes, seeded skills) overrides
+/// this afterward via its own `.env("HOME", ...)`, which simply wins — `Command::env` is last-write.
+pub const ISOLATED_HOME: &str = "/nonexistent-beyond-ai-agent-test-home";
 
 /// Locate the gateway binary (built beside the agent binary); build it on demand if absent.
 pub fn gateway_bin() -> PathBuf {
@@ -59,7 +69,35 @@ pub fn turn_text(text: &str) -> String {
     ])
 }
 
-fn sse(events: &[Value]) -> String {
+/// An OpenAI **Responses** dialect SSE turn that emits text and completes — the `gpt-4o` counterpart
+/// to `turn_text`'s Anthropic shape, for tests that need to inspect a Responses-dialect-only wire
+/// field (e.g. `prompt_cache_key`, which Anthropic's dialect never sends).
+pub fn turn_text_responses(text: &str) -> String {
+    sse(&[
+        json!({ "type": "response.output_item.added", "output_index": 0, "item": { "type": "message", "id": "msg_1" } }),
+        json!({ "type": "response.output_text.delta", "output_index": 0, "delta": text }),
+        json!({ "type": "response.output_item.done", "output_index": 0, "item": { "type": "message", "id": "msg_1", "phase": "final_answer", "content": [{ "type": "output_text", "text": text }] } }),
+        json!({ "type": "response.completed", "response": { "status": "completed", "usage": { "input_tokens": 1, "output_tokens": 1 } } }),
+    ])
+}
+
+/// An Anthropic SSE turn that ends with `stop_reason: "refusal"` — a distinct terminal condition from
+/// a normal end-of-turn (see `agent_core::agent::Agent::run_events_steered`).
+pub fn turn_refusal(text: &str) -> String {
+    sse(&[
+        json!({ "type": "message_start", "message": { "usage": { "input_tokens": 12, "output_tokens": 1 } } }),
+        json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }),
+        json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": text } }),
+        json!({ "type": "content_block_stop", "index": 0 }),
+        json!({ "type": "message_delta", "delta": { "stop_reason": "refusal" }, "usage": { "output_tokens": 6 } }),
+        json!({ "type": "message_stop" }),
+    ])
+}
+
+/// Frame each event as its own `data: ...\n\n` SSE block — used directly by callers that build a turn
+/// out of the standard shape (`turn_text`/`turn_refusal`/`turn_tool_use`) as well as ones assembling a
+/// bespoke event sequence (e.g. chunked tool-call argument streaming).
+pub fn sse(events: &[Value]) -> String {
     events.iter().map(|e| format!("data: {e}\n\n")).collect()
 }
 
@@ -119,6 +157,69 @@ pub fn spawn_model_server(responses: Vec<String>) -> (String, Arc<Mutex<Vec<Stri
     (format!("http://{addr}"), requests)
 }
 
+/// A model server whose first `fast.len()` requests get an instant response, and whose next request
+/// (e.g. the summarization call a `switch_branch{summarize:true}` triggers, or a plain `prompt`'s own
+/// model call) sends only a partial SSE body — proving the request genuinely reached the server and
+/// started streaming — then stalls for `stall` before completing, giving a test a reliable window to
+/// `abort` (or, for pi-parity Task 4's busy-then-self-abort commands, send `compact`/`switch_session`/
+/// `fork`/`clone`/`new_session` mid-run) a provably in-flight call instead of racing a near-instant
+/// local round trip. Every request in `after` then gets its own instant response too, in order — for a
+/// test whose busy-time command itself makes a further model call once it resumes idle (e.g. `compact`,
+/// when the session has enough content to attempt a real summarization rather than short-circuiting as
+/// too small).
+pub fn spawn_model_server_with_stalled_response(
+    fast: Vec<String>,
+    stall: std::time::Duration,
+    after: Vec<String>,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for resp in fast {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let http = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{resp}"
+                );
+                let _ = stream.write_all(http.as_bytes());
+                let _ = stream.flush();
+            }
+        }
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let preamble = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
+                data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n";
+            let _ = stream.write_all(preamble.as_bytes());
+            let _ = stream.flush();
+            thread::sleep(stall);
+            // Finishes the turn normally as a fallback safety net in case a test using this doesn't
+            // interrupt it before `stall` elapses — a silently-hanging server would fail such a test
+            // far more confusingly than a completed-but-too-late response would.
+            let rest = "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+                data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"recap\"}}\n\n\
+                data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+                data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n\
+                data: {\"type\":\"message_stop\"}\n\n";
+            let _ = stream.write_all(rest.as_bytes());
+            let _ = stream.flush();
+        }
+        for resp in after {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let http = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{resp}"
+                );
+                let _ = stream.write_all(http.as_bytes());
+                let _ = stream.flush();
+            }
+        }
+    });
+    format!("http://{addr}")
+}
+
 /// A free localhost port (bind `:0`, read it back, release). A subprocess must bind it promptly;
 /// there's a small TOCTOU window, acceptable for tests.
 pub fn free_port() -> u16 {
@@ -138,4 +239,90 @@ pub fn wait_for_port(port: u16) {
         thread::sleep(std::time::Duration::from_millis(10));
     }
     panic!("port {port} never came up");
+}
+
+/// Read stdout frames from a `serve` child until the `response` frame for `command` arrives; return
+/// all frames seen (including any `event`/progress frames along the way).
+pub fn read_until_response(reader: &mut impl BufRead, command: &str) -> Vec<Value> {
+    let mut frames = Vec::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).unwrap() == 0 {
+            break;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        let done = v.get("type").and_then(Value::as_str) == Some("response")
+            && v.get("command").and_then(Value::as_str) == Some(command);
+        frames.push(v);
+        if done {
+            break;
+        }
+    }
+    frames
+}
+
+/// A `serve` child bound to a single session file, talking to the mock gateway at `base`.
+pub fn serve_cmd(bin: &str, base: &str, session_file: &str) -> Command {
+    let mut c = Command::new(bin);
+    c.args([
+        "serve",
+        "--gateway-url",
+        base,
+        "--key",
+        "bai_v1.test",
+        "--model",
+        "claude-test",
+        "--session-file",
+        session_file,
+    ])
+    .env("HOME", ISOLATED_HOME)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
+    c
+}
+
+/// Like `serve_cmd`, but bound to a session *directory* (`--session-dir`) rather than a single file —
+/// exercises the multi-session-per-process repo mode (`list_sessions`, `switch`, fork).
+pub fn serve_dir_cmd(bin: &str, base: &str, session_dir: &str) -> Command {
+    let mut c = Command::new(bin);
+    c.args([
+        "serve",
+        "--gateway-url",
+        base,
+        "--key",
+        "bai_v1.test",
+        "--model",
+        "claude-test",
+        "--session-dir",
+        session_dir,
+    ])
+    .env("HOME", ISOLATED_HOME)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
+    c
+}
+
+/// [`Command::new`] for the `run` binary, pre-isolated from the real machine's `HOME` — see
+/// [`ISOLATED_HOME`]. A test that wants real HOME-relative behavior overrides it via its own
+/// `.env("HOME", ...)`, which simply wins (`Command::env` is last-write).
+pub fn run_cmd(bin: &str) -> Command {
+    let mut c = Command::new(bin);
+    c.env("HOME", ISOLATED_HOME);
+    c
+}
+
+/// Every persisted `message` entry's id, in order, read straight off a session JSONL file.
+pub fn message_ids(session_file: &str) -> Vec<String> {
+    std::fs::read_to_string(session_file)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|v| v["type"] == "message")
+        .filter_map(|v| v["id"].as_str().map(str::to_string))
+        .collect()
 }

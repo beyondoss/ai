@@ -18,22 +18,27 @@
 //! (the supported hook), feeding each chunk to a streaming structural scanner (`peek::ModelScanner`,
 //! O(1) memory) — never withholding or buffering it.
 //!
-//! One deliberate exception to the no-buffer rule: a **managed** OpenAI chat/responses request is
+//! One deliberate exception to the no-buffer rule: a **managed** OpenAI Chat Completions request is
 //! buffered and gets `stream_options.include_usage` injected when it streams without it — otherwise
 //! OpenAI emits no usage chunk and the request couldn't be metered. We can't set that option in a
 //! client SDK we don't control, so the gateway guarantees it, out of the box. Scoped to exactly that
-//! path (managed + OpenAI dialect + streaming-capable); BYO and everything else stay pure passthrough.
+//! path (managed + OpenAI dialect + chat/completions); BYO and everything else stay pure passthrough.
+//! The Responses API needs no such injection — it always reports usage on its terminal event — so it
+//! stays pure passthrough too (see `is_streamable_path`).
 //!
 //! Auth branches on key format: `bai_…` is a managed virtual key (verify → deny-check → swap to
 //! the pool key); anything else is a **BYO** request — the user's own provider token, passed
-//! through unchanged (no swap, no Beyond identity, no deny-set).
+//! through unchanged (no swap, no Beyond identity, no deny-set). The key is read from whichever
+//! header (or, for Google Gemini, query param) the client's SDK uses — see `extract_virtual_key`.
 //!
 //! Routing is by the **first path segment** = provider name (`route`, data-driven): `/{provider}/…`
 //! selects the provider and the rest of the path is forwarded **verbatim** (the gateway holds no
-//! per-provider mount knowledge). A bare path with no provider prefix that starts with `/v1` is the
-//! drop-in default — dialect picks openai/anthropic (`dialect_for_path`) — so an OpenAI/Anthropic
-//! client works by changing only the host. An unknown first segment is a 404. Model isn't used for
-//! routing (the body isn't read pre-connect); it's still captured from the body for usage.
+//! per-provider mount knowledge). A bare path with no provider prefix that is exactly `/v1` or
+//! starts with `/v1/` (boundary-checked — see `route::is_default_prefix`, not a raw
+//! `starts_with("/v1")`, which would also absorb a lookalike like Google Gemini's `/v1beta/…`) is
+//! the drop-in default — dialect picks openai/anthropic (`dialect_for_path`) — so an OpenAI/
+//! Anthropic client works by changing only the host. An unknown first segment is a 404. Model isn't
+//! used for routing (the body isn't read pre-connect); it's still captured from the body for usage.
 
 use crate::route::{self, Dialect, Provider};
 use crate::state::{GatewayState, RequestId};
@@ -53,6 +58,18 @@ use tracing::{info, warn};
 /// Response header carrying the per-request id (`{instance}-{seq}`). Set on both the proxied
 /// response and every reject body so a client can quote it and an oncall can grep for it.
 const REQUEST_ID_HEADER: &str = "x-beyond-request-id";
+
+/// OpenRouter's dashboard-attribution headers (https://openrouter.ai/docs/quickstart): purely
+/// cosmetic on OpenRouter's side (their own cost/usage categorization), no effect on the request
+/// or response. Static — this doesn't need to be configurable, just present. Only OpenRouter is in
+/// `KNOWN_PROVIDERS` among the providers pi attributes to (NVIDIA NIM, Cloudflare, Vercel AI
+/// Gateway aren't routed providers here), so this is the one case worth porting. Header names match
+/// pi's current OpenRouter-specific set (`packages/coding-agent/src/core/provider-attribution.ts`):
+/// `HTTP-Referer`, `X-OpenRouter-Title` (NOT the generic `X-Title` pi used for the now-removed Vercel
+/// AI Gateway route), and `X-OpenRouter-Categories`.
+const OPENROUTER_REFERER: &str = "https://beyond.build";
+const OPENROUTER_TITLE: &str = "Beyond Gateway";
+const OPENROUTER_CATEGORY: &str = "cli-agent";
 
 /// Reject requests whose declared Content-Length exceeds this. The body itself is **not** buffered
 /// (it streams straight through); this is purely an abuse guard checked up front via the header.
@@ -116,11 +133,11 @@ pub struct RequestCtx {
     /// success (the provider answered — a `429` is a healthy throttle, not a breaker trip), and a
     /// `None` here with an upstream error → failure (connect/read failed before any response).
     upstream_status: Option<u16>,
-    /// Managed OpenAI chat/responses request: buffer the body and inject
+    /// Managed OpenAI chat/completions request: buffer the body and inject
     /// `stream_options.include_usage` if it streams without it, so the usage chunk (hence the
     /// billable token count) is guaranteed. The single, deliberate exception to "never buffer the
-    /// request body" — scoped to the managed OpenAI streaming-capable path and bounded by
-    /// `MAX_REQUEST_BODY`. BYO and every other request still stream straight through.
+    /// request body" — scoped to the managed OpenAI chat/completions path (see `is_streamable_path`)
+    /// and bounded by `MAX_REQUEST_BODY`. BYO and every other request still stream straight through.
     inject_eligible: bool,
     /// Accumulated request body — populated only when `inject_eligible`; otherwise stays empty and
     /// the body is never buffered.
@@ -163,17 +180,44 @@ impl AiProxy {
     }
 }
 
-fn extract_virtual_key(session: &Session) -> Option<&str> {
-    let h = session.req_header();
-    // Anthropic SDK sends `x-api-key`; OpenAI SDK sends `Authorization: Bearer`. One neutral
-    // virtual key works in either, so check both. Borrowed from the header — no per-request copy.
-    if let Some(v) = h.headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
-        return Some(v);
+/// Header names carrying a plain static API key (no OAuth/signing), checked in order. Anthropic:
+/// `x-api-key`. Azure OpenAI: `api-key`. Google Gemini: `x-goog-api-key`. `Authorization: Bearer`
+/// (OpenAI and everyone else) is checked separately below since it needs prefix-stripping.
+const STATIC_KEY_HEADERS: [&str; 3] = ["x-api-key", "api-key", "x-goog-api-key"];
+
+/// Extract query-param `name`'s value from a raw query string (`k=v&k2=v2`). Used only for Google
+/// Gemini's `?key=` convention — the sole query-param credential shape among recognized providers.
+/// No percent-decoding: a real API key is alphanumeric, so a plain split is exact, and decoding would
+/// let a crafted query smuggle characters past the literal `name=` match.
+fn query_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
+    query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == name).then_some(v)
+    })
+}
+
+/// Extract the presented key (virtual or BYO) from wherever the client's SDK puts it. Every
+/// recognized shape is a **plain static key** (no OAuth/signing), so one neutral virtual key works
+/// in any of them: Anthropic's `x-api-key`, Azure OpenAI's `api-key`, Google Gemini's
+/// `x-goog-api-key` (header, falling back to the `?key=` query param — Gemini accepts either),
+/// OpenAI's `Authorization: Bearer`. Header checks first since they're the common case and cheaper
+/// (no query parse); query param last since it's the least-preferred shape (keys in a URL end up in
+/// proxy/access logs). Borrowed from the request — no per-request copy.
+fn extract_virtual_key(req: &pingora::http::RequestHeader) -> Option<&str> {
+    for header in STATIC_KEY_HEADERS {
+        if let Some(v) = req.headers.get(header).and_then(|v| v.to_str().ok()) {
+            return Some(v);
+        }
     }
-    h.headers
+    if let Some(v) = req
+        .headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
+    {
+        return Some(v);
+    }
+    req.uri.query().and_then(|q| query_param(q, "key"))
 }
 
 /// Upper bound on a model id we'll record. Real ids are short (`claude-opus-4-8`,
@@ -198,6 +242,30 @@ fn sanitize_model(model: String) -> Cow<'static, str> {
     }
 }
 
+/// Set OpenRouter's attribution headers when (and only when) `provider_name` is `"openrouter"`
+/// **and** the request is managed — every other provider, and every BYO request regardless of
+/// provider, is untouched. Task #22 (pi-parity, Medium): pi gates this dashboard-attribution
+/// behind a user-controllable telemetry setting (`isInstallTelemetryEnabled`,
+/// `packages/coding-agent/src/core/provider-attribution.ts`); this gateway has no per-user
+/// telemetry-opt-out setting to consult, but it already has an unambiguous, always-correct proxy
+/// for "is this Beyond's own attribution to make, or someone else's traffic passing through us": a
+/// BYO request carries the *caller's own* OpenRouter key, not Beyond's — attributing *their*
+/// traffic to Beyond's dashboard app would misrepresent whose usage it is, the same harm the
+/// telemetry opt-out exists to prevent. Managed traffic (Beyond's own pool key) is the only case
+/// these headers describe accurately.
+fn apply_provider_attribution(
+    upstream_request: &mut pingora::http::RequestHeader,
+    provider_name: &str,
+    managed: bool,
+) -> Result<()> {
+    if provider_name == "openrouter" && managed {
+        upstream_request.insert_header("HTTP-Referer", OPENROUTER_REFERER)?;
+        upstream_request.insert_header("X-OpenRouter-Title", OPENROUTER_TITLE)?;
+        upstream_request.insert_header("X-OpenRouter-Categories", OPENROUTER_CATEGORY)?;
+    }
+    Ok(())
+}
+
 fn dialect_for_path(path: &str) -> Dialect {
     // Anthropic Messages vs OpenAI Chat Completions/Embeddings. Embeddings are OpenAI-dialect only.
     if path.starts_with("/v1/messages") {
@@ -207,13 +275,26 @@ fn dialect_for_path(path: &str) -> Dialect {
     }
 }
 
-/// Whether the **forwarded** (provider-native) path targets an OpenAI streaming-capable endpoint —
-/// chat completions or the Responses API. Checked by *suffix*, so it holds regardless of the
-/// provider's mount prefix (`/v1/chat/completions`, `/openai/v1/chat/completions`,
-/// `/inference/v1/chat/completions`, …). Only these get buffered for `stream_options.include_usage`
-/// injection — embeddings and everything else never stream, so there's nothing to meter.
+/// Resolve the provider name for a request whose first path segment matched no known/config
+/// provider: `Some(name)` for the bare-path default — `path` is boundary-checked against
+/// [`route::DEFAULT_PREFIX`] (see [`route::is_default_prefix`]) so a lookalike like Google
+/// Gemini's `/v1beta/…` doesn't qualify — with the dialect picking openai/anthropic
+/// ([`dialect_for_path`]); `None` for anything else, which the caller turns into a 404 rather than
+/// silently guessing a provider (Task #7, pi-parity).
+fn bare_default_provider_name(path: &str) -> Option<&'static str> {
+    route::is_default_prefix(path).then(|| route::dialect_default(dialect_for_path(path)))
+}
+
+/// Whether the **forwarded** (provider-native) path targets the OpenAI Chat Completions endpoint.
+/// Checked by *suffix*, so it holds regardless of the provider's mount prefix
+/// (`/v1/chat/completions`, `/openai/v1/chat/completions`, `/inference/v1/chat/completions`, …). Only
+/// this gets buffered for `stream_options.include_usage` injection — **not** `/v1/responses`: the
+/// Responses API has no `stream_options` field at all (it always reports usage on the terminal
+/// `response.completed` event, streaming or not), so splicing this chat-completions-only fragment into
+/// a Responses body would inject a field the API doesn't recognize. Embeddings and everything else
+/// never stream, so there's nothing to meter there either.
 fn is_streamable_path(forward_path: &str) -> bool {
-    forward_path.ends_with("/chat/completions") || forward_path.ends_with("/responses")
+    forward_path.ends_with("/chat/completions")
 }
 
 /// Splice `stream_options.include_usage` into a buffered OpenAI chat body when it streams without it
@@ -251,10 +332,12 @@ impl ProxyHttp for AiProxy {
 
         // 1. Route by the **first path segment** = provider; forward the rest of the path verbatim
         // (native passthrough — the gateway holds no per-provider mount knowledge). A path with no
-        // provider segment that starts with `/v1` is the drop-in default: dialect picks
-        // openai/anthropic and the path is forwarded as-is. Anything else → unknown provider (404).
-        // We resolve before auth (an unknown route is cheap) and compute owned values inside the
-        // block so the session borrow ends before any `&mut session` reject below.
+        // provider segment that is exactly `/v1` or starts with `/v1/` (boundary-checked — see
+        // `bare_default_provider_name`/`route::is_default_prefix`, not a raw prefix test) is the
+        // drop-in default: dialect picks openai/anthropic and the path is forwarded as-is. Anything
+        // else → unknown provider (404). We resolve before auth (an unknown route is cheap) and
+        // compute owned values inside the block so the session borrow ends before any `&mut session`
+        // reject below.
         let (provider_opt, forward_path) = {
             let uri = &session.req_header().uri;
             let path = uri.path();
@@ -272,9 +355,8 @@ impl ProxyHttp for AiProxy {
                     Some(p.clone()),
                     with_query(if rest.is_empty() { "/" } else { rest }),
                 )
-            } else if path.starts_with(route::DEFAULT_PREFIX) {
+            } else if let Some(name) = bare_default_provider_name(path) {
                 // Bare default: dialect picks the provider; forward the path unchanged.
-                let name = route::dialect_default(dialect_for_path(path));
                 (self.state.provider(name).cloned(), with_query(path))
             } else {
                 (None, String::new())
@@ -294,7 +376,7 @@ impl ProxyHttp for AiProxy {
         let dialect = provider.dialect;
 
         // 2. Extract the presented key — a managed virtual key (`bai_…`) or a raw BYO provider token.
-        let Some(raw_key) = extract_virtual_key(session) else {
+        let Some(raw_key) = extract_virtual_key(session.req_header()) else {
             return Self::reject(
                 session,
                 &request_id,
@@ -413,7 +495,7 @@ impl ProxyHttp for AiProxy {
             (0, 0, false)
         };
 
-        // Mark OpenAI managed chat/responses streams for body buffering + `stream_options` injection
+        // Mark OpenAI managed chat/completions streams for body buffering + `stream_options` injection
         // (handled in `request_body_filter`). Scoped tight: managed only (BYO stays pure
         // passthrough), OpenAI dialect only, streaming-capable paths only — so everything else still
         // streams through untouched. Checked on the forwarded path (suffix), so it's prefix-agnostic.
@@ -570,18 +652,27 @@ impl ProxyHttp for AiProxy {
         };
 
         // Managed: swap the virtual key for the real pool key (precomputed at boot) in the scheme
-        // the upstream wants — removing *both* inbound auth headers first so the virtual key never
-        // leaks upstream. BYO (`!managed`): leave the user's own auth header exactly as presented.
+        // the upstream wants — removing every inbound static-key header first (see
+        // `STATIC_KEY_HEADERS`) so the virtual key never leaks upstream, and so a provider whose own
+        // auth header (e.g. Azure's `api-key` — Task #8) happens to be the same header the client
+        // presented its virtual key in doesn't end up with two stacked values. BYO (`!managed`):
+        // leave the user's own auth header exactly as presented.
         if rc.managed {
             if let Some(av) = &rc.provider.pool_auth_value {
                 upstream_request.remove_header("authorization");
-                upstream_request.remove_header("x-api-key");
+                for header in STATIC_KEY_HEADERS {
+                    upstream_request.remove_header(header);
+                }
                 upstream_request.insert_header(rc.provider.auth.header(), av.expose())?;
             }
         }
 
         // Point Host at the upstream.
         upstream_request.insert_header("host", rc.provider.host.as_str())?;
+
+        // Dashboard-attribution headers (OpenRouter, managed traffic only — Task #22, see
+        // `apply_provider_attribution`).
+        apply_provider_attribution(upstream_request, rc.provider.name.as_str(), rc.managed)?;
 
         // Forward the provider-native path (computed in `request_filter`): the client path with the
         // `/{provider}` segment stripped, or unchanged for a bare-path default. We send it verbatim —
@@ -665,7 +756,12 @@ impl ProxyHttp for AiProxy {
                 *body = Some(Bytes::from(maybe_inject_stream_usage(buf)));
             } else {
                 // Withhold — the bytes are buffered above; nothing goes upstream until end-of-stream.
-                *body = None;
+                // Use an *empty* chunk, not `None`: pingora derives end-of-body as
+                // `end_of_body || data.is_none()` (proxy_h1.rs / proxy_h2.rs), so withholding with
+                // `None` would signal end-of-body on the *first* withheld chunk and forward a truncated
+                // (empty) body — silently dropping every request body that spans more than one chunk.
+                // An empty `Some` is recognized as "nothing to write yet" without ending the body.
+                *body = Some(Bytes::new());
             }
         }
 
@@ -915,6 +1011,10 @@ impl ProxyHttp for AiProxy {
                 output_tokens = usage.output_tokens,
                 cache_read_tokens = usage.cache_read_tokens,
                 cache_write_tokens = usage.cache_write_tokens,
+                // `Some(0)` (reported, none used) vs `None` (not reported at all — an unreasoning
+                // model, or a provider that doesn't surface it) matters and is unrecoverable once this
+                // line ships, so it's logged as `?` (Debug) rather than collapsed to a bare `0`.
+                reasoning_tokens = ?usage.reasoning_tokens,
                 latency_ms = rc.start.elapsed().as_millis() as u64,
                 "usage"
             );
@@ -925,6 +1025,87 @@ impl ProxyHttp for AiProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a `RequestHeader` for a given path (+ optional query) with the given headers set —
+    /// mirrors the shape `session.req_header()` hands `extract_virtual_key` on the real path.
+    fn req_with_headers(
+        path: &str,
+        headers: &[(&'static str, &'static str)],
+    ) -> pingora::http::RequestHeader {
+        let mut req =
+            pingora::http::RequestHeader::build(http::Method::POST, path.as_bytes(), None).unwrap();
+        for (k, v) in headers {
+            req.insert_header(*k, *v).unwrap();
+        }
+        req
+    }
+
+    #[test]
+    fn extract_virtual_key_recognizes_anthropic_x_api_key() {
+        let req = req_with_headers("/v1/messages", &[("x-api-key", "sk-ant-key")]);
+        assert_eq!(extract_virtual_key(&req), Some("sk-ant-key"));
+    }
+
+    #[test]
+    fn extract_virtual_key_recognizes_openai_bearer() {
+        let req = req_with_headers(
+            "/v1/chat/completions",
+            &[("authorization", "Bearer sk-openai-key")],
+        );
+        assert_eq!(extract_virtual_key(&req), Some("sk-openai-key"));
+    }
+
+    #[test]
+    fn extract_virtual_key_recognizes_azure_api_key_header() {
+        // Task #31: Azure OpenAI authenticates via the bare `api-key` header (no `Bearer` prefix, no
+        // OAuth). Before this fix, a client presenting only this header got a 401.
+        let req = req_with_headers("/v1/responses", &[("api-key", "azure-secret")]);
+        assert_eq!(extract_virtual_key(&req), Some("azure-secret"));
+    }
+
+    #[test]
+    fn extract_virtual_key_recognizes_google_goog_api_key_header() {
+        // Task #31: Google Gemini authenticates via `x-goog-api-key`.
+        let req = req_with_headers(
+            "/v1beta/models/gemini-2.5-pro:generateContent",
+            &[("x-goog-api-key", "goog-secret")],
+        );
+        assert_eq!(extract_virtual_key(&req), Some("goog-secret"));
+    }
+
+    #[test]
+    fn extract_virtual_key_recognizes_google_key_query_param() {
+        // Task #31: Google Gemini also accepts the key as a `?key=` query param — no header at all.
+        let req = req_with_headers(
+            "/v1beta/models/gemini-2.5-pro:generateContent?key=goog-query-secret",
+            &[],
+        );
+        assert_eq!(extract_virtual_key(&req), Some("goog-query-secret"));
+    }
+
+    #[test]
+    fn extract_virtual_key_query_param_only_used_as_last_resort() {
+        // A header takes precedence over a `key=` query param if both are somehow present.
+        let req = req_with_headers(
+            "/v1beta/models/gemini-2.5-pro:generateContent?key=query-secret",
+            &[("x-goog-api-key", "header-secret")],
+        );
+        assert_eq!(extract_virtual_key(&req), Some("header-secret"));
+    }
+
+    #[test]
+    fn extract_virtual_key_returns_none_when_absent() {
+        let req = req_with_headers("/v1/chat/completions", &[]);
+        assert_eq!(extract_virtual_key(&req), None);
+    }
+
+    #[test]
+    fn query_param_finds_key_among_multiple_params() {
+        assert_eq!(query_param("a=1&key=abc123&b=2", "key"), Some("abc123"));
+        assert_eq!(query_param("key=solo", "key"), Some("solo"));
+        assert_eq!(query_param("a=1&b=2", "key"), None);
+        assert_eq!(query_param("", "key"), None);
+    }
 
     #[test]
     fn sanitize_model_passes_real_ids() {
@@ -976,18 +1157,126 @@ mod tests {
     }
 
     #[test]
+    fn bare_default_provider_name_rejects_gemini_v1beta_lookalike() {
+        // Task #7 (pi-parity, High): a raw `path.starts_with("/v1")` absorbed Google Gemini's real
+        // path shape (`/v1beta/models/{model}:generateContent`) into the bare-default branch, which
+        // then routed it to OpenAI — a silent misroute that 404s against `api.openai.com` instead of
+        // failing with a clear "unknown provider" error. Boundary-checking must reject it.
+        assert_eq!(
+            bare_default_provider_name("/v1beta/models/gemini-2.5-pro:generateContent"),
+            None,
+            "/v1beta must NOT be routed to OpenAI (or any provider) via the bare-default path"
+        );
+        assert_eq!(bare_default_provider_name("/v1beta"), None);
+
+        // The real bare-default shape still resolves correctly, dialect-picked.
+        assert_eq!(
+            bare_default_provider_name("/v1/messages"),
+            Some("anthropic")
+        );
+        assert_eq!(
+            bare_default_provider_name("/v1/chat/completions"),
+            Some("openai")
+        );
+        assert_eq!(bare_default_provider_name("/v1"), Some("openai"));
+
+        // Other near-miss prefixes must also be rejected, not just /v1beta.
+        assert_eq!(bare_default_provider_name("/v10/messages"), None);
+        assert_eq!(bare_default_provider_name("/v2/messages"), None);
+    }
+
+    #[test]
     fn is_streamable_path_matches_generation_suffixes_across_prefixes() {
-        // Only chat-completions / responses get buffered for `stream_options.include_usage`
-        // injection. The check is by *suffix* so it holds whatever mount prefix the provider uses;
-        // a mismatch here either skips injection on a streamable path (lost usage) or needlessly
-        // buffers a non-streaming one.
+        // Only chat-completions gets buffered for `stream_options.include_usage` injection. The
+        // check is by *suffix* so it holds whatever mount prefix the provider uses; a mismatch here
+        // either skips injection on a streamable path (lost usage) or needlessly buffers a
+        // non-streaming one.
         assert!(is_streamable_path("/v1/chat/completions"));
         assert!(is_streamable_path("/openai/v1/chat/completions"));
         assert!(is_streamable_path("/inference/v1/chat/completions"));
-        assert!(is_streamable_path("/v1/responses"));
+        // The Responses API must NOT be buffered/injected: it has no `stream_options` field, always
+        // reports usage on its terminal event regardless, and splicing this fragment into its body
+        // would inject a field the API doesn't recognize.
+        assert!(!is_streamable_path("/v1/responses"));
         // Non-streaming endpoints must not be buffered.
         assert!(!is_streamable_path("/v1/embeddings"));
         assert!(!is_streamable_path("/v1/messages"));
         assert!(!is_streamable_path("/v1/models"));
+    }
+
+    #[test]
+    fn openrouter_attribution_present_only_for_openrouter_managed_traffic() {
+        let mut openrouter_req = pingora::http::RequestHeader::build(
+            http::Method::POST,
+            b"/api/v1/chat/completions",
+            None,
+        )
+        .unwrap();
+        apply_provider_attribution(&mut openrouter_req, "openrouter", true).unwrap();
+        assert_eq!(
+            openrouter_req.headers.get("HTTP-Referer").unwrap(),
+            OPENROUTER_REFERER
+        );
+        assert_eq!(
+            openrouter_req.headers.get("X-OpenRouter-Title").unwrap(),
+            OPENROUTER_TITLE
+        );
+        assert_eq!(
+            openrouter_req
+                .headers
+                .get("X-OpenRouter-Categories")
+                .unwrap(),
+            OPENROUTER_CATEGORY
+        );
+
+        for other in ["openai", "anthropic", "fireworks", "groq"] {
+            let mut req = pingora::http::RequestHeader::build(
+                http::Method::POST,
+                b"/v1/chat/completions",
+                None,
+            )
+            .unwrap();
+            apply_provider_attribution(&mut req, other, true).unwrap();
+            assert!(
+                req.headers.get("HTTP-Referer").is_none(),
+                "{other} should not get HTTP-Referer"
+            );
+            assert!(
+                req.headers.get("X-OpenRouter-Title").is_none(),
+                "{other} should not get X-OpenRouter-Title"
+            );
+            assert!(
+                req.headers.get("X-OpenRouter-Categories").is_none(),
+                "{other} should not get X-OpenRouter-Categories"
+            );
+        }
+    }
+
+    #[test]
+    fn openrouter_attribution_gated_off_for_byo_traffic() {
+        // Task #22 (pi-parity, Medium): pi gates its OpenRouter dashboard-attribution headers
+        // behind a user-controllable telemetry opt-out (`isInstallTelemetryEnabled`) — before this
+        // fix, this gateway injected them unconditionally, including onto a BYO caller's own
+        // OpenRouter key, misattributing *their* traffic to Beyond's dashboard app. `managed=false`
+        // (BYO) must suppress every one of the three headers, even for the OpenRouter provider.
+        let mut byo_req = pingora::http::RequestHeader::build(
+            http::Method::POST,
+            b"/api/v1/chat/completions",
+            None,
+        )
+        .unwrap();
+        apply_provider_attribution(&mut byo_req, "openrouter", false).unwrap();
+        assert!(
+            byo_req.headers.get("HTTP-Referer").is_none(),
+            "BYO OpenRouter traffic must not get HTTP-Referer"
+        );
+        assert!(
+            byo_req.headers.get("X-OpenRouter-Title").is_none(),
+            "BYO OpenRouter traffic must not get X-OpenRouter-Title"
+        );
+        assert!(
+            byo_req.headers.get("X-OpenRouter-Categories").is_none(),
+            "BYO OpenRouter traffic must not get X-OpenRouter-Categories"
+        );
     }
 }

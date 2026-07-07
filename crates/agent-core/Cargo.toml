@@ -17,19 +17,87 @@ workspace = true
 
 [dependencies]
 async-trait.workspace = true
+# Zero-copy byte buffer for SSE line framing: `BytesMut::split_to` hands a decoded line back as an
+# owned `Bytes` handle sharing the backing allocation — no per-line `Vec` alloc, no drain-from-front
+# memmove of the buffer remainder (which `Vec<u8>` framing pays on every line of a coalesced chunk).
+bytes.workspace = true
 futures.workspace = true
+futures-timer.workspace = true
+# SIMD single-byte search for the SSE newline split — the framer's inner scan runs once per streamed
+# line (the crate's highest-frequency operation). `memchr` vectorizes it; already in the build graph
+# (reqwest/tokio pull it), so this adds nothing to compile time.
+memchr = "2"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# Was dev-only (the loop itself pulled in no executor — see the crate/`write_lock.rs` doc comments).
+# `codex_websocket`'s live WebSocket connection is the first production code path that genuinely needs
+# a bound runtime (socket read/write, connect/idle timeouts), not just a `Future` any executor can
+# drive — promoted here rather than added as a second, redundant dependency line.
+tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 
 # The default model transport (`client::GatewayClient`) speaks HTTP to the gateway. `async-stream`
 # turns the chunked SSE body into a `Stream<StreamEvent>` without hand-rolling a poll state machine.
 # reqwest mirrors the gateway crate's pins (rustls, no OpenSSL) plus `stream` for the SSE body.
 async-stream = "0.3"
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream"] }
+
+# Parse the HTTP-date form of a `Retry-After` header (`Wed, 21 Oct 2025 07:28:00 GMT`). A tiny,
+# dependency-free crate already in the build graph (hyper depends on it), so this adds nothing to
+# compile — just makes the parser reachable from this crate.
+httpdate = "1"
+
+# Zeroize-on-drop for `client::ApiKey` (the gateway virtual key held for the client's lifetime). The
+# workspace forbids `unsafe_code`, so a hand-rolled `as_bytes_mut` scrub isn't an option here — this
+# is the same crate/version the gateway's own `Secret` type already uses for the identical purpose.
+zeroize = "1"
+
+# `codex_websocket`'s live WebSocket transport for the OpenAI-Codex-Responses/ChatGPT-subscription
+# backend (pi's `openai-codex-responses.ts`): a persistent connection, unlike `reqwest`'s per-request
+# HTTP, genuinely needs a bound async runtime to drive its socket read/write — this is the one place
+# this crate can no longer honestly claim to be executor-agnostic in production code (see
+# `write_lock.rs`'s and this crate's own doc comments, updated alongside this). `rustls-tls-native-
+# roots` mirrors the workspace's existing rustls-only TLS policy (no OpenSSL — see `reqwest`'s own
+# comment above) while reusing the OS trust store via `rustls-native-certs`, already resolved in the
+# dependency graph through `reqwest`'s own `rustls-platform-verifier` — not a second, independent
+# bundled root store (`webpki-roots`) alongside it.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots"] }
+
+# Compresses the Codex SSE-fallback request body (`codex_websocket`'s HTTP/SSE path, used when the live
+# WebSocket transport above can't be used for a turn) — matches pi's own `zstdCompressSync` call in
+# `openai-codex-responses.ts`, which the real Codex backend's SSE endpoint accepts via
+# `Content-Encoding: zstd`. Already resolved in this workspace's lock file as a transitive dependency
+# (`pingora-core`); pinned directly here rather than left implicit since this crate now calls it itself.
+# Deliberately not `default-features = false`: the default `legacy`/`arrays`/`zdict_builder` features
+# aren't needed for a plain one-shot `encode_all`, but trimming them buys nothing worth the extra
+# Cargo.toml surface for a dependency already in the build graph at these defaults.
+zstd = "0.13"
 
 [dev-dependencies]
-# Async test runtime for the `Tool`/loop tests. The library itself is runtime-agnostic — it pulls in
-# no executor, only the `futures` stream traits — so the runtime lives in dev-deps.
-tokio.workspace = true
+# Bench harness for the streaming decode hot path. `divan` (the workspace's `bench:unit` pin, matching
+# gateway/agent) measures **allocations** natively via its `AllocProfiler` global allocator alongside
+# timing — so the per-SSE-event allocation cost the decode findings target is visible, not inferred.
+divan = "0.1"
+# Control allocator for the decode concurrency probe: swapping glibc malloc for a sharded, low-
+# contention allocator is the decisive test for whether the decode bend is allocator-lock contention
+# (flattens the curve) or CPU-side SMT/turbo/bandwidth (doesn't). Gated behind `bench-mimalloc` so the
+# default build/bench stays on the production system allocator; only the control run opts in.
+mimalloc = "0.1"
+
+[features]
+# Install mimalloc as the global allocator in `decode_concurrent` — the allocator-contention control
+# run: `cargo bench -p beyond-ai-agent-core --bench decode_concurrent --features bench-mimalloc`.
+bench-mimalloc = []
+
+[[bench]]
+name = "decode"
+harness = false
+
+# Concurrency-scaling probe for the decode path (allocator-contention evidence gate). A separate
+# target because it must run on the *plain* system allocator — divan's `AllocProfiler` (in the sibling
+# `decode` bench) adds global atomic counters that would manufacture the contention it measures.
+[[bench]]
+name = "decode_concurrent"
+harness = false

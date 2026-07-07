@@ -145,6 +145,49 @@ async fn managed_swaps_key_relays_body_and_meters_usage() {
 }
 
 #[tokio::test]
+async fn managed_openai_stream_relays_a_large_multichunk_body() {
+    // Regression: the inject-eligible buffering path (managed + OpenAI + streamable chat) must forward
+    // the *entire* request body. A body spanning more than one network read was withheld with `None`,
+    // which pingora reads as end-of-body (`end_of_body || data.is_none()`), truncating it to empty — so
+    // every large OpenAI request (i.e. every real coding-agent request) was silently dropped upstream.
+    let nats = Nats::start().await;
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::start(nats.port, &mock.authority(), &b64(&pubkey)).await;
+    let vkey = mint(
+        &VirtualKey {
+            tenant_id: 42,
+            vpc_id: 7,
+        },
+        1,
+        &sk,
+    );
+    let client = reqwest::Client::new();
+
+    // A streaming chat body padded well past a single read chunk (64 KiB of content) so the buffering
+    // path withholds at least one non-final chunk — the exact condition the old `None` withhold broke.
+    let pad = "x".repeat(64 * 1024);
+    let body = format!(
+        r#"{{"model":"gpt-4o","stream":true,"stream_options":{{"include_usage":true}},"messages":[{{"role":"user","content":"{pad}"}}]}}"#
+    );
+    let expected_len = body.len();
+
+    let (c, u, k, b) = (client.clone(), gw.url(), vkey.clone(), body.clone());
+    wait_for_status(200, move || {
+        let (c, u, k, b) = (c.clone(), u.clone(), k.clone(), b.clone());
+        async move { post_status(&c, &u, &k, b).await }
+    })
+    .await;
+
+    let cap = mock.captured().expect("mock received a request");
+    assert_eq!(
+        cap.body.len(),
+        expected_len,
+        "the full multi-chunk body must reach the upstream intact, not truncated/empty"
+    );
+}
+
+#[tokio::test]
 async fn byo_passes_user_token_through_unchanged() {
     let nats = Nats::start().await;
     let (pubkey, _sk) = test_keypair(1); // gateway still needs a signing key in config to boot

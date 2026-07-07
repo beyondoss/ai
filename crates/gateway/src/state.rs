@@ -31,10 +31,13 @@ const DNS_TTL: Duration = Duration::from_secs(60);
 pub type RequestId = ArrayString<33>;
 
 /// Build the resolved provider registry from the static known set + config: every known provider
-/// (its authority overridable by `provider_authorities`), plus any config-only OpenAI-wire provider
-/// (a `provider_authorities` entry whose name isn't known). Each provider's pool key (if any) is
-/// looked up by name and its managed auth header value precomputed.
-fn build_providers(config: &AiConfig, metrics: &Metrics) -> HashMap<String, Arc<Provider>> {
+/// (its authority overridable by `provider_authorities`), plus any config-only provider (a
+/// `provider_authorities` entry whose name isn't known), whose dialect/auth scheme come from
+/// `provider_dialects`/`provider_auth_schemes` (default OpenAI/Bearer, for backward compatibility).
+/// Each provider's pool key (if any) is looked up by name and its managed auth header value
+/// precomputed. An unrecognized dialect/auth-scheme string is a hard boot failure (`Err`) rather than
+/// a silent default — see `Dialect::parse_config`/`AuthScheme::parse_config`.
+fn build_providers(config: &AiConfig, metrics: &Metrics) -> Result<HashMap<String, Arc<Provider>>> {
     // One independent breaker per provider, all built from the same config (the breaker holds
     // atomics so it can't be cloned — we mint a fresh one per provider). `None` ⇒ breaker disabled.
     let cb_config = config.circuit_breaker_config();
@@ -65,18 +68,42 @@ fn build_providers(config: &AiConfig, metrics: &Metrics) -> HashMap<String, Arc<
             )),
         );
     }
-    // Config-only providers (name not in the known set): assume OpenAI-wire (Bearer). A non-OpenAI
-    // wire format would need real code, so we don't pretend to support it from config alone.
+    // Config-only providers (name not in the known set): dialect/auth scheme come from
+    // `provider_dialects`/`provider_auth_schemes` (default OpenAI/Bearer, preserved for backward
+    // compatibility), so adding an Anthropic-wire vendor (MiniMax, MiniMax-CN, Kimi-Coding, …) is a
+    // config line — `provider_authorities.minimax = "…"` + `provider_dialects.minimax = "anthropic"`
+    // (+ `provider_auth_schemes.minimax = "x-api-key"` if the default Bearer is wrong too) — not a
+    // code change. A value that doesn't parse is a boot failure, not a silent fallback: silently
+    // defaulting a typo'd "anthropic" to "openai" is exactly the zero-billing bug this field exists to
+    // prevent (see `usage::openai_body`'s dialect-mismatch guard for the runtime backstop).
     for (name, authority) in &config.provider_authorities {
         if !providers.contains_key(name) {
             let pool_key = config.pool_keys.get(name).map(|s| s.expose());
+            let dialect = match config.provider_dialects.get(name) {
+                Some(s) => Dialect::parse_config(s).ok_or_else(|| {
+                    GatewayError::Config(format!(
+                        "provider_dialects.{name} = {s:?} is not a recognized dialect \
+                         (expected \"openai\" or \"anthropic\")"
+                    ))
+                })?,
+                None => Dialect::OpenAI,
+            };
+            let auth = match config.provider_auth_schemes.get(name) {
+                Some(s) => AuthScheme::parse_config(s).ok_or_else(|| {
+                    GatewayError::Config(format!(
+                        "provider_auth_schemes.{name} = {s:?} is not a recognized auth scheme \
+                         (expected \"bearer\", \"x-api-key\", or \"api-key\")"
+                    ))
+                })?,
+                None => AuthScheme::Bearer,
+            };
             providers.insert(
                 name.clone(),
                 Arc::new(Provider::resolve(
                     name,
                     authority.clone(),
-                    Dialect::OpenAI,
-                    AuthScheme::Bearer,
+                    dialect,
+                    auth,
                     pool_key,
                     ProviderMetrics::resolve(metrics, name),
                     breaker(),
@@ -84,7 +111,7 @@ fn build_providers(config: &AiConfig, metrics: &Metrics) -> HashMap<String, Arc<
             );
         }
     }
-    providers
+    Ok(providers)
 }
 
 pub struct GatewayState {
@@ -155,7 +182,7 @@ impl GatewayState {
             );
         }
 
-        let providers = build_providers(&config, &metrics);
+        let providers = build_providers(&config, &metrics)?;
         let rate_limit = RateLimit::new(config.rate_limit_rps, config.byo_rate_limit_rps);
 
         // 8 OS-random bytes as the instance token, so two gateways' request_ids never collide when
@@ -281,7 +308,7 @@ mod tests {
             ]),
             ..Default::default()
         };
-        let providers = build_providers(&config, &test_metrics());
+        let providers = build_providers(&config, &test_metrics()).unwrap();
 
         // Known provider: authority overridden, pool auth precomputed in the right scheme.
         let openai = providers.get("openai").unwrap();
@@ -314,6 +341,75 @@ mod tests {
             custom2.pool_auth_value.is_none(),
             "a provider with no configured pool key must have no managed auth value (→ 503)"
         );
+    }
+
+    #[test]
+    fn config_added_provider_honors_dialect_and_auth_scheme_overrides() {
+        // Task #30: a config-added Anthropic-wire vendor (MiniMax, MiniMax-CN, Kimi-Coding in the
+        // real pi fleet) must be reachable with the correct dialect + auth scheme from config alone —
+        // no code change. Before this fix every config-added provider was hardcoded OpenAI+Bearer.
+        let config = AiConfig {
+            provider_authorities: HashMap::from([(
+                "minimax".to_string(),
+                "api.minimax.io:443".to_string(),
+            )]),
+            provider_dialects: HashMap::from([("minimax".to_string(), "Anthropic".to_string())]),
+            provider_auth_schemes: HashMap::from([(
+                "minimax".to_string(),
+                "x-api-key".to_string(),
+            )]),
+            pool_keys: HashMap::from([("minimax".to_string(), Secret::new("mm-key"))]),
+            ..Default::default()
+        };
+        let providers = build_providers(&config, &test_metrics()).unwrap();
+        let minimax = providers.get("minimax").unwrap();
+        assert_eq!(minimax.dialect, Dialect::Anthropic);
+        assert_eq!(minimax.auth, AuthScheme::XApiKey);
+        assert_eq!(minimax.pool_auth_value.as_ref().unwrap().expose(), "mm-key");
+
+        // Unset dialect/auth_scheme still defaults to OpenAI/Bearer (backward compatible).
+        let default_config = AiConfig {
+            provider_authorities: HashMap::from([(
+                "custom".to_string(),
+                "llm.internal:8443".to_string(),
+            )]),
+            ..Default::default()
+        };
+        let providers = build_providers(&default_config, &test_metrics()).unwrap();
+        let custom = providers.get("custom").unwrap();
+        assert_eq!(custom.dialect, Dialect::OpenAI);
+        assert_eq!(custom.auth, AuthScheme::Bearer);
+    }
+
+    #[test]
+    fn config_added_provider_rejects_unrecognized_dialect_or_auth_scheme() {
+        // A typo'd dialect ("anthropc") must fail boot loudly — silently falling back to OpenAI-wire
+        // is exactly the zero-billing bug this config field exists to prevent.
+        let bad_dialect = AiConfig {
+            provider_authorities: HashMap::from([(
+                "minimax".to_string(),
+                "api.minimax.io:443".to_string(),
+            )]),
+            provider_dialects: HashMap::from([("minimax".to_string(), "anthropc".to_string())]),
+            ..Default::default()
+        };
+        assert!(matches!(
+            build_providers(&bad_dialect, &test_metrics()),
+            Err(GatewayError::Config(_))
+        ));
+
+        let bad_auth = AiConfig {
+            provider_authorities: HashMap::from([(
+                "minimax".to_string(),
+                "api.minimax.io:443".to_string(),
+            )]),
+            provider_auth_schemes: HashMap::from([("minimax".to_string(), "bogus".to_string())]),
+            ..Default::default()
+        };
+        assert!(matches!(
+            build_providers(&bad_auth, &test_metrics()),
+            Err(GatewayError::Config(_))
+        ));
     }
 
     #[tokio::test]

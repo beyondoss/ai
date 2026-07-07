@@ -15,10 +15,24 @@ use crate::circuit_breaker::CircuitBreaker;
 use crate::metrics::ProviderMetrics;
 use crate::secret::Secret;
 
-/// The default API prefix OpenAI/Anthropic clients use. A request with no provider segment that
-/// starts with this is routed to a default provider by [`dialect_for_path`](crate::proxy) (the
-/// bare-path drop-in case); anything else with an unknown first segment is a 404.
+/// The default API prefix OpenAI/Anthropic clients use. A request with no provider segment whose
+/// path is exactly this or begins with this plus `/` (see [`is_default_prefix`]) is routed to a
+/// default provider by [`dialect_for_path`](crate::proxy) (the bare-path drop-in case); anything
+/// else with an unknown first segment is a 404.
 pub const DEFAULT_PREFIX: &str = "/v1";
+
+/// Whether `path` is the bare-default route: exactly [`DEFAULT_PREFIX`], or `DEFAULT_PREFIX`
+/// followed by `/`. **Boundary-checked**, not a raw [`str::starts_with`] — a plain prefix check
+/// would also match Google Gemini's real path shape (`/v1beta/models/{model}:generateContent`),
+/// silently absorbing it into the bare-path default (which routes to OpenAI) instead of rejecting
+/// it as an unrecognized provider. `/v1beta`, `/v10`, `/v1-anything` etc. must all be `false`; only
+/// `/v1` itself and `/v1/…` are the real default-prefix shape.
+pub fn is_default_prefix(path: &str) -> bool {
+    match path.strip_prefix(DEFAULT_PREFIX) {
+        Some(rest) => rest.is_empty() || rest.starts_with('/'),
+        None => false,
+    }
+}
 
 /// Which API surface the client called. Drives usage parsing and the bare-path default provider.
 /// On a provider-prefixed request it's the selected provider's own [`Provider::dialect`]; on a
@@ -29,13 +43,50 @@ pub enum Dialect {
     Anthropic,
 }
 
+impl Dialect {
+    /// Parse a config-supplied dialect name (case-insensitive): `"openai"` or `"anthropic"`. Used
+    /// only for a **config-added** provider (`state::build_providers`) — a known provider's dialect
+    /// is fixed in [`KNOWN_PROVIDERS`] and never parsed from a string. `None` on anything else, which
+    /// the caller turns into a hard boot failure rather than a silent default: real Anthropic-wire
+    /// vendors (MiniMax, MiniMax-CN, Kimi-Coding) added via config with a typo'd dialect must not
+    /// silently fall back to OpenAI-wire, which zero-bills every request (see
+    /// `usage::openai_body`'s dialect-mismatch guard for the runtime backstop).
+    pub fn parse_config(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "openai" => Some(Dialect::OpenAI),
+            "anthropic" => Some(Dialect::Anthropic),
+            _ => None,
+        }
+    }
+}
+
 /// How the upstream expects the API key. OpenAI-wire providers use `Authorization: Bearer <key>`;
-/// Anthropic uses the `x-api-key` header. The gateway swaps the client's virtual key for the real
-/// pool key in whichever header the upstream wants (see `proxy`).
+/// Anthropic uses the `x-api-key` header; Azure OpenAI uses the bare key in `api-key` (no `Bearer`
+/// prefix — same bare-key shape as `XApiKey`, just a different header name; see
+/// `packages/ai/src/api/azure-openai-responses.ts` in pi-mono, whose `AzureOpenAI` SDK client always
+/// authenticates this way). The gateway swaps the client's virtual key for the real pool key in
+/// whichever header the upstream wants (see `proxy`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthScheme {
     Bearer,
     XApiKey,
+    /// Azure OpenAI's `api-key` header (bare key, no prefix). A config-added provider row (Azure's
+    /// per-resource host isn't knowable at compile time, so it's never a [`KNOWN_PROVIDERS`] entry —
+    /// see that constant's doc comment) sets `provider_auth_schemes.<name> = "api-key"`.
+    ApiKey,
+    /// A `Bearer`-prefixed value in a differently-named header — Cloudflare AI Gateway's
+    /// `cf-aig-authorization: Bearer <key>` (see `packages/ai/src/providers/cloudflare-auth.ts:75-105`
+    /// in pi-mono). Task #24 (pi-parity, Medium-Low): added as a low-risk enum shape so the header
+    /// format is expressible, but **nothing constructs one yet** — Cloudflare AI Gateway's own base
+    /// URL is templated per account+gateway id (`https://gateway.ai.cloudflare.com/v1/{account}/
+    /// {gateway}/{provider}`), which this gateway's one-fixed-authority-per-provider-name model can't
+    /// express without per-tenant path templating; that's a separate, larger feature with no other
+    /// Cloudflare support in this codebase to hang it off of. Not reachable from
+    /// [`AuthScheme::parse_config`] (a `&'static str` header name can't be built from a runtime config
+    /// string without leaking memory) — a real caller needs either a compile-time
+    /// [`KNOWN_PROVIDERS`] row or a config surface that accepts owned header names, neither of which
+    /// exists today.
+    CustomHeader(&'static str),
 }
 
 impl AuthScheme {
@@ -44,14 +95,31 @@ impl AuthScheme {
         match self {
             AuthScheme::Bearer => "authorization",
             AuthScheme::XApiKey => "x-api-key",
+            AuthScheme::ApiKey => "api-key",
+            AuthScheme::CustomHeader(name) => name,
         }
     }
 
     /// Format `key` as the upstream wants it for [`Self::header`].
     pub fn format(self, key: &str) -> String {
         match self {
-            AuthScheme::Bearer => format!("Bearer {key}"),
-            AuthScheme::XApiKey => key.to_string(),
+            AuthScheme::Bearer | AuthScheme::CustomHeader(_) => format!("Bearer {key}"),
+            AuthScheme::XApiKey | AuthScheme::ApiKey => key.to_string(),
+        }
+    }
+
+    /// Parse a config-supplied auth scheme name (case-insensitive, `-`/`_` ignored): `"bearer"`,
+    /// `"x-api-key"`/`"xapikey"`, or `"api-key"`/`"apikey"` (Azure OpenAI). Used only for a
+    /// **config-added** provider (`state::build_providers`) — a known provider's scheme is fixed in
+    /// [`KNOWN_PROVIDERS`]. `None` on anything else, which the caller turns into a hard boot failure
+    /// rather than a silent default. Note `"x-api-key"` and `"api-key"` normalize to *different*
+    /// strings (`"xapikey"` vs `"apikey"`) despite both being hyphen-stripped, so they don't collide.
+    pub fn parse_config(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().replace(['-', '_'], "").as_str() {
+            "bearer" => Some(AuthScheme::Bearer),
+            "xapikey" => Some(AuthScheme::XApiKey),
+            "apikey" => Some(AuthScheme::ApiKey),
+            _ => None,
         }
     }
 }
@@ -70,7 +138,7 @@ pub struct ProviderSpec {
 
 /// The providers the gateway knows out of the box. All but Anthropic speak the OpenAI wire format
 /// (Bearer auth, chat/completions + embeddings); a new one is a single row here, then reachable at
-/// `/{name}/…`. (Config can add further OpenAI-wire providers or override any authority — see
+/// `/{name}/…`. (Config can add further providers of either dialect, or override any authority — see
 /// `state::build_providers`.)
 ///
 /// We forward the path after `/{name}` **verbatim**, so the gateway carries no per-provider mount
@@ -160,6 +228,19 @@ pub const KNOWN_PROVIDERS: &[ProviderSpec] = &[
         dialect: Dialect::OpenAI,
         auth: AuthScheme::Bearer,
     },
+    // OpenAI Codex (ChatGPT Plus/Pro subscription backend) — reached only via a stored OpenAI-Codex
+    // OAuth credential's own bearer token, never a pool key (no `AI_POOL_KEY_OPENAI_CODEX` exists;
+    // this row only ever serves BYO traffic). Base https://chatgpt.com/backend-api, Bearer — a
+    // genuinely static host, unlike GitHub Copilot's account-specific proxy endpoint (see
+    // `agent_core::client::RouteOverride`'s doc comment for why Copilot instead bypasses the gateway
+    // entirely rather than getting a row here). Client path: /openai-codex/backend-api/codex/responses
+    // (see `packages/ai/src/api/openai-codex-responses.ts` in pi-mono, `resolveCodexUrl`).
+    ProviderSpec {
+        name: "openai-codex",
+        authority: "chatgpt.com:443",
+        dialect: Dialect::OpenAI,
+        auth: AuthScheme::Bearer,
+    },
 ];
 
 /// The default provider name for a dialect — used only for the **bare-path** request (no provider
@@ -235,6 +316,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn is_default_prefix_boundary_checks() {
+        // The real default-prefix shape: exactly "/v1" or "/v1/…".
+        assert!(is_default_prefix("/v1"));
+        assert!(is_default_prefix("/v1/"));
+        assert!(is_default_prefix("/v1/messages"));
+        assert!(is_default_prefix("/v1/chat/completions"));
+        // Task #7 (pi-parity): Google Gemini's real path shape must NOT be absorbed by a raw
+        // `starts_with("/v1")` — before this fix it fell into the bare-default branch, which
+        // routes anything that isn't `/v1/messages*` to OpenAI, silently misrouting Gemini.
+        assert!(!is_default_prefix(
+            "/v1beta/models/gemini-2.5-pro:generateContent"
+        ));
+        assert!(!is_default_prefix("/v1beta"));
+        // Other near-misses that must not match either.
+        assert!(!is_default_prefix("/v10"));
+        assert!(!is_default_prefix("/v1-legacy"));
+        assert!(!is_default_prefix("/v2/messages"));
+        assert!(!is_default_prefix(""));
+        assert!(!is_default_prefix("/"));
+    }
+
+    #[test]
     fn dialect_defaults() {
         assert_eq!(dialect_default(Dialect::OpenAI), "openai");
         assert_eq!(dialect_default(Dialect::Anthropic), "anthropic");
@@ -267,12 +370,76 @@ mod tests {
     }
 
     #[test]
+    fn dialect_parse_config_accepts_known_case_insensitive() {
+        assert_eq!(Dialect::parse_config("openai"), Some(Dialect::OpenAI));
+        assert_eq!(Dialect::parse_config("OpenAI"), Some(Dialect::OpenAI));
+        assert_eq!(Dialect::parse_config("anthropic"), Some(Dialect::Anthropic));
+        assert_eq!(Dialect::parse_config("Anthropic"), Some(Dialect::Anthropic));
+        assert_eq!(Dialect::parse_config("bogus"), None);
+        assert_eq!(Dialect::parse_config(""), None);
+    }
+
+    #[test]
+    fn auth_scheme_parse_config_accepts_known_variants() {
+        assert_eq!(AuthScheme::parse_config("bearer"), Some(AuthScheme::Bearer));
+        assert_eq!(AuthScheme::parse_config("Bearer"), Some(AuthScheme::Bearer));
+        assert_eq!(
+            AuthScheme::parse_config("x-api-key"),
+            Some(AuthScheme::XApiKey)
+        );
+        assert_eq!(
+            AuthScheme::parse_config("xapikey"),
+            Some(AuthScheme::XApiKey)
+        );
+        assert_eq!(
+            AuthScheme::parse_config("x_api_key"),
+            Some(AuthScheme::XApiKey)
+        );
+        assert_eq!(AuthScheme::parse_config("bogus"), None);
+    }
+
+    #[test]
+    fn auth_scheme_parse_config_accepts_api_key_for_azure() {
+        // Task #8 (pi-parity): Azure OpenAI's `api-key` header, config-added-provider spelling.
+        assert_eq!(
+            AuthScheme::parse_config("api-key"),
+            Some(AuthScheme::ApiKey)
+        );
+        assert_eq!(
+            AuthScheme::parse_config("API-KEY"),
+            Some(AuthScheme::ApiKey)
+        );
+        assert_eq!(AuthScheme::parse_config("apikey"), Some(AuthScheme::ApiKey));
+        assert_eq!(
+            AuthScheme::parse_config("api_key"),
+            Some(AuthScheme::ApiKey)
+        );
+        // Must NOT collide with x-api-key's own normalized spelling.
+        assert_ne!(
+            AuthScheme::parse_config("api-key"),
+            AuthScheme::parse_config("x-api-key")
+        );
+    }
+
+    #[test]
     fn auth_scheme_formats_and_headers() {
         assert_eq!(AuthScheme::Bearer.header(), "authorization");
         assert_eq!(AuthScheme::XApiKey.header(), "x-api-key");
         assert_eq!(AuthScheme::Bearer.format("k"), "Bearer k");
         // Anthropic wants the bare key (no `Bearer`). Getting this wrong → upstream 401.
         assert_eq!(AuthScheme::XApiKey.format("k"), "k");
+        // Azure OpenAI: bare key (no `Bearer`) in its own `api-key` header — Task #8.
+        assert_eq!(AuthScheme::ApiKey.header(), "api-key");
+        assert_eq!(AuthScheme::ApiKey.format("k"), "k");
+        // Cloudflare AI Gateway: a `Bearer`-prefixed value in a differently-named header — Task #24.
+        assert_eq!(
+            AuthScheme::CustomHeader("cf-aig-authorization").header(),
+            "cf-aig-authorization"
+        );
+        assert_eq!(
+            AuthScheme::CustomHeader("cf-aig-authorization").format("k"),
+            "Bearer k"
+        );
     }
 
     #[test]
@@ -301,5 +468,26 @@ mod tests {
             None,
         );
         assert!(a.pool_auth_value.is_none());
+    }
+
+    #[test]
+    fn resolve_azure_config_added_provider_uses_bare_api_key_header() {
+        // Task #8 (pi-parity): a config-added Azure provider (`provider_auth_schemes.azure =
+        // "api-key"`) must produce a bare key (no `Bearer`) as the managed auth value, sent in
+        // `api-key` — matching Azure's real wire (see `AuthScheme::ApiKey`'s doc comment).
+        let azure = Provider::resolve(
+            "azure",
+            "my-resource.openai.azure.com:443".to_string(),
+            Dialect::OpenAI,
+            AuthScheme::ApiKey,
+            Some("azure-secret"),
+            ProviderMetrics::disconnected(),
+            None,
+        );
+        assert_eq!(azure.auth.header(), "api-key");
+        assert_eq!(
+            azure.pool_auth_value.as_ref().unwrap().expose(),
+            "azure-secret"
+        );
     }
 }

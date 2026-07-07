@@ -15,6 +15,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: jdx/mise-action@v2
+      # Belt-and-suspenders: a restored mise tool cache can hand back a rust toolchain without the
+      # components mise.toml requests (rustfmt/clippy) even though mise itself reports everything
+      # installed — dprint's `rustfmt --edition 2024` exec command then fails with "rustfmt is not
+      # installed for the toolchain". `rustup component add` is idempotent (a no-op if already
+      # present), so this is always safe to run, cache hit or not.
+      - run: rustup component add rustfmt clippy
       - uses: Swatinem/rust-cache@v2
       # Formatting: dprint (config/json/etc) + rustfmt.
       - run: mise check:fmt

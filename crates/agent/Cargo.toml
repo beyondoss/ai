@@ -18,17 +18,103 @@ workspace = true
 async-trait.workspace = true
 beyond-ai-agent-core = { path = "../agent-core" }
 clap.workspace = true
+# Draining a `ToolProgress` sink for `serve`'s host-level `bash` RPC command — the same channel type
+# `agent_core::ToolProgress` is built on, so we poll it directly rather than adapting between channel
+# flavors.
+futures.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+# `skills.rs`'s `SKILL.md`/prompt-template frontmatter parsing — a real YAML parser instead of a
+# hand-rolled subset, so quoting/escaping/comments/flow-collections/anchors are handled the way the
+# YAML spec (and every other tool reading these files) actually defines them. Already resolved
+# transitively at this exact version (pingora-core → crates/gateway) — this crate depending on it
+# directly adds nothing to the build graph.
+serde_yaml = "0.9"
+thiserror.workspace = true
 tokio.workspace = true
+# Login cancellation (`oauth`'s device-code poll / callback-server wait) — same primitive `agent_core`
+# already pulls in for run/turn/tool abort.
+tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
-# Coding tools: gitignore-aware walking (ripgrep's `ignore`), regex search (`grep`), glob matching
-# (`find`) — the same crates ripgrep/fd are built on.
+# The `oauth` module's direct HTTP calls to each provider's own OAuth endpoints (claude.ai,
+# github.com, auth.openai.com) — a separate network surface from `GatewayClient`'s gateway traffic
+# (agent_core never talks to a provider directly). Same version as agent_core's own pin so the
+# workspace build graph gains nothing new from this crate depending on it directly too. `form` is
+# needed for the several form-encoded OAuth endpoints (GitHub's device/token endpoints, Codex's
+# token endpoint) alongside the JSON ones.
+# Fills the PKCE verifier / Codex's CSRF state with cryptographically random bytes — same crate/pin
+# `crates/gateway/src/state.rs` already uses for its own instance token. `std` is needed so
+# `getrandom::Error` implements `std::error::Error` (for `OAuthError`'s `#[from]`) — gateway's own use
+# never needed that impl, so its plain `"0.3"` pin didn't need the feature.
+getrandom = { version = "0.3", features = ["std"] }
+# OpenAI Codex's independent CSRF `state` token (`randomBytes(16).toString("hex")`). Already resolved
+# transitively at this exact version (pingora-cache → gateway).
+hex = "0.4"
+reqwest = { version = "0.13", default-features = false, features = ["json", "form"] }
+# PKCE code_challenge (SHA-256 of the verifier). Already resolved transitively at this exact version
+# (ed25519-dalek → gateway) — this crate depending on it directly adds nothing to the build graph.
+sha2 = "0.10"
+# The one-shot local HTTP server for the Anthropic/Codex-browser PKCE callback (fixed ports
+# 53692/1455) — a single blocking `recv_timeout` loop needs no `Service`/executor wiring, unlike
+# `hyper`/`axum`, and is far lighter than pulling in `pingora` (a full L7 proxy) for a listener that
+# lives for exactly one request.
+tiny_http = "0.12"
+# Parses the local callback's query string (code/state/error) and the manual-paste fallback's
+# `code=&state=`/full-redirect-URL input. Already resolved transitively via `reqwest`.
+url = "2"
+# Zeroize-on-drop for `auth_store::Secret` (OAuth access/refresh tokens held at rest). Same crate/
+# version `agent_core::client::ApiKey` already uses for the identical purpose.
+zeroize = "1"
+
+# Global allocator — mimalloc, the fleet default (cf. `edge`). Floor bumped to 0.1.52 so we pull
+# libmimalloc-sys >= 0.1.49, which bundles and defaults to mimalloc **v3** (the `v2` feature is an
+# opt-*out*; we don't set it). Also sidesteps musl's slow multithreaded malloc for the static build.
+mimalloc = { version = "0.1.52", default-features = false }
+
+# Coding tools, built on ripgrep's own engine crates: gitignore-aware walking (`ignore`), the
+# line/byte searcher with binary detection + mmap (`grep-searcher`) driven by a regex matcher
+# (`grep-regex`), and glob matching (`globset`). `grep` links ripgrep's searcher in-process rather
+# than shelling out to `rg` (what pi does) — so it handles non-UTF-8/binary files correctly and skips
+# the subprocess spawn. `regex` remains for `regex::escape` (literal mode) and `find`'s needs.
 globset = "0.4"
+grep-regex = "0.1"
+grep-searcher = "0.1"
 ignore = "0.4"
 regex = "1"
 
+# `edit`'s fuzzy fallback matcher: NFKC folding so a model's reconstructed `old_string` (smart quotes,
+# full-width/ligature chars) still lands against the on-disk bytes.
+unicode-normalization = "0.1"
+
+# Every filesystem tool's `path` normalization: decoding a `file://` URL argument (`tools::normalize_path`)
+# needs the same percent-decoding `fileURLToPath` does. Already present transitively (`reqwest`/`url`);
+# depended on directly since we call its API, not just link it incidentally.
+percent-encoding = "2"
+
+# `read` base64-encodes image files so the multimodal model can see them (e.g. a screenshot).
+base64 = "0.22"
+# `read`'s image pipeline: magic-byte format sniffing (`guess_format`) and Lanczos3 downscaling for an
+# oversized image, so it fits the base64 budget instead of being refused outright. `default-features =
+# false` drops the `rayon`/AVIF/EXR/etc. formats we never decode; only the four raster formats `read`
+# actually accepts are enabled.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+
+# `export_html`'s markdown rendering (headers/bold/lists/code fences) for message text — pure Rust, no
+# vendored JS. Deliberately not paired with a syntax-highlighting crate (e.g. `syntect`): that pulls in
+# several MB of bundled syntax/theme data and would slow every build of this CLI, including `run`/
+# `serve`, which never touch export — see export.rs's module doc comment.
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+
 [dev-dependencies]
 # Scratch files/dirs for the file-tool tests.
+# Bench harness for the search tools. `divan` (the gateway's `bench:unit` pin) measures **allocations**
+# (via its `AllocProfiler` global allocator) alongside timing — so the search bench proves both the
+# speed and the allocation cost of our in-process engine vs shelling out to `rg` (pi's approach).
+divan = "0.1"
 tempfile = "3"
+
+[[bench]]
+name = "search"
+harness = false

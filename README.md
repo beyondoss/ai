@@ -105,3 +105,8 @@ mise run bench               # unit micro-benchmarks + end-to-end throughput
 ## Architecture
 
 [ARCHITECTURE.md](ARCHITECTURE.md) — request flow, module map, key invariants.
+
+## Third-Party Notices
+
+The agent crates are modeled on [pi](https://github.com/badlogic/pi-mono) (MIT, Mario
+Zechner). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for its license text.

@@ -69,6 +69,14 @@ run = "cargo bench --bench unit"
 description = "A-1 end-to-end bench: real beyond-ai binary + nats-server + mock upstream over HTTP."
 run = "cargo bench --bench e2e"
 
+[tasks."bench:decode"]
+description = "divan micro-bench of the SSE decode hot path (framing + per-dialect decode + pipeline): timing + native allocation counts."
+run = "cargo bench -p beyond-ai-agent-core --bench decode"
+
+[tasks."bench:decode:concurrent"]
+description = "Decode concurrency-scaling probe (allocator-contention evidence gate). Add `--features bench-mimalloc` for the control run on a sharded allocator."
+run = "cargo bench -p beyond-ai-agent-core --bench decode_concurrent"
+
 [tasks."bench"]
 description = "Run both bench harnesses (unit micro + e2e macro)."
 depends = ["bench:unit", "bench:e2e"]

@@ -38,6 +38,17 @@ shutdown_runtime_timeout_secs = 10
 
 # upstream_tls = true   # set false only for a plaintext mock (tests)
 
+# Prefer HTTP/2 (H2H1 ALPN, falling back to H1) to the upstream provider. On by default — every known
+# provider offers h2 over TLS, and it multiplexes many requests over fewer sockets/TLS handshakes from
+# our egress IPs. Set false to force all-H1 (e.g. if a provider's h2 stack misbehaves) without a
+# redeploy. Only consulted over TLS; a plaintext upstream (the mock) is always H1 regardless.
+# upstream_http2 = true
+
+# Verify the upstream's TLS certificate (and that it matches the SNI). Leave true everywhere in
+# production; the only intended `false` is the e2e concurrency bench's self-signed TLS mock. Never set
+# this false against a real provider.
+# upstream_verify_cert = true
+
 # Per-credential request-rate ceiling (requests/sec) — a blast-radius circuit breaker, not a spend
 # control (the deny-set owns spend). Caps how fast one credential (managed virtual key ≈ a tenant+app,
 # or a BYO token) can drive the gateway, bounding a leaked/runaway key during the deny-set's reaction
@@ -67,13 +78,53 @@ circuit_breaker_reset_secs = 30
 byo_rate_limit_rps = 1000
 
 # Optional per-provider upstream authority (host:port), BY PROVIDER NAME. For a known provider this
-# overrides its built-in default; for an unknown name it ADDS a new OpenAI-wire provider, then
-# reachable at `/{name}/…` (the provider is the first path segment of the request). Known providers
-# (zero-config defaults): openai, anthropic, openrouter, fireworks, groq, deepseek, together,
-# cerebras, mistral, xai.
+# overrides its built-in default; for an unknown name it ADDS a new provider, then reachable at
+# `/{name}/…` (the provider is the first path segment of the request). Known providers (zero-config
+# defaults): openai, anthropic, openrouter, fireworks, groq, deepseek, together, cerebras, mistral, xai.
 # [provider_authorities]
 # openai = "api.openai.com:443"
 # my-self-hosted = "llm.internal:8443"
+# minimax = "api.minimax.io:443"
+# fireworks-anthropic = "api.fireworks.ai:443"
+
+# A config-added provider (name not in the known set above) defaults to OpenAI-wire + Bearer auth.
+# Set these, BY PROVIDER NAME, to add an Anthropic-wire vendor instead (e.g. pi's MiniMax,
+# MiniMax-CN, Kimi-Coding all speak the Anthropic Messages wire). An unrecognized value is a hard
+# boot failure, not a silent fallback — getting this wrong silently zero-bills every request.
+# [provider_dialects]
+# minimax = "anthropic"       # "openai" (default) | "anthropic"
+# fireworks-anthropic = "anthropic"
+# [provider_auth_schemes]
+# minimax = "x-api-key"       # "bearer" (default) | "x-api-key" | "api-key"
+# fireworks-anthropic = "x-api-key"
+
+# Azure OpenAI (Task #8, pi-parity): a per-resource host — never a KNOWN_PROVIDERS row (see
+# route::AuthScheme's doc comment) — added the same way as any other config-only provider, with
+# `provider_auth_schemes.azure = "api-key"` for Azure's bare-key `api-key` header (no `Bearer`
+# prefix; see pi's `packages/ai/src/api/azure-openai-responses.ts`, whose `AzureOpenAI` SDK client
+# always authenticates this way). The client reaches it at `/azure/openai/v1/…` — Azure's current
+# unified "v1" API surface (`https://{resource}.openai.azure.com/openai/v1/responses`, model id =
+# the deployment name) — forwarded verbatim, same as every other provider here.
+# [provider_authorities]
+# azure = "my-resource.openai.azure.com:443"
+# [provider_auth_schemes]
+# azure = "api-key"
+# [pool_keys]
+# azure = "<azure-api-key>"          # or AI_POOL_KEY_AZURE in production
+
+# Example: Fireworks' KNOWN_PROVIDERS row is fixed at OpenAI-dialect + Bearer for its
+# `/inference/v1/chat/completions` endpoint (docs: https://docs.fireworks.ai/tools-sdks/openai-compatibility) —
+# that's correct for its OpenAI-wire models, but most of Fireworks' current catalog (DeepSeek, GLM,
+# Kimi, MiniMax, Qwen, …) is actually served over Fireworks' Anthropic-Messages-wire endpoint at the
+# *same host*, `https://api.fireworks.ai/inference`, authenticated via `x-api-key` (not Bearer) — see
+# pi's `packages/ai/src/providers/fireworks.models.ts`. A known provider's dialect/auth is fixed in
+# code and never overridable from config, so route Anthropic-wire Fireworks models through a second,
+# config-added provider alias instead — combine the three tables above (uncomment all three
+# `fireworks-anthropic` lines) and add a pool key under `[pool_keys] fireworks-anthropic = "fw-..."`.
+# The client then reaches those models at `/fireworks-anthropic/v1/messages`; Fireworks' own
+# `/inference/v1/chat/completions` OpenAI-wire models stay on the built-in `fireworks` provider. Zero
+# code change — this is purely config, and it's the officially recommended way to add an
+# Anthropic-wire vendor at a host the gateway already knows.
 
 # Managed Beyond pool keys, BY PROVIDER NAME. Inject via SSM-backed env in production
 # (AI_POOL_KEY_OPENAI, AI_POOL_KEY_GROQ, …) rather than this file; env wins over any value here.
@@ -82,6 +133,7 @@ byo_rate_limit_rps = 1000
 # openai = "sk-..."
 # anthropic = "sk-ant-..."
 # fireworks = "fw-..."
+# fireworks-anthropic = "fw-..."   # same Fireworks account key, second alias — see provider_authorities above
 
 # Trusted Ed25519 signing PUBLIC keys (kid -> base64). Multiple for zero-downtime rotation.
 # Managed virtual keys (bai_…) are verified against these; BYO raw tokens skip verification.

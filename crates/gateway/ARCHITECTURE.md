@@ -36,7 +36,7 @@ Client (stock OpenAI/Anthropic SDK)
   │
   ▼  request_filter (proxy.rs)
   │  ├─ Route: first segment → provider row (authority, dialect, auth scheme)
-  │  ├─ Extract key from Authorization: Bearer or x-api-key
+  │  ├─ Extract key: x-api-key / api-key / x-goog-api-key / Authorization Bearer / ?key= query param
   │  ├─ Rate guardrails (BEFORE verify — keeps forged-key floods at ns cost)
   │  │    per-credential count-min  ──────────────────────────────► 429
   │  │    global BYO aggregate (managed exempt)  ─────────────────► 429
@@ -57,9 +57,11 @@ Client (stock OpenAI/Anthropic SDK)
   │  TCP connect fail (retry 2×) ──────────────────────────────── 502
   │
   ▼  upstream_request_filter (proxy.rs)
-  │  Managed: remove both auth headers → inject pool key
+  │  Managed: remove every static-key header (authorization, x-api-key, api-key,
+  │    x-goog-api-key) → inject pool key in the provider's own scheme
   │  BYO: leave auth header unchanged
   │  Set Host; forward path verbatim (/{provider} prefix stripped)
+  │  OpenRouter + managed only: dashboard-attribution headers (HTTP-Referer, X-OpenRouter-*)
   │
   ▼  request_body_filter (proxy.rs)  — body streamed through, never buffered
   │  Feed chunks → ModelScanner (peek.rs) — extract root-level `model`, O(1) mem
@@ -80,7 +82,7 @@ Client (stock OpenAI/Anthropic SDK)
   │
   ▼  logging (proxy.rs)
      Parse usage from tail (by dialect + streaming flag)
-     Emit ai.usage fact: tenant, vpc, model, requested_model, token counts (managed only)
+     Emit ai.usage fact: tenant, vpc, model, requested_model, token counts + reasoning breakout (managed only)
      Record circuit-breaker outcome (once): 5xx / connect-fail → failure; else → success (429 incl.)
      Decrement requests_in_flight gauge
 ```
@@ -106,16 +108,26 @@ NATS (blackhole.* KV entries)
 
 ### Routing (`route.rs`)
 
-Providers are **data rows**, not code paths. `KNOWN_PROVIDERS` in `route.rs` lists 10 built-in
+Providers are **data rows**, not code paths. `KNOWN_PROVIDERS` in `route.rs` lists 11 built-in
 providers (openai, anthropic, openrouter, fireworks, groq, deepseek, together, cerebras, mistral,
-xai); each row carries its authority (host:port), dialect (OpenAI-wire vs Anthropic-wire), and auth
-scheme (Bearer vs x-api-key). The `provider_authorities` config key adds or overrides rows at boot
-with zero code change.
+xai, openai-codex); each row carries its authority (host:port), dialect (OpenAI-wire vs
+Anthropic-wire), and auth scheme (`Bearer`, `x-api-key`, or `api-key`). The `provider_authorities`
+config key adds or overrides rows at boot with zero code change; `provider_dialects`/
+`provider_auth_schemes` set the dialect/auth scheme for a **config-added** provider (default
+OpenAI/Bearer for backward compatibility — see Configuration). A known provider's dialect/scheme is
+always fixed in `KNOWN_PROVIDERS`, never overridable from config. This is how Azure OpenAI is
+supported: its per-resource host isn't knowable at compile time, so it's always config-added
+(`provider_authorities.azure = "..."` + `provider_auth_schemes.azure = "api-key"`), never a
+`KNOWN_PROVIDERS` row — see `config.example.toml` and the AWS SigV4 section below for the same
+pattern applied to Bedrock's bearer-token mode.
 
 The routing rule: **first path segment = provider name**. `/groq/openai/v1/chat/completions` routes
-to Groq and forwards `/openai/v1/chat/completions` verbatim. A bare `/v1/…` path matches the
-dialect default (OpenAI or Anthropic based on which default is set). Unknown segment → 404. Model
-is not known at peer-selection time and is never used for routing.
+to Groq and forwards `/openai/v1/chat/completions` verbatim. A bare path that is _exactly_ `/v1` or
+starts with `/v1/` (boundary-checked — `route::is_default_prefix`, not a raw string-prefix test)
+matches the dialect default (OpenAI or Anthropic based on which default is set); a lookalike like
+Google Gemini's `/v1beta/…` does **not** qualify and 404s as an unknown provider instead of being
+silently absorbed into the OpenAI default. Unknown segment → 404. Model is not known at
+peer-selection time and is never used for routing.
 
 ### Identity (`key.rs`)
 
@@ -152,16 +164,29 @@ when the snapshot is newer than the downstream price table.
 
 The tail tap feeds the parser after `logging` fires. Two dialects:
 
-| Dialect   | Format     | Fields                                                                                                            |
-| --------- | ---------- | ----------------------------------------------------------------------------------------------------------------- |
-| OpenAI    | JSON body  | `usage.prompt_tokens`, `usage.completion_tokens`, `usage.prompt_tokens_details.cached_tokens`                     |
-| OpenAI    | SSE stream | Terminal `data:` line (before `[DONE]`), same fields                                                              |
-| Anthropic | JSON body  | `usage.input_tokens`, `usage.output_tokens`, `usage.cache_read_input_tokens`, `usage.cache_creation_input_tokens` |
-| Anthropic | SSE stream | `message_delta` event with `usage` block                                                                          |
+| Dialect   | Format     | Fields                                                                                                                                                           |
+| --------- | ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| OpenAI    | JSON body  | `usage.prompt_tokens`, `usage.completion_tokens`, `usage.prompt_tokens_details.cached_tokens`, `usage.completion_tokens_details.reasoning_tokens`                |
+| OpenAI    | SSE stream | Terminal `data:` line (before `[DONE]`), same fields (Responses API: nested `response.usage`, `output_tokens_details.reasoning_tokens`)                          |
+| Anthropic | JSON body  | `usage.input_tokens`, `usage.output_tokens`, `usage.cache_read_input_tokens`, `usage.cache_creation_input_tokens`, `usage.output_tokens_details.thinking_tokens` |
+| Anthropic | SSE stream | `message_delta` event with `usage` block (thinking tokens on the same block)                                                                                     |
 
-Missing or zero usage fields deserialize to zero (safe default). If the tail is truncated by the
-compaction drain, the usage chunk is still present because SSE usage is always the final `data:`
-line and the tail keeps the last 64KB.
+Missing or zero usage fields deserialize to zero (safe default) — **except** `reasoning_tokens`
+(`Usage::reasoning_tokens: Option<u64>`), which stays `None` when the provider didn't report it at
+all, distinct from `Some(0)` when it reported a real zero; that distinction is unrecoverable once the
+request completes, so it's never collapsed to a bare zero. If the tail is truncated by the compaction
+drain, the usage chunk is still present because SSE usage is always the final `data:` line and the
+tail keeps the last 64KB.
+
+**Dialect-mismatch guard:** a config-added provider whose `provider_dialects` value doesn't match its
+actual wire (e.g. an Anthropic-wire vendor left at the default OpenAI dialect) would otherwise have
+its `usage` block parsed by the wrong dialect's parser. Because both parsers' fields are
+`#[serde(default)]`, that misparse used to succeed silently — every field defaults to zero, producing
+`Some(Usage::default())`: a zero-token billing row indistinguishable from a real (and wrong)
+zero-usage response. `openai_body`/`openai_stream` and `anthropic_body`/`anthropic_stream` now check
+for the _other_ dialect's characteristic field names (Anthropic's `input_tokens`/`output_tokens` vs
+OpenAI's `prompt_tokens`/`completion_tokens`) before accepting a parse, and return `None` on a match —
+tripping `usage_parse_errors_total` (see Metrics) instead of a silent zero-billing row.
 
 ### Deny-Set (`deny.rs`)
 
@@ -258,6 +283,82 @@ returns 401 if the token is invalid — the client sees the same rejection it wo
 just routed through the gateway. Adding a gateway-side preflight check would double the latency for
 every BYO request on the error path with no security benefit at the gateway layer.
 
+### Why AWS SigV4 (Bedrock's default credential chain) is not supported
+
+`AuthScheme` has four variants — `Bearer`, `XApiKey`, `ApiKey` (Azure OpenAI's bare-key `api-key`
+header), and `CustomHeader` (a `Bearer`-prefixed value in a differently-named header — Cloudflare AI
+Gateway's `cf-aig-authorization` shape; added for the header format's sake but not yet wired to any
+built-in or config-added provider, since Cloudflare's own base URL is templated per account+gateway
+id, a routing shape this gateway's one-fixed-authority-per-provider-name model doesn't express) —
+because every supported provider authenticates with a **static credential string** that the gateway
+can swap verbatim into a header. Bedrock's default AWS credential chain (access keys, `AWS_PROFILE`,
+the ECS task role, a web identity token) doesn't work that way: each request is signed with
+**SigV4**, a signature computed over the method, path, headers, timestamp, and a hash of the body,
+using credentials the _signer_ holds. There is no static string to swap in — the signature is
+derived fresh, per request, from the exact bytes being sent.
+
+That's structurally incompatible with a byte-relay-plus-key-swap gateway. Supporting it for real
+would mean the gateway holds AWS credentials itself and **re-signs every relayed request** — a
+SigV4 implementation covering canonical request construction, credential-scope derivation, and
+clock-skew handling, running per-request server-side. That's a materially different feature (an AWS
+signing proxy), not a config knob or a small patch to `AuthScheme`, and it doesn't fit this gateway's
+"provider is a data row" model, where adding a vendor is a struct literal, not a signing engine. We
+deliberately do not bolt on a partial implementation (e.g. accepting only unsigned requests, or
+signing with a fixed clock skew) — a SigV4 gateway that's subtly wrong fails silently at the provider
+with a cryptic signature-mismatch 403, which is worse than not supporting the mode at all.
+
+**`AWS_BEARER_TOKEN_BEDROCK` mode solves the auth half only — it does not make Bedrock a working
+route.** Bedrock also accepts a plain long-lived bearer token (no signing), which is exactly the
+`Bearer`/`XApiKey` shape this gateway already handles as a config-added provider (see
+`provider_authorities`/`provider_dialects` in Configuration), so a bearer-token credential _authenticates_
+cleanly. But authenticating is not the same as completing a turn: there is zero Bedrock Converse/
+Converse-Stream **wire-format** code anywhere in this gateway or in `agent-core`'s dialects (`grep -ri
+bedrock` across both turns up only prose and error-message pattern-matching, never a request/response
+shape). Bedrock's request body isn't Anthropic's `/v1/messages` shape and its response isn't SSE — it's
+AWS's own binary `application/vnd.amazon.eventstream` framing, which this gateway's usage extractor and
+every agent-core dialect decoder assume is never what arrives. Configuring `provider_dialects.bedrock =
+"anthropic"` today would relay a request the provider rejects (wrong body shape) or, if that were
+somehow fixed client-side, a response this stack can't parse at all (wrong stream framing) — an operator
+following this doc's bearer-token instructions alone gets a route that passes auth and then fails to
+complete a turn, not a working Bedrock integration. Full support needs both the SigV4 signing infra
+described above (for the default credential chain) _and_ a dedicated Bedrock wire dialect (Converse-API
+request mapping, event-stream response decoding) — neither exists, and building the latter without the
+former only covers Bedrock's less common auth mode. Out of proportion for this pass; revisit as a
+dedicated feature if Bedrock support is ever prioritized.
+
+### Why OpenAI Codex traffic only ever goes over HTTP+SSE, never WebSocket
+
+pi's own Codex client (`openai-codex-responses.ts`) defaults `transport` to `"auto"`, which _prefers_ a
+persistent WebSocket connection and only falls back to HTTP+SSE on a connection-limit error or a
+transport failure — pi treats WebSocket as its primary, tested path, not a fallback. Beyond's agent-core
+client only ever speaks HTTP+SSE to Codex (`GatewayClient::send_with_retry`); there is no WebSocket
+transport at all.
+
+This was evaluated and deliberately deferred, not overlooked. Two independent reasons, either one
+sufficient on its own:
+
+- **Client-side**: pi's WebSocket path is a substantial subsystem (~1000+ lines in
+  `openai-codex-responses.ts` alone) — per-session connection caching and reuse, reconnect/continuation
+  state across turns, a connection-limit-reached retry loop, its own header construction and binary/text
+  frame parsing for the Responses event stream, and a proxy-aware `WebSocket` constructor shim. It would
+  also be a new runtime dependency (a WebSocket client crate) agent-core doesn't currently have, and a
+  materially different request/response lifecycle than the current one-shot-per-turn `send_with_retry`
+  path (a long-lived, session-scoped connection instead of a fresh request per turn). Disproportionate
+  next to the HTTP+SSE path already working and covered by tests.
+- **Gateway-side**: Codex traffic that goes through this gateway at all uses `RouteOverride::Prefixed`
+  (the `/openai-codex` `KNOWN_PROVIDERS` row) — still relayed through Pingora, not bypassed like
+  Copilot's `RouteOverride::Direct`. This gateway has no WebSocket-upgrade proxying (no `Connection:
+  Upgrade`/`101 Switching Protocols` handling anywhere in `src/`); it is an HTTP request/response (and
+  SSE-response) relay only. A client-side WebSocket transport for Codex could not be relayed through this
+  gateway as-is — it would have to bypass the gateway entirely (a Copilot-style `Direct` route straight
+  to `chatgpt.com`'s WebSocket endpoint), sidestepping this gateway's pooling, metering, and rate-limiting
+  for that traffic, which is a real behavior change beyond just "add a transport option."
+
+Net: HTTP+SSE is a real, working, tested path (pi's own fallback, not a hack), and building the
+WebSocket path properly requires both a nontrivial client-side subsystem and a gateway-side proxying
+capability that doesn't exist. Revisit if Codex's HTTP+SSE path is ever observed to hit the
+connection-limit ceiling pi's WebSocket path exists to avoid.
+
 ### Why pricing is absent from the gateway
 
 The gateway emits token _facts_ (`ai.usage`): counts and model identifiers. Applying prices to
@@ -309,47 +410,51 @@ All fields configurable via `config.example.toml` and environment (`AI_` prefix,
 Secret-bearing fields (`pool_keys`, `nats_creds`) are held as `Secret<T>` — stray `Debug` or
 `Serialize` output redacts to `"***"` and the value is zeroized on drop (`secret.rs`).
 
-| Field                           | Default                           | Runtime Effect                                                                                                                                                                                         |
-| ------------------------------- | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `signing_keys`                  | _(required)_                      | Map of kid → base64 Ed25519 public key. Multiple kids enable rotation. Missing → all traffic falls through to BYO treatment.                                                                           |
-| `require_signing_keys`          | `false`                           | When `true`, an empty `signing_keys` is a hard boot failure instead of silent BYO-only mode. Set on managed deployments so a typo'd/absent SSM param fails fast rather than silently serving for free. |
-| `pool_keys.<name>`              | _(from `AI_POOL_KEY_<NAME>` env)_ | Real provider API key. Missing for a provider → managed requests to that provider return 503 before any upstream connection.                                                                           |
-| `provider_authorities.<name>`   | _(none)_                          | Override or add a provider's `authority` (host:port). Enables config-added providers beyond `KNOWN_PROVIDERS` with zero code change.                                                                   |
-| `snapshot_path`                 | _(unset)_                         | Path for the on-disk deny-set cache. Unset → re-scan NATS on every cold boot. Set → load from disk and enforce before NATS reconnects (edge/tunnel deployments).                                       |
-| `rate_limit_rps`                | `100`                             | Per-credential request ceiling (count-min, keyed on raw key hash). `0` disables. Exceeded → 429. Checked before Ed25519 verify.                                                                        |
-| `byo_rate_limit_rps`            | `1000`                            | Aggregate ceiling for all BYO traffic (single shared bucket). `0` disables. Managed traffic exempt. Exceeded → 429.                                                                                    |
-| `circuit_breaker_threshold`     | `20`                              | Per-provider upstream failures (5xx / connect; **not** 429) within the window before the breaker opens. While open, requests to that provider fast-fail with 503. `0` disables.                        |
-| `circuit_breaker_window_secs`   | `10`                              | Rolling window over which failures are counted (trips on a burst, not a slow trickle).                                                                                                                 |
-| `circuit_breaker_reset_secs`    | `30`                              | How long the breaker stays open before admitting a half-open probe. Probe success closes it; failure reopens it.                                                                                       |
-| `connect_timeout_secs`          | `10`                              | TCP connect timeout to the upstream provider. Exceeded → retry up to 2×, then 502.                                                                                                                     |
-| `read_timeout_secs`             | `600`                             | Response read timeout (10 min accommodates long-running LLM streams).                                                                                                                                  |
-| `write_timeout_secs`            | `60`                              | Upstream request-write timeout (sending the request to the provider).                                                                                                                                  |
-| `idle_timeout_secs`             | `90`                              | Idle timeout on a pooled upstream connection before it's closed.                                                                                                                                       |
-| `shutdown_grace_period_secs`    | `600`                             | SIGTERM drain window for in-flight requests (= `read_timeout_secs` so a deploy never truncates a stream). Capped by the orchestrator's stop timeout (ECS Fargate: 120s).                               |
-| `shutdown_runtime_timeout_secs` | `10`                              | Final runtime-teardown backstop after the drain window.                                                                                                                                                |
-| `nats_url`                      | `nats://localhost:4222`           | NATS server for the deny-set watcher. Unreachable → fail-open (deny-set stays empty or stale).                                                                                                         |
-| `nats_creds`                    | _(unset)_                         | NATS credentials file path. Required for authenticated clusters.                                                                                                                                       |
-| `listen_addr`                   | `0.0.0.0:8080`                    | Proxy listener address (client traffic).                                                                                                                                                               |
-| `metrics_listen`                | `0.0.0.0:9090`                    | Internal admin/observability listener: `/metrics` (Prometheus scrape), `/livez`, `/readyz`. Separate from the client listener — not externally reachable.                                              |
+| Field                           | Default                           | Runtime Effect                                                                                                                                                                                             |
+| ------------------------------- | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `signing_keys`                  | _(required)_                      | Map of kid → base64 Ed25519 public key. Multiple kids enable rotation. Missing → all traffic falls through to BYO treatment.                                                                               |
+| `require_signing_keys`          | `false`                           | When `true`, an empty `signing_keys` is a hard boot failure instead of silent BYO-only mode. Set on managed deployments so a typo'd/absent SSM param fails fast rather than silently serving for free.     |
+| `pool_keys.<name>`              | _(from `AI_POOL_KEY_<NAME>` env)_ | Real provider API key. Missing for a provider → managed requests to that provider return 503 before any upstream connection.                                                                               |
+| `provider_authorities.<name>`   | _(none)_                          | Override or add a provider's `authority` (host:port). Enables config-added providers beyond `KNOWN_PROVIDERS` with zero code change.                                                                       |
+| `provider_dialects.<name>`      | `"openai"`                        | Wire dialect for a **config-added** provider (`"openai"` or `"anthropic"`, case-insensitive). No effect on a known provider (dialect fixed in code). Unrecognized value → hard boot failure.               |
+| `provider_auth_schemes.<name>`  | `"bearer"`                        | Managed auth scheme for a **config-added** provider (`"bearer"`, `"x-api-key"`, or `"api-key"` — the last is Azure OpenAI's shape). No effect on a known provider. Unrecognized value → hard boot failure. |
+| `snapshot_path`                 | _(unset)_                         | Path for the on-disk deny-set cache. Unset → re-scan NATS on every cold boot. Set → load from disk and enforce before NATS reconnects (edge/tunnel deployments).                                           |
+| `rate_limit_rps`                | `100`                             | Per-credential request ceiling (count-min, keyed on raw key hash). `0` disables. Exceeded → 429. Checked before Ed25519 verify.                                                                            |
+| `byo_rate_limit_rps`            | `1000`                            | Aggregate ceiling for all BYO traffic (single shared bucket). `0` disables. Managed traffic exempt. Exceeded → 429.                                                                                        |
+| `circuit_breaker_threshold`     | `20`                              | Per-provider upstream failures (5xx / connect; **not** 429) within the window before the breaker opens. While open, requests to that provider fast-fail with 503. `0` disables.                            |
+| `circuit_breaker_window_secs`   | `10`                              | Rolling window over which failures are counted (trips on a burst, not a slow trickle).                                                                                                                     |
+| `circuit_breaker_reset_secs`    | `30`                              | How long the breaker stays open before admitting a half-open probe. Probe success closes it; failure reopens it.                                                                                           |
+| `connect_timeout_secs`          | `10`                              | TCP connect timeout to the upstream provider. Exceeded → retry up to 2×, then 502.                                                                                                                         |
+| `read_timeout_secs`             | `600`                             | Response read timeout (10 min accommodates long-running LLM streams).                                                                                                                                      |
+| `write_timeout_secs`            | `60`                              | Upstream request-write timeout (sending the request to the provider).                                                                                                                                      |
+| `idle_timeout_secs`             | `90`                              | Idle timeout on a pooled upstream connection before it's closed.                                                                                                                                           |
+| `shutdown_grace_period_secs`    | `600`                             | SIGTERM drain window for in-flight requests (= `read_timeout_secs` so a deploy never truncates a stream). Capped by the orchestrator's stop timeout (ECS Fargate: 120s).                                   |
+| `shutdown_runtime_timeout_secs` | `10`                              | Final runtime-teardown backstop after the drain window.                                                                                                                                                    |
+| `nats_url`                      | `nats://localhost:4222`           | NATS server for the deny-set watcher. Unreachable → fail-open (deny-set stays empty or stale).                                                                                                             |
+| `nats_creds`                    | _(unset)_                         | NATS credentials file path. Required for authenticated clusters.                                                                                                                                           |
+| `listen_addr`                   | `0.0.0.0:8080`                    | Proxy listener address (client traffic).                                                                                                                                                                   |
+| `metrics_listen`                | `0.0.0.0:9090`                    | Internal admin/observability listener: `/metrics` (Prometheus scrape), `/livez`, `/readyz`. Separate from the client listener — not externally reachable.                                                  |
 
 ---
 
 ## Failure Modes
 
-| Failure                                     | What Actually Happens                                                                                                                                                          | Recovery                                                                                                                                                                  |
-| ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| NATS unreachable at boot                    | Deny-set starts empty (fail-open). Auth still works — keys from config.                                                                                                        | Watcher reconnects; seeds from NATS or disk snapshot on connect.                                                                                                          |
-| NATS disconnects mid-run                    | Last-known deny-set stays active. New deny entries not applied until reconnect.                                                                                                | Watcher reconnects (1s→30s exponential backoff, reset on success) and resumes from saved revision — no re-scan.                                                           |
-| NATS history compacted past snapshot cursor | `CursorExpired` → full re-scan from current NATS state.                                                                                                                        | After re-scan, new cursor set; delta watch resumes normally.                                                                                                              |
-| Virtual key tampered or forged              | Ed25519 verify fails → falls through to BYO treatment. No billing event. No error reveals which part failed.                                                                   | Billing miss detectable downstream; no security boundary breach.                                                                                                          |
-| `signing_keys` absent (typo'd/missing SSM)  | Default: warn + BYO-only (silently drops all managed billing + deny-set). With `require_signing_keys=true`: hard boot failure.                                                 | Set `require_signing_keys=true` on managed deployments so the mis-deploy fails fast and visibly at boot.                                                                  |
-| Pool key missing for provider               | Managed request returns 503 before any upstream connection.                                                                                                                    | Add `AI_POOL_KEY_<NAME>` env and redeploy.                                                                                                                                |
-| Provider DNS fails                          | `upstream_peer` returns error → 502 to client.                                                                                                                                 | TTL-cached DNS (60s) serves stale; poisoned-lock guard re-resolves on next request.                                                                                       |
-| Provider TCP connect fails                  | `fail_to_connect` retries up to 2×, then returns 502. Counts as a circuit-breaker failure.                                                                                     | Client SDK retries with backoff. No HTTP-status retries (Pingora-idiomatic).                                                                                              |
-| Provider brownout (sustained 5xx)           | After `circuit_breaker_threshold` 5xx/connect failures in the window, the breaker opens; requests fast-fail 503 (`circuit_open`) instead of stalling against the read timeout. | Auto: after `circuit_breaker_reset_secs` a half-open probe is admitted — success closes the breaker, failure reopens it. Per-provider, so other providers are unaffected. |
-| Provider throttles (429 storm)              | Relayed to the client as 429; the client's `Retry-After` backoff applies. Does **not** trip the breaker (provider is healthy).                                                 | Backpressure via client + the rate guardrails; no gateway-side circuit action.                                                                                            |
-| Response body > 128KB before usage chunk    | Tail compaction fires: `drain(..half)` discards first half, keeps tail. Usage extracted from retained tail.                                                                    | No action — SSE usage is always in the final `data:` line, which always lands in the tail.                                                                                |
-| Gateway crash mid-request                   | In-flight request drops; client receives TCP close. No partial state written.                                                                                                  | Client SDK retries. No DB writes in the request path — no cleanup needed.                                                                                                 |
+| Failure                                                            | What Actually Happens                                                                                                                                                          | Recovery                                                                                                                                                                  |
+| ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| NATS unreachable at boot                                           | Deny-set starts empty (fail-open). Auth still works — keys from config.                                                                                                        | Watcher reconnects; seeds from NATS or disk snapshot on connect.                                                                                                          |
+| NATS disconnects mid-run                                           | Last-known deny-set stays active. New deny entries not applied until reconnect.                                                                                                | Watcher reconnects (1s→30s exponential backoff, reset on success) and resumes from saved revision — no re-scan.                                                           |
+| NATS history compacted past snapshot cursor                        | `CursorExpired` → full re-scan from current NATS state.                                                                                                                        | After re-scan, new cursor set; delta watch resumes normally.                                                                                                              |
+| Virtual key tampered or forged                                     | Ed25519 verify fails → falls through to BYO treatment. No billing event. No error reveals which part failed.                                                                   | Billing miss detectable downstream; no security boundary breach.                                                                                                          |
+| `signing_keys` absent (typo'd/missing SSM)                         | Default: warn + BYO-only (silently drops all managed billing + deny-set). With `require_signing_keys=true`: hard boot failure.                                                 | Set `require_signing_keys=true` on managed deployments so the mis-deploy fails fast and visibly at boot.                                                                  |
+| Pool key missing for provider                                      | Managed request returns 503 before any upstream connection.                                                                                                                    | Add `AI_POOL_KEY_<NAME>` env and redeploy.                                                                                                                                |
+| `provider_dialects`/`provider_auth_schemes` value unrecognized     | Hard boot failure (`GatewayError::Config`) naming the provider and the bad value.                                                                                              | Fix the typo — `"openai"`/`"anthropic"` and `"bearer"`/`"x-api-key"`/`"api-key"` are the only accepted values.                                                            |
+| Config-added provider's dialect misconfigured (wire doesn't match) | `usage::openai_body`/`anthropic_body` (and the stream variants) detect the other dialect's characteristic field names and return `None` instead of a zeroed `Usage`.           | `usage_parse_errors_total` fires + a `warn!` log; fix `provider_dialects.<name>` to match the vendor's actual wire.                                                       |
+| Provider DNS fails                                                 | `upstream_peer` returns error → 502 to client.                                                                                                                                 | TTL-cached DNS (60s) serves stale; poisoned-lock guard re-resolves on next request.                                                                                       |
+| Provider TCP connect fails                                         | `fail_to_connect` retries up to 2×, then returns 502. Counts as a circuit-breaker failure.                                                                                     | Client SDK retries with backoff. No HTTP-status retries (Pingora-idiomatic).                                                                                              |
+| Provider brownout (sustained 5xx)                                  | After `circuit_breaker_threshold` 5xx/connect failures in the window, the breaker opens; requests fast-fail 503 (`circuit_open`) instead of stalling against the read timeout. | Auto: after `circuit_breaker_reset_secs` a half-open probe is admitted — success closes the breaker, failure reopens it. Per-provider, so other providers are unaffected. |
+| Provider throttles (429 storm)                                     | Relayed to the client as 429; the client's `Retry-After` backoff applies. Does **not** trip the breaker (provider is healthy).                                                 | Backpressure via client + the rate guardrails; no gateway-side circuit action.                                                                                            |
+| Response body > 128KB before usage chunk                           | Tail compaction fires: `drain(..half)` discards first half, keeps tail. Usage extracted from retained tail.                                                                    | No action — SSE usage is always in the final `data:` line, which always lands in the tail.                                                                                |
+| Gateway crash mid-request                                          | In-flight request drops; client receives TCP close. No partial state written.                                                                                                  | Client SDK retries. No DB writes in the request path — no cleanup needed.                                                                                                 |
 
 ---
 
