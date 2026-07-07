@@ -449,11 +449,42 @@ mod tests {
         // written.
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("leaked");
+        let needle = dir.path().to_string_lossy().into_owned();
         let script = format!(
             "( sleep {}; echo leaked > {} ) & sleep 30",
             GRANDCHILD_DELAY.as_secs(),
             marker.display()
         );
+
+        // TEMP DIAGNOSTIC (pi-parity CI investigation, round 2): a background poller taking a full
+        // timestamped timeline of `ps` + marker existence from t=0 through well past SAFETY_WAIT,
+        // printed unconditionally at the end — round 1's single before/after snapshot proved the
+        // grandchild really does stay alive well past a merely-widened margin, so this round needs the
+        // *shape* of what happens over time, not just two data points.
+        let start = std::time::Instant::now();
+        let needle_poll = needle.clone();
+        let marker_poll = marker.clone();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log_writer = log.clone();
+        let poller = tokio::spawn(async move {
+            for _ in 0..30 {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let elapsed = start.elapsed();
+                let ps = std::process::Command::new("ps")
+                    .args(["-eo", "pid,ppid,pgid,stat,cmd"])
+                    .output()
+                    .ok()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                    .unwrap_or_default();
+                let matching: Vec<&str> = ps.lines().filter(|l| l.contains(&needle_poll)).collect();
+                let entry = format!(
+                    "t={elapsed:?} marker_exists={} procs={matching:?}",
+                    marker_poll.exists()
+                );
+                log_writer.lock().unwrap().push(entry);
+            }
+        });
+
         let res = RealRunner
             .run(
                 "sh",
@@ -464,9 +495,24 @@ mod tests {
             .await
             .unwrap();
         assert!(res.timed_out);
+        eprintln!(
+            "=== DIAG run() returned at t={:?}, timed_out={} ===",
+            start.elapsed(),
+            res.timed_out
+        );
 
         // Wait past when the grandchild would have written the marker; it must not exist.
         tokio::time::sleep(SAFETY_WAIT).await;
+        poller.abort();
+        eprintln!("=== DIAG timeline (needle={needle}) ===");
+        for line in log.lock().unwrap().iter() {
+            eprintln!("{line}");
+        }
+        eprintln!(
+            "=== DIAG marker exists at t={:?}: {} ===",
+            start.elapsed(),
+            marker.exists()
+        );
         assert!(
             !marker.exists(),
             "backgrounded grandchild survived the timeout — process group not killed"
