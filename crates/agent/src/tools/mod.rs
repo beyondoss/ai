@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use agent_core::{ToolError, ToolRegistry};
+use agent_core::{Tool, ToolError, ToolRegistry};
 
 pub mod bash;
 pub mod beyond;
@@ -14,6 +14,7 @@ pub mod exec;
 pub mod find;
 pub mod grep;
 pub mod ls;
+pub mod mcp;
 pub mod output;
 pub mod read;
 pub mod write;
@@ -422,6 +423,40 @@ pub fn default_registry_with_prefix_and_image_auto_resize(
     reg
 }
 
+/// Like [`default_registry_with_prefix_and_image_auto_resize`], additionally merging in `mcp_tools` —
+/// already-connected tools discovered from configured MCP servers (see [`mcp::connect_all`]),
+/// registered after every built-in tool — split out as its own function, rather than a fifth parameter
+/// on `default_registry_with_prefix_and_image_auto_resize` itself, so that function's existing call
+/// sites (and its own callers `default_registry_with_prefix`/`default_registry_with`/`default_registry`)
+/// are unaffected by this addition, matching this file's established convention for every prior knob
+/// added here.
+///
+/// `mcp_tools` is already-resolved, not a list of servers to connect here: connecting is inherently
+/// async (spawning a process / opening an HTTP connection, then a `tools/list` round trip), while this
+/// whole registry-construction call chain deliberately stays synchronous (see `tools::mcp`'s module doc
+/// comment for why). The two real call sites (`main.rs::run_task`, `serve.rs::build_tools`) each connect
+/// once, then pass the resulting `Vec<Arc<dyn Tool>>` in on every rebuild this function feeds — so a
+/// `serve` registry rebuild (`set_model`/`set_thinking`/...) reuses the already-connected MCP tools
+/// rather than reconnecting to every configured server on every rebuild.
+pub fn default_registry_with_prefix_image_auto_resize_and_mcp_tools(
+    bash_timeout_ms: Option<u64>,
+    bash_shell_path: Option<&str>,
+    bash_command_prefix: Option<&str>,
+    image_auto_resize: bool,
+    mcp_tools: &[Arc<dyn Tool>],
+) -> ToolRegistry {
+    let mut reg = default_registry_with_prefix_and_image_auto_resize(
+        bash_timeout_ms,
+        bash_shell_path,
+        bash_command_prefix,
+        image_auto_resize,
+    );
+    for tool in mcp_tools {
+        reg.register(tool.clone());
+    }
+    reg
+}
+
 /// Restrict a registry to an allow-list, a deny-list, or nothing at all — the CLI/RPC surface for
 /// scoping an agent's capabilities (e.g. a read-only reviewer with no `bash`/`edit`/`write`), which
 /// otherwise has no way to run with less than the full default tool set. `no_tools` wins outright
@@ -824,6 +859,58 @@ mod tests {
         ] {
             assert!(default_registry_with(None, None).get(name).is_some());
         }
+    }
+
+    /// A trivial stand-in for an [`mcp::McpTool`] — that type is crate-private and always backed by a
+    /// live connection, so tests exercising `default_registry_with_prefix_image_auto_resize_and_mcp_tools`
+    /// (which only cares that *some* `Arc<dyn Tool>` merges in under its own name) use this instead of
+    /// standing up a real MCP server.
+    struct FakeMcpTool(&'static str);
+    #[async_trait::async_trait]
+    impl Tool for FakeMcpTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "stand-in for an MCP-discovered tool"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+        async fn run(&self, _: serde_json::Value) -> Result<agent_core::ToolOutput, ToolError> {
+            Ok(self.0.into())
+        }
+    }
+
+    #[test]
+    fn default_registry_with_prefix_image_auto_resize_and_mcp_tools_merges_the_mcp_tools_in() {
+        let mcp_tools: Vec<Arc<dyn Tool>> =
+            vec![Arc::new(FakeMcpTool("mcp__filesystem__read_file"))];
+        let reg = default_registry_with_prefix_image_auto_resize_and_mcp_tools(
+            None, None, None, true, &mcp_tools,
+        );
+        // Every built-in is still there …
+        for name in [
+            "read", "write", "edit", "bash", "ls", "grep", "find", "fork", "sync", "logs",
+        ] {
+            assert!(reg.get(name).is_some(), "missing built-in tool: {name}");
+        }
+        // … plus the MCP-discovered one, under its already-namespaced name.
+        assert!(reg.get("mcp__filesystem__read_file").is_some());
+        assert_eq!(reg.len(), default_registry().len() + 1);
+    }
+
+    #[test]
+    fn default_registry_with_prefix_image_auto_resize_and_mcp_tools_with_no_servers_matches_plain_default()
+     {
+        let reg = default_registry_with_prefix_image_auto_resize_and_mcp_tools(
+            None,
+            None,
+            None,
+            true,
+            &[],
+        );
+        assert_eq!(reg.len(), default_registry().len());
     }
 
     #[test]

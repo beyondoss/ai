@@ -988,6 +988,24 @@ enum Command {
         /// `anthropic`, `github-copilot`, or `openai-codex`. Omit to report every known provider.
         provider: Option<String>,
     },
+    /// Interactively log into an MCP server's own OAuth 2.1 authorization flow (protected-resource
+    /// metadata discovery, dynamic client registration, PKCE) — for an `mcp_servers` entry using the
+    /// `http` transport that requires it. `name` must already be configured (global or, if trusted,
+    /// project `settings.json` — see `settings::Settings::mcp_servers`); a `stdio` server has no login
+    /// of its own (use its `env` for a static credential instead). Unlike `agent login`'s fixed
+    /// per-provider callback ports, this registers its own client against a freshly chosen local port
+    /// each run — there's no pre-registered redirect URI to reuse. Overwrites any existing stored
+    /// login for `name` on success only, mirroring `agent login`. See `tools::mcp`'s module doc
+    /// comment and `mcp_auth_store.rs` for how the resulting credential is used/persisted.
+    McpLogin {
+        /// The `mcp_servers` entry's own `name`, as configured in `settings.json`.
+        name: String,
+    },
+    /// Remove `name`'s stored MCP OAuth login, if any. Idempotent.
+    McpLogout {
+        /// The `mcp_servers` entry's own `name`.
+        name: String,
+    },
     /// View or update persisted defaults for `run`/`serve` flags — model, gateway URL, session
     /// directory — stored at `~/.claude/settings.json` (see `settings::SettingsStore`) and consulted as
     /// the last fallback after an explicit `--flag`/environment variable, before this crate's own
@@ -1759,6 +1777,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     None
                 }
             });
+            // Connected exactly once, here, before `serve`'s long-lived session loop starts — not
+            // re-done on every `set_model`/`set_thinking` registry rebuild (`build_tools` reads
+            // `cfg.mcp_tools` as already-resolved). Fail-soft: a server that fails to connect is
+            // skipped with a warning, matching `has_gated_resources`'s own "warn, don't block the run"
+            // convention in the `run` path above. `stored_settings.mcp_servers` is already trust-gated —
+            // see that field's own doc comment.
+            let (mcp_tools, mcp_warnings) =
+                tools::mcp::connect_all(stored_settings.mcp_servers.as_deref().unwrap_or(&[]))
+                    .await;
+            for warning in &mcp_warnings {
+                eprintln!("warning: {warning}");
+            }
             let shutdown_cause = serve::serve(serve::ServeConfig {
                 gateway: gateway_url
                     .or_else(|| stored_settings.default_gateway_url.clone())
@@ -1799,6 +1829,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tools,
                 exclude_tools,
                 no_tools,
+                mcp_tools,
                 sequential_tools,
                 deny_tool,
                 deny_bash_pattern,
@@ -1961,6 +1992,95 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Some(_) => "logged_in",
                 };
                 println!("{id}: {status}");
+            }
+        }
+        Command::McpLogin { name } => {
+            let cwd = canonical_cwd(&std::env::current_dir().unwrap_or_default());
+            let settings = beyond_ai_agent::settings::effective_settings_for_cwd(&cwd);
+            let servers = settings.mcp_servers.unwrap_or_default();
+            let server = servers.iter().find(|s| s.name == name).ok_or_else(|| {
+                format!(
+                    "no MCP server named `{name}` is configured (checked global and, if this \
+                     directory is trusted, project settings.json)"
+                )
+            })?;
+            let url = match &server.transport {
+                beyond_ai_agent::settings::McpTransport::Http { url, .. } => url.clone(),
+                beyond_ai_agent::settings::McpTransport::Stdio { .. } => {
+                    return Err(format!(
+                        "`{name}` uses the stdio transport, which has no OAuth login of its own — \
+                         configure a credential via its `env` instead"
+                    )
+                    .into());
+                }
+            };
+
+            let mut manager = rmcp::transport::auth::AuthorizationManager::new(&url)
+                .await
+                .map_err(|e| format!("failed to start MCP OAuth for `{name}`: {e}"))?;
+            let auth_store = beyond_ai_agent::mcp_auth_store::McpAuthStore::open_default();
+            manager.set_credential_store(auth_store.scoped(&name));
+            let metadata = manager.discover_metadata().await.map_err(|e| {
+                format!("`{name}` does not support MCP OAuth (or discovery failed): {e}")
+            })?;
+            manager.set_metadata(metadata);
+            let scopes = manager.select_scopes(None, &[]);
+            let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
+
+            // Dynamic client registration means we choose our own redirect URI (unlike `agent
+            // login`'s providers, each registered in advance against a fixed port) — pick a free
+            // local one, same small "check then reuse" window `agent trust`-adjacent tooling already
+            // accepts elsewhere in this codebase for a one-shot interactive command.
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .and_then(|l| l.local_addr())
+                .map_err(|e| format!("failed to allocate a local OAuth callback port: {e}"))?
+                .port();
+            let redirect_uri = format!("http://127.0.0.1:{port}/callback");
+
+            let session = rmcp::transport::auth::AuthorizationSession::new(
+                manager,
+                &scope_refs,
+                &redirect_uri,
+                Some("beyond-ai-agent"),
+                None,
+            )
+            .await
+            .map_err(|e| format!("failed to start MCP OAuth authorization for `{name}`: {e}"))?;
+            let auth_url = session.get_authorization_url().to_string();
+            let csrf_token = url::Url::parse(&auth_url)
+                .ok()
+                .and_then(|u| {
+                    u.query_pairs()
+                        .find(|(k, _)| k == "state")
+                        .map(|(_, v)| v.into_owned())
+                })
+                .ok_or("the generated authorization URL is missing its `state` parameter")?;
+
+            let listener =
+                beyond_ai_agent::oauth::callback_server::CallbackServer::bind("127.0.0.1", port)
+                    .map_err(|e| {
+                        format!("failed to bind the local OAuth callback listener: {e}")
+                    })?;
+            eprintln!("Open this URL in a browser to continue:\n\n  {auth_url}\n");
+            let cancel = agent_core::CancellationToken::new();
+            let code = listener
+                .wait_for_callback("/callback", csrf_token.clone(), cancel)
+                .await
+                .ok_or("login cancelled (no callback received)")?;
+            session
+                .handle_callback(&code, &csrf_token)
+                .await
+                .map_err(|e| format!("failed to complete MCP OAuth login for `{name}`: {e}"))?;
+            println!("logged in: {name}");
+        }
+        Command::McpLogout { name } => {
+            let store = beyond_ai_agent::mcp_auth_store::McpAuthStore::open_default();
+            let had_credential = store.has_credential(&name);
+            store.clear(&name)?;
+            if had_credential {
+                println!("logged out: {name}");
+            } else {
+                println!("not logged in: {name}");
             }
         }
         Command::Settings {
@@ -3216,11 +3336,23 @@ async fn run_task(
         beyond_ai_agent::prompts::discover(&cwd, project_trusted, &extra_prompt_template_paths)
     };
     timing.mark("discover skills/prompt templates");
-    let mut registry = tools::default_registry_with_prefix_and_image_auto_resize(
+    // Fail-soft (Task: MCP client support): a server that fails to connect is skipped with a warning,
+    // not a fatal error — matches `has_gated_resources`'s own "warn, don't block the run" convention
+    // just above. `stored_settings.mcp_servers` is already trust-gated (a project's own
+    // `.claude/settings.json` — where a project-tier `mcp_servers` entry would live — only merges in at
+    // all when `effective_settings_for_cwd` found `cwd` trusted; the global tier always applies).
+    let (mcp_tools, mcp_warnings) =
+        tools::mcp::connect_all(stored_settings.mcp_servers.as_deref().unwrap_or(&[])).await;
+    for warning in &mcp_warnings {
+        eprintln!("warning: {warning}");
+    }
+    timing.mark("connect mcp servers");
+    let mut registry = tools::default_registry_with_prefix_image_auto_resize_and_mcp_tools(
         bash_timeout_ms,
         bash_shell_path.as_deref(),
         bash_command_prefix.as_deref(),
         image_auto_resize,
+        &mcp_tools,
     );
     tools::apply_filter(
         &mut registry,

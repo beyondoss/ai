@@ -107,6 +107,28 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # `serve`, which never touch export — see export.rs's module doc comment.
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 
+# MCP client support (`tools::mcp`): the official Rust SDK, client-side only — this binary never acts
+# as an MCP *server*, so `server`/`schemars`/`macros` stay off. `client` is the base client machinery;
+# `transport-child-process` spawns a local stdio server (`TokioChildProcess`); `transport-streamable-
+# http-client-reqwest` speaks the newer streamable-HTTP transport (POST+optional-SSE, session-id
+# handshake) for a remote server, using our own `reqwest` rather than pulling in a second HTTP stack.
+# The bare `reqwest` feature name (confusingly, same as the dependency) turns on rustls in *rmcp's own*
+# `reqwest` feature flag — without it `transport-streamable-http-client-reqwest` alone leaves TLS
+# unconfigured, breaking any `https://` MCP server URL. Resolves to the exact reqwest 0.13.x already in
+# this workspace's lock file (agent-core/gateway), so this adds no second HTTP-stack copy to the graph.
+# Constructing `HeaderName`/`HeaderValue` for `tools::mcp`'s streamable-HTTP transport custom headers
+# (`rmcp`'s own `StreamableHttpClientTransportConfig::custom_headers` takes these types directly, not
+# plain strings). Already resolved transitively at this exact version (reqwest/rmcp) — depending on it
+# directly adds nothing to the build graph, since we call its API ourselves rather than just linking it
+# incidentally.
+http = "1"
+# `auth`: MCP's own OAuth 2.1 authorization flow (SEP-985 metadata discovery, dynamic client
+# registration, PKCE) for a streamable-HTTP server that needs it — `agent mcp-login`/`mcp_auth_store.rs`
+# drive `rmcp::transport::auth::AuthorizationManager` directly, reusing this crate's existing
+# `oauth::callback_server::CallbackServer` for the redirect. Pulls in `oauth2` (new transitive dep) and
+# `url` (already an existing direct dependency, for the OAuth module's own callback-URL parsing).
+rmcp = { version = "2.1.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest", "auth"] }
+
 [dev-dependencies]
 # Scratch files/dirs for the file-tool tests.
 # Bench harness for the search tools. `divan` (the gateway's `bench:unit` pin) measures **allocations**
