@@ -177,8 +177,15 @@ impl RealRunner {
                 })
             }
             Err(_) => {
-                // Timed out: dropping `guard` here (rather than waiting for the function to return)
-                // kills the entire process group promptly, reaching any backgrounded grandchildren.
+                // Timed out: unlike a future dropped mid-`await` (`GroupKillGuard`'s own `Drop`, which
+                // can't `.await`), we're still in an async context here — so actually wait for the
+                // process-group kill to finish via `spawn_blocking` before returning, rather than
+                // firing it and hoping it lands before a caller re-checks side effects. Disarms the
+                // guard (via `take`) first so its own `Drop` doesn't *also* fire a redundant kill.
+                #[cfg(unix)]
+                if let Some(pid) = guard.pid.take() {
+                    let _ = tokio::task::spawn_blocking(move || kill_process_group(pid)).await;
+                }
                 drop(guard);
                 Ok(ExecResult {
                     code: None,
@@ -212,11 +219,15 @@ impl Drop for GroupKillGuard {
     fn drop(&mut self) {
         #[cfg(unix)]
         if let Some(pid) = self.pid.take() {
-            // `Drop` can't `.await`; fire-and-forget onto the ambient runtime — `kill -KILL` is
-            // near-instant, and nothing downstream depends on this completing before `drop` returns.
-            tokio::spawn(async move {
-                kill_process_group(pid).await;
-            });
+            // `Drop` can't `.await`, so this can't be made fully synchronous with the caller — but a
+            // real OS thread (not a `tokio::spawn`ed task) is scheduled by the kernel directly, rather
+            // than depending on the ambient tokio runtime finding a moment to poll it. That matters
+            // specifically when the runtime this drop happens on is a single-threaded `#[tokio::test]`
+            // runtime under real contention from many other concurrently-running OS threads (one per
+            // test) — a queued task on a busy single-threaded runtime can be delayed well past a
+            // `tokio::spawn`'s usual near-instant turnaround; a plain OS thread isn't multiplexed onto
+            // that runtime's own poll loop at all.
+            std::thread::spawn(move || kill_process_group(pid));
         }
     }
 }
@@ -361,13 +372,20 @@ impl Capture {
 /// to `process.kill(pid, "SIGKILL")` on failure). `pgid` doubles as the original child's own pid here:
 /// the child is spawned as its own process-group leader (`process_group(0)`), so pid and pgid are the
 /// same number. Shelling out keeps this free of `unsafe`/`libc`, which the workspace forbids.
+///
+/// Blocking, not async: called from two places that each need a *synchronous* guarantee rather than a
+/// detached future — [`GroupKillGuard`]'s `Drop` impl (which can't `.await` at all, so this runs on a
+/// dedicated OS thread via `std::thread::spawn`, scheduled by the kernel independent of whatever the
+/// ambient tokio runtime is doing) and `exec`'s timeout branch (via `spawn_blocking`, so the caller
+/// actually waits for the kill to complete before `run()` returns, rather than firing it and hoping it
+/// lands before a caller re-checks side effects — the fire-and-forget shape here previously raced a
+/// backgrounded grandchild's own delayed write under real scheduling contention).
 #[cfg(unix)]
-async fn kill_process_group(pgid: u32) {
-    let group_result = tokio::process::Command::new("kill")
+fn kill_process_group(pgid: u32) {
+    let group_result = std::process::Command::new("kill")
         .arg("-KILL")
         .arg(format!("-{pgid}"))
-        .status()
-        .await;
+        .status();
     // A non-success here (including `kill`'s own exit code, e.g. ESRCH because the group already
     // exited on its own between the timeout firing and this running) isn't worth logging on its own —
     // the group kill covers the overwhelmingly common case, so try the direct fallback next regardless
@@ -375,11 +393,10 @@ async fn kill_process_group(pgid: u32) {
     if matches!(&group_result, Ok(status) if status.success()) {
         return;
     }
-    match tokio::process::Command::new("kill")
+    match std::process::Command::new("kill")
         .arg("-KILL")
         .arg(pgid.to_string())
         .status()
-        .await
     {
         // Still only the "couldn't even run `kill`" case is worth a warning — a non-zero exit here
         // most likely just means the process (or its whole group) was already gone.
@@ -558,9 +575,13 @@ mod tests {
         let pid = child.id().unwrap();
         child.wait().await.unwrap(); // let it actually exit and get reaped
 
-        tokio::time::timeout(Duration::from_secs(5), kill_process_group(pid))
-            .await
-            .expect("kill_process_group must not hang when there's nothing left to kill");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || kill_process_group(pid)),
+        )
+        .await
+        .expect("kill_process_group must not hang when there's nothing left to kill")
+        .expect("kill_process_group must not panic");
     }
 
     #[test]
