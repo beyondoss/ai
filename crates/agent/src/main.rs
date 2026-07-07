@@ -2588,6 +2588,13 @@ fn unwrap_turn_result(
                 .unwrap_or_else(|e| e.into_inner())
                 .map(serve::Signal::exit_code)
                 .unwrap_or(1);
+            // A cancellation this recent may have just dropped a `GroupKillGuard` for an in-flight
+            // bash tool call — that guard's cleanup runs on a detached thread `process::exit` below
+            // won't wait for on its own, so an in-flight timed-out/backgrounded grandchild would be
+            // silently orphaned without this. Bounded, not indefinite: a hung `kill`/`ps` shell-out
+            // must not hang the whole process's own shutdown.
+            #[cfg(unix)]
+            tools::exec::wait_for_pending_group_kills(std::time::Duration::from_secs(2));
             std::process::exit(code);
         }
         Err(e) => Err(e.into()),

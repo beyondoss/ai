@@ -215,6 +215,14 @@ impl GroupKillGuard {
     }
 }
 
+/// One per in-flight `GroupKillGuard`-triggered cleanup thread, `recv`d by
+/// [`wait_for_pending_group_kills`] — see that function's doc comment for why this registry exists
+/// at all (in short: `std::process::exit` doesn't wait for threads, so a caller that's about to call
+/// it needs an explicit way to wait for a just-dropped guard's cleanup itself).
+#[cfg(unix)]
+static PENDING_GROUP_KILLS: std::sync::Mutex<Vec<std::sync::mpsc::Receiver<()>>> =
+    std::sync::Mutex::new(Vec::new());
+
 impl Drop for GroupKillGuard {
     fn drop(&mut self) {
         #[cfg(unix)]
@@ -227,8 +235,49 @@ impl Drop for GroupKillGuard {
             // test) — a queued task on a busy single-threaded runtime can be delayed well past a
             // `tokio::spawn`'s usual near-instant turnaround; a plain OS thread isn't multiplexed onto
             // that runtime's own poll loop at all.
-            std::thread::spawn(move || kill_process_group(pid));
+            //
+            // Registered in `PENDING_GROUP_KILLS` (not truly fire-and-forget): a cancellation
+            // (SIGTERM/SIGINT/SIGHUP) can reach `std::process::exit` moments after this guard drops,
+            // and `process::exit` tears down every thread immediately with no chance for this one to
+            // finish — see `wait_for_pending_group_kills`, which such a caller must call first.
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                kill_process_group(pid);
+                let _ = tx.send(());
+            });
+            if let Ok(mut pending) = PENDING_GROUP_KILLS.lock() {
+                pending.push(rx);
+            }
         }
+    }
+}
+
+/// Block until every `GroupKillGuard` cleanup thread registered so far has actually finished its
+/// `kill_process_group` work, or `timeout` elapses overall, whichever comes first.
+///
+/// Necessary, not just defensive: `GroupKillGuard::drop` can't `.await` (it spawns a detached OS
+/// thread instead — see that impl's doc comment), and `std::process::exit` — which every shutdown-
+/// signal cancellation path in this crate calls, to set a precise POSIX `128+signal` exit code —
+/// terminates every thread immediately with no chance to finish whatever it was doing. Without this,
+/// a `run` process that gets SIGTERM'd mid-bash-tool-call could exit before its own cleanup thread
+/// ever got to run `kill`, silently orphaning the exact backgrounded grandchild `GroupKillGuard`
+/// exists to reap — confirmed live via `run_signal_handling.rs`'s e2e tests, which spawn the real
+/// compiled binary and send it a real OS signal. Call this immediately before any
+/// `std::process::exit` that follows a turn ending in `agent_core::Error::Cancelled`.
+#[cfg(unix)]
+pub fn wait_for_pending_group_kills(timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    let Ok(mut pending) = PENDING_GROUP_KILLS.lock() else {
+        return;
+    };
+    let receivers = std::mem::take(&mut *pending);
+    drop(pending);
+    for rx in receivers {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        // A zero/negative remaining budget still gets one non-blocking `try_recv`-equivalent poll
+        // (`recv_timeout(ZERO)`) rather than being skipped outright, so a kill that finished just as
+        // the deadline passed is still observed instead of assumed incomplete.
+        let _ = rx.recv_timeout(remaining);
     }
 }
 
