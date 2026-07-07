@@ -54,13 +54,26 @@ impl WriteLockRegistry {
     /// into a spawned task; dropping it releases the lock and, if no one else is waiting on this key,
     /// evicts the key's entry from the registry.
     pub async fn lock(&self, key: &str) -> WriteLockGuard {
-        let mutex: Arc<AsyncMutex<()>> = self
-            .locks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(key.to_string())
-            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-            .clone();
+        // Scoped to a block (rather than a named `let` binding dropped explicitly) so the sync
+        // `MutexGuard` — not `Send` — provably ends its lifetime before the `.await` below, keeping
+        // this function's returned future `Send`.
+        let mutex: Arc<AsyncMutex<()>> = {
+            let mut locks = self
+                .locks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Look up by borrowed `&str` first — the common case (a path already contended, or a
+            // session repeatedly editing the same handful of files) hits here and skips
+            // `key.to_string()`'s allocation entirely; only a genuinely new key pays for it, via
+            // `entry`, below.
+            match locks.get(key) {
+                Some(m) => m.clone(),
+                None => locks
+                    .entry(key.to_string())
+                    .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                    .clone(),
+            }
+        };
         let guard = mutex.lock_owned().await;
         WriteLockGuard {
             guard: Some(guard),

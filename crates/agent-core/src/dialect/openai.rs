@@ -332,7 +332,10 @@ pub fn build_body(req: &ModelRequest) -> Value {
     // doc comment) — populated as `tool_use` blocks from a foreign model are visited below, then
     // consulted when their paired `tool_result` is reached in a later message.
     let mut cross_model_tool_id_remap: HashMap<String, String> = HashMap::new();
-    let mut messages: Vec<Value> = Vec::new();
+    // +1 for the optional leading system/instruction entry pushed below; some roles push more than one
+    // entry per source message, so this is a lower-bound hint, not an exact count — still avoids most
+    // of the reallocations a `Vec::new()` start would otherwise pay as the common (1:1) case fills in.
+    let mut messages: Vec<Value> = Vec::with_capacity(req.messages.len() + 1);
     if let Some(system) = &req.system {
         messages.push(json!({ "role": instruction_role, "content": system }));
     }
