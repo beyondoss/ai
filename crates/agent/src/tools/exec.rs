@@ -366,20 +366,29 @@ impl Capture {
     }
 }
 
-/// SIGKILL an entire process group via the `kill` binary (`kill -KILL -<pgid>`), falling back to
-/// directly killing just the original process (`kill -KILL <pgid>`, no leading `-`) if the group kill
-/// doesn't succeed — matching pi's own `killProcessTree` (`process.kill(-pid, "SIGKILL")`, falling back
-/// to `process.kill(pid, "SIGKILL")` on failure). `pgid` doubles as the original child's own pid here:
-/// the child is spawned as its own process-group leader (`process_group(0)`), so pid and pgid are the
-/// same number. Shelling out keeps this free of `unsafe`/`libc`, which the workspace forbids.
+/// SIGKILL an entire process group: `kill -KILL -<pgid>` (falling back to `kill -KILL <pgid>`, no
+/// leading `-`, if that doesn't succeed — matching pi's own `killProcessTree`,
+/// `process.kill(-pid, "SIGKILL")` falling back to `process.kill(pid, "SIGKILL")`), *then* an explicit
+/// sweep that individually signals every process still reporting this pgid.
+///
+/// The sweep isn't defensive padding — it's load-bearing. Confirmed live on a real, resource-contended
+/// GitHub Actions runner (a fast dedicated dev box never reproduces this): a backgrounded grandchild,
+/// independently confirmed alive and already a member of the target pgid *before* the group-kill was
+/// even issued, survived it completely — through its full multi-second sleep — while the group
+/// leader died promptly. `kill -KILL -pgid` returning success only means the signal was handed to the
+/// kernel for group-wide delivery; it does not appear to guarantee every existing member actually
+/// receives it on every environment. Enumerating `ps`'s own pid/pgid columns and individually
+/// `kill -KILL <pid>`-ing each match closes that gap without depending on group-signal semantics at
+/// all. `pgid` doubles as the original child's own pid: the child is spawned as its own process-group
+/// leader (`process_group(0)`), so pid and pgid are the same number. Shelling out (not `libc`/`nix`)
+/// keeps this free of `unsafe`, which the workspace forbids.
 ///
 /// Blocking, not async: called from two places that each need a *synchronous* guarantee rather than a
 /// detached future — [`GroupKillGuard`]'s `Drop` impl (which can't `.await` at all, so this runs on a
 /// dedicated OS thread via `std::thread::spawn`, scheduled by the kernel independent of whatever the
 /// ambient tokio runtime is doing) and `exec`'s timeout branch (via `spawn_blocking`, so the caller
 /// actually waits for the kill to complete before `run()` returns, rather than firing it and hoping it
-/// lands before a caller re-checks side effects — the fire-and-forget shape here previously raced a
-/// backgrounded grandchild's own delayed write under real scheduling contention).
+/// lands before a caller re-checks side effects).
 #[cfg(unix)]
 fn kill_process_group(pgid: u32) {
     let group_result = std::process::Command::new("kill")
@@ -390,23 +399,60 @@ fn kill_process_group(pgid: u32) {
     // exited on its own between the timeout firing and this running) isn't worth logging on its own —
     // the group kill covers the overwhelmingly common case, so try the direct fallback next regardless
     // of *why* it didn't succeed; a no-op fallback against an already-gone process is harmless.
-    if matches!(&group_result, Ok(status) if status.success()) {
-        return;
-    }
-    match std::process::Command::new("kill")
-        .arg("-KILL")
-        .arg(pgid.to_string())
-        .status()
-    {
-        // Still only the "couldn't even run `kill`" case is worth a warning — a non-zero exit here
-        // most likely just means the process (or its whole group) was already gone.
-        Ok(_) => {}
-        Err(e) => {
-            // If `kill` itself couldn't run (missing binary, restrictive sandboxing), a backgrounded
-            // grandchild from the timed-out command may be left running with nothing else to reap
-            // it — surface that instead of silently losing the signal.
-            tracing::warn!(pgid, error = %e, "failed to run `kill` to reap a timed-out process");
+    if !matches!(&group_result, Ok(status) if status.success()) {
+        match std::process::Command::new("kill")
+            .arg("-KILL")
+            .arg(pgid.to_string())
+            .status()
+        {
+            // Still only the "couldn't even run `kill`" case is worth a warning — a non-zero exit
+            // here most likely just means the process (or its whole group) was already gone.
+            Ok(_) => {}
+            Err(e) => {
+                // If `kill` itself couldn't run (missing binary, restrictive sandboxing), a
+                // backgrounded grandchild from the timed-out command may be left running with
+                // nothing else to reap it — surface that instead of silently losing the signal.
+                tracing::warn!(pgid, error = %e, "failed to run `kill` to reap a timed-out process");
+            }
         }
+    }
+    // Two passes with a short gap: the first catches whatever the group-kill above missed; the
+    // second catches anything that was itself mid-fork (and so invisible to `ps`) during the first.
+    sweep_kill_remaining_group_members(pgid);
+    std::thread::sleep(Duration::from_millis(50));
+    sweep_kill_remaining_group_members(pgid);
+}
+
+/// Enumerate every process currently reporting `pgid` via `ps -eo pid=,pgid=` and SIGKILL each one
+/// individually. See [`kill_process_group`]'s doc comment for why this exists — a bulk
+/// `kill -KILL -<pgid>` was empirically observed to miss a live, already-a-member process on a real
+/// CI runner. Best-effort: a `ps`/`kill` invocation failing outright is silently ignored (mirrors the
+/// group-kill's own "no-op fallback against an already-gone process is harmless" stance) since the
+/// caller already tried the cheaper group-kill/direct-kill paths first.
+#[cfg(unix)]
+fn sweep_kill_remaining_group_members(pgid: u32) {
+    let Ok(out) = std::process::Command::new("ps")
+        .args(["-eo", "pid=,pgid="])
+        .output()
+    else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(pid_str), Some(pgid_str)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        if pgid_str.parse::<u32>() != Ok(pgid) {
+            continue;
+        }
+        // Best-effort per-pid kill: an already-dead pid (ESRCH) is the overwhelmingly common,
+        // harmless case (the group-kill above likely already got it) — nothing further to do either
+        // way, so the result isn't checked.
+        let _ = std::process::Command::new("kill")
+            .arg("-KILL")
+            .arg(pid_str)
+            .status();
     }
 }
 
@@ -431,14 +477,11 @@ mod tests {
     }
 
     // Both tests below race a `kill -KILL -<pgid>` against a backgrounded grandchild's own delayed
-    // write. `kill`'s own success just means the signal was handed to the kernel for delivery to every
-    // process in the group — not that a *specific* member (the grandchild, which we never directly
-    // `wait()` on) has actually been scheduled, signaled, and reaped yet. Confirmed live on a
-    // resource-contended CI runner: the group leader died promptly (reparenting the grandchild to PID
-    // 1), but the grandchild itself was still alive at the very next instant, apparently stuck mid
-    // fork/exec — under I/O contention that can plausibly stretch well past a scant few hundred
-    // milliseconds. `GRANDCHILD_DELAY`/`SAFETY_WAIT` below are sized with a wide margin for that, not
-    // tuned to a fast, uncontended dev box.
+    // write. See `kill_process_group`'s own doc comment for what these margins are guarding against —
+    // a real GitHub Actions run proved this isn't merely a delivery-latency question (the grandchild
+    // ran its *entire* multi-second sleep to completion, unaffected, while the group leader died
+    // promptly) — `sweep_kill_remaining_group_members` is the actual fix; these wider margins
+    // (vs. the original 1s/1.2s, sized for a fast uncontended dev box) are cheap insurance on top.
     const GRANDCHILD_DELAY: Duration = Duration::from_secs(3);
     const SAFETY_WAIT: Duration = Duration::from_millis(3500);
 
@@ -449,42 +492,11 @@ mod tests {
         // written.
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("leaked");
-        let needle = dir.path().to_string_lossy().into_owned();
         let script = format!(
             "( sleep {}; echo leaked > {} ) & sleep 30",
             GRANDCHILD_DELAY.as_secs(),
             marker.display()
         );
-
-        // TEMP DIAGNOSTIC (pi-parity CI investigation, round 2): a background poller taking a full
-        // timestamped timeline of `ps` + marker existence from t=0 through well past SAFETY_WAIT,
-        // printed unconditionally at the end — round 1's single before/after snapshot proved the
-        // grandchild really does stay alive well past a merely-widened margin, so this round needs the
-        // *shape* of what happens over time, not just two data points.
-        let start = std::time::Instant::now();
-        let needle_poll = needle.clone();
-        let marker_poll = marker.clone();
-        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let log_writer = log.clone();
-        let poller = tokio::spawn(async move {
-            for _ in 0..30 {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                let elapsed = start.elapsed();
-                let ps = std::process::Command::new("ps")
-                    .args(["-eo", "pid,ppid,pgid,stat,cmd"])
-                    .output()
-                    .ok()
-                    .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-                    .unwrap_or_default();
-                let matching: Vec<&str> = ps.lines().filter(|l| l.contains(&needle_poll)).collect();
-                let entry = format!(
-                    "t={elapsed:?} marker_exists={} procs={matching:?}",
-                    marker_poll.exists()
-                );
-                log_writer.lock().unwrap().push(entry);
-            }
-        });
-
         let res = RealRunner
             .run(
                 "sh",
@@ -495,24 +507,9 @@ mod tests {
             .await
             .unwrap();
         assert!(res.timed_out);
-        eprintln!(
-            "=== DIAG run() returned at t={:?}, timed_out={} ===",
-            start.elapsed(),
-            res.timed_out
-        );
 
         // Wait past when the grandchild would have written the marker; it must not exist.
         tokio::time::sleep(SAFETY_WAIT).await;
-        poller.abort();
-        eprintln!("=== DIAG timeline (needle={needle}) ===");
-        for line in log.lock().unwrap().iter() {
-            eprintln!("{line}");
-        }
-        eprintln!(
-            "=== DIAG marker exists at t={:?}: {} ===",
-            start.elapsed(),
-            marker.exists()
-        );
         assert!(
             !marker.exists(),
             "backgrounded grandchild survived the timeout — process group not killed"
