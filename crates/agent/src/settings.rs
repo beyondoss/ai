@@ -247,6 +247,20 @@ pub struct Settings {
     /// not) independently of `steering_mode`, via `serve`'s own `set_follow_up_mode` RPC command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub follow_up_mode: Option<String>,
+    /// MCP (Model Context Protocol) servers to connect to at startup, each contributing its own
+    /// `tools/list` as `mcp__<name>__<tool>`-namespaced entries in the tool registry alongside the
+    /// built-in tools — this crate's extension mechanism, deliberately MCP rather than pi's in-process
+    /// `registerTool`/`registerCommand` TypeScript modules (a standardized, language-agnostic protocol
+    /// with an existing server ecosystem, and no `unsafe`/`libloading` plugin-loading needed). No
+    /// per-field CLI flag or `agent settings` mutator exists for this (unlike most other fields here) —
+    /// configured directly in this file (global tier) or a trusted project's own
+    /// `<cwd>/.claude/settings.json` (project tier, already trust-gated — see
+    /// [`effective_settings_for_cwd`]), hand-edited like [`ModelOverride`]'s sibling `models.json`. Like
+    /// every other `Vec` field here, a project-tier list *replaces* the global one wholesale on merge
+    /// (see [`Self::merge_over`]'s doc comment) rather than concatenating — a project wanting the
+    /// operator's global servers too must repeat them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_servers: Option<Vec<McpServerConfig>>,
 }
 
 impl Settings {
@@ -341,6 +355,10 @@ impl Settings {
                 .follow_up_mode
                 .clone()
                 .or_else(|| self.follow_up_mode.clone()),
+            mcp_servers: project
+                .mcp_servers
+                .clone()
+                .or_else(|| self.mcp_servers.clone()),
         }
     }
 }
@@ -1248,6 +1266,113 @@ impl ModelOverrides {
 /// `settings.json`/`trust_store.rs`'s `trusted-projects.json`, under the same [`config_dir_root`].
 pub fn model_overrides_path() -> PathBuf {
     config_dir_root().join("models.json")
+}
+
+/// One configured MCP (Model Context Protocol) server — see [`Settings::mcp_servers`]'s doc comment
+/// for why MCP is this crate's extension mechanism. A `stdio` server is spawned as a local child
+/// process and spoken to over its stdin/stdout (`tools::mcp::connect_all`, via `rmcp`'s
+/// `TokioChildProcess`); an `http` server is a remote endpoint already running, spoken to over MCP's
+/// streamable-HTTP transport. Every tool either kind advertises via `tools/list` is registered as
+/// `mcp__<name>__<tool>` (matching the convention Claude Code itself uses for the identical problem),
+/// so `name` only needs to be unique against another configured server's own `name` — it can never
+/// collide with a built-in tool (`read`/`bash`/...), and even a same-`name` collision just means
+/// `ToolRegistry`'s ordinary last-registration-wins applies to that one server's own tools.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerConfig {
+    /// This server's name. Local-only (the registration prefix, and any connect-failure warning) —
+    /// never sent over the wire to the server itself.
+    pub name: String,
+    #[serde(flatten)]
+    pub transport: McpTransport,
+}
+
+/// How to reach one [`McpServerConfig`] — tagged by its own `"transport"` field in JSON (`"stdio"` or
+/// `"http"`), so a hand-edited `settings.json` entry reads as one flat object (`{"name": ...,
+/// "transport": "stdio", "command": ...}`) rather than a nested `{"transport": {"type": "stdio", ...}}`
+/// wrapper.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "transport", rename_all = "snake_case")]
+pub enum McpTransport {
+    /// Spawn `command` (with `args`) as a local child process and speak MCP over its stdin/stdout —
+    /// the common case (most existing MCP servers: filesystem, GitHub, Slack, Postgres, ...).
+    Stdio {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        /// Extra environment variables for the spawned process, on top of whatever this agent
+        /// process's own environment already provides (inherited by the child, like `bash`'s own
+        /// spawns — see `tools::exec::RealRunner`'s identical no-`PATH`-manipulation stance). Each
+        /// value resolves through [`resolve_config_value`] — a literal, a `!command`, or a `$VAR`/
+        /// `${VAR}` reference — so a server needing its own credential (`GITHUB_TOKEN`, ...) doesn't
+        /// need it stored in plain text here. Resolved via [`McpServerConfig::resolved_env`].
+        #[serde(default)]
+        env: std::collections::BTreeMap<String, String>,
+    },
+    /// Speak MCP's streamable-HTTP transport to a remote server already running at `url`.
+    Http {
+        url: String,
+        /// Extra headers sent on every request (most commonly an `Authorization` bearer token). Each
+        /// value resolves through [`resolve_config_value`], same as [`Self::Stdio`]'s `env`. Resolved
+        /// via [`McpServerConfig::resolved_headers`].
+        #[serde(default)]
+        headers: std::collections::BTreeMap<String, String>,
+    },
+}
+
+impl McpServerConfig {
+    /// [`McpTransport::Stdio`]'s `env`, resolved through [`resolve_config_value`] — an entry that fails
+    /// to resolve (an unset env var, a failing `!command`) or resolves to an empty string is dropped
+    /// rather than passed to the child literally, mirroring [`ModelOverride::resolved_headers`]'s
+    /// identical guard. Empty for an [`McpTransport::Http`] server (nothing to resolve).
+    pub fn resolved_env(&self) -> std::collections::BTreeMap<String, String> {
+        self.resolved_env_with_env(None)
+    }
+
+    /// [`Self::resolved_env`], but with an explicit environment-variable override map consulted before
+    /// the real process environment — production callers go through the public method (`None` here,
+    /// real environment only); tests inject a fixed map instead of mutating the real, process-wide (and
+    /// test-parallelism-unsafe) environment, mirroring [`ModelOverride::resolved_api_key_with_env`].
+    fn resolved_env_with_env(
+        &self,
+        env_overrides: Option<&std::collections::HashMap<String, String>>,
+    ) -> std::collections::BTreeMap<String, String> {
+        let McpTransport::Stdio { env, .. } = &self.transport else {
+            return std::collections::BTreeMap::new();
+        };
+        env.iter()
+            .filter_map(|(k, v)| {
+                resolve_config_value(v, env_overrides)
+                    .filter(|v| !v.is_empty())
+                    .map(|v| (k.clone(), v))
+            })
+            .collect()
+    }
+
+    /// [`McpTransport::Http`]'s `headers`, resolved through [`resolve_config_value`] — same drop-on-
+    /// unresolved-or-empty guard as [`Self::resolved_env`]. Empty for an [`McpTransport::Stdio`] server.
+    pub fn resolved_headers(&self) -> std::collections::BTreeMap<String, String> {
+        self.resolved_headers_with_env(None)
+    }
+
+    /// [`Self::resolved_headers`], but with an explicit environment-variable override map — see
+    /// [`Self::resolved_env_with_env`]'s doc comment for why tests use this instead of the public
+    /// method.
+    fn resolved_headers_with_env(
+        &self,
+        env_overrides: Option<&std::collections::HashMap<String, String>>,
+    ) -> std::collections::BTreeMap<String, String> {
+        let McpTransport::Http { headers, .. } = &self.transport else {
+            return std::collections::BTreeMap::new();
+        };
+        headers
+            .iter()
+            .filter_map(|(k, v)| {
+                resolve_config_value(v, env_overrides)
+                    .filter(|v| !v.is_empty())
+                    .map(|v| (k.clone(), v))
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -2622,5 +2747,202 @@ mod tests {
             project_settings_path(cwd),
             Path::new("/some/project/.claude/settings.json")
         );
+    }
+
+    #[test]
+    fn mcp_server_config_stdio_round_trips_through_json_as_one_flat_object() {
+        let json = serde_json::json!({
+            "name": "filesystem",
+            "transport": "stdio",
+            "command": "npx",
+            "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+            "env": { "LOG_LEVEL": "debug" },
+        });
+        let cfg: McpServerConfig = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(cfg.name, "filesystem");
+        match &cfg.transport {
+            McpTransport::Stdio { command, args, env } => {
+                assert_eq!(command, "npx");
+                assert_eq!(
+                    args,
+                    &["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+                );
+                assert_eq!(env.get("LOG_LEVEL").map(String::as_str), Some("debug"));
+            }
+            other => panic!("expected Stdio, got {other:?}"),
+        }
+        // Round-trips back to the same flat shape (order of keys doesn't matter for JSON equality).
+        assert_eq!(serde_json::to_value(&cfg).unwrap(), json);
+    }
+
+    #[test]
+    fn mcp_server_config_http_round_trips_through_json_as_one_flat_object() {
+        let json = serde_json::json!({
+            "name": "remote",
+            "transport": "http",
+            "url": "https://example.com/mcp",
+            "headers": { "Authorization": "Bearer $TOKEN" },
+        });
+        let cfg: McpServerConfig = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(cfg.name, "remote");
+        match &cfg.transport {
+            McpTransport::Http { url, headers } => {
+                assert_eq!(url, "https://example.com/mcp");
+                assert_eq!(
+                    headers.get("Authorization").map(String::as_str),
+                    Some("Bearer $TOKEN")
+                );
+            }
+            other => panic!("expected Http, got {other:?}"),
+        }
+        assert_eq!(serde_json::to_value(&cfg).unwrap(), json);
+    }
+
+    #[test]
+    fn mcp_server_config_stdio_defaults_args_and_env_when_omitted() {
+        let cfg: McpServerConfig = serde_json::from_value(serde_json::json!({
+            "name": "bare",
+            "transport": "stdio",
+            "command": "some-server",
+        }))
+        .unwrap();
+        match &cfg.transport {
+            McpTransport::Stdio { args, env, .. } => {
+                assert!(args.is_empty());
+                assert!(env.is_empty());
+            }
+            other => panic!("expected Stdio, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolved_env_substitutes_a_dollar_var_reference() {
+        let cfg = McpServerConfig {
+            name: "s".into(),
+            transport: McpTransport::Stdio {
+                command: "x".into(),
+                args: vec![],
+                env: [("TOKEN".to_string(), "$MY_VAR".to_string())].into(),
+            },
+        };
+        let overrides = [("MY_VAR".to_string(), "secret-123".to_string())].into();
+        assert_eq!(
+            cfg.resolved_env_with_env(Some(&overrides)).get("TOKEN"),
+            Some(&"secret-123".to_string())
+        );
+    }
+
+    #[test]
+    fn resolved_env_drops_an_entry_that_resolves_to_an_unset_var() {
+        let cfg = McpServerConfig {
+            name: "s".into(),
+            transport: McpTransport::Stdio {
+                command: "x".into(),
+                args: vec![],
+                env: [("TOKEN".to_string(), "$DEFINITELY_NOT_SET_XYZ".to_string())].into(),
+            },
+        };
+        assert!(
+            cfg.resolved_env_with_env(Some(&std::collections::HashMap::new()))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn resolved_env_is_empty_for_an_http_server() {
+        let cfg = McpServerConfig {
+            name: "s".into(),
+            transport: McpTransport::Http {
+                url: "https://example.com".into(),
+                headers: std::collections::BTreeMap::new(),
+            },
+        };
+        assert!(cfg.resolved_env().is_empty());
+    }
+
+    #[test]
+    fn resolved_headers_substitutes_a_dollar_var_reference() {
+        let cfg = McpServerConfig {
+            name: "s".into(),
+            transport: McpTransport::Http {
+                url: "https://example.com".into(),
+                headers: [("Authorization".to_string(), "Bearer $TOKEN".to_string())].into(),
+            },
+        };
+        let overrides = [("TOKEN".to_string(), "abc123".to_string())].into();
+        assert_eq!(
+            cfg.resolved_headers_with_env(Some(&overrides))
+                .get("Authorization"),
+            Some(&"Bearer abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn resolved_headers_is_empty_for_a_stdio_server() {
+        let cfg = McpServerConfig {
+            name: "s".into(),
+            transport: McpTransport::Stdio {
+                command: "x".into(),
+                args: vec![],
+                env: std::collections::BTreeMap::new(),
+            },
+        };
+        assert!(cfg.resolved_headers().is_empty());
+    }
+
+    #[test]
+    fn merge_over_replaces_mcp_servers_wholesale_not_concatenated() {
+        let global = Settings {
+            mcp_servers: Some(vec![McpServerConfig {
+                name: "global-server".into(),
+                transport: McpTransport::Stdio {
+                    command: "g".into(),
+                    args: vec![],
+                    env: std::collections::BTreeMap::new(),
+                },
+            }]),
+            ..Settings::default()
+        };
+        let project = Settings {
+            mcp_servers: Some(vec![McpServerConfig {
+                name: "project-server".into(),
+                transport: McpTransport::Stdio {
+                    command: "p".into(),
+                    args: vec![],
+                    env: std::collections::BTreeMap::new(),
+                },
+            }]),
+            ..Settings::default()
+        };
+        let merged = global.merge_over(&project);
+        let names: Vec<&str> = merged
+            .mcp_servers
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["project-server"],
+            "project's mcp_servers must wholesale-replace global's, not append to it"
+        );
+    }
+
+    #[test]
+    fn merge_over_falls_back_to_global_mcp_servers_when_project_has_none() {
+        let global = Settings {
+            mcp_servers: Some(vec![McpServerConfig {
+                name: "global-server".into(),
+                transport: McpTransport::Stdio {
+                    command: "g".into(),
+                    args: vec![],
+                    env: std::collections::BTreeMap::new(),
+                },
+            }]),
+            ..Settings::default()
+        };
+        let merged = global.merge_over(&Settings::default());
+        assert_eq!(merged.mcp_servers.unwrap()[0].name, "global-server");
     }
 }

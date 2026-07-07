@@ -477,6 +477,15 @@ pub struct ServeConfig {
     pub exclude_tools: Option<Vec<String>>,
     /// Register no tools at all. Wins over `tools`/`exclude_tools`.
     pub no_tools: bool,
+    /// Tools discovered from every configured MCP server, already connected and namespaced
+    /// (`mcp__<server>__<tool>`) — see `tools::mcp`'s module doc comment. Resolved exactly once, by
+    /// `main.rs`'s `serve`-dispatch branch (`tools::mcp::connect_all`), *before* this `ServeConfig` is
+    /// constructed — connecting is inherently async and this struct is a plain, synchronous value.
+    /// `build_tools` merges these into every registry rebuild (`set_model`/`set_thinking`/...) without
+    /// reconnecting to any server: the live connection (and its spawned child process, for a stdio
+    /// server) lives as long as this `Vec`'s `Arc<dyn Tool>` entries do, i.e. for the whole `serve`
+    /// session.
+    pub mcp_tools: Vec<Arc<dyn agent_core::Tool>>,
     /// Force every batch of tool calls in a turn to run one at a time instead of the default
     /// bounded-concurrent dispatch (`agent_core::Agent::with_sequential_tools`). Fixed for the process,
     /// like `tools`/`no_tools` — `build_agent` reapplies it every rebuild.
@@ -5544,11 +5553,18 @@ fn build_tools(cfg: &ServeConfig, image_auto_resize: bool) -> agent_core::ToolRe
     // hardcoding `image_auto_resize: true` regardless of `cfg.image_auto_resize` — `run`'s identical
     // `default_registry_with_prefix_and_image_auto_resize` call site (`main.rs::run_task`) is the one
     // this should have matched all along.
-    let mut registry = tools::default_registry_with_prefix_and_image_auto_resize(
+    //
+    // `cfg.mcp_tools` (already-connected, namespaced `mcp__<server>__<tool>` entries — see
+    // `tools::mcp`'s module doc comment) is merged in *before* `apply_filter` below, not after: an
+    // operator's `--tools`/`--exclude-tools` allow/deny-list is meant to scope the *whole* tool set the
+    // model sees, MCP-discovered tools included (e.g. excluding a misbehaving MCP tool by name), not
+    // just the built-ins.
+    let mut registry = tools::default_registry_with_prefix_image_auto_resize_and_mcp_tools(
         cfg.bash_timeout_ms,
         cfg.bash_shell_path.as_deref(),
         cfg.bash_command_prefix.as_deref(),
         image_auto_resize,
+        &cfg.mcp_tools,
     );
     tools::apply_filter(
         &mut registry,
@@ -6292,7 +6308,7 @@ impl LiveStats {
 /// A pure function of `scanned`'s value, not of arrival order, so it stays deterministic even though
 /// `list_with_progress`'s underlying scan runs in parallel across several files at once.
 fn should_report_scan_progress(scanned: usize, total: usize) -> bool {
-    scanned <= 1 || scanned >= total || scanned % (total / 10).max(1) == 0
+    scanned <= 1 || scanned >= total || scanned.is_multiple_of((total / 10).max(1))
 }
 
 /// The manual-code-paste channel for an in-flight `login`: `ServeLoginCallbacks::prompt_text` parks a

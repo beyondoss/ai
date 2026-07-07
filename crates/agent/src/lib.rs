@@ -12,6 +12,7 @@ pub mod auth_credential_source;
 pub mod auth_store;
 pub mod export;
 pub mod gateway_credential;
+pub mod mcp_auth_store;
 pub mod oauth;
 pub(crate) mod path_utils;
 pub mod policy;
