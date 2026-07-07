@@ -331,13 +331,22 @@ fn trim_eol(s: &str) -> std::borrow::Cow<'_, str> {
 /// (with a char-boundary backoff to avoid splitting a codepoint) never produced invalid UTF-8, but still
 /// truncated a non-ASCII line to far fewer visible characters than an ASCII line under the same nominal
 /// cap, unlike pi's own char-counting `truncateLine`.
+///
+/// Runs on every matched *and* every context line, so the common case (a line well under `MAX_LINE`,
+/// which is most source lines) is the one to keep cheap: `char_indices` finds the byte offset of the
+/// `MAX_LINE`-th char in one pass, and a line that doesn't reach it is returned via a single `to_string`
+/// (a memcpy) rather than rebuilt char-by-char through a `Chars` iterator + `collect`. Only a line that
+/// actually needs truncating pays for the slice + suffix, and even then as one allocation, not two.
 fn clip(line: &str) -> String {
-    let mut chars = line.chars();
-    let head: String = chars.by_ref().take(MAX_LINE).collect();
-    if chars.next().is_none() {
-        return head; // the whole line fit within the cap — nothing was truncated
+    match line.char_indices().nth(MAX_LINE) {
+        None => line.to_string(), // fits within the cap — nothing was truncated
+        Some((cut, _)) => {
+            let mut clipped = String::with_capacity(cut + LINE_TRUNCATED_SUFFIX.len());
+            clipped.push_str(&line[..cut]);
+            clipped.push_str(LINE_TRUNCATED_SUFFIX);
+            clipped
+        }
     }
-    format!("{head}{LINE_TRUNCATED_SUFFIX}")
 }
 
 #[async_trait]
@@ -460,7 +469,13 @@ impl Tool for Grep {
             }
             return Ok(no_match.into());
         }
-        let mut out = String::new();
+        // A rough per-line estimate (path + line number + up to `MAX_LINE` chars of text), capped by
+        // the same byte ceiling the loop below enforces anyway — avoids paying for several
+        // `String` grow-and-copy steps on a large match set without ever over-allocating past what
+        // the output could actually reach.
+        let mut out = String::with_capacity(
+            (matches.len().saturating_mul(64)).min(super::output::MAX_LISTING_BYTES),
+        );
         let mut lines_truncated = false;
         for (path, line, text, is_match) in &matches {
             // Write straight into `out` instead of allocating a `format!` temp String per line — same

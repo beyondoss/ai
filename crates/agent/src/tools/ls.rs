@@ -136,17 +136,29 @@ impl Tool for Ls {
             if !all && name.starts_with('.') {
                 continue;
             }
-            // Pi-parity fix: `DirEntry::file_type` is lstat-like — it reports a symlink's own type, not
-            // its target's, so a symlink pointing at a directory was mislabeled as a plain file (no
-            // trailing `/`). pi's own `ls.ts` stats each entry with `fs.stat` (follows symlinks), so use
-            // `std::fs::metadata` on the full entry path here to match. This also subsumes the
+            // Fast path: `DirEntry::file_type()` is populated straight from the directory read itself
+            // (on Linux, from `d_type` — no extra syscall on the filesystems that support it), so a
+            // non-symlink entry — the overwhelming majority in a typical directory — never needs the
+            // full `stat` below at all.
+            //
+            // Pi-parity fix (slow path): `DirEntry::file_type` is lstat-like — it reports a symlink's
+            // own type, not its target's, so a symlink pointing at a directory was mislabeled as a
+            // plain file (no trailing `/`). pi's own `ls.ts` stats each entry with `fs.stat` (follows
+            // symlinks), so an actual symlink (or an entry `file_type()` itself couldn't resolve) falls
+            // back to `std::fs::metadata` on the full entry path to match. This also subsumes the
             // unstattable-entry case: a vanished-between-readdir-and-here entry or a dangling symlink
             // both fail `metadata` and are skipped (hidden), matching pi's own catch-and-skip behavior,
             // instead of silently guessing `is_dir = false` for something we couldn't actually confirm.
-            let Ok(meta) = std::fs::metadata(entry.path()) else {
-                continue;
+            let is_dir = match entry.file_type() {
+                Ok(ft) if !ft.is_symlink() => ft.is_dir(),
+                _ => {
+                    let Ok(meta) = std::fs::metadata(entry.path()) else {
+                        continue;
+                    };
+                    meta.is_dir()
+                }
             };
-            entries.push((name.into_owned(), meta.is_dir()));
+            entries.push((name.into_owned(), is_dir));
         }
         // Directories first, then case-insensitive alphabetical by bare name, collated in a way that
         // groups an accented letter with its unaccented form (`collation_key`) rather than a raw

@@ -316,7 +316,11 @@ impl Tool for Read {
             .map_err(|e| ToolError::Execution(format!("read {path}: {e}")))?;
         let mut reader = BufReader::new(file);
 
-        let mut out = String::new();
+        // A rough per-line estimate (line-number prefix + a typical source line), capped by the same
+        // byte ceiling the loop below enforces anyway — avoids paying for several `String`
+        // grow-and-copy steps on a large `limit` without ever over-allocating past what the output
+        // could actually reach.
+        let mut out = String::with_capacity((limit.saturating_mul(48)).min(MAX_OUTPUT_BYTES));
         let mut lineno = 0usize;
         let mut shown = 0usize;
         let mut truncated = false;

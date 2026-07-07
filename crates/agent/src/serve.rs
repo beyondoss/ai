@@ -1992,19 +1992,27 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
     // `max_steps`), drained concurrently by the writer as fast as stdout accepts. If a client stops
     // reading, stdout's write eventually fails and the writer tears down (below), surfacing the stall
     // rather than masking it.
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Value>();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<OutFrame>();
     let writer = tokio::spawn(async move {
         let mut out = tokio::io::stdout();
         while let Some(frame) = out_rx.recv().await {
             // A frame we built ourselves failing to serialize is a bug, not bad input — skip it
-            // rather than tearing down the whole stream.
-            let line = match serde_json::to_string(&frame) {
-                Ok(line) => line,
-                Err(e) => {
-                    eprintln!("serve: failed to serialize output frame: {e}");
-                    continue;
-                }
+            // rather than tearing down the whole stream. `Raw` (an `event` frame — see `OutFrame`'s
+            // own doc comment) is already the final JSON text; only `Value` (every other frame kind)
+            // still needs this serialize.
+            let mut line = match frame {
+                OutFrame::Raw(line) => line,
+                OutFrame::Value(v) => match serde_json::to_string(&v) {
+                    Ok(line) => line,
+                    Err(e) => {
+                        eprintln!("serve: failed to serialize output frame: {e}");
+                        continue;
+                    }
+                },
             };
+            // Appended here rather than as a second `write_all` in `write_frame`, so the frame's bytes
+            // and its terminator go out as one write instead of two.
+            line.push('\n');
             // stdout is the only sink. If it breaks (client hung up, broken pipe) there is nothing
             // left to do but stop; dropping `out_rx` here makes every sender observe the closure and
             // halt the control loop instead of writing into a dead pipe forever.
@@ -2421,12 +2429,15 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
     // Announce readiness so a client can sync before issuing commands. If this already fails the
     // writer never started; there is nothing to serve.
     if out_tx
-        .send(json!({
-            "type": "ready",
-            "session_id": persistence.session_id(),
-            "model": current_model,
-            "cwd_stale": cwd_is_stale(&persistence.meta.cwd, &cwd),
-        }))
+        .send(
+            json!({
+                "type": "ready",
+                "session_id": persistence.session_id(),
+                "model": current_model,
+                "cwd_stale": cwd_is_stale(&persistence.meta.cwd, &cwd),
+            })
+            .into(),
+        )
         .is_err()
     {
         let _ = writer.await;
@@ -6338,7 +6349,7 @@ impl Drop for PendingLoginGuard {
 /// `pending_code` until a `"submit_code"` command (processed by the same main loop, concurrently —
 /// see the `"login"` dispatch arm) wakes it with the pasted value.
 struct ServeLoginCallbacks {
-    out_tx: mpsc::UnboundedSender<Value>,
+    out_tx: mpsc::UnboundedSender<OutFrame>,
     id: Option<String>,
     provider: crate::oauth::OAuthProviderId,
     pending_code: PendingCodeSlot,
@@ -6415,6 +6426,25 @@ impl crate::oauth::LoginCallbacks for ServeLoginCallbacks {
     }
 }
 
+/// A frame queued for the single stdout writer task (see its own comment, above). Every RPC
+/// `response`/`ack`/progress frame below is low-frequency and already built as a shallow `Map` of
+/// scalar `json!` leaves — for those, `Value` costs nothing extra: the writer's own `serde_json::
+/// to_string` is the only serialize they ever pay. [`event_frame`] is the one high-frequency producer
+/// (once per streamed model delta, far more often than any RPC frame) and carries its own pre-built
+/// `String` instead, serialized straight from the `AgentEvent` in one pass — see its doc comment for
+/// why going through `Value` first would cost a second full serialize on the hottest path this process
+/// has.
+enum OutFrame {
+    Value(Value),
+    Raw(String),
+}
+
+impl From<Value> for OutFrame {
+    fn from(v: Value) -> Self {
+        OutFrame::Value(v)
+    }
+}
+
 /// Build a `login_progress` frame — an unsolicited push update for an in-flight `login`, correlated
 /// to the eventual terminal `response` via the same `id`. `step` is `"browser"` (open `url`),
 /// `"device_code"` (show `user_code`/`verification_uri`), `"manual_code"` (the local callback
@@ -6430,7 +6460,7 @@ fn login_progress_frame(
     verification_uri: Option<&str>,
     expires_in_secs: Option<u64>,
     message: Option<&str>,
-) -> Value {
+) -> OutFrame {
     let mut m = Map::new();
     m.insert("type".into(), json!("login_progress"));
     if let Some(id) = id {
@@ -6454,12 +6484,17 @@ fn login_progress_frame(
     if let Some(message) = message {
         m.insert("message".into(), json!(message));
     }
-    Value::Object(m)
+    Value::Object(m).into()
 }
 
 /// Build a `list_progress` frame — an unsolicited progress update for an in-flight `list_sessions`/
 /// `list_all_sessions` scan, correlated to the eventual `response` frame via the same request `id`.
-fn list_progress_frame(id: Option<String>, command: &str, scanned: usize, total: usize) -> Value {
+fn list_progress_frame(
+    id: Option<String>,
+    command: &str,
+    scanned: usize,
+    total: usize,
+) -> OutFrame {
     let mut m = Map::new();
     m.insert("type".into(), json!("list_progress"));
     if let Some(id) = id {
@@ -6468,7 +6503,7 @@ fn list_progress_frame(id: Option<String>, command: &str, scanned: usize, total:
     m.insert("command".into(), json!(command));
     m.insert("scanned".into(), json!(scanned));
     m.insert("total".into(), json!(total));
-    Value::Object(m)
+    Value::Object(m).into()
 }
 
 /// Build an `auto_retry_start` frame — an unsolicited notice that a `prompt`'s run failed with what
@@ -6483,7 +6518,7 @@ fn auto_retry_frame(
     max_attempts: u32,
     delay_ms: u64,
     error: &str,
-) -> Value {
+) -> OutFrame {
     let mut m = Map::new();
     m.insert("type".into(), json!("auto_retry_start"));
     if let Some(id) = id {
@@ -6494,7 +6529,7 @@ fn auto_retry_frame(
     m.insert("max_attempts".into(), json!(max_attempts));
     m.insert("delay_ms".into(), json!(delay_ms));
     m.insert("error".into(), json!(error));
-    Value::Object(m)
+    Value::Object(m).into()
 }
 
 /// Build an `auto_retry_end` frame — the terminal notice for a whole-run retry sequence that made at
@@ -6508,7 +6543,7 @@ fn auto_retry_end_frame(
     success: bool,
     attempt: u32,
     final_error: Option<&str>,
-) -> Value {
+) -> OutFrame {
     let mut m = Map::new();
     m.insert("type".into(), json!("auto_retry_end"));
     if let Some(id) = id {
@@ -6520,7 +6555,7 @@ fn auto_retry_end_frame(
     if let Some(err) = final_error {
         m.insert("final_error".into(), json!(err));
     }
-    Value::Object(m)
+    Value::Object(m).into()
 }
 
 /// Build a `session_info_changed` frame — an unsolicited push notice that the session's title changed,
@@ -6528,7 +6563,7 @@ fn auto_retry_end_frame(
 /// `session_info_changed` event (`rpc-mode.ts:632-639`) lets a client learn the final *sanitized* title
 /// without a follow-up `get_state`; `title` is `None` when the sanitized result was empty (a caller can
 /// explicitly clear a title — see `sanitize_title`/`title_or_clear`).
-fn session_info_changed_frame(id: Option<String>, title: Option<String>) -> Value {
+fn session_info_changed_frame(id: Option<String>, title: Option<String>) -> OutFrame {
     let mut m = Map::new();
     m.insert("type".into(), json!("session_info_changed"));
     if let Some(id) = id {
@@ -6536,7 +6571,7 @@ fn session_info_changed_frame(id: Option<String>, title: Option<String>) -> Valu
     }
     m.insert("command".into(), json!("set_session_name"));
     m.insert("title".into(), json!(title));
-    Value::Object(m)
+    Value::Object(m).into()
 }
 
 /// Filter `nodes` (the full, chronologically ordered [`crate::session_store::TreeNode`] list — see
@@ -6568,7 +6603,7 @@ fn response(
     success: bool,
     data: Option<Value>,
     error: Option<&str>,
-) -> Value {
+) -> OutFrame {
     let mut m = Map::new();
     m.insert("type".into(), json!("response"));
     if let Some(id) = id {
@@ -6582,39 +6617,52 @@ fn response(
     if let Some(e) = error {
         m.insert("error".into(), json!(e));
     }
-    Value::Object(m)
+    Value::Object(m).into()
 }
 
-/// Wrap an `AgentEvent` in an `event` frame, or `None` if it can't be serialized. Returning `None`
-/// (and skipping the frame) rather than emitting `{type:"event"}` with no `event` field keeps a
-/// serialization bug from putting a malformed frame on the wire that a client would silently mis-read.
 /// A lightweight acknowledgement frame, emitted the moment a `prompt` is queued — before the model
 /// turn(s) actually run — so a client can distinguish "received and starting" from the eventual
 /// terminal `response` (which may be seconds away on a long tool-heavy run).
-fn ack(id: Option<String>, command: &str) -> Value {
+fn ack(id: Option<String>, command: &str) -> OutFrame {
     let mut m = Map::new();
     m.insert("type".into(), json!("ack"));
     if let Some(id) = id {
         m.insert("id".into(), json!(id));
     }
     m.insert("command".into(), json!(command));
-    Value::Object(m)
+    Value::Object(m).into()
 }
 
-fn event_frame(ev: AgentEvent) -> Option<Value> {
-    let event = serde_json::to_value(&ev)
-        .inspect_err(|e| eprintln!("serve: failed to serialize agent event: {e}"))
-        .ok()?;
-    let mut m = Map::new();
-    m.insert("type".into(), json!("event"));
-    m.insert("event".into(), event);
-    Some(Value::Object(m))
+/// Wrap an `AgentEvent` in an `event` frame, or `None` if it can't be serialized. Returning `None`
+/// (and skipping the frame) rather than emitting `{type:"event"}` with no `event` field keeps a
+/// serialization bug from putting a malformed frame on the wire that a client would silently mis-read.
+///
+/// Serializes the envelope straight to its final JSON text in one pass (`OutFrame::Raw`) instead of
+/// going through `serde_json::to_value` first — this runs once per streamed model delta (`AgentEvent::
+/// Stream`), the highest-frequency frame this process ever emits, far more often than any RPC
+/// `response`/`ack`. `to_value` would build a full owned `Value` tree from `ev` only for the writer
+/// task to immediately walk that same tree again via its own `to_string` — twice the allocation and
+/// serialization work for the one frame kind that can least afford it.
+fn event_frame(ev: AgentEvent) -> Option<OutFrame> {
+    #[derive(serde::Serialize)]
+    struct EventFrame<'a> {
+        r#type: &'static str,
+        event: &'a AgentEvent,
+    }
+    let line = serde_json::to_string(&EventFrame {
+        r#type: "event",
+        event: &ev,
+    })
+    .inspect_err(|e| eprintln!("serve: failed to serialize agent event: {e}"))
+    .ok()?;
+    Some(OutFrame::Raw(line))
 }
 
 /// Write one newline-delimited frame to stdout and flush it.
+/// `line` must already carry its own trailing `\n` — folded into the one caller's buffer rather than a
+/// second `write_all` here, so a frame goes out as a single write instead of two.
 async fn write_frame(out: &mut tokio::io::Stdout, line: &str) -> std::io::Result<()> {
     out.write_all(line.as_bytes()).await?;
-    out.write_all(b"\n").await?;
     out.flush().await
 }
 

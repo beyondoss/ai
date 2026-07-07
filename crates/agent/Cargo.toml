@@ -118,3 +118,7 @@ tempfile = "3"
 [[bench]]
 name = "search"
 harness = false
+
+[[bench]]
+name = "serve_events"
+harness = false
