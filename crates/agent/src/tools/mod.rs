@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use agent_core::ToolRegistry;
+use agent_core::{ToolError, ToolRegistry};
 
 pub mod bash;
 pub mod beyond;
@@ -265,6 +265,52 @@ pub(crate) fn canonical_write_target(path: &str) -> String {
         }
     }
     normalized.display().to_string()
+}
+
+/// Reject any resolved path that isn't a regular file or a directory, *before* a caller ever opens it —
+/// shared by `read` (image-sniffing/content), `write` (the overwrite-open path, via [`is_writable`]),
+/// and `edit` (`read_with_mtime`'s initial open). Originally lived only in `read.rs`; hoisted here once
+/// the same hang class was found in `write`/`edit` too (pi-parity pass 20) — each of those blocks on a
+/// syscall no timeout/kill-on-drop can preempt, exactly like `read`'s own pre-fix bug below, so one
+/// shared gate closes all three rather than three independently-maintained copies.
+///
+/// That gap is a real hang, not just a theoretical one: opening a FIFO for reading blocks until a
+/// writer shows up on the other end (a bare `mkfifo` with no writer wedges the very first read), opening
+/// one for *writing* (`write`'s overwrite path, `OpenOptions::write(true)`) equally blocks until a
+/// *reader* shows up, and a character device like `/dev/zero` opens and reads immediately but never
+/// signals EOF or contains a newline byte — a line-scanning read loop spins forever waiting for either.
+/// None of this has a timeout or kill-on-drop the way `bash`'s child processes do, so any one of them
+/// wedges the whole tool call — and, since dispatch awaits each call in turn, the entire turn — forever;
+/// worse, because it's a blocking syscall inline in the future's own `poll()` rather than behind an
+/// `await` point, dropping/cancelling the enclosing future can't recover it either — only killing the
+/// whole process can, which in `serve` pins a tokio worker thread shared by other concurrent sessions.
+///
+/// There's no legitimate use for reading/writing a FIFO/socket/device through these tools (a named
+/// pipe's "content" isn't a stable, replayable value the way a regular file's bytes are, and images are
+/// never any of these), so this simply refuses all of them with one clear error rather than trying to
+/// special-case any as safe. A directory is let through unmolested — opening one for reading or writing
+/// already fails cleanly a moment later (an `EISDIR`-style OS error) — so it needs no separate gate here.
+///
+/// Uses `std::fs::metadata` (follows symlinks) rather than `symlink_metadata`, so a symlink pointing
+/// *at* a FIFO/device is caught too, not just a bare one. A path whose metadata can't be read at all
+/// (most commonly: doesn't exist) is let through here — that already has its own clear "missing
+/// file"/"not writable" error at the real open call below, and duplicating it here under a different
+/// wording would just be a second, inconsistent failure mode for the same cause.
+///
+/// `tool` names the caller in the error message (`"read"`/`"write"`/`"edit"`) so the model sees which
+/// tool actually refused the path, not a generic one-size-fits-all wording.
+pub(crate) fn reject_non_regular_file(path: &str, tool: &str) -> Result<(), ToolError> {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Ok(());
+    };
+    let file_type = meta.file_type();
+    if file_type.is_file() || file_type.is_dir() {
+        return Ok(());
+    }
+    Err(ToolError::Execution(format!(
+        "{path} is not a regular file (it's a FIFO, socket, or device); `{tool}` can only operate on \
+         regular files"
+    )))
 }
 
 /// Whether `path` is actually writable by *this process* — a real access check, not an inspection of
@@ -859,5 +905,54 @@ mod tests {
             "the owner triad denies write; the real access check must reflect that even though \
              another triad's bits happen to allow it"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reject_non_regular_file_names_the_calling_tool_in_its_error() {
+        // Direct unit test for the gate `write.rs`/`edit.rs` now call before their own blocking opens
+        // (pi-parity pass 20) — the async, `mkfifo`-driven regression tests in each tool's own test
+        // module prove the *hang* is fixed; this proves the shared helper's error text actually names
+        // whichever tool called it, not a generic one-size-fits-all wording. A bare `metadata()` call
+        // never blocks on a FIFO (only *opening* one does), so this needs no timeout wrapper.
+        let dir = tempfile::tempdir().unwrap();
+        let fifo_path = dir.path().join("a.fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status()
+            .expect("mkfifo must be available to run this test");
+        assert!(status.success(), "mkfifo failed to create the test fixture");
+
+        let err = reject_non_regular_file(fifo_path.to_str().unwrap(), "edit").unwrap_err();
+        match err {
+            ToolError::Execution(msg) => {
+                assert!(msg.contains("`edit`"), "got: {msg}");
+                assert!(msg.contains("FIFO"), "got: {msg}");
+            }
+            other => panic!("expected Execution, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reject_non_regular_file_allows_a_regular_file_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "x").unwrap();
+        assert!(reject_non_regular_file(path.to_str().unwrap(), "write").is_ok());
+    }
+
+    #[test]
+    fn reject_non_regular_file_allows_a_missing_path_through() {
+        // A missing path is left to the caller's own real open call to produce a clearer, tool-specific
+        // "not found"/"not writable" error rather than duplicating that here under different wording.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.txt");
+        assert!(reject_non_regular_file(path.to_str().unwrap(), "write").is_ok());
+    }
+
+    #[test]
+    fn reject_non_regular_file_allows_a_directory_through() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(reject_non_regular_file(dir.path().to_str().unwrap(), "write").is_ok());
     }
 }

@@ -190,11 +190,28 @@ pub struct Settings {
     /// `--skill` list falls back to this list *in full*; a non-empty explicit list wins outright with no
     /// merge — same plain-override precedence as every other field (see
     /// [`Self::default_models_list`]'s doc comment).
+    ///
+    /// Since Round 20 (pi-parity feature), each entry is either a plain path — a directory (walked
+    /// recursively, unchanged) or an individual `SKILL.md`/loose-`.md` file (already supported: this list
+    /// feeds `skills::discover_with_diagnostics`'s own `extra_roots`, which has accepted a standalone file
+    /// since the M3/pi-parity single-file fix) — or an override *pattern*, classified by
+    /// [`classify_path_entry`] and applied uniformly across *every* discovery root (both standard ones and
+    /// any plain path configured here), not just this list's own plain entries: `!pattern`/a bare entry
+    /// containing `*`/`?` excludes an already-discovered skill matching by name, containing directory, or
+    /// path; `+pattern` force-includes one an exclude elsewhere would otherwise have dropped; `-pattern`
+    /// force-excludes one even if a `+pattern` elsewhere would have restored it. See
+    /// [`crate::skills::apply_path_overrides`] for the application; matches pi's own
+    /// `package-manager.ts`'s `isEnabledByOverrides`/`applyPatterns`, simplified to one uniform pass
+    /// instead of pi's own tier-scoped (global vs. project `baseDir`) split — see `classify_path_entry`'s
+    /// own doc comment for why.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_skill_paths: Option<Vec<String>>,
     /// Used when no `--prompt-template <path>`/`AI_AGENT_PROMPT_TEMPLATE_PATH` is given — pi-parity fix
     /// (Round 3), [`Self::default_skill_paths`]'s identical relationship to prompt-template discovery
-    /// roots.
+    /// roots — including, since Round 20, the identical override-pattern/individual-file semantics
+    /// described on that field's own doc comment (applied via [`crate::prompts::discover_with_diagnostics`]
+    /// reusing the same [`crate::skills::apply_path_overrides`]/[`classify_path_entry`] this crate shares
+    /// between skills and prompts everywhere else — e.g. `parse_frontmatter`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_prompt_template_paths: Option<Vec<String>>,
     /// Used when neither `--branch-summary-reserve-tokens` nor
@@ -322,6 +339,72 @@ impl Settings {
                 .clone()
                 .or_else(|| self.follow_up_mode.clone()),
         }
+    }
+}
+
+/// One classified entry from [`Settings::default_skill_paths`]/[`Settings::default_prompt_template_paths`]
+/// (equivalently, an already-merged `extra_roots` list — an operator-supplied `--skill`/
+/// `--prompt-template` path falls through the same list, see `main.rs`'s `extra_skill_paths`/
+/// `extra_prompt_template_paths` resolution) — pi-parity feature, Round 20: pi's own
+/// `package-manager.ts` treats skills/prompts as configurable "resources" whose discovery-root list can
+/// also carry override patterns (`isPattern`/`isOverridePattern`/`splitPatterns`), not just plain
+/// directory paths; beyond had no such layer at all before this.
+///
+/// Deliberately still a plain `Vec<String>` on `Settings` itself (see [`Settings::merge_over`]'s doc
+/// comment on why every list field there is wholesale-replaced, never appended, between tiers) — this
+/// type only exists to classify one already-resolved entry once `skills::discover_with_diagnostics`/
+/// `prompts::discover_with_diagnostics` read it, not to change what's actually persisted on disk.
+///
+/// Pi's own equivalent is a dual-purpose split: a bare, unprefixed glob is an *include* filter (`applyPatterns`'s
+/// `includes` bucket — "restrict to only files matching one of these"), scoped only to the files an
+/// explicit plain directory entry *in that same settings list* turned up, while `!`/`+`/`-`-prefixed
+/// entries are separately read as *overrides* (`getOverridePatterns`/`isEnabledByOverrides`) applied only
+/// to each settings tier's own fixed auto-discovery directory (global entries only ever gate the global
+/// standard root, project entries only the project one). Beyond deliberately simplifies both of those
+/// splits into one uniform pass — see [`crate::skills::apply_path_overrides`], which this variant's
+/// caller applies identically to *every* discovery root (standard and configured alike) after beyond's
+/// own [`Settings::merge_over`] has already collapsed global+project into one effective list, so there is
+/// no separate tier/`baseDir` left to scope patterns to by the time discovery runs. Concretely: a bare
+/// glob here is folded into [`PathEntry::Exclude`] rather than kept as a separate "only these" whitelist
+/// bucket — pi's own whitelist behavior only ever does anything when combined with an explicit directory
+/// entry in the very same list (with no such entry, `applyPatterns`'s own `allFiles` is empty and the
+/// bare glob filters nothing at all), a narrower and more surprising rule than "a bare glob excludes
+/// whatever it matches, everywhere," which is what an operator skimming a `skills: ["!draft-*"]` entry
+/// would reasonably expect it to mean.
+pub(crate) enum PathEntry<'a> {
+    /// A literal directory or individual file path — an additional discovery root, exactly what every
+    /// entry in this list meant before Round 20.
+    Root(&'a str),
+    /// `!pattern`, or a bare entry containing a glob metacharacter (`*`/`?`) with no `+`/`-` prefix —
+    /// exclude any already-discovered skill/prompt whose name, containing directory (for a
+    /// directory-shaped skill), or path matches.
+    Exclude(&'a str),
+    /// `+pattern` — force-include a skill/prompt an [`PathEntry::Exclude`] elsewhere in the same list
+    /// would otherwise have dropped.
+    Include(&'a str),
+    /// `-pattern` — force-exclude a skill/prompt even if a [`PathEntry::Include`] elsewhere in the same
+    /// list would have restored it.
+    ForceExclude(&'a str),
+}
+
+/// Classify one raw `default_skill_paths`/`default_prompt_template_paths` entry — see [`PathEntry`] for
+/// the exact semantics each variant carries. Prefix stripping happens here, once, so every caller (the
+/// root-walk loop and [`crate::skills::apply_path_overrides`] alike) agrees on the same four buckets
+/// rather than re-deriving them; matches pi's own `isOverridePattern`/`hasGlobPattern` prefix rules
+/// exactly (`!`/`+`/`-` always wins as an override regardless of whether the remainder also happens to
+/// contain a glob metacharacter — a literal `!my-skill` with no `*`/`?` at all is still `Exclude`, not a
+/// literal-path `Root`).
+pub(crate) fn classify_path_entry(entry: &str) -> PathEntry<'_> {
+    if let Some(rest) = entry.strip_prefix('!') {
+        PathEntry::Exclude(rest)
+    } else if let Some(rest) = entry.strip_prefix('+') {
+        PathEntry::Include(rest)
+    } else if let Some(rest) = entry.strip_prefix('-') {
+        PathEntry::ForceExclude(rest)
+    } else if entry.contains('*') || entry.contains('?') {
+        PathEntry::Exclude(entry)
+    } else {
+        PathEntry::Root(entry)
     }
 }
 
@@ -2289,6 +2372,72 @@ mod tests {
             merged.default_skill_paths,
             Some(vec!["/global/skills".to_string()])
         );
+    }
+
+    // pi-parity feature, Round 20: `classify_path_entry`'s four buckets — see `PathEntry`'s own doc
+    // comment for the exact semantics (and how they deliberately diverge from pi's own dual-bucket bare-
+    // glob behavior) each of these pins down.
+
+    #[test]
+    fn classify_path_entry_treats_a_plain_path_as_root() {
+        assert!(matches!(
+            classify_path_entry("/home/user/.claude/skills"),
+            PathEntry::Root("/home/user/.claude/skills")
+        ));
+        assert!(matches!(
+            classify_path_entry("relative/skills"),
+            PathEntry::Root("relative/skills")
+        ));
+    }
+
+    #[test]
+    fn classify_path_entry_treats_a_bare_glob_as_exclude() {
+        // No `!`/`+`/`-` prefix at all — a bare entry containing a glob metacharacter is still an
+        // exclude filter, not a literal root to walk (see `PathEntry`'s doc comment on why this diverges
+        // from pi's own "restrict to only these" bare-glob-include behavior).
+        assert!(matches!(
+            classify_path_entry("*.experimental.md"),
+            PathEntry::Exclude("*.experimental.md")
+        ));
+        assert!(matches!(
+            classify_path_entry("draft-?"),
+            PathEntry::Exclude("draft-?")
+        ));
+    }
+
+    #[test]
+    fn classify_path_entry_strips_the_bang_prefix_for_exclude() {
+        assert!(matches!(
+            classify_path_entry("!wip-skill"),
+            PathEntry::Exclude("wip-skill")
+        ));
+    }
+
+    #[test]
+    fn classify_path_entry_strips_the_plus_prefix_for_force_include() {
+        assert!(matches!(
+            classify_path_entry("+wip-skill"),
+            PathEntry::Include("wip-skill")
+        ));
+    }
+
+    #[test]
+    fn classify_path_entry_strips_the_minus_prefix_for_force_exclude() {
+        assert!(matches!(
+            classify_path_entry("-wip-skill"),
+            PathEntry::ForceExclude("wip-skill")
+        ));
+    }
+
+    #[test]
+    fn classify_path_entry_prefix_wins_even_when_the_remainder_also_has_a_glob_metacharacter() {
+        // `!`/`+`/`-` always wins as the override marker, regardless of whether the remainder also
+        // happens to contain `*`/`?` — matches pi's own `isOverridePattern` check running independently
+        // of (and before) `hasGlobPattern`.
+        assert!(matches!(
+            classify_path_entry("!draft-*.md"),
+            PathEntry::Exclude("draft-*.md")
+        ));
     }
 
     #[test]

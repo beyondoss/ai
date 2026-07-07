@@ -162,19 +162,28 @@ pub fn resolve_gateway_credential_with_identity(
                     return Err(reason);
                 }
             }
-            // Fix 1 (pi-parity, Round 2): an explicit `dialect` override wins over `Dialect::for_model`'s
-            // name heuristic — consulted here (to pick the right endpoint path for a provider whose
-            // model ids don't match the heuristic, e.g. Kimi-Coding's `kimi-k2-thinking`) AND threaded
-            // into `DirectRouting::dialect_override` below (for the actual body-building/decoding
-            // dialect `GatewayClient::stream` picks), so the two never disagree. Failing that, a handful
-            // of OpenCode Zen/OpenCode-Go id/host combinations need a *different* default than
-            // `Dialect::for_model`'s own generic bare-id table (`NATIVE_ANTHROPIC_WIRE_BARE_IDS`)
-            // provides (pi-parity remediation pass 19, Task 1) — see [`opencode_dialect_override`]'s own
-            // doc comment.
-            let dialect = over.dialect.unwrap_or_else(|| {
-                opencode_dialect_override(model, &base_url)
-                    .unwrap_or_else(|| agent_core::dialect::Dialect::for_model(model))
-            });
+            // pi-parity pass 20, Task 3/5: which known third-party aggregator (if any) this override's
+            // `base_url` names — see [`aggregator_host_for_base_url`]'s own doc comment. Computed here,
+            // before `dialect` below, so both the dialect selection AND `DirectRouting::aggregator_host`
+            // (threaded across the crate boundary to `agent_core::client::GatewayClient::stream`, which
+            // sets `ModelRequest::host` from it) reuse the identical value — no second, independent
+            // detection path.
+            let aggregator_host = aggregator_host_for_base_url(&base_url);
+            // Fix 1 (pi-parity, Round 2): an explicit `dialect` override wins over
+            // `Dialect::for_model_with_host`'s name/host heuristic — consulted here (to pick the right
+            // endpoint path for a provider whose model ids don't match the heuristic, e.g. Kimi-Coding's
+            // `kimi-k2-thinking`) AND threaded into `DirectRouting::dialect_override` below (for the
+            // actual body-building/decoding dialect `GatewayClient::stream` picks), so the two never
+            // disagree. Failing that, `for_model_with_host` is already host-aware (pi-parity pass 20,
+            // Task 6): a handful of OpenCode Zen/OpenCode-Go id/host combinations need a *different*
+            // default than `NATIVE_ANTHROPIC_WIRE_BARE_IDS`'s own host-agnostic default provides, and
+            // `aggregator_host` (just computed above) is exactly the signal that resolves them —
+            // formerly a separate `opencode_dialect_override` helper in this file (pi-parity remediation
+            // pass 19, Task 1), now folded into the one shared mechanism instead of a second, parallel
+            // "which host is this" check.
+            let dialect = over
+                .dialect
+                .unwrap_or_else(|| agent_core::dialect::Dialect::for_model_with_host(model, aggregator_host));
             // Task #11 (pi-parity feature): resolved through `!command`/`$VAR`/literal syntax (see
             // `ModelOverride::resolved_api_key`'s own doc comment) rather than used as a raw literal —
             // lets an operator avoid storing a plaintext secret in `models.json`.
@@ -192,10 +201,6 @@ pub fn resolve_gateway_credential_with_identity(
             // up an unsolicited `?api-version=v1` it never asked for.
             let is_azure = over.deployment_name.is_some() || is_azure_host(&base_url);
             let query = azure_api_version_query(over.api_version.as_deref(), is_azure);
-            // pi-parity remediation pass 19, Task 3: which known third-party aggregator (if any) this
-            // override's `base_url` names — see [`aggregator_host_for_base_url`]'s own doc comment for
-            // what this does (and doesn't yet) close the loop on.
-            let aggregator_host = aggregator_host_for_base_url(&base_url);
             let routing = DirectRouting {
                 route: RouteOverride::Direct {
                     base_url: base_url.clone(),
@@ -219,6 +224,10 @@ pub fn resolve_gateway_credential_with_identity(
                 deployment_name: over.deployment_name.clone(),
                 // Fix 2 (pi-parity, Round 2): Azure's dated `api-version` query param.
                 query: query.clone(),
+                // pi-parity pass 20, Task 5: threads the same `aggregator_host` computed above across
+                // the crate boundary so `GatewayClient::stream` can set `ModelRequest::host` from it —
+                // see `DirectRouting::aggregator_host`'s own doc comment.
+                aggregator_host,
             };
             // pi-parity remediation pass 19, Task 2: the fallback tier below both this override's own
             // credential (`bearer`, just above) and `--key`/`AI_AGENT_KEY` — a stored OAuth login, still
@@ -301,6 +310,9 @@ pub fn resolve_gateway_credential_with_identity(
                     dialect_override: None,
                     deployment_name: None,
                     query: None,
+                    // Codex is reached via its own fixed `RouteOverride::Prefixed` row, never a BYO
+                    // `base_url` override — no aggregator host of its own to report.
+                    aggregator_host: None,
                 };
                 let identity = GatewayCredentialIdentity::OpenaiCodex {
                     account_id: c.account_id.clone(),
@@ -325,12 +337,14 @@ pub fn resolve_gateway_credential_with_identity(
                 // `CopilotRoutedCredentialSource` itself (not computed here and frozen) — see that
                 // type's own doc comment for why.
                 //
-                // `for_model_via_copilot(.., true)`, not plain `for_model`: at least one id (`gpt-4.1`)
-                // is a different dialect under Copilot than it is natively (pi-parity — see that
-                // function's doc comment), and this dialect also picks `copilot_endpoint_path`'s
+                // `for_model_via_copilot(.., true, ..)`, not plain `for_model`: at least one id
+                // (`gpt-4.1`) is a different dialect under Copilot than it is natively (pi-parity — see
+                // that function's doc comment), and this dialect also picks `copilot_endpoint_path`'s
                 // baked-in `path` below, so getting it wrong here would send that id's Chat-Completions
-                // body to a `/responses` path.
-                let dialect = agent_core::dialect::Dialect::for_model_via_copilot(model, true);
+                // body to a `/responses` path. `host: None` — Copilot is matched via a stored
+                // credential's `available_model_ids`, never a BYO `base_url` override, so it has no
+                // `AggregatorHost` of its own to report.
+                let dialect = agent_core::dialect::Dialect::for_model_via_copilot(model, true, None);
                 let path = crate::oauth::github_copilot::copilot_endpoint_path(dialect);
                 let identity = GatewayCredentialIdentity::GithubCopilot {
                     enterprise_url: c.enterprise_url.clone(),
@@ -383,74 +397,6 @@ fn unsupported_wire_format_reason(model: &str) -> Option<String> {
         })
 }
 
-/// Which OpenCode aggregator a `models.json` override's `base_url` names, if either (pi-parity
-/// remediation pass 19, Task 1). pi's own `packages/ai/src/providers/opencode.models.ts` (OpenCode Zen)
-/// and `opencode-go.models.ts` (OpenCode-Go) are two distinct aggregators nested under the same
-/// registered domain — `opencode.ai/zen`(`/v1`) vs. `opencode.ai/zen/go`(`/v1`) — each with its own
-/// catalogue and, for a handful of ids, a genuinely different real wire dialect than the identical bare
-/// id gets on the other. A host-only check (à la [`is_azure_host`]) can't distinguish the two — they
-/// share the same registered domain — so this also inspects the path's `/go` segment. See
-/// [`opencode_dialect_override`]'s own doc comment for the concrete id/host combinations this exists to
-/// resolve.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OpenCodeHost {
-    /// `opencode.ai/zen`(`/v1`) — `opencode.models.ts`.
-    Zen,
-    /// `opencode.ai/zen/go`(`/v1`) — `opencode-go.models.ts`.
-    Go,
-}
-
-fn opencode_host(base_url: &str) -> Option<OpenCodeHost> {
-    let url = url::Url::parse(base_url).ok()?;
-    if url.host_str() != Some("opencode.ai") {
-        return None;
-    }
-    let path = url.path().trim_end_matches('/');
-    if path == "/zen/go" || path.starts_with("/zen/go/") {
-        Some(OpenCodeHost::Go)
-    } else if path == "/zen" || path.starts_with("/zen/") {
-        Some(OpenCodeHost::Zen)
-    } else {
-        None
-    }
-}
-
-/// The 4 known id/host combinations (pi-parity remediation pass 19, Task 1) where
-/// `agent_core::dialect::NATIVE_ANTHROPIC_WIRE_BARE_IDS`'s otherwise-correct generic bare-id default
-/// (Anthropic wire) is wrong for one *specific* OpenCode Zen/OpenCode-Go host, because that id is
-/// genuinely served over OpenAI Chat Completions there instead — a `models.json` override naming one of
-/// these exact ids on the matching host, with no explicit `dialect` of its own, would otherwise silently
-/// build an Anthropic-shaped body and send it to an endpoint that speaks Chat Completions.
-///
-/// Verified against pi's real catalogues:
-/// - `packages/ai/src/providers/opencode.models.ts` (OpenCode Zen): `"minimax-m2.7"`/`"minimax-m3"` are
-///   `api: "openai-completions"` there (`NATIVE_ANTHROPIC_WIRE_BARE_IDS` lists both only for *native*
-///   MiniMax's/MiniMax-CN's sake — genuinely Anthropic-wire on those hosts, not on OpenCode Zen).
-/// - `packages/ai/src/providers/opencode-go.models.ts` (OpenCode-Go): `"minimax-m2.7"`/`"qwen3.6-plus"`
-///   are `api: "openai-completions"` there too — a *different* split again from OpenCode Zen, where
-///   `"qwen3.6-plus"` is genuinely Anthropic-wire. `dialect/mod.rs`'s own `NATIVE_ANTHROPIC_WIRE_BARE_IDS`
-///   doc comment already flagged both of OpenCode-Go's ids as "genuinely `openai-completions`" there —
-///   this is that flag finally acted on.
-///
-/// OpenCode Zen's own `qwen3.5-plus`/`qwen3.6-plus` and OpenCode-Go's own `minimax-m3`/`qwen3.7-max`/
-/// `qwen3.7-plus` are deliberately *not* in this table: those are genuinely Anthropic-wire on their
-/// respective host, so `NATIVE_ANTHROPIC_WIRE_BARE_IDS`'s existing default is already correct for them
-/// and this function returns `None`, falling through unchanged.
-///
-/// Unlike [`unsupported_wire_format_reason`]'s sibling fix for OpenCode Zen's 3 Gemini-hosted ids, this
-/// resolves to a *supported* dialect (OpenAI Chat Completions) rather than a hard failure: beyond has a
-/// perfectly good dialect for these 4 combinations, so silently defaulting to the wrong one had a real,
-/// avoidable fix available — unlike the Gemini case, where no dialect exists for that wire format at all
-/// and failing loudly is the only honest option.
-fn opencode_dialect_override(model: &str, base_url: &str) -> Option<agent_core::dialect::Dialect> {
-    let m = model.to_ascii_lowercase();
-    match (opencode_host(base_url)?, m.as_str()) {
-        (OpenCodeHost::Zen, "minimax-m2.7" | "minimax-m3") => Some(agent_core::dialect::Dialect::OpenAi),
-        (OpenCodeHost::Go, "minimax-m2.7" | "qwen3.6-plus") => Some(agent_core::dialect::Dialect::OpenAi),
-        _ => None,
-    }
-}
-
 /// Which OAuth provider (if any) a `models.json` `base_url` override for `model` should fall through to
 /// when it supplies no bearer credential of its own (pi-parity remediation pass 19, Task 2). `over`'s own
 /// explicit `api_key`/`auth_header`, and `key` (`--key`/`AI_AGENT_KEY`, already resolved by the caller),
@@ -491,10 +437,10 @@ fn oauth_fallback_provider(
     None
 }
 
-/// Which of the 7 known third-party aggregator platforms (`agent_core::models::AggregatorHost`) a
+/// Which of the 9 known third-party aggregator platforms (`agent_core::models::AggregatorHost`) a
 /// `models.json` override's (already-normalized) `base_url` names, if any (pi-parity remediation pass 19,
-/// Task 3) — the "BYO/direct-routed" half of the host signal
-/// `agent_core::models::capabilities_for_route_with_host` exists to consume; see
+/// Task 3; OpenCode Zen/OpenCode-Go added in pass 20, Task 5) — the "BYO/direct-routed" half of the host
+/// signal `agent_core::models::capabilities_for_route_with_host` exists to consume; see
 /// `agent_core::transport::ModelRequest::host`'s own doc comment for the full mechanism this is meant to
 /// close the loop on. Matched by parsed hostname (see [`is_azure_host`]'s identical reasoning for why not
 /// a raw substring check), against each aggregator's real, documented base authority — pi's own
@@ -503,6 +449,15 @@ fn oauth_fallback_provider(
 /// `agent_core::client::GatewayClient::stream` already resolves it unconditionally from the model id's
 /// own shape (`is_fireworks_model`) before this signal would ever be consulted, so there's no
 /// base_url-matching case to add for it here.
+///
+/// OpenCode Zen and OpenCode-Go are the one pair that needs more than a hostname match: pi's
+/// `opencode.models.ts` (Zen) and `opencode-go.models.ts` (Go) are two distinct aggregators nested under
+/// the *same* registered domain — `opencode.ai/zen`(`/v1`) vs. `opencode.ai/zen/go`(`/v1`) — each with
+/// its own catalogue and, for a handful of bare ids (`"minimax-m2.7"`, `"minimax-m3"`, `"qwen3.6-plus"`,
+/// `"glm-5.1"`), a genuinely different real wire dialect/capability numbers than the identical id gets on
+/// the other (see `agent_core::dialect::anthropic_wire_bare_id_for_host` and
+/// `agent_core::models::capabilities_for_route_with_host`'s own `OpenCodeZen`/`OpenCodeGo` arms) — so this
+/// also inspects the path's `/go` segment, the same way [`is_azure_host`] cannot for those two.
 ///
 /// **This only ever covers a `base_url`-carrying override.** A plain gateway-routed request (a
 /// `bai_v1…` virtual key, no override) genuinely has no client-visible signal of which
@@ -518,18 +473,16 @@ fn oauth_fallback_provider(
 /// which exists yet. Left unaddressed here rather than guessed at; this function only ever returns one of
 /// those 3 variants for the (also legitimate) case where an operator's `base_url` override points
 /// directly at that provider's own official endpoint, bypassing the gateway entirely — the identical
-/// shape this function already handles for the 3 BYO-only hosts (HuggingFace/NVIDIA/Kimi-Coding, which
-/// have no gateway route at all).
+/// shape this function already handles for the 5 BYO-only hosts (HuggingFace/NVIDIA/Kimi-Coding/OpenCode
+/// Zen/OpenCode-Go, none of which have a gateway route at all).
 ///
-/// Not yet threaded any further than this file's own [`GatewayCredentialIdentity`] — see that type's
-/// `DirectOverride`/`DirectOverrideOauth` variants. Actually reaching `ModelRequest::host` would need
-/// either a new field on `agent_core::client::DirectRouting` (agent-core, unowned this round) for
-/// `GatewayClient::stream` to read back out, or `crates/agent/src/serve.rs` (a sibling agent's file this
-/// round) calling this function directly when it builds a `ModelRequest` — this module lands the
-/// detection primitive itself, matching the precedent [`GatewayCredentialIdentity`] (Fix #36) already set
-/// for landing an unwired primitive when the consuming call site belongs to someone else this round.
+/// Threaded to `agent_core::client::DirectRouting::aggregator_host` (pi-parity pass 20, Task 5) by
+/// [`resolve_gateway_credential_with_identity`]'s own BYO-override branch, which reads
+/// `ModelRequest::host` from it via `GatewayClient::stream` — as well as this file's own
+/// [`GatewayCredentialIdentity`] `DirectOverride`/`DirectOverrideOauth` variants, unchanged.
 pub(crate) fn aggregator_host_for_base_url(base_url: &str) -> Option<AggregatorHost> {
-    let host = url::Url::parse(base_url).ok()?.host_str()?.to_ascii_lowercase();
+    let url = url::Url::parse(base_url).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
     match host.as_str() {
         "router.huggingface.co" => Some(AggregatorHost::HuggingFace),
         "integrate.api.nvidia.com" => Some(AggregatorHost::Nvidia),
@@ -537,6 +490,16 @@ pub(crate) fn aggregator_host_for_base_url(base_url: &str) -> Option<AggregatorH
         "api.together.ai" | "api.together.xyz" => Some(AggregatorHost::Together),
         "api.groq.com" => Some(AggregatorHost::Groq),
         "openrouter.ai" => Some(AggregatorHost::OpenRouter),
+        "opencode.ai" => {
+            let path = url.path().trim_end_matches('/');
+            if path == "/zen/go" || path.starts_with("/zen/go/") {
+                Some(AggregatorHost::OpenCodeGo)
+            } else if path == "/zen" || path.starts_with("/zen/") {
+                Some(AggregatorHost::OpenCodeZen)
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -1170,91 +1133,119 @@ mod tests {
         assert!(reason.contains("dialect"), "got: {reason}");
     }
 
-    // pi-parity remediation pass 19, Task 1: `opencode_host`/`opencode_dialect_override` fix 4 known
-    // id/host combinations where OpenCode Zen/OpenCode-Go serve a bare id (already in
-    // `NATIVE_ANTHROPIC_WIRE_BARE_IDS` for another host's sake) over OpenAI Chat Completions instead of
-    // the generic Anthropic-wire default.
+    // pi-parity pass 20, Task 5/6: `aggregator_host_for_base_url` (host detection) +
+    // `agent_core::dialect::Dialect::for_model_with_host` (host-aware dialect resolution) together
+    // replace remediation pass 19 Task 1's own bespoke `opencode_host`/`opencode_dialect_override`
+    // helpers — the exact same 3 real id/host collisions, now resolved through the one shared
+    // `AggregatorHost` mechanism instead of a second, parallel "which host is this" check.
 
     #[test]
-    fn opencode_host_recognizes_zen_with_or_without_the_v1_suffix() {
+    fn aggregator_host_for_base_url_recognizes_opencode_zen_with_or_without_the_v1_suffix() {
         for url in [
             "https://opencode.ai/zen",
             "https://opencode.ai/zen/v1",
             "https://opencode.ai/zen/",
         ] {
-            assert_eq!(opencode_host(url), Some(OpenCodeHost::Zen), "{url}");
+            assert_eq!(
+                aggregator_host_for_base_url(url),
+                Some(AggregatorHost::OpenCodeZen),
+                "{url}"
+            );
         }
     }
 
     #[test]
-    fn opencode_host_recognizes_go_with_or_without_the_v1_suffix() {
+    fn aggregator_host_for_base_url_recognizes_opencode_go_with_or_without_the_v1_suffix() {
         for url in [
             "https://opencode.ai/zen/go",
             "https://opencode.ai/zen/go/v1",
             "https://opencode.ai/zen/go/",
         ] {
-            assert_eq!(opencode_host(url), Some(OpenCodeHost::Go), "{url}");
+            assert_eq!(
+                aggregator_host_for_base_url(url),
+                Some(AggregatorHost::OpenCodeGo),
+                "{url}"
+            );
         }
     }
 
     #[test]
-    fn opencode_host_is_none_for_an_unrelated_host_an_unrelated_path_or_an_unparsable_url() {
-        assert_eq!(opencode_host("https://api.together.ai/v1"), None);
-        assert_eq!(opencode_host("https://opencode.ai/other"), None);
-        assert_eq!(opencode_host("not a url at all"), None);
+    fn aggregator_host_for_base_url_is_none_for_an_opencode_ai_unrelated_path() {
+        // Same registered domain as Zen/Go, but neither the `/zen` nor `/zen/go` prefix — must not
+        // false-positive into either variant.
+        assert_eq!(aggregator_host_for_base_url("https://opencode.ai/other"), None);
     }
 
     #[test]
-    fn opencode_dialect_override_forces_openai_for_all_4_known_mis_dialected_combinations() {
+    fn host_aware_dialect_resolves_the_three_real_opencode_collisions_from_a_byo_base_url() {
         use agent_core::dialect::Dialect;
-        // OpenCode Zen: minimax-m2.7/minimax-m3 are `api: "openai-completions"` there
-        // (opencode.models.ts), despite both being in `NATIVE_ANTHROPIC_WIRE_BARE_IDS` for native
-        // MiniMax's/MiniMax-CN's sake.
+        // The exact 3 real, host-dependent bare-id wire collisions (pi-parity pass 20, Task 6) — each
+        // resolved here via the same `aggregator_host_for_base_url` → `Dialect::for_model_with_host`
+        // path a real BYO `models.json` override with no explicit `dialect` would take.
+        // "minimax-m2.7": openai-completions on both OpenCode Zen and OpenCode-Go (only native MiniMax,
+        // no aggregator host at all, is genuinely anthropic-wire).
         assert_eq!(
-            opencode_dialect_override("minimax-m2.7", "https://opencode.ai/zen/v1"),
-            Some(Dialect::OpenAi)
+            Dialect::for_model_with_host(
+                "minimax-m2.7",
+                aggregator_host_for_base_url("https://opencode.ai/zen/v1")
+            ),
+            Dialect::OpenAi
         );
         assert_eq!(
-            opencode_dialect_override("minimax-m3", "https://opencode.ai/zen/v1"),
-            Some(Dialect::OpenAi)
+            Dialect::for_model_with_host(
+                "minimax-m2.7",
+                aggregator_host_for_base_url("https://opencode.ai/zen/go/v1")
+            ),
+            Dialect::OpenAi
         );
-        // OpenCode-Go: minimax-m2.7/qwen3.6-plus are `api: "openai-completions"` there too
-        // (opencode-go.models.ts) — a different split again from OpenCode Zen, where qwen3.6-plus is
-        // genuinely Anthropic-wire.
+        // "minimax-m3": openai-completions on OpenCode Zen specifically; still anthropic-wire on
+        // OpenCode-Go (matching the host-agnostic default).
         assert_eq!(
-            opencode_dialect_override("minimax-m2.7", "https://opencode.ai/zen/go/v1"),
-            Some(Dialect::OpenAi)
+            Dialect::for_model_with_host(
+                "minimax-m3",
+                aggregator_host_for_base_url("https://opencode.ai/zen/v1")
+            ),
+            Dialect::OpenAi
         );
         assert_eq!(
-            opencode_dialect_override("qwen3.6-plus", "https://opencode.ai/zen/go/v1"),
-            Some(Dialect::OpenAi)
+            Dialect::for_model_with_host(
+                "minimax-m3",
+                aggregator_host_for_base_url("https://opencode.ai/zen/go/v1")
+            ),
+            Dialect::Anthropic
         );
-    }
-
-    #[test]
-    fn opencode_dialect_override_is_case_insensitive_on_the_model_id() {
-        use agent_core::dialect::Dialect;
+        // "qwen3.6-plus": openai-completions on OpenCode-Go specifically; still anthropic-wire on
+        // OpenCode Zen (matching the host-agnostic default).
         assert_eq!(
-            opencode_dialect_override("MiniMax-M3", "https://opencode.ai/zen/v1"),
-            Some(Dialect::OpenAi)
+            Dialect::for_model_with_host(
+                "qwen3.6-plus",
+                aggregator_host_for_base_url("https://opencode.ai/zen/go/v1")
+            ),
+            Dialect::OpenAi
         );
-    }
-
-    #[test]
-    fn opencode_dialect_override_is_none_for_ids_that_are_already_correctly_anthropic_on_their_host() {
-        // OpenCode Zen's own qwen3.6-plus is genuinely Anthropic-wire — the existing
-        // `NATIVE_ANTHROPIC_WIRE_BARE_IDS` default is already correct, so this must not override it.
-        assert_eq!(opencode_dialect_override("qwen3.6-plus", "https://opencode.ai/zen"), None);
-        // OpenCode-Go's own minimax-m3/qwen3.7-max are also genuinely Anthropic-wire there.
-        assert_eq!(opencode_dialect_override("minimax-m3", "https://opencode.ai/zen/go"), None);
-        assert_eq!(opencode_dialect_override("qwen3.7-max", "https://opencode.ai/zen/go"), None);
-    }
-
-    #[test]
-    fn opencode_dialect_override_is_none_for_an_unrelated_host() {
         assert_eq!(
-            opencode_dialect_override("minimax-m3", "https://api.together.ai/v1"),
-            None
+            Dialect::for_model_with_host(
+                "qwen3.6-plus",
+                aggregator_host_for_base_url("https://opencode.ai/zen/v1")
+            ),
+            Dialect::Anthropic
+        );
+        // Ids that are already correctly Anthropic-wire on their own host stay that way too.
+        assert_eq!(
+            Dialect::for_model_with_host(
+                "qwen3.7-max",
+                aggregator_host_for_base_url("https://opencode.ai/zen/go")
+            ),
+            Dialect::Anthropic
+        );
+        // An unrelated host (or unresolvable `base_url`) is a no-op: falls back to the same
+        // host-agnostic default `Dialect::for_model` already gave.
+        assert_eq!(
+            Dialect::for_model_with_host(
+                "minimax-m3",
+                aggregator_host_for_base_url("https://api.together.ai/v1")
+            ),
+            Dialect::Anthropic
         );
     }
 

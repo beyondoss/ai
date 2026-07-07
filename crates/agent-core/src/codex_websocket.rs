@@ -385,6 +385,46 @@ pub(crate) fn build_headers(
 }
 
 // ============================================================================
+// SSE-fallback body compression
+// ============================================================================
+
+/// Zstd level applied to a Codex SSE-fallback request body — matches pi's own
+/// `REQUEST_COMPRESSION_ZSTD_LEVEL` (`openai-codex-responses.ts`), the same level the official Codex
+/// client compresses against.
+const SSE_FALLBACK_ZSTD_LEVEL: i32 = 3;
+
+/// The header this backend's SSE-fallback endpoint expects on a zstd-compressed request body — mirrors
+/// pi's own `sseHeaders.set("content-encoding", "zstd")`. Never sent on the WebSocket frame above: pi's
+/// own comment there is explicit that transport always sends the uncompressed JSON frame, matching the
+/// official Codex client, and this crate's `wire_frame`/`attempt_once` do the same.
+///
+/// Read from `client.rs::send_with_retry`, gated on `is_codex_sse_fallback`.
+pub(crate) const SSE_FALLBACK_CONTENT_ENCODING: (&str, &str) = ("content-encoding", "zstd");
+
+/// Compress a Codex request body's JSON bytes with zstd, for the one HTTP/SSE path this crate falls
+/// back to when the live WebSocket transport ([`try_stream`] above) can't be used for a turn — a
+/// bandwidth optimization only (the real backend's SSE endpoint also accepts the plain, uncompressed
+/// JSON this crate sent before this function existed), not a correctness requirement. Returns `None` on
+/// a compression failure; the caller should fall back to sending the plain JSON body with no
+/// `Content-Encoding` header rather than failing the whole request over this optimization — mirrors
+/// pi's own `compressRequestBodyZstd`, which returns `null` on the same "compression unavailable"
+/// circumstance (there, a browser/Vite build with no native zstd binding; here, defensive parity with
+/// that same fail-open contract even though `zstd::stream::encode_all` has no realistic failure mode
+/// for an in-memory `&[u8]` source).
+///
+/// Deliberately narrow: this is the Codex backend's own SSE-fallback endpoint accepting
+/// `Content-Encoding: zstd` request bodies (`packages/ai/src/api/openai-codex-responses.ts`), not a
+/// general-purpose compression capability this crate's other request paths should reach for.
+///
+/// Wired into the live request path at `client.rs::send_with_retry`, gated on `is_codex_sse_fallback`
+/// (the same `req.is_codex && dialect == Dialect::OpenAiResponses` check
+/// `client.rs::GatewayClient::stream` already uses to decide whether to attempt the WebSocket
+/// transport, precomputed once and reused rather than re-derived).
+pub(crate) fn compress_sse_fallback_body(json: &[u8]) -> Option<Vec<u8>> {
+    zstd::stream::encode_all(json, SSE_FALLBACK_ZSTD_LEVEL).ok()
+}
+
+// ============================================================================
 // Connecting
 // ============================================================================
 
@@ -990,6 +1030,35 @@ mod tests {
         assert_eq!(get("OpenAI-Beta"), Some(OPENAI_BETA_RESPONSES_WEBSOCKETS));
         assert_eq!(get("x-client-request-id"), Some("req-1"));
         assert_eq!(get("session-id"), Some("req-1"));
+    }
+
+    #[test]
+    fn compress_sse_fallback_body_round_trips_through_zstd() {
+        let json = br#"{"model":"gpt-5-codex","input":[{"role":"user","content":"hi"}]}"#;
+        let compressed =
+            compress_sse_fallback_body(json).expect("zstd compression always succeeds here");
+        assert_ne!(compressed, json);
+        let decompressed =
+            zstd::stream::decode_all(&compressed[..]).expect("a valid zstd frame decodes cleanly");
+        assert_eq!(decompressed, json);
+    }
+
+    #[test]
+    fn compress_sse_fallback_body_shrinks_a_realistic_repetitive_payload() {
+        // A real Codex request body (JSON, repeated keys/structure across many input items) compresses
+        // well — this is the whole point of the optimization. A single short, low-entropy fixture like
+        // the round-trip test's above isn't representative of real bandwidth savings, so this uses a
+        // larger, more realistic shape instead.
+        let item = r#"{"role":"user","content":[{"type":"input_text","text":"repeat this text over and over"}]},"#;
+        let json = format!(r#"{{"model":"gpt-5-codex","input":[{}]}}"#, item.repeat(200));
+        let compressed = compress_sse_fallback_body(json.as_bytes())
+            .expect("zstd compression always succeeds here");
+        assert!(
+            compressed.len() < json.len() / 2,
+            "expected the repetitive fixture to compress to under half its size, got {} of {} bytes",
+            compressed.len(),
+            json.len()
+        );
     }
 
     #[test]

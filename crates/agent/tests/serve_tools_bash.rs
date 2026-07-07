@@ -925,3 +925,129 @@ fn serve_no_image_auto_resize_flag_skips_downscaling_an_oversized_image() {
         "--no-image-auto-resize must ship the image at its original width, not downscaled"
     );
 }
+
+#[test]
+fn serve_set_image_auto_resize_toggles_the_wire_layer_mid_session_without_a_restart() {
+    // Pass 20 (pi-parity fix): `image_auto_resize` had a `--no-image-auto-resize` startup flag (see
+    // `serve_no_image_auto_resize_flag_skips_downscaling_an_oversized_image` just above) but no live
+    // RPC toggle at all — `build_agent` read `cfg.image_auto_resize` straight off the static startup
+    // config on every rebuild, so an already-running `serve` process had no way to change it short of a
+    // restart. One process, two `read` calls on the same oversized image, `set_image_auto_resize`
+    // flipped in between: the first call must come back downscaled (the on-by-default behavior), the
+    // second — after the live toggle — must ship the original, undownscaled dimensions, proving the
+    // very next tool call actually observes the change.
+    use base64::Engine as _;
+    let img = image::RgbImage::from_pixel(2200, 2200, image::Rgb([10, 200, 10]));
+    let mut png_bytes = Vec::new();
+    image::DynamicImage::ImageRgb8(img)
+        .write_to(
+            &mut std::io::Cursor::new(&mut png_bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("big.png"), &png_bytes).unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+
+    let turn1 = turn_tool_use("toolu_1", "read", &json!({ "path": "big.png" }).to_string());
+    let turn2 = turn_tool_use("toolu_2", "read", &json!({ "path": "big.png" }).to_string());
+    let (base, bodies) = spawn_model_server(vec![
+        turn1,
+        turn_text("described (downscaled)"),
+        turn2,
+        turn_text("described (original)"),
+    ]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    // No `--no-image-auto-resize` here — starts at the on-by-default behavior.
+    let mut child = serve_cmd(bin, &base, &session_file)
+        .current_dir(dir.path())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "read big.png and describe it" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_image_auto_resize", "enabled": false })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "set_image_auto_resize");
+    assert_eq!(frames.last().unwrap()["success"], true, "got: {frames:#?}");
+    assert_eq!(frames.last().unwrap()["data"]["image_auto_resize"], false);
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "read big.png again and describe it" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    drop(stdin);
+    child.wait().unwrap();
+
+    // Pull each read call's own tool_result image width straight out of the raw wire body it produced
+    // — same extraction `serve_no_image_auto_resize_flag_skips_downscaling_an_oversized_image` uses.
+    // Each later request's body carries the *whole* growing history, including the first read call's
+    // own (already downscaled) `tool_result` — so this must find the *last* (most recent) image in the
+    // message list, not the first, or it would keep re-finding the first call's image forever.
+    let width_of = |raw: &str| -> u32 {
+        let (_, json_body) = raw.split_once("\r\n\r\n").unwrap();
+        let body: serde_json::Value = serde_json::from_str(json_body).unwrap();
+        let data_b64 = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find_map(|m| {
+                m["content"].as_array().and_then(|blocks| {
+                    blocks.iter().find_map(|b| {
+                        (b["type"] == "tool_result")
+                            .then(|| {
+                                b["content"].as_array().and_then(|inner| {
+                                    inner
+                                        .iter()
+                                        .find(|c| c["type"] == "image")
+                                        .map(|c| c["source"]["data"].as_str().unwrap().to_string())
+                                })
+                            })
+                            .flatten()
+                    })
+                })
+            })
+            .expect("the tool_result must carry the image content block");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&data_b64)
+            .unwrap();
+        image::load_from_memory(&decoded).unwrap().width()
+    };
+
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(
+        width_of(&bodies[1]),
+        2000,
+        "before the live toggle, image_auto_resize's on-by-default behavior must still downscale to \
+         MAX_IMAGE_DIMENSION: {}",
+        bodies[1]
+    );
+    assert_eq!(
+        width_of(&bodies[3]),
+        2200,
+        "set_image_auto_resize(false) must take effect on the very next read call, in the same \
+         process, with no restart: {}",
+        bodies[3]
+    );
+}

@@ -84,6 +84,14 @@ const COPILOT_FORCES_CHAT_COMPLETIONS: &[&str] = &["gpt-4.1", "claude-fable-5"];
 /// - `packages/ai/src/providers/opencode-go.models.ts`: `"minimax-m3"`, `"qwen3.7-max"`,
 ///   `"qwen3.7-plus"` (this provider's *other* MiniMax/Qwen ids — `"minimax-m2.7"`, `"qwen3.6-plus"` —
 ///   are genuinely `openai-completions` there, a within-provider split; not listed here).
+///
+/// This is the host-agnostic default only — three of these ids are real, *host-dependent* collisions
+/// (native MiniMax vs. OpenCode-Go for `"minimax-m2.7"`; OpenCode Zen vs. OpenCode-Go for `"minimax-m3"`
+/// and `"qwen3.6-plus"`), where the wire genuinely differs depending on which of the two actually serves
+/// the request — a hard 400 (wrong wire format), not a quality nit, if guessed wrong. See
+/// [`anthropic_wire_bare_id_for_host`] for the [`crate::models::AggregatorHost`]-aware resolution
+/// (pi-parity pass 20, Task 6) that narrows this default when a host signal is actually available;
+/// consulted by [`routes_to_anthropic_by_default`] before falling back to this list.
 const NATIVE_ANTHROPIC_WIRE_BARE_IDS: &[&str] = &[
     "minimax-m2.7",
     "minimax-m2.7-highspeed",
@@ -93,6 +101,38 @@ const NATIVE_ANTHROPIC_WIRE_BARE_IDS: &[&str] = &[
     "qwen3.7-max",
     "qwen3.7-plus",
 ];
+
+/// Resolves the 3 real host-dependent collisions [`NATIVE_ANTHROPIC_WIRE_BARE_IDS`]'s own doc comment
+/// documents, when `host` is actually known (pi-parity pass 20, Task 6) — reusing the same
+/// [`crate::models::AggregatorHost`] signal [`crate::client::DirectRouting::aggregator_host`] threads
+/// through `ModelRequest::host`, not a second, parallel "which host is this" mechanism. `Some(true)`/
+/// `Some(false)` when `host` disambiguates a known collision away from
+/// `NATIVE_ANTHROPIC_WIRE_BARE_IDS`'s own host-agnostic default; `None` (including `host: None`, the
+/// common case with no host signal available) falls through to that default unchanged. Only ever
+/// consulted for a bare (non-vendor-slug) id already confirmed present in that list — see
+/// [`routes_to_anthropic_by_default`]'s own call site — so a vendor-slug id on either host (which never
+/// reaches this list in the first place) is unaffected regardless.
+///
+/// - `"minimax-m2.7"`: genuinely `openai-completions` on both OpenCode Zen (`opencode.models.ts`) and
+///   OpenCode-Go (`opencode-go.models.ts`) — only native MiniMax/MiniMax-CN (`host: None`, no aggregator
+///   signal at all for a direct-to-MiniMax request) is really `anthropic-messages`, which is exactly
+///   `NATIVE_ANTHROPIC_WIRE_BARE_IDS`'s own default, so `host: None` still falls through to it
+///   unchanged.
+/// - `"minimax-m3"`: genuinely `openai-completions` on OpenCode Zen specifically (context also differs
+///   there: real 512,000 vs. this table's 1,000,000 default — see
+///   `crate::models::capabilities_for_route_with_host`'s own `OpenCodeZen` arm) — but still
+///   `anthropic-messages` on OpenCode-Go (matching the default) and on native MiniMax.
+/// - `"qwen3.6-plus"`: genuinely `openai-completions` on OpenCode-Go — but still `anthropic-messages`
+///   on OpenCode Zen (matching the default).
+fn anthropic_wire_bare_id_for_host(m: &str, host: Option<crate::models::AggregatorHost>) -> Option<bool> {
+    use crate::models::AggregatorHost::{OpenCodeGo, OpenCodeZen};
+    match (m, host) {
+        ("minimax-m2.7", Some(OpenCodeZen) | Some(OpenCodeGo)) => Some(false),
+        ("minimax-m3", Some(OpenCodeZen)) => Some(false),
+        ("qwen3.6-plus", Some(OpenCodeGo)) => Some(false),
+        _ => None,
+    }
+}
 
 /// Whether `model` is a Fireworks-hosted id (`"accounts/fireworks/…"` — see
 /// `crate::models::is_fireworks_model`) that pi serves over the Anthropic wire. 14 of Fireworks' 16
@@ -113,23 +153,38 @@ pub(crate) fn is_fireworks_anthropic_wire_model(model: &str) -> bool {
 }
 
 /// Whether `model` should default to the Anthropic dialect despite naming neither "claude" nor
-/// "anthropic" — the mechanism [`Dialect::for_model`] consults for [`NATIVE_ANTHROPIC_WIRE_BARE_IDS`]
-/// and Fireworks' own Anthropic-wire ids (see [`is_fireworks_anthropic_wire_model`]). Matching is
-/// case-insensitive, mirroring every other id check in this dialect/the capability table.
-fn routes_to_anthropic_by_default(model: &str) -> bool {
+/// "anthropic" — the mechanism [`Dialect::for_model_with_host`] consults for
+/// [`NATIVE_ANTHROPIC_WIRE_BARE_IDS`] (narrowed, when `host` is known, by
+/// [`anthropic_wire_bare_id_for_host`]) and Fireworks' own Anthropic-wire ids (see
+/// [`is_fireworks_anthropic_wire_model`]). Matching is case-insensitive, mirroring every other id check
+/// in this dialect/the capability table.
+fn routes_to_anthropic_by_default(model: &str, host: Option<crate::models::AggregatorHost>) -> bool {
     let m = model.to_ascii_lowercase();
-    (!m.contains('/') && NATIVE_ANTHROPIC_WIRE_BARE_IDS.contains(&m.as_str()))
-        || is_fireworks_anthropic_wire_model(&m)
+    let bare_default = !m.contains('/')
+        && anthropic_wire_bare_id_for_host(&m, host)
+            .unwrap_or_else(|| NATIVE_ANTHROPIC_WIRE_BARE_IDS.contains(&m.as_str()));
+    bare_default || is_fireworks_anthropic_wire_model(&m)
 }
 
 impl Dialect {
-    /// Pick the dialect for a model id. Claude → Anthropic; a handful of known non-"claude"/
-    /// "anthropic"-named ids pi still serves over the Anthropic wire (MiniMax/MiniMax-CN, OpenCode/
-    /// OpenCode-Go, Fireworks — see [`routes_to_anthropic_by_default`]) → also Anthropic; a native
-    /// OpenAI id (per the capability table's [`ApiKind`]) → the Responses API; everything else → Chat
-    /// Completions.
+    /// Pick the dialect for a model id, with no host signal available — equivalent to
+    /// [`Self::for_model_with_host`]`(model, None)`. Claude → Anthropic; a handful of known
+    /// non-"claude"/"anthropic"-named ids pi still serves over the Anthropic wire by default (MiniMax/
+    /// MiniMax-CN, OpenCode/OpenCode-Go, Fireworks — see [`routes_to_anthropic_by_default`]) → also
+    /// Anthropic; a native OpenAI id (per the capability table's [`ApiKind`]) → the Responses API;
+    /// everything else → Chat Completions.
     pub fn for_model(model: &str) -> Self {
-        if model.starts_with("claude") || model.contains("anthropic") || routes_to_anthropic_by_default(model) {
+        Self::for_model_with_host(model, None)
+    }
+
+    /// Same as [`Self::for_model`], additionally narrowing the handful of real host-dependent bare-id
+    /// wire collisions (pi-parity pass 20, Task 6 — see [`anthropic_wire_bare_id_for_host`]'s own doc
+    /// comment) when `host` is actually known. `host: None` behaves identically to [`Self::for_model`].
+    pub fn for_model_with_host(model: &str, host: Option<crate::models::AggregatorHost>) -> Self {
+        if model.starts_with("claude")
+            || model.contains("anthropic")
+            || routes_to_anthropic_by_default(model, host)
+        {
             Dialect::Anthropic
         } else if crate::models::capabilities(model).api == ApiKind::Responses {
             Dialect::OpenAiResponses
@@ -138,17 +193,22 @@ impl Dialect {
         }
     }
 
-    /// Same selection as [`Dialect::for_model`], but additionally consults whether this request is
-    /// being proxied through GitHub Copilot's own endpoint (`via_copilot`) rather than sent to a
-    /// provider natively — Copilot's proxy wants a different wire shape than the native provider for at
-    /// least one id (see [`COPILOT_FORCES_CHAT_COMPLETIONS`]). Every other id/route combination
-    /// resolves identically to `for_model`; a non-Copilot caller should keep calling `for_model`
-    /// directly rather than thread `via_copilot: false` through everywhere.
-    pub fn for_model_via_copilot(model: &str, via_copilot: bool) -> Self {
+    /// Same selection as [`Dialect::for_model_with_host`], but additionally consults whether this
+    /// request is being proxied through GitHub Copilot's own endpoint (`via_copilot`) rather than sent
+    /// to a provider natively — Copilot's proxy wants a different wire shape than the native provider
+    /// for at least one id (see [`COPILOT_FORCES_CHAT_COMPLETIONS`]). Every other id/route combination
+    /// resolves identically to `for_model_with_host`; a non-Copilot caller with no host signal should
+    /// keep calling `for_model` directly rather than thread `via_copilot: false, host: None` through
+    /// everywhere.
+    pub fn for_model_via_copilot(
+        model: &str,
+        via_copilot: bool,
+        host: Option<crate::models::AggregatorHost>,
+    ) -> Self {
         if via_copilot && COPILOT_FORCES_CHAT_COMPLETIONS.contains(&model) {
             return Dialect::OpenAi;
         }
-        Self::for_model(model)
+        Self::for_model_with_host(model, host)
     }
 
     /// The gateway path this dialect POSTs to. Bare `/v1*` so the gateway's default-provider routing
@@ -807,12 +867,54 @@ mod tests {
         for id in ["qwen3.5-plus", "qwen3.6-plus", "qwen3.7-max", "qwen3.7-plus"] {
             assert_eq!(Dialect::for_model(id), Dialect::Anthropic, "{id}");
         }
-        // OpenCode-Go's *other* Qwen id on the same provider is genuinely Chat Completions — the
-        // allowlist is per-exact-id, not a blanket "every qwen3.x-plus" rule.
+    }
+
+    #[test]
+    fn host_aware_dialect_resolves_the_three_real_opencode_host_collisions() {
+        use crate::models::AggregatorHost::{OpenCodeGo, OpenCodeZen};
+        // pi-parity pass 20 Task 6: these 3 bare ids are real, host-dependent wire-format collisions —
+        // `NATIVE_ANTHROPIC_WIRE_BARE_IDS`'s own host-agnostic default is only correct for *one* of the
+        // two real, actually-conflicting hosts per id; guessing wrong is a hard 400 (wrong wire format),
+        // not a quality nit. `for_model_with_host` (fed by `ModelRequest::host`/`DirectRouting
+        // ::aggregator_host` — see that field's own doc comment) resolves each correctly given the
+        // actual host; `for_model` (no host signal) keeps the pre-existing host-agnostic default.
+
+        // "minimax-m2.7": anthropic-wire on native MiniMax (no aggregator host at all — `host: None`),
+        // openai-completions-wire on OpenCode-Go (`opencode-go.models.ts`).
+        assert_eq!(Dialect::for_model("minimax-m2.7"), Dialect::Anthropic);
         assert_eq!(
-            Dialect::for_model("qwen3.6-plus-go-variant"),
-            Dialect::OpenAi,
-            "an unlisted id must not be swept in by a loose prefix match"
+            Dialect::for_model_with_host("minimax-m2.7", None),
+            Dialect::Anthropic
+        );
+        assert_eq!(
+            Dialect::for_model_with_host("minimax-m2.7", Some(OpenCodeGo)),
+            Dialect::OpenAi
+        );
+
+        // "minimax-m3": anthropic-wire on OpenCode-Go (`opencode-go.models.ts`), openai-wire on plain
+        // OpenCode Zen (`opencode.models.ts`) — the host-agnostic default (matching native MiniMax and
+        // OpenCode-Go) is wrong specifically for OpenCode Zen.
+        assert_eq!(Dialect::for_model("minimax-m3"), Dialect::Anthropic);
+        assert_eq!(
+            Dialect::for_model_with_host("minimax-m3", Some(OpenCodeGo)),
+            Dialect::Anthropic
+        );
+        assert_eq!(
+            Dialect::for_model_with_host("minimax-m3", Some(OpenCodeZen)),
+            Dialect::OpenAi
+        );
+
+        // "qwen3.6-plus": anthropic-wire on OpenCode Zen (`opencode.models.ts`), openai-wire on
+        // OpenCode-Go (`opencode-go.models.ts`) — the host-agnostic default is wrong specifically for
+        // OpenCode-Go.
+        assert_eq!(Dialect::for_model("qwen3.6-plus"), Dialect::Anthropic);
+        assert_eq!(
+            Dialect::for_model_with_host("qwen3.6-plus", Some(OpenCodeZen)),
+            Dialect::Anthropic
+        );
+        assert_eq!(
+            Dialect::for_model_with_host("qwen3.6-plus", Some(OpenCodeGo)),
+            Dialect::OpenAi
         );
     }
 
@@ -853,22 +955,22 @@ mod tests {
         // pi-parity: `github-copilot.models.ts` sets `api: "openai-completions"` for the Copilot-hosted
         // `gpt-4.1`, vs `openai.models.ts`'s `api: "openai-responses"` for the same id natively.
         assert_eq!(
-            Dialect::for_model_via_copilot("gpt-4.1", true),
+            Dialect::for_model_via_copilot("gpt-4.1", true, None),
             Dialect::OpenAi
         );
         // Native (non-Copilot) routing keeps the Responses classification unchanged.
         assert_eq!(
-            Dialect::for_model_via_copilot("gpt-4.1", false),
+            Dialect::for_model_via_copilot("gpt-4.1", false, None),
             Dialect::OpenAiResponses
         );
         // Copilot routing for every other id matches `for_model` unchanged — Copilot's own gpt-5.x
         // family is `"openai-responses"` there too, and Claude ids are never affected.
         assert_eq!(
-            Dialect::for_model_via_copilot("gpt-5-mini", true),
+            Dialect::for_model_via_copilot("gpt-5-mini", true, None),
             Dialect::OpenAiResponses
         );
         assert_eq!(
-            Dialect::for_model_via_copilot("claude-opus-4-8", true),
+            Dialect::for_model_via_copilot("claude-opus-4-8", true, None),
             Dialect::Anthropic
         );
     }
@@ -881,12 +983,12 @@ mod tests {
         // "claude"-named id). Without this, a Copilot-hosted claude-fable-5 request would wrongly speak
         // the Anthropic wire against an endpoint that expects Chat Completions.
         assert_eq!(
-            Dialect::for_model_via_copilot("claude-fable-5", true),
+            Dialect::for_model_via_copilot("claude-fable-5", true, None),
             Dialect::OpenAi
         );
         // Native (non-Copilot) routing is unaffected — still the Anthropic wire.
         assert_eq!(
-            Dialect::for_model_via_copilot("claude-fable-5", false),
+            Dialect::for_model_via_copilot("claude-fable-5", false, None),
             Dialect::Anthropic
         );
         assert_eq!(Dialect::for_model("claude-fable-5"), Dialect::Anthropic);

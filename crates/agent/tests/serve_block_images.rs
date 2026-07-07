@@ -163,3 +163,140 @@ fn serve_persisted_image_is_downgraded_on_resend_once_block_images_is_toggled_on
         bodies[1]
     );
 }
+
+#[test]
+fn serve_set_block_images_toggles_and_rejects_a_non_boolean() {
+    // Pass 20 (pi-parity fix): `block_images` had a `--block-images` startup flag but no live RPC
+    // toggle at all — `build_agent` read `cfg.block_images` straight off the static startup config on
+    // every rebuild, so an already-running `serve` process had no way to change it short of a restart.
+    // Mirrors `serve_set_auto_compaction_toggles_and_rejects_a_non_boolean`
+    // (`serve_compaction_retry.rs`) exactly.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_block_images", "enabled": true })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "set_block_images");
+    assert_eq!(frames.last().unwrap()["success"], true);
+    assert_eq!(frames.last().unwrap()["data"]["block_images"], true);
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_block_images", "enabled": false })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "set_block_images");
+    assert_eq!(frames.last().unwrap()["data"]["block_images"], false);
+
+    // Missing/non-boolean `enabled` is rejected, not silently coerced.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_block_images", "enabled": "yes" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "set_block_images");
+    assert_eq!(frames.last().unwrap()["success"], false);
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_set_block_images_true_downgrades_a_persisted_image_mid_session_without_a_restart() {
+    // The live-toggle counterpart to `serve_persisted_image_is_downgraded_on_resend_once_block_images_is_toggled_on`
+    // just above: that test proves the flag reaches a *second process* reopening the same session file;
+    // this proves the very same effect within *one* running process, via `set_block_images`, with the
+    // agent rebuilt in place and no restart at all — the concrete gap this pass's fix closes.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+
+    let (base, bodies) = spawn_model_server(vec![turn_text("first"), turn_text("second")]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+
+    // No `--block-images` — the image is ingested and sent to the wire as-is.
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    writeln!(
+        stdin,
+        "{}",
+        json!({
+            "type": "prompt",
+            "message": "what is this?",
+            "images": [{ "media_type": "image/png", "data": RED_PNG_B64 }],
+        })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "prompt");
+    assert_eq!(
+        frames.last().unwrap()["success"],
+        true,
+        "got: {frames:#?}"
+    );
+
+    {
+        let bodies = bodies.lock().unwrap();
+        assert!(
+            bodies[0]
+                .to_ascii_lowercase()
+                .contains(&RED_PNG_B64.to_ascii_lowercase()),
+            "sanity check: the image must actually reach the wire before block_images is ever set: {}",
+            bodies[0]
+        );
+    }
+
+    // Same process, no restart: toggle the live setting, then send an unrelated follow-up prompt —
+    // the first turn's already-persisted image is still part of `session.messages` and gets resent on
+    // this turn's own request.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_block_images", "enabled": true })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "set_block_images");
+    assert_eq!(frames.last().unwrap()["success"], true, "got: {frames:#?}");
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "and now?" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "prompt");
+    assert_eq!(
+        frames.last().unwrap()["success"],
+        true,
+        "got: {frames:#?}"
+    );
+    drop(stdin);
+    child.wait().unwrap();
+
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[1].contains("image omitted: model does not support images"),
+        "set_block_images(true) must downgrade the already-persisted image on the very next request, \
+         in the same process, with no restart: {}",
+        bodies[1]
+    );
+    assert!(
+        !bodies[1]
+            .to_ascii_lowercase()
+            .contains(&RED_PNG_B64.to_ascii_lowercase()),
+        "the raw persisted image bytes must not be resent once set_block_images(true) takes effect: {}",
+        bodies[1]
+    );
+}

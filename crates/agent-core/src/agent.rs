@@ -2713,8 +2713,10 @@ const MID_STREAM_RETRYABLE_ERROR_TYPES: &[&str] = &[
 /// everything [`MID_STREAM_RETRYABLE_ERROR_TYPES`]'s doc comment already excludes raw status digits
 /// for (the same "500 in a mid-stream message is more likely a token count than a status code" risk
 /// applies equally to prose — digits stay whole-run-only, see `agent::retry::WHOLE_RUN_RETRYABLE_STATUS_DIGITS`
-/// in the `agent` crate), pi's WebSocket/HTTP2/Bedrock-specific text (this crate never uses those
-/// transports), pi's quota/billing exclusion list (unnecessary here — this function is an *allowlist*
+/// in the `agent` crate), pi's WebSocket/HTTP2/Bedrock-specific text (this crate's own WebSocket
+/// transport, `codex_websocket.rs`, tags its connectivity failures with the same
+/// [`MID_STREAM_NETWORK_ERROR`] prefix the patterns below already recognize, rather than needing its
+/// own free-text entries here), pi's quota/billing exclusion list (unnecessary here — this function is an *allowlist*
 /// of known-retryable shapes, not pi's broad-regex-then-exclude, so an unrecognized quota/billing
 /// message simply never matches in the first place), and bare single ambiguous words like "terminated"
 /// (too easily a false positive from something unrelated a provider's own error wrapper mentions).

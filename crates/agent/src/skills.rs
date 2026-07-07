@@ -217,6 +217,16 @@ fn discover_with_diagnostics_impl(
     // is still visible below for the "later extra wins over an earlier extra" tie-break.
     let mut extra_root_skills: Vec<Vec<Skill>> = Vec::new();
     for extra in extra_roots {
+        // pi-parity feature (Round 20): `extra_roots` (fed by `default_skill_paths`, per-invocation
+        // `--skill`, or both merged — see `main.rs`'s resolution) can now also carry override-pattern
+        // entries (`!pattern`/`+pattern`/`-pattern`/a bare glob) alongside plain root paths. A pattern
+        // entry isn't a root to walk at all — it's applied uniformly across the *entire* discovered set
+        // (this loop's own roots included) by `apply_path_overrides`, below, after every root (standard,
+        // `.agents`, and extra alike) has contributed its skills.
+        let crate::settings::PathEntry::Root(extra) = crate::settings::classify_path_entry(extra)
+        else {
+            continue;
+        };
         // pi-parity fix (L8): pi's own `resolveCliPaths`→`resolvePath` expands a leading `~` on a
         // `--skill` path; ours previously took it verbatim — usually masked by the shell expanding it
         // first, but not for a quoted argument (`--skill "~/foo"`) or one built programmatically.
@@ -337,6 +347,18 @@ fn discover_with_diagnostics_impl(
             fold_skills_later_wins(&mut found, vec![skill], &mut collisions);
         }
     }
+    // pi-parity feature (Round 20): apply `extra_roots`' own override-pattern entries (see
+    // `settings::PathEntry`) uniformly across the *entire* discovered set assembled above — every
+    // standard root, `.agents/skills` root, and extra root alike — not just whatever an extra root's own
+    // plain-path entries turned up. Must run after every root has contributed (this is a filter over the
+    // final set), but before the sort below (sorting is stable output shape, not discovery).
+    let (mut found, override_diagnostics) =
+        apply_path_overrides(found, |s| s.path.as_path(), extra_roots);
+    collisions.extend(
+        override_diagnostics
+            .into_iter()
+            .map(|m| Collision::message_only("skill", m)),
+    );
     found.sort_by(|a, b| a.name.cmp(&b.name));
     (found, collisions)
 }
@@ -1008,6 +1030,156 @@ pub(crate) fn xml_escape(s: &str) -> String {
 /// The user's home directory from the environment.
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// One compiled override pattern (a [`crate::settings::PathEntry::Exclude`]/`Include`/`ForceExclude`
+/// payload) — pi-parity feature, Round 20.
+///
+/// `basename_only` mirrors the convention `tools/find.rs`'s own pattern matching already established
+/// for this crate: a pattern with no `/` at all matches by name only, so a common pattern like
+/// `!draft-*` doesn't need to know (or spell out) which discovery root a matching skill/prompt happens
+/// to live under; a pattern containing `/` matches the full path instead, letting an operator scope an
+/// exclude to one specific location (`!shared-skills/draft-*`) when a bare name would be too broad.
+struct CompiledOverride {
+    matcher: globset::GlobMatcher,
+    basename_only: bool,
+}
+
+/// Compile one override pattern's raw text (already stripped of its `!`/`+`/`-` prefix by
+/// [`crate::settings::classify_path_entry`]) into a [`CompiledOverride`]. An unparseable glob is reported
+/// through `diagnostics` (folded into the caller's `Vec<Collision>`, message-only) and `tracing::warn!`
+/// -logged, then simply contributes no match at all — mirroring `policy::ToolPolicy::deny_path`'s own
+/// lenient handling of a bad `--deny-path` glob: unlike that tool-call gate, a malformed discovery-time
+/// filter isn't a security control, so failing open (keep discovering everything, as if the one bad
+/// pattern weren't there) is the right default, not aborting discovery outright over one operator typo.
+fn compile_override(raw: &str, diagnostics: &mut Vec<String>) -> Option<CompiledOverride> {
+    let basename_only = !raw.contains('/');
+    // Matches `tools/find.rs`'s own `glob_src` construction: a path-shaped pattern that isn't already
+    // anchored (`**/`- or `/`-prefixed) is prefixed with `**/` so it still matches somewhere within an
+    // absolute path, rather than only ever matching a path that happens to start exactly at the
+    // discovery root's own filesystem root.
+    let glob_src = if basename_only || raw.starts_with("**/") || raw.starts_with('/') {
+        raw.to_string()
+    } else {
+        format!("**/{raw}")
+    };
+    match globset::Glob::new(&glob_src) {
+        Ok(glob) => Some(CompiledOverride {
+            matcher: glob.compile_matcher(),
+            basename_only,
+        }),
+        Err(err) => {
+            let message = format!("invalid skill/prompt override pattern {raw:?}: {err}");
+            tracing::warn!("{message}");
+            diagnostics.push(message);
+            None
+        }
+    }
+}
+
+/// Whether `path` matches any of `patterns` — pi's own `matchesAnyPattern`/`matchesAnyExactPattern`
+/// (`package-manager.ts`), collapsed to one glob-capable check (see `settings::PathEntry`'s own doc
+/// comment for why beyond doesn't reproduce pi's separate glob-vs.-exact-only split between `!`/bare and
+/// `+`/`-` patterns), plus one deliberate superset beyond pi's own literal behavior: alongside the full
+/// basename (pi's own `name = basename(filePath)`, extension included — e.g. `wip-experimental.md`), a
+/// basename-only pattern is also tried against the file *stem* (extension stripped — `wip-experimental`).
+/// pi requires spelling out the `.md`/using a glob whose `*` happens to absorb it; beyond additionally
+/// accepts the bare name a `default_skill_paths`/`default_prompt_template_paths` author actually thinks
+/// in (a prompt's own `/name`, or a loose skill file's name) without needing to know or type its file
+/// extension. For a `SKILL.md` specifically — a skill's identity is really its *containing directory*,
+/// not the manifest filename every skill shares — this also tries the parent directory's own name/path,
+/// so `!my-skill` (naming the skill the way a user actually thinks of it) excludes it, not just a
+/// (nonsensical) attempt to match the literal string `SKILL.md`/`SKILL`. A loose skill `.md` file or a
+/// prompt template has no such directory-vs-manifest distinction, so only the file itself (by full name
+/// or stem) is ever tried for those.
+fn override_matches(path: &Path, patterns: &[CompiledOverride]) -> bool {
+    if patterns.is_empty() {
+        return false;
+    }
+    let is_skill_manifest = path.file_name().and_then(|n| n.to_str()) == Some("SKILL.md");
+    let parent = is_skill_manifest.then(|| path.parent()).flatten();
+    patterns.iter().any(|p| {
+        if p.basename_only {
+            let name_matches = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| p.matcher.is_match(n));
+            let stem_matches = path
+                .file_stem()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| p.matcher.is_match(n));
+            let parent_matches = parent
+                .and_then(Path::file_name)
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| p.matcher.is_match(n));
+            name_matches || stem_matches || parent_matches
+        } else {
+            p.matcher.is_match(path) || parent.is_some_and(|d| p.matcher.is_match(d))
+        }
+    })
+}
+
+/// Apply `entries`' override-pattern entries (see [`crate::settings::PathEntry`]) to an already
+/// fully-discovered `items` set, uniformly across every discovery root — pi-parity feature, Round 20.
+/// `path_of` extracts the path a pattern is matched against (`Skill::path`/`PromptTemplate::path`) so
+/// this one implementation serves both `skills.rs` and `prompts.rs`, the same way `parse_frontmatter` is
+/// shared between them.
+///
+/// Precedence matches pi's own `isEnabledByOverrides` exactly (see `settings::PathEntry`'s doc comment
+/// for the one deliberate simplification: a bare, unprefixed glob is folded into the exclude bucket here
+/// rather than kept as pi's own separate "restrict to only these" whitelist): an item is dropped if it
+/// matches any [`crate::settings::PathEntry::Exclude`] pattern, then restored if it also matches any
+/// [`crate::settings::PathEntry::Include`] pattern, then dropped again — winning outright — if it matches
+/// any [`crate::settings::PathEntry::ForceExclude`] pattern. `Root` entries (plain paths) are ignored
+/// here; they were already consumed as discovery roots by the caller before `items` was ever assembled.
+///
+/// Returns the filtered `items` alongside any invalid-glob diagnostics — plain `String`s, not
+/// [`Collision`], since this is shared with `prompts.rs`, which wraps them with its own `"prompt"`
+/// `resource_type` rather than this module's `"skill"`.
+pub(crate) fn apply_path_overrides<T>(
+    items: Vec<T>,
+    path_of: impl Fn(&T) -> &Path,
+    entries: &[String],
+) -> (Vec<T>, Vec<String>) {
+    let mut diagnostics = Vec::new();
+    let mut excludes = Vec::new();
+    let mut includes = Vec::new();
+    let mut force_excludes = Vec::new();
+    for entry in entries {
+        match crate::settings::classify_path_entry(entry) {
+            crate::settings::PathEntry::Root(_) => {}
+            crate::settings::PathEntry::Exclude(p) => {
+                excludes.extend(compile_override(p, &mut diagnostics));
+            }
+            crate::settings::PathEntry::Include(p) => {
+                includes.extend(compile_override(p, &mut diagnostics));
+            }
+            crate::settings::PathEntry::ForceExclude(p) => {
+                force_excludes.extend(compile_override(p, &mut diagnostics));
+            }
+        }
+    }
+    if excludes.is_empty() && includes.is_empty() && force_excludes.is_empty() {
+        return (items, diagnostics);
+    }
+    let filtered = items
+        .into_iter()
+        .filter(|item| {
+            let path = path_of(item);
+            let mut enabled = true;
+            if override_matches(path, &excludes) {
+                enabled = false;
+            }
+            if override_matches(path, &includes) {
+                enabled = true;
+            }
+            if override_matches(path, &force_excludes) {
+                enabled = false;
+            }
+            enabled
+        })
+        .collect();
+    (filtered, diagnostics)
 }
 
 #[cfg(test)]
@@ -2695,5 +2867,198 @@ name: "caf\x65 é"
             "must escape every one of the five XML predefined entities"
         );
         assert_eq!(xml_escape("plain text"), "plain text");
+    }
+
+    // pi-parity feature, Round 20: `default_skill_paths`/`extra_roots` override-pattern support
+    // (`settings::PathEntry`/`apply_path_overrides`) — pinned against pi's own `package-manager.ts`
+    // `isEnabledByOverrides`/`applyPatterns` semantics (see `settings::PathEntry`'s doc comment for the
+    // one deliberate simplification: a bare glob is folded into the exclude bucket here).
+
+    #[test]
+    fn a_plain_directory_entry_still_discovers_everything_in_it_no_regression() {
+        // The override-pattern filter pass must be a no-op when `extra_roots` carries no pattern
+        // entries at all — every skill a plain directory root turns up must still surface, exactly as
+        // before this filter stage existed.
+        let tmp = tempfile::tempdir().unwrap();
+        let extra_root = tmp.path().join("shared-skills");
+        write_skill(&extra_root, "alpha", "---\nname: alpha\ndescription: a\n---\n");
+        write_skill(&extra_root, "beta", "---\nname: beta\ndescription: b\n---\n");
+        let cwd = tmp.path().join("project");
+        fs::create_dir_all(&cwd).unwrap();
+        let (found, _) =
+            discover_with_diagnostics(&cwd, true, &[extra_root.to_string_lossy().into_owned()]);
+        assert!(found.iter().any(|s| s.name == "alpha"), "got: {found:?}");
+        assert!(found.iter().any(|s| s.name == "beta"), "got: {found:?}");
+    }
+
+    #[test]
+    fn bang_prefix_excludes_an_already_discovered_skill_by_its_directory_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("project");
+        write_skill(
+            &cwd.join(".claude/skills"),
+            "keep-me",
+            "---\nname: keep-me\ndescription: stays\n---\n",
+        );
+        write_skill(
+            &cwd.join(".claude/skills"),
+            "wip-experimental",
+            "---\nname: wip-experimental\ndescription: hidden\n---\n",
+        );
+        let (found, _) =
+            discover_with_diagnostics(&cwd, true, &["!wip-experimental".to_string()]);
+        assert!(found.iter().any(|s| s.name == "keep-me"), "got: {found:?}");
+        assert!(
+            !found.iter().any(|s| s.name == "wip-experimental"),
+            "a !pattern must exclude the matching skill: {found:?}"
+        );
+    }
+
+    #[test]
+    fn a_bare_glob_pattern_excludes_matching_skills_uniformly_across_every_discovery_root() {
+        // The whole point of Round 20's "applied uniformly" design: one bare-glob entry in the same
+        // list that also configures a plain extra root must exclude a matching skill from *both* the
+        // standard root and the configured extra root — not just whichever root the pattern happened to
+        // be listed alongside (pi's own `applyPatterns` bare-glob whitelist behavior is scoped only to
+        // an extra root's own entries; beyond deliberately does not reproduce that narrower scoping).
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("project");
+        write_skill(
+            &cwd.join(".claude/skills"),
+            "draft-one",
+            "---\nname: draft-one\ndescription: standard root draft\n---\n",
+        );
+        write_skill(
+            &cwd.join(".claude/skills"),
+            "keep",
+            "---\nname: keep\ndescription: stays\n---\n",
+        );
+        let extra_root = tmp.path().join("shared-skills");
+        write_skill(
+            &extra_root,
+            "draft-two",
+            "---\nname: draft-two\ndescription: extra root draft\n---\n",
+        );
+        let extra_roots = vec![
+            extra_root.to_string_lossy().into_owned(),
+            "draft-*".to_string(),
+        ];
+        let (found, _) = discover_with_diagnostics(&cwd, true, &extra_roots);
+        assert!(
+            !found.iter().any(|s| s.name == "draft-one"),
+            "a bare glob must exclude a matching standard-root skill: {found:?}"
+        );
+        assert!(
+            !found.iter().any(|s| s.name == "draft-two"),
+            "a bare glob must exclude a matching extra-root skill too — applied uniformly: {found:?}"
+        );
+        assert!(found.iter().any(|s| s.name == "keep"), "got: {found:?}");
+    }
+
+    #[test]
+    fn a_slash_containing_pattern_scopes_the_exclude_to_one_location_not_every_matching_name() {
+        // `compile_override`'s path-shaped branch (as opposed to `basename_only`): a pattern containing
+        // `/` matches the full path (via the containing skill directory, for a `SKILL.md`), so an
+        // operator can exclude "draft-one" only under `shared-skills/`, leaving a same-named skill
+        // elsewhere untouched — unlike a bare `draft-one`/`draft-*`, which would match everywhere.
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("project");
+        write_skill(
+            &cwd.join(".claude/skills"),
+            "draft-one",
+            "---\nname: draft-one\ndescription: standard root, must survive\n---\n",
+        );
+        let extra_root = tmp.path().join("shared-skills");
+        write_skill(
+            &extra_root,
+            "draft-one-extra",
+            "---\nname: draft-one-extra\ndescription: excluded by its scoped location\n---\n",
+        );
+        let extra_roots = vec![
+            extra_root.to_string_lossy().into_owned(),
+            "!shared-skills/draft-one-extra".to_string(),
+        ];
+        let (found, _) = discover_with_diagnostics(&cwd, true, &extra_roots);
+        assert!(
+            !found.iter().any(|s| s.name == "draft-one-extra"),
+            "the scoped exclude must drop the skill under shared-skills/: {found:?}"
+        );
+        assert!(
+            found.iter().any(|s| s.name == "draft-one"),
+            "a same-name-shaped skill outside the scoped location must be unaffected: {found:?}"
+        );
+    }
+
+    #[test]
+    fn plus_prefix_force_includes_a_skill_an_exclude_pattern_would_otherwise_have_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("project");
+        write_skill(
+            &cwd.join(".claude/skills"),
+            "draft-one",
+            "---\nname: draft-one\ndescription: excluded\n---\n",
+        );
+        write_skill(
+            &cwd.join(".claude/skills"),
+            "draft-important",
+            "---\nname: draft-important\ndescription: restored\n---\n",
+        );
+        let extra_roots = vec!["!draft-*".to_string(), "+draft-important".to_string()];
+        let (found, _) = discover_with_diagnostics(&cwd, true, &extra_roots);
+        assert!(
+            !found.iter().any(|s| s.name == "draft-one"),
+            "must still be excluded by the bare !pattern: {found:?}"
+        );
+        assert!(
+            found.iter().any(|s| s.name == "draft-important"),
+            "a +pattern must force-include a skill the !pattern would otherwise have dropped: {found:?}"
+        );
+    }
+
+    #[test]
+    fn minus_prefix_force_excludes_even_when_a_plus_pattern_would_have_restored_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("project");
+        write_skill(
+            &cwd.join(".claude/skills"),
+            "draft-one",
+            "---\nname: draft-one\ndescription: excluded\n---\n",
+        );
+        let extra_roots = vec![
+            "!draft-*".to_string(),
+            "+draft-one".to_string(),
+            "-draft-one".to_string(),
+        ];
+        let (found, _) = discover_with_diagnostics(&cwd, true, &extra_roots);
+        assert!(
+            !found.iter().any(|s| s.name == "draft-one"),
+            "a -pattern must win outright, even over a +pattern for the very same skill: {found:?}"
+        );
+    }
+
+    #[test]
+    fn an_individually_named_file_entry_mixed_with_a_pattern_entry_is_still_discovered() {
+        // Regression guard for the `let PathEntry::Root(extra) = classify_path_entry(extra) else {
+        // continue }` change to the extra-roots walk: a pattern entry sharing the same list as a plain
+        // single-file entry must not stop that file from still being discovered as its own root.
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("solo.md");
+        fs::write(
+            &file,
+            "---\nname: solo\ndescription: a single-file skill\n---\nBody.",
+        )
+        .unwrap();
+        let cwd = tmp.path().join("project");
+        fs::create_dir_all(&cwd).unwrap();
+        let extra_roots = vec![
+            file.to_string_lossy().into_owned(),
+            "!some-unrelated-pattern".to_string(),
+        ];
+        let (found, _) = discover_with_diagnostics(&cwd, true, &extra_roots);
+        assert!(
+            found.iter().any(|s| s.name == "solo"),
+            "an individually-named file entry must still be discovered alongside a pattern entry: \
+             {found:?}"
+        );
     }
 }

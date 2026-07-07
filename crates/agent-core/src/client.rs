@@ -205,6 +205,17 @@ pub struct DirectRouting {
     /// `Prefixed`-routed request (Codex) has no analogous need and ignores this field. `None`/empty
     /// (every existing route) builds the URL with no query string, unchanged.
     pub query: Option<String>,
+    /// Which third-party aggregator platform this BYO override's `base_url` names, if any (pi-parity
+    /// pass 20, Task 5) — mirrors how [`deployment_name`](Self::deployment_name) threads Azure's
+    /// deployment mapping across the `crates/agent`/`agent-core` crate boundary. Populated by
+    /// `crates/agent::gateway_credential`'s `aggregator_host_for_base_url` (which already computes this
+    /// from the override's `base_url` for `GatewayCredentialIdentity`'s sake) whenever a `DirectRouting`
+    /// is built from a `models.json` `base_url` override; `None` for every route with no BYO override at
+    /// all (Codex, GitHub Copilot) — those have no aggregator host of their own to report. Read by
+    /// [`GatewayClient::stream`] to set [`crate::transport::ModelRequest::host`], alongside (not instead
+    /// of) Fireworks' own id-shape self-identification — see that call site's own comment for the
+    /// precedence between the two.
+    pub aggregator_host: Option<crate::models::AggregatorHost>,
 }
 
 /// A live, ready-to-attach bearer credential for one request, plus the context header construction
@@ -435,6 +446,23 @@ impl ModelTransport for GatewayClient {
             .direct
             .as_ref()
             .is_some_and(|d| d.copilot_dynamic_headers);
+        // pi-parity pass 20 Task 5: `ModelRequest::host` computed here, *before* dialect selection
+        // (rather than down where the other route flags — `is_copilot`/`is_azure`/`is_codex` — are set
+        // below), because dialect selection itself now needs it: a handful of bare ids genuinely speak
+        // a different wire depending on which aggregator serves them (see
+        // `crate::dialect::Dialect::for_model_with_host`'s own doc comment). A BYO override's explicit
+        // `DirectRouting::aggregator_host` (populated by `crates/agent::gateway_credential` from the
+        // override's own `base_url`) takes precedence over Fireworks' id-shape self-identification —
+        // checked first below — though in practice the two never both apply to the same request:
+        // Fireworks is its own host, never reached through a BYO override naming a different aggregator.
+        req.host = credential
+            .direct
+            .as_ref()
+            .and_then(|d| d.aggregator_host)
+            .or_else(|| {
+                crate::models::is_fireworks_model(&req.model.to_ascii_lowercase())
+                    .then_some(crate::models::AggregatorHost::Fireworks)
+            });
         // Pi-parity Fix 1 (Round 2): an operator-configured dialect override (`DirectRouting::
         // dialect_override` — a `models.json` `base_url` override naming a genuinely Anthropic- or
         // OpenAI-wire third-party provider whose model ids don't match `for_model_via_copilot`'s own
@@ -446,7 +474,7 @@ impl ModelTransport for GatewayClient {
             .direct
             .as_ref()
             .and_then(|d| d.dialect_override)
-            .unwrap_or_else(|| Dialect::for_model_via_copilot(&req.model, via_copilot));
+            .unwrap_or_else(|| Dialect::for_model_via_copilot(&req.model, via_copilot, req.host));
         // Pi-parity Fix 2 (Round 2): an Azure resource pinned to a dated `api-version` needs that as a
         // query param on every request (`DirectRouting::query`) — only meaningful for a `Direct` route,
         // which is the only variant that builds a URL from scratch rather than relaying through the
@@ -515,14 +543,8 @@ impl ModelTransport for GatewayClient {
             credential.direct.as_ref().map(|d| &d.route),
             Some(RouteOverride::Prefixed { .. })
         );
-        // pi-parity (models/dialects pass, Task A): `ModelRequest::host` is the aggregator-platform
-        // analogue of the three flags above — see its own doc comment for why most aggregators (Together/
-        // HuggingFace/Groq/NVIDIA/OpenRouter) aren't wired here yet. Fireworks is the one exception:
-        // it's self-identifying purely from the model id's own shape, already known at this point the
-        // same way `is_codex`/`is_azure`/`is_copilot` are, so there's no reason to wait for the
-        // `crates/agent`-side routing work the other aggregators need.
-        req.host = crate::models::is_fireworks_model(&req.model.to_ascii_lowercase())
-            .then_some(crate::models::AggregatorHost::Fireworks);
+        // `req.host` was already computed above, before dialect selection — see that assignment's own
+        // comment.
         // Anthropic's own OAuth identity-spoofing headers (`CLAUDE_CODE_BETA`/`CLAUDE_CLI_IDENTITY`
         // etc., below) and body shape (Claude Code's identity system prompt, canonical tool-name
         // casing — `dialect::anthropic::build_body`) only apply to a genuine direct-to-Anthropic
@@ -638,6 +660,11 @@ impl ModelTransport for GatewayClient {
         let needs_fine_grained_tool_streaming_beta = !req.tools.is_empty()
             && !crate::models::capabilities_for_route(&req.model, req.is_codex, req.is_azure)
                 .supports_eager_tool_streaming;
+        // Same condition already used above to decide whether to attempt the WebSocket transport at
+        // all — reused here (not re-derived) so the HTTP/SSE fallback path this falls through to can
+        // zstd-compress the body the same way the real Codex backend's own client does, without a
+        // second, independent "is this Codex" check drifting from the first.
+        let is_codex_sse_fallback = req.is_codex && dialect == Dialect::OpenAiResponses;
         let stream = async_stream::try_stream! {
             // Retry the request up to the first byte: a transient failure (refused connection, 429,
             // 503) is re-issued with backoff. We do *not* retry once events have started flowing — a
@@ -648,6 +675,7 @@ impl ModelTransport for GatewayClient {
                 &url,
                 credential.key.expose(),
                 &body,
+                is_codex_sse_fallback,
                 is_anthropic,
                 is_oauth,
                 needs_interleaved_beta,
@@ -905,6 +933,11 @@ async fn send_with_retry(
     url: &str,
     api_key: &str,
     body: &Value,
+    // Whether this request is Codex's own HTTP/SSE fallback path (the WebSocket transport declined
+    // or wasn't attempted) — the one case where the body is zstd-compressed before sending, mirroring
+    // pi's own `compressRequestBodyZstd`/`content-encoding: zstd` behavior for that exact backend.
+    // `false` for every other route, which keeps sending the plain JSON body unchanged.
+    is_codex_sse_fallback: bool,
     is_anthropic: bool,
     is_oauth: bool,
     needs_interleaved_beta: bool,
@@ -939,7 +972,27 @@ async fn send_with_retry(
 ) -> Result<reqwest::Response> {
     let mut attempt = 0u32;
     loop {
-        let mut builder = http.post(url).json(body);
+        // Codex's HTTP/SSE fallback accepts a zstd-compressed body (bandwidth optimization only —
+        // the endpoint still accepts plain JSON, so a compression failure falls back to that rather
+        // than failing the request). Every other route keeps sending `.json(body)` unchanged.
+        let mut builder = if is_codex_sse_fallback {
+            match serde_json::to_vec(body)
+                .ok()
+                .and_then(|bytes| crate::codex_websocket::compress_sse_fallback_body(&bytes))
+            {
+                Some(compressed) => http
+                    .post(url)
+                    .header(
+                        crate::codex_websocket::SSE_FALLBACK_CONTENT_ENCODING.0,
+                        crate::codex_websocket::SSE_FALLBACK_CONTENT_ENCODING.1,
+                    )
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(compressed),
+                None => http.post(url).json(body),
+            }
+        } else {
+            http.post(url).json(body)
+        };
         builder = match auth_header {
             // Azure OpenAI shape (no prefix, the ordinary case): the bare key, verbatim, in its own
             // header — never `Authorization` (see `DirectRouting::auth_header`'s doc comment on why
@@ -2694,6 +2747,7 @@ mod tests {
             dialect_override: None,
             deployment_name: None,
             query: None,
+            aggregator_host: None,
         };
         let client = GatewayClient::with_credential_source(
             format!("http://{addr}"),
@@ -2773,6 +2827,7 @@ mod tests {
             dialect_override: None,
             deployment_name: None,
             query: None,
+            aggregator_host: None,
         };
         let client = GatewayClient::with_credential_source(
             // A closed port: if the client ever mistakenly used this instead of the credential's own
@@ -2856,6 +2911,7 @@ mod tests {
             dialect_override: None,
             deployment_name: None,
             query: None,
+            aggregator_host: None,
         };
         let client = GatewayClient::with_credential_source(
             "http://127.0.0.1:1".to_string(),
@@ -2915,6 +2971,7 @@ mod tests {
             dialect_override: None,
             deployment_name: None,
             query: None,
+            aggregator_host: None,
         };
         let client = GatewayClient::with_credential_source(
             "http://127.0.0.1:1".to_string(),
@@ -3007,6 +3064,7 @@ mod tests {
             dialect_override: None,
             deployment_name: None,
             query: None,
+            aggregator_host: None,
         };
         let client = GatewayClient::with_credential_source(
             "http://127.0.0.1:1".to_string(),
@@ -3058,6 +3116,7 @@ mod tests {
             dialect_override: None,
             deployment_name: None,
             query: None,
+            aggregator_host: None,
         };
         let client = GatewayClient::with_credential_source(
             "http://127.0.0.1:1".to_string(),
@@ -3114,6 +3173,7 @@ mod tests {
             dialect_override: None,
             deployment_name: Some("my-gpt-5-1-deployment".to_string()),
             query: None,
+            aggregator_host: None,
         };
         let client = GatewayClient::with_credential_source(
             "http://127.0.0.1:1".to_string(),
@@ -3176,6 +3236,7 @@ mod tests {
             dialect_override: None,
             deployment_name: None,
             query: None,
+            aggregator_host: None,
         };
         let client = GatewayClient::with_credential_source(
             // A closed port, same guard as the Copilot test: if the client ever fell back to the
@@ -3243,6 +3304,7 @@ mod tests {
             dialect_override: None,
             deployment_name: None,
             query: None,
+            aggregator_host: None,
         };
         let client = GatewayClient::with_credential_source(
             "http://127.0.0.1:1".to_string(),
@@ -3290,15 +3352,26 @@ mod tests {
         let server = std::thread::spawn(move || {
             use std::io::{Read, Write};
             let (mut stream, _) = listener.accept().unwrap();
+            // Read the raw bytes rather than lossy-UTF8: this Codex-routed HTTP/SSE-fallback request's
+            // body is zstd-compressed (`is_codex_sse_fallback`, pi-parity), so the assertions below
+            // decompress the body before checking its JSON content. A single `read` is enough here —
+            // the (pre-compression) body was already small enough to arrive in one packet before this
+            // fix, and compression only shrinks it further.
             let mut buf = [0u8; 8192];
             let n = stream.read(&mut buf).unwrap();
-            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let raw = &buf[..n];
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
                 .unwrap();
             stream.flush().unwrap();
             drop(stream);
-            request
+            let split = raw.windows(4).position(|w| w == b"\r\n\r\n").expect("header/body separator");
+            let (head, body) = (&raw[..split], &raw[split + 4..]);
+            let head = String::from_utf8_lossy(head).to_string();
+            let decompressed = zstd::stream::decode_all(body)
+                .expect("the Codex fallback body must be a valid zstd frame");
+            let json = String::from_utf8(decompressed).expect("decompressed body must be UTF-8 JSON");
+            (head, json)
         });
 
         let routing = DirectRouting {
@@ -3313,6 +3386,7 @@ mod tests {
             dialect_override: None,
             deployment_name: None,
             query: None,
+            aggregator_host: None,
         };
         let client = GatewayClient::with_credential_source(
             format!("http://{addr}"),
@@ -3328,7 +3402,11 @@ mod tests {
         let mut events = client.stream(req).await.unwrap();
         while events.next().await.is_some() {}
 
-        let request = server.join().unwrap();
+        let (head, request) = server.join().unwrap();
+        assert!(
+            head.to_lowercase().contains("content-encoding: zstd"),
+            "expected the Codex HTTP/SSE fallback to zstd-compress its body, got headers:\n{head}"
+        );
         assert!(
             request.contains("\"instructions\":\"be terse\""),
             "expected the system prompt in a top-level instructions field, got:\n{request}"
@@ -3379,6 +3457,7 @@ mod tests {
             dialect_override: Some(Dialect::Anthropic),
             deployment_name: None,
             query: None,
+            aggregator_host: None,
         };
         let client = GatewayClient::with_credential_source(
             "http://127.0.0.1:1".to_string(),
@@ -3432,6 +3511,98 @@ mod tests {
         );
     }
 
+    /// pi-parity pass 20, Task 5/6: proves the full `DirectRouting::aggregator_host` pipeline —
+    /// populated by a BYO `models.json` `base_url` override (`crates/agent::gateway_credential`, not
+    /// exercised here directly) and read back out by `GatewayClient::stream` to set
+    /// `ModelRequest::host`, which `Dialect::for_model_via_copilot` then consults to resolve one of the
+    /// 3 real host-dependent bare-id wire collisions (`crate::dialect::anthropic_wire_bare_id_for_host`).
+    /// "minimax-m3" is Anthropic-wire by default (`NATIVE_ANTHROPIC_WIRE_BARE_IDS`, matching native
+    /// MiniMax and OpenCode-Go) but genuinely `openai-completions` on OpenCode Zen specifically — with no
+    /// `aggregator_host` signal this would silently build an Anthropic-shaped body and send it to an
+    /// OpenAI-wire endpoint, a hard 400.
+    #[tokio::test]
+    async fn aggregator_host_from_a_byo_override_resolves_a_real_bare_id_host_collision() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+            drop(stream);
+            request
+        });
+
+        let routing = DirectRouting {
+            route: RouteOverride::Direct {
+                base_url: format!("http://{addr}"),
+                path: "/v1/chat/completions",
+            },
+            static_headers: Vec::new(),
+            copilot_dynamic_headers: false,
+            auth_header: None,
+            auth_header_prefix: None,
+            dialect_override: None,
+            deployment_name: None,
+            query: None,
+            aggregator_host: Some(crate::models::AggregatorHost::OpenCodeZen),
+        };
+        let client = GatewayClient::with_credential_source(
+            "http://127.0.0.1:1".to_string(),
+            Arc::new(DirectTestCredential(routing)),
+        )
+        .unwrap();
+        let req = ModelRequest::new("minimax-m3", vec![crate::message::Message::user("hi")], 100);
+        let mut events = client.stream(req).await.unwrap();
+        while events.next().await.is_some() {}
+
+        let request = server.join().unwrap();
+        assert!(
+            !request.to_lowercase().contains("anthropic-version:"),
+            "aggregator_host: Some(OpenCodeZen) must resolve \"minimax-m3\" to the real openai-wire \
+             format for that host, not the host-agnostic Anthropic default, got:\n{request}"
+        );
+    }
+
+    /// The converse of the test above: with no `aggregator_host` signal at all (the common case for a
+    /// plain gateway-relayed request), "minimax-m3" keeps the pre-existing host-agnostic default
+    /// (Anthropic — correct for native MiniMax and OpenCode-Go, just not OpenCode Zen).
+    #[tokio::test]
+    async fn without_an_aggregator_host_the_same_bare_id_keeps_the_host_agnostic_anthropic_default() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+            drop(stream);
+            request
+        });
+
+        let client = GatewayClient::new(format!("http://{addr}"), "test-key").unwrap();
+        let req = ModelRequest::new("minimax-m3", vec![crate::message::Message::user("hi")], 100);
+        let mut events = client.stream(req).await.unwrap();
+        while events.next().await.is_some() {}
+
+        let request = server.join().unwrap();
+        assert!(
+            request.to_lowercase().contains("anthropic-version:"),
+            "baseline check: with no aggregator host signal, \"minimax-m3\" must keep building the \
+             Anthropic wire, got:\n{request}"
+        );
+    }
+
     /// Pi-parity Fix 2 (Round 2): proves [`DirectRouting::query`] is appended to a `Direct` route's
     /// URL — an Azure resource pinned to a dated `api-version` needs this on every request.
     #[tokio::test]
@@ -3464,6 +3635,7 @@ mod tests {
             dialect_override: None,
             deployment_name: None,
             query: Some("api-version=2024-08-01-preview".to_string()),
+            aggregator_host: None,
         };
         let client = GatewayClient::with_credential_source(
             "http://127.0.0.1:1".to_string(),
@@ -3515,6 +3687,7 @@ mod tests {
             dialect_override: None,
             deployment_name: Some("my-azure-deployment".to_string()),
             query: None,
+            aggregator_host: None,
         };
         let client = GatewayClient::with_credential_source(
             "http://127.0.0.1:1".to_string(),
@@ -3575,6 +3748,7 @@ mod tests {
             dialect_override: None,
             deployment_name: None,
             query: None,
+            aggregator_host: None,
         };
         let client = GatewayClient::with_credential_source(
             "http://127.0.0.1:1".to_string(),

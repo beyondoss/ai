@@ -109,6 +109,9 @@ fn anthropic_transcript(deltas: usize) -> String {
 
 /// Build an OpenAI Chat Completions (`/v1/chat/completions`) streaming turn: `deltas` content chunks,
 /// a `bash` tool call with fragmented `arguments`, a `finish_reason`, and the trailing usage-only chunk.
+/// Every non-terminal chunk carries `"finish_reason":null`, matching real OpenAI (and every
+/// OpenAI-compatible) traffic — omitting it here previously hid the fast-path regression where
+/// `FastTextChoice` didn't declare `finish_reason` and so rejected every real-shaped chunk.
 fn openai_transcript(deltas: usize) -> String {
     let mut s = String::new();
     let data = |s: &mut String, d: &str| {
@@ -119,17 +122,17 @@ fn openai_transcript(deltas: usize) -> String {
     for _ in 0..deltas {
         data(
             &mut s,
-            r#"{"choices":[{"index":0,"delta":{"content":"the quick brown fox "}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"content":"the quick brown fox "},"finish_reason":null}]}"#,
         );
     }
     data(
         &mut s,
-        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_01ABC","function":{"name":"bash","arguments":""}}]}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_01ABC","function":{"name":"bash","arguments":""}}]},"finish_reason":null}]}"#,
     );
     for _ in 0..ARG_FRAGMENTS {
         data(
             &mut s,
-            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"grep -rn "}}]}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"grep -rn "}}]},"finish_reason":null}]}"#,
         );
     }
     data(

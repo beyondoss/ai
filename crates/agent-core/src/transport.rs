@@ -266,22 +266,18 @@ pub struct ModelRequest {
     /// numbers [`crate::models::capabilities`]/`capabilities_for_route_with_copilot` already return,
     /// unchanged from before this field existed.
     ///
-    /// **Only partially populated by `GatewayClient::stream` today.** Fireworks is self-identifying
-    /// purely from the model id's own shape (`"accounts/fireworks/…"`,
+    /// Populated by `GatewayClient::stream` two ways, computed before dialect selection so both the
+    /// wire body and `capabilities_for_route_with_host` see the same signal. Fireworks is
+    /// self-identifying purely from the model id's own shape (`"accounts/fireworks/…"`,
     /// [`crate::models::is_fireworks_model`]) — genuinely free, already-known information the same way
-    /// `is_codex`/`is_azure`/`is_copilot` are, so `client.rs` sets this to
-    /// `Some(AggregatorHost::Fireworks)` unconditionally whenever the id matches. Every other
-    /// aggregator is **not yet wired**: a `KNOWN_PROVIDERS`-routed request (Together/HuggingFace/Groq/
-    /// NVIDIA/OpenRouter — `crates/gateway/src/route.rs`) picks its `/{provider}/…` path segment
-    /// somewhere in `crates/agent` (not yet — see that crate's own routing code once it exists), and a
-    /// BYO-only aggregator (HuggingFace/NVIDIA/Kimi-Coding) is only named today as a host string inside
-    /// `crates/agent::settings::ModelOverride::base_url` — neither fact is visible to this crate yet.
-    /// **Next round's wiring** (owned by whichever agent next touches
-    /// `crates/agent/src/gateway_credential.rs`/`serve.rs`): when resolving a model's route, determine
-    /// which aggregator (if any) is serving it — from the provider name chosen for a `KNOWN_PROVIDERS`
-    /// row, or by matching `ModelOverride::base_url`'s host against each BYO-only aggregator's known
-    /// authority — and set this field the same way `req.is_copilot`/`req.is_azure`/`req.is_codex` are
-    /// set today in `GatewayClient::stream` (`client.rs`).
+    /// `is_codex`/`is_azure`/`is_copilot` are. Every other aggregator (Together/HuggingFace/Groq/
+    /// NVIDIA/OpenRouter/Kimi-Coding/OpenCode Zen/OpenCode-Go) comes from a BYO `models.json` override:
+    /// `crates/agent::gateway_credential::aggregator_host_for_base_url` matches `ModelOverride::base_url`
+    /// against each aggregator's known authority and stores the result on
+    /// `DirectRouting::aggregator_host`, which `client.rs` reads here (the BYO signal wins if it's
+    /// somehow also Fireworks-shaped, though that combination shouldn't occur in practice). A plain
+    /// gateway-routed request (reached via a virtual key, not OAuth or a BYO override) still has no
+    /// client-visible host signal — that remains a real, separate gap, not fixed by this field.
     pub host: Option<AggregatorHost>,
     /// Strip/downgrade every image in this request at the wire layer, regardless of the active
     /// model's own vision support — the wire-level enforcement half of the `--block-images`/
@@ -296,12 +292,14 @@ pub struct ModelRequest {
     /// session bypasses ingestion entirely, and an image already persisted in session history before
     /// the flag was toggled on would otherwise still get resent on a resumed session.
     ///
-    /// **Not yet populated by any real caller.** The next round's wiring (`crates/agent/src/serve.rs`/
-    /// `main.rs`, wherever a `ModelRequest` is actually built for a turn) should set this to the
-    /// session/agent's current `block_images` setting on every request, the same way `Agent::new`
-    /// already reads that setting for the ingestion-time gate — this field is the wire-layer twin of
-    /// that existing flag, not a replacement for it (ingestion-time gating still avoids doing the work
-    /// of reading/encoding an image that will just be stripped again here).
+    /// Populated on every turn: [`Agent::run_events_steered`](crate::agent::Agent::run_events_steered)
+    /// sets this to the agent's own `block_images` flag (`Agent::with_block_images`) right after
+    /// building each request from `session.messages`, so it's always current — including a value
+    /// toggled on *after* some of those messages were already persisted with real images in them, and
+    /// including a request an RPC client pushed directly into a running session, bypassing ingestion
+    /// entirely. This field is the wire-layer twin of that flag, not a replacement for it
+    /// (ingestion-time gating at the `read` tool/CLI `@file` attachment still avoids doing the work of
+    /// reading/encoding an image that would just be stripped again here).
     pub block_images: bool,
 }
 
@@ -456,8 +454,10 @@ impl ModelRequest {
     }
 
     /// Builder-style: block every image in this request at the wire layer. See
-    /// [`block_images`](Self::block_images)'s own doc comment for what this does (and doesn't yet)
-    /// wire up.
+    /// [`block_images`](Self::block_images)'s own doc comment for what this wires up and who actually
+    /// sets it turn-to-turn (`Agent::run_events_steered` assigns the field directly rather than going
+    /// through this builder; it's here for tests and any other caller constructing a `ModelRequest`
+    /// fluently).
     pub fn with_block_images(mut self, block_images: bool) -> Self {
         self.block_images = block_images;
         self

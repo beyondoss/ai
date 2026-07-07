@@ -216,6 +216,14 @@ fn discover_with_diagnostics_impl(
     // order is still visible below for the "later extra wins over an earlier extra" tie-break.
     let mut extra_entries: Vec<Vec<(String, PathBuf, PromptTemplate)>> = Vec::new();
     for extra in extra_roots {
+        // pi-parity feature (Round 20): `extra_roots` can now also carry override-pattern entries
+        // (`!pattern`/`+pattern`/`-pattern`/a bare glob) alongside plain root paths — see
+        // `skills.rs`'s identical loop for the full reasoning. A pattern entry isn't a root to walk;
+        // it's applied uniformly across the entire discovered set by `apply_path_overrides` below.
+        let crate::settings::PathEntry::Root(extra) = crate::settings::classify_path_entry(extra)
+        else {
+            continue;
+        };
         // pi-parity fix (L8): pi's own `resolveCliPaths`→`resolvePath` expands a leading `~` on a
         // `--prompt-template` path; ours previously took it verbatim — usually masked by the shell
         // expanding it first, but not for a quoted argument or one built programmatically.
@@ -356,6 +364,16 @@ fn discover_with_diagnostics_impl(
             }
         }
     }
+    // pi-parity feature (Round 20): apply `extra_roots`' own override-pattern entries uniformly across
+    // the entire discovered set — see `skills.rs`'s identical call site (this shares its implementation)
+    // for the full reasoning.
+    let (mut found, override_diagnostics) =
+        crate::skills::apply_path_overrides(found, |t| t.path.as_path(), extra_roots);
+    collisions.extend(
+        override_diagnostics
+            .into_iter()
+            .map(|m| Collision::message_only("prompt", m)),
+    );
     found.sort_by(|a, b| a.name.cmp(&b.name));
     (found, collisions)
 }
@@ -1419,5 +1437,128 @@ mod tests {
             path: PathBuf::from("/x/.claude/prompts/x.md"),
             scope: "user",
         }
+    }
+
+    // pi-parity feature, Round 20: `default_prompt_template_paths`/`extra_roots` override-pattern
+    // support — shares `skills::apply_path_overrides`/`settings::PathEntry` with `skills.rs`, whose own
+    // test module exercises the same four scenarios against skill directories; these mirror them for
+    // prompt templates, whose path is always the `.md` file itself (no skill-style containing directory
+    // to also match against).
+
+    #[test]
+    fn a_plain_directory_entry_still_discovers_everything_in_it_no_regression() {
+        let tmp = tempfile::tempdir().unwrap();
+        let extra_root = tmp.path().join("shared-prompts");
+        fs::create_dir_all(&extra_root).unwrap();
+        fs::write(extra_root.join("alpha.md"), "Alpha body.").unwrap();
+        fs::write(extra_root.join("beta.md"), "Beta body.").unwrap();
+        let cwd = tmp.path().join("project");
+        fs::create_dir_all(&cwd).unwrap();
+        let (found, _) =
+            discover_with_diagnostics(&cwd, true, &[extra_root.to_string_lossy().into_owned()]);
+        assert!(found.iter().any(|t| t.name == "alpha"), "got: {found:?}");
+        assert!(found.iter().any(|t| t.name == "beta"), "got: {found:?}");
+    }
+
+    #[test]
+    fn bang_prefix_excludes_an_already_discovered_prompt_template() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("project");
+        let pdir = cwd.join(".claude/prompts");
+        fs::create_dir_all(&pdir).unwrap();
+        fs::write(pdir.join("keep-me.md"), "stays").unwrap();
+        fs::write(pdir.join("wip-experimental.md"), "hidden").unwrap();
+        let (found, _) = discover_with_diagnostics(&cwd, true, &["!wip-experimental".to_string()]);
+        assert!(found.iter().any(|t| t.name == "keep-me"), "got: {found:?}");
+        assert!(
+            !found.iter().any(|t| t.name == "wip-experimental"),
+            "a !pattern must exclude the matching template: {found:?}"
+        );
+    }
+
+    #[test]
+    fn a_bare_glob_pattern_excludes_matching_templates_uniformly_across_every_discovery_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("project");
+        let pdir = cwd.join(".claude/prompts");
+        fs::create_dir_all(&pdir).unwrap();
+        fs::write(pdir.join("draft-one.md"), "standard root draft").unwrap();
+        fs::write(pdir.join("keep.md"), "stays").unwrap();
+        let extra_root = tmp.path().join("shared-prompts");
+        fs::create_dir_all(&extra_root).unwrap();
+        fs::write(extra_root.join("draft-two.md"), "extra root draft").unwrap();
+        let extra_roots = vec![
+            extra_root.to_string_lossy().into_owned(),
+            "draft-*".to_string(),
+        ];
+        let (found, _) = discover_with_diagnostics(&cwd, true, &extra_roots);
+        assert!(
+            !found.iter().any(|t| t.name == "draft-one"),
+            "a bare glob must exclude a matching standard-root template: {found:?}"
+        );
+        assert!(
+            !found.iter().any(|t| t.name == "draft-two"),
+            "a bare glob must exclude a matching extra-root template too — applied uniformly: {found:?}"
+        );
+        assert!(found.iter().any(|t| t.name == "keep"), "got: {found:?}");
+    }
+
+    #[test]
+    fn plus_prefix_force_includes_a_template_an_exclude_pattern_would_otherwise_have_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("project");
+        let pdir = cwd.join(".claude/prompts");
+        fs::create_dir_all(&pdir).unwrap();
+        fs::write(pdir.join("draft-one.md"), "excluded").unwrap();
+        fs::write(pdir.join("draft-important.md"), "restored").unwrap();
+        let extra_roots = vec!["!draft-*".to_string(), "+draft-important".to_string()];
+        let (found, _) = discover_with_diagnostics(&cwd, true, &extra_roots);
+        assert!(
+            !found.iter().any(|t| t.name == "draft-one"),
+            "must still be excluded by the bare !pattern: {found:?}"
+        );
+        assert!(
+            found.iter().any(|t| t.name == "draft-important"),
+            "a +pattern must force-include a template the !pattern would otherwise have dropped: \
+             {found:?}"
+        );
+    }
+
+    #[test]
+    fn minus_prefix_force_excludes_even_when_a_plus_pattern_would_have_restored_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("project");
+        let pdir = cwd.join(".claude/prompts");
+        fs::create_dir_all(&pdir).unwrap();
+        fs::write(pdir.join("draft-one.md"), "excluded").unwrap();
+        let extra_roots = vec![
+            "!draft-*".to_string(),
+            "+draft-one".to_string(),
+            "-draft-one".to_string(),
+        ];
+        let (found, _) = discover_with_diagnostics(&cwd, true, &extra_roots);
+        assert!(
+            !found.iter().any(|t| t.name == "draft-one"),
+            "a -pattern must win outright, even over a +pattern for the very same template: {found:?}"
+        );
+    }
+
+    #[test]
+    fn an_individually_named_file_entry_mixed_with_a_pattern_entry_is_still_discovered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("solo.md");
+        fs::write(&file, "A single-file prompt template.").unwrap();
+        let cwd = tmp.path().join("project");
+        fs::create_dir_all(&cwd).unwrap();
+        let extra_roots = vec![
+            file.to_string_lossy().into_owned(),
+            "!some-unrelated-pattern".to_string(),
+        ];
+        let (found, _) = discover_with_diagnostics(&cwd, true, &extra_roots);
+        assert!(
+            found.iter().any(|t| t.name == "solo"),
+            "an individually-named file entry must still be discovered alongside a pattern entry: \
+             {found:?}"
+        );
     }
 }

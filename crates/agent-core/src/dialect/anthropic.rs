@@ -712,8 +712,16 @@ impl Decoder {
 /// `Decoder::push`'s own `content_block_delta` arm already warns and drops, so a future Anthropic
 /// delta kind added to the wire degrades to the slow path's existing warning rather than being
 /// silently misparsed here.
+///
+/// `kind` (the outer event's own `type`) is captured and checked explicitly in `try_fast_path` rather
+/// than assumed from the `index`+`delta` shape alone: today no other Anthropic SSE event carries both
+/// an `index` and a `delta.type`-tagged object, so this can't currently misfire, but nothing stops a
+/// future event type from coincidentally matching that shape — the explicit check keeps that failure
+/// mode closed rather than relying on it staying true forever.
 #[derive(Deserialize)]
 struct FastContentBlockDelta {
+    #[serde(rename = "type")]
+    kind: String,
     index: usize,
     delta: FastDelta,
 }
@@ -739,6 +747,9 @@ impl StreamDecoder for Decoder {
         // requiring the outer `FastContentBlockDelta`'s own fields (`index`/`delta`) instead of
         // trusting the inner tag alone.
         let parsed: FastContentBlockDelta = serde_json::from_str(payload).ok()?;
+        if parsed.kind != "content_block_delta" {
+            return None;
+        }
         let index = parsed.index;
         Some(vec![match parsed.delta {
             FastDelta::Text { text } => StreamEvent::TextDelta { index, text },
@@ -3004,5 +3015,19 @@ data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use"
                 "expected fast path to decline: {payload}"
             );
         }
+    }
+
+    #[test]
+    fn fast_path_declines_a_coincidentally_shaped_event_with_the_wrong_outer_type() {
+        // Guards `FastContentBlockDelta::kind`: an event carrying both an `index` and a
+        // `delta.type`-tagged object but whose *outer* `type` isn't `content_block_delta` must not be
+        // misparsed as one, even though no real Anthropic event does this today.
+        let mut dec = Decoder::default();
+        assert_eq!(
+            dec.try_fast_path(
+                r#"{"type":"content_block_start","index":0,"delta":{"type":"text_delta","text":"x"}}"#
+            ),
+            None
+        );
     }
 }

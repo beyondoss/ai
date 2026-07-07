@@ -44,6 +44,7 @@ impl CredentialSource for CodexCredential {
             dialect_override: None,
             deployment_name: None,
             query: None,
+            aggregator_host: None,
         }))
     }
 }
@@ -281,5 +282,93 @@ async fn a_failed_websocket_handshake_falls_back_to_http_sse_transparently() {
     assert!(
         request.contains("/openai-codex/backend-api/codex/responses"),
         "the fallback must still hit Codex's real path: {request}"
+    );
+}
+
+/// pi-parity: the Codex HTTP/SSE fallback path zstd-compresses its request body
+/// (`codex_websocket::compress_sse_fallback_body`, wired into `client.rs::send_with_retry` gated on
+/// `is_codex_sse_fallback`). Reads the raw request bytes (not `String::from_utf8_lossy`, which would
+/// corrupt a binary zstd body) to check the header and decompress the body directly.
+#[tokio::test]
+async fn the_http_sse_fallback_sends_a_zstd_compressed_body_with_the_matching_header() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    let server = tokio::spawn(async move {
+        // First connection: reject the WebSocket upgrade, forcing the HTTP/SSE fallback.
+        let (mut stream, _) = listener.accept().await.expect("accept 1");
+        let mut buf = [0u8; 8192];
+        let _ = stream.read(&mut buf).await;
+        stream
+            .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write rejection");
+        let _ = stream.shutdown().await;
+        drop(stream);
+
+        // Second connection: read the *raw* fallback request bytes — the body may be binary zstd.
+        let (mut stream, _) = listener.accept().await.expect("accept 2");
+        let mut raw = Vec::new();
+        // The mock server doesn't know the exact body length up front; read until the client stops
+        // sending or a generous cap is hit, then respond so `stream()` doesn't hang waiting on a
+        // response that never comes.
+        let mut chunk = [0u8; 8192];
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), stream.read(&mut chunk))
+                .await
+            {
+                Ok(Ok(0)) | Err(_) => break,
+                Ok(Ok(n)) => raw.extend_from_slice(&chunk[..n]),
+                Ok(Err(e)) => panic!("read fallback request: {e}"),
+            }
+        }
+        let sse_body = "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}\n\n\
+             data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"compressed ok\"}\n\n\
+             data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"content\":[{\"type\":\"output_text\",\"text\":\"compressed ok\"}]}}\n\n\
+             data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
+        let resp =
+            format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse_body}");
+        stream.write_all(resp.as_bytes()).await.expect("write sse response");
+        stream.flush().await.expect("flush");
+        raw
+    });
+
+    let client = GatewayClient::with_credential_source(format!("http://{addr}"), Arc::new(CodexCredential))
+        .expect("client");
+    let req = ModelRequest::new("gpt-5-codex", vec![Message::user("zstd please")], 200)
+        .with_cache_key("sess-zstd-fallback");
+    let mut stream = client.stream(req).await.expect("stream");
+    let mut events = Vec::new();
+    while let Some(ev) = stream.next().await {
+        events.push(ev.expect("event — the compressed fallback must still succeed"));
+    }
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::TextDelta { text, .. } if text == "compressed ok")),
+        "expected the fallback's own streamed text to reach the caller: {events:?}"
+    );
+
+    let raw = server.await.expect("server task");
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("a header/body separator");
+    let (head, body) = (&raw[..split], &raw[split + 4..]);
+    let head = String::from_utf8_lossy(head).to_lowercase();
+    assert!(
+        head.contains("content-encoding: zstd"),
+        "the fallback request must advertise a zstd-compressed body: {head}"
+    );
+    assert!(
+        head.contains("content-type: application/json"),
+        "the fallback request must still declare a JSON content type: {head}"
+    );
+
+    let decompressed = zstd::stream::decode_all(body).expect("the body must be a valid zstd frame");
+    let parsed: Value = serde_json::from_slice(&decompressed).expect("decompressed body must be JSON");
+    assert!(
+        parsed.to_string().contains("zstd please"),
+        "the decompressed body must carry the real request content: {parsed}"
     );
 }

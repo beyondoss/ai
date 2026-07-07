@@ -428,6 +428,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "zeroize",
+ "zstd",
 ]
 
 [[package]]

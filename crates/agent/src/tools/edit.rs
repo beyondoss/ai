@@ -195,8 +195,15 @@ impl Tool for Edit {
 /// `None` when the platform/filesystem doesn't report a modification time at all — rare, but exactly
 /// the same "best-effort, don't fail the whole operation over one unreadable timestamp" reasoning
 /// `session_store`'s trash-listing already uses for its own `.modified()` read.
+///
+/// pi-parity fix (pass 20): rejects a FIFO/socket/device *before* the `File::open` below — opening one
+/// of those for reading blocks until a writer connects on the other end (symmetric to the pre-fix
+/// `read` tool bug: see `reject_non_regular_file`'s doc comment in `tools/mod.rs`), and this runs before
+/// `run`'s own `is_writable` pre-check is even reached, so that check alone couldn't have caught it. A
+/// bare `mkfifo x` followed by `edit path=x ...` reproduced this hanging indefinitely.
 fn read_with_mtime(path: &str) -> Result<(String, Option<std::time::SystemTime>), ToolError> {
     use std::io::Read as _;
+    super::reject_non_regular_file(path, "edit")?;
     let mut file =
         std::fs::File::open(path).map_err(|e| ToolError::Execution(format!("read {path}: {e}")))?;
     let initial_mtime = file.metadata().and_then(|m| m.modified()).ok();
@@ -1151,6 +1158,37 @@ mod tests {
         let (raw, initial_mtime) = read_with_mtime(p).unwrap();
         write_if_unchanged(p, initial_mtime, raw.replace("quick", "slow").as_bytes()).unwrap();
         assert_eq!(std::fs::read_to_string(p).unwrap(), "the slow brown fox");
+    }
+
+    #[tokio::test]
+    async fn a_fifo_is_rejected_immediately_instead_of_hanging_the_tool_call_forever() {
+        // Regression (pi-parity pass 20): `read_with_mtime`'s `std::fs::File::open(path)` (read-only)
+        // blocks forever on an existing FIFO with no writer on the other end — symmetric to the
+        // pre-fix `read` tool bug (see `reject_non_regular_file` in `tools/mod.rs`), and it runs
+        // *before* `run`'s own `is_writable` pre-check is even reached, so that check alone couldn't
+        // have caught it. `mkfifo x` then `edit path=x ...` reproduced this with two ordinary tool
+        // calls. `tokio::time::timeout` here is a *test* safety net, not the fix itself: if the gate
+        // ever regresses, this test fails fast in seconds instead of hanging CI indefinitely.
+        let dir = tempfile::tempdir().unwrap();
+        let fifo_path = dir.path().join("a.fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status()
+            .expect("mkfifo must be available to run this test");
+        assert!(status.success(), "mkfifo failed to create the test fixture");
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            Edit.run(json!({
+                "path": fifo_path.to_str().unwrap(),
+                "old_string": "a",
+                "new_string": "b",
+            })),
+        )
+        .await
+        .expect("edit must reject a FIFO immediately, not hang");
+        let err = result.expect_err("a FIFO must be rejected, not edited");
+        assert!(matches!(err, ToolError::Execution(_)), "got: {err:?}");
     }
 
     #[tokio::test]

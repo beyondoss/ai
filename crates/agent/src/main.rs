@@ -468,6 +468,14 @@ enum Command {
         /// pi-parity feature).
         #[arg(long, env = "AI_AGENT_BLOCK_IMAGES", default_value_t = false)]
         block_images: bool,
+        /// Force `--block-images` off for this invocation, even when a persisted `agent settings
+        /// --block-images` default is `true` — `--block-images` above only ever ORs an explicit `true`
+        /// in, so previously there was no way to override a persisted `true` default back to `false`
+        /// for a single `run` (pass 20, pi-parity fix). Wins outright over both the persisted default
+        /// and an explicit `--block-images`, mirroring `--no-image-auto-resize`'s identical
+        /// escape-hatch shape just below.
+        #[arg(long, env = "AI_AGENT_NO_BLOCK_IMAGES", default_value_t = false)]
+        no_block_images: bool,
         /// Skip `read`'s resize/downscale path for an oversized image entirely, shipping its
         /// normalized (format-converted, if needed) bytes as-is regardless of size or pixel
         /// dimensions — pi's `ImageSettings.autoResize` (default enabled) inverted, matching this
@@ -799,6 +807,11 @@ enum Command {
         /// identical flag (Task #34, pi-parity fix: `serve` previously had no equivalent at all).
         #[arg(long, env = "AI_AGENT_BLOCK_IMAGES", default_value_t = false)]
         block_images: bool,
+        /// Force `--block-images` off for this invocation, even when a persisted `agent settings
+        /// --block-images` default is `true` (pass 20, pi-parity fix). `run`'s identical flag — see its
+        /// own doc comment.
+        #[arg(long, env = "AI_AGENT_NO_BLOCK_IMAGES", default_value_t = false)]
+        no_block_images: bool,
         /// Skip `read`'s resize/downscale path for an oversized image entirely, shipping its
         /// normalized (format-converted, if needed) bytes as-is regardless of size or pixel dimensions.
         /// Falls back to the persisted `agent settings --image-auto-resize` default when not explicitly
@@ -1400,6 +1413,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             no_retry,
             idle_timeout_ms,
             block_images,
+            no_block_images,
             no_image_auto_resize,
             bash_timeout_ms,
             bash_shell_path,
@@ -1455,6 +1469,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 no_retry,
                 idle_timeout_ms,
                 block_images,
+                no_block_images,
                 no_image_auto_resize,
                 bash_timeout_ms,
                 bash_shell_path,
@@ -1515,6 +1530,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             retry_max_backoff_ms,
             idle_timeout_ms,
             block_images,
+            no_block_images,
             no_image_auto_resize,
             bash_timeout_ms,
             bash_shell_path,
@@ -1619,7 +1635,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Task #34 (pi-parity fix): `run_task`'s identical "explicit flag, then stored setting,
             // then built-in default" precedence for both flags — see its own doc comments — previously
             // had no `serve` counterpart at all: `build_tools`/`build_agent` never consulted either.
-            let block_images = block_images || stored_settings.block_images.unwrap_or(false);
+            // Pass 20 (pi-parity fix): `--no-block-images` wins outright over both an explicit
+            // `--block-images` and the persisted default, the same "escape hatch" `--no-image-auto-resize`
+            // already gave the opposite-defaulted `image_auto_resize` just below — previously
+            // `block_images` had no way at all to be forced off for one invocation once a persisted
+            // `agent settings --block-images` default was `true`.
+            let block_images =
+                !no_block_images && (block_images || stored_settings.block_images.unwrap_or(false));
             let image_auto_resize =
                 !no_image_auto_resize && stored_settings.image_auto_resize.unwrap_or(true);
             let models = models.or_else(|| stored_settings.default_models_list.clone());
@@ -2823,6 +2845,7 @@ async fn run_task(
     no_retry: bool,
     idle_timeout_ms: Option<u64>,
     block_images: bool,
+    no_block_images: bool,
     no_image_auto_resize: bool,
     bash_timeout_ms: Option<u64>,
     bash_shell_path: Option<String>,
@@ -2900,7 +2923,13 @@ async fn run_task(
     // persisted `agent settings --block-images` default before finally defaulting to images allowed —
     // same "explicit flag, then stored setting, then built-in default" precedence every other
     // `stored_settings`-backed fallback here follows.
-    let block_images = block_images || stored_settings.block_images.unwrap_or(false);
+    //
+    // Pass 20 (pi-parity fix): `--no-block-images` wins outright over all of that — the escape hatch
+    // that was previously missing for forcing `block_images` off for one invocation when a persisted
+    // `agent settings --block-images` default is `true`, mirroring `--no-image-auto-resize`'s identical
+    // shape just below for the oppositely-defaulted `image_auto_resize`.
+    let block_images =
+        !no_block_images && (block_images || stored_settings.block_images.unwrap_or(false));
     // Task #4 (pi-parity feature): same "explicit flag, then stored setting, then built-in default"
     // precedence as `block_images` above, adapted for a negating `--no-x` flag: an explicit
     // `--no-image-auto-resize` always forces it off; otherwise fall back to the persisted

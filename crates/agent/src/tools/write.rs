@@ -44,6 +44,12 @@ impl Tool for Write {
             .get("content")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing `content`".into()))?;
+        // pi-parity fix (pass 20): reject a FIFO/socket/device *before* `is_writable`'s own
+        // `OpenOptions::write(true).open(path)` ever runs — opening an existing FIFO for write-only
+        // blocks until a reader connects on the other end, the same unrecoverable hang class `read.rs`
+        // was fixed for earlier (see `reject_non_regular_file`'s doc comment in `tools/mod.rs`). A bare
+        // `mkfifo x` followed by `write path=x ...` reproduced this hanging indefinitely.
+        super::reject_non_regular_file(path, "write")?;
         // `write_atomic` replaces the file via `rename(2)`, which only consults the *containing
         // directory's* write permission — the target file's own mode bits are never checked, so a
         // `chmod 444` file was silently overwritten. pi's `fs.writeFile` opens the existing path
@@ -157,6 +163,33 @@ mod tests {
     async fn missing_content_is_invalid_input() {
         let err = Write.run(json!({ "path": "/tmp/x" })).await.unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn a_fifo_is_rejected_immediately_instead_of_hanging_the_tool_call_forever() {
+        // Regression (pi-parity pass 20): `is_writable`'s own `OpenOptions::write(true).open(path)`
+        // blocks forever on an existing FIFO with no reader on the other end — reproduced hanging 30+
+        // seconds in the original audit, with no timeout able to preempt it (the blocking syscall runs
+        // inline in the future's own `poll()`, not behind an `await` point). `mkfifo x` then `write
+        // path=x ...` reproduced this with two ordinary tool calls. `tokio::time::timeout` here is a
+        // *test* safety net, not the fix itself (see `reject_non_regular_file` in `tools/mod.rs`): if
+        // the gate ever regresses, this test fails fast in seconds instead of hanging CI indefinitely.
+        let dir = tempfile::tempdir().unwrap();
+        let fifo_path = dir.path().join("a.fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status()
+            .expect("mkfifo must be available to run this test");
+        assert!(status.success(), "mkfifo failed to create the test fixture");
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            Write.run(json!({ "path": fifo_path.to_str().unwrap(), "content": "x" })),
+        )
+        .await
+        .expect("write must reject a FIFO immediately, not hang");
+        let err = result.expect_err("a FIFO must be rejected, not written to");
+        assert!(matches!(err, ToolError::Execution(_)), "got: {err:?}");
     }
 
     #[tokio::test]

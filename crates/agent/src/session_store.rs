@@ -834,7 +834,7 @@ impl SessionStore {
             if line.is_empty() {
                 continue;
             }
-            match serde_json::from_str::<Entry>(line) {
+            match parse_entry_lenient(&path, line) {
                 Ok(Entry::Session(m)) => meta = Some(m),
                 Ok(Entry::Message {
                     id,
@@ -1268,7 +1268,38 @@ impl SessionStore {
     /// summarize, split, or otherwise transform content) — written *after* the preserved nodes, so "the
     /// last message in the file" still resolves to the active tip with no `Leaf` marker needed, exactly
     /// like a plain flat file. See the module doc comment's compaction-vs-branching section.
+    ///
+    /// Every existing caller — `fork`/`fork_from_path`/`fork_at_entry` (all rewriting a store they just
+    /// got back from [`SessionRepo::create`], so every id-keyed side index below starts empty anyway) and
+    /// `rewrite_compacted`'s degenerate same-length fallback (rewriting *this* store in place, where
+    /// `labels`/`model_changes`/`level_changes`/`title_changes`/`branch_summary_details`/`compactions`/
+    /// `events` must legitimately survive since it's still the same session) — wants exactly this
+    /// narrower reset. See [`Self::reset_for_new_session`] for the one caller that genuinely wants a
+    /// blank slate.
     pub fn rewrite(&mut self, messages: &[Message]) -> std::io::Result<()> {
+        self.rewrite_impl(messages, false)
+    }
+
+    /// Like [`rewrite`](Self::rewrite), but for single-file mode's `/new`-equivalent reset (pi-parity
+    /// fix, pass 20): starting a genuinely brand-new session while reusing the same on-disk file/id,
+    /// rather than repo mode's `SessionRepo::create` (which mints a fresh, already-empty
+    /// [`SessionStore`]). A plain `rewrite(&[])` on an already-populated store clears the message tree
+    /// but leaves every id-keyed side index untouched — `labels`, `model_changes`, `level_changes`,
+    /// `title_changes`, `branch_summary_details`, the `Entry::Compaction` record map, and the flat
+    /// `events` log all keep whatever the *discarded* session left in them. Two concretely observable
+    /// leaks that fixed: (1) a stale `model_changes`/`level_changes` entry anchored at the tree root
+    /// (`None`) makes `model_at_root()`/`thinking_level_at_root()` report the old session's model/level
+    /// as if it were the new session's own change — reachable from a `switch_branch{before: true}` that
+    /// resolves to root — silently misrouting every subsequent turn to the wrong provider; (2) `events`
+    /// feeds `export_events`/`export_html` directly, so exporting the "new" session kept showing the old
+    /// session's `ModelChange`/`ThinkingLevelChange`/`Label`/`Custom` log. This clears all of that, so the
+    /// store afterward is indistinguishable — other than its file path/id — from one just returned by
+    /// [`SessionRepo::create`].
+    pub fn reset_for_new_session(&mut self) -> std::io::Result<()> {
+        self.rewrite_impl(&[], true)
+    }
+
+    fn rewrite_impl(&mut self, messages: &[Message], full_reset: bool) -> std::io::Result<()> {
         // Compaction provenance: a rewrite that ends with *fewer* messages than were on disk dropped a
         // prefix (the compaction case), so record it in the header before writing. A same-length rewrite
         // (e.g. `set_title`) or a fresh fork (`persisted == 0`) drops nothing and records nothing.
@@ -1376,6 +1407,15 @@ impl SessionStore {
         self.nodes.extend(new_nodes);
         self.active = new_active;
         self.persisted = messages.len();
+        if full_reset {
+            self.labels.clear();
+            self.model_changes.clear();
+            self.level_changes.clear();
+            self.title_changes.clear();
+            self.branch_summary_details.clear();
+            self.compactions.clear();
+            self.events.clear();
+        }
         Ok(())
     }
 
@@ -3435,7 +3475,7 @@ fn read_listing(path: &Path) -> Option<SessionMeta> {
         if line.is_empty() {
             continue;
         }
-        match serde_json::from_str::<Entry>(line) {
+        match parse_entry_lenient(path, line) {
             Ok(Entry::Message {
                 message, timestamp, ..
             }) => {
@@ -3588,6 +3628,49 @@ fn mtime_secs(path: &Path) -> u64 {
 /// fsync a path's parent directory so a just-created or just-renamed entry in it is itself durable
 /// (a file `sync_all` persists contents, not the dentry that names them). A best-effort no-op if the
 /// path has no parent.
+/// Parse one session-file line into an [`Entry`], recovering from one specific, narrow corruption
+/// instead of dropping the whole line the way the caller's generic `Err` handling otherwise would
+/// (pi-parity fix, pass 20): a hand-edited or externally corrupted `message` line with its `content`
+/// field set to `null` (or removed outright). `agent_core::Message::content` is a plain
+/// `Vec<ContentBlock>` with no `#[serde(default)]` — deliberately, since a *live*, in-process write
+/// should never omit it — so neither shape deserializes as a valid `Message`, and ordinary recovery
+/// would discard the entry's `role`/`id`/`parent_id`/tree position along with it, potentially orphaning
+/// whatever later message chained its own `parent_id` off this one's `id`. pi's own recovery for the
+/// same corruption keeps the entry and simply treats it as having empty content instead of dropping it.
+///
+/// This only ever retries that one specific shape — `"type":"message"` with `content` absent or
+/// `null` — by re-parsing the line as a bare [`Value`](serde_json::Value), patching in an empty
+/// `content` array, and re-attempting the real typed deserialize. A `content` field that's present but
+/// some *other* invalid shape (a string, a number), a missing `role`, an unknown future `type`, or
+/// genuinely unparseable JSON all fall straight through to the original error — this is a targeted
+/// repair for one known corruption, not a generally permissive parse.
+fn parse_entry_lenient(path: &Path, line: &str) -> Result<Entry, serde_json::Error> {
+    let original_err = match serde_json::from_str::<Entry>(line) {
+        Ok(entry) => return Ok(entry),
+        Err(e) => e,
+    };
+    (|| -> Option<Entry> {
+        let mut value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+        let obj = value.as_object_mut()?;
+        if obj.get("type").and_then(serde_json::Value::as_str) != Some("message") {
+            return None;
+        }
+        match obj.get("content") {
+            None | Some(serde_json::Value::Null) => {}
+            Some(_) => return None,
+        }
+        obj.insert("content".to_string(), serde_json::Value::Array(Vec::new()));
+        serde_json::from_value::<Entry>(value).ok()
+    })()
+    .inspect(|_| {
+        tracing::warn!(
+            path = %path.display(),
+            "recovered session entry line with null/missing content by treating it as empty"
+        );
+    })
+    .ok_or(original_err)
+}
+
 /// Ceiling on one session-file line (one JSON entry) while loading. A legitimate entry — even one
 /// carrying a large embedded payload (a big base64 image in a message) — stays orders of magnitude
 /// under this; it exists to bound how much a corrupted or hand-edited file (a stray length delimiter,
@@ -4245,6 +4328,91 @@ mod tests {
     }
 
     #[test]
+    fn open_recovers_a_message_line_hand_edited_to_have_null_content_instead_of_dropping_it() {
+        // Pass 20 (pi-parity fix): `Message::content` (`Vec<ContentBlock>`) has no `#[serde(default)]`
+        // — deliberately, a live in-process write should never omit it — so a line hand-edited (or
+        // externally corrupted) down to `"content":null` used to fail `Entry` deserialization entirely
+        // and fall into the same generic "skip this whole line" recovery as genuine garbage, silently
+        // losing the message's role/id/tree position along with its content. `parse_entry_lenient`
+        // recovers this one specific shape by treating the content as empty instead, matching pi's own
+        // equivalent fix, rather than dropping the entry outright.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo
+            .create(SessionMeta::new("/work", "claude-test"))
+            .unwrap();
+        let id = store.meta().id.clone();
+        let mut session = Session::new();
+        session.user("first");
+        store.append_new(&session.messages).unwrap();
+        let first_id = store.active_ids().last().unwrap().clone();
+
+        // A hand-edited message line: well-formed JSON, a real `"type":"message"` entry, but its
+        // `content` was blanked out to `null` (as if someone had redacted it in a text editor) — chained
+        // off "first" so replay's tip lands on it as the new last message.
+        let path = repo.find_path(&id).unwrap().unwrap();
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"message","id":"hand-edited","parent_id":"{first_id}","timestamp":0,"role":"user","content":null}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let (_store, restored) = repo.open_id(&id).unwrap();
+        assert_eq!(
+            restored.messages.len(),
+            2,
+            "the hand-edited line must be recovered as a message, not dropped entirely: {:?}",
+            restored.messages
+        );
+        let recovered = &restored.messages[1];
+        assert_eq!(recovered.role, Role::User, "role must survive the recovery");
+        assert!(
+            recovered.content.is_empty(),
+            "content must recover as empty, not cause the whole entry to be lost: {:?}",
+            recovered.content
+        );
+    }
+
+    #[test]
+    fn open_still_drops_a_message_line_whose_content_is_some_other_invalid_shape() {
+        // The recovery `open_recovers_a_message_line_hand_edited_to_have_null_content_instead_of_dropping_it`
+        // proves is narrowly scoped to `content` being absent or `null` specifically — a `content` field
+        // that's present but some *other* invalid shape (here, a bare string instead of an array of
+        // content blocks) is a different, genuine corruption, not this one known-recoverable case, and
+        // must still fall through to the ordinary skip-this-line recovery.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo
+            .create(SessionMeta::new("/work", "claude-test"))
+            .unwrap();
+        let id = store.meta().id.clone();
+        let mut session = Session::new();
+        session.user("first");
+        store.append_new(&session.messages).unwrap();
+        let first_id = store.active_ids().last().unwrap().clone();
+
+        let path = repo.find_path(&id).unwrap().unwrap();
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"message","id":"bad-content-shape","parent_id":"{first_id}","timestamp":0,"role":"user","content":"not an array"}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let (_store, restored) = repo.open_id(&id).unwrap();
+        assert_eq!(
+            restored.messages.len(),
+            1,
+            "a content field that's present but the wrong shape (not null/missing) must still be \
+             dropped as genuinely unparseable, not recovered: {:?}",
+            restored.messages
+        );
+    }
+
+    #[test]
     fn read_listing_survives_an_oversized_invalid_utf8_and_corrupt_line_all_mid_file() {
         // pi-parity gap (fixed, L4): `read_listing` shares `SessionStore::open`'s exact skip-and-
         // continue recovery logic (same `read_capped_line` primitive, same three corruption cases),
@@ -4337,6 +4505,95 @@ mod tests {
         assert!(
             !tmp.exists(),
             "the orphaned temp file must be removed after a failed rewrite: {err}"
+        );
+    }
+
+    #[test]
+    fn reset_for_new_session_clears_model_thinking_label_and_event_state_a_plain_rewrite_leaves_behind()
+    {
+        // Pass 20 (pi-parity fix): single-file mode's `/new`-equivalent (`Persistence::new_session`,
+        // `serve.rs`) resets an *already-populated* `SessionStore` in place (there's no fresh store to
+        // swap in the way repo mode's `SessionRepo::create` gives it) — it used to call plain
+        // `rewrite(&[])`, which only ever clears the message tree itself, never the id-keyed side
+        // indexes this test drives into every one of. `reset_for_new_session` must clear all of them.
+        let dir = tmpdir();
+        let path = dir.path().join("s.jsonl");
+        let mut store = SessionStore::create(path, SessionMeta::new("/work", "model-a")).unwrap();
+
+        // A model/thinking-level change recorded before any message exists anchors at the tree root
+        // (`self.active.last()` is `None`) — exactly the `switch_branch{before: true}`-reachable case
+        // the audit named.
+        store.record_model_change("model-b").unwrap();
+        store.record_thinking_level_change("high").unwrap();
+
+        let mut session = Session::new();
+        session.user("hello");
+        store.append_new(&session.messages).unwrap();
+        let msg_id = store.active_ids().last().unwrap().clone();
+        store.set_label(&msg_id, Some("bookmark")).unwrap();
+        store.append_custom("note", serde_json::json!({"k": "v"})).unwrap();
+
+        // Sanity check: every one of these is actually populated before the reset, or the assertions
+        // below would pass vacuously.
+        assert_eq!(store.model_at_root(), Some("model-b"));
+        assert_eq!(store.thinking_level_at_root(), Some("high"));
+        assert_eq!(store.get_label(&msg_id), Some("bookmark"));
+        assert!(!store.export_events().is_empty());
+
+        store.reset_for_new_session().unwrap();
+
+        assert_eq!(
+            store.model_at_root(),
+            None,
+            "a stale model_changes entry at root must not leak into the reset session"
+        );
+        assert_eq!(
+            store.thinking_level_at_root(),
+            None,
+            "a stale level_changes entry at root must not leak into the reset session"
+        );
+        assert_eq!(
+            store.get_label(&msg_id),
+            None,
+            "a label on a message from the discarded session must not survive the reset"
+        );
+        assert!(
+            store.export_events().is_empty(),
+            "export_events must not replay the discarded session's ModelChange/ThinkingLevelChange/\
+             Label/Custom history: {:?}",
+            store.export_events()
+        );
+    }
+
+    #[test]
+    fn reset_for_new_session_does_not_affect_a_narrow_rewrites_side_indexes() {
+        // The flip side of the test just above: `rewrite` itself (used by `fork`/`fork_at_entry`/
+        // `fork_from_path`'s already-fresh stores, and `rewrite_compacted`'s degenerate same-length
+        // fallback on *this* store) must keep its narrower, unchanged behavior — this pass's fix must
+        // not leak into every other `rewrite` caller.
+        let dir = tmpdir();
+        let path = dir.path().join("s.jsonl");
+        let mut store = SessionStore::create(path, SessionMeta::new("/work", "model-a")).unwrap();
+        store.record_model_change("model-b").unwrap();
+
+        let mut session = Session::new();
+        session.user("hello");
+        store.append_new(&session.messages).unwrap();
+        let msg_id = store.active_ids().last().unwrap().clone();
+        store.set_label(&msg_id, Some("bookmark")).unwrap();
+
+        // A same-length rewrite (mirrors `rewrite_compacted`'s degenerate fallback) on the same store.
+        store.rewrite(&session.messages).unwrap();
+
+        assert_eq!(
+            store.model_at_root(),
+            Some("model-b"),
+            "a plain `rewrite` must not clear model_changes — only `reset_for_new_session` does"
+        );
+        assert_eq!(
+            store.get_label(&msg_id),
+            Some("bookmark"),
+            "a plain `rewrite` must not clear labels — only `reset_for_new_session` does"
         );
     }
 

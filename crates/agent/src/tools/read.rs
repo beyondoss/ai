@@ -132,47 +132,6 @@ fn resolve_read_path(path: &str) -> String {
     path.to_string()
 }
 
-/// Reject any resolved path that isn't a regular file or a directory, *before* this tool ever opens it
-/// for image-sniffing or content — unlike `grep`'s walk, which already filters candidates to
-/// `entry.file_type().is_some_and(|t| t.is_file())` before opening any of them, `read` had no equivalent
-/// gate: [`sniff_image_format`] and the streaming text path both call straight through to `File::open`/
-/// `read` on whatever path resolution handed them.
-///
-/// That gap is a real hang, not just a theoretical one: opening a FIFO for reading blocks until a
-/// writer shows up on the other end (a bare `mkfifo` with no writer wedges the very first
-/// `sniff_image_format` open forever), and a character device like `/dev/zero` opens and reads
-/// immediately but never signals EOF or contains a newline byte — this tool's line-scanning loop would
-/// spin forever waiting for either. Neither has a timeout or kill-on-drop the way `bash`'s child
-/// processes do, so either one wedges the whole tool call — and, since dispatch awaits each call in
-/// turn, the entire turn — forever.
-///
-/// There's no legitimate use for reading a FIFO/socket/device through this tool (a named pipe's "read"
-/// isn't a stable, replayable value the way a regular file's bytes are, and images are never any of
-/// these), so this simply refuses all of them with one clear error rather than trying to special-case
-/// any as safe. A directory is let through unmolested — opening one for reading already fails cleanly a
-/// few lines later (an `EISDIR`-style OS error wrapped into a plain `ToolError::Execution` by the
-/// existing `File::open` calls), so it needs no separate gate here.
-///
-/// Uses `std::fs::metadata` (follows symlinks, like the `File::open` calls further down this module
-/// already do) rather than `symlink_metadata`, so a symlink pointing *at* a FIFO/device is caught too,
-/// not just a bare one. A path whose metadata can't be read at all (most commonly: doesn't exist) is
-/// let through here — that already has its own clear "missing file" error at the real `File::open`
-/// call below, and duplicating it here under a different wording would just be a second, inconsistent
-/// failure mode for the same cause.
-fn reject_non_regular_file(path: &str) -> Result<(), ToolError> {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return Ok(());
-    };
-    let file_type = meta.file_type();
-    if file_type.is_file() || file_type.is_dir() {
-        return Ok(());
-    }
-    Err(ToolError::Execution(format!(
-        "{path} is not a regular file (it's a FIFO, socket, or device); `read` can only read regular \
-         files"
-    )))
-}
-
 /// Read one line into `buf` (without the trailing newline), keeping at most `cap` bytes; bytes beyond
 /// `cap` are consumed from the stream but discarded, so a single huge line can't balloon memory.
 /// Returns `(bytes_consumed, truncated)`; `bytes_consumed == 0` means EOF.
@@ -258,7 +217,7 @@ impl Tool for Read {
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing `path`".into()))?;
         let path = resolve_read_path(&super::normalize_path(path));
-        reject_non_regular_file(&path)?;
+        super::reject_non_regular_file(&path, "read")?;
 
         // Whether the active model can accept image input at all. `agent_core::tool::Tool::run` takes
         // only a bare `Value` — unlike pi's `execute(..., ctx)`, there's no separate model-capability

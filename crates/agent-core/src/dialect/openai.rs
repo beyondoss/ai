@@ -905,8 +905,11 @@ impl Decoder {
 /// chunk). `#[serde(deny_unknown_fields)]` on every level here is load-bearing, not decoration: it's
 /// what makes this struct fail closed — reject the payload and fall back to `push`'s full handling —
 /// the instant a chunk carries *anything* this fast lane doesn't explicitly enumerate (a `role` key on
-/// the stream's opening chunk, a reasoning field, `tool_calls`, `finish_reason`), rather than silently
-/// discarding a field this fast lane doesn't know how to honor.
+/// the stream's opening chunk, a reasoning field, `tool_calls`, a genuine non-null `finish_reason`),
+/// rather than silently discarding a field this fast lane doesn't know how to honor. `finish_reason`
+/// itself is declared, not denied, for the same reason as `usage` below: real providers send
+/// `"finish_reason":null` on every non-terminal chunk, so denying it outright would defeat this fast
+/// lane on all of real traffic instead of just the terminal chunk.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FastTextChunk {
@@ -929,6 +932,13 @@ struct FastTextChoice {
     #[serde(default, rename = "index")]
     _index: Option<u64>,
     delta: FastTextDelta,
+    /// Declared (not denied) rather than omitted: real OpenAI (and every OpenAI-compatible provider)
+    /// sends `"finish_reason":null` on *every* non-terminal streamed chunk, not just the last one —
+    /// denying it outright would silently disable this fast lane for all of real traffic, not just the
+    /// terminal chunk. Same pattern as `FastTextChunk::usage` above: capture it so `try_fast_path` can
+    /// fall back only when it's genuinely non-null (a real finish reason `push`'s full handling needs).
+    #[serde(default)]
+    finish_reason: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -948,6 +958,11 @@ impl StreamDecoder for Decoder {
         // (`choices.get(0)`) — zero choices is the trailing usage-only chunk (handled above/by the
         // slow path), more than one is outside what this harness ever requests.
         let [choice] = <[FastTextChoice; 1]>::try_from(parsed.choices).ok()?;
+        // A genuine (non-null) finish reason is the terminal chunk — stop-reason mapping, tool-call
+        // closing, and the truncated-stream check all live in `push`'s full handling, not here.
+        if choice.finish_reason.as_ref().is_some_and(|f| !f.is_null()) {
+            return None;
+        }
         // A reasoning block is still open — only `push`'s `close_text_or_thinking` transition handles
         // that correctly; this fast lane only ever matches the steady-state (no reasoning / already
         // in a text block) case.
@@ -1539,8 +1554,15 @@ mod tests {
         use crate::transport::ReasoningEffort;
         // Together: a nested `reasoning: {"enabled": bool}` sent unconditionally, regardless of
         // whether a level is requested.
+        //
+        // pi-parity pass 20 Task 1: "qwen/qwen3.6-plus" (this test's id previously) turned out to be
+        // OpenRouter's own identical vendor-slug spelling too, with a real, much smaller max_output that
+        // now wins the collision (`models.rs`'s `capabilities_impl`, OpenRouter-specific Qwen overrides)
+        // — it now resolves to `OpenAiReasoningFormat::OpenRouter`, not `Together`, so it no longer
+        // exercises this shape. "qwen/qwen3.5-9b" is a genuinely Together-only id (no such collision)
+        // that still does.
         let idle = build_body(&ModelRequest::new(
-            "qwen/qwen3.6-plus",
+            "qwen/qwen3.5-9b",
             vec![Message::user("hi")],
             64,
         ));
@@ -1548,7 +1570,7 @@ mod tests {
         assert!(idle.get("reasoning_effort").is_none());
 
         let active = build_body(
-            &ModelRequest::new("qwen/qwen3.6-plus", vec![Message::user("hi")], 64)
+            &ModelRequest::new("qwen/qwen3.5-9b", vec![Message::user("hi")], 64)
                 .with_reasoning_effort(ReasoningEffort::Medium),
         );
         assert_eq!(active["reasoning"], json!({ "enabled": true }));
@@ -3361,6 +3383,31 @@ data: [DONE]
         assert_eq!(
             dec.try_fast_path(
                 r#"{"choices":[{"index":0,"delta":{"content":"hi"}}],"usage":{"prompt_tokens":1}}"#
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn fast_path_handles_a_per_chunk_null_finish_reason_but_not_a_real_one() {
+        // The regression this guards: real OpenAI (and every OpenAI-compatible provider) sends
+        // `"finish_reason":null` on *every* non-terminal chunk, not just the terminal one — see the
+        // `data:` fixtures used throughout this file's own tests. Before `FastTextChoice` declared this
+        // field, `deny_unknown_fields` rejected every single one of those chunks, so the fast lane never
+        // actually fired on real traffic and every chunk paid for a wasted, failing strict deserialize
+        // on top of the full `Value` parse it fell back to.
+        let mut dec = Decoder::default();
+        assert!(
+            dec.try_fast_path(
+                r#"{"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}"#
+            )
+            .is_some()
+        );
+        // A genuine (non-null) finish reason is the terminal chunk — decline so `push`'s full
+        // stop-reason mapping and tool-closing logic runs instead.
+        assert_eq!(
+            dec.try_fast_path(
+                r#"{"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}"#
             ),
             None
         );

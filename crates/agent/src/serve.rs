@@ -173,6 +173,13 @@
 //!     recovers, `success:false` (with `final_error`) when retries are exhausted, the failure turns out
 //!     non-retryable, or the pending backoff itself is interrupted via `abort`/`abort_retry`
 //!     (`final_error:"retry cancelled"`) — mirroring pi's own `auto_retry_end` event.
+//!   - `{type:"set_block_images", enabled}` toggle forcing every image down the vision-downgrade path
+//!     regardless of the active model's real `supports_vision` capability (pass 20, pi-parity fix: same
+//!     mutate-persist-rebuild shape as `set_auto_compaction` above — previously only settable at process
+//!     startup via `--block-images`/a persisted `agent settings --block-images` default, with no live
+//!     toggle for an already-running `serve`).
+//!   - `{type:"set_image_auto_resize", enabled}` toggle `read`'s resize/downscale path for an oversized
+//!     image (pass 20, pi-parity fix: same shape as `set_block_images` just above).
 //!   - `{type:"set_steering_mode", mode}`/`{type:"set_follow_up_mode", mode}` toggle how much of the
 //!     steer lane (mid-run drain) / follow-up lane (stop-boundary drain, including any stranded steer
 //!     messages swept in there) a single drain point consumes (`agent_core::QueueMode`) —
@@ -962,7 +969,7 @@ impl Persistence {
                 }
             }
         } else if let Some(store) = &mut self.store {
-            if let Err(e) = store.rewrite(&[]) {
+            if let Err(e) = store.reset_for_new_session() {
                 eprintln!("serve: failed to reset session: {e}");
                 return Err(e);
             }
@@ -1756,7 +1763,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
     // (a restricted `--tools`/`--exclude-tools` invocation) just adds dead weight (pi-parity fix).
     // Tools are fixed for the whole process (see `build_agent`'s doc comment), so this one check is
     // reused verbatim by `reload`'s own rebuild below rather than re-deriving it.
-    let has_read = build_tools(&cfg).get("read").is_some();
+    let has_read = build_tools(&cfg, cfg.image_auto_resize).get("read").is_some();
     let mut static_system =
         crate::resources::build_static_system_prompt(&crate::resources::PromptOptions {
             base: None,
@@ -1882,6 +1889,15 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
     // `set_auto_retry` lets an operator debugging a flaky network hop disable it to see the raw failure
     // on the very first hiccup instead of after several silent retries.
     let mut current_auto_retry = true;
+    // Pi-parity fix (pass 20): `cfg.block_images`/`cfg.image_auto_resize` are already fully resolved by
+    // `main.rs` (explicit flag, then a persisted `agent settings --block-images`/`--image-auto-resize`
+    // default), but — unlike `current_auto_compaction`/`current_auto_retry` just above — `build_agent`
+    // used to read them straight back off `cfg` on every rebuild instead of a runtime-mutable local,
+    // so there was no `set_block_images`/`set_image_auto_resize` RPC arm that could ever change them for
+    // a live process. These start at whatever `cfg` already resolved, and from here on are the sole
+    // source `build_agent` consults for both.
+    let mut current_block_images = cfg.block_images;
+    let mut current_image_auto_resize = cfg.image_auto_resize;
     // Shared across every `build_agent` rebuild for this process's lifetime, so file-mutation
     // exclusivity (same-path `edit`/`write` calls) survives a `set_model`/`set_thinking` rebuild.
     let write_locks = Arc::new(agent_core::WriteLockRegistry::new());
@@ -1915,6 +1931,8 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
         current_level,
         current_auto_compaction,
         current_auto_retry,
+        current_block_images,
+        current_image_auto_resize,
         persistence.session_id(),
         &write_locks,
         &checkpoint,
@@ -1939,7 +1957,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
     // command below reports as a clean error rather than a side door around that restriction. A direct
     // `Arc<dyn Tool>` handle, not routed through `agent`/the model loop: the host `bash` RPC command runs
     // independent of any conversation turn.
-    let bash_tool = build_tools(&cfg).get("bash");
+    let bash_tool = build_tools(&cfg, cfg.image_auto_resize).get("bash");
     // The same deny-list `build_agent` installs as an `AgentHooks` gate on the model's own tool calls —
     // built once here rather than inline in the `bash` RPC arm below, since `--deny-tool`/
     // `--deny-bash-pattern`/`--deny-path` are fixed for the whole process (`build_agent`'s doc comment).
@@ -2099,6 +2117,8 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                                 current_level,
                                 current_auto_compaction,
                                 current_auto_retry,
+                                current_block_images,
+                                current_image_auto_resize,
                                 persistence.session_id(),
                                 &write_locks,
                                 &checkpoint,
@@ -2212,6 +2232,8 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                             current_level,
                             current_auto_compaction,
                             current_auto_retry,
+                            current_block_images,
+                            current_image_auto_resize,
                             persistence.session_id(),
                             &write_locks,
                             &checkpoint,
@@ -2276,6 +2298,8 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                             current_level,
                             current_auto_compaction,
                             current_auto_retry,
+                            current_block_images,
+                            current_image_auto_resize,
                             persistence.session_id(),
                             &write_locks,
                             &checkpoint,
@@ -2820,7 +2844,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                                                     m.insert("git_branch".into(), json!(git_branch(&cwd).await));
                                                     m.insert("is_streaming".into(), json!(true));
                                                     m.insert("is_compacting".into(), json!(is_compacting.load(Ordering::Relaxed)));
-                                                    if let Value::Object(rt) = runtime_settings(current_level, current_auto_compaction, current_auto_retry, &steering) {
+                                                    if let Value::Object(rt) = runtime_settings(current_level, current_auto_compaction, current_auto_retry, current_block_images, current_image_auto_resize, &steering) {
                                                         m.extend(rt);
                                                     }
                                                 }
@@ -3263,6 +3287,8 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                         current_level,
                         current_auto_compaction,
                         current_auto_retry,
+                        current_block_images,
+                        current_image_auto_resize,
                         &steering,
                     ) {
                         m.extend(rt);
@@ -3541,7 +3567,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                 // variable around), plus `session`'s own running token totals — previously omitted
                 // entirely via the plainer `export_html_with_entries`.
                 let system_prompt = full_system(&static_system, &cwd);
-                let tool_defs = build_tools(&cfg).definitions();
+                let tool_defs = build_tools(&cfg, cfg.image_auto_resize).definitions();
                 let usage = crate::export::UsageTotals {
                     input_tokens: session.input_tokens,
                     output_tokens: session.output_tokens,
@@ -3925,6 +3951,8 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                                         current_level,
                                         current_auto_compaction,
                                         current_auto_retry,
+                                        current_block_images,
+                                        current_image_auto_resize,
                                         persistence.session_id(),
                                         &write_locks,
                                         &checkpoint,
@@ -3970,6 +3998,8 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                             current_level,
                             current_auto_compaction,
                             current_auto_retry,
+                            current_block_images,
+                            current_image_auto_resize,
                             persistence.session_id(),
                             &write_locks,
                             &checkpoint,
@@ -3993,6 +4023,8 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                             current_level,
                             current_auto_compaction,
                             current_auto_retry,
+                            current_block_images,
+                            current_image_auto_resize,
                             persistence.session_id(),
                             &write_locks,
                             &checkpoint,
@@ -4054,6 +4086,8 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                                     current_level,
                                     current_auto_compaction,
                                     current_auto_retry,
+                                    current_block_images,
+                                    current_image_auto_resize,
                                     persistence.session_id(),
                                     &write_locks,
                                     &checkpoint,
@@ -4153,6 +4187,8 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                                     current_level,
                                     current_auto_compaction,
                                     current_auto_retry,
+                                    current_block_images,
+                                    current_image_auto_resize,
                                     persistence.session_id(),
                                     &write_locks,
                                     &checkpoint,
@@ -4203,6 +4239,8 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                             current_level,
                             current_auto_compaction,
                             current_auto_retry,
+                            current_block_images,
+                            current_image_auto_resize,
                             persistence.session_id(),
                             &write_locks,
                             &checkpoint,
@@ -4254,6 +4292,8 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                         current_level,
                         current_auto_compaction,
                         current_auto_retry,
+                        current_block_images,
+                        current_image_auto_resize,
                         persistence.session_id(),
                         &write_locks,
                         &checkpoint,
@@ -4286,6 +4326,8 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                         current_level,
                         current_auto_compaction,
                         current_auto_retry,
+                        current_block_images,
+                        current_image_auto_resize,
                         persistence.session_id(),
                         &write_locks,
                         &checkpoint,
@@ -4301,6 +4343,89 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                 None => emit!(response(
                     id,
                     "set_auto_retry",
+                    false,
+                    None,
+                    Some("missing boolean `enabled`")
+                )),
+            },
+            // Pass 20 (pi-parity fix): `build_agent` already threaded `cfg.block_images` into
+            // `Agent::with_block_images` (Task #34) and `cfg.image_auto_resize` into `build_tools`'s
+            // registry (Task #34), but neither had a live RPC toggle the way `auto_compaction`/
+            // `auto_retry` just above do — an operator could only change either by restarting `serve`
+            // with a different `--block-images`/`--no-image-auto-resize` flag or persisted `agent
+            // settings` default. Mirrors `set_auto_compaction`'s exact shape: mutate the runtime-mutable
+            // local, persist best-effort (survives a restart, same as `set_auto_compaction`), rebuild
+            // `agent` so the very next turn actually sees it, then ack over RPC.
+            "set_block_images" => match cmd.get("enabled").and_then(Value::as_bool) {
+                Some(enabled) => {
+                    current_block_images = enabled;
+                    if let Err(e) = settings_store.set_block_images(Some(enabled)) {
+                        eprintln!("serve: failed to persist block-images setting: {e}");
+                    }
+                    agent = build_agent(
+                        client.clone(),
+                        &full_system(&static_system, &cwd),
+                        &cfg,
+                        &current_model,
+                        current_thinking,
+                        current_level,
+                        current_auto_compaction,
+                        current_auto_retry,
+                        current_block_images,
+                        current_image_auto_resize,
+                        persistence.session_id(),
+                        &write_locks,
+                        &checkpoint,
+                    );
+                    emit!(response(
+                        id,
+                        "set_block_images",
+                        true,
+                        Some(json!({ "block_images": current_block_images })),
+                        None,
+                    ));
+                }
+                None => emit!(response(
+                    id,
+                    "set_block_images",
+                    false,
+                    None,
+                    Some("missing boolean `enabled`")
+                )),
+            },
+            // Same shape as `set_block_images` just above, for `image_auto_resize`.
+            "set_image_auto_resize" => match cmd.get("enabled").and_then(Value::as_bool) {
+                Some(enabled) => {
+                    current_image_auto_resize = enabled;
+                    if let Err(e) = settings_store.set_image_auto_resize(Some(enabled)) {
+                        eprintln!("serve: failed to persist image-auto-resize setting: {e}");
+                    }
+                    agent = build_agent(
+                        client.clone(),
+                        &full_system(&static_system, &cwd),
+                        &cfg,
+                        &current_model,
+                        current_thinking,
+                        current_level,
+                        current_auto_compaction,
+                        current_auto_retry,
+                        current_block_images,
+                        current_image_auto_resize,
+                        persistence.session_id(),
+                        &write_locks,
+                        &checkpoint,
+                    );
+                    emit!(response(
+                        id,
+                        "set_image_auto_resize",
+                        true,
+                        Some(json!({ "image_auto_resize": current_image_auto_resize })),
+                        None,
+                    ));
+                }
+                None => emit!(response(
+                    id,
+                    "set_image_auto_resize",
                     false,
                     None,
                     Some("missing boolean `enabled`")
@@ -4570,6 +4695,8 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                                     current_level,
                                     current_auto_compaction,
                                     current_auto_retry,
+                                    current_block_images,
+                                    current_image_auto_resize,
                                     persistence.session_id(),
                                     &write_locks,
                                     &checkpoint,
@@ -5191,7 +5318,7 @@ fn build_gateway_client(cfg: &ServeConfig, model: &str) -> Result<GatewayClient,
 /// left unset, each switch picks up the *new* model's real window instead of a stale operator number.
 /// `reserve_tokens`/`keep_recent_tokens` default to `CompactionConfig::default()`, overridable
 /// independently of `context_window`.
-// 9 arguments, all independent inputs every call site already has on hand from `cfg`/local
+// 11 arguments, all independent inputs every call site already has on hand from `cfg`/local
 // runtime-switchable state — bundling them into a struct would just be a second place those same
 // fields live, not a reduction in what the function needs to know (see `client.rs::send_with_retry`
 // for the same tradeoff). Private, single-purpose helper, not a public API shape.
@@ -5205,6 +5332,13 @@ fn build_agent(
     level: agent_core::ThinkingLevel,
     auto_compaction: bool,
     auto_retry: bool,
+    // Pi-parity fix (pass 20): live counterparts of `cfg.block_images`/`cfg.image_auto_resize` — see
+    // `current_block_images`/`current_image_auto_resize`'s own doc comment in `serve` for why these are
+    // now explicit, runtime-switchable parameters (mirroring `auto_compaction`/`auto_retry` just above)
+    // instead of this function reading `cfg.block_images`/`cfg.image_auto_resize` straight off the
+    // static startup config on every rebuild.
+    block_images: bool,
+    image_auto_resize: bool,
     cache_key: &str,
     write_locks: &Arc<agent_core::WriteLockRegistry>,
     checkpoint: &Arc<dyn agent_core::CheckpointHook>,
@@ -5224,7 +5358,7 @@ fn build_agent(
     }
 
     let mut agent = Agent::new(transport, model.to_string())
-        .with_tools(build_tools(cfg))
+        .with_tools(build_tools(cfg, image_auto_resize))
         .with_system(system.to_string())
         .with_max_steps(cfg.max_steps)
         .with_compaction(compaction)
@@ -5270,8 +5404,9 @@ fn build_agent(
     // Task #34 (pi-parity fix): forces every image down the vision-downgrade path regardless of the
     // active model's real `supports_vision` capability — `run`'s identical `--block-images` handling
     // (`main.rs::run_task`'s own `with_block_images` call site), previously never threaded through here
-    // at all.
-    if cfg.block_images {
+    // at all. Pass 20 (pi-parity fix): reads the live `block_images` parameter (settable at runtime via
+    // `set_block_images`), not `cfg.block_images` — see this function's own doc comment.
+    if block_images {
         agent = agent.with_block_images(true);
     }
     let policy = crate::policy::ToolPolicy::from_lists(
@@ -5361,7 +5496,14 @@ fn is_excluded_from_model_context(m: &agent_core::Message) -> bool {
 /// `build_agent` rebuild and by the host-level `bash` RPC command (see [`serve`]), so excluding `bash`
 /// from the model's own tool set also disables the host command rather than leaving a side door open
 /// around an operator's explicit restriction.
-fn build_tools(cfg: &ServeConfig) -> agent_core::ToolRegistry {
+///
+/// `image_auto_resize` is an explicit parameter, not read off `cfg` (pass 20, pi-parity fix): the only
+/// call site where its value is actually load-bearing is `build_agent`'s own live-rebuildable registry
+/// (see `set_image_auto_resize`), which passes the runtime-mutable `current_image_auto_resize` rather
+/// than `cfg`'s frozen startup value; the other call sites here only ever check tool
+/// presence/definitions, which don't depend on this flag either way, so they just pass
+/// `cfg.image_auto_resize` straight through.
+fn build_tools(cfg: &ServeConfig, image_auto_resize: bool) -> agent_core::ToolRegistry {
     // Task #34 (pi-parity fix): previously always called the plain `default_registry_with_prefix`,
     // hardcoding `image_auto_resize: true` regardless of `cfg.image_auto_resize` — `run`'s identical
     // `default_registry_with_prefix_and_image_auto_resize` call site (`main.rs::run_task`) is the one
@@ -5370,7 +5512,7 @@ fn build_tools(cfg: &ServeConfig) -> agent_core::ToolRegistry {
         cfg.bash_timeout_ms,
         cfg.bash_shell_path.as_deref(),
         cfg.bash_command_prefix.as_deref(),
-        cfg.image_auto_resize,
+        image_auto_resize,
     );
     tools::apply_filter(
         &mut registry,
@@ -5915,12 +6057,19 @@ fn runtime_settings(
     current_level: agent_core::ThinkingLevel,
     current_auto_compaction: bool,
     current_auto_retry: bool,
+    current_block_images: bool,
+    current_image_auto_resize: bool,
     steering: &agent_core::Steering,
 ) -> Value {
     json!({
         "thinking_level": current_level.as_str(),
         "auto_compaction": current_auto_compaction,
         "auto_retry": current_auto_retry,
+        // Pass 20 (pi-parity fix): reported here for the same reason `auto_compaction`/`auto_retry`
+        // are — both are now live-toggleable (`set_block_images`/`set_image_auto_resize`), so `get_state`
+        // needs to reflect whichever value is actually in effect, not just what `serve` started with.
+        "block_images": current_block_images,
+        "image_auto_resize": current_image_auto_resize,
         "steering_mode": match steering.steering_mode() {
             agent_core::QueueMode::OneAtATime => "one_at_a_time",
             agent_core::QueueMode::All => "all",

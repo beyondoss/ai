@@ -486,6 +486,11 @@ impl CopilotRoutedCredentialSource {
             dialect_override: None,
             deployment_name: None,
             query: None,
+            // GitHub Copilot is reached via its own dynamically-resolved proxy host, matched by a
+            // stored credential's `available_model_ids`, never a BYO `base_url` override — no
+            // aggregator host of its own to report (see `DirectRouting::aggregator_host`'s own doc
+            // comment).
+            aggregator_host: None,
         }
     }
 }

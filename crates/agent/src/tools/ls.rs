@@ -213,9 +213,19 @@ impl Tool for Ls {
         if !byte_capped && needs_marker {
             let mut notices = Vec::new();
             if count_truncated {
+                // pi-parity fix (pass 20): pi's own `ls.ts` truncation notice names a concrete next
+                // value to try ("${effectiveLimit} entries limit reached. Use limit=${effectiveLimit *
+                // 2} for more") — `grep.rs`/`find.rs` already picked this up (their own "match/result
+                // limit N reached; ... or use limit={2x} for more" wording) when it was first added,
+                // but it never reached `ls.rs`, whose notice gestured at "narrow with a subpath or use
+                // find/grep" with no number to raise. `saturating_mul`, not plain `*`: a model-supplied
+                // `limit` has no upper bound here, and this crate runs with `overflow-checks = true` in
+                // release — an adversarial/huge `limit` must degrade to `usize::MAX`, never panic.
                 notices.push(format!(
-                    "{} more entries; {total} total — narrow with a subpath or use `find`/`grep`",
-                    total - limit
+                    "{} more entries; {total} total — use limit={} for more, or narrow with a subpath \
+                     or use `find`/`grep`",
+                    total - limit,
+                    limit.saturating_mul(2)
                 ));
             }
             if hard_capped {
@@ -445,7 +455,17 @@ mod tests {
             out.contains("more entries"),
             "a small limit must truncate: {out}"
         );
-        assert!(out.contains("[7 more entries; 10 total"));
+        // pi-parity fix (pass 20): names a concrete next `limit` to try (`2x` the one just used),
+        // matching `grep`/`find`'s own "... or use limit={2x} for more" wording, while keeping the
+        // existing "narrow with a subpath or use find/grep" guidance alongside it rather than
+        // replacing it.
+        assert!(
+            out.contains(
+                "[7 more entries; 10 total — use limit=6 for more, or narrow with a subpath or use \
+                 `find`/`grep`]"
+            ),
+            "got: {out}"
+        );
         // Three entry lines plus the truncation note.
         assert_eq!(out.lines().count(), 4);
     }

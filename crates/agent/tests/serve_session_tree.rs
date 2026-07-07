@@ -1629,6 +1629,88 @@ fn serve_switch_branch_restores_the_model_active_on_that_branch() {
 }
 
 #[test]
+fn serve_new_session_in_single_file_mode_does_not_leak_the_discarded_sessions_model_change() {
+    // Pass 20 (pi-parity fix): single-file mode's `new_session` used to reset the *same*, already-
+    // populated `SessionStore` via a plain `rewrite(&[])` — which only ever clears the message tree
+    // itself, never `model_changes`/`level_changes`/`labels`/`title_changes`/`branch_summary_details`/
+    // the compaction-record map/`events`. Concretely: a `set_model` recorded *before any message ever
+    // existed* anchors at the tree's own root (`None`) — exactly what a `switch_branch{before: true}`
+    // landing on root reads via `model_at_root()`. Reproduced here as: (1) `set_model` before any
+    // prompt in the original session (anchors the change at root), (2) `new_session` (the single-file
+    // reset), (3) a prompt in the "new" session, (4) `switch_branch{before: true}` back to before that
+    // new session's very first message — which resolves to root and must NOT resurrect the discarded
+    // session's model change.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+
+    let (base, _bodies) = spawn_model_server(vec![turn_text("hello answer")]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    // Before any message exists in the (soon to be discarded) original session: `set_model` anchors its
+    // `ModelChange` at the tree's own root, not at some message id.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_model", "model": "claude-test-2" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "set_model");
+    assert_eq!(frames.last().unwrap()["success"], true, "got: {frames:#?}");
+
+    // Reset in place — single-file mode's `/new`-equivalent. Keeps the same file/id but must start the
+    // "new" session with none of the old one's model/label/event bookkeeping still attached.
+    writeln!(stdin, "{}", json!({ "type": "new_session" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "new_session");
+    assert_eq!(frames.last().unwrap()["success"], true, "got: {frames:#?}");
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hello" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "prompt");
+    assert_eq!(frames.last().unwrap()["success"], true, "got: {frames:#?}");
+
+    let ids = message_ids(&session_file);
+    assert_eq!(
+        ids.len(),
+        2,
+        "the reset session must start with only this turn's own 2 messages, none carried over: {ids:?}"
+    );
+
+    // The new session's very first message has no parent of its own — `before: true` resolves to the
+    // tree's own root, the exact case `model_at_root()` serves.
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "switch_branch", "target_id": ids[0], "before": true, "summarize": false })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "switch_branch");
+    let resp = frames.last().unwrap();
+    assert_eq!(resp["success"], true, "got: {resp:#?}");
+    assert_eq!(
+        resp["data"]["model"], "claude-test",
+        "switch_branch landing on the reset session's own root must not resurrect the discarded \
+         session's set_model (\"claude-test-2\") — the new session's root never recorded a model \
+         change of its own, so this must fall back to the session's real starting model: {resp:#?}"
+    );
+
+    // `get_state` (not just the switch_branch response) must reflect it too.
+    writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_state");
+    assert_eq!(frames.last().unwrap()["data"]["model"], "claude-test");
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
 fn serve_switch_branch_before_restores_the_model_at_the_resolved_parent_not_the_raw_target() {
     // Regression guard for the `before: true` model/thinking-level restoration bug this feature
     // could easily reintroduce: the restored model must be queried against the *resolved* target

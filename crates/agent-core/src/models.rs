@@ -393,17 +393,27 @@ fn github_copilot_claude_overrides(m: &str) -> Option<ModelCaps> {
 /// in NVIDIA's current catalogue (the caller falls through to every other family branch, and
 /// eventually the generic vendor-slug fallback, unchanged).
 ///
-/// Two of NVIDIA's own ids are deliberately *not* listed below, despite being in its real catalogue:
-/// `"moonshotai/kimi-k2.6"` and `"minimaxai/minimax-m3"` are id-for-id identical to ids Together/
-/// HuggingFace already serve under the same literal string (and this table already has
-/// established, tested coverage for via the Kimi/MiniMax `family_id` branches further below) — with
-/// genuinely different real numbers/reasoning-mechanism shape on NVIDIA specifically. Since this
-/// function is checked *first*, listing them here would silently steal those two ids away from the
-/// coverage already tested for the other, equally-real host — the same known "one id, more than one
-/// host" limitation already documented at this table's own section header, just newly reachable
-/// because NVIDIA happens to reuse an org-slug shape another aggregator also uses. Left to the
-/// Kimi/MiniMax branches instead; NVIDIA's own real numbers for these two ids remain unrepresented,
-/// same as any other cross-host collision this table can't disambiguate.
+/// One of NVIDIA's own ids is deliberately *not* listed below, despite being in its real catalogue:
+/// `"moonshotai/kimi-k2.6"` is id-for-id identical to an id Together/HuggingFace already serve under
+/// the same literal string (and this table already has established, tested coverage for via the Kimi
+/// `family_id` branch further below) — with a genuinely different real max_output on NVIDIA
+/// specifically. Since this function is checked *first*, listing it here would silently steal that id
+/// away from the coverage already tested for the other, equally-real host — the same known "one id,
+/// more than one host" limitation already documented at this table's own section header, just newly
+/// reachable because NVIDIA happens to reuse an org-slug shape another aggregator also uses. Left to
+/// the Kimi branch instead; NVIDIA's own real number for this id remains unrepresented, same as any
+/// other cross-host collision this table can't disambiguate.
+///
+/// `"minimaxai/minimax-m3"` *used* to be excluded for the identical reason (left to the MiniMax
+/// `family_id` branch further below, which — like every host that branch's own "else" bucket covers —
+/// reports 128,000 max_output, NVIDIA's real number here being merely "unrepresented"). That framing
+/// undersold the bug (pi-parity pass 20, Task 2): NVIDIA's own real max_output for this id is 16,384 —
+/// a **7.8x over-report**, not a harmless gap, whenever this id is actually served by NVIDIA. Listed
+/// here now instead, using NVIDIA's real (and, conveniently, smallest of the three real hosts —
+/// Together's own real is 250,000, HuggingFace's 128,000) number — the same "smaller number wins"
+/// safe-direction tie-break this table already uses for every other unresolvable same-string
+/// collision, so Together's/HuggingFace's requests for this identical string now merely under-report
+/// (a usability loss) instead of NVIDIA's over-reporting outright (a 400).
 ///
 /// A third, converse case is investigated (pi-parity Task #21) but deliberately left as-is rather than
 /// "fixed": `"nvidia/nemotron-3-ultra-550b-a55b"` below is *also* re-hosted, id-for-id, on Together
@@ -417,6 +427,16 @@ fn github_copilot_claude_overrides(m: &str) -> Option<ModelCaps> {
 /// native case in exchange for a same-string collision this table still couldn't resolve for Together
 /// either. Left unfixed: the same "one id, several real hosts, no route signal" limitation as every
 /// other documented collision in this file, one level less tractable than the two ids just above.
+///
+/// `"nvidia/nemotron-3-super-120b-a12b"` looks like the same shape as `nemotron-3-ultra-550b-a55b`
+/// above (also re-hosted on OpenRouter under the identical string), but the safe-smallest-number
+/// reasoning that justifies leaving `-ultra` alone does *not* hold here (pi-parity pass 20, Task 1):
+/// OpenRouter's real max_output for this exact id is 4096 (`openrouter.models.ts`), vs the 262,144 this
+/// table used to return unconditionally — a **64x over-report** for an OpenRouter-routed request, not
+/// a mere usability loss. Fixed below by narrowing to OpenRouter's smaller (and therefore safe-for-
+/// both-hosts) number; NVIDIA-native's own real max_output for this id is also 262,144, so a genuine
+/// NVIDIA-routed request now under-reports instead — the same tie-break this whole doc comment
+/// otherwise describes.
 fn nvidia_caps(m: &str) -> Option<ModelCaps> {
     use crate::transport::ReasoningEffort as RE;
     // (context_window, max_output, supports_vision) — reasoning/thinking fields are uniform "no
@@ -428,11 +448,16 @@ fn nvidia_caps(m: &str) -> Option<ModelCaps> {
         "meta/llama-3.2-11b-vision-instruct" => (128_000, 4_096, true),
         "meta/llama-3.2-90b-vision-instruct" => (128_000, 8_192, true),
         "meta/llama-3.3-70b-instruct" => (128_000, 4_096, false),
+        "minimaxai/minimax-m3" => (1_000_000, 16_384, true),
         "mistralai/mistral-large-3-675b-instruct-2512" => (262_144, 262_144, true),
         "mistralai/mistral-small-4-119b-2603" => (128_000, 8_192, true),
         "nvidia/nemotron-3-nano-30b-a3b" => (131_072, 131_072, false),
         "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning" => (256_000, 65_536, true),
-        "nvidia/nemotron-3-super-120b-a12b" => (262_144, 262_144, false),
+        // pi-parity pass 20 Task 1: was (262_144, 262_144, false) — NVIDIA's own real number, but a
+        // 64x over-report of OpenRouter's real 4096 for this identical vendor-slug string (unlike
+        // `nemotron-3-ultra-550b-a55b` below, where NVIDIA's own number already IS the smaller/safer
+        // one — see this function's own doc comment).
+        "nvidia/nemotron-3-super-120b-a12b" => (262_144, 4_096, false),
         "nvidia/nemotron-3-ultra-550b-a55b" => (1_000_000, 65_536, false),
         "nvidia/nvidia-nemotron-nano-9b-v2" => (131_072, 131_072, false),
         "openai/gpt-oss-120b" => (128_000, 8_192, false),
@@ -440,7 +465,13 @@ fn nvidia_caps(m: &str) -> Option<ModelCaps> {
         "qwen/qwen3.5-122b-a10b" => (262_144, 65_536, true),
         "stepfun-ai/step-3.5-flash" => (256_000, 16_384, false),
         "stepfun-ai/step-3.7-flash" => (256_000, 16_384, true),
-        "z-ai/glm-5.2" => (1_000_000, 131_072, false),
+        // pi-parity pass 20 Task 1: was (1_000_000, 131_072, false) — NVIDIA's own real numbers, but
+        // this exact vendor-slug string is *also* OpenRouter's own real spelling
+        // (`openrouter.models.ts`: 1,048,576/128,000). Context stays at NVIDIA's smaller (safe) number;
+        // max_output takes OpenRouter's smaller one instead (a ~2.4% over-report otherwise) — the same
+        // per-field mix-and-match tie-break already used for `"qwen/qwen3-235b-a22b"` elsewhere in this
+        // file.
+        "z-ai/glm-5.2" => (1_000_000, 128_000, false),
         _ => return None,
     };
     Some(ModelCaps {
@@ -1005,6 +1036,35 @@ fn capabilities_impl(model: &str) -> ModelCaps {
             };
             return openai_family_caps_for_vendor_slug(caps, is_vendor_slug);
         }
+        // pi-parity pass 20 Task 3: OpenRouter's own vendor-slug "openai/gpt-4-turbo-preview" is a
+        // genuinely text-only legacy alias (`input: ["text"]`, `openrouter.models.ts`) — unlike its
+        // differently-named sibling "openai/gpt-4-turbo" (`input: ["text","image"]`, vision-capable),
+        // which the generic bucket below still correctly covers via `m != "gpt-4"`. Native OpenAI's own
+        // catalogue (`openai.models.ts`) has no "gpt-4-turbo-preview" entry at all — only OpenRouter
+        // does — so this is scoped to the vendor-slug form specifically; a bare id under this name (if
+        // one somehow existed) would still fall through to the generic bucket's `m != "gpt-4"` default.
+        if is_vendor_slug && m == "gpt-4-turbo-preview" {
+            let caps = ModelCaps {
+                context_window: 128_000,
+                max_output: 4_096,
+                max_tokens_field: MaxTokensField::MaxTokens,
+                supports_long_cache: true,
+                supports_vision: false,
+                supports_temperature: true,
+                thinking: ThinkingShape::None,
+                reasoning_effort: false,
+                reasoning_disableable: false,
+                supports_eager_tool_streaming: false,
+                supports_tool_stream: false,
+                api: ApiKind::Responses,
+                min_reasoning_effort: crate::transport::ReasoningEffort::Minimal,
+                supports_xhigh_reasoning: true,
+                adaptive_xhigh_effort_wire: "xhigh",
+                openai_reasoning_format: OpenAiReasoningFormat::Standard,
+                supports_cache_control_on_tools: true,
+            };
+            return openai_family_caps_for_vendor_slug(caps, is_vendor_slug);
+        }
         // Bare "gpt-4" (no suffix) is the original 8k-context model; 4-turbo caps output tighter than
         // 4o; everything else (4o, 4o-mini, and dated snapshots) shares a 128k/16384 ceiling.
         let (context_window, max_output) = if m == "gpt-4" {
@@ -1371,6 +1431,10 @@ fn capabilities_impl(model: &str) -> ModelCaps {
                 // matches its own real 1,000,000 via the `else` branch below and is left unaffected.
                 (1_040_000, 131_072, true)
             } else {
+                // Note: OpenRouter's own vendor-slug spelling ("z-ai/glm-5.2", a dash between "z" and
+                // "ai") never reaches this arm at all — `nvidia_caps` (checked earlier, unconditionally)
+                // already lists this exact string first, since it's *also* a real NVIDIA-native id. See
+                // `nvidia_caps`'s own doc comment (pi-parity pass 20, Task 1) for that fix instead.
                 (1_000_000, 131_072, true)
             }
         } else if g.starts_with("glm-4.5-air") || g == "glm-4.5" {
@@ -1500,12 +1564,23 @@ fn capabilities_impl(model: &str) -> ModelCaps {
         // smaller, safer numbers win here, matching this table's established tradeoff elsewhere (e.g.
         // the llama-3.3-70b-instruct HuggingFace/OpenRouter collision further below).
         let together_vendor_slug_k2_6 = is_vendor_slug && k == "kimi-k2.6";
+        // pi-parity pass 20 Task 1: OpenRouter's own catalogue serves this identical vendor-slug string
+        // too (`openrouter.models.ts`: real 262144/16384) — a *third* real host for the same string,
+        // and its max_output is smaller still than Together's own 131072 above (an 8x over-report for
+        // OpenRouter specifically if Together's number were kept). OpenRouter's smaller number wins,
+        // matching this table's established tie-break.
         let together_vendor_slug_k2_7_code = is_vendor_slug && k == "kimi-k2.7-code";
         // pi-parity (models/dialects pass): OpenRouter's own vendor-slug "moonshotai/kimi-k2.5"
         // (`openrouter.models.ts`) reports a real max_output of 4096, vs this bucket's generic 262144 —
         // no collision with any other host reachable through this codebase's known providers (native
         // moonshotai/moonshotai-cn/opencode all use the bare, unprefixed "kimi-k2.5" instead).
         let openrouter_vendor_slug_k2_5 = is_vendor_slug && k == "kimi-k2.5";
+        // pi-parity pass 20 Task 1: OpenRouter's own vendor-slug "moonshotai/kimi-k2-thinking" reports a
+        // real max_output of 100352 (`openrouter.models.ts`), vs this bucket's generic 262144 default —
+        // a ~2.6x over-report. HuggingFace's identical vendor-slug spelling reports the native (larger)
+        // 262144/262144 for this same suffix (`huggingface.models.ts:583`, already the "else" default
+        // below) — another same-string, no-host-signal collision; OpenRouter's smaller number wins.
+        let openrouter_vendor_slug_k2_thinking = is_vendor_slug && k == "kimi-k2-thinking";
         let (context_window, max_output) = if k.starts_with("kimi-k2-0711") {
             (131_072, 16_384)
         } else if is_kimi_coding_smaller_output {
@@ -1517,9 +1592,11 @@ fn capabilities_impl(model: &str) -> ModelCaps {
         } else if together_vendor_slug_k2_6 {
             (262_144, 131_000)
         } else if together_vendor_slug_k2_7_code {
-            (262_144, 131_072)
+            (262_144, 16_384)
         } else if openrouter_vendor_slug_k2_5 {
             (262_144, 4_096)
+        } else if openrouter_vendor_slug_k2_thinking {
+            (262_144, 100_352)
         } else {
             (262_144, 262_144)
         };
@@ -1656,6 +1733,14 @@ fn capabilities_impl(model: &str) -> ModelCaps {
             // test already locks in behavior for — left at this branch's original default, which is at
             // least closer to Together's real context (1_000_000 vs 524_288, safe over-report
             // direction) than any of the alternatives.
+            //
+            // pi-parity pass 20 Task 2: the vendor-slug string this `else` tuple used to serve
+            // ("minimaxai/minimax-m3", Together's/HuggingFace's own spelling too) no longer reaches it
+            // at all — `nvidia_caps` (checked earlier, unconditionally) now lists NVIDIA's own real,
+            // smaller max_output (16_384) for this exact string first, which wins for every host that
+            // shares it (the established "smaller number wins" tie-break — see `nvidia_caps`'s own doc
+            // comment). This `else` tuple is only still reachable for the bare native id (no vendor
+            // slug at all, so `nvidia_caps`'s exact-string match never fires).
             if is_fireworks_model(&m) {
                 (512_000, 512_000, false)
             } else {
@@ -1745,12 +1830,20 @@ fn capabilities_impl(model: &str) -> ModelCaps {
     if m.starts_with("qwen") || family_id.starts_with("qwen") {
         // HuggingFace's own bare "Qwen/Qwen3-235B-A22B" (no additional suffix — Together's own entry
         // for this same base model is a differently-suffixed "...-Instruct-2507-tput" id, so there's no
-        // collision) is far smaller than the generic bucket's 200k/40960 default
+        // collision with Together) is far smaller than the generic bucket's 200k/40960 default
         // (`huggingface.models.ts:97`: real 40960/16384) — pi-parity Task #16.
+        //
+        // pi-parity pass 20 Task 1: this identical full id string is *also* OpenRouter's own real
+        // vendor-slug spelling (`openrouter.models.ts`: real 131072/8192) — a genuine same-string
+        // collision with HuggingFace this table can't disambiguate any further. HuggingFace's smaller
+        // context (40960 vs OpenRouter's 131072) already wins safely; max_output disagrees the other
+        // way (HuggingFace's 16384 is *larger* than OpenRouter's real 8192, a ~2x over-report there),
+        // so `max_output` now takes OpenRouter's smaller number instead — the same "smaller number
+        // wins" tie-break used throughout this table.
         if m == "qwen/qwen3-235b-a22b" {
             return ModelCaps {
                 context_window: 40_960,
-                max_output: 16_384,
+                max_output: 8_192,
                 max_tokens_field: MaxTokensField::MaxTokens,
                 supports_long_cache: false,
                 supports_vision: false,
@@ -1769,6 +1862,62 @@ fn capabilities_impl(model: &str) -> ModelCaps {
             };
         }
         let q = if m.contains('/') { family_id } else { m.as_str() };
+        // pi-parity pass 20 Task 1: these 6 ids are OpenRouter's own `"qwen/…"` vendor-slug entries
+        // (`openrouter.models.ts`), each colliding on `family_id`'s shared suffix `q` with a Together
+        // id `together_match` below already covers under a genuinely different (and, for every one of
+        // these six, larger) real number — checked against the *full* id `m` (not just `q`), so
+        // Together's own numbers for these same suffixes are unaffected. `openai_reasoning_format:
+        // OpenRouter` (not `Together`) — OpenRouter's real `compat.thinkingFormat`, a nested
+        // `reasoning:{effort}` shape, distinct from Together's own nested `reasoning:{enabled}` toggle.
+        if let Some((context_window, max_output, supports_vision, is_reasoning)) = match m.as_str() {
+            // 32_768 → 4_096: an 8x over-report (Together's own real max_output for this suffix is
+            // 130_000; HuggingFace's identical vendor-slug id is 32_768 — already the shared bucket's
+            // pick below — but OpenRouter's own real number is smaller still).
+            "qwen/qwen3.5-397b-a17b" => Some((256_000, 4_096, true, true)),
+            // 500_000 → 65_536: ~7.6x over-report (Together's own real 1,000,000/500,000 is correct
+            // for Together itself — the shared bucket below — but OpenRouter's real max_output is far
+            // smaller for this identical suffix). Vision is `false`, not OpenRouter's own real `true`
+            // (`input: ["text","image"]`): Together's real entry for this exact string is text-only
+            // (`input: ["text"]`) — the same "false is the safe, false-positive-avoiding choice when
+            // hosts disagree" tie-break `together_vendor_slug_k2_7_code` already established elsewhere.
+            "qwen/qwen3.6-plus" => Some((1_000_000, 65_536, false, true)),
+            "qwen/qwen3.7-max" => Some((1_000_000, 65_536, false, true)),
+            // Falls to this branch's generic 262_144/65_536 default today (~4x over-report vs
+            // OpenRouter's real 262_144/16_384; `reasoning: false` on OpenRouter, so no toggle at all).
+            "qwen/qwen3-next-80b-a3b-instruct" => Some((262_144, 16_384, false, false)),
+            // ~4x over-report vs the HuggingFace-tuned 262_144/131_072 special case below (real for
+            // this identical suffix on HuggingFace; OpenRouter's own real max_output is smaller).
+            "qwen/qwen3-next-80b-a3b-thinking" => Some((262_144, 32_768, false, true)),
+            // Falls to this branch's generic 262_144/65_536 default today; OpenRouter's real is
+            // 160_000/32_768 (context 1.6x, max_output 2x over-reported) — HuggingFace's identical
+            // vendor-slug id agrees with the generic default, so this is OpenRouter-specific.
+            "qwen/qwen3-coder-30b-a3b-instruct" => Some((160_000, 32_768, false, false)),
+            _ => None,
+        } {
+            return ModelCaps {
+                context_window,
+                max_output,
+                max_tokens_field: MaxTokensField::MaxTokens,
+                supports_long_cache: false,
+                supports_vision,
+                supports_temperature: true,
+                thinking: ThinkingShape::None,
+                reasoning_effort: is_reasoning,
+                reasoning_disableable: true,
+                supports_eager_tool_streaming: false,
+                supports_tool_stream: false,
+                api: ApiKind::ChatCompletions,
+                min_reasoning_effort: RE::Minimal,
+                supports_xhigh_reasoning: true,
+                adaptive_xhigh_effort_wire: "xhigh",
+                openai_reasoning_format: if is_reasoning {
+                    OpenAiReasoningFormat::OpenRouter
+                } else {
+                    OpenAiReasoningFormat::Standard
+                },
+                supports_cache_control_on_tools: true,
+            };
+        }
         // Together's current Qwen lineup varies too much (context from 32_768 to 1_000_000, max_output
         // from 32_768 to 500_000 — up to ~12x either direction) for the generic 200k/40960 default
         // below to stay reasonably accurate — ported id-for-id instead, the same reasoning the Mistral/
@@ -2181,11 +2330,11 @@ fn capabilities_impl(model: &str) -> ModelCaps {
     // vendor-slug fallback below, losing their real vision support entirely (`supports_vision: false`
     // there, vs both of these being real vision models). OpenRouter also lists a
     // `"google/gemma-4-*-it"` entry with yet another (also real, also different) max_output for each —
-    // an id-only-keying collision this table can't resolve any further; HuggingFace's number wins here,
-    // matching this fix's specific target. NVIDIA's own "stepfun-ai/step-3.5-flash"/"-3.7-flash" ids
-    // have the identical collision with HuggingFace (both real, different numbers, no distinguishing
-    // prefix) — left at `nvidia_caps`'s existing, tested numbers rather than re-litigated here, since
-    // that branch runs first and already wins the tie-break for those two ids specifically.
+    // an id-only-keying collision this table can't resolve any further. NVIDIA's own
+    // "stepfun-ai/step-3.5-flash"/"-3.7-flash" ids have the identical collision with HuggingFace (both
+    // real, different numbers, no distinguishing prefix) — left at `nvidia_caps`'s existing, tested
+    // numbers rather than re-litigated here, since that branch runs first and already wins the
+    // tie-break for those two ids specifically.
     //
     // pi-parity Task #27 (investigated, kept as-is): Together *also* hosts the identical vendor-slug
     // "google/gemma-4-31B-it" string, with a real max_output of 131072 (`together.models.ts:193`) — 4x
@@ -2194,10 +2343,21 @@ fn capabilities_impl(model: &str) -> ModelCaps {
     // collision documented in this file), keeping HuggingFace's smaller number is the safe-direction
     // choice: Together's real, larger ceiling is under-reported (a usability loss, not a 400) rather
     // than HuggingFace's/OpenRouter's smaller ones being dangerously over-reported.
+    //
+    // pi-parity pass 20 Task 1: unlike "-31b-it" (where HuggingFace's 32768 is already the smallest of
+    // the three real hosts and stays), "-26b-a4b-it"'s own OpenRouter real number (4096,
+    // `openrouter.models.ts`) is *smaller* than HuggingFace's 32768 — an 8x over-report for OpenRouter
+    // specifically. Narrowed to OpenRouter's smaller number for this one id only; "-31b-it" is
+    // untouched.
     if m == "google/gemma-4-26b-a4b-it" || m == "google/gemma-4-31b-it" {
+        let max_output = if m == "google/gemma-4-26b-a4b-it" {
+            4_096
+        } else {
+            32_768
+        };
         return ModelCaps {
             context_window: 262_144,
-            max_output: 32_768,
+            max_output,
             max_tokens_field: MaxTokensField::MaxTokens,
             supports_long_cache: false,
             supports_vision: true,
@@ -2240,6 +2400,78 @@ fn capabilities_impl(model: &str) -> ModelCaps {
             api: ApiKind::ChatCompletions,
             min_reasoning_effort: RE::Minimal,
             supports_xhigh_reasoning: false,
+            adaptive_xhigh_effort_wire: "xhigh",
+            openai_reasoning_format: OpenAiReasoningFormat::Standard,
+            supports_cache_control_on_tools: true,
+        };
+    }
+
+    // pi-parity pass 20 Task 4: OpenRouter's own meta-routing pseudo-models (`openrouter.models.ts`) —
+    // bare "auto" (no vendor slug at all) picks a model on your behalf; the vendor-slug-shaped
+    // "openrouter/free"/"openrouter/fusion" (neither names a real hosting vendor — "openrouter" is
+    // OpenRouter itself) round-robin across its free tier / a multi-model fusion router, respectively.
+    // All three otherwise fell through to a *wrong* fallback: "auto" (no '/') went all the way to
+    // `ModelCaps::unknown()`'s conservative 128k/4096; the other two hit the generic `m.contains('/')`
+    // OpenRouter bucket below (128000/32000) — a genuine, dangerous over-report for "openrouter/free"
+    // specifically (real max_output is smaller, 4096, not larger). Real numbers/shape all three share
+    // with the generic OpenRouter bucket (`compat.thinkingFormat: "openrouter"`, no
+    // `supportsReasoningEffort` override ⇒ permissive default) — only context/max_output/vision differ
+    // per id.
+    if m == "auto" || m == "openrouter/free" || m == "openrouter/fusion" {
+        let (context_window, max_output, supports_vision) = match m.as_str() {
+            "auto" => (2_000_000, 30_000, true),
+            "openrouter/free" => (200_000, 4_096, true),
+            _ => (1_000_000, 30_000, false),
+        };
+        return ModelCaps {
+            context_window,
+            max_output,
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+            supports_long_cache: true,
+            supports_vision,
+            supports_temperature: true,
+            thinking: ThinkingShape::None,
+            reasoning_effort: true,
+            reasoning_disableable: true,
+            supports_eager_tool_streaming: false,
+            supports_tool_stream: false,
+            api: ApiKind::ChatCompletions,
+            min_reasoning_effort: RE::Minimal,
+            supports_xhigh_reasoning: true,
+            adaptive_xhigh_effort_wire: "xhigh",
+            openai_reasoning_format: OpenAiReasoningFormat::OpenRouter,
+            supports_cache_control_on_tools: true,
+        };
+    }
+
+    // pi-parity pass 20 Task 4: OpenCode Zen's own branded free-tier ids (`opencode.models.ts`) — bare,
+    // unprefixed, and matching no other family's id shape above, so all three fell straight through to
+    // `ModelCaps::unknown()`'s conservative 128k/4096 default. Real numbers ported id-for-id; all three
+    // share an identical compat shape in pi's catalogue (`"maxTokensField":"max_tokens"`, no
+    // `thinkingFormat` override ⇒ the plain OpenAI-style bare `reasoning_effort` shape, not the nested
+    // OpenRouter one) — distinct from the "auto"/"openrouter/free"/"openrouter/fusion" trio just above,
+    // which genuinely are OpenRouter-shaped. None of the three are vision-capable (`input: ["text"]`).
+    if m == "big-pickle" || m == "nemotron-3-ultra-free" || m == "north-mini-code-free" {
+        let (context_window, max_output) = match m.as_str() {
+            "big-pickle" => (200_000, 32_000),
+            "nemotron-3-ultra-free" => (1_000_000, 128_000),
+            _ => (256_000, 64_000),
+        };
+        return ModelCaps {
+            context_window,
+            max_output,
+            max_tokens_field: MaxTokensField::MaxTokens,
+            supports_long_cache: true,
+            supports_vision: false,
+            supports_temperature: true,
+            thinking: ThinkingShape::None,
+            reasoning_effort: true,
+            reasoning_disableable: true,
+            supports_eager_tool_streaming: false,
+            supports_tool_stream: false,
+            api: ApiKind::ChatCompletions,
+            min_reasoning_effort: RE::Minimal,
+            supports_xhigh_reasoning: true,
             adaptive_xhigh_effort_wire: "xhigh",
             openai_reasoning_format: OpenAiReasoningFormat::Standard,
             supports_cache_control_on_tools: true,
@@ -2294,7 +2526,7 @@ fn capabilities_impl(model: &str) -> ModelCaps {
 ///
 /// Not every variant here is a genuine same-string collision in practice — Fireworks ids, for
 /// instance, are already self-identifying by shape (`is_fireworks_model`) and need no host signal at
-/// all — but all seven are named here together so the one mechanism covers every aggregator platform
+/// all — but all nine are named here together so the one mechanism covers every aggregator platform
 /// this codebase routes to, rather than growing a new one-off per host as each collision is found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggregatorHost {
@@ -2318,6 +2550,17 @@ pub enum AggregatorHost {
     /// Kimi-Coding handling) — included here too since its capability numbers still benefit from a
     /// host signal the same way every other aggregator's do.
     KimiCoding,
+    /// `opencode.ai/zen`(`/v1`) — pi's `opencode.models.ts` — BYO-only, named via
+    /// `ModelOverride::base_url`. Distinct from [`Self::OpenCodeGo`] below: both are nested under the
+    /// same registered domain (`opencode.ai`), but genuinely disagree on real numbers/wire dialect for
+    /// a handful of shared bare ids (`"minimax-m3"`, `"glm-5.1"`) — a hostname-only check the way every
+    /// other variant here uses can't tell the two apart; see
+    /// `crates/agent::gateway_credential::aggregator_host_for_base_url`'s own doc comment for how the
+    /// `/zen` vs `/zen/go` path segment disambiguates them.
+    OpenCodeZen,
+    /// `opencode.ai/zen/go`(`/v1`) — pi's `opencode-go.models.ts`. See [`Self::OpenCodeZen`]'s own doc
+    /// comment for why this needs to be a separate variant rather than folded into it.
+    OpenCodeGo,
 }
 
 /// Route-aware capability override for the handful of OpenAI ids whose real numbers/thinking-map
@@ -2443,22 +2686,32 @@ pub fn capabilities_for_route_with_copilot(
 /// `capabilities_for_route_with_copilot` itself, for the identical reason that function gives for
 /// being separate from `capabilities_for_route`: most callers have no host in scope to thread through.
 ///
-/// `host: None` (the overwhelming common case until the next round's `crates/agent`-side wiring lands
-/// — see [`crate::transport::ModelRequest::host`]'s own doc comment) is a complete no-op, returning
-/// [`capabilities_for_route_with_copilot`]'s own answer untouched — every fix below only ever narrows
-/// an *already* host-ambiguous case, never changes the host-agnostic default.
+/// `host: None` (still the common case for a plain gateway-relayed request with no BYO `base_url`
+/// override — see [`crate::transport::ModelRequest::host`]'s own doc comment for exactly which routes
+/// populate it today, as of pi-parity pass 20's `crates/agent::gateway_credential` wiring) is a
+/// complete no-op, returning [`capabilities_for_route_with_copilot`]'s own answer untouched — every fix
+/// below only ever narrows an *already* host-ambiguous case, never changes the host-agnostic default.
 ///
-/// Currently overrides 2 genuine same-string collisions (pi-parity, models/dialects pass):
+/// Currently overrides 7 genuine same-string collisions:
 /// `"qwen/qwen3-235b-a22b-thinking-2507"` — the identical id string on both OpenRouter (real
 /// `max_output` 4096, matching this table's own host-agnostic default) and HuggingFace (real 131072,
 /// 32x larger) — and `"openai/gpt-oss-20b"` — at least a 4-way collision (NVIDIA/Together/Groq/
 /// OpenRouter, each with a different real `max_output`); the host-agnostic default silently returns
 /// NVIDIA's number today (`nvidia_caps` intercepts this exact string first, unconditionally — see its
 /// own doc comment), but this override still corrects the Together case regardless, since it runs
-/// *after* that base lookup rather than trying to out-order it. Every other concrete collision this
-/// pass fixed turned out to be resolvable without a host signal at all (the vendor-slug id string
-/// itself was already host-unique within this codebase's reachable provider set) — see `capabilities`'s
-/// own per-family doc comments for those.
+/// *after* that base lookup rather than trying to out-order it. Every other concrete collision the
+/// models/dialects pass fixed turned out to be resolvable without a host signal at all (the vendor-slug
+/// id string itself was already host-unique within this codebase's reachable provider set) — see
+/// `capabilities`'s own per-family doc comments for those.
+///
+/// pi-parity pass 20 Task 5 adds 5 more, all OpenCode Zen/OpenCode-Go bare-id collisions (the two
+/// aggregators disagree with each other, and/or with this table's host-agnostic default, for these
+/// specific ids — see [`AggregatorHost::OpenCodeZen`]'s own doc comment): `"kimi-k2.5"`/`"kimi-k2.6"`
+/// (real max_output 65536 on both OpenCode Zen and OpenCode-Go, vs this table's host-agnostic 262144),
+/// `"glm-5.1"` (real max_output 32768 on OpenCode-Go specifically — OpenCode Zen's own real number,
+/// 131072, already matches the host-agnostic default), and `"minimax-m3"` (real context 512000 on
+/// OpenCode Zen specifically — OpenCode-Go's own real context, 1,000,000, already matches the
+/// host-agnostic default).
 pub fn capabilities_for_route_with_host(
     model: &str,
     is_codex: bool,
@@ -2474,6 +2727,21 @@ pub fn capabilities_for_route_with_host(
         }
         (Some(AggregatorHost::Together), "openai/gpt-oss-20b") => {
             caps.max_output = 131_072;
+        }
+        // pi-parity pass 20 Task 5: OpenCode Zen's and OpenCode-Go's real numbers for these bare ids
+        // (`opencode.models.ts`/`opencode-go.models.ts`) — see this function's own doc comment for the
+        // cross-host survey each arm below corrects.
+        (Some(AggregatorHost::OpenCodeZen), "kimi-k2.5" | "kimi-k2.6") => {
+            caps.max_output = 65_536;
+        }
+        (Some(AggregatorHost::OpenCodeGo), "kimi-k2.6") => {
+            caps.max_output = 65_536;
+        }
+        (Some(AggregatorHost::OpenCodeGo), "glm-5.1") => {
+            caps.max_output = 32_768;
+        }
+        (Some(AggregatorHost::OpenCodeZen), "minimax-m3") => {
+            caps.context_window = 512_000;
         }
         _ => {}
     }
@@ -3833,7 +4101,12 @@ mod tests {
 
     #[test]
     fn together_hosted_qwen_gets_the_together_wire_format() {
-        let c = capabilities("Qwen/Qwen3.6-Plus".to_ascii_lowercase().as_str());
+        // pi-parity pass 20 Task 1: "Qwen/Qwen3.6-Plus" no longer proves this — that exact vendor-slug
+        // string is also OpenRouter's own real spelling, and now resolves to OpenRouter's smaller,
+        // safer numbers/format instead (see `openrouter_qwen_ids_get_their_own_real_numbers_not_the_
+        // colliding_together_shape` below). "Qwen/Qwen3.5-9B" has no such collision (Together-only) and
+        // still proves a reasoning-capable Together-shaped qwen id gets the real toggle.
+        let c = capabilities("Qwen/Qwen3.5-9B".to_ascii_lowercase().as_str());
         assert_eq!(c.openai_reasoning_format, OpenAiReasoningFormat::Together);
         assert!(!c.reasoning_effort);
 
@@ -3887,6 +4160,58 @@ mod tests {
     }
 
     #[test]
+    fn openrouter_meta_routing_pseudo_models_get_their_real_numbers_not_unknown_or_the_generic_fallback() {
+        // pi-parity pass 20 Task 4: bare "auto" used to fall all the way through to
+        // `ModelCaps::unknown()` (128k/4096); "openrouter/free"/"openrouter/fusion" (vendor-slug-shaped,
+        // though neither names a real hosting vendor) used to hit the generic `m.contains('/')`
+        // OpenRouter fallback (128000/32000) — a dangerous over-report specifically for
+        // "openrouter/free", whose real max_output (4096) is *smaller*, not larger.
+        let auto = capabilities("auto");
+        assert_eq!(auto.context_window, 2_000_000);
+        assert_eq!(auto.max_output, 30_000, "was 4_096 under ModelCaps::unknown()");
+        assert!(auto.supports_vision);
+        assert_eq!(auto.openai_reasoning_format, OpenAiReasoningFormat::OpenRouter);
+        assert!(auto.max_output > ModelCaps::unknown().max_output);
+
+        let free = capabilities("openrouter/free");
+        assert_eq!(free.context_window, 200_000);
+        assert_eq!(free.max_output, 4_096, "was 32_000 under the generic fallback, itself an over-report");
+        assert!(free.supports_vision);
+
+        let fusion = capabilities("openrouter/fusion");
+        assert_eq!(fusion.context_window, 1_000_000, "was 128_000 under the generic fallback");
+        assert_eq!(fusion.max_output, 30_000);
+        assert!(!fusion.supports_vision);
+    }
+
+    #[test]
+    fn opencode_zen_branded_free_tier_ids_get_their_real_numbers_not_unknown() {
+        // pi-parity pass 20 Task 4: bare, unprefixed ids matching no other family's shape at all —
+        // `opencode.models.ts`'s own branded free-tier offerings, all previously falling straight
+        // through to `ModelCaps::unknown()`.
+        let big_pickle = capabilities("big-pickle");
+        assert_eq!(big_pickle.context_window, 200_000);
+        assert_eq!(big_pickle.max_output, 32_000);
+        assert!(!big_pickle.supports_vision);
+        assert!(big_pickle.max_output > ModelCaps::unknown().max_output);
+
+        let nemotron_free = capabilities("nemotron-3-ultra-free");
+        assert_eq!(nemotron_free.context_window, 1_000_000);
+        assert_eq!(nemotron_free.max_output, 128_000);
+
+        let north_mini = capabilities("north-mini-code-free");
+        assert_eq!(north_mini.context_window, 256_000);
+        assert_eq!(north_mini.max_output, 64_000);
+
+        // All three share the plain OpenAI-style bare `reasoning_effort` shape (no `thinkingFormat`
+        // override in pi's catalogue), not OpenRouter's nested one.
+        for caps in [big_pickle, nemotron_free, north_mini] {
+            assert_eq!(caps.openai_reasoning_format, OpenAiReasoningFormat::Standard);
+            assert_eq!(caps.max_tokens_field, MaxTokensField::MaxTokens);
+        }
+    }
+
+    #[test]
     fn vercel_ai_gateway_zai_glm_5_2_gets_its_real_slightly_larger_context() {
         // pi-parity Task #30: Vercel AI Gateway's own vendor-slug spelling "zai/glm-5.2" (no "-org")
         // reports a real context of 1,040,000, not native's/NVIDIA's 1,000,000 — negligible (~4%) but
@@ -3928,15 +4253,21 @@ mod tests {
         // and, uniquely among every other vision-capable id in this family (including the bare native
         // id and HuggingFace's own identically-spelled vendor-slug entry), text-only on Together
         // specifically (`input: ["text"]`) — both the number and the vision flag must reflect that.
+        //
+        // pi-parity pass 20 Task 1: OpenRouter serves this identical vendor-slug string too, with an
+        // even smaller real max_output (16384, `openrouter.models.ts`) — an 8x over-report if
+        // Together's own 131072 were kept. OpenRouter's smaller number now wins the 3-way collision
+        // (Together/HuggingFace/OpenRouter all serve this exact string).
         let code = capabilities("moonshotai/Kimi-K2.7-Code");
         assert_eq!(code.context_window, 262_144);
-        assert_eq!(code.max_output, 131_072, "was 262_144, a dangerous 2x over-report for Together");
+        assert_eq!(code.max_output, 16_384, "OpenRouter's real, smaller number now wins the collision");
         assert!(!code.supports_vision, "Together's own K2.7-Code entry is text-only");
 
         // The bare native id is unaffected — still the family default (262144/262144), vision-capable.
         // (HuggingFace's own real entry for "moonshotai/Kimi-K2.7-Code" is identically spelled to
-        // Together's — the same same-string collision `together_vendor_slug_k2_7_code` accepts;
-        // Together's smaller, safer number and text-only flag win for this one shared string.)
+        // Together's/OpenRouter's — the same same-string collision `together_vendor_slug_k2_7_code`
+        // accepts; OpenRouter's smaller, safer number and Together's text-only flag win for this one
+        // shared string.)
         let native_code = capabilities("kimi-k2.7-code");
         assert_eq!(native_code.max_output, 262_144);
         assert!(native_code.supports_vision);
@@ -3958,9 +4289,13 @@ mod tests {
     fn huggingface_hosted_vendor_slug_ids_also_hit_their_real_family() {
         // A different aggregator, same org-slug id shape (`packages/ai/src/providers/
         // huggingface.models.ts`) — confirms the fix isn't Together-specific.
+        //
+        // pi-parity pass 20 Task 1: max_output is 100352, not HuggingFace's own 262144 — OpenRouter
+        // serves this identical vendor-slug string too, with a smaller real number that now wins the
+        // collision (this table's established safe-direction tie-break).
         let kimi = capabilities("moonshotai/Kimi-K2-Thinking");
         assert_eq!(kimi.context_window, 262_144);
-        assert_eq!(kimi.max_output, 262_144);
+        assert_eq!(kimi.max_output, 100_352);
         assert_eq!(kimi.openai_reasoning_format, OpenAiReasoningFormat::DeepSeek);
 
         let glm = capabilities("zai-org/GLM-4.7");
@@ -3977,9 +4312,16 @@ mod tests {
         // id is slug-shaped at all) would silently land in the right family branch but match the
         // wrong per-id sub-case inside it: the flat, smaller "else" shape below instead of
         // "minimax-m3"'s real 1M-context/vision-capable one.
+        //
+        // pi-parity pass 20 Task 2: `max_output` is 16_384, not the family branch's own 128_000 — this
+        // exact string is now intercepted earlier by `nvidia_caps` (NVIDIA's real, smaller number wins
+        // the cross-host tie-break; see that function's own doc comment). Still proves the point this
+        // test exists for: the id resolves to *a* real, correct-shaped entry (1M context, vision-
+        // capable), not the unrelated smaller/non-vision "minimax-m2"-style default the org-slug-prefix
+        // bug used to risk.
         let c = capabilities("MiniMaxAI/MiniMax-M3");
         assert_eq!(c.context_window, 1_000_000);
-        assert_eq!(c.max_output, 128_000);
+        assert_eq!(c.max_output, 16_384);
         assert!(c.supports_vision);
     }
 
@@ -4244,9 +4586,13 @@ mod tests {
 
         // HuggingFace's own vendor-slug spelling of this id reports the *native* (larger) numbers, not
         // Kimi-Coding's — the bare-id-only scoping must not affect it.
+        //
+        // pi-parity pass 20 Task 1: OpenRouter's identical vendor-slug spelling reports a real
+        // max_output of 100352 — smaller than HuggingFace's 262144, so it now wins this same-string
+        // collision instead (see `openrouter_vendor_slug_k2_thinking` in the capability table).
         let hf = capabilities("moonshotai/Kimi-K2-Thinking");
         assert_eq!(hf.context_window, 262_144);
-        assert_eq!(hf.max_output, 262_144, "HuggingFace's real number, not Kimi-Coding's");
+        assert_eq!(hf.max_output, 100_352, "OpenRouter's smaller real number now wins the collision");
     }
 
     // ---- Task 25: Google/Gemini capability data ----
@@ -4674,12 +5020,20 @@ mod tests {
     }
 
     #[test]
-    fn huggingface_qwen3_next_80b_a3b_thinking_gets_its_real_larger_max_output() {
-        // pi-parity (models/dialects pass): HuggingFace-only, real 262144/131072
-        // (`huggingface.models.ts`) — 2x the generic Qwen fallback's 65536.
+    fn openrouter_qwen3_next_80b_a3b_thinking_gets_its_real_smaller_max_output() {
+        // pi-parity (models/dialects pass): this exact vendor-slug string was originally believed
+        // HuggingFace-only, real 262144/131072 (`huggingface.models.ts`) — 2x the generic Qwen
+        // fallback's 65536, hence the fix at the time.
+        //
+        // pi-parity pass 20 Task 1: OpenRouter's own catalogue (`openrouter.models.ts`) turns out to
+        // serve this identical full id string too, with a real max_output of just 32768 — smaller than
+        // both HuggingFace's 131072 and the original generic fallback's 65536 (a ~4x over-report for
+        // OpenRouter specifically). Same-string, no-host-signal collision this table can't disambiguate
+        // any further; OpenRouter's smaller number now wins (this table's established safe-direction
+        // tie-break), so HuggingFace itself now under-reports instead.
         let c = capabilities("qwen/qwen3-next-80b-a3b-thinking");
         assert_eq!(c.context_window, 262_144);
-        assert_eq!(c.max_output, 131_072, "was 65_536 before this fix");
+        assert_eq!(c.max_output, 32_768, "OpenRouter's real, smaller number now wins the collision");
     }
 
     #[test]
@@ -4782,6 +5136,57 @@ mod tests {
             Some(AggregatorHost::Together),
         );
         assert_eq!(unaffected, capabilities("deepseek-v4-pro"));
+    }
+
+    #[test]
+    fn capabilities_for_route_with_host_resolves_the_opencode_zen_and_go_bare_id_collisions() {
+        // pi-parity pass 20 Task 5: `kimi-k2.5`/`kimi-k2.6` are 4x over-reported (262144 vs. the real
+        // 65536) on *both* OpenCode Zen and OpenCode-Go; `glm-5.1` is 4x over-reported (131072 vs. real
+        // 32768) on OpenCode-Go specifically (OpenCode Zen's own real number, 131072, already matches
+        // the host-agnostic default); `minimax-m3`'s *context* is 2x over-reported (1,000,000 vs. real
+        // 512,000) on OpenCode Zen specifically (OpenCode-Go's own real context, 1,000,000, already
+        // matches the host-agnostic default).
+        let no_host_kimi = capabilities_for_route_with_host("kimi-k2.5", false, false, false, None);
+        assert_eq!(no_host_kimi.max_output, 262_144, "no host signal: host-agnostic default unaffected");
+        assert_eq!(no_host_kimi, capabilities("kimi-k2.5"), "None must be a complete no-op");
+
+        for host in [AggregatorHost::OpenCodeZen, AggregatorHost::OpenCodeGo] {
+            let kimi_2_6 = capabilities_for_route_with_host("kimi-k2.6", false, false, false, Some(host));
+            assert_eq!(kimi_2_6.max_output, 65_536, "{host:?}: was 262_144, a 4x over-report");
+        }
+        let kimi_2_5_zen =
+            capabilities_for_route_with_host("kimi-k2.5", false, false, false, Some(AggregatorHost::OpenCodeZen));
+        assert_eq!(kimi_2_5_zen.max_output, 65_536, "OpenCode Zen: was 262_144, a 4x over-report");
+
+        let glm_go =
+            capabilities_for_route_with_host("glm-5.1", false, false, false, Some(AggregatorHost::OpenCodeGo));
+        assert_eq!(glm_go.max_output, 32_768, "OpenCode-Go: was 131_072, a 4x over-report");
+        let glm_zen =
+            capabilities_for_route_with_host("glm-5.1", false, false, false, Some(AggregatorHost::OpenCodeZen));
+        assert_eq!(
+            glm_zen.max_output, 131_072,
+            "OpenCode Zen's own real number already matches the host-agnostic default"
+        );
+
+        let minimax_zen = capabilities_for_route_with_host(
+            "minimax-m3",
+            false,
+            false,
+            false,
+            Some(AggregatorHost::OpenCodeZen),
+        );
+        assert_eq!(minimax_zen.context_window, 512_000, "OpenCode Zen: was 1_000_000, a 2x over-report");
+        let minimax_go = capabilities_for_route_with_host(
+            "minimax-m3",
+            false,
+            false,
+            false,
+            Some(AggregatorHost::OpenCodeGo),
+        );
+        assert_eq!(
+            minimax_go.context_window, 1_000_000,
+            "OpenCode-Go's own real context already matches the host-agnostic default"
+        );
     }
 
     #[test]
@@ -4888,13 +5293,20 @@ mod tests {
             let c = capabilities(id);
             assert!(c.supports_vision, "{id}");
             assert_eq!(c.context_window, 262_144, "{id}");
-            assert_eq!(c.max_output, 32_768, "{id}");
             assert_ne!(
                 c.openai_reasoning_format,
                 OpenAiReasoningFormat::OpenRouter,
                 "{id}: must not land on the generic vendor-slug fallback"
             );
         }
+        // pi-parity pass 20 Task 1: the two ids no longer share a single max_output. OpenRouter's own
+        // real number for "-26b-a4b-it" (4096, `openrouter.models.ts`) is far smaller than
+        // HuggingFace's shared 32768 default — an 8x over-report fixed by narrowing to the smaller
+        // number. "-31b-it" is unaffected: OpenRouter's real number there (262144) is *larger* than
+        // HuggingFace's 32768, so HuggingFace's smaller number remains the safe pick (see the
+        // `..._togethers_larger_real_one` test below for that sibling id's own, separate collision).
+        assert_eq!(capabilities("google/gemma-4-26b-a4b-it").max_output, 4_096);
+        assert_eq!(capabilities("google/gemma-4-31b-it").max_output, 32_768);
     }
 
     #[test]
@@ -4925,35 +5337,21 @@ mod tests {
             "non-reasoning id must not claim the together toggle mechanism"
         );
 
-        let plus = capabilities("Qwen/Qwen3.6-Plus");
-        assert_eq!(plus.context_window, 1_000_000);
-        assert_eq!(plus.max_output, 500_000, "was 40_960 under the stale generic bucket");
-        assert_eq!(plus.openai_reasoning_format, OpenAiReasoningFormat::Together);
-
-        let max = capabilities("Qwen/Qwen3.7-Max");
-        assert_eq!(max.context_window, 1_000_000);
-        assert_eq!(max.max_output, 500_000);
-        assert_eq!(
-            max.openai_reasoning_format,
-            OpenAiReasoningFormat::Standard,
-            "reasoning: false in pi's catalogue despite the family's usual together toggle"
-        );
+        // pi-parity pass 20 Task 1: "Qwen/Qwen3.6-Plus"/"Qwen/Qwen3.7-Max" (Together's real numbers:
+        // 1,000,000/500,000, matched here by this file's own `together_match` table) are *also*
+        // OpenRouter's own identical vendor-slug spelling, with a real max_output of just 65536 — OpenRouter's
+        // smaller number now wins this collision (see
+        // `openrouter_qwen_ids_get_their_own_real_numbers_not_the_colliding_together_shape` below), so
+        // this test no longer asserts Together's larger numbers for either id directly.
 
         let vision_9b = capabilities("Qwen/Qwen3.5-9B");
         assert!(vision_9b.supports_vision);
         assert_eq!(vision_9b.max_output, 65_536);
 
-        // pi-parity Task #17: this exact vendor-slug id is *also* served by HuggingFace under the
-        // identical full string, with the same context (262144) but a real max_output of only 32768
-        // (`huggingface.models.ts:295`) vs Together's own 130000 (`together.models.ts:81`) — a
-        // same-string collision with no host signal to disambiguate. HuggingFace's smaller number wins.
-        let vision_397b = capabilities("Qwen/Qwen3.5-397B-A17B");
-        assert_eq!(vision_397b.context_window, 262_144);
-        assert_eq!(
-            vision_397b.max_output, 32_768,
-            "was 130_000, a dangerous 4x over-report for HuggingFace"
-        );
-        assert!(vision_397b.supports_vision);
+        // "Qwen/Qwen3.5-397B-A17B" used to be tested here as a Together/HuggingFace-only collision
+        // (pi-parity Task #17: HuggingFace's smaller 32768 winning over Together's 130000) — OpenRouter
+        // turns out to serve this identical string too, with an even smaller real max_output (4096); see
+        // the dedicated test below for the fully updated 3-way resolution.
 
         // An uncatalogued Together-shaped Qwen id still falls back to the generic bucket, refreshed
         // (pi-parity Task #28) to match pi's current catalogue's ~262144/65536 default rather than the
@@ -4962,6 +5360,95 @@ mod tests {
         assert_eq!(uncatalogued.context_window, 262_144);
         assert_eq!(uncatalogued.max_output, 65_536);
         assert_eq!(uncatalogued.openai_reasoning_format, OpenAiReasoningFormat::Together);
+    }
+
+    #[test]
+    fn openrouter_qwen_ids_get_their_own_real_numbers_not_the_colliding_together_shape() {
+        // pi-parity pass 20 Task 1: every id here is OpenRouter's own vendor-slug spelling
+        // (`openrouter.models.ts`), each colliding on the identical full id string with a Together (and,
+        // for two of them, HuggingFace) entry this file's `together_match`/HuggingFace-tuned buckets
+        // already cover under a different, larger real number. OpenRouter's own smaller, safer number
+        // now wins each collision.
+        let plus = capabilities("qwen/qwen3.6-plus");
+        assert_eq!(plus.context_window, 1_000_000);
+        assert_eq!(plus.max_output, 65_536, "was 500_000, Together's number, a ~7.6x over-report");
+        assert_eq!(plus.openai_reasoning_format, OpenAiReasoningFormat::OpenRouter);
+        assert!(
+            !plus.supports_vision,
+            "Together's real entry for this exact string is text-only — the safe pick"
+        );
+
+        let max = capabilities("qwen/qwen3.7-max");
+        assert_eq!(max.context_window, 1_000_000);
+        assert_eq!(max.max_output, 65_536, "was 500_000, a ~7.6x over-report");
+        assert!(!max.supports_vision);
+
+        // Was a documented Together/HuggingFace-only collision (pi-parity Task #17); OpenRouter serves
+        // this identical string too, with an even smaller real max_output.
+        let vision_397b = capabilities("qwen/qwen3.5-397b-a17b");
+        assert_eq!(vision_397b.context_window, 256_000);
+        assert_eq!(vision_397b.max_output, 4_096, "was 32_768 (HuggingFace's number), an 8x over-report");
+        assert!(vision_397b.supports_vision);
+
+        let instruct_80b = capabilities("qwen/qwen3-next-80b-a3b-instruct");
+        assert_eq!(instruct_80b.context_window, 262_144);
+        assert_eq!(instruct_80b.max_output, 16_384, "was 65_536 under the generic bucket, a ~4x over-report");
+        assert_eq!(instruct_80b.openai_reasoning_format, OpenAiReasoningFormat::Standard);
+
+        let thinking_80b = capabilities("qwen/qwen3-next-80b-a3b-thinking");
+        assert_eq!(thinking_80b.context_window, 262_144);
+        assert_eq!(
+            thinking_80b.max_output, 32_768,
+            "was 131_072 (HuggingFace's number), a ~4x over-report"
+        );
+
+        let coder_30b = capabilities("qwen/qwen3-coder-30b-a3b-instruct");
+        assert_eq!(coder_30b.context_window, 160_000, "was 262_144, ~1.6x over-report");
+        assert_eq!(coder_30b.max_output, 32_768, "was 65_536, ~2x over-report");
+    }
+
+    #[test]
+    fn openrouter_qwen3_235b_a22b_gets_openrouters_smaller_max_output_alongside_huggingfaces_context() {
+        // pi-parity pass 20 Task 1: this exact vendor-slug string is a HuggingFace/OpenRouter collision
+        // (Task #16 originally special-cased it for HuggingFace's smaller *context* alone) — OpenRouter's
+        // own real max_output (8192) is in turn smaller than HuggingFace's 16384 this bucket used to
+        // return unconditionally, a ~2x over-report for OpenRouter specifically.
+        let c = capabilities("qwen/qwen3-235b-a22b");
+        assert_eq!(c.context_window, 40_960, "HuggingFace's smaller context, unaffected by this fix");
+        assert_eq!(c.max_output, 8_192, "was 16_384, OpenRouter's real number is smaller still");
+    }
+
+    #[test]
+    fn openrouter_z_ai_glm_5_2_gets_its_real_smaller_max_output_via_nvidia_caps() {
+        // pi-parity pass 20 Task 1: "z-ai/glm-5.2" (OpenRouter's own vendor-slug spelling — distinct
+        // from Together's/HuggingFace's "zai-org/" and Vercel's "zai/") is *also* a real NVIDIA-native
+        // id (`nvidia.models.ts`), which `nvidia_caps` intercepts first, unconditionally — so this
+        // collision is resolved there, not in the GLM family branch. NVIDIA's own real max_output
+        // (131_072) was a small (~2.4%) over-report of OpenRouter's real 128_000 for this identical
+        // string; context (1_000_000, NVIDIA's own, smaller than OpenRouter's 1,048,576) is unaffected.
+        let c = capabilities("z-ai/glm-5.2");
+        assert_eq!(c.context_window, 1_000_000);
+        assert_eq!(c.max_output, 128_000, "was 131_072, a small ~2.4% over-report for OpenRouter");
+        // nvidia_caps's own shape: no client-steerable reasoning mechanism at all (unlike the GLM
+        // branch's real effort vocabulary for bare "glm-5.2").
+        assert!(!c.reasoning_effort);
+    }
+
+    #[test]
+    fn openrouter_gpt_4_turbo_preview_is_text_only_unlike_its_gpt_4_turbo_sibling() {
+        // pi-parity pass 20 Task 3: OpenRouter's own vendor-slug "openai/gpt-4-turbo-preview" is a
+        // genuinely text-only legacy alias (`openrouter.models.ts`: `input: ["text"]`) — the shared
+        // gpt-4-turbo* bucket's `m != "gpt-4"` vision gate incorrectly claimed vision support for it,
+        // inherited from its differently-named, genuinely vision-capable sibling "openai/gpt-4-turbo".
+        let preview = capabilities("openai/gpt-4-turbo-preview");
+        assert!(!preview.supports_vision, "was true — this legacy alias has no vision support at all");
+        assert_eq!(preview.context_window, 128_000);
+        assert_eq!(preview.max_output, 4_096);
+
+        // The differently-named sibling id keeps its real vision support, matching pi's `openai/
+        // gpt-4-turbo` entry (`input: ["text","image"]`) — this fix must not regress it.
+        let turbo = capabilities("openai/gpt-4-turbo");
+        assert!(turbo.supports_vision, "openai/gpt-4-turbo itself is genuinely vision-capable");
     }
 
     #[test]
@@ -5104,17 +5591,16 @@ mod tests {
 
     #[test]
     fn nvidia_collision_ids_intentionally_left_to_the_other_hosts_established_coverage() {
-        // "minimaxai/minimax-m3" and "moonshotai/kimi-k2.6" are also real NVIDIA ids, but this table
-        // deliberately doesn't list NVIDIA's own numbers for them (see `nvidia_caps`'s own doc
-        // comment) since they're id-for-id identical to ids Together/HuggingFace already serve under
-        // the same literal string, with existing, tested coverage via the MiniMax/Kimi `family_id`
-        // branches. Regression guard that adding NVIDIA's table didn't silently steal these two ids
-        // away from that established behavior.
-        let mm = capabilities("minimaxai/minimax-m3");
-        assert_eq!(mm.context_window, 1_000_000);
-        assert_eq!(mm.max_output, 128_000);
-        assert!(mm.supports_vision);
-
+        // "moonshotai/kimi-k2.6" is also a real NVIDIA id, but this table deliberately doesn't list
+        // NVIDIA's own number for it (see `nvidia_caps`'s own doc comment) since it's id-for-id
+        // identical to an id Together/HuggingFace already serve under the same literal string, with
+        // existing, tested coverage via the Kimi `family_id` branch. Regression guard that adding
+        // NVIDIA's table didn't silently steal this id away from that established behavior.
+        //
+        // "minimaxai/minimax-m3" used to be a sibling example here — pi-parity pass 20 Task 2 moved it
+        // *into* `nvidia_caps` instead (a real 7.8x over-report, not a shrug-worthy gap); see
+        // `nvidia_minimax_m3_gets_its_real_smaller_max_output` below for that fix's own regression
+        // test.
         let kimi = capabilities("moonshotai/kimi-k2.6");
         assert_eq!(kimi.openai_reasoning_format, OpenAiReasoningFormat::DeepSeek);
     }
@@ -5130,6 +5616,31 @@ mod tests {
         assert_eq!(omni.context_window, 256_000);
         assert_eq!(omni.max_output, 65_536);
         assert!(omni.supports_vision);
+    }
+
+    #[test]
+    fn nvidia_minimax_m3_gets_its_real_smaller_max_output() {
+        // pi-parity pass 20 Task 2: NVIDIA's real max_output for "minimaxai/minimax-m3" is 16_384 — the
+        // table used to omit it entirely (deferring to the MiniMax `family_id` branch's own 128_000,
+        // Together's/HuggingFace's shared number), a 7.8x over-report for a genuine NVIDIA-routed
+        // request. Now listed in `nvidia_caps` directly, using NVIDIA's own (and smallest-of-three)
+        // real number.
+        let c = capabilities("minimaxai/minimax-m3");
+        assert_eq!(c.context_window, 1_000_000);
+        assert_eq!(c.max_output, 16_384);
+        assert!(c.supports_vision);
+    }
+
+    #[test]
+    fn nvidia_nemotron_3_super_120b_no_longer_over_reports_openrouters_max_output() {
+        // pi-parity pass 20 Task 1: this table used to return NVIDIA's own (262_144, 262_144) for this
+        // id unconditionally — a 64x over-report of OpenRouter's real max_output (4096) for the
+        // identical vendor-slug string, unlike the sibling `nemotron-3-ultra-550b-a55b`/`gpt-oss-120b`
+        // ids where NVIDIA's own number already was the smallest/safest across hosts (see
+        // `nvidia_caps`'s own doc comment for why that reasoning doesn't extend to this id).
+        let c = capabilities("nvidia/nemotron-3-super-120b-a12b");
+        assert_eq!(c.context_window, 262_144);
+        assert_eq!(c.max_output, 4_096);
     }
 
     #[test]

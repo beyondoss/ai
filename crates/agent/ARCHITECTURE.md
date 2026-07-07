@@ -1047,7 +1047,11 @@ as `write("/home/…/f")` would.
   hidden by default cuts real noise like `.git`/editor swapfiles; directories-first is a UX improvement
   independent of parity). Caps the listing at `limit` (default 500, overridable) so a
   `node_modules`-sized directory can't flood context, appending a bracketed `[N more entries; M total —
-  narrow with a subpath or use find/grep]` marker when it truncates. Matches the reference agent on: a
+  use limit={2x} for more, or narrow with a subpath or use find/grep]` marker when it truncates — the
+  `limit={2x}` suggestion matches `grep`/`find`'s own truncation notices (and pi's own `ls.ts`, whose
+  `"${effectiveLimit} entries limit reached. Use limit=${effectiveLimit * 2} for more"` this was
+  originally missing entirely); the "narrow with a subpath or use find/grep" half is additional,
+  Beyond-specific guidance kept alongside it, not replaced by it. Matches the reference agent on: a
   missing path or non-directory path gets a clean `Path not found: {path}`/`Not a directory: {path}`
   message instead of a raw OS errno string; each entry's directory-ness follows symlinks
   (`std::fs::metadata` on the entry's full path, not the lstat-like `DirEntry::file_type`), so a symlink
