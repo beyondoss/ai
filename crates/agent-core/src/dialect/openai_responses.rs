@@ -418,7 +418,10 @@ pub fn build_body(req: &ModelRequest) -> Value {
     // wire-level opt-out (`ModelRequest::block_images`) — an image is downgraded to a text
     // placeholder when either is unsupported/blocked, regardless of when/how it entered history.
     let supports_vision = caps.supports_vision && !req.block_images;
-    let mut input: Vec<Value> = Vec::new();
+    // +1 for the optional leading `instructions`/system entry pushed below; some roles push more than
+    // one entry per source message, so this is a lower-bound hint, not an exact count — still avoids
+    // most of the reallocations a `Vec::new()` start would otherwise pay as the common case fills in.
+    let mut input: Vec<Value> = Vec::with_capacity(req.messages.len() + 1);
 
     // Codex/ChatGPT's own backend wants the system prompt carried in a separate top-level
     // `instructions` field (below) instead of folded into `input[0]` — every other route keeps this

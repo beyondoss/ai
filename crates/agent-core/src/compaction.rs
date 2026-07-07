@@ -13,6 +13,7 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::message::{ContentBlock, Message, Role, StopReason};
 use crate::session::Session;
@@ -219,6 +220,26 @@ pub fn estimate_tokens(text: &str) -> u32 {
     (text.chars().count() / 4) as u32
 }
 
+/// Count `value`'s characters as its wire JSON would render, without materializing that JSON as a
+/// `String` first — `serde_json::Value`'s `Display` impl already writes through `fmt::Write` rather
+/// than building a buffer internally, so feeding it a counting-only sink (instead of collecting into a
+/// `String` via `to_string()`) skips the allocation entirely for what `estimate_message_tokens` only
+/// ever uses as a length, on a call already made once per tool-call block on every turn.
+fn count_value_chars(value: &Value) -> usize {
+    struct CharCount(usize);
+    impl std::fmt::Write for CharCount {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            self.0 += s.chars().count();
+            Ok(())
+        }
+    }
+    let mut counter = CharCount(0);
+    // `Value`'s `Display` impl never fails to format, so a write error here would only ever indicate
+    // the sink itself (which never returns `Err`) — safe to discard.
+    let _ = std::fmt::Write::write_fmt(&mut counter, format_args!("{value}"));
+    counter.0
+}
+
 /// Estimate one message's token cost from its blocks. `pub(crate)`: also used by
 /// [`crate::branch_summary`] to window a branch's transcript by token budget.
 ///
@@ -236,7 +257,7 @@ pub(crate) fn estimate_message_tokens(m: &Message) -> u32 {
             ContentBlock::Thinking { text, .. } => text.chars().count(),
             ContentBlock::RedactedThinking { data } => data.chars().count(),
             ContentBlock::ToolUse { name, input, .. } => {
-                name.chars().count() + input.to_string().chars().count()
+                name.chars().count() + count_value_chars(input)
             }
             ContentBlock::ToolResult { content, .. } => content.chars().count(),
             // Matches pi's flat `ESTIMATED_IMAGE_CHARS` (4800, chars/4 = 1200 tokens) for an image

@@ -1353,6 +1353,11 @@ impl Agent {
                     }
                     let mut outcomes: Vec<Option<GateOutcome>> = vec![None; calls.len()];
                     let mut gate_cancelled = false;
+                    // The active model can't change mid-turn (only at a turn boundary — see the
+                    // mid-run model-switching capability), so this is the same value for every call in
+                    // the batch: computed once here instead of once per call inside the loop below.
+                    let supports_vision = crate::models::capabilities(&this.model).supports_vision
+                        && !this.block_images;
                     for (i, (id, name, input)) in calls.iter().enumerate() {
                         if cancel_ref.is_cancelled() {
                             gate_cancelled = true;
@@ -1415,9 +1420,7 @@ impl Agent {
                         if let Some(obj) = coerced.as_object_mut() {
                             obj.insert(
                                 "_model_supports_vision".to_string(),
-                                (crate::models::capabilities(&this.model).supports_vision
-                                    && !this.block_images)
-                                    .into(),
+                                supports_vision.into(),
                             );
                         }
                         if let Some(reason) = match catch_tool_panic(this.hooks.before_tool_call(
@@ -1786,6 +1789,10 @@ impl Agent {
     ) -> (Vec<Option<ToolCallResult>>, bool) {
         let mut results: Vec<Option<ToolCallResult>> = vec![None; calls.len()];
         let mut cancelled_mid_dispatch = false;
+        // Same hoist as the default gate loop above: the active model is fixed for the whole turn, so
+        // this is computed once instead of once per call inside the loop below.
+        let supports_vision =
+            crate::models::capabilities(&self.model).supports_vision && !self.block_images;
         for (i, (id, name, input)) in calls.iter().enumerate() {
             if cancel.is_cancelled() {
                 cancelled_mid_dispatch = true;
@@ -1817,12 +1824,7 @@ impl Agent {
                 crate::validation::coerce_tool_arguments(&tool.input_schema(), input.clone())
                     .unwrap_or_else(|_| input.clone());
             if let Some(obj) = coerced.as_object_mut() {
-                obj.insert(
-                    "_model_supports_vision".to_string(),
-                    (crate::models::capabilities(&self.model).supports_vision
-                        && !self.block_images)
-                        .into(),
-                );
+                obj.insert("_model_supports_vision".to_string(), supports_vision.into());
             }
             let blocked = match catch_tool_panic(
                 self.hooks.before_tool_call(name, &coerced, session, cancel),
