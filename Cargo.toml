@@ -33,9 +33,15 @@ unimplemented = "deny"
 # size/count never goes unnoticed. Profiles only take effect at the workspace root.
 [profile.release]
 overflow-checks = true
-lto = "fat"
-codegen-units = 1
+# Size + speed (no runtime cost): `strip` drops debug symbols (also shrinks the Docker image, which
+# builds with this profile); `lto = "thin"` and `codegen-units = 1` optimize across the whole crate
+# graph and typically *improve* throughput too — so they fit "performance is a feature", not against
+# it. The price is slower release builds. `opt-level` stays at 3; `opt-level = "z"/"s"` and
+# `panic = "abort"` are deliberately avoided — they'd hurt a throughput-sensitive proxy / change
+# worker-panic isolation.
 strip = true
+lto = "thin"
+codegen-units = 1
 
 # Shared dependency versions. Members opt in with `<dep>.workspace = true`, so the version is pinned
 # once for the whole tree. Only deps used (or expected to be used) by more than one crate live here;
