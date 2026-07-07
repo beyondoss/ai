@@ -386,6 +386,8 @@ fn kill_process_group(pgid: u32) {
         .arg("-KILL")
         .arg(format!("-{pgid}"))
         .status();
+    // TEMP DIAGNOSTIC (pi-parity CI investigation).
+    eprintln!("=== DIAG kill_process_group(pgid={pgid}) group_result={group_result:?} ===");
     // A non-success here (including `kill`'s own exit code, e.g. ESRCH because the group already
     // exited on its own between the timeout firing and this running) isn't worth logging on its own —
     // the group kill covers the overwhelmingly common case, so try the direct fallback next regardless
@@ -393,11 +395,13 @@ fn kill_process_group(pgid: u32) {
     if matches!(&group_result, Ok(status) if status.success()) {
         return;
     }
-    match std::process::Command::new("kill")
+    let fallback_result = std::process::Command::new("kill")
         .arg("-KILL")
         .arg(pgid.to_string())
-        .status()
-    {
+        .status();
+    // TEMP DIAGNOSTIC (pi-parity CI investigation).
+    eprintln!("=== DIAG kill_process_group(pgid={pgid}) fallback_result={fallback_result:?} ===");
+    match fallback_result {
         // Still only the "couldn't even run `kill`" case is worth a warning — a non-zero exit here
         // most likely just means the process (or its whole group) was already gone.
         Ok(_) => {}
@@ -436,6 +440,7 @@ mod tests {
         // 300ms; the process-group kill must reach the grandchild so the marker is never written.
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("leaked");
+        let needle = dir.path().to_string_lossy().into_owned();
         let script = format!("( sleep 1; echo leaked > {} ) & sleep 30", marker.display());
         let res = RealRunner
             .run(
@@ -448,8 +453,40 @@ mod tests {
             .unwrap();
         assert!(res.timed_out);
 
+        // TEMP DIAGNOSTIC (pi-parity CI investigation): snapshot the process tree immediately after
+        // `run()` returns — by now the kill is synchronously awaited, so any process still alive here
+        // whose cmdline mentions this test's own tempdir path tells us exactly what the kill missed.
+        if let Ok(out) = std::process::Command::new("ps")
+            .args(["-eo", "pid,ppid,pgid,stat,cmd"])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            eprintln!("=== DIAG ps snapshot right after run() returned (needle={needle}) ===");
+            for line in text.lines() {
+                if line.contains(&needle) || line.contains("pgid") || line.to_lowercase().contains("pid") {
+                    eprintln!("{line}");
+                }
+            }
+            eprintln!("=== end snapshot ===");
+        }
+
         // Wait past when the grandchild would have written the marker; it must not exist.
         tokio::time::sleep(Duration::from_millis(1200)).await;
+        if marker.exists() {
+            if let Ok(out) = std::process::Command::new("ps")
+                .args(["-eo", "pid,ppid,pgid,stat,cmd"])
+                .output()
+            {
+                let text = String::from_utf8_lossy(&out.stdout);
+                eprintln!("=== DIAG ps snapshot at failure time (needle={needle}) ===");
+                for line in text.lines() {
+                    if line.contains(&needle) {
+                        eprintln!("{line}");
+                    }
+                }
+                eprintln!("=== end snapshot ===");
+            }
+        }
         assert!(
             !marker.exists(),
             "backgrounded grandchild survived the timeout — process group not killed"
