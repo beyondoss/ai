@@ -1356,8 +1356,8 @@ impl Agent {
                     // The active model can't change mid-turn (only at a turn boundary — see the
                     // mid-run model-switching capability), so this is the same value for every call in
                     // the batch: computed once here instead of once per call inside the loop below.
-                    let supports_vision =
-                        crate::models::capabilities(&this.model).supports_vision && !this.block_images;
+                    let supports_vision = crate::models::capabilities(&this.model).supports_vision
+                        && !this.block_images;
                     for (i, (id, name, input)) in calls.iter().enumerate() {
                         if cancel_ref.is_cancelled() {
                             gate_cancelled = true;
