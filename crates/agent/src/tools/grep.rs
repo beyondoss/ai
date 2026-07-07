@@ -1150,7 +1150,9 @@ mod tests {
             .await
             .unwrap()
             .text;
-        assert!(out.contains("[match limit 3 reached; narrow the pattern or use limit=6 for more]"));
+        assert!(
+            out.contains("[match limit 3 reached; narrow the pattern or use limit=6 for more]")
+        );
         let match_lines = out.lines().filter(|l| l.contains("needle")).count();
         assert_eq!(
             match_lines, 3,

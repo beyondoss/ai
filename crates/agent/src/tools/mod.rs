@@ -211,7 +211,11 @@ fn resolve_symlink_target(path: &std::path::Path) -> Option<std::path::PathBuf> 
     if target.is_absolute() {
         Some(target)
     } else {
-        Some(path.parent().unwrap_or_else(|| std::path::Path::new(".")).join(target))
+        Some(
+            path.parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join(target),
+        )
     }
 }
 
@@ -859,7 +863,8 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn is_writable_is_false_when_the_owner_triad_denies_write_even_though_another_triad_allows_it() {
+    fn is_writable_is_false_when_the_owner_triad_denies_write_even_though_another_triad_allows_it()
+    {
         // Pi-parity fix (task 50): `Permissions::readonly()` on Unix checks whether *any* of the three
         // permission triads (owner/group/other) has a write bit set (`mode & 0o222 == 0`) — but the
         // kernel's real access decision for a given caller only ever consults *one* triad: the owner

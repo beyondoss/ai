@@ -1170,8 +1170,14 @@ mod tests {
         assert_eq!(bare_default_provider_name("/v1beta"), None);
 
         // The real bare-default shape still resolves correctly, dialect-picked.
-        assert_eq!(bare_default_provider_name("/v1/messages"), Some("anthropic"));
-        assert_eq!(bare_default_provider_name("/v1/chat/completions"), Some("openai"));
+        assert_eq!(
+            bare_default_provider_name("/v1/messages"),
+            Some("anthropic")
+        );
+        assert_eq!(
+            bare_default_provider_name("/v1/chat/completions"),
+            Some("openai")
+        );
         assert_eq!(bare_default_provider_name("/v1"), Some("openai"));
 
         // Other near-miss prefixes must also be rejected, not just /v1beta.

@@ -336,7 +336,11 @@ fn format_civil_datetime(local_secs: i64, with_time: bool) -> String {
         return format!("{y:04}-{m:02}-{d:02}");
     }
     let time_of_day = local_secs.rem_euclid(86_400);
-    let (hh, mm, ss) = (time_of_day / 3600, (time_of_day % 3600) / 60, time_of_day % 60);
+    let (hh, mm, ss) = (
+        time_of_day / 3600,
+        (time_of_day % 3600) / 60,
+        time_of_day % 60,
+    );
     format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02}")
 }
 

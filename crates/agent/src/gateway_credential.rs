@@ -105,7 +105,10 @@ impl CredentialSource for StaticDirectCredentialSource {
 /// If both a direct Anthropic credential and a Copilot credential (whose `available_model_ids`
 /// includes `model`) are stored, the direct credential wins — checked first below, preferring the
 /// more specific, directly-authenticated relationship over a proxy.
-pub fn resolve_gateway_credential(key: Option<String>, model: &str) -> Result<GatewayCredential, String> {
+pub fn resolve_gateway_credential(
+    key: Option<String>,
+    model: &str,
+) -> Result<GatewayCredential, String> {
     resolve_gateway_credential_with_identity(key, model).map(|(credential, _identity)| credential)
 }
 
@@ -181,9 +184,9 @@ pub fn resolve_gateway_credential_with_identity(
             // formerly a separate `opencode_dialect_override` helper in this file (pi-parity remediation
             // pass 19, Task 1), now folded into the one shared mechanism instead of a second, parallel
             // "which host is this" check.
-            let dialect = over
-                .dialect
-                .unwrap_or_else(|| agent_core::dialect::Dialect::for_model_with_host(model, aggregator_host));
+            let dialect = over.dialect.unwrap_or_else(|| {
+                agent_core::dialect::Dialect::for_model_with_host(model, aggregator_host)
+            });
             // Task #11 (pi-parity feature): resolved through `!command`/`$VAR`/literal syntax (see
             // `ModelOverride::resolved_api_key`'s own doc comment) rather than used as a raw literal —
             // lets an operator avoid storing a plaintext secret in `models.json`.
@@ -269,7 +272,10 @@ pub fn resolve_gateway_credential_with_identity(
                 aggregator_host,
             };
             return Ok((
-                GatewayCredential::Oauth(Arc::new(StaticDirectCredentialSource { bearer, routing })),
+                GatewayCredential::Oauth(Arc::new(StaticDirectCredentialSource {
+                    bearer,
+                    routing,
+                })),
                 identity,
             ));
         }
@@ -344,7 +350,8 @@ pub fn resolve_gateway_credential_with_identity(
                 // body to a `/responses` path. `host: None` — Copilot is matched via a stored
                 // credential's `available_model_ids`, never a BYO `base_url` override, so it has no
                 // `AggregatorHost` of its own to report.
-                let dialect = agent_core::dialect::Dialect::for_model_via_copilot(model, true, None);
+                let dialect =
+                    agent_core::dialect::Dialect::for_model_via_copilot(model, true, None);
                 let path = crate::oauth::github_copilot::copilot_endpoint_path(dialect);
                 let identity = GatewayCredentialIdentity::GithubCopilot {
                     enterprise_url: c.enterprise_url.clone(),
@@ -632,10 +639,14 @@ impl std::fmt::Debug for GatewayCredentialIdentity {
                 .field("provider", provider)
                 .finish(),
             Self::Anthropic => f.write_str("Anthropic"),
-            Self::OpenaiCodex { account_id } => {
-                f.debug_struct("OpenaiCodex").field("account_id", account_id).finish()
-            }
-            Self::GithubCopilot { enterprise_url, path } => f
+            Self::OpenaiCodex { account_id } => f
+                .debug_struct("OpenaiCodex")
+                .field("account_id", account_id)
+                .finish(),
+            Self::GithubCopilot {
+                enterprise_url,
+                path,
+            } => f
                 .debug_struct("GithubCopilot")
                 .field("enterprise_url", enterprise_url)
                 .field("path", path)
@@ -744,7 +755,11 @@ fn direct_route_base_and_path(
 /// `normalizeAzureBaseUrl` host detection (`azure-openai-responses.ts`): the classic Azure OpenAI
 /// resource domain, Azure AI's newer Cognitive Services umbrella domain, and Azure AI Foundry's own
 /// domain — all three are real, current hostnames Azure-hosted OpenAI deployments are reachable under.
-const AZURE_HOST_SUFFIXES: &[&str] = &[".openai.azure.com", ".cognitiveservices.azure.com", ".ai.azure.com"];
+const AZURE_HOST_SUFFIXES: &[&str] = &[
+    ".openai.azure.com",
+    ".cognitiveservices.azure.com",
+    ".ai.azure.com",
+];
 
 /// Fix #34 (pi-parity audit): whether `base_url`'s host is a recognized Azure OpenAI hostname (see
 /// [`AZURE_HOST_SUFFIXES`]) — used both by [`normalize_azure_base_url`] and, independently, by
@@ -754,7 +769,11 @@ fn is_azure_host(base_url: &str) -> bool {
     url::Url::parse(base_url)
         .ok()
         .and_then(|url| url.host_str().map(str::to_string))
-        .is_some_and(|host| AZURE_HOST_SUFFIXES.iter().any(|suffix| host.ends_with(suffix)))
+        .is_some_and(|host| {
+            AZURE_HOST_SUFFIXES
+                .iter()
+                .any(|suffix| host.ends_with(suffix))
+        })
 }
 
 /// Fix #34 (pi-parity audit): if `base_url`'s host is Azure-shaped (see [`is_azure_host`]) *and* its
@@ -769,7 +788,10 @@ fn is_azure_host(base_url: &str) -> bool {
 fn normalize_azure_base_url(base_url: &str) -> Option<String> {
     let url = url::Url::parse(base_url).ok()?;
     let host = url.host_str()?;
-    if !AZURE_HOST_SUFFIXES.iter().any(|suffix| host.ends_with(suffix)) {
+    if !AZURE_HOST_SUFFIXES
+        .iter()
+        .any(|suffix| host.ends_with(suffix))
+    {
         return None;
     }
     let path = url.path().trim_end_matches('/');
@@ -880,7 +902,9 @@ mod tests {
     #[test]
     fn is_azure_host_recognizes_all_three_documented_azure_domains() {
         assert!(is_azure_host("https://my-resource.openai.azure.com"));
-        assert!(is_azure_host("https://my-resource.cognitiveservices.azure.com"));
+        assert!(is_azure_host(
+            "https://my-resource.cognitiveservices.azure.com"
+        ));
         assert!(is_azure_host("https://my-resource.ai.azure.com"));
     }
 
@@ -907,7 +931,8 @@ mod tests {
     }
 
     #[test]
-    fn normalize_azure_base_url_rewrites_the_full_v1_responses_shape_dropping_the_bare_path_suffix() {
+    fn normalize_azure_base_url_rewrites_the_full_v1_responses_shape_dropping_the_bare_path_suffix()
+    {
         assert_eq!(
             normalize_azure_base_url("https://my-resource.openai.azure.com/openai/v1/responses"),
             Some("https://my-resource.openai.azure.com/openai/v1".to_string())
@@ -917,7 +942,9 @@ mod tests {
     #[test]
     fn normalize_azure_base_url_ignores_a_trailing_slash_and_a_query_string() {
         assert_eq!(
-            normalize_azure_base_url("https://my-resource.openai.azure.com/openai/v1/responses/?api-version=v1"),
+            normalize_azure_base_url(
+                "https://my-resource.openai.azure.com/openai/v1/responses/?api-version=v1"
+            ),
             Some("https://my-resource.openai.azure.com/openai/v1".to_string())
         );
     }
@@ -947,7 +974,9 @@ mod tests {
         // The classic per-deployment path shape (`direct_route_base_and_path` builds this one itself)
         // and any other genuinely custom proxy path an operator set up on purpose must not be rewritten.
         assert_eq!(
-            normalize_azure_base_url("https://my-resource.openai.azure.com/openai/deployments/my-deployment"),
+            normalize_azure_base_url(
+                "https://my-resource.openai.azure.com/openai/deployments/my-deployment"
+            ),
             None
         );
     }
@@ -992,7 +1021,10 @@ mod tests {
             direct_route_path(Dialect::Anthropic, "http://host/v1"),
             "/v1/messages"
         );
-        assert_eq!(direct_route_path(Dialect::Anthropic, "http://host"), "/v1/messages");
+        assert_eq!(
+            direct_route_path(Dialect::Anthropic, "http://host"),
+            "/v1/messages"
+        );
     }
 
     #[test]
@@ -1003,13 +1035,17 @@ mod tests {
         use agent_core::dialect::Dialect;
         let (base_url, path) =
             direct_route_base_and_path("http://host/openai/v1", Dialect::OpenAiResponses, None);
-        assert_eq!(format!("{base_url}{path}"), "http://host/openai/v1/responses");
+        assert_eq!(
+            format!("{base_url}{path}"),
+            "http://host/openai/v1/responses"
+        );
     }
 
     #[test]
     fn base_url_without_v1_still_gets_the_full_default_path_unchanged() {
         use agent_core::dialect::Dialect;
-        let (base_url, path) = direct_route_base_and_path("http://host", Dialect::OpenAiResponses, None);
+        let (base_url, path) =
+            direct_route_base_and_path("http://host", Dialect::OpenAiResponses, None);
         assert_eq!(format!("{base_url}{path}"), "http://host/v1/responses");
     }
 
@@ -1017,7 +1053,8 @@ mod tests {
     // convention), composing cleanly with Task 45's fix rather than fighting it.
 
     #[test]
-    fn deployment_name_inserts_a_url_path_segment_for_chat_completions_and_composes_with_api_version_query() {
+    fn deployment_name_inserts_a_url_path_segment_for_chat_completions_and_composes_with_api_version_query()
+     {
         use agent_core::dialect::Dialect;
         let (base_url, path) = direct_route_base_and_path(
             "https://my-resource.openai.azure.com",
@@ -1085,8 +1122,11 @@ mod tests {
         // Even when `base_url` happens to end in `/v1`, the classic deployment convention's own path
         // shape never carries a `/v1` segment at all — this must not try to also strip/detect one.
         use agent_core::dialect::Dialect;
-        let (base_url, path) =
-            direct_route_base_and_path("https://my-resource.openai.azure.com/v1", Dialect::OpenAi, Some("gpt4"));
+        let (base_url, path) = direct_route_base_and_path(
+            "https://my-resource.openai.azure.com/v1",
+            Dialect::OpenAi,
+            Some("gpt4"),
+        );
         assert_eq!(
             format!("{base_url}{path}"),
             "https://my-resource.openai.azure.com/v1/openai/deployments/gpt4/chat/completions"
@@ -1096,8 +1136,11 @@ mod tests {
     #[test]
     fn deployment_name_trims_a_trailing_slash_on_base_url_before_inserting_the_segment() {
         use agent_core::dialect::Dialect;
-        let (base_url, path) =
-            direct_route_base_and_path("https://my-resource.openai.azure.com/", Dialect::OpenAi, Some("gpt4"));
+        let (base_url, path) = direct_route_base_and_path(
+            "https://my-resource.openai.azure.com/",
+            Dialect::OpenAi,
+            Some("gpt4"),
+        );
         assert_eq!(
             format!("{base_url}{path}"),
             "https://my-resource.openai.azure.com/openai/deployments/gpt4/chat/completions"
@@ -1123,7 +1166,10 @@ mod tests {
         assert_eq!(unsupported_wire_format_reason("gpt-5"), None);
         assert_eq!(unsupported_wire_format_reason("claude-opus-4-8"), None);
         // Not an exact match for any of the 3 known ids — must not false-positive on a substring.
-        assert_eq!(unsupported_wire_format_reason("gemini-3-flash-preview"), None);
+        assert_eq!(
+            unsupported_wire_format_reason("gemini-3-flash-preview"),
+            None
+        );
     }
 
     #[test]
@@ -1173,7 +1219,10 @@ mod tests {
     fn aggregator_host_for_base_url_is_none_for_an_opencode_ai_unrelated_path() {
         // Same registered domain as Zen/Go, but neither the `/zen` nor `/zen/go` prefix — must not
         // false-positive into either variant.
-        assert_eq!(aggregator_host_for_base_url("https://opencode.ai/other"), None);
+        assert_eq!(
+            aggregator_host_for_base_url("https://opencode.ai/other"),
+            None
+        );
     }
 
     #[test]
@@ -1253,7 +1302,8 @@ mod tests {
     // `base_url` override with no bearer of its own should still authenticate via a stored OAuth login.
 
     #[test]
-    fn oauth_fallback_provider_picks_anthropic_for_a_claude_dialect_model_with_no_credential_of_its_own() {
+    fn oauth_fallback_provider_picks_anthropic_for_a_claude_dialect_model_with_no_credential_of_its_own()
+     {
         let over = crate::settings::ModelOverride::default();
         assert_eq!(
             oauth_fallback_provider("claude-opus-4-8", &over, None),
@@ -1276,7 +1326,10 @@ mod tests {
             api_key: Some("sk-my-own-key".to_string()),
             ..Default::default()
         };
-        assert_eq!(oauth_fallback_provider("claude-opus-4-8", &over, None), None);
+        assert_eq!(
+            oauth_fallback_provider("claude-opus-4-8", &over, None),
+            None
+        );
     }
 
     #[test]
@@ -1298,7 +1351,8 @@ mod tests {
     }
 
     #[test]
-    fn oauth_fallback_provider_is_none_for_a_third_party_model_that_is_neither_anthropic_nor_codex() {
+    fn oauth_fallback_provider_is_none_for_a_third_party_model_that_is_neither_anthropic_nor_codex()
+    {
         let over = crate::settings::ModelOverride::default();
         assert_eq!(oauth_fallback_provider("llama-3.1-70b", &over, None), None);
     }
@@ -1348,7 +1402,10 @@ mod tests {
 
     #[test]
     fn aggregator_host_for_base_url_is_none_for_an_unrelated_host_or_an_unparsable_url() {
-        assert_eq!(aggregator_host_for_base_url("https://my-ollama-box.example.com"), None);
+        assert_eq!(
+            aggregator_host_for_base_url("https://my-ollama-box.example.com"),
+            None
+        );
         assert_eq!(aggregator_host_for_base_url("not a url at all"), None);
     }
 
@@ -1367,17 +1424,21 @@ mod tests {
 
     #[test]
     fn identity_direct_override_is_equal_only_when_every_distinguishing_field_matches() {
-        let make = |base_url: &str, deployment: Option<&str>| GatewayCredentialIdentity::DirectOverride {
-            base_url: base_url.to_string(),
-            path: "/chat/completions",
-            bearer: "key-1".to_string(),
-            auth_header: None,
-            auth_header_prefix: None,
-            deployment_name: deployment.map(str::to_string),
-            query: None,
-            aggregator_host: None,
-        };
-        assert_eq!(make("https://host/openai/v1", None), make("https://host/openai/v1", None));
+        let make =
+            |base_url: &str, deployment: Option<&str>| GatewayCredentialIdentity::DirectOverride {
+                base_url: base_url.to_string(),
+                path: "/chat/completions",
+                bearer: "key-1".to_string(),
+                auth_header: None,
+                auth_header_prefix: None,
+                deployment_name: deployment.map(str::to_string),
+                query: None,
+                aggregator_host: None,
+            };
+        assert_eq!(
+            make("https://host/openai/v1", None),
+            make("https://host/openai/v1", None)
+        );
         assert_ne!(
             make("https://host-a/openai/v1", None),
             make("https://host-b/openai/v1", None),
@@ -1408,7 +1469,10 @@ mod tests {
 
     #[test]
     fn identity_anthropic_is_a_singleton_equal_to_itself_and_unequal_to_every_other_variant() {
-        assert_eq!(GatewayCredentialIdentity::Anthropic, GatewayCredentialIdentity::Anthropic);
+        assert_eq!(
+            GatewayCredentialIdentity::Anthropic,
+            GatewayCredentialIdentity::Anthropic
+        );
         assert_ne!(
             GatewayCredentialIdentity::Anthropic,
             GatewayCredentialIdentity::StaticKey("anthropic".to_string())
@@ -1484,15 +1548,17 @@ mod tests {
 
     #[test]
     fn identity_direct_override_oauth_is_equal_only_when_every_distinguishing_field_matches() {
-        let make = |base_url: &str, provider: OAuthProviderId| GatewayCredentialIdentity::DirectOverrideOauth {
-            base_url: base_url.to_string(),
-            path: "/v1/messages",
-            auth_header: None,
-            auth_header_prefix: None,
-            deployment_name: None,
-            query: None,
-            aggregator_host: None,
-            provider,
+        let make = |base_url: &str, provider: OAuthProviderId| {
+            GatewayCredentialIdentity::DirectOverrideOauth {
+                base_url: base_url.to_string(),
+                path: "/v1/messages",
+                auth_header: None,
+                auth_header_prefix: None,
+                deployment_name: None,
+                query: None,
+                aggregator_host: None,
+                provider,
+            }
         };
         assert_eq!(
             make("https://host", OAuthProviderId::Anthropic),

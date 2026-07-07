@@ -381,7 +381,10 @@ impl Agent {
     /// at all (a `Fn`, not `FnMut` — the callback closes over its own interior-mutable state, e.g. an
     /// `Arc<Mutex<..>>` or reading the wall clock directly, rather than relying on the `Agent` itself to
     /// carry mutable per-call state).
-    pub fn with_system_fn(mut self, system_fn: impl Fn() -> String + Send + Sync + 'static) -> Self {
+    pub fn with_system_fn(
+        mut self,
+        system_fn: impl Fn() -> String + Send + Sync + 'static,
+    ) -> Self {
         self.system_fn = Some(Box::new(system_fn));
         self
     }
@@ -927,7 +930,8 @@ impl Agent {
                         // own `_runAutoCompaction` catch block ("Context overflow recovery failed:
                         // {error}").
                         Err(compact_err) => {
-                            let message = format!("Context overflow recovery failed: {compact_err}");
+                            let message =
+                                format!("Context overflow recovery failed: {compact_err}");
                             sink(AgentEvent::Error {
                                 message: message.clone(),
                             });
@@ -1285,9 +1289,7 @@ impl Agent {
             // interleaved gate→execute→finalize-per-call path below instead of this function's default
             // gate-the-batch-then-execute split — see `run_tool_calls_interleaved`'s own doc comment.
             let sequential_execution_requested = calls.iter().any(|(_, name, _)| {
-                current_tools
-                    .get(name)
-                    .and_then(|t| t.execution_mode())
+                current_tools.get(name).and_then(|t| t.execution_mode())
                     == Some(crate::tool::ToolExecutionMode::Sequential)
             });
             let mut groups: HashMap<String, (Option<String>, Vec<usize>)> = HashMap::new();
@@ -1316,332 +1318,342 @@ impl Agent {
             let session_ref: &Session = session;
             let cancel_ref = &cancel;
 
-            let (results, cancelled_mid_dispatch): (Vec<Option<ToolCallResult>>, bool) = if sequential_execution_requested {
-                self.run_tool_calls_interleaved(
-                    session_ref,
-                    &calls,
-                    malformed,
-                    cancel_ref,
-                    &mut sink,
-                    &current_tools,
-                )
-                .await
-            } else {
-                // Phase 1 — gate every call sequentially, in call order, before any call's actual
-                // execution begins: the malformed-args check and the `before_tool_call` hook both run
-                // here, one call fully resolved before the next call's gate even starts. Matches pi's
-                // `prepareToolCall`, resolved in a plain sequential loop ahead of
-                // `executeToolCallsParallel`'s `Promise.all` (agent-loop.ts:451-516; the
-                // `ToolExecutionMode` doc comment at types.ts:34-41 states the same contract). Without
-                // this, a later-declared call's gate could run concurrently with an earlier-approved
-                // call's own tool already executing — a permission hook reasoning about "what's already
-                // running" (a concurrency-aware policy, a rate limiter) would see a half-approved batch
-                // instead of a fully-gated one. Only the execution + `after_tool_call` phase below this
-                // one actually parallelizes.
-                //
-                // `outcomes[i]` ends up `Some(Immediate(result))` for a call fully resolved without ever
-                // running (malformed streamed args, or a hook block), `Some(Ready(coerced))` for a call
-                // that cleared its gate and is ready to actually run in phase 2, or `None` only if
-                // cancellation cut this loop short before reaching it.
-                #[derive(Clone)]
-                enum GateOutcome {
-                    Immediate(ToolCallResult),
-                    Ready(Value),
-                }
-                let mut outcomes: Vec<Option<GateOutcome>> = vec![None; calls.len()];
-                let mut gate_cancelled = false;
-                for (i, (id, name, input)) in calls.iter().enumerate() {
-                    if cancel_ref.is_cancelled() {
-                        gate_cancelled = true;
-                        break;
-                    }
-                    if let Some(raw) = malformed.get(id) {
-                        // The model streamed a tool call whose argument fragments never formed valid
-                        // JSON. Feed that back as an error result the model can correct next turn rather
-                        // than aborting the whole run on one malformed call.
-                        outcomes[i] = Some(GateOutcome::Immediate((
-                            format!(
-                                "tool call arguments were not valid JSON and could not be parsed: {raw}"
-                            ),
-                            Vec::new(),
-                            true,
-                            false,
-                        )));
-                        continue;
-                    }
-                    // Pi-parity fix: pi's `prepareToolCall` looks up the tool *first* — an unregistered
-                    // tool name resolves straight to its "not found" immediate outcome before
-                    // `prepareToolCallArguments`, `validateToolArguments`, or `config.beforeToolCall` ever
-                    // run (`agent-loop.ts`'s `prepareToolCall`, `!tool` branch). This used to fall through
-                    // to the coercion step and `before_tool_call` below with `input.clone()` unchanged,
-                    // invoking the permission hook for a call that was never going to run anyway — the
-                    // "unknown tool" outcome only surfaced later, in this turn's execution phase. Detect
-                    // it here instead, before either runs, short-circuiting straight to the exact same
-                    // "unknown tool: {name}" error result the execution phase below already produces —
-                    // only *when* it's detected moves, not the message or outcome itself.
-                    let Some(tool) = current_tools.get(name) else {
-                        outcomes[i] = Some(GateOutcome::Immediate((
-                            format!("unknown tool: {name}"),
-                            Vec::new(),
-                            true,
-                            false,
-                        )));
-                        continue;
-                    };
-                    // Best-effort pi-parity coercion (`validation.rs`, matches pi's AJV-backed
-                    // `validateToolArguments`): a provider that stringified a primitive the model emitted
-                    // as genuinely typed (`{"count":"42"}` instead of `{"count":42}`) would otherwise fail
-                    // the tool's own `as_i64()`/`as_bool()` extraction with a confusing "missing field"
-                    // error. Falls back to the raw input unchanged on any coercion failure — a genuinely
-                    // malformed call still surfaces through the tool's own existing, clearer validation
-                    // error rather than a new failure path. Run *before* `before_tool_call` (pi-parity
-                    // fix — matches pi's `prepareToolCall`, which calls `validateToolArguments` before
-                    // `config.beforeToolCall`): a permission hook must see the same coerced/typed
-                    // arguments the tool itself is about to run with, not the model's raw, possibly
-                    // stringified wire values.
-                    let mut coerced = crate::validation::coerce_tool_arguments(
-                        &tool.input_schema(),
-                        input.clone(),
-                    )
-                    .unwrap_or_else(|_| input.clone());
-                    // Task #36 (pi-parity): lets `read` append a "current model doesn't support
-                    // images" note when it reads an image file — schema-undocumented, so it's
-                    // invisible to the model and ignored by every other tool. Task #26 (pi-parity):
-                    // `this.block_images` is an operator-facing override that forces this same
-                    // downgrade path regardless of the model's real capability.
-                    if let Some(obj) = coerced.as_object_mut() {
-                        obj.insert(
-                            "_model_supports_vision".to_string(),
-                            (crate::models::capabilities(&this.model).supports_vision
-                                && !this.block_images)
-                                .into(),
-                        );
-                    }
-                    if let Some(reason) = match catch_tool_panic(
-                        this.hooks.before_tool_call(name, &coerced, session_ref, cancel_ref),
+            let (results, cancelled_mid_dispatch): (Vec<Option<ToolCallResult>>, bool) =
+                if sequential_execution_requested {
+                    self.run_tool_calls_interleaved(
+                        session_ref,
+                        &calls,
+                        malformed,
+                        cancel_ref,
+                        &mut sink,
+                        &current_tools,
                     )
                     .await
-                    {
-                        // A panicking permission hook fails closed: better to block the call than to
-                        // silently treat a crashed check as "allowed".
-                        Ok(reason) => reason,
-                        Err(panic_msg) => Some(panic_msg),
-                    } {
-                        // A hook blocked the call (e.g. a permission policy). Feed the reason back as an
-                        // error result instead of running the tool.
-                        outcomes[i] = Some(GateOutcome::Immediate((
-                            format!("tool call blocked: {reason}"),
-                            Vec::new(),
-                            true,
-                            false,
-                        )));
-                        continue;
+                } else {
+                    // Phase 1 — gate every call sequentially, in call order, before any call's actual
+                    // execution begins: the malformed-args check and the `before_tool_call` hook both run
+                    // here, one call fully resolved before the next call's gate even starts. Matches pi's
+                    // `prepareToolCall`, resolved in a plain sequential loop ahead of
+                    // `executeToolCallsParallel`'s `Promise.all` (agent-loop.ts:451-516; the
+                    // `ToolExecutionMode` doc comment at types.ts:34-41 states the same contract). Without
+                    // this, a later-declared call's gate could run concurrently with an earlier-approved
+                    // call's own tool already executing — a permission hook reasoning about "what's already
+                    // running" (a concurrency-aware policy, a rate limiter) would see a half-approved batch
+                    // instead of a fully-gated one. Only the execution + `after_tool_call` phase below this
+                    // one actually parallelizes.
+                    //
+                    // `outcomes[i]` ends up `Some(Immediate(result))` for a call fully resolved without ever
+                    // running (malformed streamed args, or a hook block), `Some(Ready(coerced))` for a call
+                    // that cleared its gate and is ready to actually run in phase 2, or `None` only if
+                    // cancellation cut this loop short before reaching it.
+                    #[derive(Clone)]
+                    enum GateOutcome {
+                        Immediate(ToolCallResult),
+                        Ready(Value),
                     }
-                    // Task #3 (pi-parity, high-severity): re-check cancellation *after* `before_tool_call`
-                    // returned — not just at the top of this loop iteration. A slow permission-check hook
-                    // can observe cancellation firing mid-await; without this second check, a single-call
-                    // (or last-in-batch) turn had no *later* iteration to catch it, so the call was marked
-                    // `Ready` and phase 2 dispatched it for real despite the run having already been
-                    // cancelled. Treated exactly like a cancellation caught at the top of the loop:
-                    // `outcomes[i]` stays `None` and `gate_cancelled` skips phase 2 entirely, so
-                    // `repair_cancelled_dispatch` below synthesizes the same cancelled error result it
-                    // already does for any other call cut short mid-gate.
-                    if cancel_ref.is_cancelled() {
-                        gate_cancelled = true;
-                        break;
+                    let mut outcomes: Vec<Option<GateOutcome>> = vec![None; calls.len()];
+                    let mut gate_cancelled = false;
+                    for (i, (id, name, input)) in calls.iter().enumerate() {
+                        if cancel_ref.is_cancelled() {
+                            gate_cancelled = true;
+                            break;
+                        }
+                        if let Some(raw) = malformed.get(id) {
+                            // The model streamed a tool call whose argument fragments never formed valid
+                            // JSON. Feed that back as an error result the model can correct next turn rather
+                            // than aborting the whole run on one malformed call.
+                            outcomes[i] = Some(GateOutcome::Immediate((
+                                format!(
+                                    "tool call arguments were not valid JSON and could not be parsed: {raw}"
+                                ),
+                                Vec::new(),
+                                true,
+                                false,
+                            )));
+                            continue;
+                        }
+                        // Pi-parity fix: pi's `prepareToolCall` looks up the tool *first* — an unregistered
+                        // tool name resolves straight to its "not found" immediate outcome before
+                        // `prepareToolCallArguments`, `validateToolArguments`, or `config.beforeToolCall` ever
+                        // run (`agent-loop.ts`'s `prepareToolCall`, `!tool` branch). This used to fall through
+                        // to the coercion step and `before_tool_call` below with `input.clone()` unchanged,
+                        // invoking the permission hook for a call that was never going to run anyway — the
+                        // "unknown tool" outcome only surfaced later, in this turn's execution phase. Detect
+                        // it here instead, before either runs, short-circuiting straight to the exact same
+                        // "unknown tool: {name}" error result the execution phase below already produces —
+                        // only *when* it's detected moves, not the message or outcome itself.
+                        let Some(tool) = current_tools.get(name) else {
+                            outcomes[i] = Some(GateOutcome::Immediate((
+                                format!("unknown tool: {name}"),
+                                Vec::new(),
+                                true,
+                                false,
+                            )));
+                            continue;
+                        };
+                        // Best-effort pi-parity coercion (`validation.rs`, matches pi's AJV-backed
+                        // `validateToolArguments`): a provider that stringified a primitive the model emitted
+                        // as genuinely typed (`{"count":"42"}` instead of `{"count":42}`) would otherwise fail
+                        // the tool's own `as_i64()`/`as_bool()` extraction with a confusing "missing field"
+                        // error. Falls back to the raw input unchanged on any coercion failure — a genuinely
+                        // malformed call still surfaces through the tool's own existing, clearer validation
+                        // error rather than a new failure path. Run *before* `before_tool_call` (pi-parity
+                        // fix — matches pi's `prepareToolCall`, which calls `validateToolArguments` before
+                        // `config.beforeToolCall`): a permission hook must see the same coerced/typed
+                        // arguments the tool itself is about to run with, not the model's raw, possibly
+                        // stringified wire values.
+                        let mut coerced = crate::validation::coerce_tool_arguments(
+                            &tool.input_schema(),
+                            input.clone(),
+                        )
+                        .unwrap_or_else(|_| input.clone());
+                        // Task #36 (pi-parity): lets `read` append a "current model doesn't support
+                        // images" note when it reads an image file — schema-undocumented, so it's
+                        // invisible to the model and ignored by every other tool. Task #26 (pi-parity):
+                        // `this.block_images` is an operator-facing override that forces this same
+                        // downgrade path regardless of the model's real capability.
+                        if let Some(obj) = coerced.as_object_mut() {
+                            obj.insert(
+                                "_model_supports_vision".to_string(),
+                                (crate::models::capabilities(&this.model).supports_vision
+                                    && !this.block_images)
+                                    .into(),
+                            );
+                        }
+                        if let Some(reason) = match catch_tool_panic(this.hooks.before_tool_call(
+                            name,
+                            &coerced,
+                            session_ref,
+                            cancel_ref,
+                        ))
+                        .await
+                        {
+                            // A panicking permission hook fails closed: better to block the call than to
+                            // silently treat a crashed check as "allowed".
+                            Ok(reason) => reason,
+                            Err(panic_msg) => Some(panic_msg),
+                        } {
+                            // A hook blocked the call (e.g. a permission policy). Feed the reason back as an
+                            // error result instead of running the tool.
+                            outcomes[i] = Some(GateOutcome::Immediate((
+                                format!("tool call blocked: {reason}"),
+                                Vec::new(),
+                                true,
+                                false,
+                            )));
+                            continue;
+                        }
+                        // Task #3 (pi-parity, high-severity): re-check cancellation *after* `before_tool_call`
+                        // returned — not just at the top of this loop iteration. A slow permission-check hook
+                        // can observe cancellation firing mid-await; without this second check, a single-call
+                        // (or last-in-batch) turn had no *later* iteration to catch it, so the call was marked
+                        // `Ready` and phase 2 dispatched it for real despite the run having already been
+                        // cancelled. Treated exactly like a cancellation caught at the top of the loop:
+                        // `outcomes[i]` stays `None` and `gate_cancelled` skips phase 2 entirely, so
+                        // `repair_cancelled_dispatch` below synthesizes the same cancelled error result it
+                        // already does for any other call cut short mid-gate.
+                        if cancel_ref.is_cancelled() {
+                            gate_cancelled = true;
+                            break;
+                        }
+                        outcomes[i] = Some(GateOutcome::Ready(coerced));
                     }
-                    outcomes[i] = Some(GateOutcome::Ready(coerced));
-                }
-                let outcomes = Arc::new(outcomes);
+                    let outcomes = Arc::new(outcomes);
 
-                // `None` until that call's group finishes (or phase 1 above resolved it directly); a slot
-                // left `None` after dispatch means cancellation aborted it before it ran, and
-                // `repair_cancelled_dispatch` needs to tell that apart from a real (possibly empty) result
-                // to synthesize a matching error `tool_result` for it.
-                let mut results: Vec<Option<ToolCallResult>> = vec![None; calls.len()];
-                // Phase 2 — actually execute every gated call, grouped and bounded exactly as before:
-                // skipped entirely when phase 1 above was itself cut short by cancellation (nothing gated
-                // means nothing left to execute).
-                let mut cancelled_mid_dispatch = gate_cancelled;
-                if !gate_cancelled {
-                    // Per-turn progress channel: every call gets a `ToolProgress` cloning `prog_tx`; the
-                    // drain loop below forwards each update to `sink` as it arrives. `futures`' mpsc keeps
-                    // this executor-agnostic (no tokio in the library).
-                    let (prog_tx, mut prog_rx) =
-                        futures::channel::mpsc::unbounded::<crate::tool::ToolUpdate>();
-                    let prog_tx = &prog_tx;
-                    let group_runs = groups.into_values().map(|(target, indices)| {
-                        let calls = &calls;
-                        let prog_tx = prog_tx.clone();
-                        let cancel = cancel_ref.clone();
-                        let write_locks = this.write_locks.clone();
-                        let outcomes = outcomes.clone();
-                        let current_tools = current_tools.clone();
-                        async move {
-                            // Held for the group's whole serial run: extends the intra-turn grouping above
-                            // across turn and session boundaries, so a concurrently-running turn (or a
-                            // different session sharing this `Agent`'s registry) touching the same path
-                            // really waits, not just calls within this one turn.
-                            let _write_guard = match &target {
-                                Some(path) => Some(write_locks.lock(path).await),
-                                None => None,
-                            };
-                            let mut out = Vec::with_capacity(indices.len());
-                            for i in indices {
-                                let (id, name, input) = &calls[i];
-                                // Per call: (text, images, is_error, terminate). Hooks rewrite the *text*
-                                // and error flag; images and the terminate hint pass through untouched.
-                                // The gate/coercion decision itself was already made, sequentially and in
-                                // call order, by phase 1 above — this only ever runs the tool (or replays
-                                // an already-immediate outcome) and the `after_tool_call` rewrite.
-                                let result: ToolCallResult = match outcomes[i].clone() {
-                                    Some(GateOutcome::Immediate(result)) => result,
-                                    Some(GateOutcome::Ready(coerced)) => {
-                                        let progress = crate::tool::ToolProgress::new(
-                                            prog_tx.clone(),
-                                            id.clone(),
-                                            name.clone(),
-                                            cancel.clone(),
-                                        );
-                                        let (text, images, is_error, terminate) =
-                                            match current_tools.get(name) {
-                                                Some(tool) => {
-                                                    match catch_tool_panic(
-                                                        tool.run_streaming(coerced, &progress),
-                                                    )
-                                                    .await
-                                                    {
-                                                        Ok(Ok(o)) => {
-                                                            (o.text, o.images, false, o.terminate)
-                                                        }
-                                                        Ok(Err(e)) => {
-                                                            (e.to_string(), Vec::new(), true, false)
-                                                        }
-                                                        Err(panic_msg) => {
-                                                            (panic_msg, Vec::new(), true, false)
+                    // `None` until that call's group finishes (or phase 1 above resolved it directly); a slot
+                    // left `None` after dispatch means cancellation aborted it before it ran, and
+                    // `repair_cancelled_dispatch` needs to tell that apart from a real (possibly empty) result
+                    // to synthesize a matching error `tool_result` for it.
+                    let mut results: Vec<Option<ToolCallResult>> = vec![None; calls.len()];
+                    // Phase 2 — actually execute every gated call, grouped and bounded exactly as before:
+                    // skipped entirely when phase 1 above was itself cut short by cancellation (nothing gated
+                    // means nothing left to execute).
+                    let mut cancelled_mid_dispatch = gate_cancelled;
+                    if !gate_cancelled {
+                        // Per-turn progress channel: every call gets a `ToolProgress` cloning `prog_tx`; the
+                        // drain loop below forwards each update to `sink` as it arrives. `futures`' mpsc keeps
+                        // this executor-agnostic (no tokio in the library).
+                        let (prog_tx, mut prog_rx) =
+                            futures::channel::mpsc::unbounded::<crate::tool::ToolUpdate>();
+                        let prog_tx = &prog_tx;
+                        let group_runs = groups.into_values().map(|(target, indices)| {
+                            let calls = &calls;
+                            let prog_tx = prog_tx.clone();
+                            let cancel = cancel_ref.clone();
+                            let write_locks = this.write_locks.clone();
+                            let outcomes = outcomes.clone();
+                            let current_tools = current_tools.clone();
+                            async move {
+                                // Held for the group's whole serial run: extends the intra-turn grouping above
+                                // across turn and session boundaries, so a concurrently-running turn (or a
+                                // different session sharing this `Agent`'s registry) touching the same path
+                                // really waits, not just calls within this one turn.
+                                let _write_guard = match &target {
+                                    Some(path) => Some(write_locks.lock(path).await),
+                                    None => None,
+                                };
+                                let mut out = Vec::with_capacity(indices.len());
+                                for i in indices {
+                                    let (id, name, input) = &calls[i];
+                                    // Per call: (text, images, is_error, terminate). Hooks rewrite the *text*
+                                    // and error flag; images and the terminate hint pass through untouched.
+                                    // The gate/coercion decision itself was already made, sequentially and in
+                                    // call order, by phase 1 above — this only ever runs the tool (or replays
+                                    // an already-immediate outcome) and the `after_tool_call` rewrite.
+                                    let result: ToolCallResult = match outcomes[i].clone() {
+                                        Some(GateOutcome::Immediate(result)) => result,
+                                        Some(GateOutcome::Ready(coerced)) => {
+                                            let progress = crate::tool::ToolProgress::new(
+                                                prog_tx.clone(),
+                                                id.clone(),
+                                                name.clone(),
+                                                cancel.clone(),
+                                            );
+                                            let (text, images, is_error, terminate) =
+                                                match current_tools.get(name) {
+                                                    Some(tool) => {
+                                                        match catch_tool_panic(
+                                                            tool.run_streaming(coerced, &progress),
+                                                        )
+                                                        .await
+                                                        {
+                                                            Ok(Ok(o)) => (
+                                                                o.text,
+                                                                o.images,
+                                                                false,
+                                                                o.terminate,
+                                                            ),
+                                                            Ok(Err(e)) => (
+                                                                e.to_string(),
+                                                                Vec::new(),
+                                                                true,
+                                                                false,
+                                                            ),
+                                                            Err(panic_msg) => {
+                                                                (panic_msg, Vec::new(), true, false)
+                                                            }
                                                         }
                                                     }
-                                                }
-                                                None => (
-                                                    format!("unknown tool: {name}"),
-                                                    Vec::new(),
-                                                    true,
-                                                    false,
-                                                ),
-                                            };
-                                        // Let a hook rewrite the result text/images (redact, cap,
-                                        // reclassify) before it's fed back to the model. A panicking hook
-                                        // here just keeps the tool's own original (text, images, is_error)
-                                        // — losing a real, already-obtained result to a broken *rewrite*
-                                        // attempt would be strictly worse than ignoring the rewrite.
-                                        let (text, images, is_error) = match catch_tool_panic(
-                                            this.hooks.after_tool_call(
-                                                name,
-                                                input,
-                                                text.clone(),
-                                                images.clone(),
-                                                is_error,
-                                                session_ref,
-                                                &cancel,
-                                            ),
-                                        )
-                                        .await
-                                        {
-                                            Ok(rewritten) => rewritten,
-                                            Err(_) => (text, images, is_error),
-                                        };
-                                        (text, images, is_error, terminate)
-                                    }
-                                    // Only reachable if cancellation cut phase 1's sequential gate loop
-                                    // short before reaching this call — but that path sets
-                                    // `gate_cancelled` and skips this whole execution phase, so this arm
-                                    // never actually runs in practice. Kept so the match stays exhaustive
-                                    // without an `.unwrap()`.
-                                    None => (
-                                        "cancelled: tool call aborted before it finished".to_string(),
-                                        Vec::new(),
-                                        true,
-                                        false,
-                                    ),
-                                };
-                                // Sent the instant this call's own result is known — not batched until
-                                // every group in the turn finishes — so a client watching the event stream
-                                // sees each tool's completion as it actually happens, not all-at-once
-                                // after the slowest concurrently-dispatched call joins.
-                                prog_tx
-                                    .unbounded_send(crate::tool::ToolUpdate::End {
-                                        id: id.clone(),
-                                        name: name.clone(),
-                                        result: result.0.clone(),
-                                        is_error: result.2,
-                                    })
-                                    .ok();
-                                out.push((i, result));
-                            }
-                            out
-                        }
-                    });
-                    // Bound how many groups run at once. `buffer_unordered` is safe here because each
-                    // group yields its results tagged with their original call index `i`; cross-group
-                    // completion order never reaches the transcript, which is rebuilt in call order below.
-                    // `exclusive_turn` caps this at 1 instead — with only ever one group in flight, a
-                    // `bash` call (or anything else `conservative_exclusive`) can't race a same-turn
-                    // `edit`/`write` group it has no path to be grouped against; which group runs first
-                    // still doesn't matter for the transcript, same as the concurrent case.
-                    // `self.sequential_tools` caps it at 1 too, host-selected rather than inferred from the
-                    // calls themselves — e.g. a deterministic-repro debugging session, or a host policy
-                    // that never wants two tool calls actually overlapping.
-                    //
-                    // Race the whole execution phase against cancellation: a tripped token drops `drain`,
-                    // which drops every in-flight tool future — aborting a hung `bash` (its
-                    // `kill_on_drop` child dies) and any other long-running tool — and returns promptly
-                    // instead of waiting them all out. The block scopes `drain`'s `&mut results` borrow so
-                    // the transcript below can consume them; `cancelled_mid_dispatch` is only *acted on*
-                    // after the block ends and that borrow is fully released (repairing the transcript
-                    // needs to move `results` out).
-                    let concurrency = if self.sequential_tools || exclusive_turn {
-                        1
-                    } else {
-                        MAX_CONCURRENT_TOOL_GROUPS
-                    };
-                    let drain = async {
-                        let mut group_stream = futures::stream::iter(group_runs)
-                            .buffer_unordered(concurrency)
-                            .fuse();
-                        // Forward tool-progress chunks to `sink` as they arrive, racing them against group
-                        // completion (progress biased first so chunks flush promptly). The loop ends when
-                        // every group has finished; the progress channel's senders outlive it, so we stop
-                        // on `group_stream`, not on the receiver.
-                        loop {
-                            futures::select_biased! {
-                                prog = prog_rx.next() => {
-                                    if let Some(u) = prog {
-                                        emit_tool_update(&mut sink, u);
-                                    }
+                                                    None => (
+                                                        format!("unknown tool: {name}"),
+                                                        Vec::new(),
+                                                        true,
+                                                        false,
+                                                    ),
+                                                };
+                                            // Let a hook rewrite the result text/images (redact, cap,
+                                            // reclassify) before it's fed back to the model. A panicking hook
+                                            // here just keeps the tool's own original (text, images, is_error)
+                                            // — losing a real, already-obtained result to a broken *rewrite*
+                                            // attempt would be strictly worse than ignoring the rewrite.
+                                            let (text, images, is_error) =
+                                                match catch_tool_panic(this.hooks.after_tool_call(
+                                                    name,
+                                                    input,
+                                                    text.clone(),
+                                                    images.clone(),
+                                                    is_error,
+                                                    session_ref,
+                                                    &cancel,
+                                                ))
+                                                .await
+                                                {
+                                                    Ok(rewritten) => rewritten,
+                                                    Err(_) => (text, images, is_error),
+                                                };
+                                            (text, images, is_error, terminate)
+                                        }
+                                        // Only reachable if cancellation cut phase 1's sequential gate loop
+                                        // short before reaching this call — but that path sets
+                                        // `gate_cancelled` and skips this whole execution phase, so this arm
+                                        // never actually runs in practice. Kept so the match stays exhaustive
+                                        // without an `.unwrap()`.
+                                        None => (
+                                            "cancelled: tool call aborted before it finished"
+                                                .to_string(),
+                                            Vec::new(),
+                                            true,
+                                            false,
+                                        ),
+                                    };
+                                    // Sent the instant this call's own result is known — not batched until
+                                    // every group in the turn finishes — so a client watching the event stream
+                                    // sees each tool's completion as it actually happens, not all-at-once
+                                    // after the slowest concurrently-dispatched call joins.
+                                    prog_tx
+                                        .unbounded_send(crate::tool::ToolUpdate::End {
+                                            id: id.clone(),
+                                            name: name.clone(),
+                                            result: result.0.clone(),
+                                            is_error: result.2,
+                                        })
+                                        .ok();
+                                    out.push((i, result));
                                 }
-                                group = group_stream.next() => match group {
-                                    Some(group) => {
-                                        for (i, result) in group {
-                                            results[i] = Some(result);
+                                out
+                            }
+                        });
+                        // Bound how many groups run at once. `buffer_unordered` is safe here because each
+                        // group yields its results tagged with their original call index `i`; cross-group
+                        // completion order never reaches the transcript, which is rebuilt in call order below.
+                        // `exclusive_turn` caps this at 1 instead — with only ever one group in flight, a
+                        // `bash` call (or anything else `conservative_exclusive`) can't race a same-turn
+                        // `edit`/`write` group it has no path to be grouped against; which group runs first
+                        // still doesn't matter for the transcript, same as the concurrent case.
+                        // `self.sequential_tools` caps it at 1 too, host-selected rather than inferred from the
+                        // calls themselves — e.g. a deterministic-repro debugging session, or a host policy
+                        // that never wants two tool calls actually overlapping.
+                        //
+                        // Race the whole execution phase against cancellation: a tripped token drops `drain`,
+                        // which drops every in-flight tool future — aborting a hung `bash` (its
+                        // `kill_on_drop` child dies) and any other long-running tool — and returns promptly
+                        // instead of waiting them all out. The block scopes `drain`'s `&mut results` borrow so
+                        // the transcript below can consume them; `cancelled_mid_dispatch` is only *acted on*
+                        // after the block ends and that borrow is fully released (repairing the transcript
+                        // needs to move `results` out).
+                        let concurrency = if self.sequential_tools || exclusive_turn {
+                            1
+                        } else {
+                            MAX_CONCURRENT_TOOL_GROUPS
+                        };
+                        let drain = async {
+                            let mut group_stream = futures::stream::iter(group_runs)
+                                .buffer_unordered(concurrency)
+                                .fuse();
+                            // Forward tool-progress chunks to `sink` as they arrive, racing them against group
+                            // completion (progress biased first so chunks flush promptly). The loop ends when
+                            // every group has finished; the progress channel's senders outlive it, so we stop
+                            // on `group_stream`, not on the receiver.
+                            loop {
+                                futures::select_biased! {
+                                    prog = prog_rx.next() => {
+                                        if let Some(u) = prog {
+                                            emit_tool_update(&mut sink, u);
                                         }
                                     }
-                                    None => break,
+                                    group = group_stream.next() => match group {
+                                        Some(group) => {
+                                            for (i, result) in group {
+                                                results[i] = Some(result);
+                                            }
+                                        }
+                                        None => break,
+                                    }
                                 }
                             }
+                            // Flush any updates buffered between the final poll and group completion.
+                            while let Ok(u) = prog_rx.try_recv() {
+                                emit_tool_update(&mut sink, u);
+                            }
+                        };
+                        let cancelled = cancel.cancelled();
+                        futures::pin_mut!(drain, cancelled);
+                        if let Either::Right(((), _)) = select(drain, cancelled).await {
+                            cancelled_mid_dispatch = true;
                         }
-                        // Flush any updates buffered between the final poll and group completion.
-                        while let Ok(u) = prog_rx.try_recv() {
-                            emit_tool_update(&mut sink, u);
-                        }
-                    };
-                    let cancelled = cancel.cancelled();
-                    futures::pin_mut!(drain, cancelled);
-                    if let Either::Right(((), _)) = select(drain, cancelled).await {
-                        cancelled_mid_dispatch = true;
                     }
-                }
-                (results, cancelled_mid_dispatch)
-            };
+                    (results, cancelled_mid_dispatch)
+                };
             if cancelled_mid_dispatch {
                 // Cancelled mid-gate or mid-dispatch: the assistant message (with its `ToolUse`
                 // blocks) is already committed above, but the tool-results message below never will
@@ -1781,7 +1793,9 @@ impl Agent {
             }
             if let Some(raw) = malformed.get(id) {
                 results[i] = Some((
-                    format!("tool call arguments were not valid JSON and could not be parsed: {raw}"),
+                    format!(
+                        "tool call arguments were not valid JSON and could not be parsed: {raw}"
+                    ),
                     Vec::new(),
                     true,
                     false,
@@ -1799,15 +1813,14 @@ impl Agent {
             // pi's `prepareToolCall`, which calls `validateToolArguments` before `config.beforeToolCall`)
             // so a permission hook sees the same coerced/typed arguments the tool is about to run with,
             // not the model's raw, possibly stringified wire values.
-            let mut coerced = crate::validation::coerce_tool_arguments(
-                &tool.input_schema(),
-                input.clone(),
-            )
-            .unwrap_or_else(|_| input.clone());
+            let mut coerced =
+                crate::validation::coerce_tool_arguments(&tool.input_schema(), input.clone())
+                    .unwrap_or_else(|_| input.clone());
             if let Some(obj) = coerced.as_object_mut() {
                 obj.insert(
                     "_model_supports_vision".to_string(),
-                    (crate::models::capabilities(&self.model).supports_vision && !self.block_images)
+                    (crate::models::capabilities(&self.model).supports_vision
+                        && !self.block_images)
                         .into(),
                 );
             }
@@ -1820,7 +1833,12 @@ impl Agent {
                 Err(panic_msg) => Some(panic_msg),
             };
             if let Some(reason) = blocked {
-                results[i] = Some((format!("tool call blocked: {reason}"), Vec::new(), true, false));
+                results[i] = Some((
+                    format!("tool call blocked: {reason}"),
+                    Vec::new(),
+                    true,
+                    false,
+                ));
                 continue;
             }
             // Same Task #3 fix as the default gate loop: re-check cancellation after the hook
@@ -1834,16 +1852,19 @@ impl Agent {
                 Some(path) => Some(self.write_locks.lock(path).await),
                 None => None,
             };
-            let (prog_tx, mut prog_rx) = futures::channel::mpsc::unbounded::<crate::tool::ToolUpdate>();
+            let (prog_tx, mut prog_rx) =
+                futures::channel::mpsc::unbounded::<crate::tool::ToolUpdate>();
             let progress =
                 crate::tool::ToolProgress::new(prog_tx, id.clone(), name.clone(), cancel.clone());
             let run_fut = async {
                 match tools.get(name) {
-                    Some(tool) => match catch_tool_panic(tool.run_streaming(coerced, &progress)).await {
-                        Ok(Ok(o)) => (o.text, o.images, false, o.terminate),
-                        Ok(Err(e)) => (e.to_string(), Vec::new(), true, false),
-                        Err(panic_msg) => (panic_msg, Vec::new(), true, false),
-                    },
+                    Some(tool) => {
+                        match catch_tool_panic(tool.run_streaming(coerced, &progress)).await {
+                            Ok(Ok(o)) => (o.text, o.images, false, o.terminate),
+                            Ok(Err(e)) => (e.to_string(), Vec::new(), true, false),
+                            Err(panic_msg) => (panic_msg, Vec::new(), true, false),
+                        }
+                    }
                     None => (format!("unknown tool: {name}"), Vec::new(), true, false),
                 }
             };
@@ -2337,7 +2358,10 @@ impl Agent {
         let reserve_tokens = self
             .branch_summary_reserve_tokens
             .unwrap_or(self.compaction.reserve_tokens);
-        let input_token_budget = self.compaction.context_window.saturating_sub(reserve_tokens);
+        let input_token_budget = self
+            .compaction
+            .context_window
+            .saturating_sub(reserve_tokens);
         let req = self.with_reasoning(crate::branch_summary::branch_summary_request(
             &self.model,
             messages,
@@ -3439,7 +3463,11 @@ mod tests {
         agent.run(&mut session, |_| {}).await.unwrap();
 
         let requests = mock.requests();
-        assert_eq!(requests.len(), 2, "one model call per turn, tool call included");
+        assert_eq!(
+            requests.len(),
+            2,
+            "one model call per turn, tool call included"
+        );
         assert_eq!(
             requests[0].system.as_deref(),
             Some("turn number 0"),
@@ -5790,10 +5818,7 @@ mod tests {
 
         assert_eq!(
             *order.lock().unwrap(),
-            call_order
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>(),
+            call_order.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
             "before_tool_call must fire in call order, not HashMap-grouping order"
         );
     }
@@ -5871,7 +5896,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_tools_execution_mode_sequential_routes_the_whole_batch_through_the_interleaved_path() {
+    async fn a_tools_execution_mode_sequential_routes_the_whole_batch_through_the_interleaved_path()
+    {
         // Task #28 (pi-parity): the default dispatch always gates the *whole* batch (every call's
         // `before_tool_call`) before any call's execution begins — a permission hook reasoning about
         // "what's already run" can't see call 1's result while gating call 2. A tool naming
@@ -6091,7 +6117,8 @@ mod tests {
     /// interleaved gate→execute→finalize-per-call loop, which had its own independent copy of the same
     /// premature-`before_tool_call` bug.
     #[tokio::test]
-    async fn before_tool_call_is_not_invoked_for_an_unregistered_tool_name_on_the_interleaved_path() {
+    async fn before_tool_call_is_not_invoked_for_an_unregistered_tool_name_on_the_interleaved_path()
+    {
         struct SeqTool;
         #[async_trait]
         impl Tool for SeqTool {
@@ -6191,7 +6218,9 @@ mod tests {
                 assert!(!is_error);
                 assert_eq!(content, "seq-done");
             }
-            other => panic!("expected a successful tool_result for the registered call, got {other:?}"),
+            other => {
+                panic!("expected a successful tool_result for the registered call, got {other:?}")
+            }
         }
     }
 
@@ -9321,7 +9350,9 @@ mod tests {
         let mut session = Session::new();
         session.user("delete the file");
 
-        let result = agent.run_events_cancellable(&mut session, |_| {}, cancel).await;
+        let result = agent
+            .run_events_cancellable(&mut session, |_| {}, cancel)
+            .await;
         assert!(
             matches!(result, Err(Error::Cancelled)),
             "expected Err(Cancelled), got {result:?}"

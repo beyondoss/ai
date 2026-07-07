@@ -51,11 +51,7 @@ fn serve_rpc_prompt_pushed_image_is_downgraded_at_the_wire_when_block_images_is_
     .unwrap();
     stdin.flush().unwrap();
     let frames = read_until_response(&mut stdout, "prompt");
-    assert_eq!(
-        frames.last().unwrap()["success"],
-        true,
-        "got: {frames:#?}"
-    );
+    assert_eq!(frames.last().unwrap()["success"], true, "got: {frames:#?}");
     drop(stdin);
     child.wait().unwrap();
 
@@ -107,11 +103,7 @@ fn serve_persisted_image_is_downgraded_on_resend_once_block_images_is_toggled_on
         .unwrap();
         stdin.flush().unwrap();
         let frames = read_until_response(&mut stdout, "prompt");
-        assert_eq!(
-            frames.last().unwrap()["success"],
-            true,
-            "got: {frames:#?}"
-        );
+        assert_eq!(frames.last().unwrap()["success"], true, "got: {frames:#?}");
         drop(stdin);
         child.wait().unwrap();
     }
@@ -136,14 +128,15 @@ fn serve_persisted_image_is_downgraded_on_resend_once_block_images_is_toggled_on
             .unwrap();
         let mut stdin = child.stdin.take().unwrap();
         let mut stdout = BufReader::new(child.stdout.take().unwrap());
-        writeln!(stdin, "{}", json!({ "type": "prompt", "message": "and now?" })).unwrap();
+        writeln!(
+            stdin,
+            "{}",
+            json!({ "type": "prompt", "message": "and now?" })
+        )
+        .unwrap();
         stdin.flush().unwrap();
         let frames = read_until_response(&mut stdout, "prompt");
-        assert_eq!(
-            frames.last().unwrap()["success"],
-            true,
-            "got: {frames:#?}"
-        );
+        assert_eq!(frames.last().unwrap()["success"], true, "got: {frames:#?}");
         drop(stdin);
         child.wait().unwrap();
     }
@@ -244,11 +237,7 @@ fn serve_set_block_images_true_downgrades_a_persisted_image_mid_session_without_
     .unwrap();
     stdin.flush().unwrap();
     let frames = read_until_response(&mut stdout, "prompt");
-    assert_eq!(
-        frames.last().unwrap()["success"],
-        true,
-        "got: {frames:#?}"
-    );
+    assert_eq!(frames.last().unwrap()["success"], true, "got: {frames:#?}");
 
     {
         let bodies = bodies.lock().unwrap();
@@ -274,14 +263,15 @@ fn serve_set_block_images_true_downgrades_a_persisted_image_mid_session_without_
     let frames = read_until_response(&mut stdout, "set_block_images");
     assert_eq!(frames.last().unwrap()["success"], true, "got: {frames:#?}");
 
-    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "and now?" })).unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "and now?" })
+    )
+    .unwrap();
     stdin.flush().unwrap();
     let frames = read_until_response(&mut stdout, "prompt");
-    assert_eq!(
-        frames.last().unwrap()["success"],
-        true,
-        "got: {frames:#?}"
-    );
+    assert_eq!(frames.last().unwrap()["success"], true, "got: {frames:#?}");
     drop(stdin);
     child.wait().unwrap();
 

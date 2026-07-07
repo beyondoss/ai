@@ -22,11 +22,20 @@ use serde_json::{Value, json};
 /// completion — every test below needs at least one committed turn to exist before it starts the
 /// *second* (stalled, mid-run-interrupted) one, so `base`'s model server must answer this first
 /// request instantly (the caller's own `fast` list should have exactly one entry for it).
-fn spawn_and_warm_up(bin: &str, base: &str, session_dir: &str) -> (Child, ChildStdin, BufReader<ChildStdout>) {
+fn spawn_and_warm_up(
+    bin: &str,
+    base: &str,
+    session_dir: &str,
+) -> (Child, ChildStdin, BufReader<ChildStdout>) {
     let mut child = serve_dir_cmd(bin, base, session_dir).spawn().unwrap();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
-    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "warmup" })).unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "warmup" })
+    )
+    .unwrap();
     stdin.flush().unwrap();
     read_until_response(&mut stdout, "prompt");
     (child, stdin, stdout)
@@ -84,14 +93,18 @@ fn serve_busy_compact_self_aborts_and_proceeds_in_one_round_trip() {
     // server needing to answer a second, genuinely-summarizing request that would otherwise race the
     // busy-time abort. `fast: Vec::new()` — the "go" prompt itself is the very first request, so it's
     // the one that stalls.
-    let base = spawn_model_server_with_stalled_response(Vec::new(), Duration::from_secs(5), Vec::new());
+    let base =
+        spawn_model_server_with_stalled_response(Vec::new(), Duration::from_secs(5), Vec::new());
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_dir_cmd(bin, &base, &session_dir).spawn().unwrap();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
-    let (prompt_resp, compact_resp) =
-        run_busy_then(&mut stdin, &mut stdout, &json!({ "type": "compact", "id": "c1" }));
+    let (prompt_resp, compact_resp) = run_busy_then(
+        &mut stdin,
+        &mut stdout,
+        &json!({ "type": "compact", "id": "c1" }),
+    );
 
     assert_eq!(
         prompt_resp["success"], false,
@@ -123,7 +136,11 @@ fn serve_busy_compact_self_aborts_and_proceeds_in_one_round_trip() {
 fn serve_busy_new_session_self_aborts_and_proceeds_in_one_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let session_dir = dir.path().join("sessions").to_string_lossy().into_owned();
-    let base = spawn_model_server_with_stalled_response(vec![turn_text("warmup")], Duration::from_secs(5), Vec::new());
+    let base = spawn_model_server_with_stalled_response(
+        vec![turn_text("warmup")],
+        Duration::from_secs(5),
+        Vec::new(),
+    );
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let (mut child, mut stdin, mut stdout) = spawn_and_warm_up(bin, &base, &session_dir);
 
@@ -193,7 +210,12 @@ fn serve_busy_switch_session_self_aborts_and_proceeds_in_one_round_trip() {
         .as_str()
         .unwrap()
         .to_string();
-    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "warmup-b" })).unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "prompt", "message": "warmup-b" })
+    )
+    .unwrap();
     stdin.flush().unwrap();
     read_until_response(&mut stdout, "prompt");
 
@@ -214,7 +236,10 @@ fn serve_busy_switch_session_self_aborts_and_proceeds_in_one_round_trip() {
 
     assert_eq!(prompt_resp["success"], false, "{prompt_resp:#?}");
     assert_eq!(switch_resp["success"], true, "{switch_resp:#?}");
-    assert_eq!(switch_resp["data"]["session_id"], session_b, "{switch_resp:#?}");
+    assert_eq!(
+        switch_resp["data"]["session_id"], session_b,
+        "{switch_resp:#?}"
+    );
     assert!(
         switch_resp["data"]["reasoning_effort"].is_string(),
         "switch_session's busy-path response must carry the same shape as its idle-path one (Task 3): \
@@ -238,7 +263,11 @@ fn serve_busy_switch_session_self_aborts_and_proceeds_in_one_round_trip() {
 fn serve_busy_fork_self_aborts_and_proceeds_in_one_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let session_dir = dir.path().join("sessions").to_string_lossy().into_owned();
-    let base = spawn_model_server_with_stalled_response(vec![turn_text("warmup")], Duration::from_secs(5), Vec::new());
+    let base = spawn_model_server_with_stalled_response(
+        vec![turn_text("warmup")],
+        Duration::from_secs(5),
+        Vec::new(),
+    );
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let (mut child, mut stdin, mut stdout) = spawn_and_warm_up(bin, &base, &session_dir);
 
@@ -250,8 +279,11 @@ fn serve_busy_fork_self_aborts_and_proceeds_in_one_round_trip() {
         .unwrap()
         .to_string();
 
-    let (prompt_resp, fork_resp) =
-        run_busy_then(&mut stdin, &mut stdout, &json!({ "type": "fork", "id": "f1" }));
+    let (prompt_resp, fork_resp) = run_busy_then(
+        &mut stdin,
+        &mut stdout,
+        &json!({ "type": "fork", "id": "f1" }),
+    );
 
     assert_eq!(prompt_resp["success"], false, "{prompt_resp:#?}");
     assert_eq!(fork_resp["success"], true, "{fork_resp:#?}");
@@ -264,7 +296,11 @@ fn serve_busy_fork_self_aborts_and_proceeds_in_one_round_trip() {
     writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
     stdin.flush().unwrap();
     let frames = read_until_response(&mut stdout, "get_state");
-    assert_eq!(frames.last().unwrap()["data"]["session_id"], fork_id, "{frames:#?}");
+    assert_eq!(
+        frames.last().unwrap()["data"]["session_id"],
+        fork_id,
+        "{frames:#?}"
+    );
 
     drop(stdin);
     child.wait().unwrap();
@@ -274,7 +310,11 @@ fn serve_busy_fork_self_aborts_and_proceeds_in_one_round_trip() {
 fn serve_busy_clone_self_aborts_and_proceeds_in_one_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let session_dir = dir.path().join("sessions").to_string_lossy().into_owned();
-    let base = spawn_model_server_with_stalled_response(vec![turn_text("warmup")], Duration::from_secs(5), Vec::new());
+    let base = spawn_model_server_with_stalled_response(
+        vec![turn_text("warmup")],
+        Duration::from_secs(5),
+        Vec::new(),
+    );
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let (mut child, mut stdin, mut stdout) = spawn_and_warm_up(bin, &base, &session_dir);
 
@@ -286,8 +326,11 @@ fn serve_busy_clone_self_aborts_and_proceeds_in_one_round_trip() {
         .unwrap()
         .to_string();
 
-    let (prompt_resp, clone_resp) =
-        run_busy_then(&mut stdin, &mut stdout, &json!({ "type": "clone", "id": "cl1" }));
+    let (prompt_resp, clone_resp) = run_busy_then(
+        &mut stdin,
+        &mut stdout,
+        &json!({ "type": "clone", "id": "cl1" }),
+    );
 
     assert_eq!(prompt_resp["success"], false, "{prompt_resp:#?}");
     assert_eq!(clone_resp["success"], true, "{clone_resp:#?}");
@@ -300,7 +343,11 @@ fn serve_busy_clone_self_aborts_and_proceeds_in_one_round_trip() {
     writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
     stdin.flush().unwrap();
     let frames = read_until_response(&mut stdout, "get_state");
-    assert_eq!(frames.last().unwrap()["data"]["session_id"], clone_id, "{frames:#?}");
+    assert_eq!(
+        frames.last().unwrap()["data"]["session_id"],
+        clone_id,
+        "{frames:#?}"
+    );
 
     drop(stdin);
     child.wait().unwrap();

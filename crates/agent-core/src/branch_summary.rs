@@ -425,7 +425,9 @@ mod tests {
                 json!({ "path": "src/" }),
             )]),
             Message::tool_result("1", "foo.rs\nbar.rs", false),
-            Message::assistant(vec![ContentBlock::text("just browsing, nothing to summarize")]),
+            Message::assistant(vec![ContentBlock::text(
+                "just browsing, nothing to summarize",
+            )]),
         ];
         let req = branch_summary_request("claude-test", &messages, 512, 100_000, None, false);
         let ContentBlock::Text { text, .. } = &req.messages[0].content[0] else {

@@ -138,9 +138,9 @@ pub async fn login(
     cancel: &CancellationToken,
 ) -> Result<OAuthCredential> {
     match provider {
-        OAuthProviderId::Anthropic => {
-            anthropic::login(callbacks, cancel).await.map(OAuthCredential::Anthropic)
-        }
+        OAuthProviderId::Anthropic => anthropic::login(callbacks, cancel)
+            .await
+            .map(OAuthCredential::Anthropic),
         OAuthProviderId::GithubCopilot => {
             github_copilot::login(callbacks, cancel, github_copilot::KNOWN_MODEL_IDS)
                 .await
@@ -157,16 +157,16 @@ pub async fn login(
 /// print/log directly" rule ported from OpenAI Codex's TS tests.
 pub async fn refresh(cred: &OAuthCredential) -> Result<OAuthCredential> {
     match cred {
-        OAuthCredential::Anthropic(c) => {
-            anthropic::refresh(&c.refresh).await.map(OAuthCredential::Anthropic)
-        }
+        OAuthCredential::Anthropic(c) => anthropic::refresh(&c.refresh)
+            .await
+            .map(OAuthCredential::Anthropic),
         OAuthCredential::GithubCopilot(c) => {
             github_copilot::refresh(&c.refresh, c.enterprise_url.as_deref())
                 .await
                 .map(OAuthCredential::GithubCopilot)
         }
-        OAuthCredential::OpenaiCodex(c) => {
-            openai_codex::refresh(&c.refresh).await.map(OAuthCredential::OpenaiCodex)
-        }
+        OAuthCredential::OpenaiCodex(c) => openai_codex::refresh(&c.refresh)
+            .await
+            .map(OAuthCredential::OpenaiCodex),
     }
 }

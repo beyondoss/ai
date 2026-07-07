@@ -304,7 +304,14 @@ fn find_spans(
         } else {
             norm_work.matches(norm_old.as_str()).count()
         };
-        return disambiguate(exact, fuzzy_count, old, replace_all, edit_index, total_edits);
+        return disambiguate(
+            exact,
+            fuzzy_count,
+            old,
+            replace_all,
+            edit_index,
+            total_edits,
+        );
     }
 
     // Fuzzy fallback: no exact match anywhere, so search — and splice — in normalized space, mapping

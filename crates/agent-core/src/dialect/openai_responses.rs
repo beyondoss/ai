@@ -1639,7 +1639,11 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
             "block_images must downgrade the image even though gpt-4o supports vision"
         );
         assert!(
-            !content.as_array().unwrap().iter().any(|c| c["type"] == "input_image"),
+            !content
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["type"] == "input_image"),
             "no input_image part should reach the wire when block_images is set"
         );
 
@@ -1923,19 +1927,27 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
         // was clamped as if it had native's larger one, risking exactly the 400 this clamp exists to
         // prevent (see `clamp_max_tokens_to_context`'s own doc comment).
         let big_text = "x".repeat(1_000_000);
-        let native_req =
-            ModelRequest::new("gpt-5.4-mini", vec![Message::user(big_text.as_str())], 50_000);
+        let native_req = ModelRequest::new(
+            "gpt-5.4-mini",
+            vec![Message::user(big_text.as_str())],
+            50_000,
+        );
         assert_eq!(
-            build_body(&native_req)["max_output_tokens"], 50_000,
+            build_body(&native_req)["max_output_tokens"],
+            50_000,
             "native routing's larger real context window leaves enough headroom that this request's \
              own max_tokens ceiling is unaffected"
         );
 
-        let codex_req =
-            ModelRequest::new("gpt-5.4-mini", vec![Message::user(big_text.as_str())], 50_000)
-                .with_codex(true);
+        let codex_req = ModelRequest::new(
+            "gpt-5.4-mini",
+            vec![Message::user(big_text.as_str())],
+            50_000,
+        )
+        .with_codex(true);
         assert_eq!(
-            build_body(&codex_req)["max_output_tokens"], 17_904,
+            build_body(&codex_req)["max_output_tokens"],
+            17_904,
             "Codex routing's genuinely smaller real context window must clamp this request's output \
              down further than native's, not send the same unclamped 50_000 ceiling regardless of route"
         );
@@ -1955,15 +1967,17 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
         for id in ["gpt-5.4", "gpt-5.5"] {
             let native_req = ModelRequest::new(id, vec![Message::user(big_text.as_str())], 50_000);
             assert_eq!(
-                build_body(&native_req)["max_output_tokens"], 1_024,
+                build_body(&native_req)["max_output_tokens"],
+                1_024,
                 "{id}: native's 272_000 context is already exhausted by this prompt, so output must \
                  clamp all the way down to the floor"
             );
 
-            let azure_req =
-                ModelRequest::new(id, vec![Message::user(big_text.as_str())], 50_000).with_azure(true);
+            let azure_req = ModelRequest::new(id, vec![Message::user(big_text.as_str())], 50_000)
+                .with_azure(true);
             assert_eq!(
-                build_body(&azure_req)["max_output_tokens"], 50_000,
+                build_body(&azure_req)["max_output_tokens"],
+                50_000,
                 "{id}: Azure's real 1.05M context leaves this same prompt with plenty of headroom — \
                  must send the request's own unclamped 50_000 ceiling, not the native/Codex-derived \
                  floor"
@@ -1982,14 +1996,16 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
         // request's own 40_000 max_tokens, so native sends it unclamped) but exhausts Copilot's smaller
         // 264_000 window entirely, clamping down to the floor.
         let big_text = "x".repeat(1_400_000);
-        let native_req = ModelRequest::new("gpt-5-mini", vec![Message::user(big_text.as_str())], 40_000);
+        let native_req =
+            ModelRequest::new("gpt-5-mini", vec![Message::user(big_text.as_str())], 40_000);
         assert_eq!(build_body(&native_req)["max_output_tokens"], 40_000);
 
         let copilot_req =
             ModelRequest::new("gpt-5-mini", vec![Message::user(big_text.as_str())], 40_000)
                 .with_copilot(true);
         assert_eq!(
-            build_body(&copilot_req)["max_output_tokens"], 1_024,
+            build_body(&copilot_req)["max_output_tokens"],
+            1_024,
             "Copilot's genuinely smaller real context window must clamp harder than native's"
         );
     }
@@ -2946,9 +2962,7 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
     fn fast_path_handles_every_delta_kind_and_opens_the_index() {
         let mut dec = Decoder::default();
         let events = dec
-            .try_fast_path(
-                r#"{"type":"response.output_text.delta","output_index":0,"delta":"hi"}"#,
-            )
+            .try_fast_path(r#"{"type":"response.output_text.delta","output_index":0,"delta":"hi"}"#)
             .unwrap();
         assert_eq!(
             events,
@@ -2984,9 +2998,7 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
             }])
         );
         assert_eq!(
-            dec.try_fast_path(
-                r#"{"type":"response.refusal.delta","output_index":0,"delta":"no"}"#
-            ),
+            dec.try_fast_path(r#"{"type":"response.refusal.delta","output_index":0,"delta":"no"}"#),
             Some(vec![StreamEvent::TextDelta {
                 index: 0,
                 text: "no".into()

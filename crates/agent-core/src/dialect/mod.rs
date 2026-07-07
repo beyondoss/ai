@@ -124,7 +124,10 @@ const NATIVE_ANTHROPIC_WIRE_BARE_IDS: &[&str] = &[
 ///   `anthropic-messages` on OpenCode-Go (matching the default) and on native MiniMax.
 /// - `"qwen3.6-plus"`: genuinely `openai-completions` on OpenCode-Go — but still `anthropic-messages`
 ///   on OpenCode Zen (matching the default).
-fn anthropic_wire_bare_id_for_host(m: &str, host: Option<crate::models::AggregatorHost>) -> Option<bool> {
+fn anthropic_wire_bare_id_for_host(
+    m: &str,
+    host: Option<crate::models::AggregatorHost>,
+) -> Option<bool> {
     use crate::models::AggregatorHost::{OpenCodeGo, OpenCodeZen};
     match (m, host) {
         ("minimax-m2.7", Some(OpenCodeZen) | Some(OpenCodeGo)) => Some(false),
@@ -158,7 +161,10 @@ pub(crate) fn is_fireworks_anthropic_wire_model(model: &str) -> bool {
 /// [`anthropic_wire_bare_id_for_host`]) and Fireworks' own Anthropic-wire ids (see
 /// [`is_fireworks_anthropic_wire_model`]). Matching is case-insensitive, mirroring every other id check
 /// in this dialect/the capability table.
-fn routes_to_anthropic_by_default(model: &str, host: Option<crate::models::AggregatorHost>) -> bool {
+fn routes_to_anthropic_by_default(
+    model: &str,
+    host: Option<crate::models::AggregatorHost>,
+) -> bool {
     let m = model.to_ascii_lowercase();
     let bare_default = !m.contains('/')
         && anthropic_wire_bare_id_for_host(&m, host)
@@ -704,7 +710,9 @@ fn parse_and_push(
     // one `sse_error` below inspects) and still have it surface as an error instead of silently
     // falling through to `decoder.push` and ending the turn as a successful-looking, empty `EndTurn`.
     if event == Some("error") {
-        return Err(Error::Transport(format!("provider stream error: {payload}")));
+        return Err(Error::Transport(format!(
+            "provider stream error: {payload}"
+        )));
     }
     // Try the decoder's own fast lane first — see `StreamDecoder::try_fast_path`'s doc comment. A hit
     // skips building a `Value` for this payload entirely (this crate's per-token hot path); a miss
@@ -844,7 +852,12 @@ mod tests {
         // `api: "anthropic-messages"` but name neither "claude" nor "anthropic" — previously fully
         // unroutable by default (silently misrouted to Chat Completions) unless the user configured a
         // per-model `models.json` `dialect` override.
-        for id in ["MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M3", "minimax-m3"] {
+        for id in [
+            "MiniMax-M2.7",
+            "MiniMax-M2.7-highspeed",
+            "MiniMax-M3",
+            "minimax-m3",
+        ] {
             assert_eq!(Dialect::for_model(id), Dialect::Anthropic, "{id}");
         }
         // Case-insensitive, matching every other id check in this dialect.
@@ -864,7 +877,12 @@ mod tests {
     fn opencode_and_opencode_go_bare_ids_default_to_anthropic() {
         // opencode.models.ts: qwen3.5-plus/qwen3.6-plus; opencode-go.models.ts: minimax-m3/qwen3.7-max/
         // qwen3.7-plus — all `api: "anthropic-messages"` despite the non-claude/anthropic id.
-        for id in ["qwen3.5-plus", "qwen3.6-plus", "qwen3.7-max", "qwen3.7-plus"] {
+        for id in [
+            "qwen3.5-plus",
+            "qwen3.6-plus",
+            "qwen3.7-max",
+            "qwen3.7-plus",
+        ] {
             assert_eq!(Dialect::for_model(id), Dialect::Anthropic, "{id}");
         }
     }
@@ -1011,7 +1029,10 @@ mod tests {
             serde_json::to_string(&Dialect::Anthropic).unwrap(),
             "\"anthropic\""
         );
-        assert_eq!(serde_json::to_string(&Dialect::OpenAi).unwrap(), "\"openai\"");
+        assert_eq!(
+            serde_json::to_string(&Dialect::OpenAi).unwrap(),
+            "\"openai\""
+        );
         assert_eq!(
             serde_json::to_string(&Dialect::OpenAiResponses).unwrap(),
             "\"openai_responses\""
@@ -1178,7 +1199,11 @@ data: {"type":"message_stop"}
         // A bare "event" (no colon) sets the SSE-level event field to "" — verified indirectly via the
         // `event: error` unconditional-error path: an empty-string event name must NOT be treated as
         // "error", so an ordinary payload flushed after it still decodes normally rather than erroring.
-        assert!(push_sse_line(&mut dec, &mut buf, "event").unwrap().is_empty());
+        assert!(
+            push_sse_line(&mut dec, &mut buf, "event")
+                .unwrap()
+                .is_empty()
+        );
         assert!(
             push_sse_line(
                 &mut dec,
@@ -1198,13 +1223,21 @@ data: {"type":"message_stop"}
         // same as an ordinary "data:" line with nothing after the colon (already dropped, not a new
         // behavior change), so it must not itself cause an error or a spurious event.
         let mut buf2 = SseEventBuffer::new();
-        assert!(push_sse_line(&mut dec, &mut buf2, "data").unwrap().is_empty());
+        assert!(
+            push_sse_line(&mut dec, &mut buf2, "data")
+                .unwrap()
+                .is_empty()
+        );
         assert!(push_sse_line(&mut dec, &mut buf2, "").unwrap().is_empty());
 
         // A colonless field name other than "event"/"data" (e.g. a bare "id") is still correctly
         // ignored, matching pre-fix behavior for every field this decoder doesn't track.
         let mut buf3 = SseEventBuffer::new();
-        assert!(push_sse_line(&mut dec, &mut buf3, "retry").unwrap().is_empty());
+        assert!(
+            push_sse_line(&mut dec, &mut buf3, "retry")
+                .unwrap()
+                .is_empty()
+        );
         assert!(push_sse_line(&mut dec, &mut buf3, "").unwrap().is_empty());
     }
 

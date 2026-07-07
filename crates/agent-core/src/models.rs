@@ -576,7 +576,11 @@ fn capabilities_impl(model: &str) -> ModelCaps {
         // doing it before family dispatch, which would corrupt an unrelated family's *meaningful* use
         // of `.` in its own version numbering (DeepSeek-V3.2, Kimi-K2.6, …).
         let is_vendor_slug = m.contains('/');
-        let base = if is_vendor_slug { family_id } else { m.as_str() };
+        let base = if is_vendor_slug {
+            family_id
+        } else {
+            m.as_str()
+        };
         let is_dot_spelled = base.contains('.');
         let normalized = base.replace('.', "-");
         let m: &str = &normalized;
@@ -802,7 +806,11 @@ fn capabilities_impl(model: &str) -> ModelCaps {
         || family_id.starts_with("o4");
     if is_o_series {
         let is_vendor_slug = m.contains('/');
-        let m: &str = if is_vendor_slug { family_id } else { m.as_str() };
+        let m: &str = if is_vendor_slug {
+            family_id
+        } else {
+            m.as_str()
+        };
         let caps = ModelCaps {
             context_window: 200_000,
             max_output: 100_000,
@@ -844,7 +852,11 @@ fn capabilities_impl(model: &str) -> ModelCaps {
     // prefix check below keeps working unmodified against a slug-prefixed id too.
     if m.starts_with("gpt-5") || family_id.starts_with("gpt-5") {
         let is_vendor_slug = m.contains('/');
-        let m: &str = if is_vendor_slug { family_id } else { m.as_str() };
+        let m: &str = if is_vendor_slug {
+            family_id
+        } else {
+            m.as_str()
+        };
         // The narrower "-chat-latest" variants share the family name but cap at the older
         // chat-completions ceiling (128k/16384), not the reasoning-model one, and aren't uniformly
         // `reasoning_effort`-driven — treat them like a non-reasoning chat model. Two of the four
@@ -975,7 +987,11 @@ fn capabilities_impl(model: &str) -> ModelCaps {
     // comment above.
     if m.starts_with("gpt-4") || family_id.starts_with("gpt-4") {
         let is_vendor_slug = m.contains('/');
-        let m: &str = if is_vendor_slug { family_id } else { m.as_str() };
+        let m: &str = if is_vendor_slug {
+            family_id
+        } else {
+            m.as_str()
+        };
         // 4.1 shipped a ~1M-token context window, a full step up from the rest of the family.
         if m.starts_with("gpt-4.1") {
             // pi-parity (models/dialects pass): OpenRouter's own vendor-slug "openai/gpt-4.1" reports a
@@ -1237,7 +1253,11 @@ fn capabilities_impl(model: &str) -> ModelCaps {
     if m.starts_with("mimo") || family_id.starts_with("mimo") {
         // Keyed on whether `m` is slug-shaped at all — same reasoning as the MiniMax/GLM/Kimi branches.
         let is_vendor_slug = m.contains('/');
-        let k = if is_vendor_slug { family_id } else { m.as_str() };
+        let k = if is_vendor_slug {
+            family_id
+        } else {
+            m.as_str()
+        };
         let (context_window, max_output, supports_vision) = if k == "mimo-v2-flash" {
             // HuggingFace's own "XiaomiMiMo/MiMo-V2-Flash" has a much smaller real `maxTokens` (4_096)
             // than the native (bare, unprefixed) id's 65_536 — an id-suffix collision `family_id`
@@ -1411,7 +1431,11 @@ fn capabilities_impl(model: &str) -> ModelCaps {
         // Keyed on whether `m` is slug-shaped at all (not on which disjunct above matched) — same
         // reasoning as the MiniMax branch below, applied uniformly even though no current GLM org
         // slug happens to collide with the literal prefix "glm" the way MiniMax's does.
-        let g = if m.contains('/') { family_id } else { m.as_str() };
+        let g = if m.contains('/') {
+            family_id
+        } else {
+            m.as_str()
+        };
         let (context_window, max_output, reasoning_effort) = if g.starts_with("glm-5.2") {
             // pi-parity Task #15: Together's and HuggingFace's own vendor-slug "zai-org/GLM-5.2"
             // (`together.models.ts:363`, `huggingface.models.ts:853`) both report a real context of
@@ -1533,7 +1557,11 @@ fn capabilities_impl(model: &str) -> ModelCaps {
     if m.starts_with("kimi") || family_id.starts_with("kimi") || m == "k2p7" {
         // Keyed on whether `m` is slug-shaped at all — same reasoning as the MiniMax/GLM branches.
         let is_vendor_slug = m.contains('/');
-        let k = if is_vendor_slug { family_id } else { m.as_str() };
+        let k = if is_vendor_slug {
+            family_id
+        } else {
+            m.as_str()
+        };
         // Kimi-Coding (`api.kimi.com/coding`, pi's `kimi-coding.models.ts`) hosts three ids with a much
         // smaller real `maxTokens` (32_768) than this bucket's generic 262_144 default: its own "k2p7"
         // alias and "kimi-for-coding" (neither collides with any moonshotai-native id at all), plus
@@ -1648,9 +1676,12 @@ fn capabilities_impl(model: &str) -> ModelCaps {
     // comment above.
     if m.starts_with("grok") || family_id.starts_with("grok") {
         let is_vendor_slug = m.contains('/');
-        let g = if is_vendor_slug { family_id } else { m.as_str() };
-        let (context_window, max_output, supports_vision) = if g == "grok-3" || g == "grok-3-fast"
-        {
+        let g = if is_vendor_slug {
+            family_id
+        } else {
+            m.as_str()
+        };
+        let (context_window, max_output, supports_vision) = if g == "grok-3" || g == "grok-3-fast" {
             (131_072, 8_192, false)
         } else if g.starts_with("grok-code-fast") {
             (32_768, 8_192, false)
@@ -1716,7 +1747,11 @@ fn capabilities_impl(model: &str) -> ModelCaps {
         // disjunct above matched: `m.starts_with("minimax")` is *already* (coincidentally) true for
         // "minimaxai/minimax-m3" itself, so selecting on that would silently keep matching the raw,
         // slug-prefixed `m` below instead of the real suffix `family_id` isolated it to.
-        let mm = if m.contains('/') { family_id } else { m.as_str() };
+        let mm = if m.contains('/') {
+            family_id
+        } else {
+            m.as_str()
+        };
         let (context_window, max_output, supports_vision) = if mm.starts_with("minimax-m3") {
             // Fireworks' own "MiniMax-M3" (`accounts/fireworks/models/minimax-m3`) reduces to this
             // identical `family_id` suffix as Together's/HuggingFace's/native's own same-named ids —
@@ -1861,7 +1896,11 @@ fn capabilities_impl(model: &str) -> ModelCaps {
                 supports_cache_control_on_tools: true,
             };
         }
-        let q = if m.contains('/') { family_id } else { m.as_str() };
+        let q = if m.contains('/') {
+            family_id
+        } else {
+            m.as_str()
+        };
         // pi-parity pass 20 Task 1: these 6 ids are OpenRouter's own `"qwen/…"` vendor-slug entries
         // (`openrouter.models.ts`), each colliding on `family_id`'s shared suffix `q` with a Together
         // id `together_match` below already covers under a genuinely different (and, for every one of
@@ -1869,7 +1908,8 @@ fn capabilities_impl(model: &str) -> ModelCaps {
         // Together's own numbers for these same suffixes are unaffected. `openai_reasoning_format:
         // OpenRouter` (not `Together`) — OpenRouter's real `compat.thinkingFormat`, a nested
         // `reasoning:{effort}` shape, distinct from Together's own nested `reasoning:{enabled}` toggle.
-        if let Some((context_window, max_output, supports_vision, is_reasoning)) = match m.as_str() {
+        if let Some((context_window, max_output, supports_vision, is_reasoning)) = match m.as_str()
+        {
             // 32_768 → 4_096: an 8x over-report (Together's own real max_output for this suffix is
             // 130_000; HuggingFace's identical vendor-slug id is 32_768 — already the shared bucket's
             // pick below — but OpenRouter's own real number is smaller still).
@@ -3589,7 +3629,11 @@ mod tests {
         let caps = capabilities("claude-opus-4-5");
         assert_eq!(caps.thinking, ThinkingShape::Budget);
         let (thinking, effort) = thinking_for_level(&caps, ThinkingLevel::High);
-        assert_eq!(thinking, Some(16_384), "pi's defaultBudgets.high is 16384, not 24000");
+        assert_eq!(
+            thinking,
+            Some(16_384),
+            "pi's defaultBudgets.high is 16384, not 24000"
+        );
         assert_eq!(
             effort, None,
             "a Budget-shape model's dialect never reads reasoning_effort"
@@ -4004,11 +4048,23 @@ mod tests {
             let c = capabilities(id);
             assert_eq!(c.context_window, 1_000_000, "{id}");
             assert_eq!(c.max_output, 384_000, "{id}");
-            assert_eq!(c.max_tokens_field, MaxTokensField::MaxCompletionTokens, "{id}");
+            assert_eq!(
+                c.max_tokens_field,
+                MaxTokensField::MaxCompletionTokens,
+                "{id}"
+            );
             assert!(c.reasoning_effort, "{id}");
-            assert_eq!(c.openai_reasoning_format, OpenAiReasoningFormat::DeepSeek, "{id}");
+            assert_eq!(
+                c.openai_reasoning_format,
+                OpenAiReasoningFormat::DeepSeek,
+                "{id}"
+            );
             // thinkingLevelMap nulls minimal/low/medium — floor is High, xhigh wired as "max".
-            assert_eq!(c.min_reasoning_effort, crate::transport::ReasoningEffort::High, "{id}");
+            assert_eq!(
+                c.min_reasoning_effort,
+                crate::transport::ReasoningEffort::High,
+                "{id}"
+            );
             assert_eq!(c.adaptive_xhigh_effort_wire, "max", "{id}");
         }
     }
@@ -4021,7 +4077,10 @@ mod tests {
         // portable (thinking_budget, reasoning_effort) pair `Agent::with_thinking`/`with_reasoning_effort`
         // are built from.
         let (thinking, effort) = thinking_for_level(&caps, ThinkingLevel::High);
-        assert_eq!(thinking, None, "DeepSeek has no Anthropic-style budget field");
+        assert_eq!(
+            thinking, None,
+            "DeepSeek has no Anthropic-style budget field"
+        );
         assert_eq!(effort, Some(RE::High));
         // Off clears it.
         assert_eq!(thinking_for_level(&caps, ThinkingLevel::Off), (None, None));
@@ -4037,7 +4096,10 @@ mod tests {
         // `--thinking high` genuinely turns its reasoning on.
         let caps = capabilities("kimi-k2-thinking");
         assert!(!caps.reasoning_effort, "Kimi has no effort vocabulary");
-        assert_eq!(caps.openai_reasoning_format, OpenAiReasoningFormat::DeepSeek);
+        assert_eq!(
+            caps.openai_reasoning_format,
+            OpenAiReasoningFormat::DeepSeek
+        );
         assert_ne!(
             available_thinking_levels(&caps),
             vec![ThinkingLevel::Off],
@@ -4050,7 +4112,10 @@ mod tests {
 
         // The non-"thinking" preview ids (reasoning: false in pi's catalogue) get no mechanism at all.
         let non_reasoning = capabilities("kimi-k2-0711-preview");
-        assert_eq!(non_reasoning.openai_reasoning_format, OpenAiReasoningFormat::Standard);
+        assert_eq!(
+            non_reasoning.openai_reasoning_format,
+            OpenAiReasoningFormat::Standard
+        );
         assert!(!non_reasoning.reasoning_effort);
         assert_eq!(
             available_thinking_levels(&non_reasoning),
@@ -4061,19 +4126,28 @@ mod tests {
         // claude-fable-5's identical shape.
         let code = capabilities("kimi-k2.7-code");
         assert!(!code.reasoning_disableable);
-        assert_ne!(clamp_thinking_level(&code, ThinkingLevel::Off), ThinkingLevel::Off);
+        assert_ne!(
+            clamp_thinking_level(&code, ThinkingLevel::Off),
+            ThinkingLevel::Off
+        );
     }
 
     #[test]
     fn glm_5_2_gets_reasoning_effort_but_earlier_glm_ids_do_not() {
         let old = capabilities("glm-4.7");
-        assert!(!old.reasoning_effort, "pre-5.2 GLM has no effort vocabulary");
+        assert!(
+            !old.reasoning_effort,
+            "pre-5.2 GLM has no effort vocabulary"
+        );
         assert_eq!(old.openai_reasoning_format, OpenAiReasoningFormat::Zai);
         assert_eq!(old.context_window, 204_800);
         assert_eq!(old.max_output, 131_072);
 
         let new = capabilities("glm-5.2");
-        assert!(new.reasoning_effort, "glm-5.2 gains a real effort vocabulary");
+        assert!(
+            new.reasoning_effort,
+            "glm-5.2 gains a real effort vocabulary"
+        );
         assert_eq!(new.context_window, 1_000_000);
         assert_eq!(new.openai_reasoning_format, OpenAiReasoningFormat::Zai);
 
@@ -4087,13 +4161,30 @@ mod tests {
         // pi's `detectCompat` marks every xAI id `supportsReasoningEffort: false` unconditionally, even
         // for the reasoning-capable ids (grok-4.3, grok-4.20-*-reasoning) — they reason on their own
         // with no client-steerable toggle at all.
-        for id in ["grok-3", "grok-4.3", "grok-4.20-0309-reasoning", "grok-build-0.1"] {
+        for id in [
+            "grok-3",
+            "grok-4.3",
+            "grok-4.20-0309-reasoning",
+            "grok-build-0.1",
+        ] {
             let c = capabilities(id);
             assert!(!c.reasoning_effort, "{id}");
-            assert_eq!(c.openai_reasoning_format, OpenAiReasoningFormat::Standard, "{id}");
-            assert_eq!(c.max_tokens_field, MaxTokensField::MaxCompletionTokens, "{id}");
+            assert_eq!(
+                c.openai_reasoning_format,
+                OpenAiReasoningFormat::Standard,
+                "{id}"
+            );
+            assert_eq!(
+                c.max_tokens_field,
+                MaxTokensField::MaxCompletionTokens,
+                "{id}"
+            );
             // No mechanism at all — Off is the only available level.
-            assert_eq!(available_thinking_levels(&c), vec![ThinkingLevel::Off], "{id}");
+            assert_eq!(
+                available_thinking_levels(&c),
+                vec![ThinkingLevel::Off],
+                "{id}"
+            );
         }
         assert_eq!(capabilities("grok-3").context_window, 131_072);
         assert_eq!(capabilities("grok-4.3").context_window, 1_000_000);
@@ -4112,7 +4203,10 @@ mod tests {
 
         // The one Groq-hosted exception is matched by its exact id first and keeps the plain shape.
         let groq = capabilities("qwen/qwen3-32b");
-        assert_eq!(groq.openai_reasoning_format, OpenAiReasoningFormat::Standard);
+        assert_eq!(
+            groq.openai_reasoning_format,
+            OpenAiReasoningFormat::Standard
+        );
         assert!(groq.reasoning_effort);
     }
 
@@ -4124,7 +4218,10 @@ mod tests {
         // (context_window agrees at 131072 on both). HuggingFace's smaller, safer number wins.
         let c = capabilities("qwen/qwen3-32b");
         assert_eq!(c.context_window, 131_072);
-        assert_eq!(c.max_output, 16_384, "was 40_960, over-reporting HuggingFace's real ceiling 2.5x");
+        assert_eq!(
+            c.max_output, 16_384,
+            "was 40_960, over-reporting HuggingFace's real ceiling 2.5x"
+        );
     }
 
     #[test]
@@ -4138,12 +4235,16 @@ mod tests {
 
         // A bare (no-slash) unrecognized id still falls all the way through to `unknown()`.
         let bare = capabilities("some-future-model-x");
-        assert_eq!(bare.openai_reasoning_format, OpenAiReasoningFormat::Standard);
+        assert_eq!(
+            bare.openai_reasoning_format,
+            OpenAiReasoningFormat::Standard
+        );
         assert_eq!(bare.max_output, 4_096);
     }
 
     #[test]
-    fn essentialai_rnj_1_instruct_gets_its_real_capabilities_not_the_generic_vendor_slug_fallback() {
+    fn essentialai_rnj_1_instruct_gets_its_real_capabilities_not_the_generic_vendor_slug_fallback()
+    {
         // pi-parity Task #29: a brand-new Together model family with zero prior coverage — real
         // numbers (`together.models.ts:175`): 32768/32768, a ~4x smaller context than the generic
         // vendor-slug fallback's 128000.
@@ -4160,7 +4261,8 @@ mod tests {
     }
 
     #[test]
-    fn openrouter_meta_routing_pseudo_models_get_their_real_numbers_not_unknown_or_the_generic_fallback() {
+    fn openrouter_meta_routing_pseudo_models_get_their_real_numbers_not_unknown_or_the_generic_fallback()
+     {
         // pi-parity pass 20 Task 4: bare "auto" used to fall all the way through to
         // `ModelCaps::unknown()` (128k/4096); "openrouter/free"/"openrouter/fusion" (vendor-slug-shaped,
         // though neither names a real hosting vendor) used to hit the generic `m.contains('/')`
@@ -4168,18 +4270,30 @@ mod tests {
         // "openrouter/free", whose real max_output (4096) is *smaller*, not larger.
         let auto = capabilities("auto");
         assert_eq!(auto.context_window, 2_000_000);
-        assert_eq!(auto.max_output, 30_000, "was 4_096 under ModelCaps::unknown()");
+        assert_eq!(
+            auto.max_output, 30_000,
+            "was 4_096 under ModelCaps::unknown()"
+        );
         assert!(auto.supports_vision);
-        assert_eq!(auto.openai_reasoning_format, OpenAiReasoningFormat::OpenRouter);
+        assert_eq!(
+            auto.openai_reasoning_format,
+            OpenAiReasoningFormat::OpenRouter
+        );
         assert!(auto.max_output > ModelCaps::unknown().max_output);
 
         let free = capabilities("openrouter/free");
         assert_eq!(free.context_window, 200_000);
-        assert_eq!(free.max_output, 4_096, "was 32_000 under the generic fallback, itself an over-report");
+        assert_eq!(
+            free.max_output, 4_096,
+            "was 32_000 under the generic fallback, itself an over-report"
+        );
         assert!(free.supports_vision);
 
         let fusion = capabilities("openrouter/fusion");
-        assert_eq!(fusion.context_window, 1_000_000, "was 128_000 under the generic fallback");
+        assert_eq!(
+            fusion.context_window, 1_000_000,
+            "was 128_000 under the generic fallback"
+        );
         assert_eq!(fusion.max_output, 30_000);
         assert!(!fusion.supports_vision);
     }
@@ -4206,7 +4320,10 @@ mod tests {
         // All three share the plain OpenAI-style bare `reasoning_effort` shape (no `thinkingFormat`
         // override in pi's catalogue), not OpenRouter's nested one.
         for caps in [big_pickle, nemotron_free, north_mini] {
-            assert_eq!(caps.openai_reasoning_format, OpenAiReasoningFormat::Standard);
+            assert_eq!(
+                caps.openai_reasoning_format,
+                OpenAiReasoningFormat::Standard
+            );
             assert_eq!(caps.max_tokens_field, MaxTokensField::MaxTokens);
         }
     }
@@ -4237,7 +4354,10 @@ mod tests {
         let kimi = capabilities("moonshotai/Kimi-K2.6");
         assert_eq!(kimi.context_window, 262_144);
         assert!(kimi.supports_vision, "kimi-k2.6 is vision-capable");
-        assert_eq!(kimi.openai_reasoning_format, OpenAiReasoningFormat::DeepSeek);
+        assert_eq!(
+            kimi.openai_reasoning_format,
+            OpenAiReasoningFormat::DeepSeek
+        );
         assert_ne!(
             kimi.openai_reasoning_format,
             OpenAiReasoningFormat::OpenRouter,
@@ -4247,7 +4367,10 @@ mod tests {
         // pi-parity Task #22: Together's real max_output for this exact vendor-slug id (131000,
         // `together.models.ts:230`) is much smaller than the generic "else" bucket's 262144, which
         // HuggingFace's identically-spelled entry legitimately matches (`huggingface.models.ts:619`).
-        assert_eq!(kimi.max_output, 131_000, "was 262_144, a dangerous 2x over-report for Together");
+        assert_eq!(
+            kimi.max_output, 131_000,
+            "was 262_144, a dangerous 2x over-report for Together"
+        );
 
         // "moonshotai/Kimi-K2.7-Code" on Together is real max_output 131072 (`together.models.ts:249`)
         // and, uniquely among every other vision-capable id in this family (including the bare native
@@ -4260,8 +4383,14 @@ mod tests {
         // (Together/HuggingFace/OpenRouter all serve this exact string).
         let code = capabilities("moonshotai/Kimi-K2.7-Code");
         assert_eq!(code.context_window, 262_144);
-        assert_eq!(code.max_output, 16_384, "OpenRouter's real, smaller number now wins the collision");
-        assert!(!code.supports_vision, "Together's own K2.7-Code entry is text-only");
+        assert_eq!(
+            code.max_output, 16_384,
+            "OpenRouter's real, smaller number now wins the collision"
+        );
+        assert!(
+            !code.supports_vision,
+            "Together's own K2.7-Code entry is text-only"
+        );
 
         // The bare native id is unaffected — still the family default (262144/262144), vision-capable.
         // (HuggingFace's own real entry for "moonshotai/Kimi-K2.7-Code" is identically spelled to
@@ -4276,7 +4405,10 @@ mod tests {
         // `together.models.ts:363` and `huggingface.models.ts:853`) is far smaller than NVIDIA's/
         // native's own 1,000,000 the bare "glm-5.2" id gets.
         let glm = capabilities("zai-org/GLM-5.2");
-        assert_eq!(glm.context_window, 262_144, "Together/HuggingFace's real context, not native's 1M");
+        assert_eq!(
+            glm.context_window, 262_144,
+            "Together/HuggingFace's real context, not native's 1M"
+        );
         assert_eq!(glm.max_output, 131_072);
         assert!(glm.reasoning_effort, "glm-5.2 has a real effort vocabulary");
         assert_eq!(glm.openai_reasoning_format, OpenAiReasoningFormat::Zai);
@@ -4296,7 +4428,10 @@ mod tests {
         let kimi = capabilities("moonshotai/Kimi-K2-Thinking");
         assert_eq!(kimi.context_window, 262_144);
         assert_eq!(kimi.max_output, 100_352);
-        assert_eq!(kimi.openai_reasoning_format, OpenAiReasoningFormat::DeepSeek);
+        assert_eq!(
+            kimi.openai_reasoning_format,
+            OpenAiReasoningFormat::DeepSeek
+        );
 
         let glm = capabilities("zai-org/GLM-4.7");
         assert_eq!(glm.context_window, 204_800);
@@ -4340,7 +4475,10 @@ mod tests {
         assert_eq!(ds.max_output, 384_000);
 
         let groq = capabilities("qwen/qwen3-32b");
-        assert_eq!(groq.openai_reasoning_format, OpenAiReasoningFormat::Standard);
+        assert_eq!(
+            groq.openai_reasoning_format,
+            OpenAiReasoningFormat::Standard
+        );
         assert!(groq.reasoning_effort);
     }
 
@@ -4388,7 +4526,10 @@ mod tests {
         let native = capabilities("gpt-5.2");
         assert_eq!(native.api, ApiKind::Responses);
         assert_eq!(native.max_tokens_field, MaxTokensField::MaxCompletionTokens);
-        assert_eq!(native.openai_reasoning_format, OpenAiReasoningFormat::Standard);
+        assert_eq!(
+            native.openai_reasoning_format,
+            OpenAiReasoningFormat::Standard
+        );
 
         // o-series and gpt-4 vendor-slug ids get the same treatment.
         let o3 = capabilities("openai/o3");
@@ -4400,7 +4541,8 @@ mod tests {
     }
 
     #[test]
-    fn openrouter_vendor_slug_grok_ids_get_the_real_family_with_openrouters_smaller_output_ceiling() {
+    fn openrouter_vendor_slug_grok_ids_get_the_real_family_with_openrouters_smaller_output_ceiling()
+    {
         // Task 13's explicit regression: "x-ai/grok-4.3" used to land on the generic vendor-slug
         // fallback (max_output: 32_000) — already an over-report of OpenRouter's real ceiling
         // (`openrouter.models.ts`: maxTokens 4096 for every current xAI id there). Extending
@@ -4436,9 +4578,16 @@ mod tests {
         // matched no `GEN6_PLUS` entry at all (all dash-spelled) and fell to the pre-gen6 Budget-shape
         // bucket — wrong shape entirely, plus Copilot's own numbers diverge from native Anthropic's.
         let opus46 = capabilities("claude-opus-4.6");
-        assert_eq!(opus46.thinking, ThinkingShape::Adaptive, "must resolve to gen6+ shape");
+        assert_eq!(
+            opus46.thinking,
+            ThinkingShape::Adaptive,
+            "must resolve to gen6+ shape"
+        );
         assert_eq!(opus46.context_window, 1_000_000);
-        assert_eq!(opus46.max_output, 32_000, "Copilot's real ceiling, not native's 128_000");
+        assert_eq!(
+            opus46.max_output, 32_000,
+            "Copilot's real ceiling, not native's 128_000"
+        );
         assert!(opus46.supports_temperature);
 
         let opus47 = capabilities("claude-opus-4.7");
@@ -4447,7 +4596,10 @@ mod tests {
             "Copilot's opus-4.7 context is smaller than native's 1M"
         );
         assert_eq!(opus47.max_output, 32_000);
-        assert!(!opus47.supports_temperature, "opus-4.7 rejects temperature on every host");
+        assert!(
+            !opus47.supports_temperature,
+            "opus-4.7 rejects temperature on every host"
+        );
 
         let opus48 = capabilities("claude-opus-4.8");
         assert_eq!(opus48.context_window, 200_000);
@@ -4484,9 +4636,15 @@ mod tests {
     #[test]
     fn copilot_sonnet_4_6_remaps_xhigh_to_max_like_its_opus_sibling() {
         let sonnet46 = capabilities("claude-sonnet-4.6");
-        assert_eq!(sonnet46.adaptive_xhigh_effort_wire, "max", "was \"xhigh\" before this fix");
+        assert_eq!(
+            sonnet46.adaptive_xhigh_effort_wire, "max",
+            "was \"xhigh\" before this fix"
+        );
         let opus46 = capabilities("claude-opus-4.6");
-        assert_eq!(opus46.adaptive_xhigh_effort_wire, "max", "opus-4.6 must be unaffected");
+        assert_eq!(
+            opus46.adaptive_xhigh_effort_wire, "max",
+            "opus-4.6 must be unaffected"
+        );
         // The native, dash-spelled sonnet-4-6 has no xhigh wire value at all (`supports_xhigh_reasoning:
         // false`) — this field is unread there and must stay unaffected by the Copilot fix.
         assert!(!capabilities("claude-sonnet-4-6").supports_xhigh_reasoning);
@@ -4521,9 +4679,19 @@ mod tests {
         // max_output.
         for id in ["claude-opus-4.5", "claude-sonnet-4.5"] {
             let c = capabilities(id);
-            assert_eq!(c.context_window, 200_000, "{id}: Copilot's context matches this bucket already");
-            assert_eq!(c.max_output, 32_000, "{id}: Copilot's real, smaller ceiling");
-            assert_eq!(c.thinking, ThinkingShape::Budget, "{id}: must stay Budget-shape, not Adaptive");
+            assert_eq!(
+                c.context_window, 200_000,
+                "{id}: Copilot's context matches this bucket already"
+            );
+            assert_eq!(
+                c.max_output, 32_000,
+                "{id}: Copilot's real, smaller ceiling"
+            );
+            assert_eq!(
+                c.thinking,
+                ThinkingShape::Budget,
+                "{id}: must stay Budget-shape, not Adaptive"
+            );
         }
 
         // The native, dash-spelled ids are completely unaffected — still the generic 64_000.
@@ -4541,7 +4709,10 @@ mod tests {
         assert_eq!(c.context_window, 256_000);
         assert_eq!(c.max_output, 128_000);
         assert!(!c.supports_vision);
-        assert!(!c.reasoning_effort, "compat.supportsReasoningEffort is false despite reasoning:true");
+        assert!(
+            !c.reasoning_effort,
+            "compat.supportsReasoningEffort is false despite reasoning:true"
+        );
         assert!(c.max_output > ModelCaps::unknown().max_output);
     }
 
@@ -4554,7 +4725,10 @@ mod tests {
         // fallback never applied). Real numbers: `kimi-coding.models.ts`.
         let c = capabilities("k2p7");
         assert_eq!(c.context_window, 262_144);
-        assert_eq!(c.max_output, 32_768, "Kimi-Coding's real ceiling, not the generic bucket's 262_144");
+        assert_eq!(
+            c.max_output, 32_768,
+            "Kimi-Coding's real ceiling, not the generic bucket's 262_144"
+        );
         assert!(c.supports_vision);
         assert!(c.max_output > ModelCaps::unknown().max_output);
     }
@@ -4581,8 +4755,14 @@ mod tests {
         // Neither host reports vision for this id, unlike k2p7/kimi-for-coding.
         let c = capabilities("kimi-k2-thinking");
         assert_eq!(c.context_window, 262_144);
-        assert_eq!(c.max_output, 32_768, "was 262_144, a dangerous 8x over-report for Kimi-Coding");
-        assert!(!c.supports_vision, "neither Kimi-Coding nor moonshotai-native report vision for this id");
+        assert_eq!(
+            c.max_output, 32_768,
+            "was 262_144, a dangerous 8x over-report for Kimi-Coding"
+        );
+        assert!(
+            !c.supports_vision,
+            "neither Kimi-Coding nor moonshotai-native report vision for this id"
+        );
 
         // HuggingFace's own vendor-slug spelling of this id reports the *native* (larger) numbers, not
         // Kimi-Coding's — the bare-id-only scoping must not affect it.
@@ -4592,14 +4772,22 @@ mod tests {
         // collision instead (see `openrouter_vendor_slug_k2_thinking` in the capability table).
         let hf = capabilities("moonshotai/Kimi-K2-Thinking");
         assert_eq!(hf.context_window, 262_144);
-        assert_eq!(hf.max_output, 100_352, "OpenRouter's smaller real number now wins the collision");
+        assert_eq!(
+            hf.max_output, 100_352,
+            "OpenRouter's smaller real number now wins the collision"
+        );
     }
 
     // ---- Task 25: Google/Gemini capability data ----
 
     #[test]
     fn gemini_ids_get_real_capabilities_not_the_unknown_default() {
-        for id in ["gemini-2.5-pro", "gemini-3-flash-preview", "gemini-3.1-pro-preview", "gemini-flash-latest"] {
+        for id in [
+            "gemini-2.5-pro",
+            "gemini-3-flash-preview",
+            "gemini-3.1-pro-preview",
+            "gemini-flash-latest",
+        ] {
             let c = capabilities(id);
             assert_eq!(c.context_window, 1_048_576, "{id}");
             assert_eq!(c.max_output, 65_536, "{id}");
@@ -4661,7 +4849,14 @@ mod tests {
 
     #[test]
     fn capabilities_for_route_is_a_no_op_for_the_native_route() {
-        for id in ["gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "gpt-5.1", "gpt-4o"] {
+        for id in [
+            "gpt-5.3-codex-spark",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.5",
+            "gpt-5.1",
+            "gpt-4o",
+        ] {
             assert_eq!(
                 capabilities_for_route(id, false, false),
                 capabilities(id),
@@ -4677,8 +4872,14 @@ mod tests {
         assert!(native.supports_vision);
 
         let codex = capabilities_for_route("gpt-5.3-codex-spark", true, false);
-        assert_eq!(codex.max_output, 128_000, "Codex's own entry ships a 128k ceiling, not 32k");
-        assert!(!codex.supports_vision, "Codex's own entry is input: [\"text\"] only");
+        assert_eq!(
+            codex.max_output, 128_000,
+            "Codex's own entry ships a 128k ceiling, not 32k"
+        );
+        assert!(
+            !codex.supports_vision,
+            "Codex's own entry is input: [\"text\"] only"
+        );
         // Context window is unaffected — identical on all three routes.
         assert_eq!(codex.context_window, native.context_window);
     }
@@ -4689,7 +4890,10 @@ mod tests {
             let native = capabilities_for_route(id, false, false);
             assert_eq!(native.context_window, 272_000, "{id}");
             let azure = capabilities_for_route(id, false, true);
-            assert_eq!(azure.context_window, 1_050_000, "{id}: Azure's real, much larger context");
+            assert_eq!(
+                azure.context_window, 1_050_000,
+                "{id}: Azure's real, much larger context"
+            );
             // Codex is unaffected for these two ids (only gpt-5.4-mini diverges on Codex).
             let codex = capabilities_for_route(id, true, false);
             assert_eq!(codex.context_window, 272_000, "{id}");
@@ -4701,9 +4905,15 @@ mod tests {
         let native = capabilities_for_route("gpt-5.4-mini", false, false);
         assert_eq!(native.context_window, 400_000);
         let codex = capabilities_for_route("gpt-5.4-mini", true, false);
-        assert_eq!(codex.context_window, 272_000, "Codex's own real, smaller context");
+        assert_eq!(
+            codex.context_window, 272_000,
+            "Codex's own real, smaller context"
+        );
         let azure = capabilities_for_route("gpt-5.4-mini", false, true);
-        assert_eq!(azure.context_window, 400_000, "Azure matches native for this one id");
+        assert_eq!(
+            azure.context_window, 400_000,
+            "Azure matches native for this one id"
+        );
     }
 
     #[test]
@@ -4741,15 +4951,35 @@ mod tests {
         // A route flag being (incorrectly, hypothetically) set true for a model Codex/Azure never
         // actually serves must still be harmless — nothing in this table keys route-awareness off
         // anything but the specific 4 (or 7, for the off-signal check) OpenAI ids above.
-        for id in ["claude-opus-4-8", "deepseek-v4-pro", "glm-5.2", "kimi-k2-thinking"] {
-            assert_eq!(capabilities_for_route(id, true, false), capabilities(id), "{id}");
-            assert_eq!(capabilities_for_route(id, false, true), capabilities(id), "{id}");
+        for id in [
+            "claude-opus-4-8",
+            "deepseek-v4-pro",
+            "glm-5.2",
+            "kimi-k2-thinking",
+        ] {
+            assert_eq!(
+                capabilities_for_route(id, true, false),
+                capabilities(id),
+                "{id}"
+            );
+            assert_eq!(
+                capabilities_for_route(id, false, true),
+                capabilities(id),
+                "{id}"
+            );
         }
     }
 
     #[test]
     fn capabilities_for_route_with_copilot_is_a_no_op_when_not_copilot_routed() {
-        for id in ["gpt-4.1", "gpt-5-mini", "gpt-5.4", "gpt-5.5", "gemini-2.5-pro", "gpt-4o"] {
+        for id in [
+            "gpt-4.1",
+            "gpt-5-mini",
+            "gpt-5.4",
+            "gpt-5.5",
+            "gemini-2.5-pro",
+            "gpt-4o",
+        ] {
             assert_eq!(
                 capabilities_for_route_with_copilot(id, false, false, false),
                 capabilities_for_route(id, false, false),
@@ -4767,8 +4997,14 @@ mod tests {
         assert_eq!(native.max_output, 32_768);
 
         let copilot = capabilities_for_route_with_copilot("gpt-4.1", false, false, true);
-        assert_eq!(copilot.context_window, 128_000, "Copilot's real, much smaller context");
-        assert_eq!(copilot.max_output, 16_384, "Copilot's real, much smaller output ceiling");
+        assert_eq!(
+            copilot.context_window, 128_000,
+            "Copilot's real, much smaller context"
+        );
+        assert_eq!(
+            copilot.max_output, 16_384,
+            "Copilot's real, much smaller output ceiling"
+        );
     }
 
     #[test]
@@ -4792,7 +5028,10 @@ mod tests {
             let native = capabilities_for_route_with_copilot(id, false, false, false);
             assert_eq!(native.context_window, 272_000, "{id}");
             let copilot = capabilities_for_route_with_copilot(id, false, false, true);
-            assert_eq!(copilot.context_window, 400_000, "{id}: Copilot's real, larger context");
+            assert_eq!(
+                copilot.context_window, 400_000,
+                "{id}: Copilot's real, larger context"
+            );
         }
     }
 
@@ -4818,7 +5057,10 @@ mod tests {
     fn capabilities_for_route_with_copilot_leaves_unrelated_ids_and_codex_azure_overrides_intact() {
         // Copilot-awareness must compose with, not replace, the existing Codex/Azure overrides.
         let codex = capabilities_for_route_with_copilot("gpt-5.3-codex-spark", true, false, false);
-        assert_eq!(codex.max_output, 128_000, "Codex's own override must still apply");
+        assert_eq!(
+            codex.max_output, 128_000,
+            "Codex's own override must still apply"
+        );
 
         // An id Copilot never serves is untouched even if (hypothetically) is_copilot were true.
         let unaffected = capabilities_for_route_with_copilot("deepseek-v4-pro", false, false, true);
@@ -4908,8 +5150,14 @@ mod tests {
     #[test]
     fn huggingface_deepseek_r1_and_v3_2_get_their_real_much_smaller_numbers() {
         let r1 = capabilities("deepseek-ai/DeepSeek-R1");
-        assert_eq!(r1.context_window, 64_000, "was 1_000_000 under the flat family bucket");
-        assert_eq!(r1.max_output, 32_768, "was 384_000 under the flat family bucket");
+        assert_eq!(
+            r1.context_window, 64_000,
+            "was 1_000_000 under the flat family bucket"
+        );
+        assert_eq!(
+            r1.max_output, 32_768,
+            "was 384_000 under the flat family bucket"
+        );
 
         let r1_0528 = capabilities("deepseek-ai/DeepSeek-R1-0528");
         assert_eq!(r1_0528.context_window, 163_840);
@@ -4926,8 +5174,14 @@ mod tests {
         // this test used to assert here (1_000_000/384_000) as if it were OpenRouter's own real number,
         // when it was actually just the flat bucket's untouched fallback.
         let openrouter_style = capabilities("deepseek/deepseek-r1");
-        assert_eq!(openrouter_style.context_window, 163_840, "was 1_000_000 under the flat family bucket");
-        assert_eq!(openrouter_style.max_output, 16_000, "was 384_000 under the flat family bucket");
+        assert_eq!(
+            openrouter_style.context_window, 163_840,
+            "was 1_000_000 under the flat family bucket"
+        );
+        assert_eq!(
+            openrouter_style.max_output, 16_000,
+            "was 384_000 under the flat family bucket"
+        );
     }
 
     #[test]
@@ -4939,8 +5193,14 @@ mod tests {
         // disambiguate. Together's smaller, safer context wins: the family-wide 1,000,000 default was a
         // 2x over-report for Together.
         let c = capabilities("deepseek-ai/DeepSeek-V4-Pro");
-        assert_eq!(c.context_window, 512_000, "was 1_000_000 under the flat family bucket");
-        assert_eq!(c.max_output, 384_000, "unaffected — already matched the family default");
+        assert_eq!(
+            c.context_window, 512_000,
+            "was 1_000_000 under the flat family bucket"
+        );
+        assert_eq!(
+            c.max_output, 384_000,
+            "unaffected — already matched the family default"
+        );
 
         // The bare native id (not this exact vendor-slug string) is unaffected.
         assert_eq!(capabilities("deepseek-v4-pro").context_window, 1_000_000);
@@ -4952,8 +5212,14 @@ mod tests {
         // (`huggingface.models.ts`) — max_output already matched the family default; only
         // context_window was under-reported (~4.6%).
         let c = capabilities("deepseek-ai/DeepSeek-V4-Flash");
-        assert_eq!(c.context_window, 1_048_576, "was 1_000_000 under the flat family bucket");
-        assert_eq!(c.max_output, 384_000, "unaffected — already matched the family default");
+        assert_eq!(
+            c.context_window, 1_048_576,
+            "was 1_000_000 under the flat family bucket"
+        );
+        assert_eq!(
+            c.max_output, 384_000,
+            "unaffected — already matched the family default"
+        );
     }
 
     #[test]
@@ -4988,7 +5254,10 @@ mod tests {
         // 202752/4096 (`openrouter.models.ts`) vs the generic GLM bucket's 200000/131072.
         let glm5_openrouter = capabilities("z-ai/glm-5");
         assert_eq!(glm5_openrouter.context_window, 202_752);
-        assert_eq!(glm5_openrouter.max_output, 4_096, "was 131_072 before this fix");
+        assert_eq!(
+            glm5_openrouter.max_output, 4_096,
+            "was 131_072 before this fix"
+        );
 
         // Together and HuggingFace both host "zai-org/glm-5"/"zai-org/glm-5.1" and agree on the real
         // numbers (202752/131072) — no collision, just a small context correction.
@@ -5003,8 +5272,14 @@ mod tests {
         assert_eq!(glm46.context_window, 204_800);
         assert_eq!(glm46.max_output, 131_072);
         let glm47flash = capabilities("zai-org/glm-4.7-flash");
-        assert_eq!(glm47flash.context_window, 200_000, "was 204_800 before this fix");
-        assert_eq!(glm47flash.max_output, 128_000, "was 131_072 before this fix");
+        assert_eq!(
+            glm47flash.context_window, 200_000,
+            "was 204_800 before this fix"
+        );
+        assert_eq!(
+            glm47flash.max_output, 128_000,
+            "was 131_072 before this fix"
+        );
         // Bare native "glm-4.7" (no "-flash" suffix) is unaffected.
         assert_eq!(capabilities("glm-4.7").context_window, 204_800);
         assert_eq!(capabilities("glm-4.7").max_output, 131_072);
@@ -5033,7 +5308,10 @@ mod tests {
         // tie-break), so HuggingFace itself now under-reports instead.
         let c = capabilities("qwen/qwen3-next-80b-a3b-thinking");
         assert_eq!(c.context_window, 262_144);
-        assert_eq!(c.max_output, 32_768, "OpenRouter's real, smaller number now wins the collision");
+        assert_eq!(
+            c.max_output, 32_768,
+            "OpenRouter's real, smaller number now wins the collision"
+        );
     }
 
     #[test]
@@ -5072,7 +5350,10 @@ mod tests {
             false,
             Some(AggregatorHost::OpenRouter),
         );
-        assert_eq!(openrouter.max_output, 4_096, "OpenRouter's real, smaller number");
+        assert_eq!(
+            openrouter.max_output, 4_096,
+            "OpenRouter's real, smaller number"
+        );
 
         let huggingface = capabilities_for_route_with_host(
             id,
@@ -5081,7 +5362,10 @@ mod tests {
             false,
             Some(AggregatorHost::HuggingFace),
         );
-        assert_eq!(huggingface.max_output, 131_072, "HuggingFace's real, 32x larger number");
+        assert_eq!(
+            huggingface.max_output, 131_072,
+            "HuggingFace's real, 32x larger number"
+        );
         assert_eq!(
             huggingface.context_window, 262_144,
             "context agrees between hosts, so it's untouched by the host override"
@@ -5104,11 +5388,19 @@ mod tests {
     fn capabilities_for_route_with_host_resolves_the_gpt_oss_20b_collision_for_together() {
         let id = "openai/gpt-oss-20b";
         let no_host = capabilities_for_route_with_host(id, false, false, false, None);
-        assert_eq!(no_host.max_output, 32_768, "NVIDIA's number wins unconditionally without a host signal");
+        assert_eq!(
+            no_host.max_output, 32_768,
+            "NVIDIA's number wins unconditionally without a host signal"
+        );
         assert_eq!(no_host, capabilities(id), "None must be a complete no-op");
 
-        let together =
-            capabilities_for_route_with_host(id, false, false, false, Some(AggregatorHost::Together));
+        let together = capabilities_for_route_with_host(
+            id,
+            false,
+            false,
+            false,
+            Some(AggregatorHost::Together),
+        );
         assert_eq!(
             together.max_output, 131_072,
             "Together's real number, corrected despite NVIDIA's base-table interception"
@@ -5126,7 +5418,10 @@ mod tests {
             false,
             Some(AggregatorHost::Fireworks),
         );
-        assert_eq!(codex.max_output, 128_000, "Codex's own override must still apply");
+        assert_eq!(
+            codex.max_output, 128_000,
+            "Codex's own override must still apply"
+        );
 
         let unaffected = capabilities_for_route_with_host(
             "deepseek-v4-pro",
@@ -5147,22 +5442,54 @@ mod tests {
         // 512,000) on OpenCode Zen specifically (OpenCode-Go's own real context, 1,000,000, already
         // matches the host-agnostic default).
         let no_host_kimi = capabilities_for_route_with_host("kimi-k2.5", false, false, false, None);
-        assert_eq!(no_host_kimi.max_output, 262_144, "no host signal: host-agnostic default unaffected");
-        assert_eq!(no_host_kimi, capabilities("kimi-k2.5"), "None must be a complete no-op");
+        assert_eq!(
+            no_host_kimi.max_output, 262_144,
+            "no host signal: host-agnostic default unaffected"
+        );
+        assert_eq!(
+            no_host_kimi,
+            capabilities("kimi-k2.5"),
+            "None must be a complete no-op"
+        );
 
         for host in [AggregatorHost::OpenCodeZen, AggregatorHost::OpenCodeGo] {
-            let kimi_2_6 = capabilities_for_route_with_host("kimi-k2.6", false, false, false, Some(host));
-            assert_eq!(kimi_2_6.max_output, 65_536, "{host:?}: was 262_144, a 4x over-report");
+            let kimi_2_6 =
+                capabilities_for_route_with_host("kimi-k2.6", false, false, false, Some(host));
+            assert_eq!(
+                kimi_2_6.max_output, 65_536,
+                "{host:?}: was 262_144, a 4x over-report"
+            );
         }
-        let kimi_2_5_zen =
-            capabilities_for_route_with_host("kimi-k2.5", false, false, false, Some(AggregatorHost::OpenCodeZen));
-        assert_eq!(kimi_2_5_zen.max_output, 65_536, "OpenCode Zen: was 262_144, a 4x over-report");
+        let kimi_2_5_zen = capabilities_for_route_with_host(
+            "kimi-k2.5",
+            false,
+            false,
+            false,
+            Some(AggregatorHost::OpenCodeZen),
+        );
+        assert_eq!(
+            kimi_2_5_zen.max_output, 65_536,
+            "OpenCode Zen: was 262_144, a 4x over-report"
+        );
 
-        let glm_go =
-            capabilities_for_route_with_host("glm-5.1", false, false, false, Some(AggregatorHost::OpenCodeGo));
-        assert_eq!(glm_go.max_output, 32_768, "OpenCode-Go: was 131_072, a 4x over-report");
-        let glm_zen =
-            capabilities_for_route_with_host("glm-5.1", false, false, false, Some(AggregatorHost::OpenCodeZen));
+        let glm_go = capabilities_for_route_with_host(
+            "glm-5.1",
+            false,
+            false,
+            false,
+            Some(AggregatorHost::OpenCodeGo),
+        );
+        assert_eq!(
+            glm_go.max_output, 32_768,
+            "OpenCode-Go: was 131_072, a 4x over-report"
+        );
+        let glm_zen = capabilities_for_route_with_host(
+            "glm-5.1",
+            false,
+            false,
+            false,
+            Some(AggregatorHost::OpenCodeZen),
+        );
         assert_eq!(
             glm_zen.max_output, 131_072,
             "OpenCode Zen's own real number already matches the host-agnostic default"
@@ -5175,7 +5502,10 @@ mod tests {
             false,
             Some(AggregatorHost::OpenCodeZen),
         );
-        assert_eq!(minimax_zen.context_window, 512_000, "OpenCode Zen: was 1_000_000, a 2x over-report");
+        assert_eq!(
+            minimax_zen.context_window, 512_000,
+            "OpenCode Zen: was 1_000_000, a 2x over-report"
+        );
         let minimax_go = capabilities_for_route_with_host(
             "minimax-m3",
             false,
@@ -5192,7 +5522,10 @@ mod tests {
     #[test]
     fn huggingface_glm_4_5v_gets_vision_and_its_own_much_smaller_numbers() {
         let c = capabilities("zai-org/GLM-4.5V");
-        assert!(c.supports_vision, "\"glm-4.5v\".starts_with(\"glm-5v\") is false; needs its own check");
+        assert!(
+            c.supports_vision,
+            "\"glm-4.5v\".starts_with(\"glm-5v\") is false; needs its own check"
+        );
         assert_eq!(c.context_window, 65_536);
         assert_eq!(c.max_output, 16_384);
         // Every other current GLM id is unaffected.
@@ -5216,26 +5549,44 @@ mod tests {
     #[test]
     fn huggingface_kimi_k2_instruct_bare_naming_gets_its_real_numbers() {
         let plain = capabilities("moonshotai/Kimi-K2-Instruct");
-        assert_eq!(plain.context_window, 131_072, "was 262_144 under the generic else bucket");
-        assert_eq!(plain.max_output, 16_384, "was 262_144 under the generic else bucket");
+        assert_eq!(
+            plain.context_window, 131_072,
+            "was 262_144 under the generic else bucket"
+        );
+        assert_eq!(
+            plain.max_output, 16_384,
+            "was 262_144 under the generic else bucket"
+        );
         assert!(!plain.supports_vision);
-        assert!(!plain.reasoning_disableable, "non-reasoning: nothing to disable");
+        assert!(
+            !plain.reasoning_disableable,
+            "non-reasoning: nothing to disable"
+        );
 
         let dated = capabilities("moonshotai/Kimi-K2-Instruct-0905");
         assert_eq!(dated.context_window, 262_144);
-        assert_eq!(dated.max_output, 16_384, "was 262_144 under the generic else bucket");
+        assert_eq!(
+            dated.max_output, 16_384,
+            "was 262_144 under the generic else bucket"
+        );
 
         // The unrelated "-0905" *preview* id (a different, non-Instruct release) keeps its own
         // existing, separately-tested treatment.
         let preview = capabilities("kimi-k2-0905");
-        assert_eq!(preview.openai_reasoning_format, OpenAiReasoningFormat::Standard);
+        assert_eq!(
+            preview.openai_reasoning_format,
+            OpenAiReasoningFormat::Standard
+        );
     }
 
     #[test]
     fn huggingface_llama_3_3_70b_instruct_gets_its_real_much_smaller_max_output() {
         let c = capabilities("meta-llama/Llama-3.3-70B-Instruct");
         assert_eq!(c.context_window, 131_072);
-        assert_eq!(c.max_output, 4_096, "was 32_768 under the generic llama branch's default");
+        assert_eq!(
+            c.max_output, 4_096,
+            "was 32_768 under the generic llama branch's default"
+        );
         // Every other llama-shaped id is unaffected.
         assert_eq!(capabilities("llama-3.1-70b").max_output, 32_768);
     }
@@ -5248,9 +5599,15 @@ mod tests {
         // default (a safe-direction under-report, fixed here for accuracy).
         let c = capabilities("meta-llama/Llama-3.3-70B-Instruct-Turbo");
         assert_eq!(c.context_window, 131_072);
-        assert_eq!(c.max_output, 131_072, "was 32_768 under the generic llama branch's default");
+        assert_eq!(
+            c.max_output, 131_072,
+            "was 32_768 under the generic llama branch's default"
+        );
         // The non-Turbo HuggingFace id is unaffected — still its own, much smaller real number.
-        assert_eq!(capabilities("meta-llama/Llama-3.3-70B-Instruct").max_output, 4_096);
+        assert_eq!(
+            capabilities("meta-llama/Llama-3.3-70B-Instruct").max_output,
+            4_096
+        );
     }
 
     #[test]
@@ -5288,7 +5645,8 @@ mod tests {
     }
 
     #[test]
-    fn huggingface_gemma_4_it_ids_get_real_vision_and_numbers_not_the_generic_openrouter_fallback() {
+    fn huggingface_gemma_4_it_ids_get_real_vision_and_numbers_not_the_generic_openrouter_fallback()
+    {
         for id in ["google/gemma-4-26b-a4b-it", "google/gemma-4-31b-it"] {
             let c = capabilities(id);
             assert!(c.supports_vision, "{id}");
@@ -5310,7 +5668,8 @@ mod tests {
     }
 
     #[test]
-    fn google_gemma_4_31b_it_keeps_huggingfaces_smaller_safe_max_output_despite_togethers_larger_real_one() {
+    fn google_gemma_4_31b_it_keeps_huggingfaces_smaller_safe_max_output_despite_togethers_larger_real_one()
+     {
         // pi-parity Task #27 (investigated, kept as-is — documented, not a new numeric fix): Together
         // also hosts this exact vendor-slug id with a real max_output of 131072
         // (`together.models.ts:193`), 4x HuggingFace's 32768. No route/host signal exists to
@@ -5318,7 +5677,10 @@ mod tests {
         // stays — this pins down the current, deliberate behavior so a future route-aware fix changes
         // it on purpose, not by accident.
         let c = capabilities("google/gemma-4-31b-it");
-        assert_eq!(c.max_output, 32_768, "HuggingFace's smaller, safe-direction number");
+        assert_eq!(
+            c.max_output, 32_768,
+            "HuggingFace's smaller, safe-direction number"
+        );
         assert_ne!(c.max_output, 131_072, "not Together's real, larger ceiling");
     }
 
@@ -5359,7 +5721,10 @@ mod tests {
         let uncatalogued = capabilities("Qwen/Qwen4-Hypothetical-Future-Id");
         assert_eq!(uncatalogued.context_window, 262_144);
         assert_eq!(uncatalogued.max_output, 65_536);
-        assert_eq!(uncatalogued.openai_reasoning_format, OpenAiReasoningFormat::Together);
+        assert_eq!(
+            uncatalogued.openai_reasoning_format,
+            OpenAiReasoningFormat::Together
+        );
     }
 
     #[test]
@@ -5371,8 +5736,14 @@ mod tests {
         // now wins each collision.
         let plus = capabilities("qwen/qwen3.6-plus");
         assert_eq!(plus.context_window, 1_000_000);
-        assert_eq!(plus.max_output, 65_536, "was 500_000, Together's number, a ~7.6x over-report");
-        assert_eq!(plus.openai_reasoning_format, OpenAiReasoningFormat::OpenRouter);
+        assert_eq!(
+            plus.max_output, 65_536,
+            "was 500_000, Together's number, a ~7.6x over-report"
+        );
+        assert_eq!(
+            plus.openai_reasoning_format,
+            OpenAiReasoningFormat::OpenRouter
+        );
         assert!(
             !plus.supports_vision,
             "Together's real entry for this exact string is text-only — the safe pick"
@@ -5387,13 +5758,22 @@ mod tests {
         // this identical string too, with an even smaller real max_output.
         let vision_397b = capabilities("qwen/qwen3.5-397b-a17b");
         assert_eq!(vision_397b.context_window, 256_000);
-        assert_eq!(vision_397b.max_output, 4_096, "was 32_768 (HuggingFace's number), an 8x over-report");
+        assert_eq!(
+            vision_397b.max_output, 4_096,
+            "was 32_768 (HuggingFace's number), an 8x over-report"
+        );
         assert!(vision_397b.supports_vision);
 
         let instruct_80b = capabilities("qwen/qwen3-next-80b-a3b-instruct");
         assert_eq!(instruct_80b.context_window, 262_144);
-        assert_eq!(instruct_80b.max_output, 16_384, "was 65_536 under the generic bucket, a ~4x over-report");
-        assert_eq!(instruct_80b.openai_reasoning_format, OpenAiReasoningFormat::Standard);
+        assert_eq!(
+            instruct_80b.max_output, 16_384,
+            "was 65_536 under the generic bucket, a ~4x over-report"
+        );
+        assert_eq!(
+            instruct_80b.openai_reasoning_format,
+            OpenAiReasoningFormat::Standard
+        );
 
         let thinking_80b = capabilities("qwen/qwen3-next-80b-a3b-thinking");
         assert_eq!(thinking_80b.context_window, 262_144);
@@ -5403,19 +5783,29 @@ mod tests {
         );
 
         let coder_30b = capabilities("qwen/qwen3-coder-30b-a3b-instruct");
-        assert_eq!(coder_30b.context_window, 160_000, "was 262_144, ~1.6x over-report");
+        assert_eq!(
+            coder_30b.context_window, 160_000,
+            "was 262_144, ~1.6x over-report"
+        );
         assert_eq!(coder_30b.max_output, 32_768, "was 65_536, ~2x over-report");
     }
 
     #[test]
-    fn openrouter_qwen3_235b_a22b_gets_openrouters_smaller_max_output_alongside_huggingfaces_context() {
+    fn openrouter_qwen3_235b_a22b_gets_openrouters_smaller_max_output_alongside_huggingfaces_context()
+     {
         // pi-parity pass 20 Task 1: this exact vendor-slug string is a HuggingFace/OpenRouter collision
         // (Task #16 originally special-cased it for HuggingFace's smaller *context* alone) — OpenRouter's
         // own real max_output (8192) is in turn smaller than HuggingFace's 16384 this bucket used to
         // return unconditionally, a ~2x over-report for OpenRouter specifically.
         let c = capabilities("qwen/qwen3-235b-a22b");
-        assert_eq!(c.context_window, 40_960, "HuggingFace's smaller context, unaffected by this fix");
-        assert_eq!(c.max_output, 8_192, "was 16_384, OpenRouter's real number is smaller still");
+        assert_eq!(
+            c.context_window, 40_960,
+            "HuggingFace's smaller context, unaffected by this fix"
+        );
+        assert_eq!(
+            c.max_output, 8_192,
+            "was 16_384, OpenRouter's real number is smaller still"
+        );
     }
 
     #[test]
@@ -5428,7 +5818,10 @@ mod tests {
         // string; context (1_000_000, NVIDIA's own, smaller than OpenRouter's 1,048,576) is unaffected.
         let c = capabilities("z-ai/glm-5.2");
         assert_eq!(c.context_window, 1_000_000);
-        assert_eq!(c.max_output, 128_000, "was 131_072, a small ~2.4% over-report for OpenRouter");
+        assert_eq!(
+            c.max_output, 128_000,
+            "was 131_072, a small ~2.4% over-report for OpenRouter"
+        );
         // nvidia_caps's own shape: no client-steerable reasoning mechanism at all (unlike the GLM
         // branch's real effort vocabulary for bare "glm-5.2").
         assert!(!c.reasoning_effort);
@@ -5441,14 +5834,20 @@ mod tests {
         // gpt-4-turbo* bucket's `m != "gpt-4"` vision gate incorrectly claimed vision support for it,
         // inherited from its differently-named, genuinely vision-capable sibling "openai/gpt-4-turbo".
         let preview = capabilities("openai/gpt-4-turbo-preview");
-        assert!(!preview.supports_vision, "was true — this legacy alias has no vision support at all");
+        assert!(
+            !preview.supports_vision,
+            "was true — this legacy alias has no vision support at all"
+        );
         assert_eq!(preview.context_window, 128_000);
         assert_eq!(preview.max_output, 4_096);
 
         // The differently-named sibling id keeps its real vision support, matching pi's `openai/
         // gpt-4-turbo` entry (`input: ["text","image"]`) — this fix must not regress it.
         let turbo = capabilities("openai/gpt-4-turbo");
-        assert!(turbo.supports_vision, "openai/gpt-4-turbo itself is genuinely vision-capable");
+        assert!(
+            turbo.supports_vision,
+            "openai/gpt-4-turbo itself is genuinely vision-capable"
+        );
     }
 
     #[test]
@@ -5486,8 +5885,14 @@ mod tests {
         // (dot vs "p"), so this silently fell to the GLM branch's flat 200k/131k "else" default instead
         // of the real glm-5.2 bucket (~1M context).
         let c = capabilities("accounts/fireworks/models/glm-5p2");
-        assert_eq!(c.context_window, 1_000_000, "must resolve to the glm-5.2 bucket, not the else one");
-        assert!(c.reasoning_effort, "glm-5.2 is the one GLM generation with a real effort vocabulary");
+        assert_eq!(
+            c.context_window, 1_000_000,
+            "must resolve to the glm-5.2 bucket, not the else one"
+        );
+        assert!(
+            c.reasoning_effort,
+            "glm-5.2 is the one GLM generation with a real effort vocabulary"
+        );
     }
 
     #[test]
@@ -5495,7 +5900,10 @@ mod tests {
         // Before normalization, `k.starts_with("kimi-k2.6")` never matched "kimi-k2p6" (dot vs "p"),
         // silently reporting a real vision-capable id as text-only.
         let c = capabilities("accounts/fireworks/models/kimi-k2p6");
-        assert!(c.supports_vision, "kimi-k2.6 is vision-capable on every host, Fireworks included");
+        assert!(
+            c.supports_vision,
+            "kimi-k2.6 is vision-capable on every host, Fireworks included"
+        );
         assert_eq!(c.openai_reasoning_format, OpenAiReasoningFormat::DeepSeek);
 
         // The "-fast"/"-turbo" router variants share the same normalized prefix.
@@ -5570,7 +5978,10 @@ mod tests {
         // vision ids entirely — NVIDIA's own catalogue does mark them vision-capable.
         assert!(capabilities("meta/llama-3.2-11b-vision-instruct").supports_vision);
         assert!(capabilities("meta/llama-3.2-90b-vision-instruct").supports_vision);
-        assert_eq!(capabilities("meta/llama-3.2-90b-vision-instruct").max_output, 8_192);
+        assert_eq!(
+            capabilities("meta/llama-3.2-90b-vision-instruct").max_output,
+            8_192
+        );
     }
 
     #[test]
@@ -5585,7 +5996,10 @@ mod tests {
 
         let small = capabilities("mistralai/mistral-small-4-119b-2603");
         assert_eq!(small.context_window, 128_000);
-        assert_eq!(small.max_output, 8_192, "must not inherit the catch-all's 128_000");
+        assert_eq!(
+            small.max_output, 8_192,
+            "must not inherit the catch-all's 128_000"
+        );
         assert!(small.supports_vision);
     }
 
@@ -5602,7 +6016,10 @@ mod tests {
         // `nvidia_minimax_m3_gets_its_real_smaller_max_output` below for that fix's own regression
         // test.
         let kimi = capabilities("moonshotai/kimi-k2.6");
-        assert_eq!(kimi.openai_reasoning_format, OpenAiReasoningFormat::DeepSeek);
+        assert_eq!(
+            kimi.openai_reasoning_format,
+            OpenAiReasoningFormat::DeepSeek
+        );
     }
 
     #[test]
@@ -5653,7 +6070,10 @@ mod tests {
         // loss for Together specifically. This pins down the current, documented behavior so a future
         // route-aware fix changes it on purpose.
         let c = capabilities("nvidia/nemotron-3-ultra-550b-a55b");
-        assert_eq!(c.context_window, 1_000_000, "NVIDIA's own real, tested number");
+        assert_eq!(
+            c.context_window, 1_000_000,
+            "NVIDIA's own real, tested number"
+        );
         assert_eq!(c.max_output, 65_536, "NVIDIA's own real, tested number");
     }
 
@@ -5681,7 +6101,10 @@ mod tests {
             assert_eq!(c.context_window, 262_144, "{id}");
             assert_eq!(c.max_output, 65_536, "{id}");
             assert!(!c.supports_vision, "{id}");
-            assert!(!c.supports_long_cache, "{id}: pi's isAntLing denylist excludes long-cache");
+            assert!(
+                !c.supports_long_cache,
+                "{id}: pi's isAntLing denylist excludes long-cache"
+            );
             assert!(c.max_output > ModelCaps::unknown().max_output, "{id}");
         }
     }
@@ -5689,17 +6112,29 @@ mod tests {
     #[test]
     fn ant_ling_ring_2_6_1t_is_the_only_reasoning_capable_id_with_a_high_floor() {
         let ring = capabilities("Ring-2.6-1T");
-        assert_eq!(ring.min_reasoning_effort, crate::transport::ReasoningEffort::High);
+        assert_eq!(
+            ring.min_reasoning_effort,
+            crate::transport::ReasoningEffort::High
+        );
         assert!(ring.supports_xhigh_reasoning);
-        assert!(!ring.reasoning_disableable, "thinkingLevelMap.off is null — no explicit off signal");
+        assert!(
+            !ring.reasoning_disableable,
+            "thinkingLevelMap.off is null — no explicit off signal"
+        );
         assert_eq!(ring.openai_reasoning_format, OpenAiReasoningFormat::AntLing);
         // No graduated top-level `reasoning_effort` string exists for this format — the mechanism lives
         // entirely in the (currently-unwired) nested `reasoning.effort` shape.
         assert!(!ring.reasoning_effort);
-        assert!(has_reasoning_mechanism(&ring), "the toggle-only third arm must still report a mechanism");
+        assert!(
+            has_reasoning_mechanism(&ring),
+            "the toggle-only third arm must still report a mechanism"
+        );
 
         let ling = capabilities("Ling-2.6-1T");
-        assert_eq!(ling.openai_reasoning_format, OpenAiReasoningFormat::Standard);
+        assert_eq!(
+            ling.openai_reasoning_format,
+            OpenAiReasoningFormat::Standard
+        );
         assert!(!has_reasoning_mechanism(&ling));
     }
 
@@ -5757,8 +6192,16 @@ mod tests {
             let c = capabilities(id);
             assert!(c.reasoning_effort, "{id}");
             assert!(c.reasoning_disableable, "{id}");
-            assert_eq!(c.max_tokens_field, MaxTokensField::MaxCompletionTokens, "{id}");
-            assert_eq!(c.openai_reasoning_format, OpenAiReasoningFormat::DeepSeek, "{id}");
+            assert_eq!(
+                c.max_tokens_field,
+                MaxTokensField::MaxCompletionTokens,
+                "{id}"
+            );
+            assert_eq!(
+                c.openai_reasoning_format,
+                OpenAiReasoningFormat::DeepSeek,
+                "{id}"
+            );
             assert!(
                 c.max_output > ModelCaps::unknown().max_output,
                 "{id} should beat unknown()'s 4096 ceiling"
@@ -5778,8 +6221,17 @@ mod tests {
 
     #[test]
     fn supports_tool_stream_is_true_for_every_glm_id_except_glm_4_5_air() {
-        for id in ["glm-4.7", "glm-5-turbo", "glm-5.1", "glm-5.2", "glm-5v-turbo"] {
-            assert!(capabilities(id).supports_tool_stream, "{id} should set tool_stream");
+        for id in [
+            "glm-4.7",
+            "glm-5-turbo",
+            "glm-5.1",
+            "glm-5.2",
+            "glm-5v-turbo",
+        ] {
+            assert!(
+                capabilities(id).supports_tool_stream,
+                "{id} should set tool_stream"
+            );
         }
         assert!(
             !capabilities("glm-4.5-air").supports_tool_stream,
@@ -5843,7 +6295,10 @@ mod tests {
 
         let large_2512 = capabilities("mistral-large-2512");
         assert_eq!(large_2512.context_window, 262_144);
-        assert!(large_2512.supports_vision, "mistral-large-2512 gained vision");
+        assert!(
+            large_2512.supports_vision,
+            "mistral-large-2512 gained vision"
+        );
         // The "-2411" predecessor is text-only and much smaller — a family-level default would have
         // misreported one of these by a wide margin.
         let large_2411 = capabilities("mistral-large-2411");
@@ -5872,9 +6327,19 @@ mod tests {
         ] {
             let c = capabilities(id);
             assert!(c.reasoning_effort, "{id} should gain a thinking mechanism");
-            assert_eq!(c.openai_reasoning_format, OpenAiReasoningFormat::Standard, "{id}");
-            assert!(c.reasoning_disableable, "{id}: off is always legal (no id nulls it)");
-            assert!(!c.supports_xhigh_reasoning, "{id}: no Mistral id defines xhigh");
+            assert_eq!(
+                c.openai_reasoning_format,
+                OpenAiReasoningFormat::Standard,
+                "{id}"
+            );
+            assert!(
+                c.reasoning_disableable,
+                "{id}: off is always legal (no id nulls it)"
+            );
+            assert!(
+                !c.supports_xhigh_reasoning,
+                "{id}: no Mistral id defines xhigh"
+            );
         }
         // "mistral-medium-latest" is (per pi's live catalogue) an alias still pointing at a
         // non-reasoning snapshot, unlike its "-2604"/"-3.5" siblings.
@@ -5898,8 +6363,16 @@ mod tests {
         ] {
             assert!(is_mistral_model(id), "{id} should be recognized as Mistral");
         }
-        for id in ["gpt-4o", "claude-opus-4-8", "deepseek-v4-pro", "some-vendor/model"] {
-            assert!(!is_mistral_model(id), "{id} should not be recognized as Mistral");
+        for id in [
+            "gpt-4o",
+            "claude-opus-4-8",
+            "deepseek-v4-pro",
+            "some-vendor/model",
+        ] {
+            assert!(
+                !is_mistral_model(id),
+                "{id} should not be recognized as Mistral"
+            );
         }
     }
 
@@ -5918,7 +6391,10 @@ mod tests {
     #[test]
     fn reasoning_wire_override_remaps_deepseek_xhigh_to_max() {
         use crate::transport::ReasoningEffort as RE;
-        assert_eq!(reasoning_wire_override("deepseek-v4-pro", RE::XHigh), Some("max"));
+        assert_eq!(
+            reasoning_wire_override("deepseek-v4-pro", RE::XHigh),
+            Some("max")
+        );
         // High is a literal passthrough — no override.
         assert_eq!(reasoning_wire_override("deepseek-v4-pro", RE::High), None);
     }
@@ -5927,7 +6403,11 @@ mod tests {
     fn reasoning_wire_override_remaps_glm_5_2_low_medium_and_xhigh() {
         use crate::transport::ReasoningEffort as RE;
         for (effort, wire) in [(RE::Low, "high"), (RE::Medium, "high"), (RE::High, "high")] {
-            assert_eq!(reasoning_wire_override("glm-5.2", effort), Some(wire), "{effort:?}");
+            assert_eq!(
+                reasoning_wire_override("glm-5.2", effort),
+                Some(wire),
+                "{effort:?}"
+            );
         }
         assert_eq!(reasoning_wire_override("glm-5.2", RE::XHigh), Some("max"));
         // Minimal is excluded by the model's own floor (`min_reasoning_effort: Low`) before this
@@ -5942,14 +6422,23 @@ mod tests {
         // "zai-org/glm-5.2" (Together/HuggingFace) must remap identically to the bare "glm-5.2" it's
         // slug-prefixed with, not silently fall through to `None` because the full id doesn't start
         // with "glm-5.2".
-        assert_eq!(reasoning_wire_override("zai-org/glm-5.2", RE::Low), Some("high"));
-        assert_eq!(reasoning_wire_override("zai-org/glm-5.2", RE::XHigh), Some("max"));
+        assert_eq!(
+            reasoning_wire_override("zai-org/glm-5.2", RE::Low),
+            Some("high")
+        );
+        assert_eq!(
+            reasoning_wire_override("zai-org/glm-5.2", RE::XHigh),
+            Some("max")
+        );
     }
 
     #[test]
     fn reasoning_wire_override_remaps_groq_qwen_high_to_default() {
         use crate::transport::ReasoningEffort as RE;
-        assert_eq!(reasoning_wire_override("qwen/qwen3-32b", RE::High), Some("default"));
+        assert_eq!(
+            reasoning_wire_override("qwen/qwen3-32b", RE::High),
+            Some("default")
+        );
         // A different qwen host (Together-shaped) isn't this one exact Groq id — no override.
         assert_eq!(reasoning_wire_override("qwen/qwen3.6-plus", RE::High), None);
     }
@@ -5978,7 +6467,13 @@ mod tests {
     #[test]
     fn reasoning_wire_override_is_none_for_every_other_family() {
         use crate::transport::ReasoningEffort as RE;
-        for id in ["o3", "gpt-5.2", "claude-opus-4-8", "grok-4.3", "kimi-k2-thinking"] {
+        for id in [
+            "o3",
+            "gpt-5.2",
+            "claude-opus-4-8",
+            "grok-4.3",
+            "kimi-k2-thinking",
+        ] {
             assert_eq!(reasoning_wire_override(id, RE::High), None, "{id}");
         }
     }
@@ -5994,12 +6489,23 @@ mod tests {
             "gpt-oss-120b",
             "zai-glm-4.7",
         ] {
-            assert!(is_non_standard_store_provider(id), "{id} should be non-standard");
+            assert!(
+                is_non_standard_store_provider(id),
+                "{id} should be non-standard"
+            );
         }
         // The one Groq-hosted qwen exception is standard (Groq isn't in pi's denylist).
         assert!(!is_non_standard_store_provider("qwen/qwen3-32b"));
-        for id in ["gpt-4o", "claude-opus-4-8", "mistral-large-latest", "some-vendor/model"] {
-            assert!(!is_non_standard_store_provider(id), "{id} should be standard");
+        for id in [
+            "gpt-4o",
+            "claude-opus-4-8",
+            "mistral-large-latest",
+            "some-vendor/model",
+        ] {
+            assert!(
+                !is_non_standard_store_provider(id),
+                "{id} should be standard"
+            );
         }
     }
 }

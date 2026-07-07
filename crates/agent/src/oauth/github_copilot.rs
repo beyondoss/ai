@@ -203,7 +203,8 @@ pub async fn refresh(
     enterprise_domain: Option<&str>,
 ) -> Result<GithubCopilotCredential> {
     let http = Client::new();
-    let (access, expires_at_ms) = fetch_copilot_token(&http, refresh_token, enterprise_domain).await?;
+    let (access, expires_at_ms) =
+        fetch_copilot_token(&http, refresh_token, enterprise_domain).await?;
     let base_url = base_url_from_token(Some(&access), enterprise_domain);
     let available_model_ids = fetch_available_models(&http, &base_url, &access)
         .await
@@ -315,7 +316,10 @@ fn parse_poll_response(body: &serde_json::Value) -> Result<DevicePollStep<String
     if let Some(token) = body.get("access_token").and_then(|v| v.as_str()) {
         return Ok(DevicePollStep::Complete(token.to_string()));
     }
-    let error = body.get("error").and_then(|v| v.as_str()).unwrap_or_default();
+    let error = body
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
     match error {
         "authorization_pending" => Ok(DevicePollStep::Pending),
         "slow_down" => {
@@ -477,7 +481,10 @@ impl CopilotRoutedCredentialSource {
             static_headers: vec![
                 ("User-Agent", COPILOT_USER_AGENT.to_string()),
                 ("Editor-Version", COPILOT_EDITOR_VERSION.to_string()),
-                ("Editor-Plugin-Version", COPILOT_EDITOR_PLUGIN_VERSION.to_string()),
+                (
+                    "Editor-Plugin-Version",
+                    COPILOT_EDITOR_PLUGIN_VERSION.to_string(),
+                ),
                 ("Copilot-Integration-Id", COPILOT_INTEGRATION_ID.to_string()),
             ],
             copilot_dynamic_headers: true,
@@ -665,7 +672,8 @@ mod tests {
 
     #[test]
     fn parse_poll_response_fails_on_an_unrecognized_error_with_its_description() {
-        let body = serde_json::json!({ "error": "access_denied", "error_description": "user said no" });
+        let body =
+            serde_json::json!({ "error": "access_denied", "error_description": "user said no" });
         let err = parse_poll_response(&body).unwrap_err();
         match err {
             OAuthError::DeviceFlowFailed(msg) => {
@@ -823,11 +831,17 @@ mod tests {
         assert!(matches!(err, OAuthError::InvalidResponse { .. }));
     }
 
-    fn entry(model_picker_enabled: bool, state: Option<&str>, tool_calls: Option<bool>) -> ModelEntry {
+    fn entry(
+        model_picker_enabled: bool,
+        state: Option<&str>,
+        tool_calls: Option<bool>,
+    ) -> ModelEntry {
         ModelEntry {
             id: "m".to_string(),
             model_picker_enabled,
-            policy: state.map(|s| ModelPolicy { state: s.to_string() }),
+            policy: state.map(|s| ModelPolicy {
+                state: s.to_string(),
+            }),
             capabilities: tool_calls.map(|t| ModelCapabilities {
                 supports: ModelSupports { tool_calls: t },
             }),
@@ -910,7 +924,9 @@ mod tests {
         crate::auth_store::AuthStore::open(store_path.clone())
             .set(
                 "github-copilot",
-                stored_copilot_credential("tid=abc;proxy-ep=proxy.pool-a.githubcopilot.com;exp=123"),
+                stored_copilot_credential(
+                    "tid=abc;proxy-ep=proxy.pool-a.githubcopilot.com;exp=123",
+                ),
             )
             .unwrap();
 
@@ -932,7 +948,9 @@ mod tests {
         crate::auth_store::AuthStore::open(store_path.clone())
             .set(
                 "github-copilot",
-                stored_copilot_credential("tid=abc;proxy-ep=proxy.pool-b.githubcopilot.com;exp=456"),
+                stored_copilot_credential(
+                    "tid=abc;proxy-ep=proxy.pool-b.githubcopilot.com;exp=456",
+                ),
             )
             .unwrap();
 
@@ -950,7 +968,9 @@ mod tests {
         crate::auth_store::AuthStore::open(store_path.clone())
             .set(
                 "github-copilot",
-                stored_copilot_credential("tid=abc;proxy-ep=proxy.pool-a.githubcopilot.com;exp=123"),
+                stored_copilot_credential(
+                    "tid=abc;proxy-ep=proxy.pool-a.githubcopilot.com;exp=123",
+                ),
             )
             .unwrap();
 

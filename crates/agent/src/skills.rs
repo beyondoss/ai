@@ -511,7 +511,10 @@ pub(crate) fn collect_ancestor_agents_skill_dirs_excluding_user_dir(start: &Path
 /// can be exercised deterministically without mutating global process state — `std::env::set_var` is
 /// unsafe to call from a test that may run concurrently with others reading `$HOME`/calling `home_dir()`
 /// (see `resources.rs`'s `tz_string_offset` for the same established pattern in this codebase).
-fn collect_ancestor_agents_skill_dirs_excluding(start: &Path, exclude: Option<&Path>) -> Vec<PathBuf> {
+fn collect_ancestor_agents_skill_dirs_excluding(
+    start: &Path,
+    exclude: Option<&Path>,
+) -> Vec<PathBuf> {
     collect_ancestor_agents_skill_dirs(start)
         .into_iter()
         .filter(|dir| exclude != Some(dir.as_path()))
@@ -873,12 +876,12 @@ fn yaml_scalar_to_string(value: &serde_yaml::Value) -> String {
         serde_yaml::Value::Bool(b) => b.to_string(),
         serde_yaml::Value::Number(n) => n.to_string(),
         serde_yaml::Value::String(s) => s.clone(),
-        serde_yaml::Value::Sequence(_) | serde_yaml::Value::Mapping(_) | serde_yaml::Value::Tagged(_) => {
-            serde_yaml::to_string(value)
-                .unwrap_or_default()
-                .trim_end()
-                .to_string()
-        }
+        serde_yaml::Value::Sequence(_)
+        | serde_yaml::Value::Mapping(_)
+        | serde_yaml::Value::Tagged(_) => serde_yaml::to_string(value)
+            .unwrap_or_default()
+            .trim_end()
+            .to_string(),
     }
 }
 
@@ -1401,8 +1404,10 @@ mod tests {
         assert_eq!(excluding_none, all);
 
         // Excluding the middle entry drops only that one, leaving the nearest and furthest untouched.
-        let excluding_middle =
-            collect_ancestor_agents_skill_dirs_excluding(&start, Some(&repo.join("a/.agents/skills")));
+        let excluding_middle = collect_ancestor_agents_skill_dirs_excluding(
+            &start,
+            Some(&repo.join("a/.agents/skills")),
+        );
         assert_eq!(
             excluding_middle,
             vec![start.join(".agents/skills"), repo.join(".agents/skills")]
@@ -1926,7 +1931,10 @@ mod tests {
         // guarantee this test pins isn't a specific error shape, it's that adversarial/malformed input
         // can't panic discovery.
         let (fm, _) = parse_frontmatter("---\nname: x\ndescription: [unclosed\n---\nBody");
-        assert!(fm.is_empty(), "invalid YAML must yield no frontmatter, not a corrupted value: {fm:?}");
+        assert!(
+            fm.is_empty(),
+            "invalid YAML must yield no frontmatter, not a corrupted value: {fm:?}"
+        );
     }
 
     #[test]
@@ -2213,7 +2221,10 @@ mod tests {
     fn a_plain_scalar_folds_multiple_continuation_lines_and_stops_at_a_blank_line_or_dedent() {
         let (fm, _) =
             parse_frontmatter("---\ndescription: one\n  two\n  three\n\nname: after-blank\n---\n");
-        assert_eq!(fm.get("description").map(String::as_str), Some("one two three"));
+        assert_eq!(
+            fm.get("description").map(String::as_str),
+            Some("one two three")
+        );
         assert_eq!(fm.get("name").map(String::as_str), Some("after-blank"));
     }
 
@@ -2256,7 +2267,10 @@ mod tests {
             Some("Line one\nLine two")
         );
         let (fm, _) = parse_frontmatter("---\ndescription: >-\n  first\n  second\n---\n");
-        assert_eq!(fm.get("description").map(String::as_str), Some("first second"));
+        assert_eq!(
+            fm.get("description").map(String::as_str),
+            Some("first second")
+        );
     }
 
     #[test]
@@ -2287,11 +2301,12 @@ mod tests {
         // pi-parity fix (Task #43): `unquote` used to only strip the surrounding quote characters,
         // leaving `\n`/`\"`/`\\` etc. as literal two-character sequences instead of the characters they
         // actually represent inside a double-quoted YAML scalar.
-        let (fm, _) =
-            parse_frontmatter(r#"---
+        let (fm, _) = parse_frontmatter(
+            r#"---
 description: "line one\nline two\ttabbed \"quoted\" and \\backslash\\"
 ---
-"#);
+"#,
+        );
         assert_eq!(
             fm.get("description").map(String::as_str),
             Some("line one\nline two\ttabbed \"quoted\" and \\backslash\\")
@@ -2300,10 +2315,12 @@ description: "line one\nline two\ttabbed \"quoted\" and \\backslash\\"
 
     #[test]
     fn double_quoted_scalar_interprets_hex_and_unicode_escapes() {
-        let (fm, _) = parse_frontmatter(r#"---
+        let (fm, _) = parse_frontmatter(
+            r#"---
 name: "caf\x65 é"
 ---
-"#);
+"#,
+        );
         assert_eq!(fm.get("name").map(String::as_str), Some("cafe é"));
     }
 
@@ -2543,7 +2560,9 @@ name: "caf\x65 é"
         .unwrap();
         let skills = discover_in(tmp.path());
         assert!(
-            !skills.iter().any(|s| s.name == "draft" || s.name == ".draft"),
+            !skills
+                .iter()
+                .any(|s| s.name == "draft" || s.name == ".draft"),
             "a dotfile loose skill must not be discovered: {skills:?}"
         );
     }
@@ -2881,8 +2900,16 @@ name: "caf\x65 é"
         // before this filter stage existed.
         let tmp = tempfile::tempdir().unwrap();
         let extra_root = tmp.path().join("shared-skills");
-        write_skill(&extra_root, "alpha", "---\nname: alpha\ndescription: a\n---\n");
-        write_skill(&extra_root, "beta", "---\nname: beta\ndescription: b\n---\n");
+        write_skill(
+            &extra_root,
+            "alpha",
+            "---\nname: alpha\ndescription: a\n---\n",
+        );
+        write_skill(
+            &extra_root,
+            "beta",
+            "---\nname: beta\ndescription: b\n---\n",
+        );
         let cwd = tmp.path().join("project");
         fs::create_dir_all(&cwd).unwrap();
         let (found, _) =
@@ -2905,8 +2932,7 @@ name: "caf\x65 é"
             "wip-experimental",
             "---\nname: wip-experimental\ndescription: hidden\n---\n",
         );
-        let (found, _) =
-            discover_with_diagnostics(&cwd, true, &["!wip-experimental".to_string()]);
+        let (found, _) = discover_with_diagnostics(&cwd, true, &["!wip-experimental".to_string()]);
         assert!(found.iter().any(|s| s.name == "keep-me"), "got: {found:?}");
         assert!(
             !found.iter().any(|s| s.name == "wip-experimental"),

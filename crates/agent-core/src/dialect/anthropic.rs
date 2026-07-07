@@ -171,7 +171,10 @@ pub fn build_body(req: &ModelRequest, is_oauth: bool) -> Value {
         }
         map.insert("system".into(), Value::Array(system));
     } else if let Some(system) = &req.system {
-        map.insert("system".into(), Value::Array(vec![system_block(system, &cc)]));
+        map.insert(
+            "system".into(),
+            Value::Array(vec![system_block(system, &cc)]),
+        );
     }
     // Anthropic forbids `temperature` alongside extended thinking (thinking requires an implicit
     // temperature of 1) — matches pi's own `!options?.thinkingEnabled` gate (`anthropic-messages.ts`).
@@ -758,9 +761,10 @@ impl StreamDecoder for Decoder {
                 text: thinking,
             },
             FastDelta::Signature { signature } => StreamEvent::SignatureDelta { index, signature },
-            FastDelta::InputJson { partial_json } => {
-                StreamEvent::InputJsonDelta { index, partial_json }
-            }
+            FastDelta::InputJson { partial_json } => StreamEvent::InputJsonDelta {
+                index,
+                partial_json,
+            },
         }])
     }
 
@@ -1202,7 +1206,10 @@ mod tests {
         );
         let body = build_body(&req, false);
         for m in body["messages"].as_array().unwrap() {
-            assert!(m.get("usage").is_none(), "usage must never reach the wire: {m}");
+            assert!(
+                m.get("usage").is_none(),
+                "usage must never reach the wire: {m}"
+            );
             assert!(
                 m.get("stop_reason").is_none(),
                 "stop_reason must never reach the wire: {m}"
@@ -1337,13 +1344,14 @@ mod tests {
         );
 
         // An ordinary Claude id is completely unaffected — still gets its tool breakpoint.
-        let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 256).with_tools(
-            vec![ToolDef {
-                name: "read".into(),
-                description: "read a file".into(),
-                input_schema: json!({ "type": "object" }),
-            }],
-        );
+        let req =
+            ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 256).with_tools(vec![
+                ToolDef {
+                    name: "read".into(),
+                    description: "read a file".into(),
+                    input_schema: json!({ "type": "object" }),
+                },
+            ]);
         let body = build_body(&req, false);
         assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
     }
@@ -1689,7 +1697,10 @@ data: {"type":"message_stop"}
             }),
             "real content around the unrecognized types must still decode: {events:?}"
         );
-        assert!(matches!(events.last(), Some(StreamEvent::MessageStop { .. })));
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::MessageStop { .. })
+        ));
     }
 
     #[test]
@@ -1971,7 +1982,11 @@ data: {"type":"message_stop"}
             "block_images must downgrade the image even though claude-opus-4-8 supports vision"
         );
         assert!(
-            !content.as_array().unwrap().iter().any(|b| b["type"] == "image"),
+            !content
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|b| b["type"] == "image"),
             "no image block should reach the wire when block_images is set"
         );
 
@@ -2812,8 +2827,8 @@ data: {"type":"message_stop"}
     fn oauth_build_body_canonicalizes_advertised_tool_names_to_claude_code_casing() {
         // pi's `claudeCodeTools` table (`anthropic-messages.ts:72-91`): our own lowercase `bash`
         // canonicalizes to Claude Code's `Bash`; a name with no match (`get_weather`) passes through.
-        let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 256).with_tools(
-            vec![
+        let req =
+            ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 256).with_tools(vec![
                 ToolDef {
                     name: "bash".into(),
                     description: "run a shell command".into(),
@@ -2824,8 +2839,7 @@ data: {"type":"message_stop"}
                     description: "look up the weather".into(),
                     input_schema: json!({ "type": "object" }),
                 },
-            ],
-        );
+            ]);
         let body = build_body(&req, true);
         assert_eq!(body["tools"][0]["name"], "Bash");
         assert_eq!(body["tools"][1]["name"], "get_weather");
@@ -2833,13 +2847,14 @@ data: {"type":"message_stop"}
 
     #[test]
     fn non_oauth_build_body_never_renames_tools() {
-        let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 256).with_tools(
-            vec![ToolDef {
-                name: "bash".into(),
-                description: "run a shell command".into(),
-                input_schema: json!({ "type": "object" }),
-            }],
-        );
+        let req =
+            ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 256).with_tools(vec![
+                ToolDef {
+                    name: "bash".into(),
+                    description: "run a shell command".into(),
+                    input_schema: json!({ "type": "object" }),
+                },
+            ]);
         let body = build_body(&req, false);
         assert_eq!(body["tools"][0]["name"], "bash");
     }
@@ -2873,13 +2888,14 @@ data: {"type":"message_stop"}
         // name goes out renamed to Claude Code's canonical casing, and a live `tool_use` block the model
         // streams back under that same canonical casing is decoded back to our own real name — so
         // nothing above this dialect (the agent loop, tool dispatch) ever sees Claude Code's naming.
-        let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 256).with_tools(
-            vec![ToolDef {
-                name: "bash".into(),
-                description: "run a shell command".into(),
-                input_schema: json!({ "type": "object" }),
-            }],
-        );
+        let req =
+            ModelRequest::new("claude-opus-4-8", vec![Message::user("hi")], 256).with_tools(vec![
+                ToolDef {
+                    name: "bash".into(),
+                    description: "run a shell command".into(),
+                    input_schema: json!({ "type": "object" }),
+                },
+            ]);
         let body = build_body(&req, true);
         assert_eq!(body["tools"][0]["name"], "Bash");
 

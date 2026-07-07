@@ -151,18 +151,19 @@ async fn login_via_device_code(
         .await;
 
     let interval = Duration::from_secs(device.interval.max(1));
-    let (code, code_verifier) = device_code::poll_device_code(interval, Some(DEVICE_CODE_TIMEOUT), false, cancel, {
-        let http = http.clone();
-        let device_auth_id = device.device_auth_id.clone();
-        let user_code = device.user_code.clone();
-        move || {
+    let (code, code_verifier) =
+        device_code::poll_device_code(interval, Some(DEVICE_CODE_TIMEOUT), false, cancel, {
             let http = http.clone();
-            let device_auth_id = device_auth_id.clone();
-            let user_code = user_code.clone();
-            async move { poll_device_token_once(&http, &device_auth_id, &user_code).await }
-        }
-    })
-    .await?;
+            let device_auth_id = device.device_auth_id.clone();
+            let user_code = device.user_code.clone();
+            move || {
+                let http = http.clone();
+                let device_auth_id = device_auth_id.clone();
+                let user_code = user_code.clone();
+                async move { poll_device_token_once(&http, &device_auth_id, &user_code).await }
+            }
+        })
+        .await?;
 
     exchange_code(&code_verifier, &code, DEVICE_REDIRECT_URI).await
 }
@@ -180,7 +181,11 @@ pub async fn refresh(refresh_token: &str) -> Result<OpenaiCodexCredential> {
     credential_from_tokens(post_token_form(&http, &params).await?)
 }
 
-async fn exchange_code(code_verifier: &str, code: &str, redirect_uri: &str) -> Result<OpenaiCodexCredential> {
+async fn exchange_code(
+    code_verifier: &str,
+    code: &str,
+    redirect_uri: &str,
+) -> Result<OpenaiCodexCredential> {
     let http = Client::new();
     let params = [
         ("grant_type", "authorization_code"),
@@ -312,7 +317,10 @@ struct ParsedAuth {
 fn parse_authorization_input(input: &str) -> Result<ParsedAuth> {
     let trimmed = input.trim();
     if let Ok(url) = url::Url::parse(trimmed) {
-        return from_pairs(url.query_pairs().map(|(k, v)| (k.into_owned(), v.into_owned())));
+        return from_pairs(
+            url.query_pairs()
+                .map(|(k, v)| (k.into_owned(), v.into_owned())),
+        );
     }
     if let Some((code, state)) = trimmed.split_once('#') {
         return Ok(ParsedAuth {
@@ -373,9 +381,9 @@ where
         serde_json::Value::Number(n) => n
             .as_u64()
             .ok_or_else(|| serde::de::Error::custom("interval is not a valid unsigned integer")),
-        serde_json::Value::String(s) => s
-            .parse()
-            .map_err(|_| serde::de::Error::custom("interval string is not a valid unsigned integer")),
+        serde_json::Value::String(s) => s.parse().map_err(|_| {
+            serde::de::Error::custom("interval string is not a valid unsigned integer")
+        }),
         _ => Err(serde::de::Error::custom(
             "interval must be a number or numeric string",
         )),
@@ -396,9 +404,10 @@ async fn request_device_user_code(http: &Client) -> Result<DeviceUserCodeRespons
     if status.as_u16() == 404 {
         return Err(OAuthError::InvalidResponse {
             provider: "openai-codex",
-            detail: "device code login is not enabled for this server. Use browser login or verify \
+            detail:
+                "device code login is not enabled for this server. Use browser login or verify \
                       the server URL."
-                .to_string(),
+                    .to_string(),
         });
     }
     if !status.is_success() {
@@ -437,10 +446,11 @@ async fn poll_device_token_once(
         })?;
     let status = resp.status();
     if status.is_success() {
-        let success: DeviceTokenSuccess = resp.json().await.map_err(|source| OAuthError::Network {
-            url: DEVICE_TOKEN_URL.to_string(),
-            source,
-        })?;
+        let success: DeviceTokenSuccess =
+            resp.json().await.map_err(|source| OAuthError::Network {
+                url: DEVICE_TOKEN_URL.to_string(),
+                source,
+            })?;
         return Ok(DevicePollStep::Complete((
             success.authorization_code,
             success.code_verifier,
@@ -486,8 +496,9 @@ mod tests {
 
     #[test]
     fn parses_a_full_redirect_url_and_a_bare_code_the_same_as_anthropics_helper() {
-        let parsed = parse_authorization_input("http://localhost:1455/auth/callback?code=abc&state=s")
-            .unwrap();
+        let parsed =
+            parse_authorization_input("http://localhost:1455/auth/callback?code=abc&state=s")
+                .unwrap();
         assert_eq!(parsed.code, "abc");
         assert_eq!(parsed.state.as_deref(), Some("s"));
 
@@ -515,9 +526,8 @@ mod tests {
 
     #[test]
     fn extracts_the_chatgpt_account_id_from_a_live_token() {
-        let token = fake_jwt(
-            r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct_123"}}"#,
-        );
+        let token =
+            fake_jwt(r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct_123"}}"#);
         assert_eq!(extract_chatgpt_account_id(&token).unwrap(), "acct_123");
     }
 
@@ -540,9 +550,8 @@ mod tests {
 
     #[test]
     fn credential_from_tokens_applies_no_early_refresh_buffer() {
-        let account_id_token = fake_jwt(
-            r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct_1"}}"#,
-        );
+        let account_id_token =
+            fake_jwt(r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct_1"}}"#);
         let now = now_ms();
         let cred = credential_from_tokens(TokenResponse {
             access_token: account_id_token,

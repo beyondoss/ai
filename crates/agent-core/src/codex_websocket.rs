@@ -143,7 +143,8 @@ const CONNECTION_LIMIT_REACHED_CODE: &str = "websocket_connection_limit_reached"
 
 /// The concrete WebSocket stream type `tokio_tungstenite::connect_async` hands back. A type alias
 /// purely so the rest of this module doesn't repeat the full generic — not a public seam.
-type WsSocket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type WsSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 // ============================================================================
 // Delta diffing (pure, no I/O — see the module doc comment)
@@ -293,7 +294,10 @@ impl CodexWebSocketCache {
     /// Take ownership of `key`'s cached connection, if any is idle and not past
     /// [`MAX_CONNECTION_AGE`]. A brief, synchronous, lock-held critical section only — never awaits.
     fn checkout(&self, key: &str) -> Option<CachedConnection> {
-        let mut guard = self.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = self
+            .idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = guard.remove(key)?;
         if entry.created_at.elapsed() >= MAX_CONNECTION_AGE {
             // Dropped here: past its age ceiling, close it rather than hand it back for reuse.
@@ -309,7 +313,10 @@ impl CodexWebSocketCache {
     /// last wins, which is a benign, documented simplification (see the module doc comment) rather
     /// than a correctness issue (each turn already sent/received its own complete, correct exchange).
     fn checkin(&self, key: String, connection: CachedConnection) {
-        let mut guard = self.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = self
+            .idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.insert(key, connection);
     }
 
@@ -343,7 +350,8 @@ pub(crate) fn to_ws_url(url: &str) -> Option<String> {
     if let Some(rest) = url.strip_prefix("https://") {
         return Some(format!("wss://{rest}"));
     }
-    url.strip_prefix("http://").map(|rest| format!("ws://{rest}"))
+    url.strip_prefix("http://")
+        .map(|rest| format!("ws://{rest}"))
 }
 
 /// A per-connection request id: the caller's own `cache_key` when there is one (matching pi's
@@ -463,18 +471,29 @@ fn classify_connect_error(error: tokio_tungstenite::tungstenite::Error) -> Conne
 }
 
 /// Open one fresh WebSocket connection to `url` with `headers` attached to the upgrade request.
-async fn connect(url: &str, headers: &[(String, String)]) -> std::result::Result<WsSocket, ConnectFailure> {
+async fn connect(
+    url: &str,
+    headers: &[(String, String)],
+) -> std::result::Result<WsSocket, ConnectFailure> {
     let mut request = url
         .into_client_request()
         .map_err(|e| ConnectFailure::Other(format!("invalid codex websocket url: {e}")))?;
     for (name, value) in headers {
         let name = match HeaderName::from_bytes(name.as_bytes()) {
             Ok(name) => name,
-            Err(e) => return Err(ConnectFailure::Other(format!("invalid header name {name:?}: {e}"))),
+            Err(e) => {
+                return Err(ConnectFailure::Other(format!(
+                    "invalid header name {name:?}: {e}"
+                )));
+            }
         };
         let value = match HeaderValue::from_str(value) {
             Ok(value) => value,
-            Err(e) => return Err(ConnectFailure::Other(format!("invalid header value for {name:?}: {e}"))),
+            Err(e) => {
+                return Err(ConnectFailure::Other(format!(
+                    "invalid header value for {name:?}: {e}"
+                )));
+            }
         };
         request.headers_mut().insert(name, value);
     }
@@ -499,7 +518,10 @@ enum FrameOutcome {
     Done,
     /// `protocol: true` — an in-band API/protocol failure (never SSE-fallback-eligible if this is the
     /// very first outcome of a turn); `protocol: false` — a connectivity failure.
-    Failure { error: Error, protocol: bool },
+    Failure {
+        error: Error,
+        protocol: bool,
+    },
 }
 
 /// Owns one live connection's decode state for one turn. Not `Clone`/`Copy` — consumed by the
@@ -598,7 +620,10 @@ impl Receiver {
                         events.append(&mut trailing);
                         FrameOutcome::Events(events)
                     }
-                    Err(e) => FrameOutcome::Failure { error: e, protocol: true },
+                    Err(e) => FrameOutcome::Failure {
+                        error: e,
+                        protocol: true,
+                    },
                 };
             }
             if !events.is_empty() {
@@ -705,8 +730,14 @@ async fn attempt_once(
             first_events: events,
             receiver: Box::new(receiver),
         },
-        FrameOutcome::Failure { error, protocol: true } => AttemptOnceOutcome::Failed(error),
-        FrameOutcome::Failure { error, protocol: false } => {
+        FrameOutcome::Failure {
+            error,
+            protocol: true,
+        } => AttemptOnceOutcome::Failed(error),
+        FrameOutcome::Failure {
+            error,
+            protocol: false,
+        } => {
             tracing::debug!(error = %error, reused, "codex websocket failed before streaming any events");
             if reused {
                 AttemptOnceOutcome::RetryStaleReuse
@@ -854,7 +885,11 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn continuation(fingerprint: Value, baseline_input: Vec<Value>, last_response_id: &str) -> Continuation {
+    fn continuation(
+        fingerprint: Value,
+        baseline_input: Vec<Value>,
+        last_response_id: &str,
+    ) -> Continuation {
         Continuation {
             fingerprint,
             baseline_input,
@@ -911,12 +946,20 @@ mod tests {
         // Changing anything but `input`/`previous_response_id`/`max_output_tokens` (a different
         // system prompt, a different tool set, …) must not silently chain off a stale
         // `previous_response_id` — pi's own `requestBodiesMatchExceptInput` guard.
-        let first_body = json!({"model": "gpt-5-codex", "instructions": "be terse", "input": [{"a": 1}]});
-        let cont = continuation(body_fingerprint(&first_body), vec![json!({"a": 1})], "resp_1");
+        let first_body =
+            json!({"model": "gpt-5-codex", "instructions": "be terse", "input": [{"a": 1}]});
+        let cont = continuation(
+            body_fingerprint(&first_body),
+            vec![json!({"a": 1})],
+            "resp_1",
+        );
 
         let second_body = json!({"model": "gpt-5-codex", "instructions": "be verbose", "input": [{"a": 1}, {"b": 2}]});
         let wire = build_wire_body(&second_body, Some(&cont));
-        assert_eq!(wire, second_body, "a fingerprint mismatch must force a full, untrimmed resend");
+        assert_eq!(
+            wire, second_body,
+            "a fingerprint mismatch must force a full, untrimmed resend"
+        );
         assert!(wire.get("previous_response_id").is_none());
     }
 
@@ -924,8 +967,13 @@ mod tests {
     fn max_output_tokens_drifting_alone_does_not_defeat_the_delta() {
         // beyond-only field (see the module doc comment) — must NOT be part of the "did the request
         // shape change" comparison, unlike every other field.
-        let first_body = json!({"model": "gpt-5-codex", "max_output_tokens": 4000, "input": [{"a": 1}]});
-        let cont = continuation(body_fingerprint(&first_body), vec![json!({"a": 1})], "resp_1");
+        let first_body =
+            json!({"model": "gpt-5-codex", "max_output_tokens": 4000, "input": [{"a": 1}]});
+        let cont = continuation(
+            body_fingerprint(&first_body),
+            vec![json!({"a": 1})],
+            "resp_1",
+        );
 
         let second_body = json!({"model": "gpt-5-codex", "max_output_tokens": 3500, "input": [{"a": 1}, {"b": 2}]});
         let wire = build_wire_body(&second_body, Some(&cont));
@@ -960,7 +1008,11 @@ mod tests {
         // `previous_response_id` whose actual server-side state no longer matches what's about to be
         // sent.
         let first_body = json!({"model": "gpt-5-codex", "input": [{"a": 1}]});
-        let cont = continuation(body_fingerprint(&first_body), vec![json!({"a": 999})], "resp_1");
+        let cont = continuation(
+            body_fingerprint(&first_body),
+            vec![json!({"a": 999})],
+            "resp_1",
+        );
         let second_body = json!({"model": "gpt-5-codex", "input": [{"a": 1}, {"b": 2}]});
         let wire = build_wire_body(&second_body, Some(&cont));
         assert_eq!(wire, second_body);
@@ -990,10 +1042,15 @@ mod tests {
     #[test]
     fn extract_response_id_reads_the_nested_response_object() {
         assert_eq!(
-            extract_response_id(&json!({"type": "response.created", "response": {"id": "resp_42"}})),
+            extract_response_id(
+                &json!({"type": "response.created", "response": {"id": "resp_42"}})
+            ),
             Some("resp_42".to_string())
         );
-        assert_eq!(extract_response_id(&json!({"type": "response.output_text.delta"})), None);
+        assert_eq!(
+            extract_response_id(&json!({"type": "response.output_text.delta"})),
+            None
+        );
         assert_eq!(extract_response_id(&json!({"response": {}})), None);
     }
 
@@ -1024,7 +1081,12 @@ mod tests {
     fn build_headers_carries_direct_headers_and_the_websocket_specific_ones() {
         let direct = vec![("chatgpt-account-id", "acct_123".to_string())];
         let headers = build_headers("sk-test", &direct, "req-1");
-        let get = |name: &str| headers.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str());
+        let get = |name: &str| {
+            headers
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.as_str())
+        };
         assert_eq!(get("Authorization"), Some("Bearer sk-test"));
         assert_eq!(get("chatgpt-account-id"), Some("acct_123"));
         assert_eq!(get("OpenAI-Beta"), Some(OPENAI_BETA_RESPONSES_WEBSOCKETS));
@@ -1050,7 +1112,10 @@ mod tests {
         // the round-trip test's above isn't representative of real bandwidth savings, so this uses a
         // larger, more realistic shape instead.
         let item = r#"{"role":"user","content":[{"type":"input_text","text":"repeat this text over and over"}]},"#;
-        let json = format!(r#"{{"model":"gpt-5-codex","input":[{}]}}"#, item.repeat(200));
+        let json = format!(
+            r#"{{"model":"gpt-5-codex","input":[{}]}}"#,
+            item.repeat(200)
+        );
         let compressed = compress_sse_fallback_body(json.as_bytes())
             .expect("zstd compression always succeeds here");
         assert!(
@@ -1080,6 +1145,9 @@ mod tests {
         assert!(!cache.is_fallback_active("s1"));
         cache.mark_fallback("s1");
         assert!(cache.is_fallback_active("s1"));
-        assert!(!cache.is_fallback_active("s2"), "the marker must not leak across keys");
+        assert!(
+            !cache.is_fallback_active("s2"),
+            "the marker must not leak across keys"
+        );
     }
 }

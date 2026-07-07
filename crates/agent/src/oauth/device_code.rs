@@ -141,7 +141,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result, 42);
-        assert!(started.elapsed() < Duration::from_millis(40), "should not have waited at all");
+        assert!(
+            started.elapsed() < Duration::from_millis(40),
+            "should not have waited at all"
+        );
     }
 
     #[tokio::test]
@@ -199,7 +202,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slow_down_with_interval_is_recognized_by_the_full_poll_loop_and_clamped_to_the_minimum() {
+    async fn slow_down_with_interval_is_recognized_by_the_full_poll_loop_and_clamped_to_the_minimum()
+     {
         // A malicious/misbehaving server naming an absurdly small interval must still be floored at
         // MIN_INTERVAL, exactly like the no-interval fallback path already is.
         let calls = Arc::new(AtomicUsize::new(0));
@@ -215,7 +219,9 @@ mod tests {
                 async move {
                     let n = calls.fetch_add(1, Ordering::SeqCst);
                     match n {
-                        0 => Ok(DevicePollStep::SlowDownWithInterval(Duration::from_millis(1))),
+                        0 => Ok(DevicePollStep::SlowDownWithInterval(Duration::from_millis(
+                            1,
+                        ))),
                         _ => Ok(DevicePollStep::Complete(n)),
                     }
                 }
@@ -314,13 +320,9 @@ mod tests {
     async fn cancellation_stops_the_poll_immediately() {
         let cancel = CancellationToken::new();
         cancel.cancel();
-        let err = poll_device_code(
-            Duration::from_millis(10),
-            None,
-            true,
-            &cancel,
-            || async { Ok(DevicePollStep::<()>::Pending) },
-        )
+        let err = poll_device_code(Duration::from_millis(10), None, true, &cancel, || async {
+            Ok(DevicePollStep::<()>::Pending)
+        })
         .await
         .unwrap_err();
         assert!(matches!(err, OAuthError::LoginCancelled));
@@ -333,7 +335,9 @@ mod tests {
             Some(Duration::from_secs(5)),
             false,
             &CancellationToken::new(),
-            || async { Err::<DevicePollStep<()>, _>(OAuthError::DeviceFlowFailed("boom".to_string())) },
+            || async {
+                Err::<DevicePollStep<()>, _>(OAuthError::DeviceFlowFailed("boom".to_string()))
+            },
         )
         .await
         .unwrap_err();

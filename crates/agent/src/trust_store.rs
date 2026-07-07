@@ -395,7 +395,11 @@ mod tests {
         // prompts above.
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join(".claude")).unwrap();
-        fs::write(dir.path().join(".claude/settings.json"), r#"{"default_model":"m"}"#).unwrap();
+        fs::write(
+            dir.path().join(".claude/settings.json"),
+            r#"{"default_model":"m"}"#,
+        )
+        .unwrap();
         assert!(has_trust_gated_resources(dir.path()));
     }
 

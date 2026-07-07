@@ -32,31 +32,29 @@ struct CodexCredential;
 #[async_trait::async_trait]
 impl CredentialSource for CodexCredential {
     async fn credential(&self) -> agent_core::Result<Credential> {
-        Ok(Credential::new("test-codex-token", false).with_direct_routing(DirectRouting {
-            route: RouteOverride::Prefixed {
-                prefix: "/openai-codex",
-                path: "/backend-api/codex/responses",
-            },
-            static_headers: vec![("chatgpt-account-id", "acct_test".to_string())],
-            copilot_dynamic_headers: false,
-            auth_header: None,
-            auth_header_prefix: None,
-            dialect_override: None,
-            deployment_name: None,
-            query: None,
-            aggregator_host: None,
-        }))
+        Ok(
+            Credential::new("test-codex-token", false).with_direct_routing(DirectRouting {
+                route: RouteOverride::Prefixed {
+                    prefix: "/openai-codex",
+                    path: "/backend-api/codex/responses",
+                },
+                static_headers: vec![("chatgpt-account-id", "acct_test".to_string())],
+                copilot_dynamic_headers: false,
+                auth_header: None,
+                auth_header_prefix: None,
+                dialect_override: None,
+                deployment_name: None,
+                query: None,
+                aggregator_host: None,
+            }),
+        )
     }
 }
 
 /// Send one complete, minimal Codex Responses turn over an already-upgraded mock server socket:
 /// `response.created` (carrying `response_id`), an opened+streamed+closed text message item, then
 /// `response.completed`.
-async fn send_turn(
-    ws: &mut WebSocketStream<tokio::net::TcpStream>,
-    response_id: &str,
-    text: &str,
-) {
+async fn send_turn(ws: &mut WebSocketStream<tokio::net::TcpStream>, response_id: &str, text: &str) {
     let frames = [
         json!({"type": "response.created", "response": {"id": response_id}}),
         json!({
@@ -105,15 +103,19 @@ async fn first_turn_sends_the_full_transcript_with_no_previous_response_id() {
 
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("accept");
-        let mut ws = tokio_tungstenite::accept_async(stream).await.expect("ws handshake");
+        let mut ws = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("ws handshake");
         let request = recv_request(&mut ws).await;
         send_turn(&mut ws, "resp_1", "hi there").await;
         request
     });
 
-    let client = GatewayClient::with_credential_source(format!("http://{addr}"), Arc::new(CodexCredential))
-        .expect("client");
-    let req = ModelRequest::new("gpt-5-codex", vec![Message::user("hi")], 200).with_cache_key("sess-first-turn");
+    let client =
+        GatewayClient::with_credential_source(format!("http://{addr}"), Arc::new(CodexCredential))
+            .expect("client");
+    let req = ModelRequest::new("gpt-5-codex", vec![Message::user("hi")], 200)
+        .with_cache_key("sess-first-turn");
     let mut stream = client.stream(req).await.expect("stream");
     let mut events = Vec::new();
     while let Some(ev) = stream.next().await {
@@ -126,7 +128,10 @@ async fn first_turn_sends_the_full_transcript_with_no_previous_response_id() {
             .any(|e| matches!(e, StreamEvent::TextDelta { text, .. } if text == "hi there")),
         "expected the mock server's streamed text to reach the caller: {events:?}"
     );
-    assert!(matches!(events.last(), Some(StreamEvent::MessageStop { .. })));
+    assert!(matches!(
+        events.last(),
+        Some(StreamEvent::MessageStop { .. })
+    ));
 
     let request = server.await.expect("server task");
     assert!(
@@ -148,7 +153,9 @@ async fn second_turn_on_the_same_session_sends_only_the_new_delta() {
 
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("accept");
-        let mut ws = tokio_tungstenite::accept_async(stream).await.expect("ws handshake");
+        let mut ws = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("ws handshake");
 
         let turn1 = recv_request(&mut ws).await;
         send_turn(&mut ws, "resp_1", "hi there").await;
@@ -162,11 +169,12 @@ async fn second_turn_on_the_same_session_sends_only_the_new_delta() {
         (turn1, turn2)
     });
 
-    let client = GatewayClient::with_credential_source(format!("http://{addr}"), Arc::new(CodexCredential))
-        .expect("client");
+    let client =
+        GatewayClient::with_credential_source(format!("http://{addr}"), Arc::new(CodexCredential))
+            .expect("client");
 
-    let req1 =
-        ModelRequest::new("gpt-5-codex", vec![Message::user("hi")], 200).with_cache_key("sess-delta");
+    let req1 = ModelRequest::new("gpt-5-codex", vec![Message::user("hi")], 200)
+        .with_cache_key("sess-delta");
     let mut stream1 = client.stream(req1).await.expect("stream 1");
     while stream1.next().await.is_some() {}
 
@@ -250,15 +258,20 @@ async fn a_failed_websocket_handshake_falls_back_to_http_sse_transparently() {
              data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"fallback ok\"}\n\n\
              data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"content\":[{\"type\":\"output_text\",\"text\":\"fallback ok\"}]}}\n\n\
              data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
-        let resp =
-            format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse_body}");
-        stream.write_all(resp.as_bytes()).await.expect("write sse response");
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse_body}"
+        );
+        stream
+            .write_all(resp.as_bytes())
+            .await
+            .expect("write sse response");
         stream.flush().await.expect("flush");
         request
     });
 
-    let client = GatewayClient::with_credential_source(format!("http://{addr}"), Arc::new(CodexCredential))
-        .expect("client");
+    let client =
+        GatewayClient::with_credential_source(format!("http://{addr}"), Arc::new(CodexCredential))
+            .expect("client");
     let req = ModelRequest::new("gpt-5-codex", vec![Message::user("hi")], 200)
         .with_cache_key("sess-fallback");
     let mut stream = client.stream(req).await.expect("stream");
@@ -272,7 +285,10 @@ async fn a_failed_websocket_handshake_falls_back_to_http_sse_transparently() {
             .any(|e| matches!(e, StreamEvent::TextDelta { text, .. } if text == "fallback ok")),
         "expected the HTTP/SSE fallback's own streamed text to reach the caller: {events:?}"
     );
-    assert!(matches!(events.last(), Some(StreamEvent::MessageStop { .. })));
+    assert!(matches!(
+        events.last(),
+        Some(StreamEvent::MessageStop { .. })
+    ));
 
     let request = server.await.expect("server task");
     assert!(
@@ -314,8 +330,11 @@ async fn the_http_sse_fallback_sends_a_zstd_compressed_body_with_the_matching_he
         // response that never comes.
         let mut chunk = [0u8; 8192];
         loop {
-            match tokio::time::timeout(std::time::Duration::from_millis(200), stream.read(&mut chunk))
-                .await
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                stream.read(&mut chunk),
+            )
+            .await
             {
                 Ok(Ok(0)) | Err(_) => break,
                 Ok(Ok(n)) => raw.extend_from_slice(&chunk[..n]),
@@ -326,15 +345,20 @@ async fn the_http_sse_fallback_sends_a_zstd_compressed_body_with_the_matching_he
              data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"compressed ok\"}\n\n\
              data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"content\":[{\"type\":\"output_text\",\"text\":\"compressed ok\"}]}}\n\n\
              data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
-        let resp =
-            format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse_body}");
-        stream.write_all(resp.as_bytes()).await.expect("write sse response");
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse_body}"
+        );
+        stream
+            .write_all(resp.as_bytes())
+            .await
+            .expect("write sse response");
         stream.flush().await.expect("flush");
         raw
     });
 
-    let client = GatewayClient::with_credential_source(format!("http://{addr}"), Arc::new(CodexCredential))
-        .expect("client");
+    let client =
+        GatewayClient::with_credential_source(format!("http://{addr}"), Arc::new(CodexCredential))
+            .expect("client");
     let req = ModelRequest::new("gpt-5-codex", vec![Message::user("zstd please")], 200)
         .with_cache_key("sess-zstd-fallback");
     let mut stream = client.stream(req).await.expect("stream");
@@ -366,7 +390,8 @@ async fn the_http_sse_fallback_sends_a_zstd_compressed_body_with_the_matching_he
     );
 
     let decompressed = zstd::stream::decode_all(body).expect("the body must be a valid zstd frame");
-    let parsed: Value = serde_json::from_slice(&decompressed).expect("decompressed body must be JSON");
+    let parsed: Value =
+        serde_json::from_slice(&decompressed).expect("decompressed body must be JSON");
     assert!(
         parsed.to_string().contains("zstd please"),
         "the decompressed body must carry the real request content: {parsed}"

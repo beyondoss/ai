@@ -220,7 +220,9 @@ fn retag_whole_number(value: Value) -> Value {
         return value;
     }
     match n.as_f64() {
-        Some(f) if f.fract() == 0.0 && f.abs() < i64::MAX as f64 => Value::Number((f as i64).into()),
+        Some(f) if f.fract() == 0.0 && f.abs() < i64::MAX as f64 => {
+            Value::Number((f as i64).into())
+        }
         _ => value,
     }
 }

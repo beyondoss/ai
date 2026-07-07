@@ -70,13 +70,18 @@ impl Drop for Secret {
 }
 
 impl Serialize for Secret {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
         serializer.serialize_str(&self.0)
     }
 }
 
 impl<'de> Deserialize<'de> for Secret {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
         Ok(Secret(String::deserialize(deserializer)?))
     }
 }
@@ -102,7 +107,10 @@ struct OnDiskCredential {
     last_refresh_error: Option<String>,
 }
 
-fn credential_to_on_disk(credential: &OAuthCredential, last_refresh_error: Option<String>) -> OnDiskCredential {
+fn credential_to_on_disk(
+    credential: &OAuthCredential,
+    last_refresh_error: Option<String>,
+) -> OnDiskCredential {
     let mut disk = OnDiskCredential {
         kind: "oauth".to_string(),
         access: Secret::new(credential.access()),
@@ -369,7 +377,10 @@ fn read_store_file(path: &Path) -> BTreeMap<String, StoredCredential> {
     credentials
 }
 
-fn write_store_file(path: &Path, credentials: &BTreeMap<String, StoredCredential>) -> io::Result<()> {
+fn write_store_file(
+    path: &Path,
+    credentials: &BTreeMap<String, StoredCredential>,
+) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -383,7 +394,10 @@ fn write_store_file(path: &Path, credentials: &BTreeMap<String, StoredCredential
     let mut raw = serde_json::Map::new();
     for (provider, stored) in credentials {
         let disk = credential_to_on_disk(&stored.credential, stored.last_refresh_error.clone());
-        raw.insert(provider.clone(), serde_json::to_value(&disk).map_err(io::Error::other)?);
+        raw.insert(
+            provider.clone(),
+            serde_json::to_value(&disk).map_err(io::Error::other)?,
+        );
     }
     let body = serde_json::to_string_pretty(&raw).map_err(io::Error::other)?;
     let path_str = path
@@ -473,7 +487,10 @@ impl FileLock {
                     if Instant::now() >= deadline {
                         return Err(io::Error::new(
                             ErrorKind::TimedOut,
-                            format!("timed out waiting for auth store lock at {}", lock_path.display()),
+                            format!(
+                                "timed out waiting for auth store lock at {}",
+                                lock_path.display()
+                            ),
                         ));
                     }
                     std::thread::sleep(LOCK_RETRY_INTERVAL);
@@ -493,7 +510,11 @@ impl Drop for FileLock {
 fn is_stale(lock_path: &Path) -> bool {
     fs::metadata(lock_path)
         .and_then(|m| m.modified())
-        .and_then(|modified| SystemTime::now().duration_since(modified).map_err(io::Error::other))
+        .and_then(|modified| {
+            SystemTime::now()
+                .duration_since(modified)
+                .map_err(io::Error::other)
+        })
         .is_ok_and(|age| age > STALE_LOCK_AGE)
 }
 
@@ -544,10 +565,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
         let mut store = AuthStore::open(path.clone());
-        store.set("anthropic", anthropic_cred("access-1", 12345)).unwrap();
+        store
+            .set("anthropic", anthropic_cred("access-1", 12345))
+            .unwrap();
 
         let reopened = AuthStore::open(path);
-        let stored = reopened.get("anthropic").expect("credential should be stored");
+        let stored = reopened
+            .get("anthropic")
+            .expect("credential should be stored");
         assert_eq!(stored.credential.access(), "access-1");
         assert_eq!(stored.credential.expires_at_ms(), 12345);
         assert!(stored.last_refresh_error.is_none());
@@ -559,7 +584,10 @@ mod tests {
         let mut store = AuthStore::open(dir.path().join("auth.json"));
         store.set("anthropic", anthropic_cred("a", 1)).unwrap();
         assert!(store.remove("anthropic").unwrap());
-        assert!(!store.remove("anthropic").unwrap(), "second remove is a no-op, not an error");
+        assert!(
+            !store.remove("anthropic").unwrap(),
+            "second remove is a no-op, not an error"
+        );
         assert!(store.get("anthropic").is_none());
     }
 
@@ -589,7 +617,10 @@ mod tests {
         // (a stray `chmod`, a restore from a backup, …) between two writes.
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o644, "precondition: permissions were loosened out-of-band");
+        assert_eq!(
+            mode, 0o644,
+            "precondition: permissions were loosened out-of-band"
+        );
 
         // Any subsequent write — not just creation — must re-assert 0600, self-healing the drift
         // rather than propagating the loosened mode forward via `write_atomic`'s copy-forward
@@ -612,14 +643,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut store = AuthStore::open(dir.path().join("auth.json"));
         let far_future = now_ms() + 3_600_000;
-        store.set("anthropic", anthropic_cred("still-valid", far_future)).unwrap();
+        store
+            .set("anthropic", anthropic_cred("still-valid", far_future))
+            .unwrap();
 
         let calls = std::cell::Cell::new(0);
         let result = store.refreshed("anthropic", |_| {
             calls.set(calls.get() + 1);
             Ok(anthropic_cred("should-not-be-used", 0))
         });
-        assert_eq!(calls.get(), 0, "refresh closure must not run for a non-expired credential");
+        assert_eq!(
+            calls.get(),
+            0,
+            "refresh closure must not run for a non-expired credential"
+        );
         assert_eq!(result.unwrap().access(), "still-valid");
     }
 
@@ -628,15 +665,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
         let mut store = AuthStore::open(path.clone());
-        store.set("anthropic", anthropic_cred("old", now_ms() - 1000)).unwrap();
+        store
+            .set("anthropic", anthropic_cred("old", now_ms() - 1000))
+            .unwrap();
 
         let result = store
-            .refreshed("anthropic", |_| Ok(anthropic_cred("refreshed", now_ms() + 3_600_000)))
+            .refreshed("anthropic", |_| {
+                Ok(anthropic_cred("refreshed", now_ms() + 3_600_000))
+            })
             .unwrap();
         assert_eq!(result.access(), "refreshed");
 
         let reopened = AuthStore::open(path);
-        assert_eq!(reopened.get("anthropic").unwrap().credential.access(), "refreshed");
+        assert_eq!(
+            reopened.get("anthropic").unwrap().credential.access(),
+            "refreshed"
+        );
     }
 
     #[test]
@@ -644,7 +688,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
         let mut store = AuthStore::open(path.clone());
-        store.set("anthropic", anthropic_cred("old", now_ms() - 1000)).unwrap();
+        store
+            .set("anthropic", anthropic_cred("old", now_ms() - 1000))
+            .unwrap();
 
         let result = store.refreshed("anthropic", |_| Err("network unreachable".to_string()));
         assert!(matches!(result, Err(AuthError::RefreshFailed(_))));
@@ -668,7 +714,9 @@ mod tests {
         let mut handle_b = AuthStore::open(store_path.clone());
 
         handle_a.set("anthropic", anthropic_cred("a", 1)).unwrap();
-        handle_b.set("github-copilot", anthropic_cred("b", 2)).unwrap();
+        handle_b
+            .set("github-copilot", anthropic_cred("b", 2))
+            .unwrap();
 
         let reopened = AuthStore::open(store_path);
         assert!(
@@ -718,7 +766,10 @@ mod tests {
         let lock_path = lock_path_for(&store_path);
         fs::write(&lock_path, b"").unwrap();
         let stale = SystemTime::now() - (STALE_LOCK_AGE + Duration::from_secs(1));
-        fs::File::open(&lock_path).unwrap().set_modified(stale).unwrap();
+        fs::File::open(&lock_path)
+            .unwrap()
+            .set_modified(stale)
+            .unwrap();
 
         let mut store = AuthStore::open(store_path);
         store.set("anthropic", anthropic_cred("a", 1)).unwrap();

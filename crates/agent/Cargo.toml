@@ -44,26 +44,26 @@ tracing-subscriber.workspace = true
 # workspace build graph gains nothing new from this crate depending on it directly too. `form` is
 # needed for the several form-encoded OAuth endpoints (GitHub's device/token endpoints, Codex's
 # token endpoint) alongside the JSON ones.
-reqwest = { version = "0.13", default-features = false, features = ["json", "form"] }
-# PKCE code_challenge (SHA-256 of the verifier). Already resolved transitively at this exact version
-# (ed25519-dalek → gateway) — this crate depending on it directly adds nothing to the build graph.
-sha2 = "0.10"
-# OpenAI Codex's independent CSRF `state` token (`randomBytes(16).toString("hex")`). Already resolved
-# transitively at this exact version (pingora-cache → gateway).
-hex = "0.4"
 # Fills the PKCE verifier / Codex's CSRF state with cryptographically random bytes — same crate/pin
 # `crates/gateway/src/state.rs` already uses for its own instance token. `std` is needed so
 # `getrandom::Error` implements `std::error::Error` (for `OAuthError`'s `#[from]`) — gateway's own use
 # never needed that impl, so its plain `"0.3"` pin didn't need the feature.
 getrandom = { version = "0.3", features = ["std"] }
-# Parses the local callback's query string (code/state/error) and the manual-paste fallback's
-# `code=&state=`/full-redirect-URL input. Already resolved transitively via `reqwest`.
-url = "2"
+# OpenAI Codex's independent CSRF `state` token (`randomBytes(16).toString("hex")`). Already resolved
+# transitively at this exact version (pingora-cache → gateway).
+hex = "0.4"
+reqwest = { version = "0.13", default-features = false, features = ["json", "form"] }
+# PKCE code_challenge (SHA-256 of the verifier). Already resolved transitively at this exact version
+# (ed25519-dalek → gateway) — this crate depending on it directly adds nothing to the build graph.
+sha2 = "0.10"
 # The one-shot local HTTP server for the Anthropic/Codex-browser PKCE callback (fixed ports
 # 53692/1455) — a single blocking `recv_timeout` loop needs no `Service`/executor wiring, unlike
 # `hyper`/`axum`, and is far lighter than pulling in `pingora` (a full L7 proxy) for a listener that
 # lives for exactly one request.
 tiny_http = "0.12"
+# Parses the local callback's query string (code/state/error) and the manual-paste fallback's
+# `code=&state=`/full-redirect-URL input. Already resolved transitively via `reqwest`.
+url = "2"
 # Zeroize-on-drop for `auth_store::Secret` (OAuth access/refresh tokens held at rest). Same crate/
 # version `agent_core::client::ApiKey` already uses for the identical purpose.
 zeroize = "1"

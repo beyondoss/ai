@@ -60,7 +60,9 @@ impl agent_core::client::CredentialSource for OAuthCredentialSource {
             })
         })
         .await
-        .map_err(|e| agent_core::Error::Transport(format!("credential refresh task panicked: {e}")))?;
+        .map_err(|e| {
+            agent_core::Error::Transport(format!("credential refresh task panicked: {e}"))
+        })?;
 
         let credential = refreshed.map_err(|e| {
             agent_core::Error::Transport(format!(
@@ -71,7 +73,8 @@ impl agent_core::client::CredentialSource for OAuthCredentialSource {
 
         let access = credential.access().to_string();
         let expires_at_ms = credential.expires_at_ms();
-        *self.cached.lock().unwrap_or_else(|e| e.into_inner()) = Some((access.clone(), expires_at_ms));
+        *self.cached.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((access.clone(), expires_at_ms));
         Ok(agent_core::client::Credential::new(access, true))
     }
 }
@@ -95,7 +98,8 @@ mod tests {
     #[tokio::test]
     async fn returns_not_logged_in_as_a_transport_error_when_nothing_is_stored() {
         let dir = tempfile::tempdir().unwrap();
-        let source = OAuthCredentialSource::new(OAuthProviderId::Anthropic, dir.path().join("auth.json"));
+        let source =
+            OAuthCredentialSource::new(OAuthProviderId::Anthropic, dir.path().join("auth.json"));
         let err = match source.credential().await {
             Ok(_) => panic!("expected an error when nothing is stored"),
             Err(e) => e,

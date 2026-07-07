@@ -358,7 +358,8 @@ mod tests {
         );
 
         // The same shape arriving as the terminal SSE usage chunk (DeepSeek's streaming wire).
-        let sse = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":50,\
+        let sse =
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":50,\
                     \"prompt_cache_hit_tokens\":64}}\n\n";
         assert_eq!(openai_stream(sse).unwrap().cache_read_tokens, 64);
 

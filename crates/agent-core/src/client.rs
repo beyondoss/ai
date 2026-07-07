@@ -146,7 +146,10 @@ pub enum RouteOverride {
     /// verbatim). This is the same "forwarded as-is, no gateway involvement" shape the gateway's own
     /// BYO-key concept already describes, just skipping the gateway hop too since there's no static
     /// row that could route it there in the first place.
-    Direct { base_url: String, path: &'static str },
+    Direct {
+        base_url: String,
+        path: &'static str,
+    },
 }
 
 /// Extra per-request wiring a [`RouteOverride`]-carrying credential needs beyond the bearer token
@@ -408,7 +411,8 @@ impl GatewayClient {
     /// operator need for pinning this off by default appears; until then every caller gets the
     /// WebSocket attempt by default, same as pi's own shipped client.
     pub fn with_codex_websocket(mut self, enabled: bool) -> Self {
-        self.codex_websocket = enabled.then(|| Arc::new(crate::codex_websocket::CodexWebSocketCache::new()));
+        self.codex_websocket =
+            enabled.then(|| Arc::new(crate::codex_websocket::CodexWebSocketCache::new()));
         self
     }
 }
@@ -497,7 +501,12 @@ impl ModelTransport for GatewayClient {
             .direct
             .as_ref()
             .filter(|d| d.copilot_dynamic_headers)
-            .map(|_| (copilot_initiator(&req.messages), copilot_has_images(&req.messages)));
+            .map(|_| {
+                (
+                    copilot_initiator(&req.messages),
+                    copilot_has_images(&req.messages),
+                )
+            });
         let direct_headers: Vec<(&'static str, String)> = credential
             .direct
             .as_ref()
@@ -506,7 +515,10 @@ impl ModelTransport for GatewayClient {
         // A non-Bearer auth header (see `DirectRouting::auth_header`'s doc comment) — `None` for
         // every route but one that explicitly opts out of `Authorization: Bearer` (Azure OpenAI's
         // `api-key`, Task #8).
-        let auth_header = credential.direct.as_ref().and_then(|d| d.auth_header.clone());
+        let auth_header = credential
+            .direct
+            .as_ref()
+            .and_then(|d| d.auth_header.clone());
         // Pi-parity Fix 4 (Round 2): a prefix prepended to `auth_header`'s value (Cloudflare AI
         // Gateway's `cf-aig-authorization: Bearer <key>` — a named header, like Azure's `api-key`,
         // but carrying a Bearer-prefixed value, unlike Azure's bare one). `None` unless both this and
@@ -560,7 +572,11 @@ impl ModelTransport for GatewayClient {
         // `req.model`/`ModelRequest::model` itself, which stays keyed on the app-level id the operator
         // configured capabilities for (`crate::models::capabilities`, thinking budgets, …) rather than
         // whatever wire name the request happens to go out under.
-        if let Some(name) = credential.direct.as_ref().and_then(|d| d.deployment_name.as_deref()) {
+        if let Some(name) = credential
+            .direct
+            .as_ref()
+            .and_then(|d| d.deployment_name.as_deref())
+        {
             if let Some(obj) = body.as_object_mut() {
                 obj.insert("model".to_string(), Value::String(name.to_string()));
             }
@@ -646,12 +662,13 @@ impl ModelTransport for GatewayClient {
         // opted out of caching (`no_cache`): pinning a one-off request to a specific gateway/cache node
         // makes no sense when it's explicitly not trying to read a cache back, and pi's own dialects
         // gate this the same way `no_cache` gates the body's own `prompt_cache_key`/`cache_control`.
-        let session_affinity_header = (matches!(dialect, Dialect::OpenAiResponses | Dialect::OpenAi)
-            && !req.no_cache
-            && is_fireworks)
-            .then_some(req.cache_key.as_deref())
-            .flatten()
-            .map(str::to_string);
+        let session_affinity_header =
+            (matches!(dialect, Dialect::OpenAiResponses | Dialect::OpenAi)
+                && !req.no_cache
+                && is_fireworks)
+                .then_some(req.cache_key.as_deref())
+                .flatten()
+                .map(str::to_string);
         // pi's Chat Completions dialect additionally sends `x-session-affinity` alongside `session_id`
         // and `x-client-request-id` (`openai-completions.ts`'s `compat.sendSessionAffinityHeaders`
         // branch); the Responses dialect never sends it.
@@ -1230,9 +1247,13 @@ fn codex_friendly_usage_limit_message(detail: &str) -> Option<String> {
         .and_then(Value::as_str)
         .or_else(|| err.get("type").and_then(Value::as_str))
         .unwrap_or_default();
-    let is_usage_limit_code = ["usage_limit_reached", "usage_not_included", "rate_limit_exceeded"]
-        .iter()
-        .any(|p| code.eq_ignore_ascii_case(p));
+    let is_usage_limit_code = [
+        "usage_limit_reached",
+        "usage_not_included",
+        "rate_limit_exceeded",
+    ]
+    .iter()
+    .any(|p| code.eq_ignore_ascii_case(p));
     if !is_usage_limit_code {
         return None;
     }
@@ -1255,7 +1276,11 @@ fn codex_friendly_usage_limit_message(detail: &str) -> Option<String> {
             format!(" Try again in ~{mins} min.")
         })
         .unwrap_or_default();
-    Some(format!("You have hit your ChatGPT usage limit{plan}.{when}").trim().to_string())
+    Some(
+        format!("You have hit your ChatGPT usage limit{plan}.{when}")
+            .trim()
+            .to_string(),
+    )
 }
 
 /// Whether a `reqwest` send error is the transient connection class (refused/reset/timed out).
@@ -1648,7 +1673,10 @@ mod tests {
             r#"{{"error":{{"code":"usage_limit_reached","plan_type":"Plus","resets_at":{resets_at}}}}}"#
         );
         let msg = codex_friendly_usage_limit_message(&body).expect("should match");
-        assert_eq!(msg, "You have hit your ChatGPT usage limit (plus plan). Try again in ~45 min.");
+        assert_eq!(
+            msg,
+            "You have hit your ChatGPT usage limit (plus plan). Try again in ~45 min."
+        );
 
         // No `plan_type`/`resets_at` at all → still a friendly message, just without those clauses.
         let body = r#"{"error":{"code":"rate_limit_exceeded"}}"#;
@@ -1673,7 +1701,10 @@ mod tests {
             .is_none()
         );
         assert!(codex_friendly_usage_limit_message("not json at all").is_none());
-        assert!(codex_friendly_usage_limit_message(r#"{"error":"a bare string, no code field"}"#).is_none());
+        assert!(
+            codex_friendly_usage_limit_message(r#"{"error":"a bare string, no code field"}"#)
+                .is_none()
+        );
     }
 
     #[test]
@@ -1720,7 +1751,12 @@ mod tests {
             Duration::from_secs(2)
         );
         assert_eq!(
-            backoff(0, Some(Duration::from_secs(3600)), BASE_BACKOFF, MAX_BACKOFF),
+            backoff(
+                0,
+                Some(Duration::from_secs(3600)),
+                BASE_BACKOFF,
+                MAX_BACKOFF
+            ),
             MAX_BACKOFF
         );
     }
@@ -1844,7 +1880,10 @@ mod tests {
             Some(Duration::from_secs_f64(2.5005))
         );
         // A negative value clamps up to zero rather than yielding a negative/underflowing duration.
-        assert_eq!(parse_retry_after_ms("-100", MAX_BACKOFF), Some(Duration::ZERO));
+        assert_eq!(
+            parse_retry_after_ms("-100", MAX_BACKOFF),
+            Some(Duration::ZERO)
+        );
         // Capped at the caller's `max_backoff`, same as the seconds/date form.
         assert_eq!(
             parse_retry_after_ms("999999999", MAX_BACKOFF),
@@ -1964,7 +2003,10 @@ mod tests {
         assert!(!request.contains("claude-code-20250219"), "got:\n{request}");
         assert!(!request.contains("oauth-2025-04-20"), "got:\n{request}");
         assert!(!request.contains("x-app:"), "got:\n{request}");
-        assert!(!request.contains("user-agent: claude-cli/"), "got:\n{request}");
+        assert!(
+            !request.contains("user-agent: claude-cli/"),
+            "got:\n{request}"
+        );
         // pi sends this header in every Anthropic auth branch, including plain API-key auth
         // (`anthropic-messages.ts`'s `createClient`) — present here too, unlike the OAuth-only
         // identity headers asserted absent above.
@@ -2785,7 +2827,9 @@ mod tests {
             "missing originator header, got:\n{request}"
         );
         assert!(
-            request.to_lowercase().contains("openai-beta: responses=experimental"),
+            request
+                .to_lowercase()
+                .contains("openai-beta: responses=experimental"),
             "missing OpenAI-Beta header, got:\n{request}"
         );
     }
@@ -2918,7 +2962,11 @@ mod tests {
             Arc::new(DirectTestCredential(routing)),
         )
         .unwrap();
-        let req = ModelRequest::new("claude-opus-4-8", vec![crate::message::Message::user("hi")], 100);
+        let req = ModelRequest::new(
+            "claude-opus-4-8",
+            vec![crate::message::Message::user("hi")],
+            100,
+        );
         let mut events = client.stream(req).await.unwrap();
         while events.next().await.is_some() {}
 
@@ -2933,7 +2981,10 @@ mod tests {
             "got:\n{request}"
         );
         assert!(!lower.contains("x-app: cli"), "got:\n{request}");
-        assert!(!lower.contains("user-agent: claude-cli/"), "got:\n{request}");
+        assert!(
+            !lower.contains("user-agent: claude-cli/"),
+            "got:\n{request}"
+        );
     }
 
     /// pi-parity (Task 2): `gpt-4.1` is `ApiKind::Responses` natively (`models::capabilities`), but
@@ -3194,7 +3245,9 @@ mod tests {
         // Sanity check: the Bearer header is still sent as normal (Entra ID's real auth scheme,
         // unaffected by the `is_azure` fix — only `DirectRouting::auth_header` controls that).
         assert!(
-            request.to_ascii_lowercase().contains("authorization: bearer"),
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer"),
             "Entra ID auth must still use a normal Bearer header, got:\n{request}"
         );
     }
@@ -3365,12 +3418,16 @@ mod tests {
                 .unwrap();
             stream.flush().unwrap();
             drop(stream);
-            let split = raw.windows(4).position(|w| w == b"\r\n\r\n").expect("header/body separator");
+            let split = raw
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .expect("header/body separator");
             let (head, body) = (&raw[..split], &raw[split + 4..]);
             let head = String::from_utf8_lossy(head).to_string();
             let decompressed = zstd::stream::decode_all(body)
                 .expect("the Codex fallback body must be a valid zstd frame");
-            let json = String::from_utf8(decompressed).expect("decompressed body must be UTF-8 JSON");
+            let json =
+                String::from_utf8(decompressed).expect("decompressed body must be UTF-8 JSON");
             (head, json)
         });
 
@@ -3397,8 +3454,12 @@ mod tests {
         // static_headers` above: a one-shot mock server with no WS handling of its own, testing the
         // HTTP/SSE wire shape specifically.
         .with_codex_websocket(false);
-        let req = ModelRequest::new("gpt-5-codex", vec![crate::message::Message::user("hi")], 100)
-            .with_system("be terse");
+        let req = ModelRequest::new(
+            "gpt-5-codex",
+            vec![crate::message::Message::user("hi")],
+            100,
+        )
+        .with_system("be terse");
         let mut events = client.stream(req).await.unwrap();
         while events.next().await.is_some() {}
 
@@ -3464,7 +3525,11 @@ mod tests {
             Arc::new(DirectTestCredential(routing)),
         )
         .unwrap();
-        let req = ModelRequest::new("kimi-k2-thinking", vec![crate::message::Message::user("hi")], 100);
+        let req = ModelRequest::new(
+            "kimi-k2-thinking",
+            vec![crate::message::Message::user("hi")],
+            100,
+        );
         let mut events = client.stream(req).await.unwrap();
         while events.next().await.is_some() {}
 
@@ -3499,7 +3564,11 @@ mod tests {
         });
 
         let client = GatewayClient::new(format!("http://{addr}"), "test-key").unwrap();
-        let req = ModelRequest::new("kimi-k2-thinking", vec![crate::message::Message::user("hi")], 100);
+        let req = ModelRequest::new(
+            "kimi-k2-thinking",
+            vec![crate::message::Message::user("hi")],
+            100,
+        );
         let mut events = client.stream(req).await.unwrap();
         while events.next().await.is_some() {}
 
@@ -3573,7 +3642,8 @@ mod tests {
     /// plain gateway-relayed request), "minimax-m3" keeps the pre-existing host-agnostic default
     /// (Anthropic — correct for native MiniMax and OpenCode-Go, just not OpenCode Zen).
     #[tokio::test]
-    async fn without_an_aggregator_host_the_same_bare_id_keeps_the_host_agnostic_anthropic_default() {
+    async fn without_an_aggregator_host_the_same_bare_id_keeps_the_host_agnostic_anthropic_default()
+    {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {

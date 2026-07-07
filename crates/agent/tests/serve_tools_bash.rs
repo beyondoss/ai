@@ -642,12 +642,7 @@ fn serve_bash_terminal_response_carries_structured_exit_code_and_truncation_fiel
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
-    writeln!(
-        stdin,
-        "{}",
-        json!({ "type": "bash", "command": "exit 7" })
-    )
-    .unwrap();
+    writeln!(stdin, "{}", json!({ "type": "bash", "command": "exit 7" })).unwrap();
     stdin.flush().unwrap();
     let frames = read_until_response(&mut stdout, "bash");
     let resp = frames.last().unwrap();
@@ -812,7 +807,11 @@ fn serve_block_images_flag_forces_a_read_tool_image_to_a_text_placeholder() {
     std::fs::write(dir.path().join("shot.png"), &png).unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
 
-    let turn1 = turn_tool_use("toolu_1", "read", &json!({ "path": "shot.png" }).to_string());
+    let turn1 = turn_tool_use(
+        "toolu_1",
+        "read",
+        &json!({ "path": "shot.png" }).to_string(),
+    );
     let (base, bodies) = spawn_model_server(vec![turn1, turn_text("described")]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");

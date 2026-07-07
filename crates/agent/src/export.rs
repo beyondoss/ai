@@ -170,7 +170,8 @@ fn render_html_inner(
             }
         }
         render_message(&mut out, message, &index);
-        branch_number = render_branches_diverging_at(&mut out, branches, i + 1, branch_number, &index);
+        branch_number =
+            render_branches_diverging_at(&mut out, branches, i + 1, branch_number, &index);
     }
     // A `ModelChange` that never matched a later message (e.g. the session ended, or was exported,
     // before another assistant turn ran under the new model) still needs to be visible somewhere —
@@ -411,7 +412,10 @@ fn index_tool_calls<'a>(
         .chain(branches.iter().flat_map(|(_, branch)| branch.iter()));
     for message in all_messages {
         for block in &message.content {
-            if let ContentBlock::ToolUse { id, name, input, .. } = block {
+            if let ContentBlock::ToolUse {
+                id, name, input, ..
+            } = block
+            {
                 index.insert(id.as_str(), (name.as_str(), input));
             }
         }
@@ -860,7 +864,12 @@ fn render_tool_result_content(
 /// host-bash command has no originating `ToolUse` at all, and a `write` call's own threshold (see
 /// [`tool_result_line_threshold`]) needs to apply even though it's rendering the call's *input*, not a
 /// `ToolResult` block.
-fn render_collapsible_output(out: &mut String, content: &str, lang: Option<&str>, threshold: usize) {
+fn render_collapsible_output(
+    out: &mut String,
+    content: &str,
+    lang: Option<&str>,
+    threshold: usize,
+) {
     let cleaned = strip_control_chars(content);
     let body = if looks_like_diff(&cleaned) {
         diff_html(&cleaned)
@@ -2218,7 +2227,10 @@ mod tests {
             thought_signature: None,
         }])];
         let html = render_html(&meta(), &messages, &[], None);
-        assert!(html.contains("Listed <code>src</code> (limit 50)"), "{html}");
+        assert!(
+            html.contains("Listed <code>src</code> (limit 50)"),
+            "{html}"
+        );
     }
 
     #[test]
@@ -2654,7 +2666,10 @@ mod tests {
             !html.contains("<details"),
             "a branch summary must not collapse: {html}"
         );
-        assert!(html.contains("class=\"summary-marker branch-summary\""), "{html}");
+        assert!(
+            html.contains("class=\"summary-marker branch-summary\""),
+            "{html}"
+        );
         assert!(html.contains("Explored using a cache"));
     }
 
@@ -2848,7 +2863,10 @@ mod tests {
             "{html}"
         );
         // `is_error`'s own block-level styling (the `"(error)\n"` marker) is untouched by this fix.
-        assert!(html.contains("class=\"tool-call host-bash error\""), "{html}");
+        assert!(
+            html.contains("class=\"tool-call host-bash error\""),
+            "{html}"
+        );
     }
 
     #[test]
@@ -2887,7 +2905,10 @@ mod tests {
         // a single `<pre>`, no threshold/collapse — same missed pattern as write (Task #46). Matches
         // pi's own `formatExpandableOutput(msg.output, 10)` call for its `bashExecution` role
         // (`template.js:1273-1285`).
-        let long_output: String = (1..=20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let long_output: String = (1..=20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let messages = vec![Message::user(format!(
             "[Host bash command, run outside the model's own turn]\n$ seq 20\n\n{long_output}"
         ))];
@@ -3105,8 +3126,14 @@ mod tests {
         assert!(html.contains("Session Events"));
         assert!(html.contains("Model changed to <code>claude-opus-4-8</code>"));
         assert!(html.contains("Thinking level changed to <code>high</code>"));
-        assert!(html.contains("Labeled <code>msg-1</code>: checkpoint"), "{html}");
-        assert!(html.contains("Label cleared on <code>msg-1</code>"), "{html}");
+        assert!(
+            html.contains("Labeled <code>msg-1</code>: checkpoint"),
+            "{html}"
+        );
+        assert!(
+            html.contains("Label cleared on <code>msg-1</code>"),
+            "{html}"
+        );
         assert!(html.contains("beyond:sync"));
         assert!(html.contains("marker"));
     }
@@ -3122,7 +3149,10 @@ mod tests {
             label: Some("checkpoint".to_string()),
         }];
         let html = render_html_with_entries(&meta(), &[Message::user("hi")], &[], None, &events);
-        assert!(html.contains("Labeled <code>abc123</code>: checkpoint"), "{html}");
+        assert!(
+            html.contains("Labeled <code>abc123</code>: checkpoint"),
+            "{html}"
+        );
     }
 
     #[test]
@@ -3133,7 +3163,10 @@ mod tests {
             label: None,
         }];
         let html = render_html_with_entries(&meta(), &[Message::user("hi")], &[], None, &events);
-        assert!(html.contains("Label cleared on <code>abc123</code>"), "{html}");
+        assert!(
+            html.contains("Label cleared on <code>abc123</code>"),
+            "{html}"
+        );
     }
 
     #[test]
@@ -3170,7 +3203,10 @@ mod tests {
         // Rendered inline, not in the flat trailing dump.
         assert!(!html.contains("Session Events"), "{html}");
         assert!(html.contains("class=\"model-change\""), "{html}");
-        assert!(html.contains("Model changed to <code>claude-b</code>"), "{html}");
+        assert!(
+            html.contains("Model changed to <code>claude-b</code>"),
+            "{html}"
+        );
         // Positioned between the turn that used the old model and the turn that used the new one, not
         // before the first assistant turn (which never used `claude-b` at all).
         let change_pos = html.find("class=\"model-change\"").unwrap();

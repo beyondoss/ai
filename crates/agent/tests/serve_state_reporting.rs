@@ -31,7 +31,11 @@ fn serve_get_session_stats_reports_the_same_field_set_idle_or_mid_turn() {
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![
-        turn_tool_use("toolu_shape", "bash", &json!({ "command": "sleep 0.5" }).to_string()),
+        turn_tool_use(
+            "toolu_shape",
+            "bash",
+            &json!({ "command": "sleep 0.5" }).to_string(),
+        ),
         turn_text("done"),
     ]);
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
@@ -39,7 +43,12 @@ fn serve_get_session_stats_reports_the_same_field_set_idle_or_mid_turn() {
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
-    writeln!(stdin, "{}", json!({ "type": "get_session_stats", "id": "idle" })).unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "get_session_stats", "id": "idle" })
+    )
+    .unwrap();
     stdin.flush().unwrap();
     let idle_frames = read_until_response(&mut stdout, "get_session_stats");
     let idle_keys = keys(&idle_frames.last().unwrap()["data"]);
@@ -47,7 +56,12 @@ fn serve_get_session_stats_reports_the_same_field_set_idle_or_mid_turn() {
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "go" })).unwrap();
     stdin.flush().unwrap();
     std::thread::sleep(Duration::from_millis(150)); // mid the tool call's own `sleep 0.5`
-    writeln!(stdin, "{}", json!({ "type": "get_session_stats", "id": "busy" })).unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "get_session_stats", "id": "busy" })
+    )
+    .unwrap();
     stdin.flush().unwrap();
 
     let frames = read_until_response(&mut stdout, "prompt");
@@ -197,10 +211,10 @@ fn serve_get_tree_since_works_from_the_busy_loop_mid_prompt() {
     assert_eq!(mid_resp["success"], true, "{mid_resp:#?}");
     let since_nodes = mid_resp["data"]["nodes"].as_array().unwrap();
     assert!(
-        since_nodes.iter().any(|n| n["role"] == "user"
-            && n["preview"]
-                .as_str()
-                .is_some_and(|p| p.contains("second"))),
+        since_nodes
+            .iter()
+            .any(|n| n["role"] == "user"
+                && n["preview"].as_str().is_some_and(|p| p.contains("second"))),
         "the second turn's user message should already be visible mid-run: {since_nodes:#?}"
     );
     assert!(!since_nodes.iter().any(|n| n["id"] == baseline_id));
@@ -364,7 +378,11 @@ fn serve_steer_and_follow_up_expose_the_actual_queued_text_not_just_a_count() {
     stdin.flush().unwrap();
     let frames = read_until_response(&mut stdout, "steer");
     let data = &frames.last().unwrap()["data"];
-    assert_eq!(data["steer_queue"], json!(["actually, redirect"]), "got: {data:#?}");
+    assert_eq!(
+        data["steer_queue"],
+        json!(["actually, redirect"]),
+        "got: {data:#?}"
+    );
     assert_eq!(
         data["follow_up_queue"],
         json!(["do the next thing"]),
@@ -377,8 +395,16 @@ fn serve_steer_and_follow_up_expose_the_actual_queued_text_not_just_a_count() {
     stdin.flush().unwrap();
     let frames = read_until_response(&mut stdout, "get_state");
     let data = &frames.last().unwrap()["data"];
-    assert_eq!(data["steer_queue"], json!(["actually, redirect"]), "got: {data:#?}");
-    assert_eq!(data["follow_up_queue"], json!(["do the next thing"]), "got: {data:#?}");
+    assert_eq!(
+        data["steer_queue"],
+        json!(["actually, redirect"]),
+        "got: {data:#?}"
+    );
+    assert_eq!(
+        data["follow_up_queue"],
+        json!(["do the next thing"]),
+        "got: {data:#?}"
+    );
 
     drop(stdin);
     child.wait().unwrap();

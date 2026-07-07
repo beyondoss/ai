@@ -192,7 +192,9 @@ impl Bash {
                 } else {
                     // pi-parity fix: pi's own bash.ts message is two lines — the plain fact, plus this
                     // explanatory second line stating the consequence — not just the first on its own.
-                    format!("Working directory does not exist: {dir}\nCannot execute bash commands.")
+                    format!(
+                        "Working directory does not exist: {dir}\nCannot execute bash commands."
+                    )
                 };
                 return Err(ToolError::InvalidInput(msg));
             }
@@ -1036,7 +1038,10 @@ mod tests {
             .unwrap_err();
         match err {
             ToolError::InvalidInput(msg) => {
-                assert!(msg.contains("Working directory does not exist"), "got: {msg}");
+                assert!(
+                    msg.contains("Working directory does not exist"),
+                    "got: {msg}"
+                );
                 // pi-parity fix: pi's own bash.ts message is two lines — the plain fact, plus this
                 // explanatory second line stating the consequence ("Cannot execute bash commands.") —
                 // not just the first line on its own.

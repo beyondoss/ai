@@ -575,7 +575,9 @@ mod tests {
             .await
             .unwrap()
             .text;
-        assert!(out.contains("[result limit 3 reached; narrow the pattern or use limit=6 for more]"));
+        assert!(
+            out.contains("[result limit 3 reached; narrow the pattern or use limit=6 for more]")
+        );
         assert!(out.contains("f00.rs") && out.contains("f01.rs") && out.contains("f02.rs"));
         assert!(!out.contains("f03.rs"));
     }

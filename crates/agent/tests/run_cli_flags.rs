@@ -276,9 +276,7 @@ fn run_binary_json_help_flag_routes_usage_to_stderr_with_empty_stdout() {
     // any of that is ever read.
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let output = run_cmd(bin)
-        .args(["run", "--json", "--help",
-            "--no-session-persistence",
-        ])
+        .args(["run", "--json", "--help", "--no-session-persistence"])
         .output()
         .expect("spawn binary");
 
@@ -424,7 +422,10 @@ fn export_subcommand_usage_totals_match_run_exports_for_the_same_session() {
         tokens_stat_value(&run_export_html).expect("run --export must report usage totals");
     // Sanity check: the mock turn's own usage must actually be reflected, not just present — a
     // blank/zeroed line would make the cross-path equality assertion below vacuous.
-    assert_eq!(run_export_tokens, "12 in, 6 out, 0 cache read, 0 cache write");
+    assert_eq!(
+        run_export_tokens,
+        "12 in, 6 out, 0 cache read, 0 cache write"
+    );
 
     let standalone_export_path = dir.path().join("standalone-export.html");
     let output = Command::new(bin)
@@ -657,7 +658,8 @@ fn run_binary_model_flag_colon_suffix_resolves_the_id_and_sets_reasoning_effort(
 }
 
 #[test]
-fn run_binary_model_flag_off_suffix_disables_reasoning_and_is_not_overridden_by_the_medium_default() {
+fn run_binary_model_flag_off_suffix_disables_reasoning_and_is_not_overridden_by_the_medium_default()
+{
     // Task #29 (pi-parity fix): `ThinkingLevel::Off.reasoning_effort()` is `None`, the exact same value
     // a bare "nothing requested" invocation produces — so `--model claude-haiku-4-5:off` previously
     // reached the same `default_reasoning_effort_for_model` fallback a plain `--model claude-haiku-4-5`
@@ -2225,7 +2227,8 @@ fn run_binary_model_override_api_key_resolves_a_bang_command() {
 }
 
 #[test]
-fn run_binary_model_override_dialect_forces_anthropic_wire_for_a_model_id_that_fails_the_heuristic() {
+fn run_binary_model_override_dialect_forces_anthropic_wire_for_a_model_id_that_fails_the_heuristic()
+{
     // Fix 1 (pi-parity, Round 2): a genuinely Anthropic-wire third-party provider (the motivating case:
     // Kimi-Coding's `api.kimi.com/coding`) whose model ids don't carry a "claude"/"anthropic" substring
     // would, without a `dialect` override, get an OpenAI-shaped body built and POSTed to an Anthropic
@@ -2275,7 +2278,9 @@ fn run_binary_model_override_dialect_forces_anthropic_wire_for_a_model_id_that_f
     );
     let bodies = bodies.lock().unwrap();
     assert!(
-        bodies[0].to_ascii_lowercase().contains("anthropic-version: 2023-06-01"),
+        bodies[0]
+            .to_ascii_lowercase()
+            .contains("anthropic-version: 2023-06-01"),
         "expected the Anthropic-only version header on the outgoing request, proving the override \
          actually changed the wire dialect, not just the endpoint path: {}",
         bodies[0]
@@ -2293,7 +2298,9 @@ fn run_binary_model_override_api_version_is_appended_as_a_query_param() {
     let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
     std::fs::write(
         config_dir.join("models.json"),
-        format!(r#"{{"claude-test": {{"base_url": "{base}", "api_version": "2024-08-01-preview"}}}}"#),
+        format!(
+            r#"{{"claude-test": {{"base_url": "{base}", "api_version": "2024-08-01-preview"}}}}"#
+        ),
     )
     .unwrap();
 
@@ -2624,7 +2631,11 @@ fn run_binary_block_images_flag_forces_a_read_tool_image_to_a_text_placeholder()
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("shot.png"), &png).unwrap();
 
-    let turn1 = turn_tool_use("toolu_1", "read", &json!({ "path": "shot.png" }).to_string());
+    let turn1 = turn_tool_use(
+        "toolu_1",
+        "read",
+        &json!({ "path": "shot.png" }).to_string(),
+    );
     let (base, bodies) = spawn_model_server(vec![turn1, turn_text("described")]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
@@ -2673,7 +2684,11 @@ fn run_binary_without_block_images_a_read_tool_image_carries_no_non_vision_place
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("shot.png"), &png).unwrap();
 
-    let turn1 = turn_tool_use("toolu_1", "read", &json!({ "path": "shot.png" }).to_string());
+    let turn1 = turn_tool_use(
+        "toolu_1",
+        "read",
+        &json!({ "path": "shot.png" }).to_string(),
+    );
     let (base, bodies) = spawn_model_server(vec![turn1, turn_text("described")]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");

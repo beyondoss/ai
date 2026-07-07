@@ -1177,10 +1177,10 @@ fn serve_get_tree_since_returns_only_what_was_appended_after_a_known_id() {
         "a custom entry must be included, not just plain messages: {since_nodes:#?}"
     );
     assert!(
-        since_nodes.iter().any(|n| n["role"] == "user"
-            && n["preview"]
-                .as_str()
-                .is_some_and(|p| p.contains("second"))),
+        since_nodes
+            .iter()
+            .any(|n| n["role"] == "user"
+                && n["preview"].as_str().is_some_and(|p| p.contains("second"))),
         "{since_nodes:#?}"
     );
     assert!(

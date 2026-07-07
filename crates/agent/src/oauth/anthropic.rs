@@ -108,7 +108,11 @@ pub async fn refresh(refresh_token: &str) -> Result<AnthropicCredential> {
     normalize(post_token(&http, &body).await?)
 }
 
-async fn exchange_code(code_verifier: &str, code: &str, state: &str) -> Result<AnthropicCredential> {
+async fn exchange_code(
+    code_verifier: &str,
+    code: &str,
+    state: &str,
+) -> Result<AnthropicCredential> {
     let http = Client::new();
     let body = serde_json::json!({
         "grant_type": "authorization_code",
@@ -149,10 +153,12 @@ async fn post_token(http: &Client, body: &serde_json::Value) -> Result<TokenResp
             body,
         });
     }
-    resp.json::<TokenResponse>().await.map_err(|source| OAuthError::Network {
-        url: TOKEN_URL.to_string(),
-        source,
-    })
+    resp.json::<TokenResponse>()
+        .await
+        .map_err(|source| OAuthError::Network {
+            url: TOKEN_URL.to_string(),
+            source,
+        })
 }
 
 fn normalize(tokens: TokenResponse) -> Result<AnthropicCredential> {
@@ -205,7 +211,10 @@ struct ParsedAuth {
 fn parse_authorization_input(input: &str) -> Result<ParsedAuth> {
     let trimmed = input.trim();
     if let Ok(url) = url::Url::parse(trimmed) {
-        return from_pairs(url.query_pairs().map(|(k, v)| (k.into_owned(), v.into_owned())));
+        return from_pairs(
+            url.query_pairs()
+                .map(|(k, v)| (k.into_owned(), v.into_owned())),
+        );
     }
     if let Some((code, state)) = trimmed.split_once('#') {
         return Ok(ParsedAuth {

@@ -20,7 +20,10 @@ pub fn generate() -> Result<Pkce> {
     getrandom::fill(&mut raw)?;
     let verifier = URL_SAFE_NO_PAD.encode(raw);
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-    Ok(Pkce { verifier, challenge })
+    Ok(Pkce {
+        verifier,
+        challenge,
+    })
 }
 
 /// An independent random CSRF token, hex-encoded — OpenAI Codex's browser flow uses this instead of

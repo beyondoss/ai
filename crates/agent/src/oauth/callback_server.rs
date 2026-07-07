@@ -147,8 +147,9 @@ fn respond(request: tiny_http::Request, success: bool) {
         )
     };
     #[allow(clippy::expect_used)] // static header name/value; construction cannot fail
-    let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..])
-        .expect("static header is valid");
+    let header =
+        tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..])
+            .expect("static header is valid");
     let response = tiny_http::Response::from_string(body)
         .with_status_code(status)
         .with_header(header);

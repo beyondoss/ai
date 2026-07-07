@@ -307,7 +307,8 @@ mod tests {
     }
 
     #[test]
-    fn from_overrides_with_enabled_false_forces_zero_max_retries_regardless_of_max_retries_override() {
+    fn from_overrides_with_enabled_false_forces_zero_max_retries_regardless_of_max_retries_override()
+     {
         // Task #52 (pi-parity feature): `--no-retry` must win outright even if `--retry-max-retries 7`
         // (or a stored `default_retry_max_retries`) was *also* given — matching pi's own
         // `RetrySettings.enabled: false` precedence, an explicit "off" always means off.

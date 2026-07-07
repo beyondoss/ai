@@ -317,7 +317,11 @@ async fn gateway_client_omits_x_client_request_id_without_a_cache_key() {
     // omitted even on an otherwise-eligible route.
     let (base, captured) = spawn_request_capturing_server();
     let client = GatewayClient::new(base, "bai_v1.test").expect("client");
-    let req = ModelRequest::new("accounts/fireworks/models/glm-5p2", vec![Message::user("hi")], 64); // no cache_key
+    let req = ModelRequest::new(
+        "accounts/fireworks/models/glm-5p2",
+        vec![Message::user("hi")],
+        64,
+    ); // no cache_key
     let mut stream = client.stream(req).await.expect("stream");
     let _ = stream.next().await;
 

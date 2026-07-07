@@ -206,7 +206,9 @@ fn model_override_extra_headers(model: &str) -> std::collections::HashMap<String
 }
 
 fn unknown_provider_error(provider: &str) -> String {
-    format!("unknown provider {provider:?}; expected one of: anthropic, github-copilot, openai-codex")
+    format!(
+        "unknown provider {provider:?}; expected one of: anthropic, github-copilot, openai-codex"
+    )
 }
 
 /// Drives `agent login`'s interactive prompts over stderr/stdin — the CLI's one implementation of
@@ -1617,8 +1619,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 bash_command_prefix.or_else(|| stored_settings.default_bash_command_prefix.clone());
             let compaction_reserve_tokens =
                 compaction_reserve_tokens.or(stored_settings.default_compaction_reserve_tokens);
-            let compaction_keep_recent_tokens =
-                compaction_keep_recent_tokens.or(stored_settings.default_compaction_keep_recent_tokens);
+            let compaction_keep_recent_tokens = compaction_keep_recent_tokens
+                .or(stored_settings.default_compaction_keep_recent_tokens);
             // Task #31 (pi-parity fix): `run_task`'s identical resolution, just below in this file.
             let branch_summary_reserve_tokens = branch_summary_reserve_tokens
                 .or(stored_settings.default_branch_summary_reserve_tokens);
@@ -1646,7 +1648,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 !no_image_auto_resize && stored_settings.image_auto_resize.unwrap_or(true);
             let models = models.or_else(|| stored_settings.default_models_list.clone());
             let extra_skill_paths = if extra_skill_paths.is_empty() {
-                stored_settings.default_skill_paths.clone().unwrap_or_default()
+                stored_settings
+                    .default_skill_paths
+                    .clone()
+                    .unwrap_or_default()
             } else {
                 extra_skill_paths
             };
@@ -2059,7 +2064,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )?;
             }
             if block_images.is_some() || clear_block_images {
-                store.set_block_images(if clear_block_images { None } else { block_images })?;
+                store.set_block_images(if clear_block_images {
+                    None
+                } else {
+                    block_images
+                })?;
             }
             if image_auto_resize.is_some() || clear_image_auto_resize {
                 store.set_image_auto_resize(if clear_image_auto_resize {
@@ -2074,9 +2083,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .ok_or_else(|| format!("--thinking-budget {kv:?} must be EFFORT=TOKENS"))?;
                 parse_reasoning_effort(effort)
                     .map_err(|e| format!("--thinking-budget {kv:?}: {e}"))?;
-                let tokens: u32 = tokens
-                    .parse()
-                    .map_err(|_| format!("--thinking-budget {kv:?}: TOKENS must be a non-negative integer"))?;
+                let tokens: u32 = tokens.parse().map_err(|_| {
+                    format!("--thinking-budget {kv:?}: TOKENS must be a non-negative integer")
+                })?;
                 store.set_thinking_budget_override(effort.to_string(), Some(tokens))?;
             }
             for effort in &clear_thinking_budget {
@@ -2090,14 +2099,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if default_bash_command_prefix.is_some() || clear_default_bash_command_prefix {
                 store.set_default_bash_command_prefix(default_bash_command_prefix)?;
             }
-            if default_compaction_reserve_tokens.is_some() || clear_default_compaction_reserve_tokens {
+            if default_compaction_reserve_tokens.is_some()
+                || clear_default_compaction_reserve_tokens
+            {
                 store.set_default_compaction_reserve_tokens(default_compaction_reserve_tokens)?;
             }
             if default_compaction_keep_recent_tokens.is_some()
                 || clear_default_compaction_keep_recent_tokens
             {
-                store
-                    .set_default_compaction_keep_recent_tokens(default_compaction_keep_recent_tokens)?;
+                store.set_default_compaction_keep_recent_tokens(
+                    default_compaction_keep_recent_tokens,
+                )?;
             }
             if default_retry_max_retries.is_some() || clear_default_retry_max_retries {
                 store.set_default_retry_max_retries(default_retry_max_retries)?;
@@ -2189,7 +2201,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             println!(
                 "default_bash_command_prefix: {}",
-                s.default_bash_command_prefix.as_deref().unwrap_or("(not set)")
+                s.default_bash_command_prefix
+                    .as_deref()
+                    .unwrap_or("(not set)")
             );
             println!(
                 "default_compaction_reserve_tokens: {}",
@@ -3014,7 +3028,8 @@ async fn run_task(
     // Round 3 (pi-parity fix): five more flag/env-only settings gain the same "explicit flag/env, then
     // stored setting, then built-in default" precedence — `serve`'s identical block, in its own command
     // handler above, for the full set (including `--models`, `serve`-only).
-    let bash_shell_path = bash_shell_path.or_else(|| stored_settings.default_bash_shell_path.clone());
+    let bash_shell_path =
+        bash_shell_path.or_else(|| stored_settings.default_bash_shell_path.clone());
     // Task #49 (pi-parity fix): `Command::Serve`'s handler (above in this file) checks this upfront and
     // fails fast — `run_task` had no equivalent at all, so a bad `--bash-shell-path`/stored default
     // surfaced only as a confusing spawn error on the first `bash` call, potentially well into a
@@ -3034,8 +3049,8 @@ async fn run_task(
         compaction_keep_recent_tokens.or(stored_settings.default_compaction_keep_recent_tokens);
     // Task #31 (pi-parity feature): independent of `compaction_reserve_tokens` — see
     // `agent_core::Agent::with_branch_summary_reserve_tokens`'s own doc comment.
-    let branch_summary_reserve_tokens = branch_summary_reserve_tokens
-        .or(stored_settings.default_branch_summary_reserve_tokens);
+    let branch_summary_reserve_tokens =
+        branch_summary_reserve_tokens.or(stored_settings.default_branch_summary_reserve_tokens);
     let retry_max_retries = retry_max_retries.or(stored_settings.default_retry_max_retries);
     let retry_base_delay_ms = retry_base_delay_ms.or(stored_settings.default_retry_base_delay_ms);
     // Task #30 (pi-parity feature): the retry cluster's third knob — see
@@ -3044,7 +3059,10 @@ async fn run_task(
         retry_max_backoff_ms.or(stored_settings.default_retry_max_backoff_ms);
     let idle_timeout_ms = idle_timeout_ms.or(stored_settings.default_provider_timeout_ms);
     let extra_skill_paths = if extra_skill_paths.is_empty() {
-        stored_settings.default_skill_paths.clone().unwrap_or_default()
+        stored_settings
+            .default_skill_paths
+            .clone()
+            .unwrap_or_default()
     } else {
         extra_skill_paths
     };
@@ -3511,7 +3529,8 @@ async fn run_task(
             let caps = agent_core::capabilities(&model);
             if matches!(
                 caps.thinking,
-                agent_core::models::ThinkingShape::Budget | agent_core::models::ThinkingShape::Adaptive
+                agent_core::models::ThinkingShape::Budget
+                    | agent_core::models::ThinkingShape::Adaptive
             ) {
                 let overrides = resolve_thinking_budget_overrides(&stored_settings);
                 let budget = agent_core::models::budget_for_effort_with_override(
@@ -4277,7 +4296,12 @@ mod tests {
         let mut turns: Vec<Vec<Result<StreamEvent, Error>>> = (0..INNER_RETRY_ATTEMPTS)
             .map(|_| vec![Err(Error::Transport("overloaded_error: overloaded".into()))])
             .collect();
-        turns.push(turn::text("would have recovered").into_iter().map(Ok).collect());
+        turns.push(
+            turn::text("would have recovered")
+                .into_iter()
+                .map(Ok)
+                .collect(),
+        );
         let transport = std::sync::Arc::new(MockTransport::scripted(turns));
         let agent = Agent::new(transport.clone(), "claude-test");
         let mut session = Session::new();
@@ -4299,7 +4323,9 @@ mod tests {
             &agent_core::Steering::new(),
         )
         .await
-        .expect_err("a disabled whole-run retry policy must never retry, even a recoverable failure");
+        .expect_err(
+            "a disabled whole-run retry policy must never retry, even a recoverable failure",
+        );
         assert!(matches!(err, Error::Transport(_)));
         // Only agent_core's own internal (mid-stream) retries ran; our whole-run wrapper made no
         // second attempt at all, so the final scripted (would-have-succeeded) turn was never reached.
@@ -4453,10 +4479,16 @@ mod tests {
     #[tokio::test]
     async fn read_file_refs_errors_naming_the_missing_file() {
         let dir = tempfile::tempdir().unwrap();
-        let err = read_file_refs(&["does-not-exist.txt".to_string()], dir.path(), false, true, true)
-            .await
-            .unwrap_err()
-            .to_string();
+        let err = read_file_refs(
+            &["does-not-exist.txt".to_string()],
+            dir.path(),
+            false,
+            true,
+            true,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("does-not-exist.txt"), "got: {err}");
     }
 
@@ -4601,11 +4633,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.images.len(), 1, "got: {out:?}");
-        let decoded = image::load_from_memory(&base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            &out.images[0].data,
+        let decoded = image::load_from_memory(
+            &base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                &out.images[0].data,
+            )
+            .unwrap(),
         )
-        .unwrap())
         .unwrap();
         assert_eq!(
             decoded.width(),
@@ -4698,7 +4732,10 @@ mod tests {
         let out = read_file_refs(&["empty.txt".to_string()], dir.path(), false, true, true)
             .await
             .unwrap();
-        assert_eq!(out.text, "", "a zero-byte file must contribute nothing at all");
+        assert_eq!(
+            out.text, "",
+            "a zero-byte file must contribute nothing at all"
+        );
         assert!(out.images.is_empty());
     }
 
@@ -4731,10 +4768,16 @@ mod tests {
         // A zero-byte skip must not swallow the genuinely-missing-file error — `metadata()` failing
         // falls through to the normal read attempt, which reports the real problem.
         let dir = tempfile::tempdir().unwrap();
-        let err = read_file_refs(&["does-not-exist.txt".to_string()], dir.path(), false, true, true)
-            .await
-            .unwrap_err()
-            .to_string();
+        let err = read_file_refs(
+            &["does-not-exist.txt".to_string()],
+            dir.path(),
+            false,
+            true,
+            true,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("does-not-exist.txt"), "got: {err}");
     }
 
@@ -4808,8 +4851,14 @@ mod tests {
             ..Default::default()
         };
         let overrides = resolve_thinking_budget_overrides(&settings).unwrap();
-        assert_eq!(overrides.get(&agent_core::ReasoningEffort::High), Some(&40_000));
-        assert_eq!(overrides.get(&agent_core::ReasoningEffort::Low), Some(&1_000));
+        assert_eq!(
+            overrides.get(&agent_core::ReasoningEffort::High),
+            Some(&40_000)
+        );
+        assert_eq!(
+            overrides.get(&agent_core::ReasoningEffort::Low),
+            Some(&1_000)
+        );
     }
 
     #[test]

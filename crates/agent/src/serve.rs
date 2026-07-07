@@ -1140,18 +1140,17 @@ impl Persistence {
             return Vec::new();
         };
         let cwd = self.meta.cwd.clone();
-        let sessions = match tokio::task::spawn_blocking(move || repo.list_with_progress(on_progress))
-            .await
-        {
-            Ok(Ok(sessions)) => sessions,
-            Ok(Err(e)) => {
-                eprintln!("serve: failed to list sessions: {e}");
-                Vec::new()
-            }
-            // `list_with_progress` never panics itself and this task is never cancelled — same
-            // reasoning as `persist_blocking`'s identical re-raise.
-            Err(e) => std::panic::resume_unwind(e.into_panic()),
-        };
+        let sessions =
+            match tokio::task::spawn_blocking(move || repo.list_with_progress(on_progress)).await {
+                Ok(Ok(sessions)) => sessions,
+                Ok(Err(e)) => {
+                    eprintln!("serve: failed to list sessions: {e}");
+                    Vec::new()
+                }
+                // `list_with_progress` never panics itself and this task is never cancelled — same
+                // reasoning as `persist_blocking`'s identical re-raise.
+                Err(e) => std::panic::resume_unwind(e.into_panic()),
+            };
         sessions.into_iter().filter(|m| m.cwd == cwd).collect()
     }
 
@@ -1395,7 +1394,12 @@ impl Persistence {
                     let (ids, messages): (Vec<String>, Vec<agent_core::Message>) =
                         abandoned.into_iter().unzip();
                     match agent
-                        .summarize_branch(&messages, cancel, custom_instructions, replace_instructions)
+                        .summarize_branch(
+                            &messages,
+                            cancel,
+                            custom_instructions,
+                            replace_instructions,
+                        )
                         .await
                     {
                         Ok(summary) if !summary.trim().is_empty() => {
@@ -1763,7 +1767,9 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
     // (a restricted `--tools`/`--exclude-tools` invocation) just adds dead weight (pi-parity fix).
     // Tools are fixed for the whole process (see `build_agent`'s doc comment), so this one check is
     // reused verbatim by `reload`'s own rebuild below rather than re-deriving it.
-    let has_read = build_tools(&cfg, cfg.image_auto_resize).get("read").is_some();
+    let has_read = build_tools(&cfg, cfg.image_auto_resize)
+        .get("read")
+        .is_some();
     let mut static_system =
         crate::resources::build_static_system_prompt(&crate::resources::PromptOptions {
             base: None,
@@ -2440,7 +2446,8 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
     // rejected and `submit_code`/`abort_login` know what to reach. Shared with the detached task
     // `login` spawns (see that arm below) — cleared back to `None` by that task itself once the
     // flow resolves, success or failure, so a later `login` is accepted again.
-    let pending_login: Arc<std::sync::Mutex<Option<PendingLogin>>> = Arc::new(std::sync::Mutex::new(None));
+    let pending_login: Arc<std::sync::Mutex<Option<PendingLogin>>> =
+        Arc::new(std::sync::Mutex::new(None));
     loop {
         let line = tokio::select! {
             biased;
@@ -3212,7 +3219,13 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                             steering.push(m);
                         }
                         // Fix 5 (pi-parity gap): see `queue_content`'s own doc comment.
-                        emit!(response(id, cmd_type, true, Some(queue_content(&steering)), None));
+                        emit!(response(
+                            id,
+                            cmd_type,
+                            true,
+                            Some(queue_content(&steering)),
+                            None
+                        ));
                     }
                     None => emit!(response(
                         id,
@@ -3458,7 +3471,13 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                     Some(json!({ "trash": trash })),
                     None,
                 )),
-                Err(e) => emit!(response(id, "list_trash", false, None, Some(&e.to_string()))),
+                Err(e) => emit!(response(
+                    id,
+                    "list_trash",
+                    false,
+                    None,
+                    Some(&e.to_string())
+                )),
             },
             "restore_session" => match cmd.get("session_id").and_then(Value::as_str) {
                 Some(target) => match persistence.restore_session(target) {
@@ -3760,13 +3779,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                     insert_session_identity(m, &persistence);
                     m.insert("pending_tool_ids".into(), json!(Vec::<String>::new()));
                 }
-                emit!(response(
-                    id,
-                    "get_session_stats",
-                    true,
-                    Some(data),
-                    None
-                ));
+                emit!(response(id, "get_session_stats", true, Some(data), None));
             }
             "get_commands" => {
                 // Skills (read-on-demand) and prompt templates (`/name`), for client autocomplete.
@@ -3966,7 +3979,13 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                                     ));
                                 }
                                 Err(e) => {
-                                    emit!(response(id, "set_model", false, None, Some(&e.to_string())))
+                                    emit!(response(
+                                        id,
+                                        "set_model",
+                                        false,
+                                        None,
+                                        Some(&e.to_string())
+                                    ))
                                 }
                             }
                         }
@@ -5118,7 +5137,9 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                                         ),
                                     }
                                 }
-                                Err(e) => response(login_id, "login", false, None, Some(&e.to_string())),
+                                Err(e) => {
+                                    response(login_id, "login", false, None, Some(&e.to_string()))
+                                }
                             };
                             let _ = out_tx_bg.send(frame);
                             // `_reset_pending_login_on_exit`'s `Drop` clears `pending_login` here.
@@ -5196,9 +5217,21 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                 match cmd.get("provider").and_then(Value::as_str) {
                     Some(p) => match crate::oauth::OAuthProviderId::parse(p) {
                         Some(pid) => {
-                            emit!(response(id, "auth_status", true, Some(status_of(pid)), None))
+                            emit!(response(
+                                id,
+                                "auth_status",
+                                true,
+                                Some(status_of(pid)),
+                                None
+                            ))
                         }
-                        None => emit!(response(id, "auth_status", false, None, Some("unknown `provider`"))),
+                        None => emit!(response(
+                            id,
+                            "auth_status",
+                            false,
+                            None,
+                            Some("unknown `provider`")
+                        )),
                     },
                     None => {
                         let providers: Vec<Value> = crate::oauth::OAuthProviderId::all()
@@ -5266,7 +5299,8 @@ fn build_gateway_client(cfg: &ServeConfig, model: &str) -> Result<GatewayClient,
             GatewayClient::new(cfg.gateway.clone(), key).map_err(|e| e.to_string())?
         }
         GatewayCredential::Oauth(source) => {
-            GatewayClient::with_credential_source(cfg.gateway.clone(), source).map_err(|e| e.to_string())?
+            GatewayClient::with_credential_source(cfg.gateway.clone(), source)
+                .map_err(|e| e.to_string())?
         }
     }
     .with_retry(
@@ -5444,7 +5478,9 @@ impl AgentHooks for ServeHooks {
         session: &Session,
         cancel: &CancellationToken,
     ) -> Option<String> {
-        self.policy.before_tool_call(name, input, session, cancel).await
+        self.policy
+            .before_tool_call(name, input, session, cancel)
+            .await
     }
 
     async fn before_provider_request(&self, req: &mut agent_core::transport::ModelRequest) {
@@ -5549,7 +5585,8 @@ fn build_tools(cfg: &ServeConfig, image_auto_resize: bool) -> agent_core::ToolRe
 /// effort too.
 pub fn default_reasoning_effort_for_model(model: &str) -> Option<agent_core::ReasoningEffort> {
     let caps = agent_core::capabilities(model);
-    agent_core::models::has_reasoning_mechanism(&caps).then_some(agent_core::ReasoningEffort::Medium)
+    agent_core::models::has_reasoning_mechanism(&caps)
+        .then_some(agent_core::ReasoningEffort::Medium)
 }
 
 /// A small, non-exhaustive list of model ids the [`capabilities`](agent_core::capabilities) table
@@ -6364,7 +6401,8 @@ impl crate::oauth::LoginCallbacks for ServeLoginCallbacks {
             None,
             None,
         ));
-        rx.await.map_err(|_| crate::oauth::OAuthError::LoginCancelled)
+        rx.await
+            .map_err(|_| crate::oauth::OAuthError::LoginCancelled)
     }
 
     async fn select(
@@ -6849,7 +6887,10 @@ mod tests {
         // since those counters never persist regardless).
         let (_restarted, reloaded) =
             Persistence::open_repo(dir.path(), "/w", "claude-opus-4-8", None).unwrap();
-        assert_eq!(reloaded.input_tokens, 0, "sanity: the running counter itself stayed at zero");
+        assert_eq!(
+            reloaded.input_tokens, 0,
+            "sanity: the running counter itself stayed at zero"
+        );
 
         let stats = session_stats(&reloaded, "claude-opus-4-8");
         assert_eq!(
@@ -6985,7 +7026,13 @@ mod tests {
             "an explicit untrusted entry must not matter when there's nothing to gate"
         );
         assert!(
-            resolve_project_trust(false, false, Some(TrustPolicy::Never), Trust::Unknown, false),
+            resolve_project_trust(
+                false,
+                false,
+                Some(TrustPolicy::Never),
+                Trust::Unknown,
+                false
+            ),
             "a blanket never policy must not matter either, for the same reason"
         );
     }
@@ -6995,8 +7042,20 @@ mod tests {
         use crate::trust_store::Trust;
         // No gated resources at all: nothing meaningfully differs between trusted/untrusted, so this
         // crate's headless "ask" fallback treats it as trusted.
-        assert!(resolve_project_trust(false, false, None, Trust::Unknown, false));
-        assert!(!resolve_project_trust(false, false, None, Trust::Unknown, true));
+        assert!(resolve_project_trust(
+            false,
+            false,
+            None,
+            Trust::Unknown,
+            false
+        ));
+        assert!(!resolve_project_trust(
+            false,
+            false,
+            None,
+            Trust::Unknown,
+            true
+        ));
     }
 
     // pi-parity fix (L10): `--models` only ever accepted flat literal ids — no glob against the known
@@ -7219,7 +7278,9 @@ mod tests {
     #[test]
     fn resolve_model_id_an_exact_match_is_returned_in_the_catalogs_own_casing() {
         assert_eq!(
-            resolve_model_id("Claude-Opus-4-8", available_models()).unwrap().0,
+            resolve_model_id("Claude-Opus-4-8", available_models())
+                .unwrap()
+                .0,
             "claude-opus-4-8"
         );
     }
@@ -7289,7 +7350,8 @@ mod tests {
         // Matches `resolve_model_scope`'s identical treatment of an invalid suffix: not a valid
         // thinking level, so it's left attached and the whole string is resolved (or kept literal) as
         // one id rather than silently dropped.
-        let (id, level) = resolve_model_id("totally-custom-id:notalevel", available_models()).unwrap();
+        let (id, level) =
+            resolve_model_id("totally-custom-id:notalevel", available_models()).unwrap();
         assert_eq!(id, "totally-custom-id:notalevel");
         assert_eq!(level, None);
     }
@@ -7327,7 +7389,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn switch_branch_propagates_a_non_cancelled_summarization_failure_instead_of_switching_anyway() {
+    async fn switch_branch_propagates_a_non_cancelled_summarization_failure_instead_of_switching_anyway()
+     {
         // Fix 3 (pi-parity gap): a genuine (non-abort) summarization failure used to be logged and the
         // switch proceeded anyway with no summary attached — this test pins the corrected behavior:
         // the switch must not happen at all, and the caller must see it failed, matching pi's own
@@ -7418,7 +7481,11 @@ mod tests {
             .expect("summarization is scripted to succeed");
 
         let requests = transport.requests();
-        assert_eq!(requests.len(), 1, "exactly one summarization call must fire");
+        assert_eq!(
+            requests.len(),
+            1,
+            "exactly one summarization call must fire"
+        );
         let prompt = match requests[0].messages.first().map(|m| &m.content[0]) {
             Some(agent_core::ContentBlock::Text { text, .. }) => text.clone(),
             other => panic!("expected a single text block, got {other:?}"),
@@ -7721,9 +7788,9 @@ mod tests {
             // has to land *after* the `set_model` for the active tip to observe the new model, matching
             // every real `set_model`-then-continue session shape.
             let store = persistence.store.as_mut().unwrap();
-            session.push(agent_core::Message::assistant(vec![agent_core::ContentBlock::text(
-                "hi there",
-            )]));
+            session.push(agent_core::Message::assistant(vec![
+                agent_core::ContentBlock::text("hi there"),
+            ]));
             store.append_new(&session.messages).unwrap();
         }
         drop(persistence);
@@ -7792,8 +7859,14 @@ mod tests {
     async fn git_branch_reports_the_current_branch_inside_a_repository() {
         let dir = tempfile::tempdir().unwrap();
         run_git(dir.path(), &["init", "--quiet", "--initial-branch=main"]);
-        run_git(dir.path(), &["commit", "--quiet", "--allow-empty", "-m", "init"]);
-        run_git(dir.path(), &["checkout", "--quiet", "-b", "feature/pi-parity"]);
+        run_git(
+            dir.path(),
+            &["commit", "--quiet", "--allow-empty", "-m", "init"],
+        );
+        run_git(
+            dir.path(),
+            &["checkout", "--quiet", "-b", "feature/pi-parity"],
+        );
 
         assert_eq!(
             git_branch(dir.path()).await.as_deref(),
@@ -7808,7 +7881,10 @@ mod tests {
         // falling back to a raw commit SHA.
         let dir = tempfile::tempdir().unwrap();
         run_git(dir.path(), &["init", "--quiet", "--initial-branch=main"]);
-        run_git(dir.path(), &["commit", "--quiet", "--allow-empty", "-m", "init"]);
+        run_git(
+            dir.path(),
+            &["commit", "--quiet", "--allow-empty", "-m", "init"],
+        );
         run_git(dir.path(), &["checkout", "--quiet", "HEAD~0"]);
 
         assert_eq!(git_branch(dir.path()).await, None);

@@ -325,7 +325,9 @@ mod tests {
         // Task #7 (pi-parity): Google Gemini's real path shape must NOT be absorbed by a raw
         // `starts_with("/v1")` — before this fix it fell into the bare-default branch, which
         // routes anything that isn't `/v1/messages*` to OpenAI, silently misrouting Gemini.
-        assert!(!is_default_prefix("/v1beta/models/gemini-2.5-pro:generateContent"));
+        assert!(!is_default_prefix(
+            "/v1beta/models/gemini-2.5-pro:generateContent"
+        ));
         assert!(!is_default_prefix("/v1beta"));
         // Other near-misses that must not match either.
         assert!(!is_default_prefix("/v10"));
@@ -399,10 +401,19 @@ mod tests {
     #[test]
     fn auth_scheme_parse_config_accepts_api_key_for_azure() {
         // Task #8 (pi-parity): Azure OpenAI's `api-key` header, config-added-provider spelling.
-        assert_eq!(AuthScheme::parse_config("api-key"), Some(AuthScheme::ApiKey));
-        assert_eq!(AuthScheme::parse_config("API-KEY"), Some(AuthScheme::ApiKey));
+        assert_eq!(
+            AuthScheme::parse_config("api-key"),
+            Some(AuthScheme::ApiKey)
+        );
+        assert_eq!(
+            AuthScheme::parse_config("API-KEY"),
+            Some(AuthScheme::ApiKey)
+        );
         assert_eq!(AuthScheme::parse_config("apikey"), Some(AuthScheme::ApiKey));
-        assert_eq!(AuthScheme::parse_config("api_key"), Some(AuthScheme::ApiKey));
+        assert_eq!(
+            AuthScheme::parse_config("api_key"),
+            Some(AuthScheme::ApiKey)
+        );
         // Must NOT collide with x-api-key's own normalized spelling.
         assert_ne!(
             AuthScheme::parse_config("api-key"),
@@ -474,6 +485,9 @@ mod tests {
             None,
         );
         assert_eq!(azure.auth.header(), "api-key");
-        assert_eq!(azure.pool_auth_value.as_ref().unwrap().expose(), "azure-secret");
+        assert_eq!(
+            azure.pool_auth_value.as_ref().unwrap().expose(),
+            "azure-secret"
+        );
     }
 }

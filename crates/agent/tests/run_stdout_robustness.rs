@@ -35,7 +35,10 @@ fn turn_with_a_large_text_delta(len: usize) -> String {
 
 /// Wait for `child` to exit, or panic after `timeout` — a hang here means the fix regressed into a
 /// blocked/deadlocked write instead of a clean exit.
-fn wait_with_timeout(child: &mut std::process::Child, timeout: Duration) -> std::process::ExitStatus {
+fn wait_with_timeout(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> std::process::ExitStatus {
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(status) = child.try_wait().unwrap() {

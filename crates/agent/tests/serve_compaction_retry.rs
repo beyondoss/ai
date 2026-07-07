@@ -569,7 +569,9 @@ fn serve_compact_reports_first_kept_entry_id_naming_a_real_pre_compaction_entry(
     assert_eq!(data["compacted"], true, "{frames:#?}");
 
     let first_kept_entry_id = data["first_kept_entry_id"].as_str().unwrap_or_else(|| {
-        panic!("compact response must carry a first_kept_entry_id on a real compaction: {frames:#?}")
+        panic!(
+            "compact response must carry a first_kept_entry_id on a real compaction: {frames:#?}"
+        )
     });
 
     let pre_ids: Vec<&str> = pre_messages

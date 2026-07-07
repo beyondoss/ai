@@ -262,10 +262,11 @@ impl Tool for Read {
             // threads too (same pattern as `grep`/`find`'s own blocking walks).
             let path_for_task = path.clone();
             let auto_resize = self.image_auto_resize;
-            let result =
-                tokio::task::spawn_blocking(move || read_image(&path_for_task, format, auto_resize))
-                    .await
-                    .map_err(|e| ToolError::Execution(format!("image read task failed: {e}")))?;
+            let result = tokio::task::spawn_blocking(move || {
+                read_image(&path_for_task, format, auto_resize)
+            })
+            .await
+            .map_err(|e| ToolError::Execution(format!("image read task failed: {e}")))?;
             match result {
                 Ok(mut out) => {
                     if !supports_vision {
@@ -609,7 +610,12 @@ fn read_u32_le(buf: &[u8], offset: usize) -> u32 {
 /// couldn't have caught that drift either.
 const SUPPORTED_IMAGE_FORMATS: &[(image::ImageFormat, &str, &str, &[&str])] = &[
     (image::ImageFormat::Png, "png", "image/png", &["png"]),
-    (image::ImageFormat::Jpeg, "jpeg", "image/jpeg", &["jpg", "jpeg"]),
+    (
+        image::ImageFormat::Jpeg,
+        "jpeg",
+        "image/jpeg",
+        &["jpg", "jpeg"],
+    ),
     (image::ImageFormat::Gif, "gif", "image/gif", &["gif"]),
     (image::ImageFormat::WebP, "webp", "image/webp", &["webp"]),
     (image::ImageFormat::Bmp, "bmp", "image/bmp", &["bmp"]),
@@ -1024,7 +1030,10 @@ mod tests {
         // lines short?). The total must reflect the *whole* file, not just what was shown or what
         // was left after an `offset` — proven here with an offset partway into a file bigger than
         // what's shown.
-        let body = (1..=50).map(|i| i.to_string()).collect::<Vec<_>>().join("\n");
+        let body = (1..=50)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
         let f = tmp_file(&format!("{body}\n")); // 50 lines total
         let out = Read::default()
             .run(json!({ "path": f.path().to_str().unwrap(), "offset": 10, "limit": 5 }))
@@ -1176,7 +1185,11 @@ mod tests {
         // (needs no `$HOME` mutation — see `expand_tilde`'s own direct unit tests for that half).
         let f = tmp_file("alpha\n");
         let at_prefixed = format!("@{}", f.path().to_str().unwrap());
-        let out = Read::default().run(json!({ "path": at_prefixed })).await.unwrap().text;
+        let out = Read::default()
+            .run(json!({ "path": at_prefixed }))
+            .await
+            .unwrap()
+            .text;
         assert!(out.contains("alpha"));
     }
 
@@ -1738,11 +1751,18 @@ mod tests {
         let height = 600;
         let img = image::RgbImage::from_fn(width, height, |x, y| {
             let h = (x.wrapping_mul(2654435761) ^ y.wrapping_mul(40503)).wrapping_add(0x9e3779b9);
-            image::Rgb([(h & 0xff) as u8, ((h >> 8) & 0xff) as u8, ((h >> 16) & 0xff) as u8])
+            image::Rgb([
+                (h & 0xff) as u8,
+                ((h >> 8) & 0xff) as u8,
+                ((h >> 16) & 0xff) as u8,
+            ])
         });
         let mut bytes = Vec::new();
         image::DynamicImage::ImageRgb8(img)
-            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
             .unwrap();
         bytes
     }

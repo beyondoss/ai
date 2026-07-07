@@ -173,7 +173,13 @@ fn run_binary_with_no_settings_file_at_all_falls_back_to_the_built_in_default() 
     let (base, _bodies) = spawn_model_server(vec![turn_text("ok")]);
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let output = run_cmd(bin)
-        .args(["run", "hi", "--gateway-url", &base, "--key", "bai_v1.test",
+        .args([
+            "run",
+            "hi",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
             "--no-session-persistence",
         ])
         .stdin(Stdio::null())
@@ -560,9 +566,16 @@ fn settings_shows_round_3_defaults_as_not_set_and_round_trips_set_show_clear() {
         .env("HOME", home.path())
         .output()
         .unwrap();
-    assert!(set.status.success(), "stderr: {}", String::from_utf8_lossy(&set.stderr));
+    assert!(
+        set.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&set.stderr)
+    );
     let stdout = String::from_utf8_lossy(&set.stdout);
-    assert!(stdout.contains("default_bash_shell_path: /bin/zsh"), "{stdout}");
+    assert!(
+        stdout.contains("default_bash_shell_path: /bin/zsh"),
+        "{stdout}"
+    );
     assert!(
         stdout.contains("default_bash_command_prefix: source .venv/bin/activate"),
         "{stdout}"
@@ -576,13 +589,22 @@ fn settings_shows_round_3_defaults_as_not_set_and_round_trips_set_show_clear() {
         "{stdout}"
     );
     assert!(stdout.contains("default_retry_max_retries: 5"), "{stdout}");
-    assert!(stdout.contains("default_retry_base_delay_ms: 500"), "{stdout}");
-    assert!(stdout.contains("default_provider_timeout_ms: 60000"), "{stdout}");
+    assert!(
+        stdout.contains("default_retry_base_delay_ms: 500"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("default_provider_timeout_ms: 60000"),
+        "{stdout}"
+    );
     assert!(
         stdout.contains("default_models_list: claude-opus-4-8,gpt-5"),
         "{stdout}"
     );
-    assert!(stdout.contains("default_skill_paths: /opt/skills"), "{stdout}");
+    assert!(
+        stdout.contains("default_skill_paths: /opt/skills"),
+        "{stdout}"
+    );
     assert!(
         stdout.contains("default_prompt_template_paths: /opt/prompts"),
         "{stdout}"
@@ -595,8 +617,14 @@ fn settings_shows_round_3_defaults_as_not_set_and_round_trips_set_show_clear() {
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&show.stdout);
-    assert!(stdout.contains("default_bash_shell_path: /bin/zsh"), "{stdout}");
-    assert!(stdout.contains("default_models_list: claude-opus-4-8,gpt-5"), "{stdout}");
+    assert!(
+        stdout.contains("default_bash_shell_path: /bin/zsh"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("default_models_list: claude-opus-4-8,gpt-5"),
+        "{stdout}"
+    );
 
     let cleared = Command::new(bin)
         .args([
@@ -610,12 +638,18 @@ fn settings_shows_round_3_defaults_as_not_set_and_round_trips_set_show_clear() {
         .unwrap();
     assert!(cleared.status.success());
     let stdout = String::from_utf8_lossy(&cleared.stdout);
-    assert!(stdout.contains("default_bash_shell_path: (not set)"), "{stdout}");
+    assert!(
+        stdout.contains("default_bash_shell_path: (not set)"),
+        "{stdout}"
+    );
     assert!(
         stdout.contains("default_compaction_reserve_tokens: (not set)"),
         "{stdout}"
     );
-    assert!(stdout.contains("default_models_list: (not set)"), "{stdout}");
+    assert!(
+        stdout.contains("default_models_list: (not set)"),
+        "{stdout}"
+    );
     // Clearing those three must not have clobbered an unrelated field left set.
     assert!(
         stdout.contains("default_bash_command_prefix: source .venv/bin/activate"),
@@ -632,7 +666,11 @@ fn serve_binary_stored_default_bash_shell_path_fails_fast_like_an_explicit_flag_
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
     Command::new(bin)
-        .args(["settings", "--default-bash-shell-path", "/no/such/shell-binary"])
+        .args([
+            "settings",
+            "--default-bash-shell-path",
+            "/no/such/shell-binary",
+        ])
         .env("HOME", home.path())
         .output()
         .unwrap();
@@ -679,7 +717,11 @@ fn serve_binary_explicit_bash_shell_path_flag_wins_over_a_stored_default() {
 
     // A stored default that, left alone, would fail startup outright.
     Command::new(bin)
-        .args(["settings", "--default-bash-shell-path", "/no/such/shell-binary"])
+        .args([
+            "settings",
+            "--default-bash-shell-path",
+            "/no/such/shell-binary",
+        ])
         .env("HOME", home.path())
         .output()
         .unwrap();
@@ -1131,7 +1173,11 @@ fn run_binary_project_settings_missing_or_malformed_degrades_to_global_only() {
     assert!(trust.status.success());
     let claude_dir = project_dir_malformed.path().join(".claude");
     std::fs::create_dir_all(&claude_dir).unwrap();
-    std::fs::write(claude_dir.join("settings.json"), "not valid json at all { [ }").unwrap();
+    std::fs::write(
+        claude_dir.join("settings.json"),
+        "not valid json at all { [ }",
+    )
+    .unwrap();
 
     let (base2, bodies2) = spawn_model_server(vec![turn_text("ok")]);
     let output2 = Command::new(bin)

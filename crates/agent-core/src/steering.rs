@@ -807,7 +807,9 @@ mod tests {
         s.request_tool_set(registry_with(&["read", "write"]));
         let taken = s.take_tool_switch().expect("a tool switch must be queued");
         assert!(
-            taken.get("bash").is_none() && taken.get("read").is_some() && taken.get("write").is_some(),
+            taken.get("bash").is_none()
+                && taken.get("read").is_some()
+                && taken.get("write").is_some(),
             "only the most recent request should apply — no queue of switches"
         );
     }
@@ -922,10 +924,21 @@ mod tests {
 
         s.clear_run_scoped();
 
-        assert_eq!(s.drain_at_stop(), Vec::<String>::new(), "follow-up must be dropped");
-        assert_eq!(s.drain_steer(), Vec::<String>::new(), "steer must be dropped");
+        assert_eq!(
+            s.drain_at_stop(),
+            Vec::<String>::new(),
+            "follow-up must be dropped"
+        );
+        assert_eq!(
+            s.drain_steer(),
+            Vec::<String>::new(),
+            "steer must be dropped"
+        );
         assert!(!s.take_stop_requested(), "the stop request must be dropped");
-        assert!(s.take_model_switch().is_none(), "the model switch must be dropped");
+        assert!(
+            s.take_model_switch().is_none(),
+            "the model switch must be dropped"
+        );
         assert_eq!(
             s.drain_next_turn(),
             vec!["must survive".to_string()],
@@ -947,11 +960,7 @@ mod tests {
     #[test]
     fn request_model_switch_with_thinking_level_sets_the_tri_stated_field() {
         let s = Steering::new();
-        s.request_model_switch_with_thinking_level(
-            "claude-cheap",
-            None,
-            Some(ThinkingLevel::Off),
-        );
+        s.request_model_switch_with_thinking_level("claude-cheap", None, Some(ThinkingLevel::Off));
         assert_eq!(
             s.take_model_switch(),
             Some(ModelSwitch {

@@ -143,9 +143,7 @@ fn logout_removes_a_stored_credential_and_reports_it_was_present() {
         .output()
         .unwrap();
     assert!(second.status.success());
-    assert!(
-        String::from_utf8_lossy(&second.stdout).starts_with("not logged in:")
-    );
+    assert!(String::from_utf8_lossy(&second.stdout).starts_with("not logged in:"));
 }
 
 #[test]

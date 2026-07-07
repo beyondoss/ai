@@ -990,7 +990,9 @@ impl SessionStore {
                 // `title_changes` (pass 15 pi-parity fix) *is* keyed by `parent_id`, same as
                 // `model_changes`/`level_changes` — consulted separately by `title_at_or_root` for a
                 // fork's own path-scoped resolution (see that method's doc comment).
-                Ok(Entry::TitleChange { parent_id, title, .. }) => {
+                Ok(Entry::TitleChange {
+                    parent_id, title, ..
+                }) => {
                     let resolved = title_or_clear(title);
                     if let Some(m) = &mut meta {
                         m.title = resolved.clone();
@@ -4125,7 +4127,10 @@ mod tests {
         let id = store.meta().id.clone();
         let (_reopened, restored) = repo.open_id(&id).unwrap();
         assert_eq!(restored.messages.len(), 2);
-        assert_eq!(restored.messages[0].usage, None, "a user turn never carries usage");
+        assert_eq!(
+            restored.messages[0].usage, None,
+            "a user turn never carries usage"
+        );
         assert_eq!(
             restored.messages[1].usage,
             Some(usage),
@@ -4510,7 +4515,7 @@ mod tests {
 
     #[test]
     fn reset_for_new_session_clears_model_thinking_label_and_event_state_a_plain_rewrite_leaves_behind()
-    {
+     {
         // Pass 20 (pi-parity fix): single-file mode's `/new`-equivalent (`Persistence::new_session`,
         // `serve.rs`) resets an *already-populated* `SessionStore` in place (there's no fresh store to
         // swap in the way repo mode's `SessionRepo::create` gives it) — it used to call plain
@@ -4531,7 +4536,9 @@ mod tests {
         store.append_new(&session.messages).unwrap();
         let msg_id = store.active_ids().last().unwrap().clone();
         store.set_label(&msg_id, Some("bookmark")).unwrap();
-        store.append_custom("note", serde_json::json!({"k": "v"})).unwrap();
+        store
+            .append_custom("note", serde_json::json!({"k": "v"}))
+            .unwrap();
 
         // Sanity check: every one of these is actually populated before the reset, or the assertions
         // below would pass vacuously.
@@ -6016,7 +6023,10 @@ mod tests {
         assert!(repo.list().unwrap().is_empty());
 
         let restored = repo.restore_session(&id).unwrap();
-        assert!(restored, "restore_session must report it actually moved something");
+        assert!(
+            restored,
+            "restore_session must report it actually moved something"
+        );
         assert!(
             repo.list_trash().unwrap().is_empty(),
             "the entry must no longer be in .trash/ once restored"
@@ -7063,7 +7073,8 @@ mod tests {
 
         store.record_thinking_level_change("high").unwrap();
         assert_eq!(
-            store.meta().thinking_level, None,
+            store.meta().thinking_level,
+            None,
             "meta.thinking_level is not auto-populated by record_thinking_level_change"
         );
     }
@@ -7129,7 +7140,8 @@ mod tests {
         let session_id = store.meta().id.clone();
         let (forked, _) = repo.fork(&session_id, 1).unwrap();
         assert_eq!(
-            forked.meta().title, None,
+            forked.meta().title,
+            None,
             "a fork from before the rename must not inherit a title chosen for a later conversation"
         );
     }
@@ -7187,7 +7199,8 @@ mod tests {
         let session_id = store.meta().id.clone();
         let (forked, _) = repo.fork_at_entry(&session_id, &ids[0], false).unwrap();
         assert_eq!(
-            forked.meta().title, None,
+            forked.meta().title,
+            None,
             "forking at a point that predates every rename on its own path must not inherit one made \
              later on the same chain"
         );
@@ -8239,7 +8252,11 @@ mod tests {
         store.switch_active(&ids[1]).unwrap();
 
         let mut abandoned = store.abandoned_branches();
-        assert_eq!(abandoned.len(), 2, "both A (leaf a2) and B (leaf b1): {abandoned:?}");
+        assert_eq!(
+            abandoned.len(),
+            2,
+            "both A (leaf a2) and B (leaf b1): {abandoned:?}"
+        );
         abandoned.sort_by_key(|(_, messages)| messages.len());
         let (shared_b, messages_b) = &abandoned[0]; // [m1, a1, b1] — the shorter chain
         let (shared_a, messages_a) = &abandoned[1]; // [m1, a1, a2]

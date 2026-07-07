@@ -333,7 +333,10 @@ impl Settings {
             default_branch_summary_reserve_tokens: project
                 .default_branch_summary_reserve_tokens
                 .or(self.default_branch_summary_reserve_tokens),
-            steering_mode: project.steering_mode.clone().or_else(|| self.steering_mode.clone()),
+            steering_mode: project
+                .steering_mode
+                .clone()
+                .or_else(|| self.steering_mode.clone()),
             follow_up_mode: project
                 .follow_up_mode
                 .clone()
@@ -483,7 +486,10 @@ impl SettingsStore {
 
     /// Set (`Some`) or clear (`None`) the persisted `--no-image-auto-resize` default, persisting
     /// atomically.
-    pub fn set_image_auto_resize(&mut self, image_auto_resize: Option<bool>) -> std::io::Result<()> {
+    pub fn set_image_auto_resize(
+        &mut self,
+        image_auto_resize: Option<bool>,
+    ) -> std::io::Result<()> {
         self.mutate_locked(move |s| s.image_auto_resize = image_auto_resize)
     }
 
@@ -499,7 +505,9 @@ impl SettingsStore {
         tokens: Option<u32>,
     ) -> std::io::Result<()> {
         self.mutate_locked(move |s| {
-            let table = s.thinking_budget_overrides.get_or_insert_with(Default::default);
+            let table = s
+                .thinking_budget_overrides
+                .get_or_insert_with(Default::default);
             match tokens {
                 Some(t) => {
                     table.insert(effort, t);
@@ -520,13 +528,19 @@ impl SettingsStore {
     }
 
     /// Set (`Some`) or clear (`None`) the stored default `--bash-command-prefix`, persisting atomically.
-    pub fn set_default_bash_command_prefix(&mut self, prefix: Option<String>) -> std::io::Result<()> {
+    pub fn set_default_bash_command_prefix(
+        &mut self,
+        prefix: Option<String>,
+    ) -> std::io::Result<()> {
         self.mutate_locked(move |s| s.default_bash_command_prefix = prefix)
     }
 
     /// Set (`Some`) or clear (`None`) the stored default compaction reserve-token override, persisting
     /// atomically.
-    pub fn set_default_compaction_reserve_tokens(&mut self, tokens: Option<u32>) -> std::io::Result<()> {
+    pub fn set_default_compaction_reserve_tokens(
+        &mut self,
+        tokens: Option<u32>,
+    ) -> std::io::Result<()> {
         self.mutate_locked(move |s| s.default_compaction_reserve_tokens = tokens)
     }
 
@@ -1079,7 +1093,10 @@ fn resolve_config_value(
 /// The `$VAR`/`${VAR}`/`$$`/`$!` template half of [`resolve_config_value`] — split out so its
 /// character-by-character scan is unit-testable independent of the `!command`/env-lookup plumbing
 /// around it.
-fn resolve_config_value_template(config: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+fn resolve_config_value_template(
+    config: &str,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
     let chars: Vec<char> = config.chars().collect();
     let mut out = String::with_capacity(config.len());
     let mut i = 0;
@@ -1117,7 +1134,8 @@ fn resolve_config_value_template(config: &str, lookup: &dyn Fn(&str) -> Option<S
             Some(c) if c.is_ascii_alphabetic() || c == '_' => {
                 let start = i + 1;
                 let mut end = start;
-                while end < chars.len() && (chars[end].is_ascii_alphanumeric() || chars[end] == '_') {
+                while end < chars.len() && (chars[end].is_ascii_alphanumeric() || chars[end] == '_')
+                {
                     end += 1;
                 }
                 let name: String = chars[start..end].iter().collect();
@@ -1319,8 +1337,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         let mut store = SettingsStore::open(path.clone());
-        assert_eq!(store.get().steering_mode, None, "no stored override by default");
-        assert_eq!(store.get().follow_up_mode, None, "no stored override by default");
+        assert_eq!(
+            store.get().steering_mode,
+            None,
+            "no stored override by default"
+        );
+        assert_eq!(
+            store.get().follow_up_mode,
+            None,
+            "no stored override by default"
+        );
 
         store.set_steering_mode(Some("all".to_string())).unwrap();
         assert_eq!(store.get().steering_mode.as_deref(), Some("all"));
@@ -1348,7 +1374,10 @@ mod tests {
         assert_eq!(store.get().follow_up_mode.as_deref(), Some("one_at_a_time"));
         let reopened = SettingsStore::open(path);
         assert_eq!(reopened.get().steering_mode, None);
-        assert_eq!(reopened.get().follow_up_mode.as_deref(), Some("one_at_a_time"));
+        assert_eq!(
+            reopened.get().follow_up_mode.as_deref(),
+            Some("one_at_a_time")
+        );
     }
 
     #[test]
@@ -1526,14 +1555,8 @@ mod tests {
 
     #[test]
     fn model_overrides_default_path_is_a_sibling_of_settings_json() {
-        assert_eq!(
-            model_overrides_path().file_name().unwrap(),
-            "models.json"
-        );
-        assert_eq!(
-            model_overrides_path().parent(),
-            default_path().parent()
-        );
+        assert_eq!(model_overrides_path().file_name().unwrap(), "models.json");
+        assert_eq!(model_overrides_path().parent(), default_path().parent());
     }
 
     #[test]
@@ -1585,7 +1608,12 @@ mod tests {
             .set_thinking_budget_override("high".to_string(), Some(40_000))
             .unwrap();
         assert_eq!(
-            store.get().thinking_budget_overrides.as_ref().unwrap().get("high"),
+            store
+                .get()
+                .thinking_budget_overrides
+                .as_ref()
+                .unwrap()
+                .get("high"),
             Some(&40_000)
         );
         let reopened = SettingsStore::open(path);
@@ -1728,14 +1756,19 @@ mod tests {
     #[test]
     fn resolved_headers_drops_an_entry_whose_referenced_env_var_is_unset() {
         let mut over = ModelOverride::default();
-        over.headers
-            .insert("X-Missing".to_string(), "$TOTALLY_UNSET_VAR_XYZ".to_string());
+        over.headers.insert(
+            "X-Missing".to_string(),
+            "$TOTALLY_UNSET_VAR_XYZ".to_string(),
+        );
         over.headers
             .insert("X-Present".to_string(), "literal".to_string());
 
         let resolved = over.resolved_headers_with_env(Some(&std::collections::HashMap::new()));
         assert_eq!(resolved.get("X-Missing"), None);
-        assert_eq!(resolved.get("X-Present").map(String::as_str), Some("literal"));
+        assert_eq!(
+            resolved.get("X-Present").map(String::as_str),
+            Some("literal")
+        );
     }
 
     #[test]
@@ -1753,7 +1786,10 @@ mod tests {
 
         let resolved = over.resolved_headers_with_env(Some(&env));
         assert_eq!(resolved.get("X-Empty"), None, "got: {resolved:?}");
-        assert_eq!(resolved.get("X-Present").map(String::as_str), Some("literal"));
+        assert_eq!(
+            resolved.get("X-Present").map(String::as_str),
+            Some("literal")
+        );
     }
 
     // Fixes #37/#38 (pi-parity audit): a BYO `base_url` pointed at a known provider host that requires
@@ -1767,7 +1803,9 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            over.resolved_headers().get("NVCF-POLL-SECONDS").map(String::as_str),
+            over.resolved_headers()
+                .get("NVCF-POLL-SECONDS")
+                .map(String::as_str),
             Some("3600")
         );
     }
@@ -1779,7 +1817,9 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            over.resolved_headers().get("User-Agent").map(String::as_str),
+            over.resolved_headers()
+                .get("User-Agent")
+                .map(String::as_str),
             Some("KimiCLI/1.5")
         );
     }
@@ -1819,7 +1859,9 @@ mod tests {
         over.headers
             .insert("NVCF-POLL-SECONDS".to_string(), "60".to_string());
         assert_eq!(
-            over.resolved_headers().get("NVCF-POLL-SECONDS").map(String::as_str),
+            over.resolved_headers()
+                .get("NVCF-POLL-SECONDS")
+                .map(String::as_str),
             Some("60")
         );
     }
@@ -1833,8 +1875,14 @@ mod tests {
         over.headers
             .insert("X-Extra".to_string(), "extra-value".to_string());
         let resolved = over.resolved_headers();
-        assert_eq!(resolved.get("User-Agent").map(String::as_str), Some("KimiCLI/1.5"));
-        assert_eq!(resolved.get("X-Extra").map(String::as_str), Some("extra-value"));
+        assert_eq!(
+            resolved.get("User-Agent").map(String::as_str),
+            Some("KimiCLI/1.5")
+        );
+        assert_eq!(
+            resolved.get("X-Extra").map(String::as_str),
+            Some("extra-value")
+        );
         assert_eq!(resolved.len(), 2);
     }
 
@@ -2034,7 +2082,10 @@ mod tests {
         store
             .set_default_bash_shell_path(Some("/bin/zsh".to_string()))
             .unwrap();
-        assert_eq!(store.get().default_bash_shell_path.as_deref(), Some("/bin/zsh"));
+        assert_eq!(
+            store.get().default_bash_shell_path.as_deref(),
+            Some("/bin/zsh")
+        );
         let reopened = SettingsStore::open(path.clone());
         assert_eq!(
             reopened.get().default_bash_shell_path.as_deref(),
@@ -2082,10 +2133,15 @@ mod tests {
         let mut store = SettingsStore::open(path.clone());
         assert_eq!(store.get().default_compaction_reserve_tokens, None);
 
-        store.set_default_compaction_reserve_tokens(Some(8_192)).unwrap();
+        store
+            .set_default_compaction_reserve_tokens(Some(8_192))
+            .unwrap();
         assert_eq!(store.get().default_compaction_reserve_tokens, Some(8_192));
         let reopened = SettingsStore::open(path.clone());
-        assert_eq!(reopened.get().default_compaction_reserve_tokens, Some(8_192));
+        assert_eq!(
+            reopened.get().default_compaction_reserve_tokens,
+            Some(8_192)
+        );
 
         let mut store = SettingsStore::open(path.clone());
         store.set_default_compaction_reserve_tokens(None).unwrap();
@@ -2115,7 +2171,9 @@ mod tests {
         );
 
         let mut store = SettingsStore::open(path.clone());
-        store.set_default_compaction_keep_recent_tokens(None).unwrap();
+        store
+            .set_default_compaction_keep_recent_tokens(None)
+            .unwrap();
         assert_eq!(store.get().default_compaction_keep_recent_tokens, None);
         let reopened = SettingsStore::open(path);
         assert_eq!(reopened.get().default_compaction_keep_recent_tokens, None);
@@ -2185,7 +2243,9 @@ mod tests {
         let mut store = SettingsStore::open(path.clone());
         assert_eq!(store.get().default_retry_max_backoff_ms, None);
 
-        store.set_default_retry_max_backoff_ms(Some(30_000)).unwrap();
+        store
+            .set_default_retry_max_backoff_ms(Some(30_000))
+            .unwrap();
         assert_eq!(store.get().default_retry_max_backoff_ms, Some(30_000));
         let reopened = SettingsStore::open(path.clone());
         assert_eq!(reopened.get().default_retry_max_backoff_ms, Some(30_000));
@@ -2218,7 +2278,9 @@ mod tests {
         );
 
         let mut store = SettingsStore::open(path.clone());
-        store.set_default_branch_summary_reserve_tokens(None).unwrap();
+        store
+            .set_default_branch_summary_reserve_tokens(None)
+            .unwrap();
         assert_eq!(store.get().default_branch_summary_reserve_tokens, None);
         let reopened = SettingsStore::open(path);
         assert_eq!(reopened.get().default_branch_summary_reserve_tokens, None);
@@ -2232,7 +2294,10 @@ mod tests {
         assert_eq!(store.get().default_models_list, None);
 
         store
-            .set_default_models_list(Some(vec!["claude-opus-4-8".to_string(), "gpt-5".to_string()]))
+            .set_default_models_list(Some(vec![
+                "claude-opus-4-8".to_string(),
+                "gpt-5".to_string(),
+            ]))
             .unwrap();
         assert_eq!(
             store.get().default_models_list,
@@ -2338,7 +2403,10 @@ mod tests {
             Some("global-model"),
             "a field the project doesn't set must fall through to the global value unchanged"
         );
-        assert_eq!(merged.default_gateway_url.as_deref(), Some("http://project-gw"));
+        assert_eq!(
+            merged.default_gateway_url.as_deref(),
+            Some("http://project-gw")
+        );
     }
 
     #[test]
@@ -2456,7 +2524,8 @@ mod tests {
             .set_default_gateway_url(Some("http://global-gw".to_string()))
             .unwrap();
 
-        let mut trust = crate::trust_store::TrustStore::open(dir.path().join("trusted-projects.json"));
+        let mut trust =
+            crate::trust_store::TrustStore::open(dir.path().join("trusted-projects.json"));
         trust.trust(&project_dir).unwrap();
 
         let effective = effective_settings_with_stores(&global, &project_dir, &trust);
@@ -2510,7 +2579,8 @@ mod tests {
             .set_default_model(Some("global-model".to_string()))
             .unwrap();
 
-        let mut trust = crate::trust_store::TrustStore::open(dir.path().join("trusted-projects.json"));
+        let mut trust =
+            crate::trust_store::TrustStore::open(dir.path().join("trusted-projects.json"));
         trust.trust(&project_dir).unwrap();
 
         let effective = effective_settings_with_stores(&global, &project_dir, &trust);
@@ -2533,7 +2603,8 @@ mod tests {
             .set_default_model(Some("global-model".to_string()))
             .unwrap();
 
-        let mut trust = crate::trust_store::TrustStore::open(dir.path().join("trusted-projects.json"));
+        let mut trust =
+            crate::trust_store::TrustStore::open(dir.path().join("trusted-projects.json"));
         trust.trust(&project_dir).unwrap();
 
         let effective = effective_settings_with_stores(&global, &project_dir, &trust);

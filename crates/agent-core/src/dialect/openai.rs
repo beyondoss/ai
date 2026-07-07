@@ -264,7 +264,10 @@ impl MistralToolCallIdNormalizer {
 
 /// Reshape `id` through `normalizer` when this request targets a Mistral model (`normalizer` is `Some`
 /// only then); every other model's ids pass through untouched.
-fn normalize_mistral_tool_id(normalizer: &mut Option<MistralToolCallIdNormalizer>, id: &str) -> String {
+fn normalize_mistral_tool_id(
+    normalizer: &mut Option<MistralToolCallIdNormalizer>,
+    id: &str,
+) -> String {
     match normalizer {
         Some(n) => n.normalize(id),
         None => id.to_string(),
@@ -290,7 +293,13 @@ fn normalize_cross_model_tool_id(id: &str) -> String {
     match id.split_once('|') {
         Some((call_id, _item_id)) => call_id
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .take(40)
             .collect(),
         None => id.to_string(),
@@ -317,8 +326,8 @@ pub fn build_body(req: &ModelRequest) -> Value {
     // Mistral's real API rejects a `tool_call_id` that isn't exactly 9 alphanumeric characters — only
     // built (and only ever `Some`) when this request actually targets a Mistral model, so every other
     // provider's ids pass through `normalize_mistral_tool_id` untouched.
-    let mut mistral_ids = crate::models::is_mistral_model(&req.model)
-        .then(MistralToolCallIdNormalizer::default);
+    let mut mistral_ids =
+        crate::models::is_mistral_model(&req.model).then(MistralToolCallIdNormalizer::default);
     // Defense-in-depth cross-model tool-call-id normalization (see `normalize_cross_model_tool_id`'s own
     // doc comment) — populated as `tool_use` blocks from a foreign model are visited below, then
     // consulted when their paired `tool_result` is reached in a later message.
@@ -680,7 +689,10 @@ fn apply_reasoning_wire(
             }
         }
         Fmt::Together => {
-            map.insert("reasoning".into(), json!({ "enabled": requested.is_some() }));
+            map.insert(
+                "reasoning".into(),
+                json!({ "enabled": requested.is_some() }),
+            );
             if caps.reasoning_effort {
                 if let Some(effort) = requested {
                     map.insert("reasoning_effort".into(), json!(wire_str(effort)));
@@ -1966,7 +1978,8 @@ mod tests {
         let native_req =
             ModelRequest::new("gpt-4.1", vec![Message::user(big_text.as_str())], 50_000);
         assert_eq!(
-            build_body(&native_req)["max_tokens"], 50_000,
+            build_body(&native_req)["max_tokens"],
+            50_000,
             "native's ~1.05M context leaves plenty of headroom for this prompt"
         );
 
@@ -1974,7 +1987,8 @@ mod tests {
             ModelRequest::new("gpt-4.1", vec![Message::user(big_text.as_str())], 50_000)
                 .with_copilot(true);
         assert_eq!(
-            build_body(&copilot_req)["max_tokens"], 23_904,
+            build_body(&copilot_req)["max_tokens"],
+            23_904,
             "Copilot's genuinely smaller real context window (128_000) must clamp harder than native's"
         );
     }
@@ -2788,7 +2802,10 @@ data: [DONE]
             assistant_id.chars().all(|c| c.is_ascii_alphanumeric()),
             "got: {assistant_id}"
         );
-        assert_ne!(assistant_id, "call_1", "the original id must actually be reshaped");
+        assert_ne!(
+            assistant_id, "call_1",
+            "the original id must actually be reshaped"
+        );
     }
 
     #[test]
@@ -3225,9 +3242,14 @@ data: [DONE]
         assert!(build_body(&req).get("tool_stream").is_none());
 
         // No other family emits it, even with tools present.
-        for id in ["gpt-4o", "deepseek-v4-pro", "kimi-k2-thinking", "mistral-large-latest"] {
-            let req = ModelRequest::new(id, vec![Message::user("hi")], 64)
-                .with_tools(vec![tool.clone()]);
+        for id in [
+            "gpt-4o",
+            "deepseek-v4-pro",
+            "kimi-k2-thinking",
+            "mistral-large-latest",
+        ] {
+            let req =
+                ModelRequest::new(id, vec![Message::user("hi")], 64).with_tools(vec![tool.clone()]);
             assert!(
                 build_body(&req).get("tool_stream").is_none(),
                 "{id}: got {:#?}",
@@ -3262,9 +3284,14 @@ data: [DONE]
         // reasoning-effort knob) but pi still always sends them a plain "system" role, never
         // "developer". Before this fix, `instruction_role` gated purely on `caps.reasoning_effort` and
         // sent "developer" to both.
-        for id in ["deepseek-v4-pro", "glm-4.7", "kimi-k2-thinking", "grok-4.3", "gpt-oss-120b"] {
-            let req =
-                ModelRequest::new(id, vec![Message::user("hi")], 64).with_system("be terse");
+        for id in [
+            "deepseek-v4-pro",
+            "glm-4.7",
+            "kimi-k2-thinking",
+            "grok-4.3",
+            "gpt-oss-120b",
+        ] {
+            let req = ModelRequest::new(id, vec![Message::user("hi")], 64).with_system("be terse");
             assert_eq!(
                 build_body(&req)["messages"][0]["role"],
                 "system",

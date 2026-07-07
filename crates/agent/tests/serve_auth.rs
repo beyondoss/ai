@@ -54,9 +54,7 @@ fn auth_status_with_nothing_stored_reports_every_provider_logged_out() {
     let providers = resp["data"]["providers"].as_array().unwrap();
     assert_eq!(providers.len(), 3);
     assert!(
-        providers
-            .iter()
-            .all(|p| p["status"] == "logged_out"),
+        providers.iter().all(|p| p["status"] == "logged_out"),
         "{providers:#?}"
     );
 
@@ -234,9 +232,8 @@ fn login_acks_then_a_second_concurrent_login_is_rejected_then_abort_login_cancel
     // Cancel the first login; it must resolve with a failure response, not hang forever.
     writeln!(stdin, "{}", json!({ "id": "3", "type": "abort_login" })).unwrap();
     stdin.flush().unwrap();
-    let abort_ack = read_one_frame_matching(&mut stdout, |v| {
-        v["type"] == "response" && v["id"] == "3"
-    });
+    let abort_ack =
+        read_one_frame_matching(&mut stdout, |v| v["type"] == "response" && v["id"] == "3");
     assert_eq!(abort_ack["success"], true, "{abort_ack:#?}");
 
     let login_result = read_one_frame_matching(&mut stdout, |v| {
