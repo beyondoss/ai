@@ -11,8 +11,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use common::{
-    ISOLATED_HOME, free_port, spawn_model_server, turn_text, wait_for_port, ws_connect,
-    ws_read_until_response, ws_send,
+    ISOLATED_HOME, free_port, spawn_model_server, turn_text, turn_tool_use, wait_for_port,
+    ws_connect, ws_next_frame, ws_read_until_response, ws_send,
 };
 use serde_json::{Value, json};
 
@@ -151,6 +151,88 @@ async fn attached_session_past_timeout_is_not_reaped() {
     ws_send(&mut ws, json!({ "type": "get_state" })).await;
     let frames = ws_read_until_response(&mut ws, "get_state").await;
     assert_eq!(frames.last().unwrap()["success"], true);
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// (iii) The `running`-flag guard: a session that is **detached but mid-run** must NOT be reaped even
+/// once it's idle past the timeout — else a long run that outlived its connection (the whole point of
+/// the "connection is a view" design) would get cancelled by the reaper. Hold the run open with a real
+/// `bash sleep` that outlasts the idle timeout, drop the connection mid-run, and assert the session
+/// survives (`live:true`) and the run completes — reconnecting receives its terminal response.
+#[tokio::test]
+async fn detached_but_mid_run_session_is_not_reaped() {
+    const SID: &str = "midrunsession01";
+    // Turn 1 runs `bash sleep 4` (outlasts the 1s idle timeout); turn 2 replies once it finishes.
+    let (base, _requests) = spawn_model_server(vec![
+        turn_tool_use("t1", "bash", &json!({ "command": "sleep 4" }).to_string()),
+        turn_text("finishedmidrun"),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let mut child = serve_reaper_child(&base, dir.path().to_str().unwrap(), port, 1);
+    wait_for_port(port);
+
+    // Start the run; wait until the bash tool is actually running, then drop the connection (detached,
+    // but the run keeps going on the server).
+    let mut ws = ws_connect(port, Some(SID)).await;
+    ws_send(
+        &mut ws,
+        json!({ "type": "prompt", "id": "p", "message": "go" }),
+    )
+    .await;
+    let mut running = false;
+    while let Some(f) = ws_next_frame(&mut ws).await {
+        if f["type"] == "event" && f["event"]["kind"] == "tool_start" {
+            running = true;
+            break;
+        }
+    }
+    assert!(
+        running,
+        "the run should reach the bash tool before we detach"
+    );
+    drop(ws);
+
+    // Idle past the timeout (1s) + a couple reaper ticks, while the run's `bash sleep 4` is still going.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Primary assertion: the mid-run session was NOT reaped despite being detached past the timeout —
+    // if the `running` guard were broken, the reaper would have dropped its input, cancelled the run,
+    // and the id would show `live:false` here (or be gone from the map).
+    let sessions = list_daemon_sessions(port).await;
+    let entry = sessions
+        .iter()
+        .find(|s| s["id"] == SID)
+        .unwrap_or_else(|| panic!("{SID} should still be present mid-run: {sessions:#?}"));
+    assert_eq!(
+        entry["live"], true,
+        "a detached but mid-run session must NOT be reaped (the running-flag guard): {entry}"
+    );
+
+    // Secondary proof it was never cancelled: reconnect and receive the run's terminal response.
+    let mut ws2 = ws_connect(port, Some(SID)).await;
+    let frames = ws_read_until_response(&mut ws2, "prompt").await;
+    let resp = frames
+        .iter()
+        .rev()
+        .find(|f| f["type"] == "response" && f["command"] == "prompt")
+        .unwrap_or_else(|| panic!("the mid-run run should complete, not be reaped: {frames:#?}"));
+    assert_eq!(
+        resp["success"], true,
+        "the detached mid-run must complete (never cancelled by the reaper): {resp}"
+    );
+    ws_send(&mut ws2, json!({ "type": "get_messages" })).await;
+    let dump = ws_read_until_response(&mut ws2, "get_messages")
+        .await
+        .last()
+        .unwrap()["data"]["messages"]
+        .to_string();
+    assert!(
+        dump.contains("finishedmidrun"),
+        "the survived run's reply must be committed: {dump}"
+    );
 
     let _ = child.kill();
     let _ = child.wait();
