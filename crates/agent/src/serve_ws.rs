@@ -37,7 +37,10 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use futures::{SinkExt, StreamExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, MissedTickBehavior};
 use tokio_tungstenite::WebSocketStream;
@@ -91,6 +94,10 @@ impl Supervisor {
     fn session_cfg(&self, id: &str) -> ServeConfig {
         let mut c = self.cfg.clone();
         c.listen = None;
+        // A spawned session must never itself re-bind a transport listener — it's driven purely
+        // through its `input_rx`/`out_conn` channels by the supervisor.
+        c.listen_uds = None;
+        c.listen_uds_mode = None;
         c.session_id = Some(id.to_string());
         match &self.cfg.session_dir {
             Some(dir) => {
@@ -114,11 +121,10 @@ impl Supervisor {
     /// session if it isn't already live. Supersedes any previous connection to that session
     /// (last-attach-wins), then drives this socket until it closes or is superseded — the session
     /// itself keeps running either way.
-    async fn attach(
-        self: &Arc<Self>,
-        requested_id: Option<String>,
-        ws: WebSocketStream<TcpStream>,
-    ) {
+    async fn attach<S>(self: &Arc<Self>, requested_id: Option<String>, ws: WebSocketStream<S>)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let id = requested_id.unwrap_or_else(new_id);
 
         // Look up (or spawn) the session and supersede any prior connection — all under the map lock,
@@ -294,19 +300,108 @@ impl Supervisor {
     }
 }
 
-/// Serve the control protocol over a WebSocket listener bound at `addr` (expected loopback/internal).
-/// Runs until an OS shutdown signal, returning it so the caller exits with the matching code — same
-/// contract as [`serve`](crate::serve::serve). Each accepted connection is handled concurrently and
-/// routed to its session by id.
+/// Which transports [`serve_ws`] should bind, on **one** shared supervisor. Loopback TCP
+/// ([`Self::tcp`]) and a Unix-domain socket ([`Self::uds`]) can both be on: a session created over
+/// either is reachable over the other by the same `?session_id=` (they share the session map). Shaped
+/// so a future systemd socket-activation arm (`systemd_fd`) is a one-field add.
+pub struct ServeListeners {
+    /// Loopback/internal TCP address to bind, if any. The agent authenticates no caller over TCP.
+    pub tcp: Option<SocketAddr>,
+    /// Unix-domain socket path to bind, if any — kernel-enforced local authz via filesystem perms.
+    #[cfg(unix)]
+    pub uds: Option<std::path::PathBuf>,
+    /// Octal mode to `chmod` the UDS to after binding (default `0o600`). Ignored when `uds` is `None`.
+    #[cfg(unix)]
+    pub uds_mode: Option<u32>,
+}
+
+/// Await the next TCP connection, or `pending()` forever when there's no TCP listener — so this can
+/// sit in a `select!` arm unconditionally without `select!` needing to branch on the `Option`.
+async fn accept_tcp(listener: &Option<TcpListener>) -> Option<TcpStream> {
+    match listener {
+        Some(l) => match l.accept().await {
+            Ok((stream, _peer)) => Some(stream),
+            Err(e) => {
+                eprintln!("serve: websocket accept failed: {e}");
+                None
+            }
+        },
+        None => std::future::pending().await,
+    }
+}
+
+/// Bind a `UnixListener` at `path`, without clobbering a **live** daemon: on `AddrInUse`, probe by
+/// connecting — a successful connect means another daemon owns the socket (hard error, don't remove);
+/// a refused/absent connect means the socket is stale, so remove it and rebind once. After a
+/// successful bind, `chmod` the socket to `mode` (default `0o600`).
+#[cfg(unix)]
+async fn bind_uds(
+    path: &std::path::Path,
+    mode: Option<u32>,
+) -> Result<UnixListener, Box<dyn std::error::Error>> {
+    use std::io::ErrorKind;
+    use std::os::unix::fs::PermissionsExt;
+
+    let listener = match UnixListener::bind(path) {
+        Ok(l) => l,
+        Err(e) if e.kind() == ErrorKind::AddrInUse => {
+            // Probe: does something answer at this path?
+            if UnixStream::connect(path).await.is_ok() {
+                return Err(format!(
+                    "unix socket {} is already in use by a live daemon",
+                    path.display()
+                )
+                .into());
+            }
+            // Stale socket (connect refused / not found) — safe to remove and rebind once.
+            std::fs::remove_file(path)?;
+            UnixListener::bind(path)?
+        }
+        Err(e) => return Err(e.into()),
+    };
+    std::fs::set_permissions(path, PermissionsExt::from_mode(mode.unwrap_or(0o600)))?;
+    Ok(listener)
+}
+
+/// Serve the control protocol over the WebSocket listeners in `listeners` (loopback TCP and/or a
+/// Unix-domain socket), all fronting **one** shared supervisor so a session is reachable over either
+/// transport by its id. Runs until an OS shutdown signal, returning it so the caller exits with the
+/// matching code — same contract as [`serve`](crate::serve::serve). Each accepted connection is
+/// handled concurrently and routed to its session by id.
 pub async fn serve_ws(
     cfg: ServeConfig,
-    addr: SocketAddr,
+    listeners: ServeListeners,
 ) -> Result<Option<Signal>, Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind(addr).await?;
-    let local = listener.local_addr()?;
-    // A well-defined line (on stderr, which the protocol never uses) so an operator — or a test that
-    // binds port 0 — can learn the actual bound address.
-    eprintln!("serve: websocket listening on {local} (path {WS_PATH})");
+    let tcp_listener = match listeners.tcp {
+        Some(addr) => {
+            let listener = TcpListener::bind(addr).await?;
+            let local = listener.local_addr()?;
+            // A well-defined line (on stderr, which the protocol never uses) so an operator — or a
+            // test that binds port 0 — can learn the actual bound address.
+            eprintln!("serve: websocket listening on {local} (path {WS_PATH})");
+            Some(listener)
+        }
+        None => None,
+    };
+
+    #[cfg(unix)]
+    let uds_path = listeners.uds.clone();
+    #[cfg(unix)]
+    let uds_listener = match &listeners.uds {
+        Some(path) => {
+            let listener = bind_uds(path, listeners.uds_mode).await?;
+            eprintln!(
+                "serve: unix socket listening on {} (path {WS_PATH})",
+                path.display()
+            );
+            Some(listener)
+        }
+        None => None,
+    };
+    // On a non-unix target there is no UDS to bind (`--listen-uds` errored before we got here); the
+    // `select!` UDS arm still needs a listener binding, so give it a `None` that `pending()`s forever.
+    #[cfg(not(unix))]
+    let uds_listener: Option<()> = None;
 
     let supervisor = Arc::new(Supervisor {
         sessions: Mutex::new(HashMap::new()),
@@ -318,6 +413,11 @@ pub async fn serve_ws(
         tokio::select! {
             sig = shutdown.wait() => {
                 eprintln!("serve: shutting down websocket listener");
+                // Best-effort remove the socket file so a restart isn't tripped by our own stale node.
+                #[cfg(unix)]
+                if let Some(path) = &uds_path {
+                    let _ = std::fs::remove_file(path);
+                }
                 // Drive shutdown deterministically from here rather than relying on each session's own
                 // signal handler (which runs on a spawned-thread runtime that may not receive the
                 // signal): drop every retained `input_tx` so each session observes EOF and
@@ -326,14 +426,7 @@ pub async fn serve_ws(
                 supervisor.shutdown().await;
                 return Ok(Some(sig));
             }
-            accepted = listener.accept() => {
-                let (stream, _peer) = match accepted {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("serve: websocket accept failed: {e}");
-                        continue;
-                    }
-                };
+            Some(stream) = accept_tcp(&tcp_listener) => {
                 let supervisor = supervisor.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_connection(&supervisor, stream).await {
@@ -341,16 +434,50 @@ pub async fn serve_ws(
                     }
                 });
             }
+            Some(stream) = accept_uds_arm(&uds_listener) => {
+                let supervisor = supervisor.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_connection(&supervisor, stream).await {
+                        eprintln!("serve: unix socket connection error: {e}");
+                    }
+                });
+            }
         }
     }
 }
 
+// The UDS counterpart to [`accept_tcp`], wrapped in a cfg-gated shim so the `select!` arm compiles
+// identically on every target: on unix it awaits real `UnixStream`s (or `pending()`s when there's no
+// listener); elsewhere it's a listener-less `pending()` forever (there's no UDS to bind, and
+// `--listen-uds` errors before we ever reach here).
+#[cfg(unix)]
+async fn accept_uds_arm(listener: &Option<UnixListener>) -> Option<UnixStream> {
+    match listener {
+        Some(l) => match l.accept().await {
+            Ok((stream, _addr)) => Some(stream),
+            Err(e) => {
+                eprintln!("serve: unix socket accept failed: {e}");
+                None
+            }
+        },
+        None => std::future::pending().await,
+    }
+}
+#[cfg(not(unix))]
+async fn accept_uds_arm(_listener: &Option<()>) -> Option<TcpStream> {
+    std::future::pending().await
+}
+
 /// Perform the WebSocket handshake (validating the path and extracting `?session_id=`), then hand the
-/// connection to the supervisor to attach to its session.
-async fn handle_connection(
+/// connection to the supervisor to attach to its session. Generic over the underlying byte stream so
+/// the same handshake+attach path serves both TCP and Unix-domain sockets.
+async fn handle_connection<S>(
     supervisor: &Arc<Supervisor>,
-    stream: TcpStream,
-) -> Result<(), Box<dyn std::error::Error>> {
+    stream: S,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     // The handshake callback sees the HTTP request. Reject a wrong path outright; stash the requested
     // session id (parsed from the query) for use after the upgrade completes.
     let requested_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));

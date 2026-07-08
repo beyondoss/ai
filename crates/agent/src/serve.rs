@@ -581,6 +581,15 @@ pub struct ServeConfig {
     /// [`crate::serve_ws`]). Bind loopback/internal only: the agent authenticates no caller, it trusts
     /// whatever the front door forwarded. `None` (the default) keeps the stdio transport.
     pub listen: Option<std::net::SocketAddr>,
+    /// When set, `serve` also (or instead) offers its control protocol over a Unix-domain socket at
+    /// this path — a same-VM client gets kernel-enforced local authz via filesystem permissions
+    /// (unlike loopback TCP, which authenticates nothing). Bound on the *same* shared supervisor as
+    /// [`Self::listen`], so a session created over either transport is reachable over the other by the
+    /// same `?session_id=`. `None` (the default) means no UDS listener. See [`crate::serve_ws`].
+    pub listen_uds: Option<std::path::PathBuf>,
+    /// The octal permission mode to `chmod` the [`Self::listen_uds`] socket to after binding (default
+    /// `0o600` — owner-only; use `0o660` for a shared group). Ignored when `listen_uds` is `None`.
+    pub listen_uds_mode: Option<u32>,
 }
 
 /// Resolve whether a project is trusted for this session, from already-gathered inputs — shared by

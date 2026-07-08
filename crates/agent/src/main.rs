@@ -685,6 +685,17 @@ enum Command {
         /// front door. Pair with `--session-dir` so sessions survive a process restart. Absent ⇒ stdio.
         #[arg(long, env = "AI_AGENT_LISTEN")]
         listen: Option<std::net::SocketAddr>,
+        /// Also (or instead) offer the control protocol over a Unix-domain socket at this path — a
+        /// same-VM client gets kernel-enforced local authz via the socket's filesystem permissions,
+        /// which loopback TCP does not provide. Bound on the *same* supervisor as `--listen`, so a
+        /// session created over either transport is reachable over the other by its `?session_id=`.
+        /// Only on unix targets. Pair with `--session-dir` for restart durability.
+        #[arg(long, env = "AI_AGENT_LISTEN_UDS")]
+        listen_uds: Option<std::path::PathBuf>,
+        /// Octal permission mode to `chmod` the `--listen-uds` socket to after binding (e.g. `0o660`
+        /// or `660` for a shared group). Default `0o600` (owner-only). Ignored without `--listen-uds`.
+        #[arg(long, env = "AI_AGENT_LISTEN_UDS_MODE")]
+        listen_uds_mode: Option<String>,
         /// Use this exact session id instead of a freshly generated one — a caller (a script, a test
         /// harness) that wants a known, predictable id to correlate against rather than parsing it back
         /// out of `get_state`/the startup `{"kind":"session", id, …}` banner. Applies only when a *new*
@@ -1533,6 +1544,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             session_file,
             session_dir,
             listen,
+            listen_uds,
+            listen_uds_mode,
             session_id,
             no_session_persistence,
             max_steps,
@@ -1797,6 +1810,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             for warning in &mcp_warnings {
                 eprintln!("warning: {warning}");
             }
+            // Parse the UDS socket mode from its octal string (`0o660`, `660`, `0660` all work) up
+            // front so a bad value fails fast with a clear message rather than deep in the listener.
+            let listen_uds_mode: Option<u32> = match &listen_uds_mode {
+                Some(s) => {
+                    let trimmed = s.trim().trim_start_matches("0o");
+                    Some(u32::from_str_radix(trimmed, 8).map_err(|e| {
+                        format!("invalid --listen-uds-mode {s:?} (expected octal, e.g. 0o660): {e}")
+                    })?)
+                }
+                None => None,
+            };
             let serve_cfg = serve::ServeConfig {
                 gateway: gateway_url
                     .or_else(|| stored_settings.default_gateway_url.clone())
@@ -1813,6 +1837,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 session_file,
                 session_dir: resolved_session_dir,
                 listen,
+                listen_uds: listen_uds.clone(),
+                listen_uds_mode,
                 session_id,
                 no_session_persistence,
                 context_window,
@@ -1857,12 +1883,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 steering_mode,
                 follow_up_mode,
             };
-            let shutdown_cause = match serve_cfg.listen {
-                // WebSocket transport: one session per `?session_id=`, each outliving its connection
-                // so a dropped mobile client re-attaches to a still-running run (see `serve_ws`).
-                Some(addr) => serve_ws::serve_ws(serve_cfg, addr).await?,
-                // Default stdio transport.
-                None => serve::serve(serve_cfg).await?,
+            // WebSocket transport (TCP and/or UDS): one session per `?session_id=`, each outliving its
+            // connection so a dropped client re-attaches to a still-running run (see `serve_ws`). Both
+            // listeners front one shared supervisor. Absent both ⇒ the default stdio transport.
+            let use_ws = serve_cfg.listen.is_some() || serve_cfg.listen_uds.is_some();
+            let shutdown_cause = if use_ws {
+                #[cfg(not(unix))]
+                if listen_uds.is_some() {
+                    return Err("--listen-uds is only supported on unix targets".into());
+                }
+                let listeners = serve_ws::ServeListeners {
+                    tcp: serve_cfg.listen,
+                    #[cfg(unix)]
+                    uds: serve_cfg.listen_uds.clone(),
+                    #[cfg(unix)]
+                    uds_mode: serve_cfg.listen_uds_mode,
+                };
+                serve_ws::serve_ws(serve_cfg, listeners).await?
+            } else {
+                serve::serve(serve_cfg).await?
             };
             // `serve` reads stdin via `tokio::io::stdin()`, which parks a dedicated blocking OS
             // thread doing a blocking read for the life of the process. If stdin is never closed
