@@ -293,6 +293,12 @@ fn build_http(read_timeout: Duration) -> Result<reqwest::Client> {
 /// any other [`CredentialSource`]).
 pub struct GatewayClient {
     http: reqwest::Client,
+    /// True once [`with_http_client`](Self::with_http_client) has injected an externally-owned,
+    /// shared `reqwest::Client` (e.g. one connection pool shared across all sessions of a serve
+    /// daemon). When set, [`with_idle_timeout`](Self::with_idle_timeout) will NOT rebuild `http` —
+    /// rebuilding would silently discard the shared pool. Defaults to `false` (this client owns its
+    /// own `build_http`-constructed client).
+    http_shared: bool,
     base_url: String,
     credential_source: Arc<dyn CredentialSource>,
     max_retries: u32,
@@ -338,6 +344,7 @@ impl GatewayClient {
         let http = build_http(READ_TIMEOUT)?;
         Ok(Self {
             http,
+            http_shared: false,
             base_url: base_url.into().trim_end_matches('/').to_string(),
             credential_source: source,
             max_retries: MAX_RETRIES,
@@ -388,11 +395,35 @@ impl GatewayClient {
         self
     }
 
+    /// Builder-style: use an externally-owned, shared `reqwest::Client` (e.g. one connection pool
+    /// shared across all sessions of a serve daemon) instead of this client's own [`build_http`] one.
+    /// `reqwest::Client` is `Arc`-backed, so the caller keeps a cheap clone of the same pool. Once set,
+    /// a later [`with_idle_timeout`](Self::with_idle_timeout) will NOT rebuild the client — that would
+    /// silently discard the shared pool; the shared client's read timeout is instead fixed by whoever
+    /// built it.
+    pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
+        self.http = http;
+        self.http_shared = true;
+        self
+    }
+
     /// Builder-style: override the idle-read timeout between chunks on the streaming body (default
     /// [`READ_TIMEOUT`] — see that constant's doc comment on why it's an idle timeout, not a ceiling
     /// on total stream duration). Rebuilds the underlying HTTP client, since `reqwest::Client`'s
     /// timeouts are fixed at construction; connect timeout is unaffected.
+    ///
+    /// **No-op for a shared client:** if an externally-owned client was injected via
+    /// [`with_http_client`](Self::with_http_client), this returns `self` unchanged rather than
+    /// rebuilding — rebuilding would tear down the shared connection pool. The shared client's read
+    /// timeout is fixed by whoever built it.
     pub fn with_idle_timeout(mut self, timeout: Duration) -> Result<Self> {
+        if self.http_shared {
+            tracing::debug!(
+                "ignoring per-client idle-read timeout override for a shared reqwest client \
+                 (would discard the shared connection pool)"
+            );
+            return Ok(self);
+        }
         self.http = build_http(timeout)?;
         Ok(self)
     }
@@ -414,6 +445,14 @@ impl GatewayClient {
         self.codex_websocket =
             enabled.then(|| Arc::new(crate::codex_websocket::CodexWebSocketCache::new()));
         self
+    }
+
+    /// Test-only: whether an externally-owned client was injected via
+    /// [`with_http_client`](Self::with_http_client). Lets a unit test assert that
+    /// [`with_idle_timeout`](Self::with_idle_timeout) leaves a shared client untouched.
+    #[cfg(test)]
+    pub(crate) fn http_is_shared(&self) -> bool {
+        self.http_shared
     }
 }
 
@@ -2106,6 +2145,42 @@ mod tests {
         assert!(
             tagged,
             "a read past the configured idle timeout must surface as a mid-stream network error"
+        );
+    }
+
+    /// W3 (shared upstream pool): a client given an externally-owned `reqwest::Client` via
+    /// [`GatewayClient::with_http_client`] must NOT have that client rebuilt by a later
+    /// [`GatewayClient::with_idle_timeout`] — rebuilding would silently discard the shared connection
+    /// pool. We prove the shared client survives via the `http_shared` flag (a rebuild clears it,
+    /// since only `with_http_client` sets it), and confirm the guard is specific to shared clients by
+    /// checking a non-shared client's `with_idle_timeout` still succeeds (rebuilds) as before.
+    #[test]
+    fn with_http_client_then_with_idle_timeout_keeps_the_shared_client() {
+        // A distinct, caller-owned client standing in for the daemon's one shared pool.
+        let shared = reqwest::Client::builder().build().unwrap();
+        let client = GatewayClient::new("http://ai.internal", "test-key")
+            .unwrap()
+            .with_http_client(shared);
+        assert!(
+            client.http_is_shared(),
+            "with_http_client must mark the client shared"
+        );
+
+        // The load-bearing assertion: overriding the idle timeout leaves the shared client in place.
+        let client = client.with_idle_timeout(Duration::from_millis(50)).unwrap();
+        assert!(
+            client.http_is_shared(),
+            "with_idle_timeout must not rebuild (and thereby discard) an injected shared client"
+        );
+
+        // Guard is specific to shared clients: a self-owned client still rebuilds on idle override.
+        let owned = GatewayClient::new("http://ai.internal", "test-key")
+            .unwrap()
+            .with_idle_timeout(Duration::from_millis(50))
+            .unwrap();
+        assert!(
+            !owned.http_is_shared(),
+            "a non-shared client must remain non-shared and rebuild"
         );
     }
 
