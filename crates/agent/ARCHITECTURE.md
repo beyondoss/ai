@@ -29,7 +29,15 @@ The harness layers several capabilities over the bare tools + loop:
   `<session-dir>/<id>.jsonl`, and is superseded last-attach-wins if a second connection claims its id.
   Auth is **not** this crate's concern: `serve_ws` binds loopback/internal only and trusts the front
   door (the edge) — it never parses a user token. See serve.rs's module doc for the full command/frame
-  reference and the reconnect flow.
+  reference and the reconnect flow. Two supervisor-level daemon facilities sit above the per-session
+  protocol: **`list_daemon_sessions`** — intercepted in the read loop (never forwarded to a session)
+  and answered by unioning the live `session id → running session` map with an on-disk scan of
+  `<session-dir>/*.jsonl`, each entry tagged `live: true|false`; and an optional **idle reaper**
+  (`--session-idle-timeout <secs>`, off by default) — a background ticker that reclaims sessions with no
+  attached connection, idle past the timeout, and not mid-run (a per-session `running` flag `serve_session`
+  flips around a `prompt`), dropping the retained `input_tx` so the session persists and exits exactly as
+  graceful shutdown does per-entry (both share `join_handles`). A reconnect to a just-reaped id respawns
+  it from disk and replays via `get_messages {since}`.
 - **Trust** ([`trust_store`](src/trust_store.rs)) — a tri-state, ancestor-inheriting allowlist
   (`~/.claude/trusted-projects.json`: `{trusted: [...], untrusted: [...]}`, most-specific directory
   wins, untrusted checked first at each level) gates the project-local `SYSTEM.md`/`APPEND_SYSTEM.md`

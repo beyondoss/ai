@@ -3364,6 +3364,21 @@ fn migrate(meta: SessionMeta, path: &Path) -> std::io::Result<SessionMeta> {
     }
 }
 
+/// Gather the `*.jsonl` files directly under `dir` — the flat, extension-filtered candidate set the
+/// daemon's `list_daemon_sessions` feeds to [`scan_listings`]. A single non-recursive `read_dir`;
+/// an unreadable directory (or a missing one) yields an empty list rather than erroring, matching the
+/// skip-and-continue semantics of the listing scans that consume it.
+pub(crate) fn scan_session_dir(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+        .collect()
+}
+
 /// Scan every path in `paths` for its listing metadata, calling `on_progress(scanned, total)` once per
 /// path — including ones that turn out unreadable, which still count as scanned and just contribute
 /// nothing. `read_listing` is pure disk I/O plus parsing with no dependency between files, so the work
@@ -3371,7 +3386,7 @@ fn migrate(meta: SessionMeta, path: &Path) -> std::io::Result<SessionMeta> {
 /// path) rather than running strictly one file at a time; below two candidate workers it just runs
 /// inline; no thread pool to justify the setup cost for a one- or two-file listing. Returned in
 /// arbitrary order — every caller sorts the result itself.
-fn scan_listings(
+pub(crate) fn scan_listings(
     paths: Vec<PathBuf>,
     on_progress: &(impl Fn(usize, usize) + Send + Sync),
 ) -> Vec<SessionMeta> {
@@ -3423,7 +3438,7 @@ fn scan_listings(
 /// alone gives id/title/etc.; only the count and preview/search text need the scan). Returns `None` for
 /// a file that isn't a readable session (no/invalid header, or an unreadable version), matching `list`'s
 /// skip semantics.
-fn read_listing(path: &Path) -> Option<SessionMeta> {
+pub(crate) fn read_listing(path: &Path) -> Option<SessionMeta> {
     let mtime = mtime_secs(path);
     let file = File::open(path).ok()?;
     let mut reader = BufReader::new(file);

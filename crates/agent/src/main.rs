@@ -696,6 +696,12 @@ enum Command {
         /// or `660` for a shared group). Default `0o600` (owner-only). Ignored without `--listen-uds`.
         #[arg(long, env = "AI_AGENT_LISTEN_UDS_MODE")]
         listen_uds_mode: Option<String>,
+        /// Daemon mode only: reap a session that has had no attached connection for this many seconds
+        /// and isn't mid-run — dropping it so it persists and exits, exactly like a graceful shutdown
+        /// does per-session. Absent (the default) keeps today's behavior: a detached session lives until
+        /// the daemon stops. Ignored without `--listen`/`--listen-uds`.
+        #[arg(long, env = "AI_AGENT_SESSION_IDLE_TIMEOUT")]
+        session_idle_timeout: Option<u64>,
         /// Use this exact session id instead of a freshly generated one — a caller (a script, a test
         /// harness) that wants a known, predictable id to correlate against rather than parsing it back
         /// out of `get_state`/the startup `{"kind":"session", id, …}` banner. Applies only when a *new*
@@ -1546,6 +1552,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             listen,
             listen_uds,
             listen_uds_mode,
+            session_idle_timeout,
             session_id,
             no_session_persistence,
             max_steps,
@@ -1839,6 +1846,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 listen,
                 listen_uds: listen_uds.clone(),
                 listen_uds_mode,
+                session_idle_timeout: session_idle_timeout.map(std::time::Duration::from_secs),
                 session_id,
                 no_session_persistence,
                 context_window,

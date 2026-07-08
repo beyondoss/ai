@@ -590,6 +590,12 @@ pub struct ServeConfig {
     /// The octal permission mode to `chmod` the [`Self::listen_uds`] socket to after binding (default
     /// `0o600` — owner-only; use `0o660` for a shared group). Ignored when `listen_uds` is `None`.
     pub listen_uds_mode: Option<u32>,
+    /// When set (daemon mode only), the supervisor reaps a session that has had **no attached
+    /// connection** for at least this long and isn't mid-run — dropping its retained `input_tx` so it
+    /// persists and exits, exactly like graceful shutdown does per-session (see [`crate::serve_ws`]).
+    /// `None` (the default) keeps today's forever-lived behavior: a detached session lives until the
+    /// daemon shuts down. Ignored outside the WebSocket/UDS daemon path.
+    pub session_idle_timeout: Option<std::time::Duration>,
 }
 
 /// Resolve whether a project is trusted for this session, from already-gathered inputs — shared by
@@ -1748,7 +1754,9 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
         }
     });
 
-    let sig = serve_session(cfg, input_rx, out_conn).await?;
+    // Stdio has no supervisor and no reaper, so the `running` flag is inert here — a throwaway.
+    let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sig = serve_session(cfg, input_rx, out_conn, running).await?;
     // The session has ended (and dropped its `out_conn` clones), so `conn_rx` is now closed — this
     // just reaps the stdout task after it flushes the last frame.
     let _ = stdout_task.await;
@@ -1766,6 +1774,10 @@ pub(crate) async fn serve_session(
     cfg: ServeConfig,
     mut input_rx: mpsc::UnboundedReceiver<String>,
     out_conn: SharedOutConn,
+    // Set `true` for the duration of a `prompt` run, `false` otherwise. The daemon supervisor's idle
+    // reaper reads this to never reap a session with an in-flight background run (see
+    // [`crate::serve_ws`]); the stdio wrapper passes a throwaway it never observes.
+    running: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<Option<Signal>, Box<dyn std::error::Error>> {
     let mut timing = crate::timing::StartupTiming::new();
     let (mut persistence, mut session) = Persistence::open(&cfg)?;
@@ -2712,6 +2724,9 @@ pub(crate) async fn serve_session(
                     let live_stats = Arc::new(LiveStats::from_session(&session));
                     let live_stats_sink = live_stats.clone();
 
+                    // Mark this session busy for the reaper's benefit (daemon mode) — it never reaps a
+                    // session with a run in flight. Cleared once the attempt's future resolves, below.
+                    running.store(true, Ordering::Relaxed);
                     let attempt_result = {
                         let run = agent.run_events_steered(
                             &mut session,
@@ -3091,6 +3106,10 @@ pub(crate) async fn serve_session(
                             }
                         }
                     };
+                    // The run's future has resolved (idle again) — clear the busy flag so the reaper may
+                    // reclaim this session once it's also been detached long enough. A subsequent retry
+                    // attempt re-sets it at the top of the next loop iteration.
+                    running.store(false, Ordering::Relaxed);
 
                     // Fix 4: the run has now actually gone idle — `run_events_steered`'s future only
                     // resolves once the whole run (including tool cleanup) has stopped touching

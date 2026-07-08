@@ -32,11 +32,14 @@
 //! and trust the front door (the edge, in another repo) to have validated the client before forwarding
 //! the upgrade. This module never sees or parses a user token.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use futures::{SinkExt, StreamExt};
+use serde_json::json;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 #[cfg(unix)]
@@ -52,7 +55,7 @@ use crate::serve::{
     OutFrame, ServeConfig, SharedOutConn, Signal, frame_to_line, lock_ignoring_poison,
     serve_session,
 };
-use crate::session_store::{is_valid_session_id, new_id};
+use crate::session_store::{is_valid_session_id, new_id, scan_listings, scan_session_dir};
 
 /// The fixed URL path a WebSocket upgrade must target. The front door maps a service subdomain to this
 /// path on the loopback listener; any other path is rejected at the handshake.
@@ -79,6 +82,13 @@ struct SessionHandle {
     /// persist and exit (dropping `input_tx` closes its input, then this joins) rather than letting
     /// `process::exit` race the persist. `None` only transiently while a handle is being moved out.
     join: Option<std::thread::JoinHandle<()>>,
+    /// When the last connection detached (left `conn_cancel` `None`), for the idle reaper's clock.
+    /// `None` while a connection is attached (`conn_cancel.is_some()`) or on a fresh, never-detached
+    /// session — either way the session isn't eligible for idle reaping yet.
+    last_detached_at: Option<Instant>,
+    /// `true` exactly while the session's [`serve_session`] loop is running a `prompt`. The reaper reads
+    /// it so a detached-but-mid-run background session is never reaped out from under an in-flight turn.
+    running: Arc<AtomicBool>,
 }
 
 /// Owns the `session id → live session` map and the base config every session is cloned from.
@@ -128,7 +138,9 @@ impl Supervisor {
         let id = requested_id.unwrap_or_else(new_id);
 
         // Look up (or spawn) the session and supersede any prior connection — all under the map lock,
-        // which is never held across an `.await`.
+        // which is never held across an `.await`. `my_cancel` doubles as this attach's *identity*: only
+        // a superseding attach ever cancels it (see the teardown below), so `is_cancelled()` later means
+        // "someone took over this session," never "this socket closed."
         let (input_tx, out_conn, my_cancel) = {
             let mut sessions = lock_ignoring_poison(&self.sessions);
 
@@ -144,6 +156,10 @@ impl Supervisor {
                 let cfg = self.session_cfg(&id);
                 let session_out = out_conn.clone();
                 let log_id = id.clone();
+                // Shared with the session loop: `true` only while it's running a `prompt`. The reaper
+                // reads this handle-side clone to never reclaim a mid-run background session.
+                let running = Arc::new(AtomicBool::new(false));
+                let session_running = running.clone();
                 // `serve_session`'s event sink is a `Box<dyn FnMut>` (not `Send`), so its future
                 // can't be `tokio::spawn`ed onto the multi-threaded accept runtime — the stdio path
                 // only ever `.await`s it inline. Give each session its own thread with a
@@ -162,7 +178,7 @@ impl Supervisor {
                         }
                     };
                     rt.block_on(async move {
-                        match serve_session(cfg, input_rx, session_out).await {
+                        match serve_session(cfg, input_rx, session_out, session_running).await {
                             Ok(_) => {}
                             Err(e) => eprintln!("serve: session {log_id} ended: {e}"),
                         }
@@ -173,6 +189,8 @@ impl Supervisor {
                     out_conn,
                     conn_cancel: None,
                     join: Some(join),
+                    last_detached_at: None,
+                    running,
                 }
             });
 
@@ -182,6 +200,9 @@ impl Supervisor {
             }
             let my_cancel = CancellationToken::new();
             handle.conn_cancel = Some(my_cancel.clone());
+            // Attached again ⇒ not idle: clear any detach timestamp so the reaper's clock only ever runs
+            // while genuinely detached (`conn_cancel.is_none()`).
+            handle.last_detached_at = None;
             (handle.input_tx.clone(), handle.out_conn.clone(), my_cancel)
         };
 
@@ -189,6 +210,11 @@ impl Supervisor {
         // `conn_tx`, which closes the prior send task's receiver (a second teardown path alongside the
         // cancel token above).
         let (conn_tx, mut conn_rx) = mpsc::unbounded_channel::<OutFrame>();
+        // A direct handle to *this* connection's send channel, kept for supervisor-level replies (the
+        // `list_daemon_sessions` command below) that must go back to this socket rather than through the
+        // session's swappable `out_conn` tail. Feeds the same `conn_rx`/send task; a supersession that
+        // rebinds `out_conn` doesn't affect it.
+        let reply_tx = conn_tx.clone();
         *lock_ignoring_poison(&out_conn) = Some(conn_tx);
 
         let (mut sink, mut stream) = ws.split();
@@ -197,14 +223,19 @@ impl Supervisor {
         // replies, and periodic keepalive `Ping`s — funnels through it so the single sink has one
         // writer. `ctrl_rx` carries the read loop's `Pong` replies.
         let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<Message>();
-        let send_cancel = my_cancel.clone();
+        // A *separate* token from `my_cancel`: this one stops only this connection's send task at
+        // teardown, leaving `my_cancel` to mean supersession exclusively (so the teardown's
+        // "am I still the current attach?" check stays unambiguous). The send task also stops on its own
+        // when a superseding attach rebinds `out_conn` and drops our `conn_tx`, closing `conn_rx`.
+        let send_cancel = CancellationToken::new();
+        let send_task_cancel = send_cancel.clone();
         let send_task = tokio::spawn(async move {
             let mut ping = tokio::time::interval(PING_INTERVAL);
             ping.set_missed_tick_behavior(MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
                     biased;
-                    _ = send_cancel.cancelled() => break,
+                    _ = send_task_cancel.cancelled() => break,
                     // A closed `conn_rx` means we were superseded (out_conn rebound) or the session
                     // ended — stop writing to this socket.
                     frame = conn_rx.recv() => match frame {
@@ -246,6 +277,25 @@ impl Supervisor {
                     };
                     match msg {
                         Message::Text(text) => {
+                            // Supervisor-level intercept: `list_daemon_sessions` is answered *here* (only
+                            // the supervisor sees every session), not forwarded to the pinned session. A
+                            // cheap substring prefilter keeps the byte-identical hot path allocation-free
+                            // for every other command; only a real match pays the parse.
+                            if text.contains("list_daemon_sessions") {
+                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(text.as_str()) {
+                                    if v.get("type").and_then(serde_json::Value::as_str)
+                                        == Some("list_daemon_sessions")
+                                    {
+                                        let client_id = v
+                                            .get("id")
+                                            .and_then(serde_json::Value::as_str)
+                                            .map(str::to_owned);
+                                        let frame = self.list_daemon_sessions(client_id).await;
+                                        let _ = reply_tx.send(frame);
+                                        continue;
+                                    }
+                                }
+                            }
                             if input_tx.send(text.as_str().to_owned()).is_err() {
                                 break; // session gone
                             }
@@ -266,8 +316,23 @@ impl Supervisor {
         // re-attaches by id. We deliberately do NOT reset `out_conn` to `None`: the next attach
         // overwrites it, and until then the session's writer harmlessly drops frames into this now-dead
         // channel.
-        my_cancel.cancel();
+        send_cancel.cancel();
         let _ = send_task.await;
+
+        // Mark the session detached so the idle reaper can start its clock — but only if we're still the
+        // current attach. Re-check `my_cancel.is_cancelled()` *under the map lock*: a superseding attach
+        // cancels our token and rebinds `conn_cancel` while holding this same lock, so whichever of us
+        // takes it first wins cleanly. If we were superseded, the new attach owns `conn_cancel`/
+        // `last_detached_at` and we must not clobber it.
+        {
+            let mut sessions = lock_ignoring_poison(&self.sessions);
+            if !my_cancel.is_cancelled() {
+                if let Some(h) = sessions.get_mut(&id) {
+                    h.conn_cancel = None;
+                    h.last_detached_at = Some(Instant::now());
+                }
+            }
+        }
     }
 
     /// Graceful shutdown: drain the session map (dropping each `input_tx`, which closes that session's
@@ -282,21 +347,110 @@ impl Supervisor {
                 .filter_map(|(_, mut h)| h.join.take())
                 .collect()
         };
-        if joins.is_empty() {
-            return;
-        }
-        // `JoinHandle::join` blocks, so hand it to a blocking thread and cap the total wait.
-        let waiter = tokio::task::spawn_blocking(move || {
-            for j in joins {
-                let _ = j.join();
+        join_handles(joins).await;
+    }
+
+    /// Answer a `list_daemon_sessions` command: the union of every session the daemon knows about — the
+    /// live in-memory map (`live:true`) and every `*.jsonl` under the base `--session-dir` (whose
+    /// `live` flag says whether that persisted id also has a running task right now). The reply is a
+    /// single `response` frame the caller sends back on the originating connection.
+    async fn list_daemon_sessions(&self, client_id: Option<String>) -> OutFrame {
+        // Snapshot the live ids (task still running ⇒ `input_tx` open) under the lock, then drop it —
+        // the on-disk scan below must not run while holding the map mutex.
+        let live: HashSet<String> = {
+            let sessions = lock_ignoring_poison(&self.sessions);
+            sessions
+                .iter()
+                .filter(|(_, h)| !h.input_tx.is_closed())
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+
+        // On-disk listings, if this daemon persists at all. `scan_listings` is CPU-bound and uses
+        // `thread::scope`, so it runs on the blocking pool rather than stalling this async task.
+        let metas = match &self.cfg.session_dir {
+            Some(dir) => {
+                let paths = scan_session_dir(std::path::Path::new(dir));
+                tokio::task::spawn_blocking(move || scan_listings(paths, &|_, _| {}))
+                    .await
+                    .unwrap_or_default()
             }
-        });
-        if tokio::time::timeout(Duration::from_secs(10), waiter)
-            .await
-            .is_err()
-        {
-            eprintln!("serve: some sessions did not persist within the shutdown grace period");
+            None => Vec::new(),
+        };
+
+        let mut seen: HashSet<&str> = HashSet::with_capacity(metas.len());
+        let mut sessions: Vec<serde_json::Value> = Vec::with_capacity(metas.len().max(live.len()));
+        for meta in &metas {
+            let mut obj = meta.to_listing_json();
+            if let serde_json::Value::Object(map) = &mut obj {
+                map.insert("live".into(), json!(live.contains(&meta.id)));
+            }
+            seen.insert(meta.id.as_str());
+            sessions.push(obj);
         }
+        // A brand-new live session may have no file yet (in-memory only, or not yet flushed) — surface
+        // it too, as a minimal entry, so a client sees every reachable session.
+        for id in &live {
+            if !seen.contains(id.as_str()) {
+                sessions.push(json!({ "id": id, "live": true }));
+            }
+        }
+
+        OutFrame::Value(json!({
+            "type": "response",
+            "command": "list_daemon_sessions",
+            "id": client_id,
+            "success": true,
+            "data": { "sessions": sessions },
+        }))
+    }
+
+    /// Idle reaper (only spawned when [`ServeConfig::session_idle_timeout`] is set): reclaim every
+    /// session that has been **detached** (`conn_cancel.is_none()`) for at least `timeout`, whose input
+    /// channel is still open, and that isn't mid-`prompt` (`running`). Removing the handle drops its
+    /// retained `input_tx`, so the session observes EOF and persists+exits exactly as in [`shutdown`];
+    /// the join then waits for that persist to land. A reconnect to a just-reaped id transparently
+    /// respawns and replays via `get_messages{since}`.
+    async fn reap_idle(&self, timeout: Duration) {
+        let joins: Vec<std::thread::JoinHandle<()>> = {
+            let mut sessions = lock_ignoring_poison(&self.sessions);
+            let reap: Vec<String> = sessions
+                .iter()
+                .filter(|(_, h)| {
+                    h.conn_cancel.is_none()
+                        && h.last_detached_at.is_some_and(|d| d.elapsed() >= timeout)
+                        && !h.input_tx.is_closed()
+                        && !h.running.load(Ordering::Relaxed)
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            reap.into_iter()
+                .filter_map(|id| sessions.remove(&id).and_then(|mut h| h.join.take()))
+                .collect()
+        };
+        join_handles(joins).await;
+    }
+}
+
+/// Wait for a batch of session threads to finish, bounded so a wedged session can't hang the caller
+/// forever. `JoinHandle::join` blocks, so it runs on the blocking pool with a total 10s cap; a
+/// straggler past the cap is left behind (graceful shutdown then falls back to `process::exit`, the
+/// reaper simply retries the id on its next tick). Shared by [`Supervisor::shutdown`] and
+/// [`Supervisor::reap_idle`] so both persist-then-join on the same discipline.
+async fn join_handles(joins: Vec<std::thread::JoinHandle<()>>) {
+    if joins.is_empty() {
+        return;
+    }
+    let waiter = tokio::task::spawn_blocking(move || {
+        for j in joins {
+            let _ = j.join();
+        }
+    });
+    if tokio::time::timeout(Duration::from_secs(10), waiter)
+        .await
+        .is_err()
+    {
+        eprintln!("serve: some sessions did not persist within the join grace period");
     }
 }
 
@@ -403,16 +557,50 @@ pub async fn serve_ws(
     #[cfg(not(unix))]
     let uds_listener: Option<()> = None;
 
+    // Read before `cfg` is moved into the supervisor: whether (and how aggressively) to reap idle
+    // sessions.
+    let idle_timeout = cfg.session_idle_timeout;
+
     let supervisor = Arc::new(Supervisor {
         sessions: Mutex::new(HashMap::new()),
         cfg,
     });
     let mut shutdown = crate::serve::ShutdownSignal::new()?;
 
+    // The idle reaper (off unless `--session-idle-timeout` is set). A background ticker that reclaims
+    // detached, idle, not-mid-run sessions — the same drop-`input_tx` → persist → join path shutdown
+    // uses. Its handle is aborted on shutdown so the process can exit cleanly. Tick at half the timeout
+    // (so a session is reaped within ~1.5× the timeout at worst), capped at 30s so a long timeout still
+    // ticks at a sane cadence.
+    let reaper = idle_timeout.map(|t| {
+        let supervisor = supervisor.clone();
+        eprintln!("serve: idle-session reaper on ({}s)", t.as_secs());
+        tokio::spawn(async move {
+            // Floor the period at 1ms so a pathological sub-2s timeout can't hand `interval` a zero
+            // period (which panics).
+            let period = (t / 2)
+                .min(Duration::from_secs(30))
+                .max(Duration::from_millis(1));
+            let mut tick = tokio::time::interval(period);
+            tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            // The first tick fires immediately; skip it so a just-started session gets a full period.
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                supervisor.reap_idle(t).await;
+            }
+        })
+    });
+
     loop {
         tokio::select! {
             sig = shutdown.wait() => {
                 eprintln!("serve: shutting down websocket listener");
+                // Stop the idle reaper before draining sessions ourselves, so the two don't race over
+                // the same handles.
+                if let Some(reaper) = &reaper {
+                    reaper.abort();
+                }
                 // Best-effort remove the socket file so a restart isn't tripped by our own stale node.
                 #[cfg(unix)]
                 if let Some(path) = &uds_path {
