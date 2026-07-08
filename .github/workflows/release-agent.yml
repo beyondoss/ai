@@ -1,0 +1,44 @@
+name: Release Agent Binary
+# Builds beyond-ai-agent as a static musl binary and publishes it as a GitHub
+# Release asset, matching the beyond-<name>-v*-linux-<arch>.tar.gz convention
+# dev/.scripts/publish-primitives.sh (in the beyond repo) already expects for
+# every other externally-built primitive binary (beyond-pg, beyond-kv, ...).
+# Separate from publish.yml (which builds the gateway's Docker image) — this
+# only runs on a version tag, not every push to main.
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  release:
+    name: Build & publish release asset
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v2
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          sudo ln -sf /usr/bin/musl-gcc /usr/local/bin/x86_64-linux-musl-gcc
+          rustup target add x86_64-unknown-linux-musl
+      - name: Build beyond-ai-agent (static musl)
+        run: |
+          CC_x86_64_unknown_linux_musl=x86_64-linux-musl-gcc \
+            CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-linux-musl-gcc \
+            cargo build --release -p beyond-ai-agent --target x86_64-unknown-linux-musl
+      - name: Package release asset
+        run: |
+          mkdir -p dist
+          tar -C target/x86_64-unknown-linux-musl/release -czf \
+            "dist/beyond-ai-agent-${{ github.ref_name }}-linux-amd64.tar.gz" beyond-ai-agent
+      - name: Publish GitHub Release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" --repo "${{ github.repository }}" \
+            --title "${{ github.ref_name }}" --generate-notes || true
+          gh release upload "${{ github.ref_name }}" \
+            "dist/beyond-ai-agent-${{ github.ref_name }}-linux-amd64.tar.gz" \
+            --repo "${{ github.repository }}" --clobber
