@@ -316,6 +316,67 @@ pub fn run_cmd(bin: &str) -> Command {
     c
 }
 
+/// The fixed WebSocket path `serve --listen` accepts (see `serve_ws`).
+pub const WS_PATH: &str = "/_beyond/agent";
+
+/// A connected test WebSocket client (over plain `ws://`, so `MaybeTlsStream` is always the plain arm).
+pub type TestWs =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Connect a WebSocket client to a `serve --listen` port, optionally naming a session via the URL.
+pub async fn ws_connect(port: u16, session_id: Option<&str>) -> TestWs {
+    let url = match session_id {
+        Some(id) => format!("ws://127.0.0.1:{port}{WS_PATH}?session_id={id}"),
+        None => format!("ws://127.0.0.1:{port}{WS_PATH}"),
+    };
+    let (ws, _resp) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("websocket connect");
+    ws
+}
+
+/// Send one command object as a single WS text message.
+pub async fn ws_send(ws: &mut TestWs, v: Value) {
+    use futures::SinkExt as _;
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        v.to_string().into(),
+    ))
+    .await
+    .expect("websocket send");
+}
+
+/// Read the next JSON frame (skipping ping/pong/binary), or `None` if the socket closed.
+pub async fn ws_next_frame(ws: &mut TestWs) -> Option<Value> {
+    use futures::StreamExt as _;
+    use tokio_tungstenite::tungstenite::Message;
+    while let Some(msg) = ws.next().await {
+        match msg.expect("websocket recv") {
+            Message::Text(t) => {
+                if let Ok(v) = serde_json::from_str::<Value>(t.as_str()) {
+                    return Some(v);
+                }
+            }
+            Message::Close(_) => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Collect WS frames until the `response` frame for `command` arrives (or the socket closes).
+pub async fn ws_read_until_response(ws: &mut TestWs, command: &str) -> Vec<Value> {
+    let mut frames = Vec::new();
+    while let Some(v) = ws_next_frame(ws).await {
+        let done = v.get("type").and_then(Value::as_str) == Some("response")
+            && v.get("command").and_then(Value::as_str) == Some(command);
+        frames.push(v);
+        if done {
+            break;
+        }
+    }
+    frames
+}
+
 /// Every persisted `message` entry's id, in order, read straight off a session JSONL file.
 pub fn message_ids(session_file: &str) -> Vec<String> {
     std::fs::read_to_string(session_file)

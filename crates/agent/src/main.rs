@@ -27,7 +27,7 @@ use beyond_ai_agent::session_store::{
     SessionMeta, SessionRepo, SessionStore, canonical_cwd, default_session_dir, fork_by_arg,
     is_path_like, open_session_by_id, sessions_root,
 };
-use beyond_ai_agent::{serve, tools};
+use beyond_ai_agent::{serve, serve_ws, tools};
 use clap::{Parser, Subcommand};
 
 /// Default model when neither `--model` nor `AI_AGENT_MODEL` is set.
@@ -678,6 +678,13 @@ enum Command {
         /// Persist many sessions under this directory (enables list/switch/fork/name commands).
         #[arg(long, env = "AI_AGENT_SESSION_DIR")]
         session_dir: Option<String>,
+        /// Offer the control protocol over a WebSocket on this address instead of stdio (e.g.
+        /// `127.0.0.1:8787`). Each connection drives a session at `/_beyond/agent?session_id=<id>`, and
+        /// a session outlives a dropped connection so a reconnecting client re-attaches to a still-
+        /// running run. Bind loopback/internal only: the agent authenticates no caller — it trusts the
+        /// front door. Pair with `--session-dir` so sessions survive a process restart. Absent ⇒ stdio.
+        #[arg(long, env = "AI_AGENT_LISTEN")]
+        listen: Option<std::net::SocketAddr>,
         /// Use this exact session id instead of a freshly generated one — a caller (a script, a test
         /// harness) that wants a known, predictable id to correlate against rather than parsing it back
         /// out of `get_state`/the startup `{"kind":"session", id, …}` banner. Applies only when a *new*
@@ -1525,6 +1532,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             key,
             session_file,
             session_dir,
+            listen,
             session_id,
             no_session_persistence,
             max_steps,
@@ -1789,7 +1797,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             for warning in &mcp_warnings {
                 eprintln!("warning: {warning}");
             }
-            let shutdown_cause = serve::serve(serve::ServeConfig {
+            let serve_cfg = serve::ServeConfig {
                 gateway: gateway_url
                     .or_else(|| stored_settings.default_gateway_url.clone())
                     .unwrap_or_else(|| DEFAULT_GATEWAY.to_string()),
@@ -1804,6 +1812,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 context_files: !no_context_files,
                 session_file,
                 session_dir: resolved_session_dir,
+                listen,
                 session_id,
                 no_session_persistence,
                 context_window,
@@ -1847,8 +1856,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 default_project_trust: stored_settings.default_project_trust,
                 steering_mode,
                 follow_up_mode,
-            })
-            .await?;
+            };
+            let shutdown_cause = match serve_cfg.listen {
+                // WebSocket transport: one session per `?session_id=`, each outliving its connection
+                // so a dropped mobile client re-attaches to a still-running run (see `serve_ws`).
+                Some(addr) => serve_ws::serve_ws(serve_cfg, addr).await?,
+                // Default stdio transport.
+                None => serve::serve(serve_cfg).await?,
+            };
             // `serve` reads stdin via `tokio::io::stdin()`, which parks a dedicated blocking OS
             // thread doing a blocking read for the life of the process. If stdin is never closed
             // (a client that doesn't hang up, or — the case this matters for — a SIGTERM/SIGINT
@@ -2936,25 +2951,11 @@ fn expand_message(
     beyond_ai_agent::prompts::expand_if_slash(&message, prompt_templates)
 }
 
-/// Whether `id` is safe to embed directly in a filename component — alphanumeric, optionally with
-/// `.`/`_`/`-` in the middle, starting and ending with a letter or digit. Matches pi's
-/// `assertValidSessionId` (`^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$`); rejects anything that could
-/// resolve to a path outside the sessions directory (a leading `/` or `..`, an embedded `/`, etc.) or
-/// be empty.
+/// Whether `id` is safe to embed directly in a filename component. Delegates to the canonical
+/// implementation in [`beyond_ai_agent::session_store::is_valid_session_id`] (shared with the
+/// WebSocket transport, which validates a client-supplied `?session_id=` the same way).
 fn is_valid_session_id(id: &str) -> bool {
-    let bytes = id.as_bytes();
-    let is_alnum = |b: u8| b.is_ascii_alphanumeric();
-    match bytes {
-        [] => false,
-        [only] => is_alnum(*only),
-        [first, .., last] => {
-            is_alnum(*first)
-                && is_alnum(*last)
-                && bytes
-                    .iter()
-                    .all(|&b| is_alnum(b) || b == b'.' || b == b'_' || b == b'-')
-        }
-    }
+    beyond_ai_agent::session_store::is_valid_session_id(id)
 }
 
 #[allow(clippy::too_many_arguments)]

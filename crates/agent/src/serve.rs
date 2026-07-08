@@ -1,13 +1,25 @@
-//! Headless `serve` — a newline-delimited JSON control protocol over stdio.
+//! Headless `serve` — a newline-delimited JSON control protocol, over stdio or a WebSocket.
 //!
-//! The server is the source of truth; any client (a TUI, an editor, or an `ssh` pipe) drives it by
-//! writing one JSON command per line to stdin and reading one JSON frame per line from stdout. The
-//! shape mirrors pi's `rpc` mode and opencode's session server: commands get a `response` frame,
-//! and a `prompt` streams `event` frames (the agent's `AgentEvent`s) before its response.
+//! The server is the source of truth; any client (a TUI, an editor, an `ssh` pipe, or the Beyond
+//! iPhone app) drives it by sending one JSON command per message and reading one JSON frame per
+//! message. The shape mirrors pi's `rpc` mode and opencode's session server: commands get a
+//! `response` frame, and a `prompt` streams `event` frames (the agent's `AgentEvent`s) before its
+//! response.
+//!
+//! **Two transports, one protocol.** The command/frame protocol below is byte-identical regardless of
+//! transport. [`serve`] is the default stdio transport (one line per command on stdin, one frame per
+//! line on stdout — built for an `ssh` pipe). [`serve_ws`](crate::serve_ws), enabled by
+//! `--listen <addr>`, offers the same protocol over a WebSocket: one command per inbound text message,
+//! one frame per outbound text message. Both feed the transport-agnostic [`serve_session`] core, which
+//! reads commands from an `mpsc` channel and emits frames to whichever connection is currently
+//! attached — so a WebSocket session **outlives its connection**: a dropped mobile client reconnects
+//! (same `?session_id=`) and re-attaches to the same still-running run, catching up on anything
+//! committed while it was gone via `get_messages {since}`.
 //!
 //! Sessions persist as append-only JSONL: `--session-file` for one session, or `--session-dir` for a
-//! [`SessionRepo`](crate::session_store::SessionRepo) of many. A turn appends only its new messages
-//! (compaction rewrites atomically). A reattaching client sees a **stable** session id and metadata.
+//! [`SessionRepo`](crate::session_store::SessionRepo) of many (WebSocket sessions get one file each,
+//! named by session id). A turn appends only its new messages (compaction rewrites atomically). A
+//! reattaching client sees a **stable** session id and metadata.
 //!
 //! Commands (stdin): `{id?, type, …}`
 //!   - `{type:"prompt", message, streaming_behavior?}` run a turn: an immediate lightweight `ack`
@@ -318,6 +330,11 @@ use crate::session_store::{
 use crate::tools;
 
 /// Options for the headless server (mirrors `run`, plus persistence).
+///
+/// `Clone` so a WebSocket supervisor ([`crate::serve_ws`]) can hand each per-session task its own
+/// copy with a distinct [`Self::session_id`] pinned in — `mcp_tools` clones the `Arc`s (shared live
+/// connections), every other field is a plain owned value.
+#[derive(Clone)]
 pub struct ServeConfig {
     pub gateway: String,
     /// The raw `--key`/`AI_AGENT_KEY` value, if the operator gave one explicitly. Deliberately *not*
@@ -558,6 +575,12 @@ pub struct ServeConfig {
     /// Same idea as [`Self::steering_mode`], for the follow-up lane (`set_follow_up_mode`) — pi's own
     /// `followUpMode`.
     pub follow_up_mode: agent_core::QueueMode,
+    /// When set, `serve` offers its (byte-identical) control protocol over a WebSocket on this address
+    /// instead of stdio — each accepted connection drives a session, and a session outlives its
+    /// connection so a dropped mobile client can reconnect and re-attach to a still-running run (see
+    /// [`crate::serve_ws`]). Bind loopback/internal only: the agent authenticates no caller, it trusts
+    /// whatever the front door forwarded. `None` (the default) keeps the stdio transport.
+    pub listen: Option<std::net::SocketAddr>,
 }
 
 /// Resolve whether a project is trusted for this session, from already-gathered inputs — shared by
@@ -1679,7 +1702,62 @@ fn resolve_startup_model_and_level(
 }
 
 /// Run the control loop until stdin closes.
+/// Headless `serve` over **stdio** — the default transport. A thin wrapper over the transport-
+/// agnostic [`serve_session`]: pump stdin lines into its input channel (EOF drops the sender, which
+/// closes the channel and shuts the session down — byte-identical to the pre-refactor loop), and
+/// drain its single "connection" to stdout. One session, one permanent connection. Every existing
+/// `serve` behavior and test rides this path unchanged; [`crate::serve_ws`] is the parallel WebSocket
+/// entry point that reuses the same [`serve_session`] core.
 pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::error::Error>> {
+    let (input_tx, input_rx) = mpsc::unbounded_channel::<String>();
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(tokio::io::stdin()).lines();
+        // A malformed-UTF-8 read error is treated as a clean EOF, matching the pre-refactor idle/busy
+        // read loops (killing a long-running process over one bad stdin byte is far more disruptive).
+        while let Ok(Some(line)) = lines.next_line().await {
+            if input_tx.send(line).is_err() {
+                break; // the session ended; nothing left to feed
+            }
+        }
+        // Dropping `input_tx` closes `input_rx` → the session observes EOF and shuts down.
+    });
+
+    let (conn_tx, mut conn_rx) = mpsc::unbounded_channel::<OutFrame>();
+    let out_conn: SharedOutConn = Arc::new(std::sync::Mutex::new(Some(conn_tx)));
+    let stdout_task = tokio::spawn(async move {
+        let mut out = tokio::io::stdout();
+        while let Some(frame) = conn_rx.recv().await {
+            let Some(mut line) = frame_to_line(frame) else {
+                continue;
+            };
+            // The frame's bytes and its terminator go out as one write.
+            line.push('\n');
+            if let Err(e) = write_frame(&mut out, &line).await {
+                eprintln!("serve: stdout write failed, shutting down writer: {e}");
+                break;
+            }
+        }
+    });
+
+    let sig = serve_session(cfg, input_rx, out_conn).await?;
+    // The session has ended (and dropped its `out_conn` clones), so `conn_rx` is now closed — this
+    // just reaps the stdout task after it flushes the last frame.
+    let _ = stdout_task.await;
+    Ok(sig)
+}
+
+/// The transport-agnostic control loop: one session, driven by a stream of command lines
+/// (`input_rx`) and emitting frames to whatever connection is currently attached (`out_conn`). The
+/// stdio [`serve`] wrapper feeds it (stdin lines / a stdout task); [`crate::serve_ws`] feeds it from a
+/// WebSocket, where the connection can detach and a later one re-attach to this same still-running
+/// task — because `input_rx`'s `Sender` is held by the supervisor (not the socket), a dropped
+/// connection is *not* an EOF: `input_rx.recv()` simply pends until the next command, and the run
+/// keeps going. The command protocol below is byte-identical across both transports.
+pub(crate) async fn serve_session(
+    cfg: ServeConfig,
+    mut input_rx: mpsc::UnboundedReceiver<String>,
+    out_conn: SharedOutConn,
+) -> Result<Option<Signal>, Box<dyn std::error::Error>> {
     let mut timing = crate::timing::StartupTiming::new();
     let (mut persistence, mut session) = Persistence::open(&cfg)?;
     timing.mark("open persistence");
@@ -1991,46 +2069,36 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
     // id per call still lets a client correlate a run's own three events without ambiguity.
     let mut host_bash_seq: u32 = 0;
 
-    // One writer task owns stdout; every frame (events + responses) is serialized through it in FIFO
-    // order, so output never interleaves.
+    // One writer task drains the FIFO and forwards each frame to whatever connection is currently
+    // attached (`out_conn`); every frame (events + responses) passes through it in order, so output
+    // never interleaves. The actual serialize + socket/stdout write happens in the connection's own
+    // consumer (the stdio stdout task, or a WebSocket send task) — this task only preserves ordering
+    // and bridges to the swappable tail.
     //
     // The channel is intentionally unbounded. The event `sink` (see `Agent::run_events`) is a
     // synchronous `FnMut`, so the producer cannot `.await` to apply backpressure; a bounded channel
     // would force `try_send`, which silently drops frames and corrupts the event stream — unacceptable
     // for a protocol. In practice the backlog is bounded by one in-flight turn's events (capped by
-    // `max_steps`), drained concurrently by the writer as fast as stdout accepts. If a client stops
-    // reading, stdout's write eventually fails and the writer tears down (below), surfacing the stall
-    // rather than masking it.
+    // `max_steps`), drained as fast as the attached connection accepts.
+    //
+    // Unlike the old stdout-owning writer, this task does NOT tear down when the connection breaks: a
+    // detached session (no connection, or a dead one) simply drops frames and keeps running, which is
+    // exactly what lets a WebSocket client reconnect and re-attach to a still-live run. The task ends
+    // only when every `out_tx` clone is dropped at teardown (`drop(out_tx)` + the joined run).
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<OutFrame>();
-    let writer = tokio::spawn(async move {
-        let mut out = tokio::io::stdout();
-        while let Some(frame) = out_rx.recv().await {
-            // A frame we built ourselves failing to serialize is a bug, not bad input — skip it
-            // rather than tearing down the whole stream. `Raw` (an `event` frame — see `OutFrame`'s
-            // own doc comment) is already the final JSON text; only `Value` (every other frame kind)
-            // still needs this serialize.
-            let mut line = match frame {
-                OutFrame::Raw(line) => line,
-                OutFrame::Value(v) => match serde_json::to_string(&v) {
-                    Ok(line) => line,
-                    Err(e) => {
-                        eprintln!("serve: failed to serialize output frame: {e}");
-                        continue;
-                    }
-                },
-            };
-            // Appended here rather than as a second `write_all` in `write_frame`, so the frame's bytes
-            // and its terminator go out as one write instead of two.
-            line.push('\n');
-            // stdout is the only sink. If it breaks (client hung up, broken pipe) there is nothing
-            // left to do but stop; dropping `out_rx` here makes every sender observe the closure and
-            // halt the control loop instead of writing into a dead pipe forever.
-            if let Err(e) = write_frame(&mut out, &line).await {
-                eprintln!("serve: stdout write failed, shutting down writer: {e}");
-                break;
+    let writer = {
+        let out_conn = out_conn.clone();
+        tokio::spawn(async move {
+            while let Some(frame) = out_rx.recv().await {
+                // Lock only to read the current sender and (non-blocking) hand off; if nothing is
+                // attached the frame is dropped by design. `send` failing means the attached
+                // connection's consumer already went away — harmless, same drop.
+                if let Some(tx) = lock_ignoring_poison(&out_conn).as_ref() {
+                    let _ = tx.send(frame);
+                }
             }
-        }
-    });
+        })
+    };
 
     // Sends a frame through the writer; if the writer has shut down (stdout closed), stop the control
     // loop — there is no way to deliver any further response, so continuing would only swallow output.
@@ -2453,7 +2521,6 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
         return Ok(None);
     }
 
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut shutdown = ShutdownSignal::new()?;
     // Task #41 (pi-parity fix): which signal (if any) actually triggered shutdown, so the caller can
     // exit with the matching POSIX code (`Signal::exit_code`) instead of always `0` — every graceful
@@ -2477,15 +2544,14 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                 shutdown_cause = Some(sig);
                 break;
             }
-            // A malformed-UTF-8 read error is treated the same as a clean EOF (`Ok(None)`) —
-            // matching the busy-mode read loops below, which never propagate a bare `?` here:
-            // this is the idle state the process spends most of its life in, and killing the
-            // whole long-running `serve` process over one bad byte on stdin (pi's own
-            // `StringDecoder`-based reader never throws on invalid UTF-8 either) is far more
-            // disruptive than just ending the session gracefully.
-            maybe_line = lines.next_line() => match maybe_line {
-                Ok(Some(l)) => l,
-                Ok(None) | Err(_) => break,
+            // A closed `input_rx` (the stdio reader hit EOF and dropped its sender, or a WebSocket
+            // supervisor deliberately dropped this session's retained sender to tear it down) ends the
+            // session gracefully — the same clean-shutdown path stdin EOF always drove. A merely
+            // *detached* WebSocket connection does NOT close `input_rx` (the supervisor keeps the
+            // sender), so this arm simply pends across a reconnect rather than firing.
+            maybe_line = input_rx.recv() => match maybe_line {
+                Some(l) => l,
+                None => break,
             },
         };
         let line = line.trim();
@@ -2713,8 +2779,8 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                                         tracing::warn!(error = %e, "mid-run checkpoint failed to persist");
                                     }
                                 }
-                                maybe_line = lines.next_line(), if stdin_open => match maybe_line {
-                                    Ok(Some(l)) => {
+                                maybe_line = input_rx.recv(), if stdin_open => match maybe_line {
+                                    Some(l) => {
                                         let l = l.trim();
                                         if l.is_empty() {
                                             continue;
@@ -3008,7 +3074,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                                     }
                                     // stdin closed (or errored) mid-run: cancel and let the run unwind, then
                                     // we'll fall out of the outer loop below.
-                                    Ok(None) | Err(_) => {
+                                    None => {
                                         stdin_open = false;
                                         cancel.cancel();
                                     }
@@ -3094,8 +3160,8 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                                         retry_cancelled = true;
                                         break;
                                     }
-                                    maybe_line = lines.next_line(), if stdin_open => match maybe_line {
-                                        Ok(Some(l)) => {
+                                    maybe_line = input_rx.recv(), if stdin_open => match maybe_line {
+                                        Some(l) => {
                                             let l = l.trim();
                                             if l.is_empty() {
                                                 continue;
@@ -3133,7 +3199,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                                                 }
                                             }
                                         }
-                                        Ok(None) | Err(_) => {
+                                        None => {
                                             stdin_open = false;
                                             retry_cancelled = true;
                                             break;
@@ -4640,8 +4706,8 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                                     branch_stdin_open = false;
                                     branch_cancel.cancel();
                                 }
-                                maybe_line = lines.next_line(), if branch_stdin_open => match maybe_line {
-                                    Ok(Some(l)) => {
+                                maybe_line = input_rx.recv(), if branch_stdin_open => match maybe_line {
+                                    Some(l) => {
                                         let l = l.trim();
                                         if l.is_empty() {
                                             continue;
@@ -4664,11 +4730,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                                             }
                                         }
                                     }
-                                    Ok(None) => {
-                                        branch_stdin_open = false;
-                                        branch_cancel.cancel();
-                                    }
-                                    Err(_) => {
+                                    None => {
                                         branch_stdin_open = false;
                                         branch_cancel.cancel();
                                     }
@@ -4904,8 +4966,8 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                                     }
                                 }
                             }
-                            maybe_line = lines.next_line(), if stdin_open => match maybe_line {
-                                Ok(Some(l)) => {
+                            maybe_line = input_rx.recv(), if stdin_open => match maybe_line {
+                                Some(l) => {
                                     let l = l.trim();
                                     if l.is_empty() {
                                         continue;
@@ -4928,7 +4990,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
                                         }
                                     }
                                 }
-                                Ok(None) | Err(_) => {
+                                None => {
                                     stdin_open = false;
                                     cancel.cancel();
                                 }
@@ -6333,7 +6395,7 @@ type PendingCodeSlot = Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<
 /// panic-free-production-code convention (no bare `.unwrap()` on a lock), and there's no invariant
 /// here a partial write could actually violate (the guarded value is always a plain, independently
 /// valid `Option`/replace-whole-value).
-fn lock_ignoring_poison<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(crate) fn lock_ignoring_poison<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -6450,7 +6512,7 @@ impl crate::oauth::LoginCallbacks for ServeLoginCallbacks {
 /// `String` instead, serialized straight from the `AgentEvent` in one pass — see its doc comment for
 /// why going through `Value` first would cost a second full serialize on the hottest path this process
 /// has.
-enum OutFrame {
+pub(crate) enum OutFrame {
     Value(Value),
     Raw(String),
 }
@@ -6458,6 +6520,31 @@ enum OutFrame {
 impl From<Value> for OutFrame {
     fn from(v: Value) -> Self {
         OutFrame::Value(v)
+    }
+}
+
+/// The swappable tail of a session's output: whichever connection is currently attached (a stdio
+/// stdout task, or a WebSocket send task), or `None` while detached. The session's single writer task
+/// forwards each [`OutFrame`] here; if `None`, the frame is dropped (a reconnecting client replays
+/// committed state via `get_messages {since}` — see [`crate::serve_ws`]). An `std::sync::Mutex` (not
+/// tokio's) is deliberate: it is only ever held across a non-`await` `send` into an unbounded channel,
+/// and the supervisor rebinds it with one non-blocking `*lock = Some(new_tx)` on re-attach.
+pub(crate) type SharedOutConn = Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<OutFrame>>>>;
+
+/// Serialize one [`OutFrame`] to its final JSON line (no trailing newline). `Raw` (the hot
+/// `event`-frame path) is already the final text; only `Value` pays a `serde_json::to_string`. Returns
+/// `None` only if a frame we built ourselves fails to serialize — a bug, skipped rather than tearing
+/// down the stream. Shared by both transports so stdio and WebSocket emit byte-identical frame text.
+pub(crate) fn frame_to_line(frame: OutFrame) -> Option<String> {
+    match frame {
+        OutFrame::Raw(line) => Some(line),
+        OutFrame::Value(v) => match serde_json::to_string(&v) {
+            Ok(line) => Some(line),
+            Err(e) => {
+                eprintln!("serve: failed to serialize output frame: {e}");
+                None
+            }
+        },
     }
 }
 
