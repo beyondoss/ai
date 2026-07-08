@@ -15,9 +15,7 @@ use common::{
     ISOLATED_HOME, free_port, spawn_model_server, turn_text, turn_tool_use, wait_for_port,
     ws_connect, ws_next_frame, ws_read_until_response, ws_send,
 };
-use futures::StreamExt;
 use serde_json::json;
-use tokio_tungstenite::tungstenite::Message;
 
 /// Spawn a `serve --listen 127.0.0.1:<port>` child against `base` (the mock gateway), persisting
 /// per-session files under `session_dir`. In `--listen` mode stdio is unused, so null it.
@@ -168,51 +166,77 @@ async fn ws_run_survives_dropped_connection_and_reattaches() {
     let _ = child.wait();
 }
 
-/// (iii) Two connections to one session: last-attach-wins. The second attach supersedes the first
-/// (which is closed), and the second drives the session normally.
+/// (iii) Multi-attach: two connections on ONE session both receive the live stream, and either can
+/// drive. A prompt sent on connection A streams to BOTH A and B; a prompt sent on B streams to both
+/// too. No eviction — this is the phone + TUI "watch/drive one session together" case.
 #[tokio::test]
-async fn ws_second_connection_supersedes_the_first() {
+async fn ws_two_connections_both_receive_the_stream() {
     const SID: &str = "sharedsession1";
-    let (base, _requests) = spawn_model_server(vec![turn_text("second wins")]);
+    // One turn per prompt (one driven from each connection).
+    let (base, _requests) =
+        spawn_model_server(vec![turn_text("firstreply"), turn_text("secondreply")]);
     let dir = tempfile::tempdir().unwrap();
     let port = free_port();
     let mut child = serve_ws_child(&base, dir.path().to_str().unwrap(), port);
     wait_for_port(port);
 
+    // Both connect to the SAME session id — they coexist (no eviction).
     let mut ws1 = ws_connect(port, Some(SID)).await;
-    // Ensure the session exists / ws1 is the attached connection before ws2 arrives.
-    ws_send(&mut ws1, json!({ "type": "get_state" })).await;
-    let _ = ws_read_until_response(&mut ws1, "get_state").await;
-
-    // ws2 attaches to the same id → supersedes ws1.
     let mut ws2 = ws_connect(port, Some(SID)).await;
 
-    // ws1 is evicted: its stream ends (a Close frame, then None).
-    let mut ws1_closed = false;
-    for _ in 0..50 {
-        match tokio::time::timeout(Duration::from_secs(2), ws1.next()).await {
-            Ok(Some(Ok(Message::Close(_)))) | Ok(None) | Ok(Some(Err(_))) => {
-                ws1_closed = true;
-                break;
-            }
-            Ok(Some(Ok(_))) => continue, // a stray frame; keep waiting for the close
-            Err(_) => break,
-        }
-    }
-    assert!(ws1_closed, "the superseded first connection must be closed");
-
-    // ws2 drives the session: a prompt round-trips normally.
+    // Drive from ws1 → the run must stream to BOTH connections.
     ws_send(
-        &mut ws2,
-        json!({ "type": "prompt", "id": "p1", "message": "hi" }),
+        &mut ws1,
+        json!({ "type": "prompt", "id": "p1", "message": "one" }),
     )
     .await;
-    let frames = ws_read_until_response(&mut ws2, "prompt").await;
-    let resp = frames.last().unwrap();
-    assert_eq!(resp["type"], "response");
+    let f1 = ws_read_until_response(&mut ws1, "prompt").await;
+    let f2 = ws_read_until_response(&mut ws2, "prompt").await; // ws2 receives the broadcast
+    for (who, frames) in [("ws1", &f1), ("ws2", &f2)] {
+        assert!(
+            frames.iter().any(|f| f["type"] == "event"),
+            "{who} must receive the streamed events: {frames:#?}"
+        );
+        let resp = frames
+            .iter()
+            .rev()
+            .find(|f| f["type"] == "response" && f["command"] == "prompt")
+            .unwrap_or_else(|| panic!("{who} must receive the prompt response: {frames:#?}"));
+        assert_eq!(resp["success"], true, "{who} prompt: {resp}");
+    }
+    assert!(
+        f2.iter()
+            .map(|f| f.to_string())
+            .collect::<String>()
+            .contains("firstreply"),
+        "ws2 must see the reply streamed live even though ws1 drove it"
+    );
+
+    // Drive from ws2 → both see it too (shared input; neither connection was evicted).
+    ws_send(
+        &mut ws2,
+        json!({ "type": "prompt", "id": "p2", "message": "two" }),
+    )
+    .await;
+    let g2 = ws_read_until_response(&mut ws2, "prompt").await;
+    let g1 = ws_read_until_response(&mut ws1, "prompt").await;
     assert_eq!(
-        resp["success"], true,
-        "ws2 should drive the session: {resp}"
+        g2.last().unwrap()["success"],
+        true,
+        "ws2 (driver of the 2nd prompt): {:?}",
+        g2.last()
+    );
+    assert_eq!(
+        g1.last().unwrap()["success"],
+        true,
+        "ws1 must still be attached and see the run ws2 drove"
+    );
+    assert!(
+        g1.iter()
+            .map(|f| f.to_string())
+            .collect::<String>()
+            .contains("secondreply"),
+        "ws1 must see ws2's driven reply streamed live"
     );
 
     let _ = child.kill();

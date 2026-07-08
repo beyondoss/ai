@@ -1788,7 +1788,10 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
     });
 
     let (conn_tx, mut conn_rx) = mpsc::unbounded_channel::<OutFrame>();
-    let out_conn: SharedOutConn = Arc::new(std::sync::Mutex::new(Some(conn_tx)));
+    // stdio has exactly one permanent "connection": stdout. Register it in the fanout as the sole sink.
+    let out_conn: SharedOutConn =
+        Arc::new(std::sync::Mutex::new(crate::serve::OutFanout::default()));
+    lock_ignoring_poison(&out_conn).add(conn_tx);
     let stdout_task = tokio::spawn(async move {
         let mut out = tokio::io::stdout();
         while let Some(frame) = conn_rx.recv().await {
@@ -2161,12 +2164,9 @@ pub(crate) async fn serve_session(
         let out_conn = out_conn.clone();
         tokio::spawn(async move {
             while let Some(frame) = out_rx.recv().await {
-                // Lock only to read the current sender and (non-blocking) hand off; if nothing is
-                // attached the frame is dropped by design. `send` failing means the attached
-                // connection's consumer already went away — harmless, same drop.
-                if let Some(tx) = lock_ignoring_poison(&out_conn).as_ref() {
-                    let _ = tx.send(frame);
-                }
+                // Broadcast to every attached connection (see `OutFanout`); if none are attached the
+                // frame is dropped by design. Lock is held only across the non-`await` sends.
+                lock_ignoring_poison(&out_conn).broadcast(frame);
             }
         })
     };
@@ -6600,6 +6600,7 @@ impl crate::oauth::LoginCallbacks for ServeLoginCallbacks {
 /// `String` instead, serialized straight from the `AgentEvent` in one pass — see its doc comment for
 /// why going through `Value` first would cost a second full serialize on the hottest path this process
 /// has.
+#[derive(Clone)]
 pub(crate) enum OutFrame {
     Value(Value),
     Raw(String),
@@ -6611,13 +6612,51 @@ impl From<Value> for OutFrame {
     }
 }
 
-/// The swappable tail of a session's output: whichever connection is currently attached (a stdio
-/// stdout task, or a WebSocket send task), or `None` while detached. The session's single writer task
-/// forwards each [`OutFrame`] here; if `None`, the frame is dropped (a reconnecting client replays
-/// committed state via `get_messages {since}` — see [`crate::serve_ws`]). An `std::sync::Mutex` (not
-/// tokio's) is deliberate: it is only ever held across a non-`await` `send` into an unbounded channel,
-/// and the supervisor rebinds it with one non-blocking `*lock = Some(new_tx)` on re-attach.
-pub(crate) type SharedOutConn = Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<OutFrame>>>>;
+/// The set of connections currently attached to a session, each an unbounded sink the session's single
+/// writer task **broadcasts** every [`OutFrame`] to — so a phone and a TUI (or any N of the user's own
+/// devices) on one session all render the same live stream, in the same order. Empty ⇒ detached, frames
+/// dropped (a reconnecting client replays committed state via `get_messages {since}` — see
+/// [`crate::serve_ws`]). The supervisor [`add`](OutFanout::add)s a sink on attach and
+/// [`remove`](OutFanout::remove)s it on disconnect. An `std::sync::Mutex` (not tokio's) is deliberate:
+/// it is only ever held across non-`await` `send`s into unbounded channels.
+#[derive(Default)]
+pub(crate) struct OutFanout {
+    next_id: u64,
+    sinks: Vec<(u64, mpsc::UnboundedSender<OutFrame>)>,
+}
+
+impl OutFanout {
+    /// Register a connection's sink; returns an id to [`remove`](Self::remove) it by on disconnect.
+    pub(crate) fn add(&mut self, tx: mpsc::UnboundedSender<OutFrame>) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.sinks.push((id, tx));
+        id
+    }
+
+    /// Drop the sink registered under `id` (a disconnected connection). Idempotent.
+    pub(crate) fn remove(&mut self, id: u64) {
+        self.sinks.retain(|(i, _)| *i != id);
+    }
+
+    /// Send `frame` to every attached sink, pruning any whose receiver has gone away. The single-sink
+    /// case (one connection — the common case) moves the frame with **no clone**, preserving the hot
+    /// event path's zero-copy behavior; only 2+ attached connections pay a per-sink clone.
+    pub(crate) fn broadcast(&mut self, frame: OutFrame) {
+        match self.sinks.as_slice() {
+            [] => {}
+            [(_, tx)] => {
+                if tx.send(frame).is_err() {
+                    self.sinks.clear();
+                }
+            }
+            _ => self.sinks.retain(|(_, tx)| tx.send(frame.clone()).is_ok()),
+        }
+    }
+}
+
+/// Shared handle to a session's attached-connection set (see [`OutFanout`]).
+pub(crate) type SharedOutConn = Arc<std::sync::Mutex<OutFanout>>;
 
 /// Serialize one [`OutFrame`] to its final JSON line (no trailing newline). `Raw` (the hot
 /// `event`-frame path) is already the final text; only `Value` pays a `serde_json::to_string`. Returns

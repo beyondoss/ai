@@ -36,8 +36,12 @@ The harness layers several capabilities over the bare tools + loop:
   dropped mobile client does not abort the run (the retained input `Sender` means a dropped socket is
   not an EOF), and a reconnecting client (same `?session_id=`) re-attaches to the same still-running
   session, catching up via `get_messages {since}`. `serve_ws` owns a `session id → running session`
-  map; each session runs on its own thread (its event sink isn't `Send`), persists to its own
-  `<session-dir>/<id>.jsonl`, and is superseded last-attach-wins if a second connection claims its id.
+  map; each session runs on its own thread (its event sink isn't `Send`) and persists to its own
+  `<session-dir>/<id>.jsonl`. **Multiple connections can attach to one session at once** (the user's own
+  phone + TUI): the session's output is **broadcast** to every attached connection (`serve::OutFanout`,
+  with a zero-copy fast path for the single-connection case) and input is shared (any device drives; the
+  others watch live). Query responses (`get_state`/`get_messages`) broadcast too, so clients correlate
+  `response`s by the `id` they sent; `list_daemon_sessions` is unicast to its requester.
   Auth is **not** this crate's concern: `serve_ws` binds loopback/internal only and trusts the front
   door (the edge) — it never parses a user token. See serve.rs's module doc for the full command/frame
   reference and the reconnect flow. Two supervisor-level daemon facilities sit above the per-session
