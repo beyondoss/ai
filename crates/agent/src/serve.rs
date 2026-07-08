@@ -329,6 +329,43 @@ use crate::session_store::{
 };
 use crate::tools;
 
+/// How the daemon pools its upstream (agent→gateway) connections across sessions — the mode selected
+/// by `--upstream-http2` (see [`crate::serve_ws::build_shared_h2_client`]).
+///
+/// The agent→gateway hop is plaintext, so `H2c` (HTTP/2 cleartext) is what actually collapses N
+/// sessions onto ~one multiplexed connection — but it hard-requires a gateway that speaks h2c, so it
+/// is **not** the default (see the variant docs). `FromStr` backs the CLI flag's `value_parser`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UpstreamHttp2 {
+    /// No shared client — every session (and every model switch) builds its own `reqwest::Client`, as
+    /// before this feature. The default until the gateway's h2c support is verified end-to-end.
+    #[default]
+    Off,
+    /// One shared client with **no** prior-knowledge: HTTP/1.1 connection pooling across all sessions
+    /// today, transparently negotiating h2 if the hop later moves to `https://` with ALPN. Safe against
+    /// an h1-only gateway (unlike [`Self::H2c`]).
+    Auto,
+    /// One shared client pinned to HTTP/2 cleartext (`http2_prior_knowledge`) — multiplexes every
+    /// session over ~one TCP connection to the gateway. **Requires a gateway that accepts h2c**: against
+    /// an h1-only gateway *every* request fails, which is why this is never the default.
+    H2c,
+}
+
+impl std::str::FromStr for UpstreamHttp2 {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "auto" => Ok(Self::Auto),
+            "h2c" => Ok(Self::H2c),
+            other => Err(format!(
+                "invalid --upstream-http2 {other:?} (expected one of: off, auto, h2c)"
+            )),
+        }
+    }
+}
+
 /// Options for the headless server (mirrors `run`, plus persistence).
 ///
 /// `Clone` so a WebSocket supervisor ([`crate::serve_ws`]) can hand each per-session task its own
@@ -596,6 +633,19 @@ pub struct ServeConfig {
     /// `None` (the default) keeps today's forever-lived behavior: a detached session lives until the
     /// daemon shuts down. Ignored outside the WebSocket/UDS daemon path.
     pub session_idle_timeout: Option<std::time::Duration>,
+    /// How the daemon pools upstream (agent→gateway) connections across sessions — the mode from
+    /// `--upstream-http2`. Only consulted in the WebSocket daemon path ([`crate::serve_ws::serve_ws`],
+    /// which reads it once to build [`Self::shared_http`]); the stdio/`run` path leaves it at
+    /// [`UpstreamHttp2::Off`] and never pools.
+    pub upstream_http2: UpstreamHttp2,
+    /// The one `reqwest::Client` every session in this daemon shares, so N concurrent sessions collapse
+    /// onto one connection pool (HTTP/2-multiplexed under [`UpstreamHttp2::H2c`]) instead of N. Built
+    /// once by [`crate::serve_ws::serve_ws`] from [`Self::upstream_http2`] and injected per session via
+    /// [`agent_core::GatewayClient::with_http_client`] in `build_gateway_client`; **kept** (not nulled)
+    /// by `session_cfg` so every session inherits it. `reqwest::Client` is `Arc`-backed, so cloning it
+    /// into each session is a cheap pointer bump. `None` (the default, and always on the stdio/`run`
+    /// path) preserves the per-session-client behavior.
+    pub shared_http: Option<reqwest::Client>,
 }
 
 /// Resolve whether a project is trusted for this session, from already-gathered inputs — shared by
@@ -5437,6 +5487,16 @@ fn build_gateway_client(cfg: &ServeConfig, model: &str) -> Result<GatewayClient,
         client.with_max_backoff(max_backoff)
     } else {
         client
+    };
+    // W3 (shared upstream pool): inject the daemon-wide `reqwest::Client` so every session multiplexes
+    // over one connection pool instead of each opening its own. **Must** precede `with_idle_timeout`
+    // below: `with_http_client` sets the `http_shared` guard, which makes that later call a no-op rather
+    // than rebuilding (and thereby tearing down) the shared pool on a model switch or idle override. The
+    // shared client's own read timeout is fixed when the supervisor builds it (see
+    // `serve_ws::build_shared_h2_client`). `None` (stdio/`run`, or `--upstream-http2 off`) is unchanged.
+    let client = match &cfg.shared_http {
+        Some(h) => client.with_http_client(h.clone()),
+        None => client,
     };
     // Task #38 (pi-parity fix): `run`'s identical `--idle-timeout-ms` wiring (`main.rs::run_task`'s own
     // `with_idle_timeout` call site) previously had no `serve` counterpart — this is called on every

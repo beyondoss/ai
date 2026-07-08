@@ -52,8 +52,8 @@ use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, 
 use tokio_util::sync::CancellationToken;
 
 use crate::serve::{
-    OutFrame, ServeConfig, SharedOutConn, Signal, frame_to_line, lock_ignoring_poison,
-    serve_session,
+    OutFrame, ServeConfig, SharedOutConn, Signal, UpstreamHttp2, frame_to_line,
+    lock_ignoring_poison, serve_session,
 };
 use crate::session_store::{is_valid_session_id, new_id, scan_listings, scan_session_dir};
 
@@ -517,15 +517,71 @@ async fn bind_uds(
     Ok(listener)
 }
 
+/// Build the one `reqwest::Client` every session in this daemon shares (W3), from
+/// [`ServeConfig::upstream_http2`]. `Off` returns `None` (each session keeps building its own client,
+/// today's behavior). `H2c`/`Auto` return `Some(shared)` — the difference is only
+/// `http2_prior_knowledge`:
+///
+/// - `H2c` pins the client to HTTP/2 cleartext, so all sessions multiplex over ~one TCP connection.
+///   **Requires a gateway that speaks h2c** — against an h1-only gateway *every* request fails, which
+///   is the footgun `serve_ws` logs loudly and why `Off` is the default.
+/// - `Auto` omits prior-knowledge: HTTP/1.1 pooling today, transparently negotiating h2 if the hop
+///   later moves to `https://` with ALPN — safe against any gateway.
+///
+/// The read (idle) timeout mirrors [`GatewayClient::with_idle_timeout`]'s: `--idle-timeout-ms` if set,
+/// else the gateway's own 600s upstream idle. Fixed here at construction because the shared client is
+/// injected past the `http_shared` guard, so `with_idle_timeout` will *not* rebuild it downstream.
+fn build_shared_h2_client(cfg: &ServeConfig) -> Result<Option<reqwest::Client>, String> {
+    // Matches `agent_core::client`'s own `READ_TIMEOUT` (private there) — a downstream hop's idle
+    // patience must be at least its upstream's, which the gateway sets to 600s.
+    const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(600);
+    let read_timeout = cfg
+        .idle_timeout_ms
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_READ_TIMEOUT);
+    let build = |prior_knowledge: bool| -> Result<reqwest::Client, String> {
+        let mut builder = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(read_timeout)
+            .pool_idle_timeout(Duration::from_secs(90));
+        if prior_knowledge {
+            builder = builder.http2_prior_knowledge();
+        }
+        builder.build().map_err(|e| e.to_string())
+    };
+    match cfg.upstream_http2 {
+        UpstreamHttp2::Off => Ok(None),
+        UpstreamHttp2::H2c => Ok(Some(build(true)?)),
+        UpstreamHttp2::Auto => Ok(Some(build(false)?)),
+    }
+}
+
 /// Serve the control protocol over the WebSocket listeners in `listeners` (loopback TCP and/or a
 /// Unix-domain socket), all fronting **one** shared supervisor so a session is reachable over either
 /// transport by its id. Runs until an OS shutdown signal, returning it so the caller exits with the
 /// matching code — same contract as [`serve`](crate::serve::serve). Each accepted connection is
 /// handled concurrently and routed to its session by id.
 pub async fn serve_ws(
-    cfg: ServeConfig,
+    mut cfg: ServeConfig,
     listeners: ServeListeners,
 ) -> Result<Option<Signal>, Box<dyn std::error::Error>> {
+    // W3 (shared upstream pool): build the daemon-wide client once, here, before any session spawns —
+    // `session_cfg` then clones it (a cheap `Arc` bump) into every session. Log the chosen mode loudly
+    // on stderr (the protocol never uses stderr): `h2c` against an h1-only gateway fails *every*
+    // request, so an operator who flipped this on must see the mode they're running.
+    cfg.shared_http = build_shared_h2_client(&cfg)?;
+    match cfg.upstream_http2 {
+        UpstreamHttp2::Off => {
+            eprintln!("serve: upstream-http2=off — each session opens its own connection pool")
+        }
+        UpstreamHttp2::Auto => eprintln!(
+            "serve: upstream-http2=auto — one shared client, HTTP/1.1 pooling (h2 if the hop gains ALPN)"
+        ),
+        UpstreamHttp2::H2c => eprintln!(
+            "serve: upstream-http2=h2c — one shared HTTP/2-cleartext client; REQUIRES an h2c-capable gateway, else every request fails"
+        ),
+    }
+
     let tcp_listener = match listeners.tcp {
         Some(addr) => {
             let listener = TcpListener::bind(addr).await?;

@@ -163,6 +163,12 @@ fn parse_queue_mode(s: &str) -> Result<agent_core::QueueMode, String> {
     }
 }
 
+/// Parse `--upstream-http2`'s value (`off`/`auto`/`h2c`) into [`serve::UpstreamHttp2`] — delegates to
+/// that type's own `FromStr` so the CLI and any programmatic caller share one spelling.
+fn parse_upstream_http2(s: &str) -> Result<serve::UpstreamHttp2, String> {
+    s.parse()
+}
+
 /// Parse `settings::Settings::thinking_budget_overrides`'s plain-string keys into the
 /// `agent_core::ReasoningEffort`-keyed table `agent_core::models::budget_for_effort_with_override`
 /// needs (Task #36, pi-parity feature) — an unrecognized key (a hand-edited typo in `settings.json`) is
@@ -702,6 +708,14 @@ enum Command {
         /// the daemon stops. Ignored without `--listen`/`--listen-uds`.
         #[arg(long, env = "AI_AGENT_SESSION_IDLE_TIMEOUT")]
         session_idle_timeout: Option<u64>,
+        /// How the daemon pools its upstream (agent→gateway) connections across sessions: `off` (the
+        /// default — each session opens its own pool, as before), `auto` (one shared client, HTTP/1.1
+        /// pooling now, h2 if the hop later gains ALPN), or `h2c` (one shared HTTP/2-cleartext client
+        /// multiplexing all sessions over ~one connection). `h2c` **requires** an h2c-capable gateway —
+        /// against an h1-only gateway every request fails — so it stays opt-in. Only meaningful with
+        /// `--listen`/`--listen-uds`; ignored on the stdio path.
+        #[arg(long, env = "AI_AGENT_UPSTREAM_HTTP2", value_parser = parse_upstream_http2, default_value = "off")]
+        upstream_http2: serve::UpstreamHttp2,
         /// Use this exact session id instead of a freshly generated one — a caller (a script, a test
         /// harness) that wants a known, predictable id to correlate against rather than parsing it back
         /// out of `get_state`/the startup `{"kind":"session", id, …}` banner. Applies only when a *new*
@@ -1553,6 +1567,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             listen_uds,
             listen_uds_mode,
             session_idle_timeout,
+            upstream_http2,
             session_id,
             no_session_persistence,
             max_steps,
@@ -1847,6 +1862,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 listen_uds: listen_uds.clone(),
                 listen_uds_mode,
                 session_idle_timeout: session_idle_timeout.map(std::time::Duration::from_secs),
+                upstream_http2,
+                // The daemon path (`serve_ws`) fills this from `upstream_http2` before spawning any
+                // session; the stdio/`run` path leaves it `None` and never pools.
+                shared_http: None,
                 session_id,
                 no_session_persistence,
                 context_window,
