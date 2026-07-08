@@ -17,12 +17,13 @@ use beyond_ai::proxy::AiProxy;
 use beyond_ai::state::GatewayState;
 use beyond_ai::store_watch::WatcherService;
 use clap::{Parser, Subcommand};
+use pingora_core::apps::HttpServerOptions;
 use pingora_core::apps::http_app::HttpServer;
 use pingora_core::server::Server;
 use pingora_core::server::configuration::ServerConf;
 use pingora_core::services::background::background_service;
 use pingora_core::services::listening::Service as ListeningService;
-use pingora_proxy::http_proxy_service;
+use pingora_proxy::ProxyServiceBuilder;
 use std::path::Path;
 use std::process::exit;
 use tracing_subscriber::EnvFilter;
@@ -102,6 +103,7 @@ fn main() {
     let config = load_config(cli.config.as_deref());
     let listen = config.listen.clone();
     let metrics_listen = config.metrics_listen.clone();
+    let downstream_h2c = config.downstream_h2c;
     // Capture the shutdown knobs before `config` is moved into the gateway state below.
     let grace_period_secs = config.shutdown_grace_period_secs;
     let runtime_timeout_secs = config.shutdown_runtime_timeout_secs;
@@ -133,13 +135,22 @@ fn main() {
     let mut server = Server::new_with_opt_and_conf(None, conf);
     server.bootstrap();
 
-    // Client (app) traffic.
-    let mut proxy_svc = http_proxy_service(
+    // Client (app) traffic. Enable downstream HTTP/2 cleartext (h2c) when configured: Pingora peeks
+    // the H2 connection preface and serves h2c, transparently falling back to HTTP/1.1 for h1
+    // clients — so this is backward-compatible. Stays plaintext (no TLS); `add_tcp` is unchanged.
+    let mut proxy_builder = ProxyServiceBuilder::new(
         &server.configuration,
         AiProxy {
             state: state.clone(),
         },
     );
+    if downstream_h2c {
+        // `HttpServerOptions` is `#[non_exhaustive]`, so build via `Default` and set the field.
+        let mut opts = HttpServerOptions::default();
+        opts.h2c = true;
+        proxy_builder = proxy_builder.server_options(opts);
+    }
+    let mut proxy_svc = proxy_builder.build();
     proxy_svc.add_tcp(&listen);
     server.add_service(proxy_svc);
 
@@ -167,6 +178,7 @@ fn main() {
         %metrics_listen,
         grace_period_secs,
         runtime_timeout_secs,
+        downstream_h2c,
         "starting beyond-ai"
     );
     server.run_forever();
