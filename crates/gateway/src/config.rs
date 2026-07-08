@@ -28,6 +28,14 @@ pub struct AiConfig {
     /// Prometheus metrics listener.
     pub metrics_listen: String,
 
+    /// Accept HTTP/2 cleartext (h2c) on the downstream (`listen`) listener, in addition to
+    /// HTTP/1.1. Backward-compatible: Pingora peeks the connection preface and serves h2c only when
+    /// the client sends the H2 preface, otherwise it transparently falls back to HTTP/1.1 — so
+    /// existing h1 clients are unaffected. Lets an on-VM agent multiplex all its sessions over a
+    /// single h2c connection to the gateway (`--upstream-http2 h2c` on the agent side). Default
+    /// `true`; set `false` to force h1-only downstream.
+    pub downstream_h2c: bool,
+
     /// NATS / slipstream connection (cf. `_envcommon/ecs-service.hcl`: `tls://connect.ngs.global`).
     /// Used only for the watched deny-set (`blackhole.*`).
     pub nats_url: String,
@@ -188,6 +196,9 @@ impl Default for AiConfig {
         Self {
             listen: "0.0.0.0:8080".to_string(),
             metrics_listen: "0.0.0.0:9090".to_string(),
+            // Accept downstream h2c by default; it's backward-compatible (h1 clients fall back
+            // transparently) and lets the on-VM agent share one multiplexed connection.
+            downstream_h2c: true,
             nats_url: "nats://localhost:4222".to_string(),
             nats_creds: None,
             nats_creds_file: None,

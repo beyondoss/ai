@@ -335,8 +335,36 @@ pub async fn ws_connect(port: u16, session_id: Option<&str>) -> TestWs {
     ws
 }
 
-/// Send one command object as a single WS text message.
-pub async fn ws_send(ws: &mut TestWs, v: Value) {
+/// A test WebSocket client running over a Unix-domain socket (the `--listen-uds` transport). The
+/// generic stream arm differs from [`TestWs`]'s TCP one, so UDS helpers take this type; the frame
+/// helpers ([`ws_send`], [`ws_next_frame`], [`ws_read_until_response`]) are generic over the stream.
+pub type TestWsUds = tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>;
+
+/// Dial a `serve --listen-uds` socket at `path`, optionally naming a session via the URL. The HTTP
+/// `Host` is ignored over a UDS, so it's a synthetic `localhost`; only the path + `?session_id=` query
+/// matter (the handshake validates the path and parses the session id).
+pub async fn ws_connect_uds(path: &std::path::Path, session_id: Option<&str>) -> TestWsUds {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let url = match session_id {
+        Some(id) => format!("ws://localhost{WS_PATH}?session_id={id}"),
+        None => format!("ws://localhost{WS_PATH}"),
+    };
+    let request = url.into_client_request().expect("build ws request");
+    let stream = tokio::net::UnixStream::connect(path)
+        .await
+        .expect("connect unix socket");
+    let (ws, _resp) = tokio_tungstenite::client_async(request, stream)
+        .await
+        .expect("websocket handshake over uds");
+    ws
+}
+
+/// Send one command object as a single WS text message. Generic over the underlying transport so the
+/// same helper drives both the TCP ([`TestWs`]) and UDS ([`TestWsUds`]) clients.
+pub async fn ws_send<T>(ws: &mut tokio_tungstenite::WebSocketStream<T>, v: Value)
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     use futures::SinkExt as _;
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         v.to_string().into(),
@@ -346,7 +374,10 @@ pub async fn ws_send(ws: &mut TestWs, v: Value) {
 }
 
 /// Read the next JSON frame (skipping ping/pong/binary), or `None` if the socket closed.
-pub async fn ws_next_frame(ws: &mut TestWs) -> Option<Value> {
+pub async fn ws_next_frame<T>(ws: &mut tokio_tungstenite::WebSocketStream<T>) -> Option<Value>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     use futures::StreamExt as _;
     use tokio_tungstenite::tungstenite::Message;
     while let Some(msg) = ws.next().await {
@@ -364,7 +395,13 @@ pub async fn ws_next_frame(ws: &mut TestWs) -> Option<Value> {
 }
 
 /// Collect WS frames until the `response` frame for `command` arrives (or the socket closes).
-pub async fn ws_read_until_response(ws: &mut TestWs, command: &str) -> Vec<Value> {
+pub async fn ws_read_until_response<T>(
+    ws: &mut tokio_tungstenite::WebSocketStream<T>,
+    command: &str,
+) -> Vec<Value>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let mut frames = Vec::new();
     while let Some(v) = ws_next_frame(ws).await {
         let done = v.get("type").and_then(Value::as_str) == Some("response")
