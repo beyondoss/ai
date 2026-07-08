@@ -20,6 +20,7 @@ pub mod prompts;
 pub mod resources;
 pub mod retry;
 pub mod serve;
+pub mod serve_ws;
 pub mod session_store;
 pub mod settings;
 pub mod skills;

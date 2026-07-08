@@ -23,7 +23,10 @@ use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 
-use common::{DEV_PUBKEY_B64, DEV_TOKEN, free_port, gateway_bin, wait_for_port};
+use common::{
+    DEV_PUBKEY_B64, DEV_TOKEN, free_port, gateway_bin, wait_for_port, ws_connect, ws_next_frame,
+    ws_read_until_response, ws_send,
+};
 use serde_json::{Value, json};
 
 /// A live provider profile: the env var holding its key, the gateway pool-key name (= the provider
@@ -1988,6 +1991,206 @@ fn smoke_whole_run_auto_retry_recovers_from_a_real_dropped_connection_live() {
             elapsed >= std::time::Duration::from_secs(1),
             "[{}] recovery should show real backoff delay, not an instant success suspiciously \
              consistent with the proxy never actually being exercised: {elapsed:?}",
+            p.name
+        );
+    }
+}
+
+/// Spawn a `serve --listen` child against the gateway on `gw_port`, persisting per-session files under
+/// `session_dir`, bound to WebSocket `ws_port`. The WebSocket transport uses stdio for nothing, so null
+/// it. Mirrors [`serve_child`] but for the `serve_ws` path.
+fn serve_ws_child(
+    gw_port: u16,
+    cwd: &Path,
+    model: &str,
+    session_dir: &Path,
+    ws_port: u16,
+) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+        .args([
+            "serve",
+            "--listen",
+            &format!("127.0.0.1:{ws_port}"),
+            "--gateway-url",
+            &format!("http://127.0.0.1:{gw_port}"),
+            "--key",
+            DEV_TOKEN,
+            "--model",
+            model,
+            "--max-steps",
+            "6",
+            "--session-dir",
+            session_dir.to_str().unwrap(),
+        ])
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn serve --listen")
+}
+
+/// (iv) Live end-to-end over the **WebSocket** transport: a real prompt drives a real tool round-trip
+/// through the real gateway to a real provider, and the streamed `ack` → `event` → `response` arrive
+/// over the socket. The WS analogue of [`smoke_tool_round_trip`] — the definitive proof the transport
+/// carries a real session end to end, not just the deterministic mock.
+#[tokio::test]
+#[ignore = "live provider smoke; run via `mise run test:smoke:agent` with a provider key set"]
+async fn smoke_ws_prompt_round_trip_live() {
+    let providers = available();
+    if providers.is_empty() {
+        eprintln!("smoke[ws-prompt]: no provider key set — skipping");
+        return;
+    }
+    for p in providers {
+        let key = env_key(p.env).expect("provider key present");
+        let token = "PINEAPPLE-7493";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("marker.txt"), format!("{token}\n")).unwrap();
+        let (gw_port, mut gateway) = boot_gateway(dir.path(), p.pool, &key);
+        let session_dir = dir.path().join("sessions");
+        let ws_port = free_port();
+        let mut child = serve_ws_child(gw_port, dir.path(), p.model, &session_dir, ws_port);
+        wait_for_port(ws_port);
+
+        let mut ws = ws_connect(ws_port, None).await;
+        ws_send(
+            &mut ws,
+            json!({
+                "type": "prompt",
+                "id": "p1",
+                "message": "Use the read tool to read the file marker.txt in the current directory, then reply with ONLY the exact token it contains.",
+            }),
+        )
+        .await;
+        let frames = ws_read_until_response(&mut ws, "prompt").await;
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = gateway.kill();
+        let _ = gateway.wait();
+
+        eprintln!("--- [{}] ws prompt frames ---\n{frames:#?}", p.name);
+        let ack_pos = frames
+            .iter()
+            .position(|f| f["type"] == "ack" && f["command"] == "prompt")
+            .unwrap_or_else(|| panic!("[{}] no ack frame: {frames:#?}", p.name));
+        let event_pos = frames
+            .iter()
+            .position(|f| f["type"] == "event")
+            .unwrap_or_else(|| panic!("[{}] no event frame: {frames:#?}", p.name));
+        assert!(
+            ack_pos < event_pos,
+            "[{}] ack must precede the first event",
+            p.name
+        );
+        let resp = frames.last().unwrap();
+        assert_eq!(
+            resp["success"], true,
+            "[{}] the live prompt over the socket should succeed: {resp}",
+            p.name
+        );
+        let dump = frames.iter().map(|f| f.to_string()).collect::<String>();
+        assert!(
+            dump.contains(token),
+            "[{}] the model should have read the file via the tool and echoed `{token}` over the socket.\n{dump}",
+            p.name
+        );
+    }
+}
+
+/// (v) The option-C end-to-end proof against a **real** model: a run held open by a real `bash sleep`
+/// survives a dropped WebSocket, and a reconnecting client re-attaches to the still-running run and
+/// sees it complete. This is what distinguishes live re-attach from today's disconnect-aborts behavior.
+#[tokio::test]
+#[ignore = "live provider smoke; run via `mise run test:smoke:agent` with a provider key set"]
+async fn smoke_ws_run_survives_reconnect_live() {
+    const SID: &str = "wsreattachlive1";
+    let providers = available();
+    if providers.is_empty() {
+        eprintln!("smoke[ws-reattach]: no provider key set — skipping");
+        return;
+    }
+    for p in providers {
+        let key = env_key(p.env).expect("provider key present");
+        let dir = tempfile::tempdir().unwrap();
+        let (gw_port, mut gateway) = boot_gateway(dir.path(), p.pool, &key);
+        let session_dir = dir.path().join("sessions");
+        let ws_port = free_port();
+        let mut child = serve_ws_child(gw_port, dir.path(), p.model, &session_dir, ws_port);
+        wait_for_port(ws_port);
+
+        // ws1 starts a run that runs `bash sleep 8` (a wide, real in-flight window), waits until the
+        // tool is actually running, then drops mid-run.
+        let mut ws1 = ws_connect(ws_port, Some(SID)).await;
+        ws_send(
+            &mut ws1,
+            json!({
+                "type": "prompt",
+                "id": "p1",
+                "message": "Run this exact shell command with the bash tool: sleep 8. After it finishes, reply with ONLY the word DONE.",
+            }),
+        )
+        .await;
+        let mut running = false;
+        for _ in 0..2000 {
+            match ws_next_frame(&mut ws1).await {
+                Some(f) if f["type"] == "event" && f["event"]["kind"] == "tool_start" => {
+                    running = true;
+                    break;
+                }
+                Some(_) => continue,
+                None => break,
+            }
+        }
+        assert!(
+            running,
+            "[{}] the bash tool should start (run in flight)",
+            p.name
+        );
+        drop(ws1); // mobile network drop mid-run
+
+        // ws2 re-attaches to the same session; the run is still sleeping on the real host.
+        let mut ws2 = ws_connect(ws_port, Some(SID)).await;
+        ws_send(&mut ws2, json!({ "type": "get_state" })).await;
+        let frames = ws_read_until_response(&mut ws2, "get_state").await;
+        assert_eq!(
+            frames.last().unwrap()["data"]["session_id"],
+            SID,
+            "[{}] the reconnecting client re-attaches to the same session id",
+            p.name
+        );
+
+        // The run completes on ws2 even though ws2 never issued the prompt — it was never aborted.
+        let frames = ws_read_until_response(&mut ws2, "prompt").await;
+        let resp = frames
+            .iter()
+            .rev()
+            .find(|f| f["type"] == "response" && f["command"] == "prompt")
+            .unwrap_or_else(|| {
+                panic!(
+                    "[{}] the in-flight run should complete on ws2: {frames:#?}",
+                    p.name
+                )
+            });
+        assert_eq!(
+            resp["success"], true,
+            "[{}] the run that survived the drop should succeed: {resp}",
+            p.name
+        );
+
+        ws_send(&mut ws2, json!({ "type": "get_messages" })).await;
+        let frames = ws_read_until_response(&mut ws2, "get_messages").await;
+        let dump = frames.last().unwrap()["data"]["messages"].to_string();
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = gateway.kill();
+        let _ = gateway.wait();
+
+        assert!(
+            dump.to_uppercase().contains("DONE"),
+            "[{}] the reconnected run should have finished the sleep and replied DONE: {dump}",
             p.name
         );
     }

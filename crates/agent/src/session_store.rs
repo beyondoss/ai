@@ -3815,7 +3815,7 @@ fn now_secs() -> u64 {
 /// (the OS-seeded hasher `HashMap` uses), so independent processes diverge even at the same instant;
 /// within a process the monotonic `seq` breaks same-nanosecond ties. The nanosecond prefix keeps ids
 /// sortable by creation. A UUID-shaped string isn't required — global uniqueness and ordering are.
-fn new_id() -> String {
+pub(crate) fn new_id() -> String {
     use std::collections::hash_map::RandomState;
     use std::hash::BuildHasher;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -3832,6 +3832,28 @@ fn new_id() -> String {
         .unwrap_or(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     format!("{nanos:x}-{salt:016x}-{seq:x}")
+}
+
+/// Whether `id` is safe to embed directly in a filename component — alphanumeric, optionally with
+/// `.`/`_`/`-` in the middle, starting and ending with a letter or digit. Matches pi's
+/// `assertValidSessionId` (`^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$`); rejects anything that could
+/// resolve to a path outside the sessions directory (a leading `/` or `..`, an embedded `/`, etc.) or
+/// be empty. Lives here (not just in `main.rs`) so the WebSocket transport ([`crate::serve_ws`]) can
+/// validate a client-supplied `?session_id=` before it ever becomes a filename component.
+pub fn is_valid_session_id(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    let is_alnum = |b: u8| b.is_ascii_alphanumeric();
+    match bytes {
+        [] => false,
+        [only] => is_alnum(*only),
+        [first, .., last] => {
+            is_alnum(*first)
+                && is_alnum(*last)
+                && bytes
+                    .iter()
+                    .all(|&b| is_alnum(b) || b == b'.' || b == b'_' || b == b'-')
+        }
+    }
 }
 
 #[cfg(test)]

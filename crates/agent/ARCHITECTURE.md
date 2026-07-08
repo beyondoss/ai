@@ -16,6 +16,20 @@ CLI, and the `serve` control protocol built on top of them.
 
 The harness layers several capabilities over the bare tools + loop:
 
+- **`serve` transports** ([`serve`](src/serve.rs), [`serve_ws`](src/serve_ws.rs)) — the headless
+  control protocol runs over **stdio** (default, one line per command/frame — built for an `ssh` pipe)
+  or a **WebSocket** (`--listen <addr>`, one text message per command/frame). The protocol is
+  byte-identical across both; both feed the transport-agnostic `serve::serve_session` core, which reads
+  commands from an `mpsc` channel and emits frames to whichever connection is currently attached. The
+  key property this buys the WebSocket path: **the session is a view, not owned by the connection** — a
+  dropped mobile client does not abort the run (the retained input `Sender` means a dropped socket is
+  not an EOF), and a reconnecting client (same `?session_id=`) re-attaches to the same still-running
+  session, catching up via `get_messages {since}`. `serve_ws` owns a `session id → running session`
+  map; each session runs on its own thread (its event sink isn't `Send`), persists to its own
+  `<session-dir>/<id>.jsonl`, and is superseded last-attach-wins if a second connection claims its id.
+  Auth is **not** this crate's concern: `serve_ws` binds loopback/internal only and trusts the front
+  door (the edge) — it never parses a user token. See serve.rs's module doc for the full command/frame
+  reference and the reconnect flow.
 - **Trust** ([`trust_store`](src/trust_store.rs)) — a tri-state, ancestor-inheriting allowlist
   (`~/.claude/trusted-projects.json`: `{trusted: [...], untrusted: [...]}`, most-specific directory
   wins, untrusted checked first at each level) gates the project-local `SYSTEM.md`/`APPEND_SYSTEM.md`

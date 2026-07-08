@@ -129,13 +129,23 @@ http = "1"
 # `url` (already an existing direct dependency, for the OAuth module's own callback-URL parsing).
 rmcp = { version = "2.1.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest", "auth"] }
 
+# `serve --listen`'s WebSocket transport (`serve_ws`): the server/`accept_async` side. Only
+# `handshake` is needed here (a plain-`ws://` loopback listener — the edge terminates TLS in front of
+# us, so no TLS feature). Same crate + exact version `agent-core` already depends on for its Codex
+# *client* WS (`["connect", "handshake", "rustls-tls-native-roots"]`); Cargo unifies the feature sets,
+# so this adds nothing new to the build graph — it just enables our own use of the accept path.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
+
 [dev-dependencies]
+# The client side of the WebSocket transport, for `tests/serve_websocket.rs` and the live WS smokes:
+# `connect_async` to a `ws://127.0.0.1` listener (no TLS). Same crate/version as the non-dev dep above.
 # Scratch files/dirs for the file-tool tests.
 # Bench harness for the search tools. `divan` (the gateway's `bench:unit` pin) measures **allocations**
 # (via its `AllocProfiler` global allocator) alongside timing — so the search bench proves both the
 # speed and the allocation cost of our in-process engine vs shelling out to `rg` (pi's approach).
 divan = "0.1"
 tempfile = "3"
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake"] }
 
 [[bench]]
 name = "search"
