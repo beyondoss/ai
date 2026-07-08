@@ -934,13 +934,17 @@ async fn health_endpoints_report_ready_on_the_metrics_listener() {
     );
 
     let (ready_status, ready_body) = gw.admin_get("/readyz").await;
+    // The load-bearing invariant is that readyz stays **200** with NATS down (fail-open) — never a 5xx
+    // that would evict the pod. The body is `"ok"` until the deny-set watcher notices NATS dropped and
+    // `"degraded"` after; since we stop NATS just above, either is valid and which one we observe is a
+    // race with the watcher's disconnect detection (previously this asserted only `"ok"` and flaked).
     assert_eq!(
         ready_status, 200,
         "readyz should be 200 even with NATS down (fail-open): {ready_body}"
     );
     assert!(
-        ready_body.contains("\"status\":\"ok\""),
-        "readyz body: {ready_body}"
+        ready_body.contains("\"status\":\"ok\"") || ready_body.contains("\"status\":\"degraded\""),
+        "readyz body should be ok or degraded (both fail-open 200s): {ready_body}"
     );
 
     // An unknown admin path is a clean 404, not a hang or a 200.

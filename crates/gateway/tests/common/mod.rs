@@ -611,6 +611,10 @@ impl GatewayBuilder {
             config_path,
         };
         wait_for_port(port, "beyond-ai").await;
+        // The metrics/admin listener (`/livez`, `/readyz`, `/metrics`) binds on a *separate* port from
+        // the proxy; wait for it too, or a test that probes it right after `start()` races the bind
+        // (pre-existing flake in `health_endpoints_report_ready_on_the_metrics_listener`).
+        wait_for_port(metrics_port, "beyond-ai-metrics").await;
         gw
     }
 }
@@ -659,11 +663,25 @@ impl Gateway {
     /// GET a path on the admin/metrics listener, returning `(status, body)`. Used to probe
     /// `/livez` and `/readyz` (which live on `metrics_port`, alongside `/metrics`).
     pub async fn admin_get(&self, path: &str) -> (u16, String) {
-        let resp = reqwest::get(format!("http://127.0.0.1:{}{path}", self.metrics_port))
-            .await
-            .unwrap();
-        let status = resp.status().as_u16();
-        (status, resp.text().await.unwrap())
+        // Retry briefly: the listener is bound (we waited for the port), but the app can answer a
+        // connection with a transient non-200 for a few ms right after startup. Retry a handful of
+        // times before giving up, so a startup-timing blip doesn't flake the probe.
+        let url = format!("http://127.0.0.1:{}{path}", self.metrics_port);
+        for attempt in 0..20 {
+            match reqwest::get(&url).await {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let body = resp.text().await.unwrap_or_default();
+                    if status == 200 || attempt == 19 {
+                        return (status, body);
+                    }
+                }
+                Err(_) if attempt < 19 => {}
+                Err(e) => panic!("admin_get {url} failed: {e}"),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        unreachable!("admin_get loop always returns")
     }
 }
 
