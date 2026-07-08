@@ -2376,3 +2376,72 @@ async fn smoke_h2c_shared_pool_live() {
         }
     }
 }
+
+/// Live end-to-end multi-attach: a "phone" and a "tui" on the SAME session at the same time. A prompt
+/// driven from one connection streams — through the real gateway to a real model — to BOTH sockets
+/// live. The proof of fan-out output (no last-attach-wins eviction): the device that didn't drive the
+/// run still sees the assistant's tokens as they stream.
+#[tokio::test]
+#[ignore = "live provider smoke; run via `mise run test:smoke:agent` with a provider key set"]
+async fn smoke_multi_attach_both_see_live_stream() {
+    let providers = available();
+    if providers.is_empty() {
+        eprintln!("smoke[multi-attach]: no provider key set — skipping");
+        return;
+    }
+    for p in providers {
+        let key = env_key(p.env).expect("provider key present");
+        let token = "GRAPEFRUIT-3307";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("marker.txt"), format!("{token}\n")).unwrap();
+        let (gw_port, mut gateway) = boot_gateway(dir.path(), p.pool, &key);
+        let session_dir = dir.path().join("sessions");
+        let ws_port = free_port();
+        let mut child = serve_ws_child(gw_port, dir.path(), p.model, &session_dir, ws_port);
+        wait_for_port(ws_port);
+
+        const SID: &str = "multiattachlive1";
+        // Two devices on ONE session, at the same time.
+        let mut phone = ws_connect(ws_port, Some(SID)).await;
+        let mut tui = ws_connect(ws_port, Some(SID)).await;
+
+        // Drive from the "phone"; the "tui" must see the same run stream live.
+        ws_send(
+            &mut phone,
+            json!({
+                "type": "prompt",
+                "id": "p1",
+                "message": "Use the read tool to read marker.txt in the current directory, then reply with ONLY the exact token it contains.",
+            }),
+        )
+        .await;
+        let pf = ws_read_until_response(&mut phone, "prompt").await;
+        let tf = ws_read_until_response(&mut tui, "prompt").await;
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = gateway.kill();
+        let _ = gateway.wait();
+
+        for (who, frames) in [("phone", &pf), ("tui", &tf)] {
+            eprintln!("--- [{}] {who} frames ---\n{frames:#?}", p.name);
+            assert!(
+                frames.iter().any(|f| f["type"] == "event"),
+                "[{}] {who} must receive live events: {frames:#?}",
+                p.name
+            );
+            let resp = frames
+                .iter()
+                .rev()
+                .find(|f| f["type"] == "response" && f["command"] == "prompt")
+                .unwrap_or_else(|| panic!("[{}] {who} must receive the prompt response", p.name));
+            assert_eq!(resp["success"], true, "[{}] {who}: {resp}", p.name);
+            let dump = frames.iter().map(|f| f.to_string()).collect::<String>();
+            assert!(
+                dump.contains(token),
+                "[{}] {who} must see the token `{token}` streamed live.\n{dump}",
+                p.name
+            );
+        }
+    }
+}

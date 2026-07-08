@@ -52,7 +52,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, 
 use tokio_util::sync::CancellationToken;
 
 use crate::serve::{
-    OutFrame, ServeConfig, SharedOutConn, Signal, UpstreamHttp2, frame_to_line,
+    OutFanout, OutFrame, ServeConfig, SharedOutConn, Signal, UpstreamHttp2, frame_to_line,
     lock_ignoring_poison, serve_session,
 };
 use crate::session_store::{is_valid_session_id, new_id, scan_listings, scan_session_dir};
@@ -70,21 +70,23 @@ const PING_INTERVAL: Duration = Duration::from_secs(30);
 /// of shutting down (see the module doc).
 struct SessionHandle {
     /// Feeds command lines into the session's [`serve_session`] loop. Held here (not by any socket) so
-    /// the session outlives its connections.
+    /// the session outlives its connections. Every attached connection feeds this one channel, so any
+    /// device can drive the session (its `mpsc` is multi-sender).
     input_tx: mpsc::UnboundedSender<String>,
-    /// The session's swappable output tail: the supervisor rebinds this to each newly-attached
-    /// connection's send channel, or leaves the previous one (whose receiver is gone) to drop frames.
+    /// The session's set of attached connections — its output is **broadcast** to all of them, so a
+    /// phone and a TUI (or any N of the user's devices) on one session all see the live stream at once
+    /// (see [`crate::serve::OutFanout`]). Each connection registers its sink on attach and removes it on
+    /// disconnect.
     out_conn: SharedOutConn,
-    /// The currently-attached connection's cancellation token, if any. A new attach cancels it
-    /// (last-attach-wins) so a stale socket from a flaky reconnect can't keep feeding the session.
-    conn_cancel: Option<CancellationToken>,
     /// The session's dedicated thread. Retained so a graceful shutdown can **wait** for the session to
     /// persist and exit (dropping `input_tx` closes its input, then this joins) rather than letting
     /// `process::exit` race the persist. `None` only transiently while a handle is being moved out.
     join: Option<std::thread::JoinHandle<()>>,
-    /// When the last connection detached (left `conn_cancel` `None`), for the idle reaper's clock.
-    /// `None` while a connection is attached (`conn_cancel.is_some()`) or on a fresh, never-detached
-    /// session — either way the session isn't eligible for idle reaping yet.
+    /// How many connections are currently attached. The idle reaper only considers a session for
+    /// reclamation when this reaches `0` (see [`Self::last_detached_at`]).
+    attached: usize,
+    /// When the last connection detached (`attached` reached `0`), for the idle reaper's clock. `None`
+    /// while any connection is attached, or on a fresh session — either way it isn't reap-eligible yet.
     last_detached_at: Option<Instant>,
     /// `true` exactly while the session's [`serve_session`] loop is running a `prompt`. The reaper reads
     /// it so a detached-but-mid-run background session is never reaped out from under an in-flight turn.
@@ -137,11 +139,10 @@ impl Supervisor {
     {
         let id = requested_id.unwrap_or_else(new_id);
 
-        // Look up (or spawn) the session and supersede any prior connection — all under the map lock,
-        // which is never held across an `.await`. `my_cancel` doubles as this attach's *identity*: only
-        // a superseding attach ever cancels it (see the teardown below), so `is_cancelled()` later means
-        // "someone took over this session," never "this socket closed."
-        let (input_tx, out_conn, my_cancel) = {
+        // Look up (or spawn) the session and register this connection — all under the map lock, which is
+        // never held across an `.await`. No eviction: multiple connections coexist on one session (the
+        // output fans out to all; input is shared), so a phone and a TUI can watch/drive it together.
+        let (input_tx, out_conn) = {
             let mut sessions = lock_ignoring_poison(&self.sessions);
 
             // A handle whose session task has ended (SIGTERM, internal error) has a closed `input_tx`;
@@ -152,7 +153,7 @@ impl Supervisor {
 
             let handle = sessions.entry(id.clone()).or_insert_with(|| {
                 let (input_tx, input_rx) = mpsc::unbounded_channel::<String>();
-                let out_conn: SharedOutConn = Arc::new(Mutex::new(None));
+                let out_conn: SharedOutConn = Arc::new(Mutex::new(OutFanout::default()));
                 let cfg = self.session_cfg(&id);
                 let session_out = out_conn.clone();
                 let log_id = id.clone();
@@ -187,35 +188,28 @@ impl Supervisor {
                 SessionHandle {
                     input_tx,
                     out_conn,
-                    conn_cancel: None,
                     join: Some(join),
+                    attached: 0,
                     last_detached_at: None,
                     running,
                 }
             });
 
-            // Last-attach-wins: cancel whoever was attached before us.
-            if let Some(prev) = handle.conn_cancel.take() {
-                prev.cancel();
-            }
-            let my_cancel = CancellationToken::new();
-            handle.conn_cancel = Some(my_cancel.clone());
-            // Attached again ⇒ not idle: clear any detach timestamp so the reaper's clock only ever runs
-            // while genuinely detached (`conn_cancel.is_none()`).
+            // Register, don't evict: one more attached connection, and clear any detach timestamp so the
+            // reaper's clock only runs while genuinely detached (`attached == 0`).
+            handle.attached += 1;
             handle.last_detached_at = None;
-            (handle.input_tx.clone(), handle.out_conn.clone(), my_cancel)
+            (handle.input_tx.clone(), handle.out_conn.clone())
         };
 
-        // Bind this connection's send channel as the session's output tail. Rebinding drops the prior
-        // `conn_tx`, which closes the prior send task's receiver (a second teardown path alongside the
-        // cancel token above).
+        // Register this connection's send channel as one of the session's output sinks — the session
+        // broadcasts every frame to all registered sinks. Keep the `sink_id` to remove it on disconnect.
         let (conn_tx, mut conn_rx) = mpsc::unbounded_channel::<OutFrame>();
-        // A direct handle to *this* connection's send channel, kept for supervisor-level replies (the
-        // `list_daemon_sessions` command below) that must go back to this socket rather than through the
-        // session's swappable `out_conn` tail. Feeds the same `conn_rx`/send task; a supersession that
-        // rebinds `out_conn` doesn't affect it.
+        // A direct handle to *this* connection's send channel, for supervisor-level replies (the
+        // `list_daemon_sessions` command below) that must go back to *this* socket only, not fan out to
+        // the other attached connections. Feeds the same `conn_rx`/send task.
         let reply_tx = conn_tx.clone();
-        *lock_ignoring_poison(&out_conn) = Some(conn_tx);
+        let sink_id = lock_ignoring_poison(&out_conn).add(conn_tx);
 
         let (mut sink, mut stream) = ws.split();
 
@@ -223,10 +217,9 @@ impl Supervisor {
         // replies, and periodic keepalive `Ping`s — funnels through it so the single sink has one
         // writer. `ctrl_rx` carries the read loop's `Pong` replies.
         let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<Message>();
-        // A *separate* token from `my_cancel`: this one stops only this connection's send task at
-        // teardown, leaving `my_cancel` to mean supersession exclusively (so the teardown's
-        // "am I still the current attach?" check stays unambiguous). The send task also stops on its own
-        // when a superseding attach rebinds `out_conn` and drops our `conn_tx`, closing `conn_rx`.
+        // Stops this connection's send task at teardown (when its read loop ends on socket close). The
+        // send task also stops on its own if `conn_rx` closes (this connection's sink removed + `reply_tx`
+        // dropped).
         let send_cancel = CancellationToken::new();
         let send_task_cancel = send_cancel.clone();
         let send_task = tokio::spawn(async move {
@@ -238,6 +231,7 @@ impl Supervisor {
                     _ = send_task_cancel.cancelled() => break,
                     // A closed `conn_rx` means we were superseded (out_conn rebound) or the session
                     // ended — stop writing to this socket.
+                    // A closed `conn_rx` means this connection's sink was removed (teardown) — stop.
                     frame = conn_rx.recv() => match frame {
                         Some(frame) => if let Some(line) = frame_to_line(frame) {
                             if sink.send(Message::Text(line.into())).await.is_err() {
@@ -264,11 +258,11 @@ impl Supervisor {
         });
 
         // Read loop: this socket's inbound messages. Each text message is exactly one command line fed
-        // into the session; the session (not this loop) decides what to do with it.
+        // into the session; the session (not this loop) decides what to do with it. Ends when the socket
+        // closes — there's no eviction, so a peer connection never tears this one down.
         loop {
             tokio::select! {
                 biased;
-                _ = my_cancel.cancelled() => break,
                 msg = stream.next() => {
                     let Some(msg) = msg else { break }; // socket closed
                     let msg = match msg {
@@ -312,23 +306,19 @@ impl Supervisor {
             }
         }
 
-        // This connection is done; stop its send task. The session keeps running — a later connection
-        // re-attaches by id. We deliberately do NOT reset `out_conn` to `None`: the next attach
-        // overwrites it, and until then the session's writer harmlessly drops frames into this now-dead
-        // channel.
+        // This connection is done. Remove its sink from the fanout (the session stops writing to this
+        // socket) and stop its send task. The session keeps running — other connections stay attached,
+        // and even the last one leaving just detaches (the run lives on for a reconnect).
+        lock_ignoring_poison(&out_conn).remove(sink_id);
         send_cancel.cancel();
         let _ = send_task.await;
 
-        // Mark the session detached so the idle reaper can start its clock — but only if we're still the
-        // current attach. Re-check `my_cancel.is_cancelled()` *under the map lock*: a superseding attach
-        // cancels our token and rebinds `conn_cancel` while holding this same lock, so whichever of us
-        // takes it first wins cleanly. If we were superseded, the new attach owns `conn_cancel`/
-        // `last_detached_at` and we must not clobber it.
+        // One fewer attached connection; if that was the last, start the idle reaper's clock.
         {
             let mut sessions = lock_ignoring_poison(&self.sessions);
-            if !my_cancel.is_cancelled() {
-                if let Some(h) = sessions.get_mut(&id) {
-                    h.conn_cancel = None;
+            if let Some(h) = sessions.get_mut(&id) {
+                h.attached = h.attached.saturating_sub(1);
+                if h.attached == 0 {
                     h.last_detached_at = Some(Instant::now());
                 }
             }
@@ -406,18 +396,18 @@ impl Supervisor {
     }
 
     /// Idle reaper (only spawned when [`ServeConfig::session_idle_timeout`] is set): reclaim every
-    /// session that has been **detached** (`conn_cancel.is_none()`) for at least `timeout`, whose input
-    /// channel is still open, and that isn't mid-`prompt` (`running`). Removing the handle drops its
-    /// retained `input_tx`, so the session observes EOF and persists+exits exactly as in [`shutdown`];
-    /// the join then waits for that persist to land. A reconnect to a just-reaped id transparently
-    /// respawns and replays via `get_messages{since}`.
+    /// session that has been **detached** (`attached == 0`) for at least `timeout`, whose input channel
+    /// is still open, and that isn't mid-`prompt` (`running`). Removing the handle drops its retained
+    /// `input_tx`, so the session observes EOF and persists+exits exactly as in [`shutdown`]; the join
+    /// then waits for that persist to land. A reconnect to a just-reaped id transparently respawns and
+    /// replays via `get_messages{since}`.
     async fn reap_idle(&self, timeout: Duration) {
         let joins: Vec<std::thread::JoinHandle<()>> = {
             let mut sessions = lock_ignoring_poison(&self.sessions);
             let reap: Vec<String> = sessions
                 .iter()
                 .filter(|(_, h)| {
-                    h.conn_cancel.is_none()
+                    h.attached == 0
                         && h.last_detached_at.is_some_and(|d| d.elapsed() >= timeout)
                         && !h.input_tx.is_closed()
                         && !h.running.load(Ordering::Relaxed)
