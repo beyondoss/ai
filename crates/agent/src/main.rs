@@ -1913,7 +1913,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // WebSocket transport (TCP and/or UDS): one session per `?session_id=`, each outliving its
             // connection so a dropped client re-attaches to a still-running run (see `serve_ws`). Both
             // listeners front one shared supervisor. Absent both ⇒ the default stdio transport.
-            let use_ws = serve_cfg.listen.is_some() || serve_cfg.listen_uds.is_some();
+            //
+            // systemd socket activation: if systemd started us with a passed socket (`LISTEN_FDS`) and
+            // no explicit listen flag was given, adopt that socket instead of binding — the socket then
+            // outlives a `systemctl restart` (connections queue in the kernel). Unix/systemd only, and
+            // deferred to `--listen`/`--listen-uds` when either is set.
+            let systemd_activated = cfg!(unix)
+                && serve_cfg.listen.is_none()
+                && serve_cfg.listen_uds.is_none()
+                && std::env::var_os("LISTEN_FDS").is_some();
+            let use_ws =
+                serve_cfg.listen.is_some() || serve_cfg.listen_uds.is_some() || systemd_activated;
             let shutdown_cause = if use_ws {
                 #[cfg(not(unix))]
                 if listen_uds.is_some() {
@@ -1925,6 +1935,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     uds: serve_cfg.listen_uds.clone(),
                     #[cfg(unix)]
                     uds_mode: serve_cfg.listen_uds_mode,
+                    systemd: systemd_activated,
                 };
                 serve_ws::serve_ws(serve_cfg, listeners).await?
             } else {

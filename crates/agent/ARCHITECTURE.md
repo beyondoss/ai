@@ -25,7 +25,11 @@ The harness layers several capabilities over the bare tools + loop:
   the same id), and can be bound simultaneously. UDS is the local-authz story TCP loopback can't give:
   the socket is `chmod`ed (default `0o600`, `--listen-uds-mode`), so kernel filesystem permissions —
   not "anything on `127.0.0.1`" — decide who may connect; stale sockets are reclaimed with a
-  connect-probe (never clobbering a live daemon). The protocol is byte-identical across all transports;
+  connect-probe (never clobbering a live daemon). Under **systemd socket activation** (`LISTEN_FDS`
+  set, no explicit listen flag), the daemon _adopts_ the socket systemd bound and passed as fd 3
+  (`listenfd`, honoring the `LISTEN_PID` guard) instead of binding its own — so the socket outlives a
+  `systemctl restart` (connections queue in the kernel) and systemd owns its perms/lifecycle. The
+  protocol is byte-identical across all transports;
   all feed the transport-agnostic `serve::serve_session` core, which reads
   commands from an `mpsc` channel and emits frames to whichever connection is currently attached. The
   key property this buys the WebSocket path: **the session is a view, not owned by the connection** — a
