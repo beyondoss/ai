@@ -24,8 +24,8 @@ use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 
 use common::{
-    DEV_PUBKEY_B64, DEV_TOKEN, free_port, gateway_bin, wait_for_port, ws_connect, ws_next_frame,
-    ws_read_until_response, ws_send,
+    DEV_PUBKEY_B64, DEV_TOKEN, free_port, gateway_bin, wait_for_port, ws_connect, ws_connect_uds,
+    ws_next_frame, ws_read_until_response, ws_send,
 };
 use serde_json::{Value, json};
 
@@ -2193,5 +2193,186 @@ async fn smoke_ws_run_survives_reconnect_live() {
             "[{}] the reconnected run should have finished the sleep and replied DONE: {dump}",
             p.name
         );
+    }
+}
+
+/// Spawn a `serve --listen-uds <sock>` child (UDS transport) against the gateway on `gw_port`.
+fn serve_uds_child(
+    gw_port: u16,
+    cwd: &Path,
+    model: &str,
+    session_dir: &Path,
+    sock: &Path,
+) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+        .args([
+            "serve",
+            "--listen-uds",
+            sock.to_str().unwrap(),
+            "--gateway-url",
+            &format!("http://127.0.0.1:{gw_port}"),
+            "--key",
+            DEV_TOKEN,
+            "--model",
+            model,
+            "--max-steps",
+            "6",
+            "--session-dir",
+            session_dir.to_str().unwrap(),
+        ])
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn serve --listen-uds")
+}
+
+/// Block until `sock` accepts a Unix-socket connection, or panic after ~5s.
+fn wait_for_uds(sock: &Path) {
+    for _ in 0..500 {
+        if std::os::unix::net::UnixStream::connect(sock).is_ok() {
+            return;
+        }
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("unix socket {} never came up", sock.display());
+}
+
+/// Live end-to-end over the **Unix-domain-socket** transport: a real prompt drives a real tool
+/// round-trip through the real gateway to a real provider, over a UDS instead of TCP. The definitive
+/// proof the UDS transport carries a real session end to end (the same protocol, a different socket).
+#[tokio::test]
+#[ignore = "live provider smoke; run via `mise run test:smoke:agent` with a provider key set"]
+async fn smoke_uds_prompt_round_trip_live() {
+    let providers = available();
+    if providers.is_empty() {
+        eprintln!("smoke[uds-prompt]: no provider key set — skipping");
+        return;
+    }
+    for p in providers {
+        let key = env_key(p.env).expect("provider key present");
+        let token = "TANGERINE-5521";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("marker.txt"), format!("{token}\n")).unwrap();
+        let (gw_port, mut gateway) = boot_gateway(dir.path(), p.pool, &key);
+        let session_dir = dir.path().join("sessions");
+        let sock = dir.path().join("agent.sock");
+        let mut child = serve_uds_child(gw_port, dir.path(), p.model, &session_dir, &sock);
+        wait_for_uds(&sock);
+
+        let mut ws = ws_connect_uds(&sock, None).await;
+        ws_send(
+            &mut ws,
+            json!({
+                "type": "prompt",
+                "id": "p1",
+                "message": "Use the read tool to read the file marker.txt in the current directory, then reply with ONLY the exact token it contains.",
+            }),
+        )
+        .await;
+        let frames = ws_read_until_response(&mut ws, "prompt").await;
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = gateway.kill();
+        let _ = gateway.wait();
+
+        eprintln!("--- [{}] uds prompt frames ---\n{frames:#?}", p.name);
+        let resp = frames.last().unwrap();
+        assert_eq!(
+            resp["success"], true,
+            "[{}] the live prompt over the UDS should succeed: {resp}",
+            p.name
+        );
+        let dump = frames.iter().map(|f| f.to_string()).collect::<String>();
+        assert!(
+            dump.contains(token),
+            "[{}] the model should have read the file via the tool and echoed `{token}` over the UDS.\n{dump}",
+            p.name
+        );
+    }
+}
+
+/// Live end-to-end of the **shared HTTP/2 (h2c) connection pool**: with `--upstream-http2 h2c`, all
+/// daemon sessions multiplex over ONE cleartext-h2 connection to the (now h2c-capable) real gateway,
+/// which forwards to a real provider. Two concurrent sessions both completing proves the agent→gateway
+/// h2c hop works on the wire (if h2c were broken against the gateway, every request would fail). This
+/// is the on-the-wire h2c assertion the deterministic tests deferred.
+#[tokio::test]
+#[ignore = "live provider smoke; run via `mise run test:smoke:agent` with a provider key set"]
+async fn smoke_h2c_shared_pool_live() {
+    let providers = available();
+    if providers.is_empty() {
+        eprintln!("smoke[h2c-pool]: no provider key set — skipping");
+        return;
+    }
+    for p in providers {
+        let key = env_key(p.env).expect("provider key present");
+        let token = "CLEMENTINE-8842";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("marker.txt"), format!("{token}\n")).unwrap();
+        let (gw_port, mut gateway) = boot_gateway(dir.path(), p.pool, &key);
+        let session_dir = dir.path().join("sessions");
+        let ws_port = free_port();
+        // serve with the shared h2c client. The gateway (this branch) accepts downstream h2c.
+        let mut child = Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+            .args([
+                "serve",
+                "--listen",
+                &format!("127.0.0.1:{ws_port}"),
+                "--upstream-http2",
+                "h2c",
+                "--gateway-url",
+                &format!("http://127.0.0.1:{gw_port}"),
+                "--key",
+                DEV_TOKEN,
+                "--model",
+                p.model,
+                "--max-steps",
+                "6",
+                "--session-dir",
+                session_dir.to_str().unwrap(),
+            ])
+            .current_dir(dir.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn serve --upstream-http2 h2c");
+        wait_for_port(ws_port);
+
+        // Two concurrent sessions, both reading the marker through the ONE shared h2c client.
+        let mut a = ws_connect(ws_port, Some("h2csessa")).await;
+        let mut b = ws_connect(ws_port, Some("h2csessb")).await;
+        let prompt = json!({
+            "type": "prompt",
+            "id": "p1",
+            "message": "Use the read tool to read marker.txt in the current directory, then reply with ONLY the exact token it contains.",
+        });
+        ws_send(&mut a, prompt.clone()).await;
+        ws_send(&mut b, prompt).await;
+        let fa = ws_read_until_response(&mut a, "prompt").await;
+        let fb = ws_read_until_response(&mut b, "prompt").await;
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = gateway.kill();
+        let _ = gateway.wait();
+
+        for (name, frames) in [("a", &fa), ("b", &fb)] {
+            let resp = frames.last().unwrap();
+            assert_eq!(
+                resp["success"], true,
+                "[{}] session {name} must succeed over the shared h2c client (h2c hop works): {resp}",
+                p.name
+            );
+            let dump = frames.iter().map(|f| f.to_string()).collect::<String>();
+            assert!(
+                dump.contains(token),
+                "[{}] session {name} should have echoed `{token}` over the shared h2c client.\n{dump}",
+                p.name
+            );
+        }
     }
 }

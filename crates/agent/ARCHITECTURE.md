@@ -18,8 +18,15 @@ The harness layers several capabilities over the bare tools + loop:
 
 - **`serve` transports** ([`serve`](src/serve.rs), [`serve_ws`](src/serve_ws.rs)) — the headless
   control protocol runs over **stdio** (default, one line per command/frame — built for an `ssh` pipe)
-  or a **WebSocket** (`--listen <addr>`, one text message per command/frame). The protocol is
-  byte-identical across both; both feed the transport-agnostic `serve::serve_session` core, which reads
+  or a **WebSocket** — over a **TCP** listener (`--listen <addr>`) and/or a **Unix-domain socket**
+  (`--listen-uds <path>`), one text message per command/frame. Both socket transports run the same WS
+  handshake + `?session_id=` routing (`serve_ws`'s `handle_connection`/`attach` are generic over the
+  stream), share **one** supervisor/session map (a session created over TCP is reachable over the UDS by
+  the same id), and can be bound simultaneously. UDS is the local-authz story TCP loopback can't give:
+  the socket is `chmod`ed (default `0o600`, `--listen-uds-mode`), so kernel filesystem permissions —
+  not "anything on `127.0.0.1`" — decide who may connect; stale sockets are reclaimed with a
+  connect-probe (never clobbering a live daemon). The protocol is byte-identical across all transports;
+  all feed the transport-agnostic `serve::serve_session` core, which reads
   commands from an `mpsc` channel and emits frames to whichever connection is currently attached. The
   key property this buys the WebSocket path: **the session is a view, not owned by the connection** — a
   dropped mobile client does not abort the run (the retained input `Sender` means a dropped socket is
@@ -37,7 +44,15 @@ The harness layers several capabilities over the bare tools + loop:
   attached connection, idle past the timeout, and not mid-run (a per-session `running` flag `serve_session`
   flips around a `prompt`), dropping the retained `input_tx` so the session persists and exits exactly as
   graceful shutdown does per-entry (both share `join_handles`). A reconnect to a just-reaped id respawns
-  it from disk and replays via `get_messages {since}`.
+  it from disk and replays via `get_messages {since}`. A third daemon facility, **shared upstream
+  pooling** (`--upstream-http2 <off|auto|h2c>`, off by default): instead of each session building its own
+  `reqwest::Client` (so N sessions ≈ N connections to the gateway on the plaintext HTTP/1.1 hop),
+  `serve_ws` builds **one** client and injects it into every session via
+  `GatewayClient::with_http_client` (guarded so a model-switch/idle rebuild never discards the shared
+  pool). `h2c` gives it `.http2_prior_knowledge()`, so all sessions multiplex over ~one cleartext-HTTP/2
+  connection — paired with the gateway's downstream `h2c` support (backward-compatible: Pingora peeks the
+  H2 preface and falls back to h1). `off` keeps the per-session-client behavior; `auto` shares the pool
+  over h1 today (h2 later if the hop gains TLS+ALPN).
 - **Trust** ([`trust_store`](src/trust_store.rs)) — a tri-state, ancestor-inheriting allowlist
   (`~/.claude/trusted-projects.json`: `{trusted: [...], untrusted: [...]}`, most-specific directory
   wins, untrusted checked first at each level) gates the project-local `SYSTEM.md`/`APPEND_SYSTEM.md`
