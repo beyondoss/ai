@@ -136,6 +136,13 @@ rmcp = { version = "2.1.0", default-features = false, features = ["client", "tra
 # so this adds nothing new to the build graph — it just enables our own use of the accept path.
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
 
+# systemd socket activation for `serve --listen`: adopt the already-bound listener fd systemd passes
+# (`LISTEN_FDS`/`LISTEN_PID`) instead of binding our own, so the socket outlives a `systemctl restart`
+# (connections queue in the kernel — zero-downtime). The workspace forbids `unsafe_code`, so we can't
+# hand-roll `UnixListener::from_raw_fd`; `listenfd` encapsulates that unsafe internally and exposes a
+# safe API (`ListenFd::from_env().take_unix_listener(0)`), including the `LISTEN_PID == getpid()` guard.
+listenfd = "1"
+
 [dev-dependencies]
 # The client side of the WebSocket transport, for `tests/serve_websocket.rs` and the live WS smokes:
 # `connect_async` to a `ws://127.0.0.1` listener (no TLS). Same crate/version as the non-dev dep above.

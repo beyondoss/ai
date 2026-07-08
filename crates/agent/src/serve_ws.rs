@@ -467,6 +467,12 @@ pub struct ServeListeners {
     /// Octal mode to `chmod` the UDS to after binding (default `0o600`). Ignored when `uds` is `None`.
     #[cfg(unix)]
     pub uds_mode: Option<u32>,
+    /// Adopt a listener socket **systemd passed us** via socket activation (`LISTEN_FDS`) instead of
+    /// binding our own. systemd owns the socket's lifecycle and perms, and it outlives a
+    /// `systemctl restart` (connections queue in the kernel — zero-downtime). Set by `main.rs` when it
+    /// detects the activation env. Composes with [`Self::tcp`]/[`Self::uds`]: an inherited fd is used
+    /// for its transport; any transport without an inherited fd still binds normally.
+    pub systemd: bool,
 }
 
 /// Await the next TCP connection, or `pending()` forever when there's no TCP listener — so this can
@@ -515,6 +521,36 @@ async fn bind_uds(
     };
     std::fs::set_permissions(path, PermissionsExt::from_mode(mode.unwrap_or(0o600)))?;
     Ok(listener)
+}
+
+/// Adopt the listener socket systemd passed via socket activation (`LISTEN_FDS`/`LISTEN_PID`). Returns
+/// `(tcp, uds)` — whichever transport systemd activated. `listenfd::ListenFd::from_env` reads the env
+/// honoring the `LISTEN_PID == getpid()` guard (so we never grab a parent's fds), and hands back the
+/// inherited std listeners; we set them non-blocking and wrap as tokio listeners. Tries a unix socket
+/// first (the local-daemon case), then TCP. Errors if systemd set `LISTEN_FDS` but passed nothing we
+/// can serve. Must run on a tokio runtime — `from_std` registers the listener with the reactor.
+#[cfg(unix)]
+fn adopt_systemd_listeners()
+-> Result<(Option<TcpListener>, Option<UnixListener>), Box<dyn std::error::Error>> {
+    let mut fds = listenfd::ListenFd::from_env();
+    // `.ok().flatten()` so a wrong-type fd (e.g. asking for unix when it's tcp) falls through rather
+    // than propagating — we then try the other type.
+    if let Some(std_uds) = fds.take_unix_listener(0).ok().flatten() {
+        std_uds.set_nonblocking(true)?;
+        eprintln!("serve: adopted systemd-activated unix socket (path {WS_PATH})");
+        return Ok((None, Some(UnixListener::from_std(std_uds)?)));
+    }
+    if let Some(std_tcp) = fds.take_tcp_listener(0).ok().flatten() {
+        std_tcp.set_nonblocking(true)?;
+        let local = std_tcp.local_addr()?;
+        eprintln!("serve: adopted systemd-activated tcp socket {local} (path {WS_PATH})");
+        return Ok((Some(TcpListener::from_std(std_tcp)?), None));
+    }
+    Err(
+        "systemd socket activation was requested (LISTEN_FDS set) but systemd passed no usable \
+         socket file descriptor"
+            .into(),
+    )
 }
 
 /// Build the one `reqwest::Client` every session in this daemon shares (W3), from
@@ -582,31 +618,56 @@ pub async fn serve_ws(
         ),
     }
 
-    let tcp_listener = match listeners.tcp {
-        Some(addr) => {
-            let listener = TcpListener::bind(addr).await?;
-            let local = listener.local_addr()?;
-            // A well-defined line (on stderr, which the protocol never uses) so an operator — or a
-            // test that binds port 0 — can learn the actual bound address.
-            eprintln!("serve: websocket listening on {local} (path {WS_PATH})");
-            Some(listener)
-        }
-        None => None,
+    // systemd socket activation (a Linux/systemd feature, so unix-only): adopt the already-bound
+    // listener systemd handed us via `LISTEN_FDS` rather than binding our own. Mutually exclusive with
+    // `--listen`/`--listen-uds` (main.rs only sets `systemd` when neither is given). systemd owns the
+    // socket, so it survives a `systemctl restart` (connections queue in the kernel) and we never
+    // bind/chmod/unlink it.
+    #[cfg(unix)]
+    let (adopted_tcp, adopted_uds) = if listeners.systemd {
+        adopt_systemd_listeners()?
+    } else {
+        (None, None)
+    };
+    #[cfg(not(unix))]
+    let adopted_tcp: Option<TcpListener> = None;
+
+    let tcp_listener = match adopted_tcp {
+        Some(listener) => Some(listener),
+        None => match listeners.tcp {
+            Some(addr) => {
+                let listener = TcpListener::bind(addr).await?;
+                let local = listener.local_addr()?;
+                // A well-defined line (on stderr, which the protocol never uses) so an operator — or a
+                // test that binds port 0 — can learn the actual bound address.
+                eprintln!("serve: websocket listening on {local} (path {WS_PATH})");
+                Some(listener)
+            }
+            None => None,
+        },
     };
 
+    // Only a socket WE bound is ours to unlink on shutdown — never a systemd-owned one.
     #[cfg(unix)]
-    let uds_path = listeners.uds.clone();
+    let uds_path = if listeners.systemd {
+        None
+    } else {
+        listeners.uds.clone()
+    };
     #[cfg(unix)]
-    let uds_listener = match &listeners.uds {
-        Some(path) => {
-            let listener = bind_uds(path, listeners.uds_mode).await?;
-            eprintln!(
-                "serve: unix socket listening on {} (path {WS_PATH})",
-                path.display()
-            );
-            Some(listener)
-        }
-        None => None,
+    let uds_listener = match adopted_uds {
+        Some(listener) => Some(listener),
+        None => match &listeners.uds {
+            Some(path) => {
+                let listener = bind_uds(path, listeners.uds_mode).await?;
+                eprintln!(
+                    "serve: unix socket listening on {} (path {WS_PATH})",
+                    path.display()
+                );
+                Some(listener)
+            }
+            None => None,
+        },
     };
     // On a non-unix target there is no UDS to bind (`--listen-uds` errored before we got here); the
     // `select!` UDS arm still needs a listener binding, so give it a `None` that `pending()`s forever.
