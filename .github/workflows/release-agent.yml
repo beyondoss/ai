@@ -1,10 +1,9 @@
 name: Release Agent Binary
-# Builds beyond-ai-agent as a static musl binary and publishes it as a GitHub
-# Release asset, matching the beyond-<name>-v*-linux-<arch>.tar.gz convention
-# dev/.scripts/publish-primitives.sh (in the beyond repo) already expects for
-# every other externally-built primitive binary (beyond-pg, beyond-kv, ...).
-# Separate from publish.yml (which builds the gateway's Docker image) — this
-# only runs on a version tag, not every push to main.
+# Builds beyond-ai-agent as a static musl binary for linux/amd64 and linux/arm64, UPX-compresses each,
+# and publishes them as GitHub Release assets, matching the beyond-<name>-v*-linux-<arch>.tar.gz
+# convention dev/.scripts/publish-primitives.sh (in the beyond repo) expects for every other
+# externally-built primitive binary (beyond-pg, beyond-kv, ...). Separate from publish.yml (which
+# builds the gateway's Docker image) — this only runs on a version tag, not every push to main.
 on:
   push:
     tags: ["v*"]
@@ -12,33 +11,56 @@ permissions:
   contents: write
 jobs:
   release:
-    name: Build & publish release asset
-    runs-on: ubuntu-latest
+    name: Build & publish (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # Publish whatever arches succeed rather than cancelling one because the other failed.
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            arch: amd64
+          # Native arm64 runner (free for public repos) — avoids the cross-linker pain of building
+          # aarch64-musl (ring/mimalloc C bits) from an x86 host.
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            arch: arm64
     steps:
-      - uses: actions/checkout@v5
-      - uses: jdx/mise-action@v2
-      - name: Install musl toolchain
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - name: Install musl toolchain + upx
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools
-          sudo ln -sf /usr/bin/musl-gcc /usr/local/bin/x86_64-linux-musl-gcc
-          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get install -y musl-tools upx-ucl
+          rustup target add ${{ matrix.target }}
       - name: Build beyond-ai-agent (static musl)
         run: |
-          CC_x86_64_unknown_linux_musl=x86_64-linux-musl-gcc \
-            CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-linux-musl-gcc \
-            cargo build --release -p beyond-ai-agent --target x86_64-unknown-linux-musl
+          # `musl-tools` installs a native `musl-gcc` on each runner (x86_64 on amd64, aarch64 on
+          # arm64), so a native build needs no cross-linker. Point cargo's per-target linker + `cc`
+          # (ring's build) at it. The env-var names embed the target triple, so derive them.
+          linker_env="CARGO_TARGET_$(echo '${{ matrix.target }}' | tr 'a-z-' 'A-Z_')_LINKER"
+          cc_env="CC_$(echo '${{ matrix.target }}' | tr '-' '_')"
+          export "$linker_env=musl-gcc"
+          export "$cc_env=musl-gcc"
+          cargo build --release -p beyond-ai-agent --target ${{ matrix.target }}
+      - name: Compress with UPX
+        # ~20 MB static binary → ~6 MB; a trivial one-time self-extract at exec. Verified locally that
+        # the static-pie musl binary compresses and still runs.
+        run: upx --best --lzma target/${{ matrix.target }}/release/beyond-ai-agent
       - name: Package release asset
         run: |
           mkdir -p dist
-          tar -C target/x86_64-unknown-linux-musl/release -czf \
-            "dist/beyond-ai-agent-${{ github.ref_name }}-linux-amd64.tar.gz" beyond-ai-agent
+          tar -C target/${{ matrix.target }}/release -czf \
+            "dist/beyond-ai-agent-${{ github.ref_name }}-linux-${{ matrix.arch }}.tar.gz" beyond-ai-agent
       - name: Publish GitHub Release asset
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Create the release once; the second matrix job's create is a no-op (`|| true`). Each job
+          # uploads its own distinct per-arch asset, so `--clobber` never races across arches.
           gh release create "${{ github.ref_name }}" --repo "${{ github.repository }}" \
             --title "${{ github.ref_name }}" --generate-notes || true
           gh release upload "${{ github.ref_name }}" \
-            "dist/beyond-ai-agent-${{ github.ref_name }}-linux-amd64.tar.gz" \
+            "dist/beyond-ai-agent-${{ github.ref_name }}-linux-${{ matrix.arch }}.tar.gz" \
             --repo "${{ github.repository }}" --clobber
