@@ -13,8 +13,8 @@ jobs:
     name: Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: jdx/mise-action@v2
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
       # Belt-and-suspenders: a restored mise tool cache can hand back a rust toolchain without the
       # components mise.toml requests (rustfmt/clippy) even though mise itself reports everything
       # installed — dprint's `rustfmt --edition 2024` exec command then fails with "rustfmt is not
