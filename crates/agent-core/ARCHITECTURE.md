@@ -260,6 +260,34 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   two OpenAI wire formats had no proactive protection at all against this exact failure mode). Never
   clamps below a configured thinking budget, and never raises
   `max_tokens` above what was asked.
+
+- **The deterministic-carry channel** — `apply_summary` is deliberately destructive: it _replaces_
+  `session.messages` with `[summary, …kept_suffix]`, and `SessionStore::open` reloads that
+  post-compaction list, so anything living only inside a folded-away message is gone for good. A
+  summarizing model asked to "merge the previous summary" will paraphrase or drop specifics, so nothing
+  that _must_ survive a cut may depend on it doing so. `CompactionProvenance` (`Session::compaction`) is
+  the channel that does: `merge_provenance` folds it forward every round from the doomed prefix,
+  `crates/agent`'s `session_store.rs` persists it on the `Entry::Compaction` record and restores it on
+  reopen, and `Agent::compact` re-renders it into every new summary by appending host-generated blocks
+  to the model's prose — never trusting the prose itself.
+
+  Two things ride it, for the same reason:
+  - **File awareness** — `extract_file_ops` (read vs. modified paths from `read`/`write`/`edit` calls),
+    accumulated and deduped across rounds, rendered by `format_file_operations` as
+    `<read-files>`/`<modified-files>`.
+  - **The model's plan** — `extract_todos` (the last `todo` call's list), rendered by `format_todo_list`
+    as `<todo_list>`. _Last-wins_, not accumulated: the `todo` tool's contract is a full replace, so
+    folding two rounds' lists together would resurrect steps the model deliberately dropped — and an
+    explicitly cleared list (`[]`) must beat the older one rather than letting a finished plan reappear.
+    This is why `tools::todo` holds no state of its own (it couldn't: its registry is rebuilt on every
+    `set_model`), and it is what `serve`'s `get_todos` falls back to once the `tool_use` block that
+    carried the list has been compacted away.
+
+  `previous_summary` strips these blocks back off the body before it is fed forward — both into the
+  incremental summarization prompt (or the model echoes a stale copy into its prose alongside the fresh
+  ones) and into `compact`'s own `turn_start == 1` verbatim-reuse path (or every split-turn round appends
+  another copy of every block, unboundedly). Adding a third rider should clear the same bar: it is the
+  run's working state, and losing it degrades the model silently rather than failing loudly.
 - **Thinking** — `ContentBlock::Thinking`/`RedactedThinking` + `ThinkingDelta`/`SignatureDelta` stream
   events; signatures replay verbatim (Anthropic requires it with tools). `with_thinking(budget)`; the
   thinking _shape_ (Anthropic enabled-budget vs adaptive) is chosen per model from the capability

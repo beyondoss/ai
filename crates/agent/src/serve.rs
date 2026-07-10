@@ -137,6 +137,11 @@
 //!     pi-parity gap) is the tree entry beginning the retained post-compaction portion of history —
 //!     pi's own `firstKeptEntryId` — `null` when persistence isn't configured or no compaction fired
 //!   - `{type:"get_last_assistant_text"}` → `data: {text}` (the latest assistant reply)
+//!   - `{type:"get_todos"}`              → `data: {todos}` — the model's current `todo` list (`null` if
+//!     it never made one). The `todo` tool is stateless and its live `tool_progress` frames are
+//!     ephemeral, so this is how a client attaching mid-run learns the plan without replaying history.
+//!     Idle, it reads the last `todo` call still in the transcript, falling back to the list a past
+//!     compaction folded into `Session::compaction`; mid-run, it reads the live mirror (`LiveStats`).
 //!   - `{type:"get_session_stats"}`      → token/step accounting + message-type breakdown
 //!     (`user_messages`/`assistant_messages`/`tool_calls`/`tool_results`/`total_messages`)
 //!   - `{type:"get_commands"}`           → discoverable skills + prompt templates, each entry carrying
@@ -269,7 +274,8 @@
 //! read-only commands that don't need the run's exclusively-borrowed session — `get_state` (with
 //! `message_count: null`, the one field that genuinely needs it), `get_session_stats` (from a live
 //! mirror of the session's own counters, updated as the run streams), `get_commands`, `list_branches`,
-//! `get_tree`, `list_sessions`, `list_all_sessions`, `get_available_models` — are answered live too,
+//! `get_todos` (from that same live mirror), `get_tree`, `list_sessions`, `list_all_sessions`,
+//! `get_available_models` — are answered live too,
 //! rather than rejected, so a client can poll for progress during a long tool-heavy turn. Everything
 //! else issued during a run is rejected as busy. `steer`/`follow_up` are also accepted while idle (no
 //! `prompt` in flight) — they
@@ -1707,6 +1713,21 @@ pub fn cwd_is_stale(meta_cwd: &str, actual_cwd: &std::path::Path) -> bool {
     !std::path::Path::new(meta_cwd).is_dir() || meta_cwd != actual_cwd.to_string_lossy()
 }
 
+/// The model's current `todo` list for this session, or `None` if it never made one.
+///
+/// Two sources, in priority order, because the `todo` tool holds no state of its own (its registry is
+/// rebuilt on every `set_model`, so it couldn't):
+/// 1. The last `todo` `tool_use` block still in the live transcript.
+/// 2. `Session::compaction.todos` — where a compaction folded the plan when it dropped the block that
+///    carried it. Persisted with the session, so this is also what a resumed session recovers from.
+///
+/// Checked in that order: a call in the live suffix is always newer than anything a past compaction
+/// carried forward.
+fn current_todos(session: &Session) -> Option<Value> {
+    agent_core::compaction::extract_todos(&session.messages)
+        .or_else(|| session.compaction.todos.clone())
+}
+
 /// The current short branch name at `cwd` (Task #25, pi-parity fix), for `get_state`'s `git_branch`
 /// field — matters more for this crate than for pi, since the whole point of the RPC protocol is
 /// letting a client with no shared filesystem drive the agent remotely; without this, such a client has
@@ -1942,9 +1963,9 @@ pub(crate) async fn serve_session(
     // (a restricted `--tools`/`--exclude-tools` invocation) just adds dead weight (pi-parity fix).
     // Tools are fixed for the whole process (see `build_agent`'s doc comment), so this one check is
     // reused verbatim by `reload`'s own rebuild below rather than re-deriving it.
-    let has_read = build_tools(&cfg, cfg.image_auto_resize)
-        .get("read")
-        .is_some();
+    let startup_tools = build_tools(&cfg, cfg.image_auto_resize);
+    let has_read = startup_tools.get("read").is_some();
+    let has_todo = startup_tools.get(crate::tools::todo::NAME).is_some();
     let mut static_system =
         crate::resources::build_static_system_prompt(&crate::resources::PromptOptions {
             base: None,
@@ -1954,6 +1975,7 @@ pub(crate) async fn serve_session(
             include_context_files: cfg.context_files,
             skills: &skills,
             has_read,
+            has_todo,
             project_trusted,
             agents: &cfg.agents,
         });
@@ -2847,6 +2869,19 @@ pub(crate) async fn serve_session(
                                 if let AgentEvent::ToolEnd { id, .. } = &ev {
                                     live_stats_sink.tool_ended(id);
                                 }
+                                // Same mirroring, for the `todo` list — see `LiveStats::todos`. The tool
+                                // validates before it emits, so a rejected call never lands here and the
+                                // mirror only ever holds a list the model actually committed.
+                                if let AgentEvent::ToolProgress {
+                                    name,
+                                    details: Some(d),
+                                    ..
+                                } = &ev
+                                    && name == crate::tools::todo::NAME
+                                    && let Some(todos) = d.get("todos")
+                                {
+                                    live_stats_sink.todos_updated(todos.clone());
+                                }
                                 // Best-effort: a sync sink can't break the control loop. If the writer is
                                 // gone the send fails here and the terminal response send below detects it
                                 // via `emit!` and stops the loop. An unserializable event is skipped rather
@@ -3095,6 +3130,11 @@ pub(crate) async fn serve_session(
                                             }
                                             "list_branches" => {
                                                 let _ = out_tx.send(response(cid, "list_branches", true, Some(json!({ "branches": persistence.list_branches() })), None));
+                                            }
+                                            "get_todos" => {
+                                                // From the live mirror: `&session` is exclusively borrowed by
+                                                // the in-flight turn. See `LiveStats::todos`.
+                                                let _ = out_tx.send(response(cid, "get_todos", true, Some(json!({ "todos": live_stats.todos() })), None));
                                             }
                                             "get_tree" => {
                                                 // Same `since` handling as the idle-loop arm below — see
@@ -3969,6 +4009,17 @@ pub(crate) async fn serve_session(
                     None,
                 ));
             }
+            "get_todos" => {
+                // Straight from the session while idle — no mirror needed, and no chance of one going
+                // stale against a `switch_branch`/`fork`/`compact` that happened since the last turn.
+                emit!(response(
+                    id,
+                    "get_todos",
+                    true,
+                    Some(json!({ "todos": current_todos(&session) })),
+                    None,
+                ));
+            }
             "get_session_stats" => {
                 // Fix 8 (pi-parity gap): backfills session_id/session_file (mirroring get_state's own
                 // idle arm, above) and pending_tool_ids (mirroring get_state's own "nothing pending
@@ -4097,6 +4148,7 @@ pub(crate) async fn serve_session(
                         include_context_files: cfg.context_files,
                         skills: &skills,
                         has_read,
+                        has_todo,
                         project_trusted,
                         agents: &cfg.agents,
                     },
@@ -6529,6 +6581,13 @@ struct LiveStats {
     /// does. A `Mutex<BTreeSet>` rather than another atomic: ids are strings, and insert/remove need to
     /// be atomic *with each other*, not just individually.
     pending_tool_ids: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    /// The model's current `todo` list, mirrored off the `todo` tool's own `ToolProgress` events for
+    /// exactly the same reason as `pending_tool_ids` above: `&session` is exclusively borrowed by the
+    /// in-flight turn, so `get_todos` could otherwise only be answered while idle — and the client that
+    /// most needs it is a phone attaching *mid-run*, which has already missed every `tool_progress`
+    /// frame streamed before it connected. Seeded from the session (see [`current_todos`]) so a
+    /// `get_todos` answered one event into a fresh turn still reports the plan the last turn left.
+    todos: std::sync::Mutex<Option<Value>>,
 }
 
 impl LiveStats {
@@ -6555,7 +6614,17 @@ impl LiveStats {
             reasoning_tokens: totals.reasoning_tokens.into(),
             last_input_tokens: AtomicU32::new(session.last_input_tokens),
             pending_tool_ids: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            todos: std::sync::Mutex::new(current_todos(session)),
         }
+    }
+
+    /// Record the list a `todo` call just committed (the tool's own `ToolProgress` payload).
+    fn todos_updated(&self, todos: Value) {
+        *self.todos.lock().unwrap_or_else(|e| e.into_inner()) = Some(todos);
+    }
+
+    fn todos(&self) -> Option<Value> {
+        self.todos.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn tool_started(&self, id: String) {

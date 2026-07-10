@@ -3477,6 +3477,7 @@ async fn run_task(
     // being able to open its `SKILL.md` itself, so advertising them at all when `read` isn't registered
     // (a restricted `--tools`/`--exclude-tools` invocation) just adds dead weight (pi-parity fix).
     let has_read = registry.get("read").is_some();
+    let has_todo = registry.get("todo").is_some();
     let system = beyond_ai_agent::resources::build_system_prompt(
         &beyond_ai_agent::resources::PromptOptions {
             base: system_prompt.as_deref(),
@@ -3486,6 +3487,7 @@ async fn run_task(
             include_context_files: !no_context_files,
             skills: &skills,
             has_read,
+            has_todo,
             project_trusted,
             agents: &agent_defs,
         },

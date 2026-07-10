@@ -156,6 +156,12 @@ pub struct PromptOptions<'a> {
     /// entries the model has no way to actually use. `false` skips the whole section regardless of
     /// `skills`'s own contents.
     pub has_read: bool,
+    /// Whether the registered tool set includes `todo`. The tool is useless to a model that hasn't been
+    /// told the protocol it expects — full replacement of the list on every call, exactly one item
+    /// `in_progress` — and the guidance is dead weight in a prompt for a process (or a subagent child)
+    /// whose registry never advertised the tool. Same gate-on-what's-registered discipline as
+    /// [`has_read`](Self::has_read) and [`agents`](Self::agents).
+    pub has_todo: bool,
     /// Whether `cwd` is a trusted project (an explicit `--trust-project`/RPC override, or recorded in
     /// `TrustStore`). Gates the *project-local* `SYSTEM.md`/`APPEND_SYSTEM.md` overrides and the
     /// project-local skills root (`<cwd>/.claude/skills`, see `skills::discover`) — an untrusted
@@ -248,8 +254,33 @@ pub fn build_static_system_prompt(opts: &PromptOptions) -> String {
         s.push_str(&agents);
     }
 
+    // The `todo` protocol, when the tool is actually registered. Its schema can state the shape of a
+    // call but not *when* to make one, nor that the list is a full replacement rather than a delta —
+    // the two things a model gets wrong without being told.
+    if opts.has_todo {
+        s.push_str("\n\n");
+        s.push_str(TODO_GUIDANCE);
+    }
+
     s
 }
+
+/// How to drive the `todo` tool. Gated on [`PromptOptions::has_todo`].
+const TODO_GUIDANCE: &str = "\
+<todo_protocol>
+You have a `todo` tool for planning multi-step work. Use it for any task that takes more than a couple \
+of steps, or when the user gives you several things to do. Skip it for trivial single-step requests \
+where a plan adds nothing.
+
+Call `todo` with the COMPLETE list every time — it fully replaces the previous list, so always include \
+every item, not just the one that changed. Give each item a `content` (imperative: \"Add the retry \
+loop\"), an `activeForm` (present continuous: \"Adding the retry loop\"), and a `status` of `pending`, \
+`in_progress`, or `completed`.
+
+Keep exactly one item `in_progress` at a time: mark an item `in_progress` right before you start it, \
+and `completed` the moment it is done — don't batch completions. Send an empty list to clear the plan \
+once the work is finished.
+</todo_protocol>";
 
 /// The cheap, time-varying tail of the system prompt: the current date and working directory. Does no
 /// filesystem discovery (unlike [`build_static_system_prompt`]), so it's cheap enough to recompute
@@ -918,6 +949,7 @@ mod tests {
             include_context_files: false,
             skills: &[],
             has_read: true,
+            has_todo: false,
             project_trusted: true,
             agents: &[],
         });
@@ -949,6 +981,7 @@ mod tests {
             include_context_files: false,
             skills: &[],
             has_read: true,
+            has_todo: false,
             project_trusted: true,
             agents: &[],
         });
@@ -977,6 +1010,7 @@ mod tests {
             include_context_files: false,
             skills: &[],
             has_read: true,
+            has_todo: false,
             project_trusted: false,
             agents: &[],
         });
@@ -1008,6 +1042,7 @@ mod tests {
             include_context_files: false,
             skills: std::slice::from_ref(&skill),
             has_read: true,
+            has_todo: false,
             project_trusted: true,
             agents: &[],
         });
@@ -1040,6 +1075,7 @@ mod tests {
             include_context_files: false,
             skills: std::slice::from_ref(&skill),
             has_read: true,
+            has_todo: false,
             project_trusted: true,
             agents: &[],
         });
@@ -1071,6 +1107,7 @@ mod tests {
             include_context_files: false,
             skills: std::slice::from_ref(&skill),
             has_read: false,
+            has_todo: false,
             project_trusted: true,
             agents: &[],
         });
@@ -1095,6 +1132,7 @@ mod tests {
             include_context_files: false,
             skills: &[],
             has_read: true,
+            has_todo: false,
             project_trusted: true,
             agents: &[],
         });
@@ -1120,6 +1158,7 @@ mod tests {
             include_context_files: false,
             skills: &[],
             has_read: true,
+            has_todo: false,
             project_trusted: false,
             agents: &[],
         });
@@ -1141,6 +1180,7 @@ mod tests {
             include_context_files: false,
             skills: &[],
             has_read: true,
+            has_todo: false,
             project_trusted: true,
             agents: &[],
         });
@@ -1199,6 +1239,37 @@ mod tests {
         assert_eq!(tz_string_offset("Not/A/Real/Zone", 1_700_000_000), None);
     }
 
+    fn todo_opts(cwd: &Path, has_todo: bool) -> PromptOptions<'_> {
+        PromptOptions {
+            base: Some("You are an agent."),
+            default_base: "",
+            append: None,
+            cwd,
+            include_context_files: false,
+            skills: &[],
+            has_read: true,
+            has_todo,
+            project_trusted: false,
+            agents: &[],
+        }
+    }
+
+    #[test]
+    fn the_todo_protocol_is_advertised_only_when_the_tool_is_registered() {
+        // Same gate-on-what's-registered discipline as `<available_skills>`/`<available_agents>`: a
+        // process (or subagent child) whose registry never advertised `todo` must not carry the
+        // protocol's dead weight in its prompt.
+        let tmp = tempfile::tempdir().unwrap();
+        let with = build_static_system_prompt(&todo_opts(tmp.path(), true));
+        assert!(with.contains("<todo_protocol>"));
+        assert!(with.contains("fully replaces the previous list"));
+        assert!(with.contains("exactly one item `in_progress`"));
+
+        let without = build_static_system_prompt(&todo_opts(tmp.path(), false));
+        assert!(!without.contains("todo_protocol"));
+        assert!(!without.contains("in_progress"));
+    }
+
     #[test]
     fn system_prompt_includes_project_instructions_and_env() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1211,6 +1282,7 @@ mod tests {
             include_context_files: true,
             skills: &[],
             has_read: true,
+            has_todo: false,
             project_trusted: false,
             agents: &[],
         });
@@ -1240,6 +1312,7 @@ mod tests {
             include_context_files: false,
             skills: &[],
             has_read: true,
+            has_todo: false,
             project_trusted: false,
             agents: &[],
         };
@@ -1270,6 +1343,7 @@ mod tests {
             include_context_files: false,
             skills: &[],
             has_read: true,
+            has_todo: false,
             project_trusted: false,
             agents: &[],
         });

@@ -7,8 +7,17 @@
 //!
 //! This module is the pure, network-free half: the trigger ([`should_compact`]), the cut-point
 //! search ([`find_cut`]), the summary-prompt construction ([`render_prefix`]/[`summary_request`]),
-//! and file-op extraction. [`Agent`](crate::Agent) owns the one piece that needs the network — making
-//! the summarization model call — and stitches the result back into the [`Session`].
+//! and provenance extraction. [`Agent`](crate::Agent) owns the one piece that needs the network —
+//! making the summarization model call — and stitches the result back into the [`Session`].
+//!
+//! **The deterministic-carry channel.** A summarizing model cannot be trusted to preserve specific
+//! facts in free prose, so anything that *must* survive a cut rides [`CompactionProvenance`] instead:
+//! it is folded forward every round by [`merge_provenance`], persisted with the session, restored on
+//! reopen, and re-appended to each new summary verbatim by host code in
+//! [`Agent::compact`](crate::agent::Agent::compact). Two things ride it today — the read/modified file
+//! lists ([`format_file_operations`]) and the model's `todo` list ([`format_todo_list`]) — and both are
+//! there for the same reason: they are the run's working state, and losing them silently degrades the
+//! model rather than failing loudly. Anything else added here should clear the same bar.
 
 use std::sync::Arc;
 
@@ -35,7 +44,7 @@ pub enum CompactionReason {
 
 /// What compaction has recorded about this session so far, folded forward across every round.
 /// [`Session::compaction`] carries one of these; each successful [`crate::agent::Agent::compact`] call
-/// replaces it with the merged result of [`merge_file_ops`].
+/// replaces it with the merged result of [`merge_provenance`].
 ///
 /// This exists because `apply_summary` is *deliberately* destructive — it physically replaces the
 /// summarized prefix with a summary message, matching this project's flat-history simplification — so
@@ -57,15 +66,27 @@ pub struct CompactionProvenance {
     /// Why the most recent compaction fired. `None` until the first one.
     #[serde(default)]
     pub last_reason: Option<CompactionReason>,
+    /// The most recent `todo` list any compacted prefix carried — the raw `todos` array the model last
+    /// sent, verbatim. `None` when the session has never compacted away a `todo` call.
+    ///
+    /// Unlike the file lists, this is *last-wins*, not accumulate-and-dedupe: the tool's contract is a
+    /// full replace, so folding two rounds' lists together would resurrect steps the model deliberately
+    /// dropped. An explicitly cleared list (`[]`) is therefore meaningful and must not fall back to an
+    /// older one — see [`merge_provenance`].
+    #[serde(default)]
+    pub todos: Option<Value>,
 }
 
-/// Fold `previous`'s file-ops forward with whatever [`extract_file_ops`] finds in `messages` (the
-/// current round's prefix), deduping by path and keeping first-seen order, and record `reason` as the
-/// new `last_reason`. `messages` is the *whole* current-round prefix, including a leading
-/// prior-summary message if there is one — that message carries no `ToolUse` blocks (it's prose), so
-/// scanning it contributes nothing and this naturally reduces to "previous provenance + this round's
-/// new activity" without needing to slice it off.
-pub fn merge_file_ops(
+/// Fold `previous`'s provenance forward with whatever the current round's prefix (`messages`) adds, and
+/// record `reason` as the new `last_reason`.
+///
+/// File paths accumulate (deduped by path, first-seen order); the `todo` list is replaced whenever this
+/// round's prefix contains one at all, and otherwise carried forward untouched. `messages` is the
+/// *whole* current-round prefix, including a leading prior-summary message if there is one — that
+/// message carries no `ToolUse` blocks (it's prose), so scanning it contributes nothing and this
+/// naturally reduces to "previous provenance + this round's new activity" without needing to slice it
+/// off.
+pub fn merge_provenance(
     previous: &CompactionProvenance,
     messages: &[Message],
     reason: CompactionReason,
@@ -88,6 +109,9 @@ pub fn merge_file_ops(
         modified_files: modified,
         compactions: previous.compactions.saturating_add(1),
         last_reason: Some(reason),
+        // `or_else`, not `or`: a round whose prefix cleared the list (`todos: []`) yields `Some([])` and
+        // must win over `previous`, or a cleared plan would silently reappear at the next compaction.
+        todos: extract_todos(messages).or_else(|| previous.todos.clone()),
     }
 }
 
@@ -613,12 +637,85 @@ pub fn extract_file_ops(messages: &[Message]) -> (Vec<String>, Vec<String>) {
     (read, modified)
 }
 
+/// The `todos` array from the **last** `todo` tool call in `messages`, or `None` if there wasn't one.
+///
+/// The `todo` tool's contract is a full replace — every call carries the complete list — so the last
+/// call is the whole truth and earlier ones are dead. Scanning backwards for it is what lets a compacted
+/// prefix hand its plan forward without the tool having to hold any state of its own (which it couldn't:
+/// its registry is rebuilt on every model switch).
+pub fn extract_todos(messages: &[Message]) -> Option<Value> {
+    messages
+        .iter()
+        .rev()
+        .flat_map(|m| m.content.iter().rev())
+        .find_map(|b| match b {
+            ContentBlock::ToolUse { name, input, .. } if name == "todo" => {
+                input.get("todos").filter(|t| t.is_array()).cloned()
+            }
+            _ => None,
+        })
+}
+
+/// Render a `todos` array as the compact checklist both the `todo` tool's own result and a compaction
+/// summary show the model. Shared so the two can never drift.
+///
+/// Tolerant by construction: this also runs over a `todos` value restored from a *persisted* session,
+/// which an older build (or a hand-edited file) may have written in a shape this build no longer emits.
+/// A malformed item degrades to a plain `[ ]` row rather than being dropped or panicking.
+pub fn render_todo_list(todos: &[Value]) -> String {
+    let mut out = String::new();
+    for item in todos {
+        let glyph = match item.get("status").and_then(Value::as_str) {
+            Some("completed") => "[x]",
+            Some("in_progress") => "[>]",
+            _ => "[ ]",
+        };
+        let content = item
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("(untitled)");
+        out.push_str(glyph);
+        out.push(' ');
+        out.push_str(content);
+        out.push('\n');
+    }
+    out.pop();
+    out
+}
+
+/// Render the carried `todo` list as a `<todo_list>` block, meant to be appended to the summarization
+/// model's *output* — the same deterministic-carry contract [`format_file_operations`] documents, and
+/// for the same reason: a summarizing model asked to "merge the previous summary" will paraphrase or
+/// drop a checklist, and a plan the model has quietly forgotten is worse than no plan.
+///
+/// Returns `""` for `None` and for an empty list (the model explicitly cleared its plan — there is
+/// nothing to carry, and an empty block would only invite the model to invent one), so appending this
+/// to a summary is always safe, unconditionally.
+pub fn format_todo_list(todos: Option<&Value>) -> String {
+    let items = todos.and_then(Value::as_array).filter(|a| !a.is_empty());
+    match items {
+        Some(items) => format!("\n\n<todo_list>\n{}\n</todo_list>", render_todo_list(items)),
+        None => String::new(),
+    }
+}
+
 /// If `prefix` begins with a prior compaction summary (a user message tagged with [`SUMMARY_MARKER`]),
-/// return the summary body (without the marker line, or `apply_summary`'s leading token-count line).
+/// return the summary's **prose body** — without the marker line, without `apply_summary`'s leading
+/// token-count line, and without the deterministic-carry blocks the host appended to it.
+///
 /// This is what lets compaction be *incremental*: the previous summary is fed forward as-is and
 /// updated, not re-summarized as transcript — so the token-count line (informational metadata for an
 /// exported transcript, not part of the summary itself) is stripped before it would otherwise leak into
 /// the next summarization prompt.
+///
+/// The carry blocks (`<read-files>`, `<modified-files>`, `<todo_list>`) are stripped for the same class
+/// of reason, and their omission here is load-bearing in *two* places. In [`summary_request`]'s
+/// incremental path the body is handed to the summarizing model under `<previous-summary>`: left in, the
+/// model dutifully echoes a now-stale copy into its own prose, right before [`Agent::compact`]
+/// (crate::agent::Agent::compact) appends the freshly-merged real ones — two conflicting file lists in
+/// one summary. And in `compact`'s own `turn_start == 1` fast path the body is reused *verbatim* as the
+/// next summary, which then gets the fresh blocks appended to it: without stripping, every split-turn
+/// compaction round would append another copy of every block, unboundedly.
 pub fn previous_summary(prefix: &[Message]) -> Option<&str> {
     let first = prefix.first()?;
     if first.role != Role::User {
@@ -629,7 +726,39 @@ pub fn previous_summary(prefix: &[Message]) -> Option<&str> {
     };
     let body = text.strip_prefix(SUMMARY_MARKER)?.trim_start();
     let body = strip_leading_tokens_before_line(body);
-    Some(body)
+    Some(strip_carry_blocks(body))
+}
+
+/// The host-appended, deterministically-regenerated blocks a summary body carries at its tail, as
+/// `(open, close)` tag pairs. See [`format_file_operations`] / [`format_todo_list`].
+const CARRY_BLOCKS: [(&str, &str); 3] = [
+    ("<read-files>", "</read-files>"),
+    ("<modified-files>", "</modified-files>"),
+    ("<todo_list>", "</todo_list>"),
+];
+
+/// Strip every trailing [`CARRY_BLOCKS`] block from a summary body, leaving only the model's own prose.
+///
+/// Peels from the tail rather than searching the whole body: the blocks are only ever *appended*, in a
+/// fixed order, so anything matching earlier in the text is the model's own prose quoting a tag name and
+/// must be left alone.
+fn strip_carry_blocks(body: &str) -> &str {
+    let mut body = body;
+    loop {
+        // `trim_end` only removes trailing bytes, so `trimmed` is a prefix of `body` and their byte
+        // indices agree — `rfind`'s offset is valid in either.
+        let trimmed = body.trim_end();
+        let Some((open, _)) = CARRY_BLOCKS
+            .iter()
+            .find(|(_, close)| trimmed.ends_with(*close))
+        else {
+            return body.trim_end();
+        };
+        let Some(start) = trimmed.rfind(open) else {
+            return body.trim_end();
+        };
+        body = &body[..start];
+    }
 }
 
 /// Strip an optional leading `"Compacted from {N} tokens\n\n"` line (see `apply_summary`) if present;
@@ -683,7 +812,7 @@ pub fn merge_split_summary(history: &str, turn_prefix: &str) -> String {
 /// and the model is asked to merge them — so successive compactions don't re-summarize (and lose) the
 /// same early context over and over.
 ///
-/// `file_ops` is the *already-merged* provenance (see [`merge_file_ops`]) — the read/modified-file
+/// `file_ops` is the *already-merged* provenance (see [`merge_provenance`]) — the read/modified-file
 /// tags embedded in the prompt reflect every round so far, not just this one's new activity, so the
 /// model doesn't lose file awareness the previous round recorded.
 ///
@@ -1380,7 +1509,7 @@ mod tests {
             // `SPLIT_TURN_INSTRUCTION` instead of the generic template this test is exercising.
             Message::assistant(vec![ContentBlock::text("done")]),
         ];
-        let file_ops = merge_file_ops(
+        let file_ops = merge_provenance(
             &CompactionProvenance::default(),
             &messages,
             CompactionReason::Manual,
@@ -1403,7 +1532,7 @@ mod tests {
         // rendered transcript in `<conversation>` tags — matching our own incremental-update path's
         // `<new-activity>` wrapper for internal consistency.
         let messages = convo();
-        let file_ops = merge_file_ops(
+        let file_ops = merge_provenance(
             &CompactionProvenance::default(),
             &messages,
             CompactionReason::Threshold,
@@ -1431,7 +1560,7 @@ mod tests {
             Message::user(format!("{SUMMARY_MARKER}\n\nPrevious summary body")),
             Message::assistant(vec![ContentBlock::text("new work since")]),
         ];
-        let file_ops = merge_file_ops(
+        let file_ops = merge_provenance(
             &CompactionProvenance::default(),
             &prefix,
             CompactionReason::Manual,
@@ -1541,7 +1670,7 @@ mod tests {
             Some("Previous summary body about task X")
         );
 
-        let file_ops = merge_file_ops(
+        let file_ops = merge_provenance(
             &CompactionProvenance::default(),
             &prefix,
             CompactionReason::Manual,
@@ -1571,7 +1700,7 @@ mod tests {
             )]),
             Message::tool_result("1", "contents", false),
         ];
-        let round1_ops = merge_file_ops(
+        let round1_ops = merge_provenance(
             &CompactionProvenance::default(),
             &round1_prefix,
             CompactionReason::Threshold,
@@ -1593,7 +1722,7 @@ mod tests {
             )]),
             Message::tool_result("2", "edited", false),
         ];
-        let round2_ops = merge_file_ops(&round1_ops, &round2_prefix, CompactionReason::Threshold);
+        let round2_ops = merge_provenance(&round1_ops, &round2_prefix, CompactionReason::Threshold);
 
         // Both rounds' files survive, in first-seen order — round1.rs isn't lost, and round2.rs isn't
         // just tacked on without it.
@@ -1615,19 +1744,20 @@ mod tests {
     }
 
     #[test]
-    fn merge_file_ops_dedupes_a_path_seen_again_in_a_later_round() {
+    fn merge_provenance_dedupes_a_path_seen_again_in_a_later_round() {
         let previous = CompactionProvenance {
             read_files: vec!["a.rs".into()],
             modified_files: vec![],
             compactions: 1,
             last_reason: Some(CompactionReason::Threshold),
+            todos: None,
         };
         let messages = vec![Message::assistant(vec![ContentBlock::tool_use(
             "1",
             "read",
             json!({ "path": "a.rs" }), // the same file, read again
         )])];
-        let merged = merge_file_ops(&previous, &messages, CompactionReason::Manual);
+        let merged = merge_provenance(&previous, &messages, CompactionReason::Manual);
         assert_eq!(merged.read_files, vec!["a.rs"]); // not duplicated
         assert_eq!(merged.last_reason, Some(CompactionReason::Manual));
     }
@@ -1676,7 +1806,7 @@ mod tests {
     fn summary_request_uses_the_split_turn_instruction_when_the_cut_is_mid_turn() {
         let messages = convo();
         let prefix = &messages[..messages.len() - 1]; // ends on a bare tool_result — split-turn shape
-        let file_ops = merge_file_ops(
+        let file_ops = merge_provenance(
             &CompactionProvenance::default(),
             prefix,
             CompactionReason::Threshold,
@@ -1694,7 +1824,7 @@ mod tests {
     #[test]
     fn summary_request_uses_the_generic_instruction_when_the_cut_is_a_clean_boundary() {
         let messages = convo(); // ends on a genuine assistant conclusion — not split
-        let file_ops = merge_file_ops(
+        let file_ops = merge_provenance(
             &CompactionProvenance::default(),
             &messages,
             CompactionReason::Threshold,
@@ -1713,7 +1843,7 @@ mod tests {
         // the structured instruction template, not replacing it — a manual compaction's client-supplied
         // steering, not a wholesale prompt override.
         let messages = convo();
-        let file_ops = merge_file_ops(
+        let file_ops = merge_provenance(
             &CompactionProvenance::default(),
             &messages,
             CompactionReason::Manual,
@@ -1741,7 +1871,7 @@ mod tests {
     #[test]
     fn summary_request_omits_additional_focus_when_no_custom_instructions_given() {
         let messages = convo();
-        let file_ops = merge_file_ops(
+        let file_ops = merge_provenance(
             &CompactionProvenance::default(),
             &messages,
             CompactionReason::Threshold,
@@ -1771,5 +1901,229 @@ mod tests {
         // Alternation: summary(user) then the kept assistant message.
         assert_eq!(s.messages[1].role, Role::Assistant);
         assert_eq!(s.last_input_tokens, 0);
+    }
+
+    // ---- the `todo` deterministic-carry channel -------------------------------------------------
+
+    /// A `todo` tool call, as the loop records it.
+    fn todo_call(id: &str, items: &[(&str, &str)]) -> Message {
+        let todos: Vec<Value> = items
+            .iter()
+            .map(|(content, status)| {
+                json!({ "content": content, "activeForm": format!("{content}ing"), "status": status })
+            })
+            .collect();
+        Message::assistant(vec![ContentBlock::tool_use(
+            id,
+            "todo",
+            json!({ "todos": todos }),
+        )])
+    }
+
+    #[test]
+    fn extract_todos_takes_the_last_call_not_the_first() {
+        // Full-replace semantics: the newest call is the whole truth, every earlier one is dead.
+        let messages = vec![
+            todo_call("1", &[("Old plan", "pending")]),
+            Message::user("go on"),
+            todo_call("2", &[("New plan", "in_progress")]),
+        ];
+        let todos = extract_todos(&messages).expect("a todo call is present");
+        assert_eq!(todos[0]["content"], "New plan");
+    }
+
+    #[test]
+    fn extract_todos_is_none_without_a_todo_call() {
+        assert!(extract_todos(&convo()).is_none());
+    }
+
+    #[test]
+    fn extract_todos_ignores_a_todo_call_with_a_non_array_todos_argument() {
+        // A malformed call the loop still recorded (the tool rejected it, but the `tool_use` block is
+        // in history regardless). Carrying a non-array forward would poison every later render.
+        let messages = vec![Message::assistant(vec![ContentBlock::tool_use(
+            "1",
+            "todo",
+            json!({ "todos": "not an array" }),
+        )])];
+        assert!(extract_todos(&messages).is_none());
+    }
+
+    #[test]
+    fn render_todo_list_maps_each_status_to_its_glyph() {
+        let todos = json!([
+            { "content": "Parse the config", "status": "completed" },
+            { "content": "Wire the retry loop", "status": "in_progress" },
+            { "content": "Add tests", "status": "pending" },
+        ]);
+        assert_eq!(
+            render_todo_list(todos.as_array().expect("array")),
+            "[x] Parse the config\n[>] Wire the retry loop\n[ ] Add tests"
+        );
+    }
+
+    #[test]
+    fn render_todo_list_degrades_a_malformed_item_instead_of_panicking() {
+        // This also runs over a `todos` value restored from a persisted session an older build wrote.
+        let todos = json!([{ "status": "bogus" }, { "content": "Real" }]);
+        assert_eq!(
+            render_todo_list(todos.as_array().expect("array")),
+            "[ ] (untitled)\n[ ] Real"
+        );
+    }
+
+    #[test]
+    fn format_todo_list_is_empty_for_none_and_for_a_cleared_list() {
+        // Appending this to a summary must always be safe, unconditionally.
+        assert_eq!(format_todo_list(None), "");
+        assert_eq!(format_todo_list(Some(&json!([]))), "");
+        // A non-array can only arrive from a corrupted/hand-edited session file.
+        assert_eq!(format_todo_list(Some(&json!("garbage"))), "");
+    }
+
+    #[test]
+    fn format_todo_list_renders_a_tagged_block() {
+        let todos = json!([{ "content": "Ship it", "status": "in_progress" }]);
+        assert_eq!(
+            format_todo_list(Some(&todos)),
+            "\n\n<todo_list>\n[>] Ship it\n</todo_list>"
+        );
+    }
+
+    #[test]
+    fn merge_provenance_replaces_the_todo_list_rather_than_accumulating_it() {
+        // Unlike file paths, a todo list is a full replace — folding two rounds together would
+        // resurrect steps the model deliberately dropped.
+        let previous = CompactionProvenance {
+            todos: Some(json!([{ "content": "Old", "status": "pending" }])),
+            ..Default::default()
+        };
+        let merged = merge_provenance(
+            &previous,
+            &[todo_call("1", &[("New", "pending")])],
+            CompactionReason::Threshold,
+        );
+        let todos = merged.todos.expect("carried forward");
+        assert_eq!(todos.as_array().map(Vec::len), Some(1));
+        assert_eq!(todos[0]["content"], "New");
+    }
+
+    #[test]
+    fn merge_provenance_carries_the_todo_list_forward_across_a_round_that_has_none() {
+        // The exact failure this channel exists to prevent: the model plans, works for many turns
+        // without touching the list, and a compaction folds the planning turn away.
+        let previous = CompactionProvenance {
+            todos: Some(json!([{ "content": "Keep me", "status": "in_progress" }])),
+            ..Default::default()
+        };
+        let merged = merge_provenance(&previous, &convo(), CompactionReason::Threshold);
+        assert_eq!(
+            merged.todos.expect("carried forward")[0]["content"],
+            "Keep me"
+        );
+    }
+
+    #[test]
+    fn merge_provenance_lets_an_explicitly_cleared_list_win_over_an_older_one() {
+        // `Some([])` must beat `previous`, or a plan the model finished with would silently reappear.
+        let previous = CompactionProvenance {
+            todos: Some(json!([{ "content": "Done with this", "status": "completed" }])),
+            ..Default::default()
+        };
+        let merged = merge_provenance(
+            &previous,
+            &[todo_call("1", &[])],
+            CompactionReason::Threshold,
+        );
+        assert_eq!(merged.todos, Some(json!([])));
+        assert_eq!(format_todo_list(merged.todos.as_ref()), "");
+    }
+
+    #[test]
+    fn previous_summary_strips_the_carry_blocks_the_host_appended() {
+        // Left in, the summarizing model echoes a stale copy into its prose right before `compact`
+        // appends the freshly-merged real ones.
+        let body = format!(
+            "Prose about the work.{}{}",
+            format_file_operations(&["a.rs".into()], &["b.rs".into()]),
+            format_todo_list(Some(
+                &json!([{ "content": "Ship it", "status": "pending" }])
+            ))
+        );
+        let msg = Message::user(format!(
+            "{SUMMARY_MARKER}\n\nCompacted from 500 tokens\n\n{body}"
+        ));
+        assert_eq!(
+            previous_summary(&[msg]),
+            Some("Prose about the work."),
+            "the marker, token line, and every carry block must be stripped"
+        );
+    }
+
+    #[test]
+    fn previous_summary_leaves_a_tag_name_the_model_wrote_in_its_own_prose_alone() {
+        // Only *trailing* blocks are peeled; a tag quoted mid-prose is the model's own content.
+        let body = "I read <read-files> from the tool output, then stopped.";
+        let msg = Message::user(format!("{SUMMARY_MARKER}\n\n{body}"));
+        assert_eq!(previous_summary(&[msg]), Some(body));
+    }
+
+    #[test]
+    fn a_todo_list_survives_two_consecutive_compactions() {
+        // The load-bearing test for the whole channel. Round 1 folds away the turn that planned; round
+        // 2's prefix is `[summary#1, ...new activity]`, which contains no `ToolUse` block at all — so
+        // without provenance the plan would be gone, and with only an LLM-rewritten summary it would be
+        // gone at the model's discretion. `merge_provenance` must carry it through both rounds and
+        // `format_todo_list` must re-render it into each new summary verbatim.
+        let round1_prefix = vec![
+            Message::user("plan and do the work"),
+            todo_call("1", &[("Wire the retry loop", "in_progress")]),
+        ];
+        let round1 = merge_provenance(
+            &CompactionProvenance::default(),
+            &round1_prefix,
+            CompactionReason::Threshold,
+        );
+        let summary1 = format!(
+            "The model planned the work.{}",
+            format_todo_list(round1.todos.as_ref())
+        );
+        assert!(summary1.contains("[>] Wire the retry loop"));
+
+        // Round 2's prefix opens with round 1's summary message and carries only new, todo-less
+        // activity after it.
+        let round2_prefix = vec![
+            Message::user(format!(
+                "{SUMMARY_MARKER}\n\nCompacted from 500 tokens\n\n{summary1}"
+            )),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "2",
+                "read",
+                json!({ "path": "src/lib.rs" }),
+            )]),
+        ];
+        assert!(
+            extract_todos(&round2_prefix).is_none(),
+            "round 2's prefix has no `todo` tool_use block — provenance is the only surviving copy"
+        );
+
+        let round2 = merge_provenance(&round1, &round2_prefix, CompactionReason::Threshold);
+        let summary2 = format!(
+            "The model kept working.{}",
+            format_todo_list(round2.todos.as_ref())
+        );
+        assert!(
+            summary2.contains("[>] Wire the retry loop"),
+            "the plan must survive the second compaction: {summary2}"
+        );
+        assert_eq!(round2.compactions, 2);
+
+        // And the block is appended exactly once — `previous_summary` peeled round 1's copy off before
+        // it could be fed forward and re-appended.
+        assert_eq!(summary2.matches("<todo_list>").count(), 1);
+        assert_eq!(
+            previous_summary(&round2_prefix),
+            Some("The model planned the work.")
+        );
     }
 }

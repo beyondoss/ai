@@ -786,6 +786,7 @@ impl Subagent {
             include_context_files: true,
             skills: &self.ctx.skills,
             has_read: registry.get("read").is_some(),
+            has_todo: registry.get(crate::tools::todo::NAME).is_some(),
             // A child never has `subagent` unless its definition asked for it and the depth cap allowed
             // it; there is no point listing agents it cannot delegate to.
             agents: if registry.get(NAME).is_some() {

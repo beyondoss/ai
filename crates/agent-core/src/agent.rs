@@ -2174,7 +2174,7 @@ impl Agent {
         let before = session.messages.len();
         let tokens_before = session.last_input_tokens;
         let prefix: Vec<Message> = session.messages[..first_kept].to_vec();
-        let file_ops = compaction::merge_file_ops(&session.compaction, &prefix, reason);
+        let file_ops = compaction::merge_provenance(&session.compaction, &prefix, reason);
 
         let summary = match cut.turn_start {
             None => {
@@ -2256,11 +2256,15 @@ impl Agent {
             // the clean-boundary case above, just discovered a call later.
             return Ok(CompactOutcome::AlreadyCompacted);
         }
-        // Append the file list deterministically rather than trusting the summarizing model to have
-        // mentioned exact paths in its own prose — see `format_file_operations`'s doc comment.
+        // Append the carried provenance deterministically rather than trusting the summarizing model to
+        // have preserved it in its own prose — see `compaction`'s module doc on the deterministic-carry
+        // channel. Both blocks come from `file_ops` (this round's already-merged provenance), so they
+        // reflect every round so far, not just this one's new activity. `previous_summary` strips these
+        // same blocks back off before the body is ever fed forward, so they never accumulate.
         let summary = format!(
-            "{summary}{}",
-            compaction::format_file_operations(&file_ops.read_files, &file_ops.modified_files)
+            "{summary}{}{}",
+            compaction::format_file_operations(&file_ops.read_files, &file_ops.modified_files),
+            compaction::format_todo_list(file_ops.todos.as_ref())
         );
         compaction::apply_summary(session, first_kept, &summary, tokens_before);
         session.compaction = file_ops;
@@ -7250,6 +7254,202 @@ mod tests {
         };
         assert!(text.contains("<read-files>"), "got: {text}");
         assert!(text.contains("src/lib.rs"), "got: {text}");
+    }
+
+    /// A conversation that plans with `todo`, then does unrelated work — the shape whose plan a
+    /// compaction would otherwise fold away.
+    fn planning_session() -> Vec<Message> {
+        vec![
+            Message::user("plan and do the work"),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "1",
+                "todo",
+                json!({ "todos": [
+                    { "content": "Wire the retry loop", "activeForm": "Wiring the retry loop", "status": "in_progress" },
+                    { "content": "Add tests", "activeForm": "Adding tests", "status": "pending" },
+                ]}),
+            )]),
+            Message::tool_result("1", "Todos updated (2 items):", false),
+            Message::assistant(vec![ContentBlock::text("planned")]),
+            Message::user("ok keep going"),
+            Message::assistant(vec![ContentBlock::text("done")]),
+        ]
+    }
+
+    fn summary_text(session: &Session) -> &str {
+        match &session.messages[0].content[0] {
+            ContentBlock::Text { text, .. } => text,
+            _ => panic!("expected the spliced summary message to be text"),
+        }
+    }
+
+    fn aggressive_compaction() -> CompactionConfig {
+        CompactionConfig {
+            keep_recent_tokens: 1,
+            ..CompactionConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_appends_the_carried_todo_list_to_the_applied_summary_text() {
+        // Same deterministic-carry contract `<read-files>` has, and for the same reason: the
+        // summarizing model here never mentions the plan in its prose, so if the block weren't appended
+        // by host code the model would wake up on the far side of the cut with no plan at all.
+        let mut session = Session::new();
+        session.messages = Arc::new(planning_session());
+
+        let mock = Arc::new(MockTransport::new(vec![turn::text(
+            "A prose summary that never mentions the plan.",
+        )]));
+        let agent = Agent::new(mock, "claude-opus-4-8").with_compaction(aggressive_compaction());
+        let compacted = agent
+            .compact(
+                &mut session,
+                CompactionReason::Manual,
+                &CancellationToken::new(),
+                &mut |_| {},
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(compacted.compacted());
+
+        let text = summary_text(&session);
+        assert!(text.contains("<todo_list>"), "got: {text}");
+        assert!(text.contains("[>] Wire the retry loop"), "got: {text}");
+        assert!(text.contains("[ ] Add tests"), "got: {text}");
+        // And structurally, for a host that wants the list without parsing text (`serve`'s `get_todos`).
+        assert_eq!(
+            session
+                .compaction
+                .todos
+                .as_ref()
+                .map(|t| t[0]["content"].clone()),
+            Some(json!("Wire the retry loop"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_todo_list_survives_a_second_compaction_through_the_real_compact_path() {
+        // The whole point of routing the plan through `CompactionProvenance`. By round 2 the `todo`
+        // `tool_use` block no longer exists anywhere in `session.messages` — `apply_summary` physically
+        // dropped it — so the only surviving copy is the one folded forward on the session, and the only
+        // way it reaches the model is `compact` re-appending it. Neither round's summarizing model
+        // mentions the plan, exactly as a real one usually wouldn't.
+        let mut session = Session::new();
+        session.messages = Arc::new(planning_session());
+
+        let mock = Arc::new(MockTransport::new(vec![
+            turn::text("Round one prose."),
+            turn::text("Round two prose."),
+        ]));
+        let agent =
+            Agent::new(mock.clone(), "claude-opus-4-8").with_compaction(aggressive_compaction());
+        let cancel = CancellationToken::new();
+
+        agent
+            .compact(
+                &mut session,
+                CompactionReason::Manual,
+                &cancel,
+                &mut |_| {},
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(summary_text(&session).contains("[>] Wire the retry loop"));
+
+        // More work happens, none of it touching `todo`. Roles keep alternating: summary(user),
+        // assistant, user, assistant.
+        let mut next = session.messages.as_ref().clone();
+        next.push(Message::user("now do something unrelated"));
+        next.push(Message::assistant(vec![ContentBlock::text(
+            "unrelated work finished",
+        )]));
+        session.messages = Arc::new(next);
+        assert!(
+            compaction::extract_todos(&session.messages).is_none(),
+            "the `todo` tool_use block is already gone from history — provenance is the only copy"
+        );
+
+        agent
+            .compact(
+                &mut session,
+                CompactionReason::Manual,
+                &cancel,
+                &mut |_| {},
+                None,
+            )
+            .await
+            .unwrap();
+
+        let text = summary_text(&session);
+        assert!(
+            text.contains("[>] Wire the retry loop"),
+            "the plan must survive the second compaction, got: {text}"
+        );
+        assert_eq!(
+            text.matches("<todo_list>").count(),
+            1,
+            "`previous_summary` must peel round one's block off before it is fed forward and \
+             re-appended, or the blocks accumulate unboundedly: {text}"
+        );
+        assert_eq!(session.compaction.compactions, 2);
+        assert_eq!(mock.calls(), 2, "one summarization call per round");
+    }
+
+    #[tokio::test]
+    async fn compact_does_not_stack_carry_blocks_when_it_reuses_a_prior_summary_verbatim() {
+        // The `turn_start == 1` fast path reuses the prior summary's body as the new summary's history
+        // half, and `compact` then appends the freshly-merged carry blocks to the result. Without
+        // `previous_summary` stripping them first, every split-turn round would append another copy of
+        // every block — an unbounded leak of the exact text this channel exists to keep exact.
+        let prior = format!(
+            "{}\n\nprior summary body{}{}",
+            compaction::SUMMARY_MARKER,
+            compaction::format_file_operations(&["a.rs".into()], &[]),
+            compaction::format_todo_list(Some(
+                &json!([{ "content": "Wire the retry loop", "status": "in_progress" }])
+            ))
+        );
+        let mut session = Session::new();
+        session.messages = Arc::new(vec![
+            Message::user(prior),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "1",
+                "read",
+                json!({ "path": "a.rs" }),
+            )]),
+            Message::tool_result("1", "contents of a.rs", false),
+        ]);
+        // Seed the provenance the way a real prior round would have left it.
+        session.compaction = compaction::CompactionProvenance {
+            read_files: vec!["a.rs".into()],
+            todos: Some(json!([{ "content": "Wire the retry loop", "status": "in_progress" }])),
+            compactions: 1,
+            last_reason: Some(CompactionReason::Threshold),
+            modified_files: vec![],
+        };
+
+        let mock = Arc::new(MockTransport::new(vec![turn::text("turn prefix summary")]));
+        let agent =
+            Agent::new(mock.clone(), "claude-opus-4-8").with_compaction(aggressive_compaction());
+        agent
+            .compact(
+                &mut session,
+                CompactionReason::Manual,
+                &CancellationToken::new(),
+                &mut |_| {},
+                None,
+            )
+            .await
+            .unwrap();
+
+        let text = summary_text(&session);
+        assert!(text.contains("prior summary body"), "got: {text}");
+        assert_eq!(text.matches("<todo_list>").count(), 1, "got: {text}");
+        assert_eq!(text.matches("<read-files>").count(), 1, "got: {text}");
+        assert!(text.contains("[>] Wire the retry loop"), "got: {text}");
     }
 
     #[tokio::test]
