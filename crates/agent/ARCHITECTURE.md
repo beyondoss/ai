@@ -1288,7 +1288,7 @@ appears.
 
 **Three modes, one tool call** — `single {agent, task}`, `parallel {tasks:[…]}` (≤8, 4 at a time, order
 preserved, no early abort), `chain {chain:[…]}` (sequential; each step's `{previous}` is replaced by the
-prior child's final assistant text). Parallel fan-out lives *inside one call* deliberately: the tool
+prior child's final assistant text). Parallel fan-out lives _inside one call_ deliberately: the tool
 returns `conservative_exclusive() == true` (a child's blast radius is opaque, like `bash`'s), and the
 loop caps an exclusive turn's concurrency at 1 — so N separate `subagent` calls would serialize. The
 array shape is what gets real parallelism.
@@ -1303,9 +1303,9 @@ array shape is what gets real parallelism.
    is a private one), so same-path `write`/`edit` across parent and children serialize.
 3. **Parallel writers need worktrees.** `bash` reports no `write_target`, so the lock registry provably
    cannot serialize two children's shell commands. In parallel mode, a write-capable agent
-   (`write`/`edit`/`bash`) *must* declare `isolation: worktree` or the call is rejected.
+   (`write`/`edit`/`bash`) _must_ declare `isolation: worktree` or the call is rejected.
 4. **Recursion bound.** Depth is carried in the `Subagent` instance (there is no ambient context in
-   `Tool::run`). A child gets its own `subagent` tool only if its definition lists it *and*
+   `Tool::run`). A child gets its own `subagent` tool only if its definition lists it _and_
    `depth+1 < max_depth` (default 1). A child with no `tools:` inherits the parent's effective set minus
    `subagent`.
 
@@ -1329,13 +1329,13 @@ other.
 
 - **Rooted tools.** `Read`/`Write`/`Edit`/`Ls`/`Grep`/`Find`/`Bash` each carry a `root` (see
   `tools::ToolConfig`); a relative path resolves against it via `tools::resolve_against`, and
-  `canonical_write_target(root, path)` keys the write-lock on the *resolved* path — so two worktrees'
+  `canonical_write_target(root, path)` keys the write-lock on the _resolved_ path — so two worktrees'
   `src/lib.rs` are correctly two different files. An empty root means the process cwd (the pre-subagent
   behavior every non-child caller keeps).
 - **Seeding.** `git worktree add HEAD` checks out HEAD, not the developer's uncommitted work, so
   `Worktree::create` copies the parent's tracked modifications and untracked-but-not-ignored files into
   the worktree and commits them as a throwaway baseline. `child_delta` diffs against that baseline, so
-  the patch is *only* what the child changed — the parent's own WIP isn't replayed onto it.
+  the patch is _only_ what the child changed — the parent's own WIP isn't replayed onto it.
 - **Merge-back.** On child success, `apply_patch` re-checks every path in the diff against the parent's
   `--deny-path` globs (mapped back to the main tree) — `git apply` is not a tool call and never reaches
   `ToolPolicy`, so this is the only place that check can live — then applies with `git apply --3way`. A
