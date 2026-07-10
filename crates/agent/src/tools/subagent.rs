@@ -89,6 +89,11 @@ pub struct ChildToolConfig {
     pub bash_shell_path: Option<String>,
     pub bash_command_prefix: Option<String>,
     pub image_auto_resize: bool,
+    /// The parent's `web` egress policy, inherited so a child can't reach internal URLs the parent was
+    /// forbidden — the same bypass class the deny-list/approval inheritance already guards.
+    pub web_allow_private: bool,
+    pub web_allow_hosts: Vec<String>,
+    pub web_timeout_ms: Option<u64>,
 }
 
 /// Everything a [`Subagent`] needs to build and run a child. Shared by `Arc` across every depth level,
@@ -862,6 +867,9 @@ impl Subagent {
             image_auto_resize: self.ctx.tool_cfg.image_auto_resize,
             root: root.to_path_buf(),
             mcp_tools: &self.ctx.mcp_tools,
+            web_allow_private: self.ctx.tool_cfg.web_allow_private,
+            web_allow_hosts: &self.ctx.tool_cfg.web_allow_hosts,
+            web_timeout_ms: self.ctx.tool_cfg.web_timeout_ms,
         });
         let allow = self.effective_tools(def);
         super::apply_filter(&mut registry, Some(&allow), None, false);

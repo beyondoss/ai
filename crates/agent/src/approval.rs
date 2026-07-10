@@ -43,7 +43,7 @@ use crate::policy::ToolPolicy;
 
 /// Tools that only ever read. `GatedSet::All` still skips them: asking a human to approve a `grep` is
 /// how an approval prompt gets trained away into a reflex.
-const READ_ONLY_TOOLS: [&str; 7] = [
+const READ_ONLY_TOOLS: [&str; 8] = [
     "read",
     "grep",
     "find",
@@ -51,6 +51,10 @@ const READ_ONLY_TOOLS: [&str; 7] = [
     "todo",
     "logs",
     "structured_output",
+    // `web` fetches over the network, but its blast radius is bounded by its own deny-by-default egress
+    // filter (`tools::web::ssrf`), not by a human gate — the operator chose not to prompt on it. Listed
+    // here so `--approve all` doesn't ask.
+    "web",
 ];
 
 /// Tools that mutate the filesystem through a path they name. `bash` is deliberately absent: it mutates

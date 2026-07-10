@@ -55,7 +55,7 @@ getrandom = { version = "0.3", features = ["std"] }
 # OpenAI Codex's independent CSRF `state` token (`randomBytes(16).toString("hex")`). Already resolved
 # transitively at this exact version (pingora-cache → gateway).
 hex = "0.4"
-reqwest = { version = "0.13", default-features = false, features = ["json", "form", "http2"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "form", "http2", "stream"] }
 # PKCE code_challenge (SHA-256 of the verifier). Already resolved transitively at this exact version
 # (ed25519-dalek → gateway) — this crate depending on it directly adds nothing to the build graph.
 sha2 = "0.10"
@@ -104,11 +104,17 @@ base64 = "0.22"
 # actually accepts are enabled.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 
+# The `web` tool's `markdown` mode: HTML→markdown, so the model reads a page's prose rather than its
+# HTML. See `tools/web/markdown.rs`.
+htmd = "0.5"
 # `export_html`'s markdown rendering (headers/bold/lists/code fences) for message text — pure Rust, no
 # vendored JS. Deliberately not paired with a syntax-highlighting crate (e.g. `syntect`): that pulls in
 # several MB of bundled syntax/theme data and would slow every build of this CLI, including `run`/
 # `serve`, which never touch export — see export.rs's module doc comment.
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+# The `web` tool's HTML parsing (html5ever, the linkedom equivalent) for its outline/locate/extract/
+# table modes. `scraper` also re-exports the `selectors`/`ego-tree` it's built on. See `tools/web/`.
+scraper = { version = "0.27", default-features = false }
 
 # MCP client support (`tools::mcp`): the official Rust SDK, client-side only — this binary never acts
 # as an MCP *server*, so `server`/`schemars`/`macros` stay off. `client` is the base client machinery;

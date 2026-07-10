@@ -451,6 +451,17 @@ enum Command {
         /// `serve`'s identical flag.
         #[arg(long, env = "AI_AGENT_BASH_COMMAND_PREFIX")]
         bash_command_prefix: Option<String>,
+        /// Let the `web` tool reach loopback/private/link-local addresses. Off by default: the tool
+        /// refuses them to prevent SSRF (it fetches URLs the model chose). `serve`'s identical flag.
+        #[arg(long, env = "AI_AGENT_WEB_ALLOW_PRIVATE")]
+        web_allow_private: bool,
+        /// A hostname the `web` tool may reach even with private egress off (repeatable) — an internal
+        /// service, or `127.0.0.1` for local testing. `serve`'s identical flag.
+        #[arg(long, env = "AI_AGENT_WEB_ALLOW_HOST")]
+        web_allow_host: Vec<String>,
+        /// The `web` tool's per-request timeout (ms). Default 30,000. `serve`'s identical flag.
+        #[arg(long, env = "AI_AGENT_WEB_TIMEOUT_MS")]
+        web_timeout_ms: Option<u64>,
         /// Restrict the tool set to exactly these names (comma-separated), dropping everything else.
         /// Combine with `--exclude-tools` to carve one back out of the allow-list. `serve`'s identical
         /// flag/env var — a deployment convention setting this env var to sandbox an agent must apply
@@ -834,6 +845,17 @@ enum Command {
         /// Fixed for the process, like `--bash-shell-path`; survives `set_model`/`set_thinking` rebuilds.
         #[arg(long, env = "AI_AGENT_BASH_COMMAND_PREFIX")]
         bash_command_prefix: Option<String>,
+        /// Let the `web` tool reach loopback/private/link-local addresses. Off by default: the tool
+        /// refuses them to prevent SSRF (it fetches URLs the model chose). `serve`'s identical flag.
+        #[arg(long, env = "AI_AGENT_WEB_ALLOW_PRIVATE")]
+        web_allow_private: bool,
+        /// A hostname the `web` tool may reach even with private egress off (repeatable) — an internal
+        /// service, or `127.0.0.1` for local testing. `serve`'s identical flag.
+        #[arg(long, env = "AI_AGENT_WEB_ALLOW_HOST")]
+        web_allow_host: Vec<String>,
+        /// The `web` tool's per-request timeout (ms). Default 30,000. `serve`'s identical flag.
+        #[arg(long, env = "AI_AGENT_WEB_TIMEOUT_MS")]
+        web_timeout_ms: Option<u64>,
         /// Restrict the tool set to exactly these names (comma-separated), dropping everything else.
         /// Fixed for the process, like `--system-prompt`; survives `set_model`/`set_thinking` rebuilds.
         /// `-t` matches pi's own `--tools`/`-t`.
@@ -1449,6 +1471,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             bash_timeout_ms,
             bash_shell_path,
             bash_command_prefix,
+            web_allow_private,
+            web_allow_host,
+            web_timeout_ms,
             tools,
             exclude_tools,
             no_tools,
@@ -1507,6 +1532,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 bash_timeout_ms,
                 bash_shell_path,
                 bash_command_prefix,
+                web_allow_private,
+                web_allow_host,
+                web_timeout_ms,
                 tools,
                 exclude_tools,
                 no_tools,
@@ -1575,6 +1603,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             bash_timeout_ms,
             bash_shell_path,
             bash_command_prefix,
+            web_allow_private,
+            web_allow_host,
+            web_timeout_ms,
             tools,
             exclude_tools,
             no_tools,
@@ -1867,6 +1898,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 bash_timeout_ms,
                 bash_shell_path,
                 bash_command_prefix,
+                web_allow_private,
+                web_allow_hosts: web_allow_host,
+                web_timeout_ms,
                 tools,
                 exclude_tools,
                 no_tools,
@@ -3060,6 +3094,9 @@ async fn run_task(
     bash_timeout_ms: Option<u64>,
     bash_shell_path: Option<String>,
     bash_command_prefix: Option<String>,
+    web_allow_private: bool,
+    web_allow_host: Vec<String>,
+    web_timeout_ms: Option<u64>,
     tools_allow: Option<Vec<String>>,
     tools_exclude: Option<Vec<String>>,
     no_tools: bool,
@@ -3425,6 +3462,9 @@ async fn run_task(
         bash_timeout_ms,
         bash_shell_path: bash_shell_path.as_deref(),
         bash_command_prefix: bash_command_prefix.as_deref(),
+        web_allow_private,
+        web_allow_hosts: &web_allow_host,
+        web_timeout_ms,
         image_auto_resize,
         mcp_tools: &mcp_tools,
         ..tools::ToolConfig::new()
@@ -3507,6 +3547,9 @@ async fn run_task(
                 bash_timeout_ms,
                 bash_shell_path: bash_shell_path.clone(),
                 bash_command_prefix: bash_command_prefix.clone(),
+                web_allow_private,
+                web_allow_hosts: web_allow_host.clone(),
+                web_timeout_ms,
                 image_auto_resize,
             },
             cwd: cwd.clone(),

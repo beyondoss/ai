@@ -21,6 +21,7 @@ pub mod read;
 pub mod structured_output;
 pub mod subagent;
 pub mod todo;
+pub mod web;
 pub mod write;
 
 /// Normalize a filesystem tool's `path` argument the way `bash` gets for free from the real shell it
@@ -422,6 +423,15 @@ pub struct ToolConfig<'a> {
     /// the resulting `Arc`s in on every rebuild, so a `serve` rebuild reuses live connections rather
     /// than reconnecting to every server.
     pub mcp_tools: &'a [Arc<dyn Tool>],
+    /// `--web-allow-private`: let the `web` tool reach loopback/private/link-local addresses. Off by
+    /// default — the tool refuses them to prevent SSRF, since it fetches URLs the model chose. See
+    /// [`web`].
+    pub web_allow_private: bool,
+    /// `--web-allow-host`: specific hostnames the `web` tool may reach even when private egress is off
+    /// (an internal service, or `127.0.0.1` for a test fixture).
+    pub web_allow_hosts: &'a [String],
+    /// `--web-timeout-ms`: the `web` tool's per-request timeout (default 30 s).
+    pub web_timeout_ms: Option<u64>,
 }
 
 impl<'a> ToolConfig<'a> {
@@ -491,6 +501,14 @@ pub fn default_registry_with_config(cfg: &ToolConfig<'_>) -> ToolRegistry {
     // Stateless: it validates and echoes the model's own full-replace list. See `todo`'s module doc for
     // why it holds nothing across calls (this registry is rebuilt on every `set_model`).
     reg.register(Arc::new(todo::Todo::new()));
+    // Owns its own reqwest client (SSRF resolver, no default redirects) — see `web`'s module doc. The
+    // egress policy is fixed at build time from `cfg`; a `set_model` rebuild reconstructs it, which is
+    // fine (the policy is cheap and immutable for the process).
+    reg.register(Arc::new(web::Web::new(
+        cfg.web_allow_private,
+        cfg.web_allow_hosts,
+        cfg.web_timeout_ms,
+    )));
     reg.register(Arc::new(beyond::Fork::real()));
     reg.register(Arc::new(beyond::Sync::real()));
     reg.register(Arc::new(beyond::Logs::real()));
@@ -811,13 +829,14 @@ mod tests {
         for name in ["read", "write", "edit", "bash", "ls", "grep", "find"] {
             assert!(reg.get(name).is_some(), "missing coding tool: {name}");
         }
-        // … the model's own task list …
+        // … the model's own task list, and its window to the web …
         assert!(reg.get("todo").is_some(), "missing todo tool");
+        assert!(reg.get("web").is_some(), "missing web tool");
         // … plus the Beyond platform tools.
         for name in ["fork", "sync", "logs"] {
             assert!(reg.get(name).is_some(), "missing beyond tool: {name}");
         }
-        assert_eq!(reg.len(), 11);
+        assert_eq!(reg.len(), 12);
     }
 
     #[test]

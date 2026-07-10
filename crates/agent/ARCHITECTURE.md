@@ -1351,6 +1351,43 @@ Three hosts surface it, all reading the same slot:
 | `serve`    | `prompt {output_schema, output_description}`                 | `data.structured_output` on the terminal `prompt` response — `null` when the model didn't answer, **absent** when no schema was asked for. Per-prompt, not per-session: installing, changing, or removing a schema rebuilds the tool set and the prompt section through the same path `set_model` uses. |
 | `subagent` | a task's own `output_schema`                                 | `ChildOutcome.text` becomes the compact JSON instead of the child's last assistant message. A child that never calls the tool _fails_ its task — a paragraph is not the typed answer the parent asked for.                                                                                              |
 
+## `web` — a "curl for agents"
+
+`tools/web/` gives the agent a window to the web: `fetch` (status + headers + body), `markdown`
+(readable page text), and structured extraction — `outline`, `locate`, `extract`, `table` — that keeps
+raw HTML _out of the context window_. It's modeled on [ax](https://github.com/yusukebe/ax), including
+the `title=a, href=a@href` row spec (`a@attr` reads an attribute, else text) and the `--where` filter
+grammar (`price > 100 && name ~ /^foo/i`, a hand-rolled panic-free evaluator in `whereexpr.rs`).
+Dispatched by an explicit `mode` rather than ax's flag-inference — clearer for a model. Output is a
+compact header-once TSV with a trailing `[N row(s); M more not shown]` note, since a tool has no stderr
+the model reads. Body/time caps are ax's: 20 MB, 30 s.
+
+**Egress safety is the load-bearing part** (`web/ssrf.rs`). ax is a local CLI a human runs; this is a
+server fetching URLs the _model_ chose. Because the tool is read-only (in `READ_ONLY_TOOLS`, so
+`--approve all` never prompts on it — the operator's choice), the SSRF filter is the **sole** boundary
+between the model and an internal fetch. It is deny-by-default, in two layers:
+
+- **A validating `reqwest::dns::Resolve`.** reqwest connects to exactly what the resolver returns, so
+  checking every resolved `SocketAddr` validates the _actual_ connection IP — on the initial request and
+  on every redirect hop — closing the resolve-then-reconnect (DNS-rebinding) TOCTOU gap a bare hostname
+  check leaves open.
+- **`validate_url` on every hop.** Non-http(s) schemes and literal-IP internal targets are refused
+  before any DNS; redirects are followed manually (`Policy::none()`, capped at 5) so each hop is
+  re-validated, which also blocks an `http → file:` scheme downgrade.
+
+Every blocked range is an explicit octet/segment check rather than a std helper (loopback, RFC-1918,
+link-local incl. `169.254.169.254`, CGNAT, v6 ULA/link-local, and — a real bypass — IPv4-mapped v6 like
+`::ffff:169.254.169.254`, unwrapped and re-checked as its embedded v4). `--web-allow-private` and
+`--web-allow-host <host>` open it back up; the allowlist is also what makes a loopback test fixture
+reachable. The tool owns its own `reqwest::Client` (the gateway's `shared_http` is h2-pinned with a
+10-minute timeout, the wrong shape), and subagents inherit the parent's egress policy via
+`ChildToolConfig` — a child that could reach internal URLs the parent couldn't is the same bypass class
+the deny-list/approval inheritance already guards.
+
+Deferred (not v1): a disk/parse cache (ax's ~2 min) — the registry is rebuilt on every `set_model`, so a
+tool-held cache would reset mid-session, the same gotcha `todo`/`structured_output` documented; revisit
+as host-owned. And JS rendering — ax doesn't either; static DOM only.
+
 ## Subagents — in-process delegation with worktree isolation
 
 The `subagent` tool (`tools/subagent.rs`) lets the model delegate a task to a nested `agent_core::Agent`
