@@ -22,6 +22,9 @@ clap.workspace = true
 # `agent_core::ToolProgress` is built on, so we poll it directly rather than adapting between channel
 # flavors.
 futures.workspace = true
+# Validates the `structured_output` tool's payload against the caller-supplied schema. See the
+# workspace manifest for why `default-features = false` matters here.
+jsonschema.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # `skills.rs`'s `SKILL.md`/prompt-template frontmatter parsing — a real YAML parser instead of a

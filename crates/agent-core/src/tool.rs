@@ -110,6 +110,17 @@ impl ToolProgress {
     }
 }
 
+/// The one key the dispatch loop stamps onto every tool call's coerced input before handing it to
+/// [`Tool::run`]: whether the *active model* can actually see images (see `Agent::run_events_steered`,
+/// and `Agent::with_block_images` for the operator override that forces it `false`).
+///
+/// Deliberately absent from every tool's advertised `input_schema`, so the model never sees it and
+/// can't set it. `read` is the only tool that reads it. Every other tool ignores extra keys — with one
+/// exception that must not: a tool which *validates* its input against a caller-supplied JSON Schema
+/// (`structured_output`) has to strip this key first, or a schema with `"additionalProperties": false`
+/// would reject every call the loop ever makes to it.
+pub const MODEL_SUPPORTS_VISION_KEY: &str = "_model_supports_vision";
+
 /// A tool's successful output: text for the model, plus any images it produced (a screenshot, a
 /// rendered chart, `read` on an image file) and an optional hint to end the run.
 ///

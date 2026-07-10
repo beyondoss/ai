@@ -1269,6 +1269,39 @@ and `serve`'s own `bash`/`abort_bash` RPC commands reuse `RealRunner` directly, 
 
 ---
 
+## `structured_output` — the agent as a callable function
+
+`tools/structured_output.rs` turns a run into something a script or a parent agent can call: a caller
+supplies a JSON Schema, the tool advertises it **as its own `input_schema`**, and the model fills it in
+the way it fills in any other tool call. The payload is validated (`jsonschema`), captured into a
+host-owned `OutputSlot`, and the run ends via `ToolOutput::terminate`.
+
+Three properties are load-bearing:
+
+- **The slot is host-owned.** `serve` rebuilds its registry on every `set_model`/`set_thinking`, so a
+  value captured into the tool itself would vanish on a mid-run model switch. The host holds the slot,
+  clears it before each run, and reads it once the run drains.
+- **Registration happens after `--tools`/`--exclude-tools` filtering**, like `subagent`. An allow-list
+  scopes what the agent may _do_; silently stripping the one tool the invocation exists to add would
+  leave a run that can never satisfy its own contract.
+- **There is no `tool_choice` forcing.** It is per-request (so pinning it would stop the model doing any
+  work before it answers) and the OpenAI Chat Completions dialect ignores it outright. The contract is
+  carried by a system-prompt section — gated on `PromptOptions::has_structured_output` — plus
+  `terminate`. A run that ends without a payload is reported as a failure rather than papered over.
+
+A schema can be **model-authored** (a parent writing its child's), so nothing may panic on a hostile
+one. It is compiled once at construction, never at first call, and a compile failure is returned to
+whoever wrote it. `jsonschema` is built with `default-features = false`: that disables `$ref` resolution
+over HTTP and the filesystem, so a schema cannot make the agent fetch a URL or read `/etc/passwd`.
+
+Three hosts surface it, all reading the same slot:
+
+| Host       | In                                                           | Out                                                                                                                                                                                                                                                                                                     |
+| ---------- | ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `run`      | `--output-schema` (inline or a file), `--output-description` | payload as the **last stdout line** (compact, so `… \| tail -1 \| jq` works); `--json` wraps it as one final `{"kind":"structured_output"}` line. Exit 1 if the model never produced one; exit 2 for an unusable schema, before any model call is billed.                                               |
+| `serve`    | `prompt {output_schema, output_description}`                 | `data.structured_output` on the terminal `prompt` response — `null` when the model didn't answer, **absent** when no schema was asked for. Per-prompt, not per-session: installing, changing, or removing a schema rebuilds the tool set and the prompt section through the same path `set_model` uses. |
+| `subagent` | a task's own `output_schema`                                 | `ChildOutcome.text` becomes the compact JSON instead of the child's last assistant message. A child that never calls the tool _fails_ its task — a paragraph is not the typed answer the parent asked for.                                                                                              |
+
 ## Subagents — in-process delegation with worktree isolation
 
 The `subagent` tool (`tools/subagent.rs`) lets the model delegate a task to a nested `agent_core::Agent`

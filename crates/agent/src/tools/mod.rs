@@ -18,6 +18,7 @@ pub mod ls;
 pub mod mcp;
 pub mod output;
 pub mod read;
+pub mod structured_output;
 pub mod subagent;
 pub mod todo;
 pub mod write;

@@ -162,6 +162,11 @@ pub struct PromptOptions<'a> {
     /// whose registry never advertised the tool. Same gate-on-what's-registered discipline as
     /// [`has_read`](Self::has_read) and [`agents`](Self::agents).
     pub has_todo: bool,
+    /// Whether the registered tool set includes `structured_output`. With no `tool_choice` forcing (it
+    /// is per-request, so pinning it would stop the model doing any real work first, and the OpenAI Chat
+    /// Completions dialect ignores it outright), *this prompt section is the forcing mechanism*: the tool
+    /// itself ends the run, but nothing else tells the model to call it rather than answer in prose.
+    pub has_structured_output: bool,
     /// Whether `cwd` is a trusted project (an explicit `--trust-project`/RPC override, or recorded in
     /// `TrustStore`). Gates the *project-local* `SYSTEM.md`/`APPEND_SYSTEM.md` overrides and the
     /// project-local skills root (`<cwd>/.claude/skills`, see `skills::discover`) — an untrusted
@@ -262,8 +267,25 @@ pub fn build_static_system_prompt(opts: &PromptOptions) -> String {
         s.push_str(TODO_GUIDANCE);
     }
 
+    // The `structured_output` contract. See `PromptOptions::has_structured_output`: with no
+    // `tool_choice` forcing, this is what actually makes the model return typed data instead of prose.
+    if opts.has_structured_output {
+        s.push_str("\n\n");
+        s.push_str(STRUCTURED_OUTPUT_GUIDANCE);
+    }
+
     s
 }
+
+/// How to drive the `structured_output` tool. Gated on [`PromptOptions::has_structured_output`].
+const STRUCTURED_OUTPUT_GUIDANCE: &str = "\
+<structured_output_protocol>
+This run must end by calling the `structured_output` tool exactly once, with the task's result \
+conforming to that tool's schema. Do the work first, using whatever tools you need; then call \
+`structured_output`. Do not describe the result in prose — return it through the tool, which ends the \
+run. If the payload you send does not match the schema, you will be told what was wrong and must call \
+the tool again with a corrected one.
+</structured_output_protocol>";
 
 /// How to drive the `todo` tool. Gated on [`PromptOptions::has_todo`].
 const TODO_GUIDANCE: &str = "\
@@ -950,6 +972,7 @@ mod tests {
             skills: &[],
             has_read: true,
             has_todo: false,
+            has_structured_output: false,
             project_trusted: true,
             agents: &[],
         });
@@ -982,6 +1005,7 @@ mod tests {
             skills: &[],
             has_read: true,
             has_todo: false,
+            has_structured_output: false,
             project_trusted: true,
             agents: &[],
         });
@@ -1011,6 +1035,7 @@ mod tests {
             skills: &[],
             has_read: true,
             has_todo: false,
+            has_structured_output: false,
             project_trusted: false,
             agents: &[],
         });
@@ -1043,6 +1068,7 @@ mod tests {
             skills: std::slice::from_ref(&skill),
             has_read: true,
             has_todo: false,
+            has_structured_output: false,
             project_trusted: true,
             agents: &[],
         });
@@ -1076,6 +1102,7 @@ mod tests {
             skills: std::slice::from_ref(&skill),
             has_read: true,
             has_todo: false,
+            has_structured_output: false,
             project_trusted: true,
             agents: &[],
         });
@@ -1108,6 +1135,7 @@ mod tests {
             skills: std::slice::from_ref(&skill),
             has_read: false,
             has_todo: false,
+            has_structured_output: false,
             project_trusted: true,
             agents: &[],
         });
@@ -1133,6 +1161,7 @@ mod tests {
             skills: &[],
             has_read: true,
             has_todo: false,
+            has_structured_output: false,
             project_trusted: true,
             agents: &[],
         });
@@ -1159,6 +1188,7 @@ mod tests {
             skills: &[],
             has_read: true,
             has_todo: false,
+            has_structured_output: false,
             project_trusted: false,
             agents: &[],
         });
@@ -1181,6 +1211,7 @@ mod tests {
             skills: &[],
             has_read: true,
             has_todo: false,
+            has_structured_output: false,
             project_trusted: true,
             agents: &[],
         });
@@ -1239,7 +1270,8 @@ mod tests {
         assert_eq!(tz_string_offset("Not/A/Real/Zone", 1_700_000_000), None);
     }
 
-    fn todo_opts(cwd: &Path, has_todo: bool) -> PromptOptions<'_> {
+    /// Options whose only interesting axes are the two tool-gated prompt sections.
+    fn section_opts(cwd: &Path, has_todo: bool, has_structured_output: bool) -> PromptOptions<'_> {
         PromptOptions {
             base: Some("You are an agent."),
             default_base: "",
@@ -1249,6 +1281,7 @@ mod tests {
             skills: &[],
             has_read: true,
             has_todo,
+            has_structured_output,
             project_trusted: false,
             agents: &[],
         }
@@ -1260,14 +1293,28 @@ mod tests {
         // process (or subagent child) whose registry never advertised `todo` must not carry the
         // protocol's dead weight in its prompt.
         let tmp = tempfile::tempdir().unwrap();
-        let with = build_static_system_prompt(&todo_opts(tmp.path(), true));
+        let with = build_static_system_prompt(&section_opts(tmp.path(), true, false));
         assert!(with.contains("<todo_protocol>"));
         assert!(with.contains("fully replaces the previous list"));
         assert!(with.contains("exactly one item `in_progress`"));
 
-        let without = build_static_system_prompt(&todo_opts(tmp.path(), false));
+        let without = build_static_system_prompt(&section_opts(tmp.path(), false, false));
         assert!(!without.contains("todo_protocol"));
         assert!(!without.contains("in_progress"));
+    }
+
+    #[test]
+    fn the_structured_output_protocol_is_advertised_only_when_the_tool_is_registered() {
+        // This section *is* the forcing mechanism — there is no `tool_choice` pinning — so its presence
+        // when the tool is registered is a correctness property, not a nicety.
+        let tmp = tempfile::tempdir().unwrap();
+        let with = build_static_system_prompt(&section_opts(tmp.path(), false, true));
+        assert!(with.contains("<structured_output_protocol>"));
+        assert!(with.contains("exactly once"));
+        assert!(with.contains("Do not describe the result in prose"));
+
+        let without = build_static_system_prompt(&section_opts(tmp.path(), false, false));
+        assert!(!without.contains("structured_output"));
     }
 
     #[test]
@@ -1283,6 +1330,7 @@ mod tests {
             skills: &[],
             has_read: true,
             has_todo: false,
+            has_structured_output: false,
             project_trusted: false,
             agents: &[],
         });
@@ -1313,6 +1361,7 @@ mod tests {
             skills: &[],
             has_read: true,
             has_todo: false,
+            has_structured_output: false,
             project_trusted: false,
             agents: &[],
         };
@@ -1344,6 +1393,7 @@ mod tests {
             skills: &[],
             has_read: true,
             has_todo: false,
+            has_structured_output: false,
             project_trusted: false,
             agents: &[],
         });

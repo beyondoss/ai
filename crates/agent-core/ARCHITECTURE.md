@@ -787,7 +787,23 @@ would 400 the next request whenever the model batched more than one tool call.
 Each call resolves to `(text, images, is_error, terminate)`: a tool's `ToolOutput` images ride onto
 its `ContentBlock::ToolResult` so the multimodal model sees them, and if _every_ call in the batch set
 `terminate` the loop ends the run after recording the results — an `attempt_completion`/`exit`-style
-tool, gated so one tool can't cut off the others dispatched alongside it. Any **steer** messages a
+tool, gated so one tool can't cut off the others dispatched alongside it.
+
+`crates/agent`'s `structured_output` is that mechanism's one production consumer, and its shape is what
+callers have to reason about. The error path can never terminate (a `ToolError` resolves to
+`terminate: false`), so an invalid payload becomes an error `tool_result` the model retries against —
+that _is_ the retry loop, with no extra machinery. And because the unanimous-agreement rule lets a
+mixed batch continue, a `structured_output` call dispatched alongside an `edit` stages its value and the
+run goes on; a host must therefore read its result only once the run has fully drained, since a later
+call may revise it. Neither behavior is special-cased for the tool — both fall out of the fold.
+
+Dispatch also stamps one schema-undocumented key onto every call's coerced input:
+`tool::MODEL_SUPPORTS_VISION_KEY` (`_model_supports_vision`), which `read` uses to decide whether to
+downgrade an image to a text placeholder. Every other tool ignores extra keys — except one that cannot:
+a tool validating its input against a caller-supplied JSON Schema must strip the key first, or a schema
+with `"additionalProperties": false` would reject every call the loop ever makes to it.
+
+Any **steer** messages a
 client queued mid-run (`Steering::push_steer`) are folded onto this same tool-results user turn as
 trailing text blocks, letting a client redirect a busy agent between tool turns while keeping role
 alternation valid; **follow-ups** (`push`) are a separate lane, injected only at the stop boundary.

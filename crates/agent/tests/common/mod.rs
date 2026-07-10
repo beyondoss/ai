@@ -457,6 +457,32 @@ where
     frames
 }
 
+/// The JSON body of a raw recorded request (as `spawn_model_server` records it: headers + body).
+pub fn body_json(raw_request: &str) -> Value {
+    let body = raw_request
+        .split_once("\r\n\r\n")
+        .expect("request must have a body")
+        .1;
+    serde_json::from_str(body).expect("request body must be JSON")
+}
+
+/// The names of the tools a request *advertised* to the model.
+///
+/// Not a substring search on the raw request: the body also carries the conversation history, whose
+/// `tool_use`/`tool_result` blocks name every tool the model has ever called. A turn that no longer
+/// offers a tool still mentions it, so only the `tools` array answers "what may the model call now?".
+pub fn advertised_tools(raw_request: &str) -> Vec<String> {
+    body_json(raw_request)["tools"]
+        .as_array()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|t| t["name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Every persisted `message` entry's id, in order, read straight off a session JSONL file.
 pub fn message_ids(session_file: &str) -> Vec<String> {
     std::fs::read_to_string(session_file)

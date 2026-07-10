@@ -22,13 +22,23 @@
 //! reattaching client sees a **stable** session id and metadata.
 //!
 //! Commands (stdin): `{id?, type, …}`
-//!   - `{type:"prompt", message, streaming_behavior?}` run a turn: an immediate lightweight `ack`
+//!   - `{type:"prompt", message, streaming_behavior?, output_schema?, output_description?}` run a turn:
+//!     an immediate lightweight `ack`
 //!     frame (the turn is queued and starting), then `event` frames, then a `response` whose `data`
 //!     includes `refused: bool` — whether the run's last turn ended in a refusal rather than an
 //!     ordinary stop (a refusal doesn't drain queued `steer`/`follow_up` messages; see `agent-core`).
 //!     Sent while another `prompt` is already in flight, it's rejected as busy *unless*
 //!     `streaming_behavior` is `"steer"` or `"follow_up"`, in which case `message` is queued through
 //!     the same `Steering` lane an explicit `steer`/`follow_up` command would use.
+//!
+//!     `output_schema` (a JSON Schema object) makes the run a callable function: the model must return
+//!     a conforming payload through the `structured_output` tool instead of answering in prose, and
+//!     `data.structured_output` on the terminal response carries it — `null` if the model never
+//!     produced one, and **absent entirely** when the prompt didn't ask for typed output, so a client
+//!     can tell the two apart. `output_description` overrides what the model is told the payload is for.
+//!     Both are **per-prompt**: the schema is installed for this run and removed by the next prompt that
+//!     omits it. A malformed schema is rejected with `success:false` *before* the `ack`, so no model call
+//!     is billed for a contract that can never be satisfied.
 //!   - `{type:"abort"}`                  cancel the in-flight `prompt` (if any), else a no-op ack —
 //!     the ack for a *mid-run* abort isn't sent until the cancelled run has actually gone idle (matches
 //!     pi's own `agent-session.ts` awaiting `waitForIdle()` first), so a client that treats the ack as
@@ -1966,6 +1976,17 @@ pub(crate) async fn serve_session(
     let startup_tools = build_tools(&cfg, cfg.image_auto_resize);
     let has_read = startup_tools.get("read").is_some();
     let has_todo = startup_tools.get(crate::tools::todo::NAME).is_some();
+
+    // `structured_output` is installed per-`prompt` (see that arm's `output_schema` handling), not at
+    // startup: one session can answer one request in prose and the next as typed JSON. The `OutputSlot`
+    // outlives every rebuild — it is this session's return channel, and a `set_model` mid-run must not
+    // drop the answer that landed in it. `current_output_spec` is what an incoming `prompt` is compared
+    // against to decide whether anything actually has to be rebuilt.
+    let output_slot = crate::tools::structured_output::OutputSlot::new();
+    let mut structured_output: Option<Arc<crate::tools::structured_output::StructuredOutput>> =
+        None;
+    let mut current_output_spec: Option<(Value, Option<String>)> = None;
+
     let mut static_system =
         crate::resources::build_static_system_prompt(&crate::resources::PromptOptions {
             base: None,
@@ -1976,6 +1997,7 @@ pub(crate) async fn serve_session(
             skills: &skills,
             has_read,
             has_todo,
+            has_structured_output: structured_output.is_some(),
             project_trusted,
             agents: &cfg.agents,
         });
@@ -2159,6 +2181,7 @@ pub(crate) async fn serve_session(
         &write_locks,
         &checkpoint,
         subagent_ctx.as_ref(),
+        structured_output.as_ref(),
     );
     timing.mark("build agent");
     // Persistent across every `prompt` call (not just the one currently in flight), so `steer`/
@@ -2341,6 +2364,7 @@ pub(crate) async fn serve_session(
                                 &write_locks,
                                 &checkpoint,
                                 subagent_ctx.as_ref(),
+                                structured_output.as_ref(),
                                 );
                         }
                         let _ = out_tx.send(response(
@@ -2457,6 +2481,7 @@ pub(crate) async fn serve_session(
                             &write_locks,
                             &checkpoint,
                             subagent_ctx.as_ref(),
+                                structured_output.as_ref(),
                             );
                     }
                     let _ = out_tx.send(response(
@@ -2524,6 +2549,7 @@ pub(crate) async fn serve_session(
                             &write_locks,
                             &checkpoint,
                             subagent_ctx.as_ref(),
+                                structured_output.as_ref(),
                             );
                     }
                     let _ = out_tx.send(response(
@@ -2710,6 +2736,75 @@ pub(crate) async fn serve_session(
 
         match ctype.as_str() {
             "prompt" => {
+                // `output_schema` makes this prompt a callable function: the model must fill the schema
+                // in via `structured_output` rather than answering in prose, and the validated payload
+                // rides the terminal response's `data.structured_output`. Handled before the ack, so a
+                // malformed schema is rejected outright rather than acknowledged and then failed.
+                //
+                // Installing (or removing, or changing) a schema changes both the *tool set* and the
+                // system-prompt section that tells the model to use it, so both are rebuilt — through
+                // the very same `build_agent` path `set_model` already uses. A prompt repeating the
+                // schema it already had rebuilds nothing.
+                match parse_output_spec(&cmd) {
+                    Err(e) => {
+                        emit!(response(id, "prompt", false, None, Some(&e)));
+                        continue;
+                    }
+                    Ok(spec) if spec != current_output_spec => {
+                        structured_output = match &spec {
+                            Some((schema, description)) => {
+                                match crate::tools::structured_output::StructuredOutput::new(
+                                    schema.clone(),
+                                    description.clone(),
+                                    output_slot.clone(),
+                                ) {
+                                    Ok(tool) => Some(Arc::new(tool)),
+                                    Err(e) => {
+                                        emit!(response(id, "prompt", false, None, Some(&e)));
+                                        continue;
+                                    }
+                                }
+                            }
+                            None => None,
+                        };
+                        current_output_spec = spec;
+                        static_system = crate::resources::build_static_system_prompt(
+                            &crate::resources::PromptOptions {
+                                base: None,
+                                default_base: &cfg.system,
+                                append: cfg.append_system.as_deref(),
+                                cwd: &cwd,
+                                include_context_files: cfg.context_files,
+                                skills: &skills,
+                                has_read,
+                                has_todo,
+                                has_structured_output: structured_output.is_some(),
+                                project_trusted,
+                                agents: &cfg.agents,
+                            },
+                        );
+                        agent = build_agent(
+                            client.clone(),
+                            &full_system(&static_system, &cwd),
+                            &cfg,
+                            &current_model,
+                            current_thinking,
+                            current_level,
+                            current_auto_compaction,
+                            current_auto_retry,
+                            current_block_images,
+                            current_image_auto_resize,
+                            persistence.session_id(),
+                            &write_locks,
+                            &checkpoint,
+                            subagent_ctx.as_ref(),
+                            structured_output.as_ref(),
+                        );
+                    }
+                    Ok(_) => {}
+                }
+                // A previous prompt's answer must never be mistaken for this one's.
+                output_slot.clear();
                 // Refresh the cheap, time-varying part of the system prompt (the date) every turn —
                 // the expensive discovery-based static half only changes on `set_model`/`set_thinking`/
                 // `reload`, so it's cached rather than recomputed here.
@@ -3406,6 +3501,18 @@ pub(crate) async fn serve_session(
                         let mut data = session_stats(&session, &current_model);
                         if let Value::Object(m) = &mut data {
                             m.insert("refused".into(), json!(refused.load(Ordering::Relaxed)));
+                            // Present exactly when this prompt asked for typed output, so a client can
+                            // tell "the model never produced a payload" (`null`) apart from "this run
+                            // wasn't asked for one" (field absent) — the same reason `refused` is always
+                            // present rather than only when true. Read after the run has fully drained,
+                            // so a mixed batch (`structured_output` + `edit` in one turn, which the
+                            // loop's unanimous-terminate rule lets continue) reports the final value.
+                            if current_output_spec.is_some() {
+                                m.insert(
+                                    "structured_output".into(),
+                                    output_slot.get().unwrap_or(Value::Null),
+                                );
+                            }
                         }
                         match &persist_error {
                             // The run itself succeeded, but its transcript failed to durably persist —
@@ -4149,6 +4256,7 @@ pub(crate) async fn serve_session(
                         skills: &skills,
                         has_read,
                         has_todo,
+                        has_structured_output: structured_output.is_some(),
                         project_trusted,
                         agents: &cfg.agents,
                     },
@@ -4173,6 +4281,7 @@ pub(crate) async fn serve_session(
                     &write_locks,
                     &checkpoint,
                     subagent_ctx.as_ref(),
+                    structured_output.as_ref(),
                 );
                 emit!(response(id, "reload", true, None, None));
             }
@@ -4261,6 +4370,7 @@ pub(crate) async fn serve_session(
                                         &write_locks,
                                         &checkpoint,
                                         subagent_ctx.as_ref(),
+                                        structured_output.as_ref(),
                                     );
                                     emit!(response(
                                         id,
@@ -4315,6 +4425,7 @@ pub(crate) async fn serve_session(
                             &write_locks,
                             &checkpoint,
                             subagent_ctx.as_ref(),
+                            structured_output.as_ref(),
                         );
                         emit!(response(
                             id,
@@ -4341,6 +4452,7 @@ pub(crate) async fn serve_session(
                             &write_locks,
                             &checkpoint,
                             subagent_ctx.as_ref(),
+                            structured_output.as_ref(),
                         );
                         emit!(response(
                             id,
@@ -4405,6 +4517,7 @@ pub(crate) async fn serve_session(
                                     &write_locks,
                                     &checkpoint,
                                     subagent_ctx.as_ref(),
+                                    structured_output.as_ref(),
                                 );
                                 let (thinking, reasoning_effort) = agent_core::thinking_for_level(
                                     &agent_core::capabilities(&current_model),
@@ -4507,6 +4620,7 @@ pub(crate) async fn serve_session(
                                     &write_locks,
                                     &checkpoint,
                                     subagent_ctx.as_ref(),
+                                    structured_output.as_ref(),
                                 );
                                 let mut resp_data =
                                     model_switch_response(&current_model, current_level);
@@ -4560,6 +4674,7 @@ pub(crate) async fn serve_session(
                             &write_locks,
                             &checkpoint,
                             subagent_ctx.as_ref(),
+                            structured_output.as_ref(),
                         );
                         let (thinking, reasoning_effort) = agent_core::thinking_for_level(
                             &agent_core::capabilities(&current_model),
@@ -4614,6 +4729,7 @@ pub(crate) async fn serve_session(
                         &write_locks,
                         &checkpoint,
                         subagent_ctx.as_ref(),
+                        structured_output.as_ref(),
                     );
                     emit!(response(
                         id,
@@ -4649,6 +4765,7 @@ pub(crate) async fn serve_session(
                         &write_locks,
                         &checkpoint,
                         subagent_ctx.as_ref(),
+                        structured_output.as_ref(),
                     );
                     emit!(response(
                         id,
@@ -4695,6 +4812,7 @@ pub(crate) async fn serve_session(
                         &write_locks,
                         &checkpoint,
                         subagent_ctx.as_ref(),
+                        structured_output.as_ref(),
                     );
                     emit!(response(
                         id,
@@ -4734,6 +4852,7 @@ pub(crate) async fn serve_session(
                         &write_locks,
                         &checkpoint,
                         subagent_ctx.as_ref(),
+                        structured_output.as_ref(),
                     );
                     emit!(response(
                         id,
@@ -5017,6 +5136,7 @@ pub(crate) async fn serve_session(
                                     &write_locks,
                                     &checkpoint,
                                     subagent_ctx.as_ref(),
+                                    structured_output.as_ref(),
                                 );
                             }
                             emit!(response(
@@ -5565,6 +5685,31 @@ fn full_system(static_system: &str, cwd: &std::path::Path) -> String {
     format!("{static_system}{}", crate::resources::dynamic_footer(cwd))
 }
 
+/// The `output_schema`/`output_description` a `prompt` command asks for, as the pair the session
+/// compares against what it already has installed. `None` means "answer in prose", the default.
+///
+/// An explicit `output_schema: null` is the same as omitting it — that is how a client *removes* a
+/// schema installed by an earlier prompt on the same session. Anything else non-object is a client bug
+/// and is rejected here rather than reaching `StructuredOutput::new`, which would then complain about
+/// the wrong thing.
+type OutputSpec = Option<(Value, Option<String>)>;
+
+fn parse_output_spec(cmd: &Value) -> Result<OutputSpec, String> {
+    let schema = match cmd.get("output_schema") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(v) => v,
+    };
+    if !schema.is_object() {
+        return Err("`output_schema` must be a JSON Schema object".to_string());
+    }
+    let description = match cmd.get("output_description") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => return Err("`output_description` must be a string".to_string()),
+    };
+    Ok(Some((schema.clone(), description)))
+}
+
 /// The extra per-request headers a `models.json` override configures for this model id, if any (Task
 /// #11 pi-parity feature) — the lib-crate-side twin of `main.rs::model_override_extra_headers`. Not
 /// literally shared with it: `main.rs` is a separate binary crate over this library (see
@@ -5747,6 +5892,11 @@ fn build_agent(
     write_locks: &Arc<agent_core::WriteLockRegistry>,
     checkpoint: &Arc<dyn agent_core::CheckpointHook>,
     subagent_ctx: Option<&Arc<crate::tools::subagent::SubagentCtx>>,
+    // The `structured_output` tool for the schema currently installed on this session, if any (see the
+    // `prompt` command's `output_schema`). An `Arc` shared across every rebuild rather than
+    // reconstructed here: it owns the compiled validator, and — more importantly — the `OutputSlot` the
+    // model's answer lands in, which must survive a mid-run `set_model` rebuild.
+    structured_output: Option<&Arc<crate::tools::structured_output::StructuredOutput>>,
 ) -> Agent {
     let mut compaction = agent_core::CompactionConfig {
         context_window: cfg
@@ -5768,6 +5918,12 @@ fn build_agent(
     // per-child model itself, so a `set_model` rebuild doesn't invalidate it.
     if let Some(ctx) = subagent_ctx {
         registry.register(Arc::new(crate::tools::subagent::Subagent::new(ctx.clone())));
+    }
+    // After `build_tools`'s `--tools`/`--exclude-tools` filter, like `subagent` above: an allow-list
+    // scopes what the agent may *do*, and must not strip the one tool a `prompt {output_schema}` exists
+    // to add — leaving a run that can never satisfy the contract it was started with.
+    if let Some(tool) = structured_output {
+        registry.register(tool.clone());
     }
     let mut agent = Agent::new(transport, model.to_string())
         .with_tools(registry)

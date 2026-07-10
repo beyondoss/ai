@@ -1419,7 +1419,7 @@ impl Agent {
                         // downgrade path regardless of the model's real capability.
                         if let Some(obj) = coerced.as_object_mut() {
                             obj.insert(
-                                "_model_supports_vision".to_string(),
+                                crate::tool::MODEL_SUPPORTS_VISION_KEY.to_string(),
                                 supports_vision.into(),
                             );
                         }
@@ -1824,7 +1824,10 @@ impl Agent {
                 crate::validation::coerce_tool_arguments(&tool.input_schema(), input.clone())
                     .unwrap_or_else(|_| input.clone());
             if let Some(obj) = coerced.as_object_mut() {
-                obj.insert("_model_supports_vision".to_string(), supports_vision.into());
+                obj.insert(
+                    crate::tool::MODEL_SUPPORTS_VISION_KEY.to_string(),
+                    supports_vision.into(),
+                );
             }
             let blocked = match catch_tool_panic(
                 self.hooks.before_tool_call(name, &coerced, session, cancel),
