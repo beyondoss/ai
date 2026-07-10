@@ -562,6 +562,13 @@ pub struct ServeConfig {
     /// Prepend this line to every `bash` command, in the same shell invocation — matches pi's own
     /// `shellCommandPrefix` setting. Fixed for the process, like `bash_shell_path`.
     pub bash_command_prefix: Option<String>,
+    /// `--web-allow-private`: let the `web` tool reach loopback/private/link-local addresses. Off by
+    /// default. See `tools::web`.
+    pub web_allow_private: bool,
+    /// `--web-allow-host`: hostnames the `web` tool may reach even with private egress off.
+    pub web_allow_hosts: Vec<String>,
+    /// `--web-timeout-ms`: the `web` tool's per-request timeout (default 30 s).
+    pub web_timeout_ms: Option<u64>,
     /// Restrict the tool set to exactly these names, dropping everything else. Combine with
     /// `exclude_tools` to carve one back out of the allow-list. Fixed for the process — like `system`,
     /// there's no runtime RPC to change it, but it does survive a `set_model`/`set_thinking` rebuild
@@ -5932,6 +5939,9 @@ fn build_subagent_ctx(
             bash_timeout_ms: cfg.bash_timeout_ms,
             bash_shell_path: cfg.bash_shell_path.clone(),
             bash_command_prefix: cfg.bash_command_prefix.clone(),
+            web_allow_private: cfg.web_allow_private,
+            web_allow_hosts: cfg.web_allow_hosts.clone(),
+            web_timeout_ms: cfg.web_timeout_ms,
             image_auto_resize: cfg.image_auto_resize,
         },
         cwd: cwd.to_path_buf(),
@@ -6191,6 +6201,9 @@ fn build_tools(cfg: &ServeConfig, image_auto_resize: bool) -> agent_core::ToolRe
         bash_timeout_ms: cfg.bash_timeout_ms,
         bash_shell_path: cfg.bash_shell_path.as_deref(),
         bash_command_prefix: cfg.bash_command_prefix.as_deref(),
+        web_allow_private: cfg.web_allow_private,
+        web_allow_hosts: &cfg.web_allow_hosts,
+        web_timeout_ms: cfg.web_timeout_ms,
         image_auto_resize,
         mcp_tools: &cfg.mcp_tools,
         ..tools::ToolConfig::new()
