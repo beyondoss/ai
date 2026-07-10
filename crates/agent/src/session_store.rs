@@ -344,22 +344,29 @@ enum Entry {
         /// neighboring `Message` entry purely so this record is self-describing without needing to
         /// cross-reference it.
         summary: String,
-        /// `agent_core::Session.compaction`'s file-provenance (`read_files`/`modified_files`, folded
-        /// forward via `merge_file_ops`) as of *this* round — i.e. this round's own new activity already
-        /// merged with every prior round's. Since each record is already a complete, self-contained
-        /// snapshot, `SessionStore::open` only needs the *last* one in file order to restore
-        /// `Session.compaction` in full, not fold every record together itself. `#[serde(default)]` so a
-        /// file written before this field existed round-trips unchanged — such a session simply doesn't
-        /// get its provenance restored across a reopen (no worse than before this fix), rather than
-        /// failing to parse. Fixes a bug where this provenance was purely in-memory: every `serve`
-        /// restart or session reattach past a compaction silently forgot it, so the *next* compaction's
-        /// `<read-files>`/`<modified-files>` tags quietly omitted everything from before the restart.
+        /// `agent_core::Session.compaction`'s provenance (`read_files`/`modified_files`/`todos`, folded
+        /// forward via `merge_provenance`) as of *this* round — i.e. this round's own new activity
+        /// already merged with every prior round's. Since each record is already a complete,
+        /// self-contained snapshot, `SessionStore::open` only needs the *last* one in file order to
+        /// restore `Session.compaction` in full, not fold every record together itself.
+        /// `#[serde(default)]` so a file written before any of these fields existed round-trips
+        /// unchanged — such a session simply doesn't get that part of its provenance restored across a
+        /// reopen (no worse than before), rather than failing to parse. Fixes a bug where this
+        /// provenance was purely in-memory: every `serve` restart or session reattach past a compaction
+        /// silently forgot it, so the *next* compaction's `<read-files>`/`<modified-files>` tags quietly
+        /// omitted everything from before the restart.
         #[serde(default)]
         read_files: Vec<String>,
         #[serde(default)]
         modified_files: Vec<String>,
         #[serde(default)]
         last_reason: Option<CompactionReason>,
+        /// The `todo` list carried across this round (see `CompactionProvenance::todos`). Restored the
+        /// same way, so a `serve` restart past a compaction doesn't lose the model's plan — the one
+        /// piece of the run's working state that lives nowhere else once `apply_summary` has dropped the
+        /// `tool_use` block that carried it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        todos: Option<serde_json::Value>,
     },
     /// A record that the active model changed, anchored to whatever message was the tip at the moment
     /// it did — see [`SessionStore::record_model_change`]/[`SessionStore::model_at`]. `parent_id` here
@@ -937,6 +944,7 @@ impl SessionStore {
                     read_files,
                     modified_files,
                     last_reason,
+                    todos,
                     ..
                 }) => {
                     // Each record already carries every earlier round's file-provenance folded in (via
@@ -951,6 +959,7 @@ impl SessionStore {
                         modified_files,
                         compactions: 0, // replaced by `meta.compactions` (the authoritative counter) below
                         last_reason,
+                        todos,
                     });
                     compactions.insert(
                         id,
@@ -1607,6 +1616,7 @@ impl SessionStore {
             read_files: meta.provenance.read_files,
             modified_files: meta.provenance.modified_files,
             last_reason: meta.provenance.last_reason,
+            todos: meta.provenance.todos,
         };
 
         // An updated header snapshot (the new `compactions`/`dropped_messages` counters) first, then the
@@ -4785,6 +4795,7 @@ mod tests {
             modified_files: vec!["src/lib.rs".to_string()],
             compactions: 1,
             last_reason: Some(agent_core::compaction::CompactionReason::Threshold),
+            todos: None,
         };
         store
             .rewrite_compacted(
@@ -4816,6 +4827,100 @@ mod tests {
     }
 
     #[test]
+    fn a_compacted_away_todo_list_survives_a_fresh_reopen() {
+        // Once `apply_summary` has dropped the `todo` tool_use block, `Session.compaction.todos` is the
+        // only copy of the model's plan that exists. If it didn't round-trip through the store, every
+        // `serve` restart or reattach past a compaction would silently lose it — and the very next
+        // compaction would write a summary with no `<todo_list>` block at all.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("a");
+        session.user("b");
+        store.append_new(&session.messages).unwrap();
+
+        let todos = serde_json::json!([
+            { "content": "Wire the retry loop", "activeForm": "Wiring the retry loop", "status": "in_progress" },
+        ]);
+        store
+            .rewrite_compacted(
+                &[Message::user("summary")],
+                CompactionMeta {
+                    tokens_before: 4242,
+                    provenance: CompactionProvenance {
+                        todos: Some(todos.clone()),
+                        compactions: 1,
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap();
+
+        let (_reopened, restored) = repo.open_id(&store.meta().id.clone()).unwrap();
+        assert_eq!(
+            restored.compaction.todos,
+            Some(todos),
+            "the todo list must survive a fresh reopen, not reset to None"
+        );
+    }
+
+    #[test]
+    fn a_compaction_record_written_before_the_todos_field_existed_still_loads() {
+        // `#[serde(default)]` on the field, exercised against the literal on-disk shape an older build
+        // wrote: a `compaction` entry with no `todos` key at all must parse (and simply restore `None`),
+        // not fail the line and silently drop the whole provenance record with it.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut session = Session::new();
+        session.user("a");
+        session.user("b");
+        store.append_new(&session.messages).unwrap();
+        store
+            .rewrite_compacted(
+                &[Message::user("summary")],
+                CompactionMeta {
+                    tokens_before: 1,
+                    provenance: CompactionProvenance {
+                        read_files: vec!["a.rs".into()],
+                        todos: Some(serde_json::json!([{ "content": "x", "status": "pending" }])),
+                        compactions: 1,
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap();
+
+        // Strip the field back out of the on-disk record, exactly as a pre-`todos` build left it.
+        let path = store.path.clone();
+        let stripped = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let mut v: serde_json::Value = serde_json::from_str(line).unwrap();
+                if v.get("type").and_then(|t| t.as_str()) == Some("compaction") {
+                    assert!(
+                        v.as_object_mut().unwrap().remove("todos").is_some(),
+                        "the field must have been written in the first place"
+                    );
+                }
+                serde_json::to_string(&v).unwrap()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, format!("{stripped}\n")).unwrap();
+
+        let (_reopened, restored) = repo.open_id(&store.meta().id.clone()).unwrap();
+        assert_eq!(restored.compaction.todos, None);
+        assert_eq!(
+            restored.compaction.read_files,
+            vec!["a.rs".to_string()],
+            "the rest of the record must still restore — the line parsed, it wasn't skipped"
+        );
+    }
+
+    #[test]
     fn rewrite_compacted_folds_file_provenance_forward_across_two_rounds_and_both_survive_a_reopen()
     {
         // The forward-folding half of Fix 2: a *second* compaction round's own `CompactionMeta
@@ -4838,6 +4943,7 @@ mod tests {
             modified_files: vec![],
             compactions: 1,
             last_reason: Some(agent_core::compaction::CompactionReason::Threshold),
+            todos: None,
         };
         store
             .rewrite_compacted(
@@ -4861,6 +4967,7 @@ mod tests {
             modified_files: vec!["c.rs".to_string()],
             compactions: 2,
             last_reason: Some(agent_core::compaction::CompactionReason::Manual),
+            todos: None,
         };
         store
             .rewrite_compacted(

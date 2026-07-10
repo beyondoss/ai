@@ -60,6 +60,11 @@ futures = "0.3"
 # Runtime-agnostic timer for the transport's retry backoff — keeps the core free of a bound executor
 # (the library pulls in no runtime; see agent-core's manifest note).
 futures-timer = "3"
+# JSON Schema validation for the `structured_output` tool. `default-features = false` is a security
+# property, not a size one: the default feature set enables `resolve-http`/`resolve-file`, which would
+# let a `$ref` in a schema make the agent fetch a URL or read a local file — and a schema can be
+# authored by a model (a parent writing its subagent's `output_schema`), not just by the operator.
+jsonschema = { version = "0.47", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

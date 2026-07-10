@@ -18,7 +18,9 @@ pub mod ls;
 pub mod mcp;
 pub mod output;
 pub mod read;
+pub mod structured_output;
 pub mod subagent;
+pub mod todo;
 pub mod write;
 
 /// Normalize a filesystem tool's `path` argument the way `bash` gets for free from the real shell it
@@ -440,8 +442,9 @@ impl<'a> ToolConfig<'a> {
     }
 }
 
-/// The default tool set: pi's seven coding tools (read, write, edit, bash, ls, grep, find) plus the
-/// Beyond platform tools (fork, sync, logs), with production defaults and no root (process cwd).
+/// The default tool set: pi's seven coding tools (read, write, edit, bash, ls, grep, find), the `todo`
+/// task list, and the Beyond platform tools (fork, sync, logs), with production defaults and no root
+/// (process cwd).
 pub fn default_registry() -> ToolRegistry {
     default_registry_with_config(&ToolConfig::new())
 }
@@ -485,6 +488,9 @@ pub fn default_registry_with_config(cfg: &ToolConfig<'_>) -> ToolRegistry {
         bash = bash.with_command_prefix(prefix);
     }
     reg.register(Arc::new(bash));
+    // Stateless: it validates and echoes the model's own full-replace list. See `todo`'s module doc for
+    // why it holds nothing across calls (this registry is rebuilt on every `set_model`).
+    reg.register(Arc::new(todo::Todo::new()));
     reg.register(Arc::new(beyond::Fork::real()));
     reg.register(Arc::new(beyond::Sync::real()));
     reg.register(Arc::new(beyond::Logs::real()));
@@ -805,11 +811,13 @@ mod tests {
         for name in ["read", "write", "edit", "bash", "ls", "grep", "find"] {
             assert!(reg.get(name).is_some(), "missing coding tool: {name}");
         }
+        // … the model's own task list …
+        assert!(reg.get("todo").is_some(), "missing todo tool");
         // … plus the Beyond platform tools.
         for name in ["fork", "sync", "logs"] {
             assert!(reg.get(name).is_some(), "missing beyond tool: {name}");
         }
-        assert_eq!(reg.len(), 10);
+        assert_eq!(reg.len(), 11);
     }
 
     #[test]

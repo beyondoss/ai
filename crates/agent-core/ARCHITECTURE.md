@@ -260,6 +260,34 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   two OpenAI wire formats had no proactive protection at all against this exact failure mode). Never
   clamps below a configured thinking budget, and never raises
   `max_tokens` above what was asked.
+
+- **The deterministic-carry channel** — `apply_summary` is deliberately destructive: it _replaces_
+  `session.messages` with `[summary, …kept_suffix]`, and `SessionStore::open` reloads that
+  post-compaction list, so anything living only inside a folded-away message is gone for good. A
+  summarizing model asked to "merge the previous summary" will paraphrase or drop specifics, so nothing
+  that _must_ survive a cut may depend on it doing so. `CompactionProvenance` (`Session::compaction`) is
+  the channel that does: `merge_provenance` folds it forward every round from the doomed prefix,
+  `crates/agent`'s `session_store.rs` persists it on the `Entry::Compaction` record and restores it on
+  reopen, and `Agent::compact` re-renders it into every new summary by appending host-generated blocks
+  to the model's prose — never trusting the prose itself.
+
+  Two things ride it, for the same reason:
+  - **File awareness** — `extract_file_ops` (read vs. modified paths from `read`/`write`/`edit` calls),
+    accumulated and deduped across rounds, rendered by `format_file_operations` as
+    `<read-files>`/`<modified-files>`.
+  - **The model's plan** — `extract_todos` (the last `todo` call's list), rendered by `format_todo_list`
+    as `<todo_list>`. _Last-wins_, not accumulated: the `todo` tool's contract is a full replace, so
+    folding two rounds' lists together would resurrect steps the model deliberately dropped — and an
+    explicitly cleared list (`[]`) must beat the older one rather than letting a finished plan reappear.
+    This is why `tools::todo` holds no state of its own (it couldn't: its registry is rebuilt on every
+    `set_model`), and it is what `serve`'s `get_todos` falls back to once the `tool_use` block that
+    carried the list has been compacted away.
+
+  `previous_summary` strips these blocks back off the body before it is fed forward — both into the
+  incremental summarization prompt (or the model echoes a stale copy into its prose alongside the fresh
+  ones) and into `compact`'s own `turn_start == 1` verbatim-reuse path (or every split-turn round appends
+  another copy of every block, unboundedly). Adding a third rider should clear the same bar: it is the
+  run's working state, and losing it degrades the model silently rather than failing loudly.
 - **Thinking** — `ContentBlock::Thinking`/`RedactedThinking` + `ThinkingDelta`/`SignatureDelta` stream
   events; signatures replay verbatim (Anthropic requires it with tools). `with_thinking(budget)`; the
   thinking _shape_ (Anthropic enabled-budget vs adaptive) is chosen per model from the capability
@@ -759,7 +787,23 @@ would 400 the next request whenever the model batched more than one tool call.
 Each call resolves to `(text, images, is_error, terminate)`: a tool's `ToolOutput` images ride onto
 its `ContentBlock::ToolResult` so the multimodal model sees them, and if _every_ call in the batch set
 `terminate` the loop ends the run after recording the results — an `attempt_completion`/`exit`-style
-tool, gated so one tool can't cut off the others dispatched alongside it. Any **steer** messages a
+tool, gated so one tool can't cut off the others dispatched alongside it.
+
+`crates/agent`'s `structured_output` is that mechanism's one production consumer, and its shape is what
+callers have to reason about. The error path can never terminate (a `ToolError` resolves to
+`terminate: false`), so an invalid payload becomes an error `tool_result` the model retries against —
+that _is_ the retry loop, with no extra machinery. And because the unanimous-agreement rule lets a
+mixed batch continue, a `structured_output` call dispatched alongside an `edit` stages its value and the
+run goes on; a host must therefore read its result only once the run has fully drained, since a later
+call may revise it. Neither behavior is special-cased for the tool — both fall out of the fold.
+
+Dispatch also stamps one schema-undocumented key onto every call's coerced input:
+`tool::MODEL_SUPPORTS_VISION_KEY` (`_model_supports_vision`), which `read` uses to decide whether to
+downgrade an image to a text placeholder. Every other tool ignores extra keys — except one that cannot:
+a tool validating its input against a caller-supplied JSON Schema must strip the key first, or a schema
+with `"additionalProperties": false` would reject every call the loop ever makes to it.
+
+Any **steer** messages a
 client queued mid-run (`Steering::push_steer`) are folded onto this same tool-results user turn as
 trailing text blocks, letting a client redirect a busy agent between tool turns while keeping role
 alternation valid; **follow-ups** (`push`) are a separate lane, injected only at the stop boundary.

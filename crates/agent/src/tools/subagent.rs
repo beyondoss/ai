@@ -121,6 +121,15 @@ pub struct SubagentCtx {
     pub deny_path: Vec<String>,
     pub child_max_steps: u32,
     pub max_depth: u32,
+    /// The parent's interactive approval gate, if it has one. Shared, not rebuilt: a child queues behind
+    /// the same one-question-at-a-time lock its siblings do (eight parallel children must not raise eight
+    /// simultaneous prompts), and reads the same [`SessionMemory`](crate::approval::SessionMemory) — so a
+    /// decision the user already made is not asked again per child.
+    ///
+    /// That sharing **widens privilege across the subagent tree**: an "always allow" granted to one child
+    /// applies to its siblings and to the parent for the rest of the session. Intended, and load-bearing
+    /// for the "don't re-ask" property, but a real property nonetheless.
+    pub approval: Option<crate::approval::ApprovalRuntime>,
 }
 
 /// The tool. `depth` is per-instance because [`Tool::run`] receives no ambient context — there is
@@ -163,6 +172,12 @@ fn describe() -> String {
 struct TaskSpec {
     agent: String,
     task: String,
+    /// A JSON Schema the child must fill in and return via `structured_output` instead of ending in
+    /// prose — so the parent gets `{"files_changed": [...]}` back rather than a paragraph it has to
+    /// parse. Authored by the *parent model*, so it is never trusted: it is only checked for object-ness
+    /// here, and a schema that fails to compile fails that one task rather than panicking or taking the
+    /// whole fan-out down (see `try_run_child`).
+    output_schema: Option<Value>,
 }
 
 /// Which of the three mutually exclusive shapes the model asked for.
@@ -193,6 +208,36 @@ impl ChildOutcome {
             ok: false,
             note: None,
         }
+    }
+}
+
+/// The one [`agent_core::AgentHooks`] a child installs: the parent's static deny-lists composed with its
+/// interactive approval gate. `Agent::new` installs `NoHooks`, so without this a child ignores both.
+struct ChildHooks {
+    policy: ToolPolicy,
+    approval: Option<crate::approval::ApprovalRuntime>,
+    origin: crate::approval::ApprovalOrigin,
+}
+
+#[async_trait]
+impl agent_core::AgentHooks for ChildHooks {
+    async fn before_tool_call(
+        &self,
+        name: &str,
+        input: &Value,
+        session: &agent_core::Session,
+        cancel: &agent_core::CancellationToken,
+    ) -> Option<String> {
+        crate::approval::gated_before_tool_call(
+            &self.policy,
+            self.approval.as_ref(),
+            &self.origin,
+            name,
+            input,
+            session,
+            cancel,
+        )
+        .await
     }
 }
 
@@ -295,11 +340,16 @@ impl Tool for Subagent {
     }
 
     fn input_schema(&self) -> Value {
+        const OUTPUT_SCHEMA_DESC: &str = "Optional JSON Schema (an object schema). When given, the \
+             agent must return a payload conforming to it instead of a prose message, and its result \
+             is that payload as compact JSON. Use this when you need to consume the answer \
+             programmatically rather than read it.";
         let task_item = json!({
             "type": "object",
             "properties": {
                 "agent": { "type": "string", "description": "Name from <available_agents>." },
-                "task": { "type": "string", "description": "What this agent should do." }
+                "task": { "type": "string", "description": "What this agent should do." },
+                "output_schema": { "type": "object", "description": OUTPUT_SCHEMA_DESC }
             },
             "required": ["agent", "task"]
         });
@@ -308,6 +358,7 @@ impl Tool for Subagent {
             "properties": {
                 "agent": { "type": "string", "description": "Single mode: the agent to delegate to." },
                 "task": { "type": "string", "description": "Single mode: what it should do." },
+                "output_schema": { "type": "object", "description": OUTPUT_SCHEMA_DESC },
                 "tasks": {
                     "type": "array",
                     "description": format!("Parallel mode: up to {MAX_TASKS} independent tasks. Results are returned in order."),
@@ -375,6 +426,7 @@ impl Subagent {
             (Some(a), Some(t)) if !a.is_empty() && !t.is_empty() => Some(TaskSpec {
                 agent: a.to_string(),
                 task: t.to_string(),
+                output_schema: parse_output_schema(input)?,
             }),
             _ => None,
         };
@@ -492,6 +544,7 @@ impl Subagent {
             let resolved = TaskSpec {
                 agent: spec.agent.clone(),
                 task: spec.task.replace("{previous}", &previous),
+                output_schema: spec.output_schema.clone(),
             };
             let outcome = self.run_child(&resolved, index, &board).await;
             if !outcome.ok {
@@ -600,13 +653,42 @@ impl Subagent {
             }
         };
 
-        let registry = self.build_child_registry(def, &root);
+        let mut registry = self.build_child_registry(def, &root);
+        // The parent asked for typed data back. Registered *after* `build_child_registry`'s own
+        // `--tools` filter, like every other explicitly-requested tool, and *before* the system prompt is
+        // built so `has_structured_output` picks it up and the child is actually told the contract.
+        //
+        // `output_schema` was written by the parent *model*. A schema that won't compile fails this one
+        // task — the parent gets a message it can act on and its siblings keep running — rather than
+        // panicking or aborting the whole fan-out.
+        let output_slot = crate::tools::structured_output::OutputSlot::new();
+        if let Some(schema) = &spec.output_schema {
+            match crate::tools::structured_output::StructuredOutput::new(
+                schema.clone(),
+                None,
+                output_slot.clone(),
+            ) {
+                Ok(tool) => {
+                    registry.register(Arc::new(tool));
+                }
+                Err(e) => {
+                    return Ok(ChildOutcome::failed(
+                        spec,
+                        format!("invalid output_schema: {e}"),
+                    ));
+                }
+            }
+        }
         let system = self.build_child_system_prompt(def, &registry, &root);
         let model = def
             .model
             .clone()
             .unwrap_or_else(|| self.ctx.parent_model.clone());
         let transport = (self.ctx.factory)(&model)?;
+
+        // One id per spawned child: it disambiguates the prompt-cache key *and* names this child in an
+        // approval request, so a UI can say "reviewer#7 wants to run bash" rather than "something does".
+        let spawn_id = CHILD_SEQ.fetch_add(1, Ordering::Relaxed);
 
         let mut agent = Agent::new(transport, model)
             .with_tools(registry)
@@ -617,11 +699,7 @@ impl Subagent {
             .with_write_locks(self.ctx.write_locks.clone())
             // A distinct key per child. Sharing the parent's would both poison the Anthropic prompt
             // cache and contend for one pooled Codex WebSocket connection, which is keyed on it.
-            .with_cache_key(format!(
-                "{}:sub:{}",
-                self.ctx.parent_cache_key,
-                CHILD_SEQ.fetch_add(1, Ordering::Relaxed)
-            ));
+            .with_cache_key(format!("{}:sub:{spawn_id}", self.ctx.parent_cache_key));
 
         // MANDATORY. `Agent::new` installs `NoHooks`; without this the child ignores every
         // `--deny-tool`/`--deny-bash-pattern`/`--deny-path` the parent was launched with, and `subagent`
@@ -633,8 +711,18 @@ impl Subagent {
             &self.ctx.deny_path,
         )
         .with_root(&root);
-        if !policy.is_empty() {
-            agent = agent.with_hooks(Arc::new(policy.clone()));
+        // The interactive gate is inherited for exactly the same reason the deny-lists are: a child that
+        // could run `bash` without the human's approval *is* the bypass. `Agent::with_hooks` holds one
+        // object, so the two compose here rather than stacking.
+        if !policy.is_empty() || self.ctx.approval.is_some() {
+            agent = agent.with_hooks(Arc::new(ChildHooks {
+                policy: policy.clone(),
+                approval: self.ctx.approval.clone(),
+                origin: crate::approval::ApprovalOrigin::Subagent {
+                    agent: def.name.clone(),
+                    spawn_id: spawn_id.to_string(),
+                },
+            }));
         }
         // Deliberately no `.with_checkpoint_hook`: `Agent::new`'s `NoCheckpoint` default is correct. A
         // child inheriting the parent's would persist its turns into the parent's session store.
@@ -659,13 +747,36 @@ impl Subagent {
 
         let result = run.await;
 
+        // Read before `merge_back` below, so a worktree conflict note rides `outcome.note` rather than
+        // being appended to what is now a machine-parseable JSON payload.
         let mut outcome = match result {
-            Ok(()) => ChildOutcome {
-                agent: spec.agent.clone(),
-                task: spec.task.clone(),
-                text: nonempty(last_assistant_text(&session)),
-                ok: true,
-                note: None,
+            Ok(()) => match &spec.output_schema {
+                // The parent asked for a typed answer; the child's prose is not it. A child that ended
+                // without calling `structured_output` did not do what it was told, and reporting that as
+                // success would hand the parent a paragraph where it expected an object.
+                Some(_) => match output_slot.take() {
+                    Some(value) => ChildOutcome {
+                        agent: spec.agent.clone(),
+                        task: spec.task.clone(),
+                        text: value.to_string(),
+                        ok: true,
+                        note: None,
+                    },
+                    None => ChildOutcome::failed(
+                        spec,
+                        format!(
+                            "the agent finished without calling `{}`, so it produced no structured output",
+                            crate::tools::structured_output::NAME
+                        ),
+                    ),
+                },
+                None => ChildOutcome {
+                    agent: spec.agent.clone(),
+                    task: spec.task.clone(),
+                    text: nonempty(last_assistant_text(&session)),
+                    ok: true,
+                    note: None,
+                },
             },
             Err(e) => ChildOutcome::failed(spec, format!("agent run failed: {e}")),
         };
@@ -786,6 +897,10 @@ impl Subagent {
             include_context_files: true,
             skills: &self.ctx.skills,
             has_read: registry.get("read").is_some(),
+            has_todo: registry.get(crate::tools::todo::NAME).is_some(),
+            has_structured_output: registry
+                .get(crate::tools::structured_output::NAME)
+                .is_some(),
             // A child never has `subagent` unless its definition asked for it and the depth cap allowed
             // it; there is no point listing agents it cannot delegate to.
             agents: if registry.get(NAME).is_some() {
@@ -828,9 +943,23 @@ fn parse_task_array(value: Option<&Value>) -> Result<Option<Vec<TaskSpec>>, Tool
         specs.push(TaskSpec {
             agent: agent.to_string(),
             task: task.to_string(),
+            output_schema: parse_output_schema(item)?,
         });
     }
     Ok(Some(specs))
+}
+
+/// The optional `output_schema` on a task, checked only for the one thing that can be checked without
+/// compiling it: a tool's arguments are always a JSON object, so anything else can never be satisfied.
+/// Absent or `null` means "answer in prose", the default.
+fn parse_output_schema(item: &Value) -> Result<Option<Value>, ToolError> {
+    match item.get("output_schema") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) if v.is_object() => Ok(Some(v.clone())),
+        Some(_) => Err(ToolError::InvalidInput(
+            "`output_schema` must be a JSON Schema object".to_string(),
+        )),
+    }
 }
 
 /// A child that ended without producing assistant text (it exhausted `max_steps` mid-tool-call, say) must

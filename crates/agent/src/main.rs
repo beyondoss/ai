@@ -612,6 +612,17 @@ enum Command {
         /// for a scripting caller that wants structured output without spawning `serve`.
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Make this run a callable function: a JSON Schema (inline, or a path to a `.json` file) the
+        /// agent must fill in and return via the `structured_output` tool instead of ending in prose.
+        /// The validated payload is printed as the last stdout line; the run exits non-zero if the model
+        /// never produced one. Registered after `--tools`/`--exclude-tools` filtering, so an unrelated
+        /// allow-list can't strip the one tool this flag exists to add.
+        #[arg(long, env = "AI_AGENT_OUTPUT_SCHEMA")]
+        output_schema: Option<String>,
+        /// Override the `structured_output` tool's description — what the model is told the payload is
+        /// for. Ignored without `--output-schema`.
+        #[arg(long)]
+        output_description: Option<String>,
     },
     /// Run the headless agent server: a newline-delimited JSON control protocol over stdio.
     Serve {
@@ -856,6 +867,22 @@ enum Command {
         /// repeatable). `run`'s identical flag.
         #[arg(long, env = "AI_AGENT_DENY_PATH", value_delimiter = ',')]
         deny_path: Vec<String>,
+        /// Require a human to approve a tool call before it runs: `off` (default), `writes`
+        /// (`write`/`edit`), `all` (everything except the read-only tools), or `tools:<name>,<name>`.
+        /// `serve` broadcasts an `approval_request` frame to every attached client and blocks the call
+        /// until one of them answers with an `approve` command. An unrecognized value is an error, not a
+        /// silently empty gate.
+        ///
+        /// Fails closed: a timeout, an abort, or no attached client all deny the call (the model gets an
+        /// error `tool_result` and the run continues). The static `--deny-*` lists still win first, with
+        /// no round trip. `run` has no equivalent — it has no client to ask.
+        #[arg(long, env = "AI_AGENT_APPROVE", default_value = "off")]
+        approve: String,
+        /// Seconds an unanswered approval request waits before it is denied. `0` waits forever, which is
+        /// only safe with a reliably-attached client: a question nobody answers pins the session until an
+        /// `abort`.
+        #[arg(long, env = "AI_AGENT_APPROVAL_TIMEOUT", default_value_t = 300)]
+        approval_timeout: u64,
         /// Restrict `cycle_model`'s candidate list to exactly these ids, in this order
         /// (comma-separated) — e.g. `--models claude-opus-4-8,claude-sonnet-4-5,gpt-5`.
         /// `set_model`/`get_available_models` are unaffected; empty/absent cycles the full known-model
@@ -1444,6 +1471,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             no_session_persistence,
             export,
             json,
+            output_schema,
+            output_description,
         } => {
             run_task(
                 tasks,
@@ -1500,6 +1529,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 no_session_persistence,
                 export,
                 json,
+                output_schema,
+                output_description,
             )
             .await?;
         }
@@ -1551,6 +1582,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             deny_tool,
             deny_bash_pattern,
             deny_path,
+            approve,
+            approval_timeout,
             models,
             no_skills,
             no_prompt_templates,
@@ -1846,6 +1879,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 deny_tool,
                 deny_bash_pattern,
                 deny_path,
+                // Fail fast on an unrecognized value, before any session is opened — the same discipline
+                // `ToolPolicy::validate_deny_path_patterns` uses for a malformed `--deny-path` glob.
+                approve: beyond_ai_agent::approval::GatedSet::parse(&approve).unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }),
+                approval_timeout: (approval_timeout > 0)
+                    .then(|| std::time::Duration::from_secs(approval_timeout)),
                 models: models.unwrap_or_default(),
                 no_skills,
                 no_prompt_templates,
@@ -3041,6 +3082,8 @@ async fn run_task(
     no_session_persistence: bool,
     export: Option<String>,
     json: bool,
+    output_schema: Option<String>,
+    output_description: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Fail fast, before touching any files — matches pi's own `--name` validation. Whitespace-only is
     // rejected outright here (a startup argument the operator clearly meant to be meaningful), unlike
@@ -3393,6 +3436,35 @@ async fn run_task(
         no_tools,
     );
 
+    // `--output-schema` turns this run into a callable function: the model must fill the schema in via
+    // `structured_output` rather than ending in prose, and the validated payload is this process's real
+    // return value (printed last, and the difference between exit 0 and exit 1 below).
+    //
+    // Registered *after* `apply_filter`, like `subagent` below: a `--tools read` allow-list is about
+    // scoping what the agent may *do*, and must not silently strip the one tool this flag exists to add
+    // — leaving a run that can never satisfy the contract it was started with.
+    //
+    // Fail fast on a bad schema, before a single model call is billed — the same discipline
+    // `ToolPolicy::validate_deny_path_patterns` uses for a malformed `--deny-path` glob.
+    let output_slot = tools::structured_output::OutputSlot::new();
+    let wants_structured_output = output_schema.is_some();
+    if let Some(arg) = &output_schema {
+        let schema = tools::structured_output::load_schema(arg).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2);
+        });
+        let tool = tools::structured_output::StructuredOutput::new(
+            schema,
+            output_description,
+            output_slot.clone(),
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2);
+        });
+        registry.register(Arc::new(tool));
+    }
+
     // Subagents. A shared write-lock registry (rather than `Agent::new`'s private default) so the parent
     // and every child serialize same-path writes against each other. Registered only when at least one
     // agent definition exists — a `subagent` tool with no agents to call is dead weight in the prompt.
@@ -3448,6 +3520,9 @@ async fn run_task(
             deny_path: deny_path.clone(),
             child_max_steps: subagent::DEFAULT_CHILD_MAX_STEPS,
             max_depth: subagent::DEFAULT_MAX_DEPTH,
+            // `run` has no client to ask, so it has no interactive gate — only the static `--deny-*`
+            // lists, which `ChildHooks` still installs. See `crate::approval`'s module doc.
+            approval: None,
         });
         registry.register(Arc::new(subagent::Subagent::new(ctx)));
     }
@@ -3477,6 +3552,8 @@ async fn run_task(
     // being able to open its `SKILL.md` itself, so advertising them at all when `read` isn't registered
     // (a restricted `--tools`/`--exclude-tools` invocation) just adds dead weight (pi-parity fix).
     let has_read = registry.get("read").is_some();
+    let has_todo = registry.get("todo").is_some();
+    let has_structured_output = registry.get(tools::structured_output::NAME).is_some();
     let system = beyond_ai_agent::resources::build_system_prompt(
         &beyond_ai_agent::resources::PromptOptions {
             base: system_prompt.as_deref(),
@@ -3486,6 +3563,8 @@ async fn run_task(
             include_context_files: !no_context_files,
             skills: &skills,
             has_read,
+            has_todo,
+            has_structured_output,
             project_trusted,
             agents: &agent_defs,
         },
@@ -3930,6 +4009,41 @@ async fn run_task(
         "[done in {} step(s); {} in / {} out tokens]",
         session.steps, session.input_tokens, session.output_tokens
     );
+
+    // `--output-schema` made this run a callable function, so the payload is its real return value: the
+    // last thing on stdout, and the difference between exit 0 and exit 1. Read only now, once the run
+    // has fully drained — a mixed batch (`structured_output` alongside an `edit` in one turn, which the
+    // loop's unanimous-terminate rule lets continue) stages the value and may revise it later.
+    //
+    // Emitted on *one* line in both modes, so `... | tail -1 | jq` is the whole contract. Text mode
+    // already echoed the call as `[tool: structured_output] {...}` above and prints live assistant text,
+    // so its stdout was never a bare JSON document to begin with; pretty-printing the payload here would
+    // only cost the caller the one property that makes it usable. In `--json` mode the payload is
+    // wrapped as a final `kind` object so the stream stays strictly one-event-per-line. Nothing is
+    // emitted at all without `--output-schema`, so existing `--json` consumers see no new line.
+    if wants_structured_output {
+        match output_slot.take() {
+            Some(value) => {
+                let line = if json {
+                    serde_json::json!({ "kind": "structured_output", "value": value }).to_string()
+                } else {
+                    value.to_string()
+                };
+                write_stdout_or_exit(&line, &cancel, &broken_pipe);
+                write_stdout_or_exit("\n", &cancel, &broken_pipe);
+            }
+            None => {
+                // The contract the run was started with was never met. Exiting 0 here would be
+                // indistinguishable from success to a script that pipes stdout into `jq`.
+                eprintln!(
+                    "[no structured output: the model ended the run without calling `{}`]",
+                    tools::structured_output::NAME
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
     // Text mode has no other failure signal a script/CI caller could key off of — a refusal would
     // otherwise still exit 0, indistinguishable from a normal completion, unless the last turn's
     // stop reason is checked explicitly here. JSON mode already carries `stop_reason` on every

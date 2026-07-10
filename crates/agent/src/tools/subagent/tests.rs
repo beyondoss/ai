@@ -119,6 +119,7 @@ fn ctx(defs: Vec<AgentDef>, factory: Factory) -> (Arc<SubagentCtx>, tempfile::Te
         deny_path: Vec::new(),
         child_max_steps: DEFAULT_CHILD_MAX_STEPS,
         max_depth: DEFAULT_MAX_DEPTH,
+        approval: None,
     });
     (ctx, dir)
 }
@@ -526,4 +527,153 @@ async fn each_child_gets_a_distinct_cache_key() {
     .await
     .unwrap();
     assert_eq!(f2.call_models(), vec!["m0", "m1"]);
+}
+
+// ---- interactive approval inheritance ----
+
+/// A gate that records what it was asked and answers with a fixed decision.
+struct RecordingGate {
+    answer: crate::approval::ApprovalDecision,
+    seen: Arc<std::sync::Mutex<Vec<crate::approval::ApprovalRequest>>>,
+}
+
+#[async_trait]
+impl crate::approval::ApprovalGate for RecordingGate {
+    async fn request(
+        &self,
+        req: crate::approval::ApprovalRequest,
+        _cancel: &agent_core::CancellationToken,
+    ) -> Result<crate::approval::ApprovalDecision, crate::approval::ApprovalError> {
+        self.seen.lock().unwrap().push(req);
+        Ok(self.answer)
+    }
+}
+
+/// A ctx whose children answer with one `bash` tool call, then a final message — enough to reach the
+/// approval gate, which `Factory`'s text-only replies never do.
+fn ctx_with_gate(
+    defs: Vec<AgentDef>,
+    command: &str,
+    allow: bool,
+) -> (
+    Arc<SubagentCtx>,
+    Arc<std::sync::Mutex<Vec<crate::approval::ApprovalRequest>>>,
+    tempfile::TempDir,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let gate = Arc::new(RecordingGate {
+        answer: crate::approval::ApprovalDecision {
+            allow,
+            scope: crate::approval::ApprovalScope::Once,
+        },
+        seen: seen.clone(),
+    });
+    let args = json!({ "command": command }).to_string();
+    let factory: TransportFactory = Arc::new(move |_model: &str| {
+        Ok(Arc::new(agent_core::MockTransport::new(vec![
+            agent_core::mock::turn::tool_call("t1", "bash", &args),
+            agent_core::mock::turn::text("finished"),
+        ])) as Arc<dyn ModelTransport>)
+    });
+    let ctx = Arc::new(SubagentCtx {
+        factory,
+        agents: Arc::new(defs),
+        skills: Arc::new(Vec::new()),
+        write_locks: Arc::new(agent_core::WriteLockRegistry::new()),
+        mcp_tools: Vec::new(),
+        tool_cfg: ChildToolConfig {
+            image_auto_resize: true,
+            ..Default::default()
+        },
+        cwd: dir.path().to_path_buf(),
+        project_trusted: true,
+        prompt_guidelines: Vec::new(),
+        parent_model: "parent-model".to_string(),
+        parent_cache_key: "parent-key".to_string(),
+        parent_tools: vec!["bash".to_string()],
+        deny_tool: Vec::new(),
+        deny_bash_pattern: Vec::new(),
+        deny_path: Vec::new(),
+        child_max_steps: DEFAULT_CHILD_MAX_STEPS,
+        max_depth: DEFAULT_MAX_DEPTH,
+        approval: Some(crate::approval::ApprovalRuntime::new(
+            gate,
+            crate::approval::GatedSet::All,
+        )),
+    });
+    (ctx, seen, dir)
+}
+
+#[tokio::test]
+async fn a_child_tool_call_goes_through_the_parents_approval_gate() {
+    // A child that could run `bash` without the human's approval *is* the bypass. `Agent::new` installs
+    // `NoHooks`, so this only holds because `try_run_child` re-installs the composed hook.
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("child-ran.txt");
+    let command = format!("touch {}", marker.display());
+
+    let (ctx, seen, _d) = ctx_with_gate(
+        vec![def("worker", None, Some(vec!["bash"]), Isolation::None)],
+        &command,
+        false, // deny
+    );
+    let tool = Subagent::new(ctx);
+    run(&tool, json!({ "agent": "worker", "task": "do it" }))
+        .await
+        .unwrap();
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(
+        seen.len(),
+        1,
+        "the child's `bash` call must have been gated"
+    );
+    assert_eq!(seen[0].tool, "bash");
+    assert_eq!(seen[0].scope_key, format!("cmd:{command}"));
+    assert!(!marker.exists(), "a denied child call must not have run");
+}
+
+#[tokio::test]
+async fn a_childs_approval_request_names_which_child_is_asking() {
+    // "Something wants to run `rm -rf`" is not an answerable question, and a parallel fan-out can have
+    // several children blocked at once.
+    let (ctx, seen, _d) = ctx_with_gate(
+        vec![def("reviewer", None, Some(vec!["bash"]), Isolation::None)],
+        "echo hi",
+        true,
+    );
+    let tool = Subagent::new(ctx);
+    run(&tool, json!({ "agent": "reviewer", "task": "look" }))
+        .await
+        .unwrap();
+
+    let seen = seen.lock().unwrap();
+    match &seen[0].origin {
+        crate::approval::ApprovalOrigin::Subagent { agent, spawn_id } => {
+            assert_eq!(agent, "reviewer");
+            assert!(
+                spawn_id.parse::<u64>().is_ok(),
+                "spawn_id must be the child's own sequence number: {spawn_id}"
+            );
+        }
+        other => panic!("a child must not report itself as the main agent: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_allowed_child_call_actually_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("child-ran.txt");
+    let (ctx, seen, _d) = ctx_with_gate(
+        vec![def("worker", None, Some(vec!["bash"]), Isolation::None)],
+        &format!("touch {}", marker.display()),
+        true,
+    );
+    let tool = Subagent::new(ctx);
+    run(&tool, json!({ "agent": "worker", "task": "do it" }))
+        .await
+        .unwrap();
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    assert!(marker.exists(), "an approved child call must have run");
 }

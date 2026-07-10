@@ -238,7 +238,7 @@ impl Tool for Read {
         // `agent_core::models::ModelCaps::supports_vision`. Defaults to `true` (vision capable) if
         // absent (e.g. a direct `Tool::run` call in a test, bypassing dispatch).
         let supports_vision = input
-            .get("_model_supports_vision")
+            .get(agent_core::tool::MODEL_SUPPORTS_VISION_KEY)
             .and_then(Value::as_bool)
             .unwrap_or(true);
 
