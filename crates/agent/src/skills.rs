@@ -473,11 +473,20 @@ fn find_git_repo_root(start: &Path) -> Option<PathBuf> {
 /// uncapped recursive descent could; [`MAX_DEPTH`] still bounds how far `walk` descends into whichever
 /// `.agents/skills` directory this discovers.
 pub(crate) fn collect_ancestor_agents_skill_dirs(start: &Path) -> Vec<PathBuf> {
+    collect_ancestor_agents_dirs(start, ".agents/skills")
+}
+
+/// The generalized ancestor walk [`collect_ancestor_agents_skill_dirs`] is one instantiation of:
+/// every `<ancestor>/<suffix>` between `start` (inclusive) and the enclosing git-repo root (inclusive),
+/// nearest first. `suffix` is the vendor-neutral convention's subpath — `.agents/skills` here,
+/// `.agents/agents` for [`crate::agents`], which needs the identical git-root-stopping walk and would
+/// otherwise duplicate it (along with `find_git_repo_root`) verbatim.
+pub(crate) fn collect_ancestor_agents_dirs(start: &Path, suffix: &str) -> Vec<PathBuf> {
     let git_repo_root = find_git_repo_root(start);
     let mut dirs = Vec::new();
     let mut dir = start.to_path_buf();
     loop {
-        dirs.push(dir.join(".agents/skills"));
+        dirs.push(dir.join(suffix));
         if git_repo_root.as_deref() == Some(dir.as_path()) {
             break;
         }
@@ -487,6 +496,22 @@ pub(crate) fn collect_ancestor_agents_skill_dirs(start: &Path) -> Vec<PathBuf> {
         }
     }
     dirs
+}
+
+/// [`collect_ancestor_agents_dirs`] with the operator's own `~/<suffix>` filtered out — the generalized
+/// form of [`collect_ancestor_agents_skill_dirs_excluding_user_dir`], for the same reason: the user root
+/// is listed separately and unconditionally by every discovery pass, so an ancestor walk that reaches
+/// `$HOME` (a `cwd` under `$HOME` with no enclosing git repo) must not double-count it as if it were a
+/// project-controlled, trust-gated resource.
+pub(crate) fn collect_ancestor_agents_dirs_excluding_user_dir(
+    start: &Path,
+    suffix: &str,
+) -> Vec<PathBuf> {
+    let user_dir = home_dir().map(|h| h.join(suffix));
+    collect_ancestor_agents_dirs(start, suffix)
+        .into_iter()
+        .filter(|dir| user_dir.as_deref() != Some(dir.as_path()))
+        .collect()
 }
 
 /// Like [`collect_ancestor_agents_skill_dirs`], but excludes the user's own `~/.agents/skills` — pi's

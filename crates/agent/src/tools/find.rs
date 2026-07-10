@@ -26,7 +26,18 @@ const DEFAULT_LIMIT: usize = 1000;
 /// sane `limit`; when it trips, which paths survive truncation can depend on walk order (flagged).
 const HARD_CAP: usize = 10_000;
 
-pub struct Find;
+#[derive(Default)]
+pub struct Find {
+    /// A relative search `path` (including its `"."` default) resolves against this. Empty = the
+    /// process cwd. See [`super::resolve_against`].
+    root: PathBuf,
+}
+
+impl Find {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+}
 
 /// A prepared find: compiled glob, whether it matches the basename only (vs. the full path), search
 /// root, and the report cap.
@@ -126,8 +137,9 @@ impl Tool for Find {
     fn description(&self) -> &str {
         // Pi-parity fix (task 52): built via `format!` referencing the real constants — like
         // `bash.rs`'s `describe()` — instead of a hand-typed literal safety-netted only by a unit test
-        // that has to be kept in sync manually. `OnceLock` caches the one-time render since `Find` is a
-        // unit struct with no field to build it into at construction the way `Bash` does.
+        // that has to be kept in sync manually. Unlike `bash`'s, this description depends on no
+        // per-instance config (only on compile-time constants), so it's rendered once into a `OnceLock`
+        // rather than stored on every `Find` the way `Bash` stores its timeout-dependent one.
         static DESC: OnceLock<String> = OnceLock::new();
         DESC.get_or_init(|| {
             format!(
@@ -158,7 +170,7 @@ impl Tool for Find {
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing `pattern`".into()))?;
         let root = input.get("path").and_then(Value::as_str).unwrap_or(".");
-        let root = &super::normalize_path(root);
+        let root = &super::resolve_against(&self.root, root);
         let limit = input
             .get("limit")
             .and_then(Value::as_u64)
@@ -283,7 +295,7 @@ mod tests {
         std::fs::write(dir.path().join("src/lib.rs"), "").unwrap();
         std::fs::write(dir.path().join("README.md"), "").unwrap();
 
-        let out = Find
+        let out = Find::default()
             .run(json!({ "pattern": "*.rs", "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -304,7 +316,7 @@ mod tests {
         std::fs::write(dir.path().join("lower.rs"), "").unwrap();
         std::fs::write(dir.path().join("Mixed.Rs"), "").unwrap();
 
-        let out = Find
+        let out = Find::default()
             .run(json!({ "pattern": "*.rs", "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -322,7 +334,7 @@ mod tests {
         std::fs::write(dir.path().join("File.RS"), "").unwrap();
         std::fs::write(dir.path().join("lower.rs"), "").unwrap();
 
-        let out = Find
+        let out = Find::default()
             .run(json!({ "pattern": "*.RS", "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -341,7 +353,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("main.rs"), "").unwrap();
         let at_prefixed = format!("@{}", dir.path().to_str().unwrap());
-        let out = Find
+        let out = Find::default()
             .run(json!({ "pattern": "*.rs", "path": at_prefixed }))
             .await
             .unwrap()
@@ -358,7 +370,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("src/main.rs"), "").unwrap();
 
-        let out = Find
+        let out = Find::default()
             .run(json!({ "pattern": "*.rs", "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -376,7 +388,7 @@ mod tests {
         // path only; an unterminated character class must produce a clear tool error, not a panic or a
         // confusing "no files matching" result.
         let dir = tempfile::tempdir().unwrap();
-        let err = Find
+        let err = Find::default()
             .run(json!({ "pattern": "[", "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap_err();
@@ -391,7 +403,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("node_modules")).unwrap();
         std::fs::write(dir.path().join("node_modules/pkg.json"), "").unwrap();
-        let out = Find
+        let out = Find::default()
             .run(json!({ "pattern": "node_modules", "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -413,7 +425,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("somedir")).unwrap();
         std::fs::write(dir.path().join("somefile.txt"), "").unwrap();
-        let out = Find
+        let out = Find::default()
             .run(json!({ "pattern": "some*", "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -442,7 +454,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("plain.rs");
         std::fs::write(&file, "").unwrap();
-        let err = Find
+        let err = Find::default()
             .run(json!({ "pattern": "*.rs", "path": file.to_str().unwrap() }))
             .await
             .unwrap_err();
@@ -463,7 +475,7 @@ mod tests {
     async fn no_match_is_reported() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "").unwrap();
-        let out = Find
+        let out = Find::default()
             .run(json!({ "pattern": "*.zzz", "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -491,7 +503,7 @@ mod tests {
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
         let blocks = mode_actually_blocks_reads(dir.path());
 
-        let result = Find
+        let result = Find::default()
             .run(json!({ "pattern": "*.txt", "path": dir.path().to_str().unwrap() }))
             .await;
         let _ = std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755));
@@ -526,7 +538,7 @@ mod tests {
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
         let blocks = mode_actually_blocks_reads(&locked);
 
-        let result = Find
+        let result = Find::default()
             .run(json!({ "pattern": "*.rs", "path": dir.path().to_str().unwrap() }))
             .await;
         let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
@@ -553,7 +565,8 @@ mod tests {
         }
         let path = dir.path().to_str().unwrap();
         let run_once = || async {
-            Find.run(json!({ "pattern": "*.rs", "path": path }))
+            Find::default()
+                .run(json!({ "pattern": "*.rs", "path": path }))
                 .await
                 .unwrap()
                 .text
@@ -570,7 +583,7 @@ mod tests {
         for i in 0..10 {
             std::fs::write(dir.path().join(format!("f{i:02}.rs")), "").unwrap();
         }
-        let out = Find
+        let out = Find::default()
             .run(json!({ "pattern": "*.rs", "path": dir.path().to_str().unwrap(), "limit": 3 }))
             .await
             .unwrap()
@@ -591,7 +604,7 @@ mod tests {
         std::fs::write(dir.path().join(".gitignore"), "ignored.rs\n").unwrap();
         std::fs::write(dir.path().join("ignored.rs"), "").unwrap();
         std::fs::write(dir.path().join("kept.rs"), "").unwrap();
-        let out = Find
+        let out = Find::default()
             .run(json!({ "pattern": "*.rs", "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -614,7 +627,7 @@ mod tests {
         std::fs::write(dir.path().join(".gitignore"), "ignored.rs\n").unwrap();
         std::fs::write(dir.path().join("ignored.rs"), "").unwrap();
         std::fs::write(dir.path().join("kept.rs"), "").unwrap();
-        let out = Find
+        let out = Find::default()
             .run(json!({ "pattern": "*.rs", "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -637,7 +650,7 @@ mod tests {
         std::fs::write(dir.path().join(".secret/hidden.txt"), "hidden").unwrap();
         std::fs::write(dir.path().join("visible.txt"), "visible").unwrap();
 
-        let out = Find
+        let out = Find::default()
             .run(json!({ "pattern": "**/*.txt", "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -669,7 +682,7 @@ mod tests {
         std::fs::write(dir.path().join("b/kept.txt"), "").unwrap();
         std::fs::write(dir.path().join("root.txt"), "").unwrap();
 
-        let out = Find
+        let out = Find::default()
             .run(json!({ "pattern": "**/*.txt", "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -707,7 +720,7 @@ mod tests {
         std::fs::write(dir.path().join("b/kept.txt"), "").unwrap();
         std::fs::write(dir.path().join("root.txt"), "").unwrap();
 
-        let out = Find
+        let out = Find::default()
             .run(json!({ "pattern": "**/*.txt", "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -741,7 +754,7 @@ mod tests {
             let name = format!("{i:04}-{}.rs", "x".repeat(200));
             std::fs::write(dir.path().join(name), "").unwrap();
         }
-        let out = Find
+        let out = Find::default()
             .run(json!({ "pattern": "*.rs", "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -787,7 +800,7 @@ mod tests {
         // "regression-safe": a `/`-free pattern must keep matching by basename exactly as before, even
         // once path-glob support (below) is layered on top of it.
         let dir = regression_3302_tree();
-        let out = Find
+        let out = Find::default()
             .run(json!({ "pattern": "*.spec.ts", "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -800,7 +813,7 @@ mod tests {
     async fn regression_3302_directory_prefixed_pattern_with_trailing_double_star_matches_the_subtree()
      {
         let dir = regression_3302_tree();
-        let out = Find
+        let out = Find::default()
             .run(json!({ "pattern": "some/parent/child/**", "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -812,7 +825,7 @@ mod tests {
     #[tokio::test]
     async fn regression_3302_leading_double_star_wildcard_with_path_segments_matches() {
         let dir = regression_3302_tree();
-        let out = Find
+        let out = Find::default()
             .run(json!({ "pattern": "**/parent/child/*", "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -824,7 +837,7 @@ mod tests {
     #[tokio::test]
     async fn regression_3302_nested_src_glob_matches_the_nested_spec_file() {
         let dir = regression_3302_tree();
-        let out = Find
+        let out = Find::default()
             .run(json!({ "pattern": "src/**/*.spec.ts", "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -842,7 +855,7 @@ mod tests {
             let name = format!("{i:04}-{}.rs", "x".repeat(200));
             std::fs::write(dir.path().join(name), "").unwrap();
         }
-        let out = Find
+        let out = Find::default()
             .run(json!({ "pattern": "*.rs", "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -868,7 +881,7 @@ mod tests {
         // output truncation budget numerically), `find`'s description only stated the result-count
         // default in the `limit` schema field, never the overall byte-truncation cap it shares with
         // `grep`/`ls`.
-        let desc = Find.description().to_string();
+        let desc = Find::default().description().to_string();
         assert!(
             desc.contains(&DEFAULT_LIMIT.to_string())
                 && desc.contains(&super::super::output::format_size(

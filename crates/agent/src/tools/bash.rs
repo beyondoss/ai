@@ -77,6 +77,16 @@ pub struct Bash {
     /// in what the model sees instead of the tool description silently going stale for a deployment
     /// that overrides it via `--bash-timeout-ms`.
     description: String,
+    /// The working directory a command runs in when the model omits `cwd`, and what a *relative* `cwd`
+    /// resolves against. Empty = the process cwd (the pre-root behavior: `run_streaming` is handed
+    /// `None` and the spawned child inherits ours).
+    ///
+    /// This is the whole reason `bash` can honor a subagent's `isolation: worktree` at all. Unlike the
+    /// other filesystem tools, `bash`'s blast radius is opaque — it reports no `write_target`, so a
+    /// shared `WriteLockRegistry` provably cannot serialize two children's shell commands (see
+    /// [`Tool::conservative_exclusive`]). Pointing its cwd at a per-child worktree is what keeps those
+    /// commands from colliding.
+    root: std::path::PathBuf,
 }
 
 /// Build the model-facing tool description, stating the *actual* default timeout (a model omitting
@@ -105,6 +115,7 @@ impl Bash {
             shell_path: None,
             command_prefix: None,
             description: describe(DEFAULT_TIMEOUT_MS),
+            root: std::path::PathBuf::new(),
         }
     }
 
@@ -113,6 +124,25 @@ impl Bash {
         self.default_timeout_ms = ms;
         self.description = describe(ms);
         self
+    }
+
+    /// Builder-style: run commands in `root` when the model omits `cwd`, and resolve a relative `cwd`
+    /// against it. An empty `root` leaves the pre-root behavior (inherit the process cwd) untouched.
+    pub fn with_root(mut self, root: impl Into<std::path::PathBuf>) -> Self {
+        self.root = root.into();
+        self
+    }
+
+    /// The directory this call runs in: the model's `cwd` resolved against [`Self::root`], else `root`
+    /// itself, else `None` (inherit the process cwd). Returned as an owned `String` because both the
+    /// validation below and the runner need it, and it may be a freshly-joined path rather than a
+    /// borrow of the input.
+    fn resolve_cwd(&self, cwd: Option<&str>) -> Option<String> {
+        match cwd {
+            Some(dir) => Some(super::resolve_against(&self.root, dir)),
+            None if !self.root.as_os_str().is_empty() => Some(self.root.display().to_string()),
+            None => None,
+        }
     }
 
     /// Builder-style: run commands through this shell instead of the auto-resolved one
@@ -147,6 +177,7 @@ impl Bash {
             shell_path: None,
             command_prefix: None,
             description: describe(DEFAULT_TIMEOUT_MS),
+            root: std::path::PathBuf::new(),
         }
     }
 
@@ -175,7 +206,13 @@ impl Bash {
         // fixed once at construction (the shell config baked in at startup), not choosable per
         // invocation. Letting the model pick `cwd` per call is a real capability beyond's own, kept as
         // a plausible enhancement rather than narrowed to match.
-        let cwd = input.get("cwd").and_then(Value::as_str);
+        //
+        // Resolved against this tool's `root` (see `Bash::root`): an omitted `cwd` becomes `root`, and a
+        // relative one is joined onto it. Everything below — the validation, the error text, and what
+        // the runner is handed — uses the *resolved* directory, since that is the one the child will
+        // actually chdir into and the one whose non-existence would fail the spawn.
+        let cwd = self.resolve_cwd(input.get("cwd").and_then(Value::as_str));
+        let cwd = cwd.as_deref();
         // Fail with a clear message instead of the raw spawn-error wrapping ("spawn failed: No such
         // file or directory") a bad `cwd` would otherwise surface as — matches pi's own pre-check, plus
         // a stricter, more accurate rejection: pi only checks existence, so it would happily hand a
@@ -1331,5 +1368,113 @@ mod tests {
         };
         assert_eq!(msg, "Command timed out after 5 seconds");
         assert!(!msg.contains("no output"));
+    }
+
+    /// Records the `cwd` the runner was actually handed — the one thing `RecordingRunner` throws away,
+    /// and the only observable that proves `Bash::root` reached the spawned child.
+    struct CwdRecordingRunner {
+        cwd: std::sync::Mutex<Option<Option<String>>>,
+    }
+
+    #[async_trait]
+    impl CommandRunner for CwdRecordingRunner {
+        async fn run(
+            &self,
+            _program: &str,
+            _args: &[String],
+            cwd: Option<&str>,
+            _timeout: Duration,
+        ) -> std::io::Result<ExecResult> {
+            *self.cwd.lock().unwrap() = Some(cwd.map(str::to_string));
+            Ok(ExecResult {
+                code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                timed_out: false,
+                truncated: false,
+            })
+        }
+    }
+
+    /// Run `input` through a `Bash` rooted at `root` and report the `cwd` its runner received.
+    async fn captured_cwd(root: &Path, input: Value) -> Option<String> {
+        let runner = Arc::new(CwdRecordingRunner {
+            cwd: std::sync::Mutex::new(None),
+        });
+        Bash::with_runner(runner.clone())
+            .with_root(root)
+            .run(input)
+            .await
+            .unwrap();
+        let captured = runner.cwd.lock().unwrap().clone();
+        captured.expect("runner was never invoked")
+    }
+
+    #[tokio::test]
+    async fn an_omitted_cwd_defaults_to_the_root() {
+        // This is what makes `isolation: worktree` work at all: `bash` reports no `write_target`, so a
+        // shared `WriteLockRegistry` can't serialize two children's shell commands. Pointing each
+        // child's `bash` at its own worktree is the only thing keeping them apart.
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            captured_cwd(tmp.path(), json!({ "command": "echo hi" })).await,
+            Some(tmp.path().display().to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_omitted_cwd_with_an_empty_root_still_inherits_the_process_cwd() {
+        // The pre-root behavior, unchanged: no root and no `cwd` means the child inherits ours, so
+        // `default_registry()` and every existing caller behave exactly as before.
+        assert_eq!(
+            captured_cwd(Path::new(""), json!({ "command": "echo hi" })).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_relative_cwd_resolves_against_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("sub")).unwrap();
+        assert_eq!(
+            captured_cwd(tmp.path(), json!({ "command": "echo hi", "cwd": "sub" })).await,
+            Some(tmp.path().join("sub").display().to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_absolute_cwd_escapes_the_root_by_design() {
+        // A worktree is conflict avoidance, not containment — same contract as Claude Code's
+        // `isolation: "worktree"`. A child naming an absolute `cwd` reaches it. Asserted so that if
+        // someone later decides to jail this, they do it deliberately and update this test.
+        let tmp = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let abs = elsewhere.path().display().to_string();
+        assert_eq!(
+            captured_cwd(tmp.path(), json!({ "command": "echo hi", "cwd": &abs })).await,
+            Some(abs)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_relative_cwd_that_does_not_exist_under_the_root_is_reported_with_the_resolved_path()
+    {
+        // The error must name the directory the child would actually have chdir'd into, not the bare
+        // relative spelling the model wrote — otherwise "does not exist: sub" is unactionable.
+        let tmp = tempfile::tempdir().unwrap();
+        let runner = Arc::new(CwdRecordingRunner {
+            cwd: std::sync::Mutex::new(None),
+        });
+        let err = Bash::with_runner(runner)
+            .with_root(tmp.path())
+            .run(json!({ "command": "echo hi", "cwd": "nope" }))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&tmp.path().join("nope").display().to_string()),
+            "{msg}"
+        );
+        assert!(msg.contains("does not exist"), "{msg}");
     }
 }

@@ -1269,6 +1269,86 @@ and `serve`'s own `bash`/`abort_bash` RPC commands reuse `RealRunner` directly, 
 
 ---
 
+## Subagents — in-process delegation with worktree isolation
+
+The `subagent` tool (`tools/subagent.rs`) lets the model delegate a task to a nested `agent_core::Agent`
+that runs **in the same process** with its own context window. The reference agent (pi) ships this as an
+extension that spawns a subprocess per child; we own the loop, so a child is an in-process `Agent`,
+which keeps the shared HTTP/connection pool, avoids reconnecting every MCP server per child, and makes a
+child's progress stream into the parent's own observers for free.
+
+**Agent definitions** (`agents.rs`) are markdown files — `~/.claude/agents/*.md`, `~/.agents/agents/*.md`
+(user, ungated), and `<cwd>/.claude/agents`, `.agents/agents` ancestors (project, trust-gated exactly
+like skills, because a definition body is injected verbatim as a child's system prompt). Frontmatter:
+`name`, `description` (required); `tools` (comma-separated allow-list), `model`, `isolation`
+(`none`|`worktree`) (optional); the body is the child's system prompt. Discovered like skills/prompts,
+reusing `skills::parse_frontmatter`/`xml_escape`/`Collision`. When at least one definition exists, the
+tool is registered and an `<available_agents>` block is added to the system prompt; otherwise neither
+appears.
+
+**Three modes, one tool call** — `single {agent, task}`, `parallel {tasks:[…]}` (≤8, 4 at a time, order
+preserved, no early abort), `chain {chain:[…]}` (sequential; each step's `{previous}` is replaced by the
+prior child's final assistant text). Parallel fan-out lives *inside one call* deliberately: the tool
+returns `conservative_exclusive() == true` (a child's blast radius is opaque, like `bash`'s), and the
+loop caps an exclusive turn's concurrency at 1 — so N separate `subagent` calls would serialize. The
+array shape is what gets real parallelism.
+
+**Four invariants the implementation exists to hold:**
+
+1. **Policy inheritance.** `Agent::new` installs `NoHooks`, so a child is built with the parent's
+   `ToolPolicy::from_lists(deny_tool, deny_bash_pattern, deny_path)` — otherwise `subagent` would be a
+   sandbox escape (a child running a `bash` command the parent's `--deny-bash-pattern` forbids). Covered
+   by `tests/subagent_policy.rs`, which must never regress.
+2. **Write serialization.** Every child shares the parent's `WriteLockRegistry` (`Agent::new`'s default
+   is a private one), so same-path `write`/`edit` across parent and children serialize.
+3. **Parallel writers need worktrees.** `bash` reports no `write_target`, so the lock registry provably
+   cannot serialize two children's shell commands. In parallel mode, a write-capable agent
+   (`write`/`edit`/`bash`) *must* declare `isolation: worktree` or the call is rejected.
+4. **Recursion bound.** Depth is carried in the `Subagent` instance (there is no ambient context in
+   `Tool::run`). A child gets its own `subagent` tool only if its definition lists it *and*
+   `depth+1 < max_depth` (default 1). A child with no `tools:` inherits the parent's effective set minus
+   `subagent`.
+
+Each child gets a **distinct `cache_key`** (`{parent}:sub:{seq}`): the parent's would poison the
+Anthropic prompt cache and contend the Codex WebSocket pool, which is keyed on it. Children get **no
+checkpoint hook** (`Agent::new`'s `NoCheckpoint` default) so their turns don't leak into the parent's
+session store. The transport is built per child via a **factory closure** (`TransportFactory`), not by
+cloning the parent's — credentials/routing are model-keyed, so a child naming its own `model:` must
+re-resolve.
+
+Child `AgentEvent`s are folded into `ToolProgress::emit` as a **coalesced, throttled** status snapshot
+(≥100 ms between emits; raw token deltas are never forwarded) — `serve`'s outbound channel is unbounded,
+and eight streaming children would otherwise flood it.
+
+### Worktree isolation and merge-back (`worktree.rs`)
+
+A `worktree`-isolated child runs with its filesystem tools rooted at a private `git worktree`. This is
+**conflict avoidance, not containment** — the same contract as Claude Code's `isolation: "worktree"`; an
+absolute path still escapes, and that's fine. The point is that two parallel writers don't stomp each
+other.
+
+- **Rooted tools.** `Read`/`Write`/`Edit`/`Ls`/`Grep`/`Find`/`Bash` each carry a `root` (see
+  `tools::ToolConfig`); a relative path resolves against it via `tools::resolve_against`, and
+  `canonical_write_target(root, path)` keys the write-lock on the *resolved* path — so two worktrees'
+  `src/lib.rs` are correctly two different files. An empty root means the process cwd (the pre-subagent
+  behavior every non-child caller keeps).
+- **Seeding.** `git worktree add HEAD` checks out HEAD, not the developer's uncommitted work, so
+  `Worktree::create` copies the parent's tracked modifications and untracked-but-not-ignored files into
+  the worktree and commits them as a throwaway baseline. `child_delta` diffs against that baseline, so
+  the patch is *only* what the child changed — the parent's own WIP isn't replayed onto it.
+- **Merge-back.** On child success, `apply_patch` re-checks every path in the diff against the parent's
+  `--deny-path` globs (mapped back to the main tree) — `git apply` is not a tool call and never reaches
+  `ToolPolicy`, so this is the only place that check can live — then applies with `git apply --3way`. A
+  clean apply removes the worktree; a conflict leaves markers in the main tree, preserves the worktree,
+  and names it in the tool result for the parent (or the user) to resolve; a policy refusal rejects the
+  whole patch (all-or-nothing).
+- **Cleanup.** `Drop` removes a worktree best-effort, but a `process::exit`/SIGKILL runs no destructors,
+  so worktrees live under `$XDG_CACHE_HOME/beyond-agent/worktrees/<repo-id>/<pid>-<label>` (on disk, not
+  tmpfs — a checkout in RAM would exhaust it) and a startup `sweep` reaps any whose owning PID is gone.
+  Keyed by PID so a sweep never deletes a concurrently-running session's work.
+
+---
+
 ## State Machine — `serve` session lifecycle
 
 ```

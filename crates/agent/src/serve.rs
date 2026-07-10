@@ -540,6 +540,10 @@ pub struct ServeConfig {
     /// server) lives as long as this `Vec`'s `Arc<dyn Tool>` entries do, i.e. for the whole `serve`
     /// session.
     pub mcp_tools: Vec<Arc<dyn agent_core::Tool>>,
+    /// Agent definitions discovered at startup (see [`crate::agents`]) — the delegable personas the
+    /// `subagent` tool accepts, advertised in `<available_agents>`. Discovered once, like `mcp_tools`,
+    /// rather than re-walked on every registry rebuild. Empty when subagents aren't configured.
+    pub agents: Vec<crate::agents::AgentDef>,
     /// Force every batch of tool calls in a turn to run one at a time instead of the default
     /// bounded-concurrent dispatch (`agent_core::Agent::with_sequential_tools`). Fixed for the process,
     /// like `tools`/`no_tools` — `build_agent` reapplies it every rebuild.
@@ -1824,7 +1828,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
 /// connection is *not* an EOF: `input_rx.recv()` simply pends until the next command, and the run
 /// keeps going. The command protocol below is byte-identical across both transports.
 pub(crate) async fn serve_session(
-    cfg: ServeConfig,
+    mut cfg: ServeConfig,
     mut input_rx: mpsc::UnboundedReceiver<String>,
     out_conn: SharedOutConn,
     // Set `true` for the duration of a `prompt` run, `false` otherwise. The daemon supervisor's idle
@@ -1865,6 +1869,16 @@ pub(crate) async fn serve_session(
         crate::trust_store::TrustStore::open_default().lookup(&cwd),
         has_gated_resources,
     );
+    // Agent definitions are trust-gated exactly like skills (a project-local `.claude/agents/*.md` body
+    // is injected verbatim as a child's system prompt), so they're discovered here — after trust is
+    // resolved — not by `main.rs` at `ServeConfig`-construction time, where the interactive trust grant
+    // hasn't happened yet. Stored on `cfg` so `build_agent`/`build_tools` (which take only `&cfg`) can
+    // reach them on every rebuild without re-walking. The `reload` arm re-discovers below, since trust
+    // (and the on-disk definitions) can change mid-process.
+    cfg.agents = crate::agents::discover(&cwd, project_trusted);
+    // Reap any subagent worktree orphaned by a previous crash of a process against this repo.
+    crate::worktree::sweep(&cwd);
+
     // Track L32 (pi-parity fix): mirrors `main.rs`'s identical warning for `run` — an untrusted
     // project with a `SYSTEM.md`/skills/prompts on disk silently skipped all of them with no signal at
     // all that anything was there. Re-checked (not just at startup) on every `reload`, below, since
@@ -1941,6 +1955,7 @@ pub(crate) async fn serve_session(
             skills: &skills,
             has_read,
             project_trusted,
+            agents: &cfg.agents,
         });
     timing.mark("build static system prompt");
 
@@ -2068,6 +2083,24 @@ pub(crate) async fn serve_session(
     // Shared across every `build_agent` rebuild for this process's lifetime, so file-mutation
     // exclusivity (same-path `edit`/`write` calls) survives a `set_model`/`set_thinking` rebuild.
     let write_locks = Arc::new(agent_core::WriteLockRegistry::new());
+    // The subagent context, built once and reused across every rebuild — its transport factory closes
+    // over `cfg` and re-resolves per child model, so nothing here changes when the *parent's* model does.
+    // `None` when no agent definitions were discovered: no delegable agents, no `subagent` tool.
+    // `mut` because `reload` rebuilds it when trust or the on-disk definitions change and then rebuilds
+    // the agent, so a mid-session-added agent becomes delegable immediately.
+    let mut subagent_ctx: Option<Arc<crate::tools::subagent::SubagentCtx>> =
+        if cfg.agents.is_empty() {
+            None
+        } else {
+            Some(build_subagent_ctx(
+                &cfg,
+                &cwd,
+                project_trusted,
+                &current_model,
+                &write_locks,
+                &skills,
+            ))
+        };
     // A multi-step run (several tool round-trips) is otherwise only ever durable once it *fully*
     // completes — a crash, OOM-kill, or panic mid-run loses everything back to the turn's start,
     // including the user's own prompt. `ChannelCheckpoint` streams a cheap `Arc` snapshot of
@@ -2103,6 +2136,7 @@ pub(crate) async fn serve_session(
         persistence.session_id(),
         &write_locks,
         &checkpoint,
+        subagent_ctx.as_ref(),
     );
     timing.mark("build agent");
     // Persistent across every `prompt` call (not just the one currently in flight), so `steer`/
@@ -2284,7 +2318,8 @@ pub(crate) async fn serve_session(
                                 persistence.session_id(),
                                 &write_locks,
                                 &checkpoint,
-                            );
+                                subagent_ctx.as_ref(),
+                                );
                         }
                         let _ = out_tx.send(response(
                             $id,
@@ -2399,7 +2434,8 @@ pub(crate) async fn serve_session(
                             persistence.session_id(),
                             &write_locks,
                             &checkpoint,
-                        );
+                            subagent_ctx.as_ref(),
+                            );
                     }
                     let _ = out_tx.send(response(
                         $id,
@@ -2465,7 +2501,8 @@ pub(crate) async fn serve_session(
                             persistence.session_id(),
                             &write_locks,
                             &checkpoint,
-                        );
+                            subagent_ctx.as_ref(),
+                            );
                     }
                     let _ = out_tx.send(response(
                         $id,
@@ -4034,6 +4071,23 @@ pub(crate) async fn serve_session(
                         &cfg.extra_skill_paths,
                     )
                 };
+                // Agent definitions are trust-gated like skills, so a `reload` after a trust change (or
+                // an edit to `.claude/agents/`) must re-discover them and rebuild the subagent context —
+                // otherwise `<available_agents>` and the `subagent` tool would advertise a stale set until
+                // restart. The `set_model` arm below then rebuilds the agent with the refreshed ctx.
+                cfg.agents = crate::agents::discover(&cwd, project_trusted);
+                subagent_ctx = if cfg.agents.is_empty() {
+                    None
+                } else {
+                    Some(build_subagent_ctx(
+                        &cfg,
+                        &cwd,
+                        project_trusted,
+                        &current_model,
+                        &write_locks,
+                        &skills,
+                    ))
+                };
                 static_system = crate::resources::build_static_system_prompt(
                     &crate::resources::PromptOptions {
                         base: None,
@@ -4044,9 +4098,30 @@ pub(crate) async fn serve_session(
                         skills: &skills,
                         has_read,
                         project_trusted,
+                        agents: &cfg.agents,
                     },
                 );
-                agent.set_system(full_system(&static_system, &cwd));
+                // A full rebuild, not just `agent.set_system(...)`: `reload` may have changed the agent
+                // *definitions* (a new `.claude/agents/*.md`, or trust newly granted), and the `subagent`
+                // tool's registration lives in the registry, which only a rebuild refreshes. Without this,
+                // a mid-session-added agent wouldn't become delegable until the next `set_model`. Mirrors
+                // `set_model`'s own rebuild; the session is untouched.
+                agent = build_agent(
+                    client.clone(),
+                    &full_system(&static_system, &cwd),
+                    &cfg,
+                    &current_model,
+                    current_thinking,
+                    current_level,
+                    current_auto_compaction,
+                    current_auto_retry,
+                    current_block_images,
+                    current_image_auto_resize,
+                    persistence.session_id(),
+                    &write_locks,
+                    &checkpoint,
+                    subagent_ctx.as_ref(),
+                );
                 emit!(response(id, "reload", true, None, None));
             }
             // Rejects an empty/whitespace-only id, and — Fix 10 (pi-parity feature) — resolves a
@@ -4133,6 +4208,7 @@ pub(crate) async fn serve_session(
                                         persistence.session_id(),
                                         &write_locks,
                                         &checkpoint,
+                                        subagent_ctx.as_ref(),
                                     );
                                     emit!(response(
                                         id,
@@ -4186,6 +4262,7 @@ pub(crate) async fn serve_session(
                             persistence.session_id(),
                             &write_locks,
                             &checkpoint,
+                            subagent_ctx.as_ref(),
                         );
                         emit!(response(
                             id,
@@ -4211,6 +4288,7 @@ pub(crate) async fn serve_session(
                             persistence.session_id(),
                             &write_locks,
                             &checkpoint,
+                            subagent_ctx.as_ref(),
                         );
                         emit!(response(
                             id,
@@ -4274,6 +4352,7 @@ pub(crate) async fn serve_session(
                                     persistence.session_id(),
                                     &write_locks,
                                     &checkpoint,
+                                    subagent_ctx.as_ref(),
                                 );
                                 let (thinking, reasoning_effort) = agent_core::thinking_for_level(
                                     &agent_core::capabilities(&current_model),
@@ -4375,6 +4454,7 @@ pub(crate) async fn serve_session(
                                     persistence.session_id(),
                                     &write_locks,
                                     &checkpoint,
+                                    subagent_ctx.as_ref(),
                                 );
                                 let mut resp_data =
                                     model_switch_response(&current_model, current_level);
@@ -4427,6 +4507,7 @@ pub(crate) async fn serve_session(
                             persistence.session_id(),
                             &write_locks,
                             &checkpoint,
+                            subagent_ctx.as_ref(),
                         );
                         let (thinking, reasoning_effort) = agent_core::thinking_for_level(
                             &agent_core::capabilities(&current_model),
@@ -4480,6 +4561,7 @@ pub(crate) async fn serve_session(
                         persistence.session_id(),
                         &write_locks,
                         &checkpoint,
+                        subagent_ctx.as_ref(),
                     );
                     emit!(response(
                         id,
@@ -4514,6 +4596,7 @@ pub(crate) async fn serve_session(
                         persistence.session_id(),
                         &write_locks,
                         &checkpoint,
+                        subagent_ctx.as_ref(),
                     );
                     emit!(response(
                         id,
@@ -4559,6 +4642,7 @@ pub(crate) async fn serve_session(
                         persistence.session_id(),
                         &write_locks,
                         &checkpoint,
+                        subagent_ctx.as_ref(),
                     );
                     emit!(response(
                         id,
@@ -4597,6 +4681,7 @@ pub(crate) async fn serve_session(
                         persistence.session_id(),
                         &write_locks,
                         &checkpoint,
+                        subagent_ctx.as_ref(),
                     );
                     emit!(response(
                         id,
@@ -4879,6 +4964,7 @@ pub(crate) async fn serve_session(
                                     persistence.session_id(),
                                     &write_locks,
                                     &checkpoint,
+                                    subagent_ctx.as_ref(),
                                 );
                             }
                             emit!(response(
@@ -5521,6 +5607,68 @@ fn build_gateway_client(cfg: &ServeConfig, model: &str) -> Result<GatewayClient,
 /// that and stays pinned across a model switch (the operator's compaction budget, not the dialect's) —
 /// left unset, each switch picks up the *new* model's real window instead of a stale operator number.
 /// `reserve_tokens`/`keep_recent_tokens` default to `CompactionConfig::default()`, overridable
+/// Build the subagent context once, at startup. Its transport factory closes over a clone of `cfg` and
+/// calls [`build_gateway_client`] per child model — the same model-switch-safe recipe the parent uses —
+/// so the ctx is valid for the whole session regardless of parent model switches.
+///
+/// `skills` are the parent session's own discovered skills, so a worktree/read-only child sees the same
+/// `<available_skills>` the parent does. `prompt_guidelines` is empty: `serve` renders its base prompt
+/// once into `cfg.system` and doesn't carry the raw guideline list past that.
+fn build_subagent_ctx(
+    cfg: &ServeConfig,
+    cwd: &Path,
+    project_trusted: bool,
+    parent_model: &str,
+    write_locks: &Arc<agent_core::WriteLockRegistry>,
+    skills: &[crate::skills::Skill],
+) -> Arc<crate::tools::subagent::SubagentCtx> {
+    use crate::tools::subagent;
+    let cfg_for_factory = cfg.clone();
+    let factory: subagent::TransportFactory = Arc::new(move |m: &str| {
+        build_gateway_client(&cfg_for_factory, m)
+            .map(|c| Arc::new(c) as Arc<dyn agent_core::ModelTransport>)
+    });
+    // The parent's effective set (after `--tools`/`--exclude-tools`) minus `subagent`, so a child with
+    // no `tools:` of its own inherits exactly what the parent may do — no more.
+    let mut probe = build_tools(cfg, cfg.image_auto_resize);
+    crate::tools::apply_filter(
+        &mut probe,
+        cfg.tools.as_deref(),
+        cfg.exclude_tools.as_deref(),
+        cfg.no_tools,
+    );
+    let parent_tools: Vec<String> = probe
+        .definitions()
+        .into_iter()
+        .map(|d| d.name)
+        .filter(|n| n != subagent::NAME)
+        .collect();
+    Arc::new(subagent::SubagentCtx {
+        factory,
+        agents: Arc::new(cfg.agents.clone()),
+        skills: Arc::new(skills.to_vec()),
+        write_locks: write_locks.clone(),
+        mcp_tools: cfg.mcp_tools.clone(),
+        tool_cfg: subagent::ChildToolConfig {
+            bash_timeout_ms: cfg.bash_timeout_ms,
+            bash_shell_path: cfg.bash_shell_path.clone(),
+            bash_command_prefix: cfg.bash_command_prefix.clone(),
+            image_auto_resize: cfg.image_auto_resize,
+        },
+        cwd: cwd.to_path_buf(),
+        project_trusted,
+        prompt_guidelines: Vec::new(),
+        parent_model: parent_model.to_string(),
+        parent_cache_key: parent_model.to_string(),
+        parent_tools,
+        deny_tool: cfg.deny_tool.clone(),
+        deny_bash_pattern: cfg.deny_bash_pattern.clone(),
+        deny_path: cfg.deny_path.clone(),
+        child_max_steps: subagent::DEFAULT_CHILD_MAX_STEPS,
+        max_depth: subagent::DEFAULT_MAX_DEPTH,
+    })
+}
+
 /// independently of `context_window`.
 // 11 arguments, all independent inputs every call site already has on hand from `cfg`/local
 // runtime-switchable state — bundling them into a struct would just be a second place those same
@@ -5546,6 +5694,7 @@ fn build_agent(
     cache_key: &str,
     write_locks: &Arc<agent_core::WriteLockRegistry>,
     checkpoint: &Arc<dyn agent_core::CheckpointHook>,
+    subagent_ctx: Option<&Arc<crate::tools::subagent::SubagentCtx>>,
 ) -> Agent {
     let mut compaction = agent_core::CompactionConfig {
         context_window: cfg
@@ -5561,8 +5710,15 @@ fn build_agent(
         compaction.keep_recent_tokens = keep_recent;
     }
 
+    let mut registry = build_tools(cfg, image_auto_resize);
+    // Registered here, not in `build_tools`, because this is where `write_locks` is in scope — the ctx
+    // needs the same registry every child shares. Reused across rebuilds; the ctx's factory handles the
+    // per-child model itself, so a `set_model` rebuild doesn't invalidate it.
+    if let Some(ctx) = subagent_ctx {
+        registry.register(Arc::new(crate::tools::subagent::Subagent::new(ctx.clone())));
+    }
     let mut agent = Agent::new(transport, model.to_string())
-        .with_tools(build_tools(cfg, image_auto_resize))
+        .with_tools(registry)
         .with_system(system.to_string())
         .with_max_steps(cfg.max_steps)
         .with_compaction(compaction)
@@ -5720,13 +5876,14 @@ fn build_tools(cfg: &ServeConfig, image_auto_resize: bool) -> agent_core::ToolRe
     // operator's `--tools`/`--exclude-tools` allow/deny-list is meant to scope the *whole* tool set the
     // model sees, MCP-discovered tools included (e.g. excluding a misbehaving MCP tool by name), not
     // just the built-ins.
-    let mut registry = tools::default_registry_with_prefix_image_auto_resize_and_mcp_tools(
-        cfg.bash_timeout_ms,
-        cfg.bash_shell_path.as_deref(),
-        cfg.bash_command_prefix.as_deref(),
+    let mut registry = tools::default_registry_with_config(&tools::ToolConfig {
+        bash_timeout_ms: cfg.bash_timeout_ms,
+        bash_shell_path: cfg.bash_shell_path.as_deref(),
+        bash_command_prefix: cfg.bash_command_prefix.as_deref(),
         image_auto_resize,
-        &cfg.mcp_tools,
-    );
+        mcp_tools: &cfg.mcp_tools,
+        ..tools::ToolConfig::new()
+    });
     tools::apply_filter(
         &mut registry,
         cfg.tools.as_deref(),

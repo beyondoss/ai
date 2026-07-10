@@ -31,6 +31,20 @@ pub struct ToolPolicy {
     /// Compiled once at construction (same reasoning as `denied_bash_patterns`'s one-time lowercasing)
     /// rather than re-parsing the same glob source on every `write`/`edit` call.
     denied_paths: Vec<GlobMatcher>,
+    /// The same root the gated agent's filesystem tools resolve relative paths against (see
+    /// [`crate::tools::resolve_against`]). Empty = the process cwd, which is every non-subagent case.
+    ///
+    /// This must track the tools' root or the policy checks a *different path than the one that gets
+    /// written*: a subagent under `isolation: worktree` resolves `edit path=notes.md` to
+    /// `<worktree>/notes.md`, so a policy still keying on `<process cwd>/notes.md` would compare the
+    /// wrong string. Relative globs (`**/secrets.env`) then behave identically inside a worktree.
+    ///
+    /// An **absolute** deny glob (`/home/me/repo/secrets.env`) still cannot match a worktree path, and
+    /// this field does not change that. What closes that hole is the merge-back step, which re-checks
+    /// every path in a child's patch against these same `denied_paths` — mapped back to the main tree —
+    /// before `git apply` runs. `git apply` is not a tool call and never reaches `before_tool_call`, so
+    /// merge-back is the only place that check can live.
+    root: std::path::PathBuf,
 }
 
 impl ToolPolicy {
@@ -60,6 +74,19 @@ impl ToolPolicy {
             policy = policy.deny_path(pattern);
         }
         policy
+    }
+
+    /// Builder-style: resolve `write`/`edit` paths against `root` rather than the process cwd — see the
+    /// [`ToolPolicy::root`] field. Must be given the same root the gated agent's tool registry was built
+    /// with.
+    pub fn with_root(mut self, root: impl Into<std::path::PathBuf>) -> Self {
+        self.root = root.into();
+        self
+    }
+
+    /// The compiled deny-path globs, for the merge-back re-check described on [`ToolPolicy::root`].
+    pub fn denied_paths(&self) -> &[GlobMatcher] {
+        &self.denied_paths
     }
 
     /// Deny every call to a tool named `name`, regardless of arguments.
@@ -146,11 +173,16 @@ impl AgentHooks for ToolPolicy {
         }
         if (name == "write" || name == "edit") && !self.denied_paths.is_empty() {
             let path = input.get("path").and_then(Value::as_str)?;
-            // The same canonical form `WriteLockRegistry` keys on: resolved against the process cwd
-            // and symlink-followed when the target already exists, so a pattern like `--deny-path
-            // '/etc/**'` can't be sidestepped with a `./`/`..`-laden or relative spelling of the same
-            // path.
-            let target = crate::tools::canonical_write_target(&crate::tools::normalize_path(path));
+            // The same canonical form `WriteLockRegistry` keys on, and — crucially — the same one the
+            // `write`/`edit` tools themselves compute: resolved against *this policy's root* (the tools'
+            // root; the process cwd when empty) and symlink-followed when the target already exists, so
+            // a pattern like `--deny-path '/etc/**'` can't be sidestepped with a `./`/`..`-laden or
+            // relative spelling of the same path. Resolving against a different root than the tools use
+            // would check a path that is not the one about to be written.
+            let target = crate::tools::canonical_write_target(
+                &self.root,
+                &crate::tools::resolve_against(&self.root, path),
+            );
             if let Some(m) = self.denied_paths.iter().find(|m| m.is_match(&target)) {
                 return Some(format!(
                     "path '{target}' is denied by policy (matches {:?})",
@@ -303,6 +335,55 @@ mod tests {
             policy.is_empty(),
             "an unparseable glob must be dropped, not silently kept as a standing deny-all"
         );
+    }
+
+    #[tokio::test]
+    async fn a_rooted_policy_resolves_a_relative_path_against_its_root_not_the_process_cwd() {
+        // A subagent under `isolation: worktree` gets tools rooted at its worktree, so `edit
+        // path=secrets.env` writes `<worktree>/secrets.env`. The policy must check *that* path — a
+        // policy still keying on `<process cwd>/secrets.env` would be comparing a string that no tool
+        // is ever going to write, and the deny would silently stop firing.
+        let wt = tempfile::tempdir().unwrap();
+        let policy = ToolPolicy::new()
+            .deny_path("**/secrets.env")
+            .with_root(wt.path());
+        let session = agent_core::Session::new();
+        let cancel = CancellationToken::new();
+
+        let reason = policy
+            .before_tool_call(
+                "edit",
+                &json!({"path": "secrets.env", "old_string": "a", "new_string": "b"}),
+                &session,
+                &cancel,
+            )
+            .await
+            .expect("a relative path resolving into a denied glob must be blocked");
+        assert!(reason.contains("denied by policy"), "{reason}");
+        assert!(
+            reason.contains(&wt.path().join("secrets.env").display().to_string()),
+            "the message must name the path actually about to be written: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unrooted_policy_is_unchanged_by_the_root_field() {
+        // Every non-subagent caller leaves `root` empty; behavior must be bit-identical to before it
+        // existed — an absolute path is matched exactly as it always was.
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secrets.env");
+        let policy = ToolPolicy::new().deny_path("*.env");
+        let session = agent_core::Session::new();
+        let cancel = CancellationToken::new();
+        let reason = policy
+            .before_tool_call(
+                "write",
+                &json!({"path": secret.to_str().unwrap(), "content": "x"}),
+                &session,
+                &cancel,
+            )
+            .await;
+        assert!(reason.is_some_and(|r| r.contains("denied by policy")));
     }
 
     #[test]

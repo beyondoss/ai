@@ -50,7 +50,18 @@ const MAX_CONTEXT: usize = 100;
 /// `Hit`/`Collector` just for one summary line.
 const LINE_TRUNCATED_SUFFIX: &str = "… [truncated]";
 
-pub struct Grep;
+#[derive(Default)]
+pub struct Grep {
+    /// A relative search `path` (including its `"."` default) resolves against this. Empty = the
+    /// process cwd. See [`super::resolve_against`].
+    root: PathBuf,
+}
+
+impl Grep {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+}
 
 /// One reported line: its path, line number, text, and whether it is a match (vs a context line). The
 /// path is an `Arc<Path>` so a file with many matches allocates the path **once** and each hit is a
@@ -357,8 +368,9 @@ impl Tool for Grep {
     fn description(&self) -> &str {
         // Pi-parity fix (task 52): built via `format!` referencing the real constants — like
         // `bash.rs`'s `describe()` — instead of a hand-typed literal safety-netted only by a unit test
-        // that has to be kept in sync manually. `OnceLock` caches the one-time render since `Grep` is a
-        // unit struct with no field to build it into at construction the way `Bash` does.
+        // that has to be kept in sync manually. Unlike `bash`'s, this description depends on no
+        // per-instance config (only on compile-time constants), so it's rendered once into a `OnceLock`
+        // rather than stored on every `Grep` the way `Bash` stores its timeout-dependent one.
         static DESC: OnceLock<String> = OnceLock::new();
         DESC.get_or_init(|| {
             format!(
@@ -395,7 +407,7 @@ impl Tool for Grep {
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing `pattern`".into()))?;
         let root = input.get("path").and_then(Value::as_str).unwrap_or(".");
-        let root = &super::normalize_path(root);
+        let root = &super::resolve_against(&self.root, root);
         let ignore_case = input
             .get("ignore_case")
             .and_then(Value::as_bool)
@@ -634,7 +646,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "call a.b(c) here\nand axbc too\n").unwrap();
         // As a regex `a.b(c)` matches `axbc`; literal mode must match only the verbatim text.
-        let out = Grep
+        let out = Grep::default()
             .run(json!({
                 "pattern": "a.b(c)",
                 "literal": true,
@@ -661,7 +673,7 @@ mod tests {
         std::fs::create_dir(dir.path().join("sub")).unwrap();
         std::fs::write(dir.path().join("sub").join("b.txt"), "needle\n").unwrap();
 
-        let out = Grep
+        let out = Grep::default()
             .run(json!({ "pattern": "needle", "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -689,7 +701,7 @@ mod tests {
         let file = dir.path().join("a.txt");
         std::fs::write(&file, "needle\n").unwrap();
 
-        let out = Grep
+        let out = Grep::default()
             .run(json!({ "pattern": "needle", "path": file.to_str().unwrap() }))
             .await
             .unwrap()
@@ -703,7 +715,7 @@ mod tests {
         std::fs::write(dir.path().join("a.txt"), "hello\nworld\nhello again\n").unwrap();
         std::fs::write(dir.path().join("b.log"), "nothing here\n").unwrap();
 
-        let out = Grep
+        let out = Grep::default()
             .run(json!({ "pattern": "hello", "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -720,7 +732,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
         let at_prefixed = format!("@{}", dir.path().to_str().unwrap());
-        let out = Grep
+        let out = Grep::default()
             .run(json!({ "pattern": "hello", "path": at_prefixed }))
             .await
             .unwrap()
@@ -733,7 +745,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("keep.rs"), "fn target() {}\n").unwrap();
         std::fs::write(dir.path().join("skip.txt"), "fn target() {}\n").unwrap();
-        let out = Grep
+        let out = Grep::default()
             .run(json!({ "pattern": "target", "path": dir.path().to_str().unwrap(), "glob": "*.rs" }))
             .await
             .unwrap()
@@ -750,7 +762,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("plain.rs"), "fn target() {}\n").unwrap();
         std::fs::write(dir.path().join("thing.test.rs"), "fn target() {}\n").unwrap();
-        let out = Grep
+        let out = Grep::default()
             .run(json!({
                 "pattern": "target",
                 "path": dir.path().to_str().unwrap(),
@@ -778,7 +790,7 @@ mod tests {
         std::fs::write(dir.path().join(".gitignore"), "ignored.txt\n").unwrap();
         std::fs::write(dir.path().join("ignored.txt"), "needle\n").unwrap();
         std::fs::write(dir.path().join("kept.txt"), "needle\n").unwrap();
-        let out = Grep
+        let out = Grep::default()
             .run(json!({ "pattern": "needle", "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -802,7 +814,7 @@ mod tests {
         std::fs::write(dir.path().join(".gitignore"), "ignored.txt\n").unwrap();
         std::fs::write(dir.path().join("ignored.txt"), "needle\n").unwrap();
         std::fs::write(dir.path().join("kept.txt"), "needle\n").unwrap();
-        let out = Grep
+        let out = Grep::default()
             .run(json!({ "pattern": "needle", "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -818,7 +830,7 @@ mod tests {
     async fn no_matches_is_reported() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "abc\n").unwrap();
-        let out = Grep
+        let out = Grep::default()
             .run(json!({ "pattern": "zzz", "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -847,7 +859,7 @@ mod tests {
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
         let blocks = mode_actually_blocks_reads(dir.path());
 
-        let result = Grep
+        let result = Grep::default()
             .run(json!({ "pattern": "needle", "path": dir.path().to_str().unwrap() }))
             .await;
         let _ = std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755));
@@ -879,7 +891,7 @@ mod tests {
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
         let blocks = mode_actually_blocks_reads(&locked);
 
-        let result = Grep
+        let result = Grep::default()
             .run(json!({ "pattern": "needle", "path": dir.path().to_str().unwrap() }))
             .await;
         let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
@@ -918,7 +930,7 @@ mod tests {
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
         let blocks = mode_actually_blocks_reads(&locked);
 
-        let result = Grep
+        let result = Grep::default()
             .run(json!({ "pattern": "needle", "path": dir.path().to_str().unwrap() }))
             .await;
         let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
@@ -946,7 +958,8 @@ mod tests {
         }
         let path = dir.path().to_str().unwrap();
         let run_once = || async {
-            Grep.run(json!({ "pattern": "needle", "path": path }))
+            Grep::default()
+                .run(json!({ "pattern": "needle", "path": path }))
                 .await
                 .unwrap()
                 .text
@@ -970,7 +983,7 @@ mod tests {
 
         // `context: 1` shows one line on each side. The match keeps the `:` separator; context lines
         // use the `-` separator.
-        let out = Grep
+        let out = Grep::default()
             .run(json!({ "pattern": "NEEDLE", "path": path, "context": 1 }))
             .await
             .unwrap()
@@ -988,7 +1001,7 @@ mod tests {
         );
 
         // `before`/`after` set each side independently (here: only after).
-        let out = Grep
+        let out = Grep::default()
             .run(json!({ "pattern": "NEEDLE", "path": path, "before": 0, "after": 2 }))
             .await
             .unwrap()
@@ -1014,7 +1027,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         std::fs::write(dir.path().join("a.txt"), &body).unwrap();
-        let out = Grep
+        let out = Grep::default()
             .run(json!({
                 "pattern": "needle",
                 "path": dir.path().to_str().unwrap(),
@@ -1059,7 +1072,7 @@ mod tests {
         let long_line = format!("needle {}", "x".repeat(600));
         let body = format!("{long_line}\nneedle short\n");
         std::fs::write(dir.path().join("a.txt"), &body).unwrap();
-        let out = Grep
+        let out = Grep::default()
             .run(json!({
                 "pattern": "needle",
                 "path": dir.path().to_str().unwrap(),
@@ -1093,7 +1106,7 @@ mod tests {
         lines.extend(std::iter::repeat_n("needle short".to_string(), 20));
         let body = lines.join("\n");
         std::fs::write(dir.path().join("a.txt"), &body).unwrap();
-        let out = Grep
+        let out = Grep::default()
             .run(json!({
                 "pattern": "needle",
                 "path": dir.path().to_str().unwrap(),
@@ -1125,7 +1138,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         std::fs::write(dir.path().join("a.txt"), &body).unwrap();
-        let out = Grep
+        let out = Grep::default()
             .run(json!({
                 "pattern": "needle",
                 "path": dir.path().to_str().unwrap(),
@@ -1160,7 +1173,7 @@ mod tests {
         for i in 0..10 {
             std::fs::write(dir.path().join(format!("f{i:02}.txt")), "needle\n").unwrap();
         }
-        let out = Grep
+        let out = Grep::default()
             .run(json!({ "pattern": "needle", "path": dir.path().to_str().unwrap(), "limit": 3 }))
             .await
             .unwrap()
@@ -1217,7 +1230,7 @@ mod tests {
         // "no matches" even though a real match exists.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("f.txt"), "needle\n").unwrap();
-        let out = Grep
+        let out = Grep::default()
             .run(json!({ "pattern": "needle", "path": dir.path().to_str().unwrap(), "limit": 0 }))
             .await
             .unwrap()
@@ -1239,7 +1252,8 @@ mod tests {
         }
         let path = dir.path().to_str().unwrap();
         let run_once = || async {
-            Grep.run(json!({ "pattern": "needle", "path": path, "limit": 100 }))
+            Grep::default()
+                .run(json!({ "pattern": "needle", "path": path, "limit": 100 }))
                 .await
                 .unwrap()
                 .text
@@ -1263,7 +1277,7 @@ mod tests {
         // correctness regression vs pi's `rg` that the rewrite fixes.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("latin1.txt"), b"caf\xe9 NEEDLE here\n").unwrap();
-        let out = Grep
+        let out = Grep::default()
             .run(json!({ "pattern": "NEEDLE", "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -1282,7 +1296,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("blob.bin"), b"\x00\x00 NEEDLE \x00binary").unwrap();
         std::fs::write(dir.path().join("text.txt"), b"NEEDLE in text\n").unwrap();
-        let out = Grep
+        let out = Grep::default()
             .run(json!({ "pattern": "NEEDLE", "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -1300,7 +1314,7 @@ mod tests {
         // output truncation budget numerically), `grep`'s description only stated the match-count
         // default in the `limit` schema field, never the overall byte-truncation cap it shares with
         // `find`/`ls`, nor the per-line character clip.
-        let desc = Grep.description().to_string();
+        let desc = Grep::default().description().to_string();
         assert!(
             desc.contains(&DEFAULT_LIMIT.to_string())
                 && desc.contains(&super::super::output::format_size(

@@ -2,12 +2,29 @@
 //! first, then a normalized fuzzy fallback (NFKC + unified quotes/dashes/spaces + per-line
 //! trailing-whitespace) so a model's slightly-off `old_string` still lands.
 
+use std::path::PathBuf;
+
 use agent_core::tool::Tool;
 use agent_core::{ToolError, ToolOutput};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-pub struct Edit;
+#[derive(Default)]
+pub struct Edit {
+    /// Relative `path` arguments resolve against this. Empty = the process cwd. See
+    /// [`super::resolve_against`].
+    root: PathBuf,
+}
+
+impl Edit {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    fn resolve(&self, path: &str) -> String {
+        super::resolve_against(&self.root, path)
+    }
+}
 
 #[async_trait]
 impl Tool for Edit {
@@ -48,8 +65,8 @@ impl Tool for Edit {
         input
             .get("path")
             .and_then(Value::as_str)
-            .map(super::normalize_path)
-            .map(|p| super::canonical_write_target(&p))
+            .map(|p| self.resolve(p))
+            .map(|p| super::canonical_write_target(&self.root, &p))
     }
 
     async fn run(&self, input: Value) -> Result<ToolOutput, ToolError> {
@@ -57,7 +74,7 @@ impl Tool for Edit {
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing `path`".into()))?;
-        let path = &super::normalize_path(path);
+        let path = &self.resolve(path);
         let edits = parse_edits(&input)?;
         let replace_all = input
             .get("replace_all")
@@ -542,7 +559,8 @@ mod tests {
     async fn replaces_unique_match() {
         let f = write_tmp("the quick brown fox");
         let p = f.path().to_str().unwrap();
-        Edit.run(json!({ "path": p, "old_string": "quick", "new_string": "slow" }))
+        Edit::default()
+            .run(json!({ "path": p, "old_string": "quick", "new_string": "slow" }))
             .await
             .unwrap();
         assert_eq!(std::fs::read_to_string(p).unwrap(), "the slow brown fox");
@@ -554,7 +572,8 @@ mod tests {
         // (needs no `$HOME` mutation — see `expand_tilde`'s own direct unit tests for that half).
         let f = write_tmp("the quick brown fox");
         let at_prefixed = format!("@{}", f.path().to_str().unwrap());
-        Edit.run(json!({ "path": at_prefixed, "old_string": "quick", "new_string": "slow" }))
+        Edit::default()
+            .run(json!({ "path": at_prefixed, "old_string": "quick", "new_string": "slow" }))
             .await
             .unwrap();
         assert_eq!(
@@ -570,15 +589,17 @@ mod tests {
         let f = write_tmp("x");
         let p = f.path().to_str().unwrap();
         let at_prefixed = format!("@{p}");
-        let plain = Edit.write_target(&json!({ "path": p })).unwrap();
-        let normalized = Edit.write_target(&json!({ "path": at_prefixed })).unwrap();
+        let plain = Edit::default().write_target(&json!({ "path": p })).unwrap();
+        let normalized = Edit::default()
+            .write_target(&json!({ "path": at_prefixed }))
+            .unwrap();
         assert_eq!(plain, normalized);
     }
 
     #[tokio::test]
     async fn rejects_ambiguous_match() {
         let f = write_tmp("a a a");
-        let err = Edit
+        let err = Edit::default()
             .run(
                 json!({ "path": f.path().to_str().unwrap(), "old_string": "a", "new_string": "b" }),
             )
@@ -598,7 +619,7 @@ mod tests {
         // `old_string` doesn't even match — if the writability pre-check didn't fire first, this
         // would fail with "not found" instead of "not writable", proving the check runs before any
         // match/diff work rather than only surfacing at the final write.
-        let err = Edit
+        let err = Edit::default()
             .run(json!({ "path": p, "old_string": "does not appear", "new_string": "x" }))
             .await
             .unwrap_err();
@@ -617,7 +638,8 @@ mod tests {
     async fn replace_all_replaces_every_occurrence() {
         let f = write_tmp("a a a");
         let p = f.path().to_str().unwrap();
-        Edit.run(json!({ "path": p, "old_string": "a", "new_string": "b", "replace_all": true }))
+        Edit::default()
+            .run(json!({ "path": p, "old_string": "a", "new_string": "b", "replace_all": true }))
             .await
             .unwrap();
         assert_eq!(std::fs::read_to_string(p).unwrap(), "b b b");
@@ -627,22 +649,23 @@ mod tests {
     async fn applies_edits_array_in_order() {
         let f = write_tmp("foo and bar");
         let p = f.path().to_str().unwrap();
-        Edit.run(json!({
-            "path": p,
-            "edits": [
-                { "old_string": "foo", "new_string": "baz" },
-                { "old_string": "bar", "new_string": "qux" }
-            ]
-        }))
-        .await
-        .unwrap();
+        Edit::default()
+            .run(json!({
+                "path": p,
+                "edits": [
+                    { "old_string": "foo", "new_string": "baz" },
+                    { "old_string": "bar", "new_string": "qux" }
+                ]
+            }))
+            .await
+            .unwrap();
         assert_eq!(std::fs::read_to_string(p).unwrap(), "baz and qux");
     }
 
     #[tokio::test]
     async fn missing_string_is_invalid_input() {
         let f = write_tmp("hello");
-        let err = Edit
+        let err = Edit::default()
             .run(json!({ "path": f.path().to_str().unwrap(), "old_string": "zzz", "new_string": "x" }))
             .await
             .unwrap_err();
@@ -656,7 +679,7 @@ mod tests {
         // (single old_string/new_string form here) must read exactly as it did before this fix, with no
         // "edits[" noise about an array the caller never even sent.
         let f = write_tmp("hello");
-        let err = Edit
+        let err = Edit::default()
             .run(json!({ "path": f.path().to_str().unwrap(), "old_string": "zzz", "new_string": "x" }))
             .await
             .unwrap_err();
@@ -672,13 +695,14 @@ mod tests {
         // its CRLF endings after the edit.
         let f = write_tmp("line one\r\nline two\r\nline three\r\n");
         let p = f.path().to_str().unwrap();
-        Edit.run(json!({
-            "path": p,
-            "old_string": "line one\nline two",
-            "new_string": "line one\nLINE TWO",
-        }))
-        .await
-        .unwrap();
+        Edit::default()
+            .run(json!({
+                "path": p,
+                "old_string": "line one\nline two",
+                "new_string": "line one\nLINE TWO",
+            }))
+            .await
+            .unwrap();
         let result = std::fs::read_to_string(p).unwrap();
         assert_eq!(result, "line one\r\nLINE TWO\r\nline three\r\n");
     }
@@ -691,7 +715,8 @@ mod tests {
         // mixed file.
         let f = write_tmp("a\r\nb\nc\r\n");
         let p = f.path().to_str().unwrap();
-        Edit.run(json!({ "path": p, "old_string": "b", "new_string": "B" }))
+        Edit::default()
+            .run(json!({ "path": p, "old_string": "b", "new_string": "B" }))
             .await
             .unwrap();
         assert_eq!(std::fs::read_to_string(p).unwrap(), "a\r\nB\nc\r\n");
@@ -700,7 +725,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_overlapping_edits() {
         let f = write_tmp("abcdef");
-        let err = Edit
+        let err = Edit::default()
             .run(json!({
                 "path": f.path().to_str().unwrap(),
                 "edits": [
@@ -721,7 +746,7 @@ mod tests {
         // prints edits[0]/edits[1]", so this uses 3 edits with a non-colliding first edit — proving the
         // reported indices (1 and 2) are the actual overlapping pair, not just the first two entries.
         let f = write_tmp("abcdefghij");
-        let err = Edit
+        let err = Edit::default()
             .run(json!({
                 "path": f.path().to_str().unwrap(),
                 "edits": [
@@ -755,7 +780,7 @@ mod tests {
         // `edits[0]`/`edits[1]` rather than reverting to the bare "edits overlap" wording, since
         // `total_edits > 1` is what actually gates it, not a distinct-pair count.
         let f = write_tmp("abcdef");
-        let err = Edit
+        let err = Edit::default()
             .run(json!({
                 "path": f.path().to_str().unwrap(),
                 "edits": [
@@ -779,7 +804,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_no_op_edit() {
         let f = write_tmp("hello world");
-        let err = Edit
+        let err = Edit::default()
             .run(json!({
                 "path": f.path().to_str().unwrap(),
                 "old_string": "hello",
@@ -795,12 +820,13 @@ mod tests {
         let f = write_tmp("foo and bar");
         let p = f.path().to_str().unwrap();
         // `edits` as a JSON-encoded string rather than an array.
-        Edit.run(json!({
-            "path": p,
-            "edits": "[{\"old_string\":\"foo\",\"new_string\":\"baz\"}]",
-        }))
-        .await
-        .unwrap();
+        Edit::default()
+            .run(json!({
+                "path": p,
+                "edits": "[{\"old_string\":\"foo\",\"new_string\":\"baz\"}]",
+            }))
+            .await
+            .unwrap();
         assert_eq!(std::fs::read_to_string(p).unwrap(), "baz and bar");
     }
 
@@ -817,7 +843,7 @@ mod tests {
         // message that would leak `serde_json`'s own wording to the model.
         let f = write_tmp("foo and bar");
         let p = f.path().to_str().unwrap();
-        let err = Edit
+        let err = Edit::default()
             .run(json!({ "path": p, "edits": "not json" }))
             .await
             .unwrap_err();
@@ -838,15 +864,16 @@ mod tests {
         // keeps this deterministic.
         let f = write_tmp("foo bar");
         let p = f.path().to_str().unwrap();
-        Edit.run(json!({
-            "path": p,
-            "edits": [
-                { "old_string": "foo", "new_string": "bar" },
-                { "old_string": "bar", "new_string": "qux" }
-            ]
-        }))
-        .await
-        .unwrap();
+        Edit::default()
+            .run(json!({
+                "path": p,
+                "edits": [
+                    { "old_string": "foo", "new_string": "bar" },
+                    { "old_string": "bar", "new_string": "qux" }
+                ]
+            }))
+            .await
+            .unwrap();
         // Second edit targets the *original* "bar", not the "bar" produced by the first edit.
         assert_eq!(std::fs::read_to_string(p).unwrap(), "bar qux");
     }
@@ -858,13 +885,14 @@ mod tests {
         // the line byte-for-byte (the wider em-dash span is mapped back correctly).
         let f = write_tmp("title = \u{201c}hello\u{201d} \u{2014} world");
         let p = f.path().to_str().unwrap();
-        Edit.run(json!({
-            "path": p,
-            "old_string": "\"hello\" - world",
-            "new_string": "greeting",
-        }))
-        .await
-        .unwrap();
+        Edit::default()
+            .run(json!({
+                "path": p,
+                "old_string": "\"hello\" - world",
+                "new_string": "greeting",
+            }))
+            .await
+            .unwrap();
         assert_eq!(std::fs::read_to_string(p).unwrap(), "title = greeting");
     }
 
@@ -873,13 +901,14 @@ mod tests {
         // The file has trailing spaces after `foo`; the model's old_string omits them.
         let f = write_tmp("foo   \nbar\n");
         let p = f.path().to_str().unwrap();
-        Edit.run(json!({
-            "path": p,
-            "old_string": "foo\nbar",
-            "new_string": "baz\nqux",
-        }))
-        .await
-        .unwrap();
+        Edit::default()
+            .run(json!({
+                "path": p,
+                "old_string": "foo\nbar",
+                "new_string": "baz\nqux",
+            }))
+            .await
+            .unwrap();
         assert_eq!(std::fs::read_to_string(p).unwrap(), "baz\nqux\n");
     }
 
@@ -887,7 +916,8 @@ mod tests {
     async fn fuzzy_matches_nbsp_as_space() {
         let f = write_tmp("a\u{00a0}b\u{00a0}c");
         let p = f.path().to_str().unwrap();
-        Edit.run(json!({ "path": p, "old_string": "a b c", "new_string": "x" }))
+        Edit::default()
+            .run(json!({ "path": p, "old_string": "a b c", "new_string": "x" }))
             .await
             .unwrap();
         assert_eq!(std::fs::read_to_string(p).unwrap(), "x");
@@ -901,7 +931,8 @@ mod tests {
         // than trusting that by reading the Unicode tables.
         let f = write_tmp("call(a\u{ff0c}b)"); // fullwidth comma U+FF0C, fullwidth parens U+FF08/FF09
         let p = f.path().to_str().unwrap();
-        Edit.run(json!({ "path": p, "old_string": "call(a,b)", "new_string": "call(a, b)" }))
+        Edit::default()
+            .run(json!({ "path": p, "old_string": "call(a,b)", "new_string": "call(a, b)" }))
             .await
             .unwrap();
         assert_eq!(std::fs::read_to_string(p).unwrap(), "call(a, b)");
@@ -913,7 +944,8 @@ mod tests {
         // pure-LF case (the common one) explicitly rather than only by absence of a CRLF-specific test.
         let f = write_tmp("line one\nline two\nline three\n");
         let p = f.path().to_str().unwrap();
-        Edit.run(json!({ "path": p, "old_string": "line two", "new_string": "LINE TWO" }))
+        Edit::default()
+            .run(json!({ "path": p, "old_string": "line two", "new_string": "LINE TWO" }))
             .await
             .unwrap();
         assert_eq!(
@@ -930,7 +962,7 @@ mod tests {
         // would eventually win, so this must be rejected rather than silently picking the exact one.
         let f = write_tmp("'a' and \u{2018}a\u{2019}");
         let p = f.path().to_str().unwrap();
-        let err = Edit
+        let err = Edit::default()
             .run(json!({ "path": p, "old_string": "'a'", "new_string": "X" }))
             .await
             .unwrap_err();
@@ -944,7 +976,8 @@ mod tests {
         // being rewritten from normalized text.
         let f = write_tmp("'a' and something else");
         let p = f.path().to_str().unwrap();
-        Edit.run(json!({ "path": p, "old_string": "'a'", "new_string": "X" }))
+        Edit::default()
+            .run(json!({ "path": p, "old_string": "'a'", "new_string": "X" }))
             .await
             .unwrap();
         assert_eq!(std::fs::read_to_string(p).unwrap(), "X and something else");
@@ -957,21 +990,22 @@ mod tests {
         // replacement to existing edits").
         let f = write_tmp("foo and bar and baz");
         let p = f.path().to_str().unwrap();
-        Edit.run(json!({
-            "path": p,
-            "edits": [{ "old_string": "foo", "new_string": "FOO" }],
-            "old_string": "baz",
-            "new_string": "BAZ",
-        }))
-        .await
-        .unwrap();
+        Edit::default()
+            .run(json!({
+                "path": p,
+                "edits": [{ "old_string": "foo", "new_string": "FOO" }],
+                "old_string": "baz",
+                "new_string": "BAZ",
+            }))
+            .await
+            .unwrap();
         assert_eq!(std::fs::read_to_string(p).unwrap(), "FOO and bar and BAZ");
     }
 
     #[tokio::test]
     async fn empty_edits_array_is_invalid_input() {
         let f = write_tmp("hello");
-        let err = Edit
+        let err = Edit::default()
             .run(json!({ "path": f.path().to_str().unwrap(), "edits": [] }))
             .await
             .unwrap_err();
@@ -980,7 +1014,7 @@ mod tests {
 
     #[tokio::test]
     async fn editing_a_nonexistent_path_is_an_execution_error() {
-        let err = Edit
+        let err = Edit::default()
             .run(json!({
                 "path": "/nonexistent/definitely-not-here.txt",
                 "old_string": "a",
@@ -994,7 +1028,7 @@ mod tests {
     #[tokio::test]
     async fn ambiguous_match_error_reports_the_exact_count() {
         let f = write_tmp("a a a");
-        let err = Edit
+        let err = Edit::default()
             .run(
                 json!({ "path": f.path().to_str().unwrap(), "old_string": "a", "new_string": "b" }),
             )
@@ -1014,7 +1048,7 @@ mod tests {
         let original = "foo and bar and baz";
         let f = write_tmp(original);
         let p = f.path().to_str().unwrap();
-        let err = Edit
+        let err = Edit::default()
             .run(json!({
                 "path": p,
                 "edits": [
@@ -1038,7 +1072,7 @@ mod tests {
         let original = "foo and bar and baz";
         let f = write_tmp(original);
         let p = f.path().to_str().unwrap();
-        let err = Edit
+        let err = Edit::default()
             .run(json!({
                 "path": p,
                 "edits": [
@@ -1068,7 +1102,8 @@ mod tests {
     async fn preserves_a_byte_order_mark_across_a_single_edit() {
         let f = write_tmp("\u{feff}foo bar");
         let p = f.path().to_str().unwrap();
-        Edit.run(json!({ "path": p, "old_string": "foo", "new_string": "baz" }))
+        Edit::default()
+            .run(json!({ "path": p, "old_string": "foo", "new_string": "baz" }))
             .await
             .unwrap();
         let out = std::fs::read_to_string(p).unwrap();
@@ -1080,15 +1115,16 @@ mod tests {
     async fn preserves_a_byte_order_mark_with_crlf_and_multiple_edits() {
         let f = write_tmp("\u{feff}foo\r\nbar\r\n");
         let p = f.path().to_str().unwrap();
-        Edit.run(json!({
-            "path": p,
-            "edits": [
-                { "old_string": "foo", "new_string": "FOO" },
-                { "old_string": "bar", "new_string": "BAR" }
-            ]
-        }))
-        .await
-        .unwrap();
+        Edit::default()
+            .run(json!({
+                "path": p,
+                "edits": [
+                    { "old_string": "foo", "new_string": "FOO" },
+                    { "old_string": "bar", "new_string": "BAR" }
+                ]
+            }))
+            .await
+            .unwrap();
         let out = std::fs::read_to_string(p).unwrap();
         assert_eq!(out, "\u{feff}FOO\r\nBAR\r\n");
     }
@@ -1099,15 +1135,16 @@ mod tests {
         // `find_spans` per-edit, but nothing previously proved that end-to-end.
         let f = write_tmp("\u{201c}hello\u{201d} and \u{2014}world\u{2014}");
         let p = f.path().to_str().unwrap();
-        Edit.run(json!({
-            "path": p,
-            "edits": [
-                { "old_string": "\"hello\"", "new_string": "greeting" },
-                { "old_string": "-world-", "new_string": "planet" }
-            ]
-        }))
-        .await
-        .unwrap();
+        Edit::default()
+            .run(json!({
+                "path": p,
+                "edits": [
+                    { "old_string": "\"hello\"", "new_string": "greeting" },
+                    { "old_string": "-world-", "new_string": "planet" }
+                ]
+            }))
+            .await
+            .unwrap();
         assert_eq!(std::fs::read_to_string(p).unwrap(), "greeting and planet");
     }
 
@@ -1186,7 +1223,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            Edit.run(json!({
+            Edit::default().run(json!({
                 "path": fifo_path.to_str().unwrap(),
                 "old_string": "a",
                 "new_string": "b",
@@ -1203,7 +1240,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("f.txt");
         std::fs::write(&path, "the quick brown fox").unwrap();
-        Edit.run(
+        Edit::default().run(
             json!({ "path": path.to_str().unwrap(), "old_string": "quick", "new_string": "slow" }),
         )
         .await

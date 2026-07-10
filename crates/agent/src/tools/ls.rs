@@ -11,6 +11,7 @@
 //! `DirEntry::file_type`), so a symlink to a directory gets the `/` suffix; and an entry that can't be
 //! stat'd at all (permission race, dangling symlink) is silently skipped rather than guessed at.
 
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use agent_core::tool::Tool;
@@ -50,7 +51,18 @@ fn collation_key(name: &str) -> String {
         .collect()
 }
 
-pub struct Ls;
+#[derive(Default)]
+pub struct Ls {
+    /// A relative `path` (including its `"."` default) resolves against this. Empty = the process cwd.
+    /// See [`super::resolve_against`].
+    root: PathBuf,
+}
+
+impl Ls {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+}
 
 #[async_trait]
 impl Tool for Ls {
@@ -60,8 +72,9 @@ impl Tool for Ls {
     fn description(&self) -> &str {
         // Pi-parity fix (task 52): built via `format!` referencing the real constants — like
         // `bash.rs`'s `describe()` — instead of a hand-typed literal safety-netted only by a unit test
-        // that has to be kept in sync manually. `OnceLock` caches the one-time render since `Ls` is a
-        // unit struct with no field to build it into at construction the way `Bash` does.
+        // that has to be kept in sync manually. Unlike `bash`'s, this description depends on no
+        // per-instance config (only on compile-time constants), so it's rendered once into a `OnceLock`
+        // rather than stored on every `Ls` the way `Bash` stores its timeout-dependent one.
         static DESC: OnceLock<String> = OnceLock::new();
         DESC.get_or_init(|| {
             format!(
@@ -85,7 +98,7 @@ impl Tool for Ls {
 
     async fn run(&self, input: Value) -> Result<ToolOutput, ToolError> {
         let path = input.get("path").and_then(Value::as_str).unwrap_or(".");
-        let path = &super::normalize_path(path);
+        let path = &super::resolve_against(&self.root, path);
         let all = input.get("all").and_then(Value::as_bool).unwrap_or(false);
         let limit = input
             .get("limit")
@@ -263,14 +276,14 @@ mod tests {
         std::fs::write(dir.path().join("file.txt"), "x").unwrap();
         std::fs::write(dir.path().join(".hidden"), "x").unwrap();
 
-        let out = Ls
+        let out = Ls::default()
             .run(json!({ "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
             .text;
         assert_eq!(out, "subdir/\nfile.txt");
 
-        let all = Ls
+        let all = Ls::default()
             .run(json!({ "path": dir.path().to_str().unwrap(), "all": true }))
             .await
             .unwrap()
@@ -285,7 +298,7 @@ mod tests {
         // specific messages.
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("does-not-exist");
-        let err = Ls
+        let err = Ls::default()
             .run(json!({ "path": missing.to_str().unwrap() }))
             .await
             .unwrap_err();
@@ -307,7 +320,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("plain.txt");
         std::fs::write(&file, "x").unwrap();
-        let err = Ls
+        let err = Ls::default()
             .run(json!({ "path": file.to_str().unwrap() }))
             .await
             .unwrap_err();
@@ -327,7 +340,7 @@ mod tests {
         let target = dir.path().join("real_dir");
         std::fs::create_dir(&target).unwrap();
         std::os::unix::fs::symlink(&target, dir.path().join("link_to_dir")).unwrap();
-        let out = Ls
+        let out = Ls::default()
             .run(json!({ "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -348,7 +361,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(dir.path().join("nowhere"), dir.path().join("dangling"))
             .unwrap();
-        let out = Ls
+        let out = Ls::default()
             .run(json!({ "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -369,7 +382,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("src-old")).unwrap();
         std::fs::create_dir(dir.path().join("src")).unwrap();
-        let out = Ls
+        let out = Ls::default()
             .run(json!({ "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -386,7 +399,7 @@ mod tests {
         for name in ["Zebra.txt", "apple.txt", "banana.txt"] {
             std::fs::write(dir.path().join(name), "x").unwrap();
         }
-        let out = Ls
+        let out = Ls::default()
             .run(json!({ "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -404,7 +417,7 @@ mod tests {
         for name in ["cafz.txt", "café.txt", "cafe.txt"] {
             std::fs::write(dir.path().join(name), "x").unwrap();
         }
-        let out = Ls
+        let out = Ls::default()
             .run(json!({ "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -417,7 +430,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Foo.txt"), "x").unwrap();
         std::fs::write(dir.path().join("foo.txt"), "x").unwrap();
-        let out = Ls
+        let out = Ls::default()
             .run(json!({ "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -432,7 +445,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("file.txt"), "x").unwrap();
         let at_prefixed = format!("@{}", dir.path().to_str().unwrap());
-        let out = Ls.run(json!({ "path": at_prefixed })).await.unwrap().text;
+        let out = Ls::default()
+            .run(json!({ "path": at_prefixed }))
+            .await
+            .unwrap()
+            .text;
         assert!(out.contains("file.txt"));
     }
 
@@ -442,7 +459,7 @@ mod tests {
         for i in 0..(DEFAULT_LIMIT + 50) {
             std::fs::write(dir.path().join(format!("f{i:04}")), "x").unwrap();
         }
-        let out = Ls
+        let out = Ls::default()
             .run(json!({ "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -458,7 +475,7 @@ mod tests {
         for i in 0..10 {
             std::fs::write(dir.path().join(format!("f{i:02}")), "x").unwrap();
         }
-        let out = Ls
+        let out = Ls::default()
             .run(json!({ "path": dir.path().to_str().unwrap(), "limit": 3 }))
             .await
             .unwrap()
@@ -495,7 +512,7 @@ mod tests {
             std::fs::write(dir.path().join(format!("f{i:05}.txt")), "").unwrap();
         }
 
-        let out = Ls
+        let out = Ls::default()
             .run(json!({ "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -531,7 +548,7 @@ mod tests {
             let name = format!("{i:04}-{}", "x".repeat(200));
             std::fs::write(dir.path().join(name), "x").unwrap();
         }
-        let out = Ls
+        let out = Ls::default()
             .run(json!({ "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -562,7 +579,7 @@ mod tests {
             let name = format!("{i:04}-{}", "x".repeat(200));
             std::fs::write(dir.path().join(name), "x").unwrap();
         }
-        let out = Ls
+        let out = Ls::default()
             .run(json!({ "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -588,7 +605,7 @@ mod tests {
         // output truncation budget numerically), `ls`'s description only stated the entry-count
         // default in the `limit` schema field, never the overall byte-truncation cap it shares with
         // `find`/`grep`.
-        let desc = Ls.description().to_string();
+        let desc = Ls::default().description().to_string();
         assert!(
             desc.contains(&DEFAULT_LIMIT.to_string())
                 && desc.contains(&super::super::output::format_size(
