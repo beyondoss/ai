@@ -867,6 +867,22 @@ enum Command {
         /// repeatable). `run`'s identical flag.
         #[arg(long, env = "AI_AGENT_DENY_PATH", value_delimiter = ',')]
         deny_path: Vec<String>,
+        /// Require a human to approve a tool call before it runs: `off` (default), `writes`
+        /// (`write`/`edit`), `all` (everything except the read-only tools), or `tools:<name>,<name>`.
+        /// `serve` broadcasts an `approval_request` frame to every attached client and blocks the call
+        /// until one of them answers with an `approve` command. An unrecognized value is an error, not a
+        /// silently empty gate.
+        ///
+        /// Fails closed: a timeout, an abort, or no attached client all deny the call (the model gets an
+        /// error `tool_result` and the run continues). The static `--deny-*` lists still win first, with
+        /// no round trip. `run` has no equivalent — it has no client to ask.
+        #[arg(long, env = "AI_AGENT_APPROVE", default_value = "off")]
+        approve: String,
+        /// Seconds an unanswered approval request waits before it is denied. `0` waits forever, which is
+        /// only safe with a reliably-attached client: a question nobody answers pins the session until an
+        /// `abort`.
+        #[arg(long, env = "AI_AGENT_APPROVAL_TIMEOUT", default_value_t = 300)]
+        approval_timeout: u64,
         /// Restrict `cycle_model`'s candidate list to exactly these ids, in this order
         /// (comma-separated) — e.g. `--models claude-opus-4-8,claude-sonnet-4-5,gpt-5`.
         /// `set_model`/`get_available_models` are unaffected; empty/absent cycles the full known-model
@@ -1566,6 +1582,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             deny_tool,
             deny_bash_pattern,
             deny_path,
+            approve,
+            approval_timeout,
             models,
             no_skills,
             no_prompt_templates,
@@ -1861,6 +1879,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 deny_tool,
                 deny_bash_pattern,
                 deny_path,
+                // Fail fast on an unrecognized value, before any session is opened — the same discipline
+                // `ToolPolicy::validate_deny_path_patterns` uses for a malformed `--deny-path` glob.
+                approve: beyond_ai_agent::approval::GatedSet::parse(&approve).unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }),
+                approval_timeout: (approval_timeout > 0)
+                    .then(|| std::time::Duration::from_secs(approval_timeout)),
                 models: models.unwrap_or_default(),
                 no_skills,
                 no_prompt_templates,
@@ -3494,6 +3520,9 @@ async fn run_task(
             deny_path: deny_path.clone(),
             child_max_steps: subagent::DEFAULT_CHILD_MAX_STEPS,
             max_depth: subagent::DEFAULT_MAX_DEPTH,
+            // `run` has no client to ask, so it has no interactive gate — only the static `--deny-*`
+            // lists, which `ChildHooks` still installs. See `crate::approval`'s module doc.
+            approval: None,
         });
         registry.register(Arc::new(subagent::Subagent::new(ctx)));
     }

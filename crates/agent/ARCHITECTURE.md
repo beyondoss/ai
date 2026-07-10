@@ -1269,6 +1269,55 @@ and `serve`'s own `bash`/`abort_bash` RPC commands reuse `RealRunner` directly, 
 
 ---
 
+## Interactive approval — the human-in-the-loop gate
+
+`approval.rs` is the second consumer of `AgentHooks::before_tool_call`, alongside `ToolPolicy`'s static
+deny-lists, and the second instance of this codebase's one human-in-the-loop seam pattern (the first is
+`oauth::LoginCallbacks`): an abstract `ApprovalGate` trait, one implementation per host. `serve --approve`
+installs `ServeApprovalGate`, which broadcasts an `approval_request` frame to every attached client,
+parks a `oneshot` behind a drop guard, and resolves it from a later inbound `approve` command. Nothing in
+`agent-core` changes. `run` has no gate: it has no client to ask.
+
+The decision order in `gated_before_tool_call` is load-bearing:
+
+1. **A static deny wins outright, with no round trip.** Asking a person to approve what the operator
+   already forbade is pointless, and a way to social-engineer past the deny-list.
+2. A tool outside the gated set (`--approve off|writes|all|tools:a,b`) runs unimpeded. An
+   unrecognized value is a startup error, not a silently empty gate.
+3. A remembered decision answers without asking.
+4. Otherwise, ask.
+5. **Every failure to get an answer denies.** Timeout, abort, and "no client attached" all produce an
+   error `tool_result` the model reads, and the run continues. A gate that fails open on absence provides
+   no security — and denying is what keeps a detached background session from blocking forever on a
+   question nobody will ever see. (`running` stays `true` for the whole prompt, so a hang would pin the
+   session against the idle reaper until an `abort`.)
+
+"Always allow" is keyed on `(tool, scope_key)`, and `scope_key` is deliberately narrow: the **resolved
+absolute path** for `write`/`edit` (same canonicalization the policy and the tools use, so `../` and
+symlink spellings can't evade a remembered decision), the **verbatim command string** for `bash`, and the
+bare tool name otherwise. Not a command prefix: `git status` vs `git push` is not fixable with prefixes,
+and exact matching fails safe — the only cost is re-asking when a command varies by a byte.
+
+Two implementation notes worth keeping:
+
+- **Questions are serialized by a width-1 `tokio::Mutex` inside the gate**, not by
+  `ToolExecutionMode::Sequential`. One sequential-requesting call reroutes the loop's _entire_ batch
+  through its interleaved dispatch path — a cross-cutting change to execution semantics in service of a
+  UI concern. Approved calls still run concurrently afterward.
+- **`approval_resolved` has no OAuth analogue** because a login is a single-client RPC. An approval fans
+  out to N attached clients of which exactly one answers; without a resolution frame the others keep a
+  dead prompt on screen. The losing client's `approve` returns `accepted:false` — a race it can lose, not
+  an error.
+
+Subagent children inherit the gate for the same reason they inherit the deny-lists: a child that could
+run `bash` without the human's approval _is_ the bypass. They share the parent's `ApprovalRuntime`, so
+they queue behind the same one-question-at-a-time lock (eight parallel children must not raise eight
+simultaneous prompts) and read the same `SessionMemory`. That sharing **widens privilege across the
+tree** — an "always allow" granted to one child applies to its siblings and the parent for the rest of
+the session. Intended, and load-bearing for "don't re-ask", but a real property. Each child stamps its
+own `origin: {agent, spawn_id}` so a UI can say _reviewer#7 wants to run bash_ rather than _something
+does_.
+
 ## `structured_output` — the agent as a callable function
 
 `tools/structured_output.rs` turns a run into something a script or a parent agent can call: a caller

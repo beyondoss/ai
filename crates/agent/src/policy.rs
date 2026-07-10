@@ -89,6 +89,13 @@ impl ToolPolicy {
         &self.denied_paths
     }
 
+    /// The filesystem root this policy resolves relative paths against — see [`ToolPolicy::root`].
+    /// [`crate::approval`] needs it for the same reason this hook does: a remembered "always allow this
+    /// path" decision must key on the path that will actually be written, not a spelling of it.
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+
     /// Deny every call to a tool named `name`, regardless of arguments.
     pub fn deny_tool(mut self, name: impl Into<String>) -> Self {
         self.denied_tools.insert(name.into());

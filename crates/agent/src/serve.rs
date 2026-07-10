@@ -270,6 +270,13 @@
 //!     (the local OAuth callback listener couldn't complete, e.g. no loopback access over SSH) →
 //!     `data: {accepted: bool}`; the originating `login` request's own `id`-correlated `response`
 //!     remains the authoritative completion signal, this only confirms the code was delivered
+//!   - `{type:"approve", request_id, decision, scope?}` answer an outstanding `approval_request` (see
+//!     `--approve`). `decision` is `"allow"`/`"deny"`; `scope` is `"once"` (default) or `"session"`,
+//!     which remembers the decision for the rest of the session against the request's own `scope_key`.
+//!     → `data: {accepted: bool}`. `accepted:false` means the `request_id` names no outstanding
+//!     question — another attached client already answered it, it timed out, or the run was aborted;
+//!     that is a race a client can lose, not an error. Accepted **while a run is in flight**, which is
+//!     the only time a question can be outstanding at all.
 //!   - `{type:"abort_login"}`            cancel an in-flight `login`, else a no-op ack
 //!   - `{type:"logout", provider}`       remove `provider`'s stored subscription credential, if any,
 //!     idempotently → `data: {provider, was_logged_in}`
@@ -306,6 +313,20 @@
 //! command:"login", provider, step, url?, user_code?, verification_uri?, expires_in?, message?}`,
 //! zero or more unsolicited updates for an in-flight `login`, correlated via `id` (see `login` above).
 //!
+//! Two more frames exist only when `--approve` installed an interactive gate (see [`crate::approval`]).
+//! `{type:"approval_request", request_id, tool, summary, scope_key, origin, options}` is broadcast to
+//! **every** attached client when a gated tool call is about to run, and the call blocks until one of
+//! them answers with an `approve` command. `summary` is a truncated preview of the call's arguments (a
+//! megabyte file body is not fanned out to a phone); `scope_key` is what an `"session"`-scoped answer
+//! would be remembered against, shown so the user can see exactly what they are agreeing to; `origin` is
+//! `"main"` or `{agent, spawn_id}` naming the subagent child that is asking.
+//! `{type:"approval_resolved", request_id, decision, scope?, reason?}` follows, broadcast to everyone, so
+//! the clients that *didn't* answer can dismiss the prompt — a login is a single-client RPC and needs no
+//! such frame, but an approval fans out to N clients of which exactly one wins. `reason` is
+//! `timed_out`/`cancelled`/`no_client` when nobody answered; **all three deny the call**, because a gate
+//! that fails open on absence provides no security (the model then gets an ordinary error `tool_result`
+//! and the run continues, rather than hanging on a question nobody will ever see).
+//!
 //! **Structural stdout guard:** every byte on stdout must be a protocol frame — a stray line (a
 //! debug `println!`, a misconfigured logger) would corrupt the NDJSON stream a remote client is
 //! reading line-by-line. pi's equivalent (`output-guard.ts`'s `takeOverStdout`) monkey-patches
@@ -325,9 +346,12 @@
 //! risk than in the Node ecosystem pi targets, where ad hoc `console.log` debug output is common.
 #![deny(clippy::print_stdout)]
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+use crate::approval::{ApprovalDecision, ApprovalError, ApprovalScope};
 
 use agent_core::{
     Agent, AgentEvent, AgentHooks, CancellationToken, GatewayClient, Session, StopReason,
@@ -576,6 +600,14 @@ pub struct ServeConfig {
     /// Block a `write`/`edit` call whenever its `path` argument matches this glob. Combines with
     /// `deny_tool`/`deny_bash_pattern` under the same policy hook.
     pub deny_path: Vec<String>,
+    /// Which tools require a human's approval before they run (`--approve off|writes|all|tools:a,b`). The
+    /// static deny-lists above still win first — they need no round trip, and asking a person to approve
+    /// what the operator already forbade is a way to social-engineer past them. See [`crate::approval`].
+    pub approve: crate::approval::GatedSet,
+    /// How long an unanswered `approval_request` waits before it is denied (`--approval-timeout`).
+    /// `None` waits forever, which is only safe with a reliably-attached client: `running` stays `true`
+    /// for the whole prompt, so a question nobody answers pins the session until an `abort`.
+    pub approval_timeout: Option<std::time::Duration>,
     /// Disable *standard-root* skills discovery/loading (`~/.claude/skills`, `<cwd>/.claude/skills`) —
     /// no `<available_skills>` listing in the system prompt from either, and a `/skill:name` invocation
     /// is sent through unexpanded unless it resolves against a `--skill` path instead. Matches pi's own
@@ -1977,6 +2009,23 @@ pub(crate) async fn serve_session(
     let has_read = startup_tools.get("read").is_some();
     let has_todo = startup_tools.get(crate::tools::todo::NAME).is_some();
 
+    // The interactive approval gate. One per session, shared by every `build_agent` rebuild and by every
+    // subagent child, so a remembered decision isn't re-asked and eight parallel children can't spam
+    // eight simultaneous questions. `pending_approvals` is the map the `approve` command resolves
+    // against — held here rather than inside the gate so both the busy and idle command loops can reach
+    // it while a run is blocked inside the gate itself.
+    let (approval, pending_approvals) = if cfg.approve.is_off() {
+        (None, None)
+    } else {
+        let (gate, pending) = ServeApprovalGate::new(
+            out_conn.clone(),
+            cfg.approval_timeout,
+            persistence.session_id(),
+        );
+        let runtime = crate::approval::ApprovalRuntime::new(gate, cfg.approve.clone());
+        (Some(runtime), Some(pending))
+    };
+
     // `structured_output` is installed per-`prompt` (see that arm's `output_schema` handling), not at
     // startup: one session can answer one request in prose and the next as typed JSON. The `OutputSlot`
     // outlives every rebuild — it is this session's return channel, and a `set_model` mid-run must not
@@ -2143,6 +2192,7 @@ pub(crate) async fn serve_session(
                 &current_model,
                 &write_locks,
                 &skills,
+                approval.as_ref(),
             ))
         };
     // A multi-step run (several tool round-trips) is otherwise only ever durable once it *fully*
@@ -2182,6 +2232,7 @@ pub(crate) async fn serve_session(
         &checkpoint,
         subagent_ctx.as_ref(),
         structured_output.as_ref(),
+        approval.as_ref(),
     );
     timing.mark("build agent");
     // Persistent across every `prompt` call (not just the one currently in flight), so `steer`/
@@ -2365,6 +2416,7 @@ pub(crate) async fn serve_session(
                                 &checkpoint,
                                 subagent_ctx.as_ref(),
                                 structured_output.as_ref(),
+                                approval.as_ref(),
                                 );
                         }
                         let _ = out_tx.send(response(
@@ -2482,6 +2534,7 @@ pub(crate) async fn serve_session(
                             &checkpoint,
                             subagent_ctx.as_ref(),
                                 structured_output.as_ref(),
+                                approval.as_ref(),
                             );
                     }
                     let _ = out_tx.send(response(
@@ -2550,6 +2603,7 @@ pub(crate) async fn serve_session(
                             &checkpoint,
                             subagent_ctx.as_ref(),
                                 structured_output.as_ref(),
+                                approval.as_ref(),
                             );
                     }
                     let _ = out_tx.send(response(
@@ -2799,6 +2853,7 @@ pub(crate) async fn serve_session(
                             &checkpoint,
                             subagent_ctx.as_ref(),
                             structured_output.as_ref(),
+                            approval.as_ref(),
                         );
                     }
                     Ok(_) => {}
@@ -3230,6 +3285,13 @@ pub(crate) async fn serve_session(
                                                 // From the live mirror: `&session` is exclusively borrowed by
                                                 // the in-flight turn. See `LiveStats::todos`.
                                                 let _ = out_tx.send(response(cid, "get_todos", true, Some(json!({ "todos": live_stats.todos() })), None));
+                                            }
+                                            // The arm that matters: an approval question is only ever
+                                            // outstanding *while a run is blocked inside the gate*, so this
+                                            // must be answerable mid-run. `accepted:false` tells the losing
+                                            // client in a multi-attach race that its answer arrived too late.
+                                            "approve" => {
+                                                let _ = out_tx.send(handle_approve(cid, &c, pending_approvals.as_ref()));
                                             }
                                             "get_tree" => {
                                                 // Same `since` handling as the idle-loop arm below — see
@@ -4116,6 +4178,11 @@ pub(crate) async fn serve_session(
                     None,
                 ));
             }
+            // Reachable while idle only for a stale/duplicate answer (`accepted:false`): a real question
+            // can only be outstanding while a run is in flight, which is the busy arm above.
+            "approve" => {
+                emit!(handle_approve(id, &cmd, pending_approvals.as_ref()));
+            }
             "get_todos" => {
                 // Straight from the session while idle — no mirror needed, and no chance of one going
                 // stale against a `switch_branch`/`fork`/`compact` that happened since the last turn.
@@ -4244,6 +4311,7 @@ pub(crate) async fn serve_session(
                         &current_model,
                         &write_locks,
                         &skills,
+                        approval.as_ref(),
                     ))
                 };
                 static_system = crate::resources::build_static_system_prompt(
@@ -4282,6 +4350,7 @@ pub(crate) async fn serve_session(
                     &checkpoint,
                     subagent_ctx.as_ref(),
                     structured_output.as_ref(),
+                    approval.as_ref(),
                 );
                 emit!(response(id, "reload", true, None, None));
             }
@@ -4371,6 +4440,7 @@ pub(crate) async fn serve_session(
                                         &checkpoint,
                                         subagent_ctx.as_ref(),
                                         structured_output.as_ref(),
+                                        approval.as_ref(),
                                     );
                                     emit!(response(
                                         id,
@@ -4426,6 +4496,7 @@ pub(crate) async fn serve_session(
                             &checkpoint,
                             subagent_ctx.as_ref(),
                             structured_output.as_ref(),
+                            approval.as_ref(),
                         );
                         emit!(response(
                             id,
@@ -4453,6 +4524,7 @@ pub(crate) async fn serve_session(
                             &checkpoint,
                             subagent_ctx.as_ref(),
                             structured_output.as_ref(),
+                            approval.as_ref(),
                         );
                         emit!(response(
                             id,
@@ -4518,6 +4590,7 @@ pub(crate) async fn serve_session(
                                     &checkpoint,
                                     subagent_ctx.as_ref(),
                                     structured_output.as_ref(),
+                                    approval.as_ref(),
                                 );
                                 let (thinking, reasoning_effort) = agent_core::thinking_for_level(
                                     &agent_core::capabilities(&current_model),
@@ -4621,6 +4694,7 @@ pub(crate) async fn serve_session(
                                     &checkpoint,
                                     subagent_ctx.as_ref(),
                                     structured_output.as_ref(),
+                                    approval.as_ref(),
                                 );
                                 let mut resp_data =
                                     model_switch_response(&current_model, current_level);
@@ -4675,6 +4749,7 @@ pub(crate) async fn serve_session(
                             &checkpoint,
                             subagent_ctx.as_ref(),
                             structured_output.as_ref(),
+                            approval.as_ref(),
                         );
                         let (thinking, reasoning_effort) = agent_core::thinking_for_level(
                             &agent_core::capabilities(&current_model),
@@ -4730,6 +4805,7 @@ pub(crate) async fn serve_session(
                         &checkpoint,
                         subagent_ctx.as_ref(),
                         structured_output.as_ref(),
+                        approval.as_ref(),
                     );
                     emit!(response(
                         id,
@@ -4766,6 +4842,7 @@ pub(crate) async fn serve_session(
                         &checkpoint,
                         subagent_ctx.as_ref(),
                         structured_output.as_ref(),
+                        approval.as_ref(),
                     );
                     emit!(response(
                         id,
@@ -4813,6 +4890,7 @@ pub(crate) async fn serve_session(
                         &checkpoint,
                         subagent_ctx.as_ref(),
                         structured_output.as_ref(),
+                        approval.as_ref(),
                     );
                     emit!(response(
                         id,
@@ -4853,6 +4931,7 @@ pub(crate) async fn serve_session(
                         &checkpoint,
                         subagent_ctx.as_ref(),
                         structured_output.as_ref(),
+                        approval.as_ref(),
                     );
                     emit!(response(
                         id,
@@ -5137,6 +5216,7 @@ pub(crate) async fn serve_session(
                                     &checkpoint,
                                     subagent_ctx.as_ref(),
                                     structured_output.as_ref(),
+                                    approval.as_ref(),
                                 );
                             }
                             emit!(response(
@@ -5818,6 +5898,8 @@ fn build_subagent_ctx(
     parent_model: &str,
     write_locks: &Arc<agent_core::WriteLockRegistry>,
     skills: &[crate::skills::Skill],
+    // Shared with the parent, not rebuilt — see `SubagentCtx::approval`.
+    approval: Option<&crate::approval::ApprovalRuntime>,
 ) -> Arc<crate::tools::subagent::SubagentCtx> {
     use crate::tools::subagent;
     let cfg_for_factory = cfg.clone();
@@ -5863,6 +5945,7 @@ fn build_subagent_ctx(
         deny_path: cfg.deny_path.clone(),
         child_max_steps: subagent::DEFAULT_CHILD_MAX_STEPS,
         max_depth: subagent::DEFAULT_MAX_DEPTH,
+        approval: approval.cloned(),
     })
 }
 
@@ -5897,6 +5980,10 @@ fn build_agent(
     // reconstructed here: it owns the compiled validator, and — more importantly — the `OutputSlot` the
     // model's answer lands in, which must survive a mid-run `set_model` rebuild.
     structured_output: Option<&Arc<crate::tools::structured_output::StructuredOutput>>,
+    // The interactive approval gate, when `--approve` asked for one. Shared (not rebuilt) across every
+    // `set_model` rebuild so the session's remembered "always allow" decisions — and the one
+    // prompt-serializing lock the whole subagent tree queues behind — survive a model switch.
+    approval: Option<&crate::approval::ApprovalRuntime>,
 ) -> Agent {
     let mut compaction = agent_core::CompactionConfig {
         context_window: cfg
@@ -5986,7 +6073,10 @@ fn build_agent(
     // only when non-empty, `ServeHooks::before_provider_request` (the `bash` RPC's
     // `exclude_from_context` filter) is needed unconditionally, and `Agent::with_hooks` only ever holds
     // one hook object. See `ServeHooks`'s own doc comment.
-    agent = agent.with_hooks(Arc::new(ServeHooks { policy }));
+    agent = agent.with_hooks(Arc::new(ServeHooks {
+        policy,
+        approval: approval.cloned(),
+    }));
     agent
 }
 
@@ -5999,8 +6089,14 @@ fn build_agent(
 /// `convertToLlm` (`packages/coding-agent/src/core/messages.ts`), which performs the identical
 /// late-and-separate filter rather than gating what `recordBashResult` commits to history in the first
 /// place.
+///
+/// It also composes in the interactive approval gate ([`crate::approval`]) — `Agent::with_hooks` only
+/// ever holds one hook object, so a second seam has to fold in here rather than replace this one.
 struct ServeHooks {
     policy: crate::policy::ToolPolicy,
+    /// `None` unless `--approve` asked for one. Static deny still wins first; see
+    /// [`crate::approval::gated_before_tool_call`], whose decision order is load-bearing.
+    approval: Option<crate::approval::ApprovalRuntime>,
 }
 
 #[async_trait::async_trait]
@@ -6012,9 +6108,16 @@ impl AgentHooks for ServeHooks {
         session: &Session,
         cancel: &CancellationToken,
     ) -> Option<String> {
-        self.policy
-            .before_tool_call(name, input, session, cancel)
-            .await
+        crate::approval::gated_before_tool_call(
+            &self.policy,
+            self.approval.as_ref(),
+            &crate::approval::ApprovalOrigin::Main,
+            name,
+            input,
+            session,
+            cancel,
+        )
+        .await
     }
 
     async fn before_provider_request(&self, req: &mut agent_core::transport::ModelRequest) {
@@ -6892,6 +6995,257 @@ impl Drop for PendingLoginGuard {
     }
 }
 
+/// Outstanding approval questions, keyed by request id.
+///
+/// A **map**, not the single slot `pending_login` gets away with: the loop dispatches tool groups
+/// `buffer_unordered`, so several `before_tool_call` hooks can await concurrently, and a `subagent`
+/// fan-out multiplies that again. One `oneshot` per question.
+type PendingApprovals =
+    Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<ApprovalDecision>>>>;
+
+/// Clears a pending approval's slot when its `request` call returns — normally, on timeout, on abort, or
+/// through a panic. The `PendingLoginGuard` idea, keyed.
+struct PendingApprovalGuard {
+    pending: PendingApprovals,
+    id: String,
+}
+
+impl Drop for PendingApprovalGuard {
+    fn drop(&mut self) {
+        lock_ignoring_poison(&self.pending).remove(&self.id);
+    }
+}
+
+/// `serve`'s [`ApprovalGate`]: broadcast the question to every attached client, park a `oneshot`, and
+/// let whichever client answers first resolve it — the same ack-now/respond-later shape
+/// [`ServeLoginCallbacks`] uses for a pasted OAuth code, generalized to N concurrent questions and N
+/// concurrent answerers.
+///
+/// Broadcasts through `out` (the fan-out) rather than the session's `out_tx` writer channel, because the
+/// gate is constructed before that channel exists — and because `broadcast` *is* the multi-attach
+/// primitive. A control frame may therefore interleave with streamed `event` frames; that is fine, and
+/// the client correlates by `request_id` regardless.
+pub(crate) struct ServeApprovalGate {
+    out: SharedOutConn,
+    pending: PendingApprovals,
+    /// Width-1: the user is asked **one question at a time**, even when eight tool calls (or eight
+    /// subagent children sharing this gate) block at once.
+    ///
+    /// Deliberately not `ToolExecutionMode::Sequential`: one sequential-requesting call reroutes the
+    /// loop's *entire* batch through its interleaved dispatch path, which is a cross-cutting change to
+    /// execution semantics in service of a UI concern. Approved calls still run concurrently afterward.
+    serialize: tokio::sync::Mutex<()>,
+    /// `None` waits forever. A finite default exists because `running` stays `true` for the whole
+    /// prompt, so an unanswered question on a session whose clients all detached mid-wait would
+    /// otherwise pin it indefinitely (an `abort` still frees it either way).
+    timeout: Option<std::time::Duration>,
+    seq: AtomicU64,
+    session_id: String,
+}
+
+impl ServeApprovalGate {
+    pub(crate) fn new(
+        out: SharedOutConn,
+        timeout: Option<std::time::Duration>,
+        session_id: impl Into<String>,
+    ) -> (Arc<Self>, PendingApprovals) {
+        let pending: PendingApprovals = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let gate = Arc::new(Self {
+            out,
+            pending: pending.clone(),
+            serialize: tokio::sync::Mutex::new(()),
+            timeout,
+            seq: AtomicU64::new(0),
+            session_id: session_id.into(),
+        });
+        (gate, pending)
+    }
+
+    fn broadcast(&self, frame: OutFrame) {
+        lock_ignoring_poison(&self.out).broadcast(frame);
+    }
+
+    fn no_client(&self) -> bool {
+        lock_ignoring_poison(&self.out).is_empty()
+    }
+}
+
+/// Resolve a parked approval. Returns `false` when the id is unknown or already answered — which is how
+/// the *losing* client in a multi-attach race learns its answer arrived too late.
+pub(crate) fn resolve_approval(
+    pending: &PendingApprovals,
+    request_id: &str,
+    decision: ApprovalDecision,
+) -> bool {
+    let sender = lock_ignoring_poison(pending).remove(request_id);
+    match sender {
+        Some(tx) => tx.send(decision).is_ok(),
+        None => false,
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::approval::ApprovalGate for ServeApprovalGate {
+    async fn request(
+        &self,
+        req: crate::approval::ApprovalRequest,
+        cancel: &CancellationToken,
+    ) -> Result<ApprovalDecision, ApprovalError> {
+        // One question at a time. An abort while queued behind another question must not wait for it.
+        let _one_at_a_time = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(ApprovalError::Cancelled),
+            guard = self.serialize.lock() => guard,
+        };
+        if cancel.is_cancelled() {
+            return Err(ApprovalError::Cancelled);
+        }
+        // Fail closed rather than hang: a gate that silently executes privileged operations with nobody
+        // watching is not a gate, and a detached background session has nobody watching.
+        if self.no_client() {
+            return Err(ApprovalError::NoClient);
+        }
+
+        let request_id = format!(
+            "{}:{}",
+            self.session_id,
+            self.seq.fetch_add(1, Ordering::Relaxed)
+        );
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        lock_ignoring_poison(&self.pending).insert(request_id.clone(), tx);
+        let _slot = PendingApprovalGuard {
+            pending: self.pending.clone(),
+            id: request_id.clone(),
+        };
+
+        self.broadcast(approval_request_frame(&request_id, &req));
+
+        // `biased`, so a photo-finish resolves the only way that is defensible in both directions: an
+        // abort outranks a human's answer (never run a tool after the run was cancelled), and a human's
+        // answer outranks the timeout (they *did* answer, and `resolve_approval` already told them it was
+        // accepted). Left unbiased, `select!` picks at random and a client could be told `accepted:true`
+        // for a call the timeout then denied.
+        let outcome = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(ApprovalError::Cancelled),
+            answer = rx => answer.map_err(|_| ApprovalError::Cancelled),
+            _ = sleep_opt(self.timeout) => Err(ApprovalError::TimedOut),
+        };
+        // Every other attached client is still showing this question. Tell them it's answered.
+        self.broadcast(approval_resolved_frame(&request_id, outcome));
+        outcome
+    }
+}
+
+/// `sleep(d)`, or a future that never resolves when `d` is `None`.
+async fn sleep_opt(duration: Option<std::time::Duration>) {
+    match duration {
+        Some(d) => tokio::time::sleep(d).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// `{type:"approval_request", …}` — a tool call waiting on a human. Broadcast to every attached client.
+fn approval_request_frame(request_id: &str, req: &crate::approval::ApprovalRequest) -> OutFrame {
+    let mut m = Map::new();
+    m.insert("type".into(), json!("approval_request"));
+    m.insert("request_id".into(), json!(request_id));
+    m.insert("tool".into(), json!(req.tool));
+    m.insert("summary".into(), req.summary.clone());
+    m.insert("scope_key".into(), json!(req.scope_key));
+    m.insert("origin".into(), req.origin.to_json());
+    m.insert(
+        "options".into(),
+        json!(["allow_once", "allow_session", "deny_once", "deny_session"]),
+    );
+    Value::Object(m).into()
+}
+
+/// `{type:"approval_resolved", …}` — this question is settled, however it settled.
+///
+/// No OAuth analogue: a login is a single-client RPC, but an approval fans out to every attached client
+/// and only one of them answers. Without this the others keep a dead prompt on screen forever.
+fn approval_resolved_frame(
+    request_id: &str,
+    outcome: Result<ApprovalDecision, ApprovalError>,
+) -> OutFrame {
+    let mut m = Map::new();
+    m.insert("type".into(), json!("approval_resolved"));
+    m.insert("request_id".into(), json!(request_id));
+    let (decision, reason) = match outcome {
+        Ok(d) if d.allow => ("allow", None),
+        Ok(_) => ("deny", None),
+        Err(ApprovalError::TimedOut) => ("deny", Some("timed_out")),
+        Err(ApprovalError::Cancelled) => ("deny", Some("cancelled")),
+        Err(ApprovalError::NoClient) => ("deny", Some("no_client")),
+    };
+    m.insert("decision".into(), json!(decision));
+    if let Ok(d) = outcome {
+        m.insert(
+            "scope".into(),
+            json!(match d.scope {
+                ApprovalScope::Once => "once",
+                ApprovalScope::Session => "session",
+            }),
+        );
+    }
+    if let Some(reason) = reason {
+        m.insert("reason".into(), json!(reason));
+    }
+    Value::Object(m).into()
+}
+
+/// The `approve` command, shared by the busy and idle dispatch loops.
+///
+/// `accepted` is `false` when the `request_id` names no outstanding question — it was already answered
+/// by another attached client, it timed out, or the run was aborted. That is not an error: it is the
+/// answer a client races and loses.
+fn handle_approve(id: Option<String>, cmd: &Value, pending: Option<&PendingApprovals>) -> OutFrame {
+    let Some(request_id) = cmd.get("request_id").and_then(Value::as_str) else {
+        return response(id, "approve", false, None, Some("missing `request_id`"));
+    };
+    let decision = match parse_approval_decision(cmd) {
+        Ok(d) => d,
+        Err(e) => return response(id, "approve", false, None, Some(&e)),
+    };
+    let Some(pending) = pending else {
+        return response(
+            id,
+            "approve",
+            false,
+            None,
+            Some("this session has no approval gate (see `--approve`)"),
+        );
+    };
+    let accepted = resolve_approval(pending, request_id, decision);
+    response(
+        id,
+        "approve",
+        true,
+        Some(json!({ "accepted": accepted })),
+        None,
+    )
+}
+
+/// Parse an inbound `approve` command's `decision`/`scope` fields.
+fn parse_approval_decision(cmd: &Value) -> Result<ApprovalDecision, String> {
+    let allow = match cmd.get("decision").and_then(Value::as_str) {
+        Some("allow") => true,
+        Some("deny") => false,
+        _ => return Err("`decision` must be \"allow\" or \"deny\"".to_string()),
+    };
+    let scope = match cmd.get("scope").and_then(Value::as_str) {
+        None | Some("once") => ApprovalScope::Once,
+        Some("session") => ApprovalScope::Session,
+        Some(other) => {
+            return Err(format!(
+                "`scope` must be \"once\" or \"session\" (got {other:?})"
+            ));
+        }
+    };
+    Ok(ApprovalDecision { allow, scope })
+}
+
 /// Drives an in-flight `login` RPC command: pushes `login_progress` frames for whatever the flow
 /// needs to show (a URL, a device code, narration), and for the manual-code-paste path, parks on
 /// `pending_code` until a `"submit_code"` command (processed by the same main loop, concurrently —
@@ -7019,6 +7373,14 @@ impl OutFanout {
     /// Drop the sink registered under `id` (a disconnected connection). Idempotent.
     pub(crate) fn remove(&mut self, id: u64) {
         self.sinks.retain(|(i, _)| *i != id);
+    }
+
+    /// Whether no client is currently attached. The stdio transport registers exactly one sink for the
+    /// life of the process, so this is only ever `false` there; a WebSocket/UDS session whose clients
+    /// have all detached reports `true`. [`crate::approval`] checks this before posing a question that
+    /// nobody would ever see.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.sinks.is_empty()
     }
 
     /// Send `frame` to every attached sink, pruning any whose receiver has gone away. The single-sink

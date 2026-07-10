@@ -121,6 +121,15 @@ pub struct SubagentCtx {
     pub deny_path: Vec<String>,
     pub child_max_steps: u32,
     pub max_depth: u32,
+    /// The parent's interactive approval gate, if it has one. Shared, not rebuilt: a child queues behind
+    /// the same one-question-at-a-time lock its siblings do (eight parallel children must not raise eight
+    /// simultaneous prompts), and reads the same [`SessionMemory`](crate::approval::SessionMemory) — so a
+    /// decision the user already made is not asked again per child.
+    ///
+    /// That sharing **widens privilege across the subagent tree**: an "always allow" granted to one child
+    /// applies to its siblings and to the parent for the rest of the session. Intended, and load-bearing
+    /// for the "don't re-ask" property, but a real property nonetheless.
+    pub approval: Option<crate::approval::ApprovalRuntime>,
 }
 
 /// The tool. `depth` is per-instance because [`Tool::run`] receives no ambient context — there is
@@ -199,6 +208,36 @@ impl ChildOutcome {
             ok: false,
             note: None,
         }
+    }
+}
+
+/// The one [`agent_core::AgentHooks`] a child installs: the parent's static deny-lists composed with its
+/// interactive approval gate. `Agent::new` installs `NoHooks`, so without this a child ignores both.
+struct ChildHooks {
+    policy: ToolPolicy,
+    approval: Option<crate::approval::ApprovalRuntime>,
+    origin: crate::approval::ApprovalOrigin,
+}
+
+#[async_trait]
+impl agent_core::AgentHooks for ChildHooks {
+    async fn before_tool_call(
+        &self,
+        name: &str,
+        input: &Value,
+        session: &agent_core::Session,
+        cancel: &agent_core::CancellationToken,
+    ) -> Option<String> {
+        crate::approval::gated_before_tool_call(
+            &self.policy,
+            self.approval.as_ref(),
+            &self.origin,
+            name,
+            input,
+            session,
+            cancel,
+        )
+        .await
     }
 }
 
@@ -647,6 +686,10 @@ impl Subagent {
             .unwrap_or_else(|| self.ctx.parent_model.clone());
         let transport = (self.ctx.factory)(&model)?;
 
+        // One id per spawned child: it disambiguates the prompt-cache key *and* names this child in an
+        // approval request, so a UI can say "reviewer#7 wants to run bash" rather than "something does".
+        let spawn_id = CHILD_SEQ.fetch_add(1, Ordering::Relaxed);
+
         let mut agent = Agent::new(transport, model)
             .with_tools(registry)
             .with_system(system)
@@ -656,11 +699,7 @@ impl Subagent {
             .with_write_locks(self.ctx.write_locks.clone())
             // A distinct key per child. Sharing the parent's would both poison the Anthropic prompt
             // cache and contend for one pooled Codex WebSocket connection, which is keyed on it.
-            .with_cache_key(format!(
-                "{}:sub:{}",
-                self.ctx.parent_cache_key,
-                CHILD_SEQ.fetch_add(1, Ordering::Relaxed)
-            ));
+            .with_cache_key(format!("{}:sub:{spawn_id}", self.ctx.parent_cache_key));
 
         // MANDATORY. `Agent::new` installs `NoHooks`; without this the child ignores every
         // `--deny-tool`/`--deny-bash-pattern`/`--deny-path` the parent was launched with, and `subagent`
@@ -672,8 +711,18 @@ impl Subagent {
             &self.ctx.deny_path,
         )
         .with_root(&root);
-        if !policy.is_empty() {
-            agent = agent.with_hooks(Arc::new(policy.clone()));
+        // The interactive gate is inherited for exactly the same reason the deny-lists are: a child that
+        // could run `bash` without the human's approval *is* the bypass. `Agent::with_hooks` holds one
+        // object, so the two compose here rather than stacking.
+        if !policy.is_empty() || self.ctx.approval.is_some() {
+            agent = agent.with_hooks(Arc::new(ChildHooks {
+                policy: policy.clone(),
+                approval: self.ctx.approval.clone(),
+                origin: crate::approval::ApprovalOrigin::Subagent {
+                    agent: def.name.clone(),
+                    spawn_id: spawn_id.to_string(),
+                },
+            }));
         }
         // Deliberately no `.with_checkpoint_hook`: `Agent::new`'s `NoCheckpoint` default is correct. A
         // child inheriting the parent's would persist its turns into the parent's session store.

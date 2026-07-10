@@ -23,6 +23,19 @@ mise tasks | grep "search"
 - Parallelize only when the work itself is the bottleneck—not as a first instinct.
 - Measure before you optimize, but design with performance in mind from the start.
 
+## Human-in-the-loop
+
+There is **one** seam pattern for asking a human something mid-run, and it has exactly two instances:
+`oauth::LoginCallbacks` (paste an OAuth code) and `approval::ApprovalGate` (approve a tool call). Don't
+invent a third shape.
+
+- An **abstract callback trait**, with one implementation per host.
+- `serve`'s implementation broadcasts a frame, parks a `oneshot` behind a **Drop guard**, and resolves it
+  from a later inbound command.
+- The wait races the run's `CancellationToken` and a timeout, and **fails closed**: no answer — for any
+  reason — denies. A gate that fails open on absence provides no security, and it is what keeps a
+  detached background session from blocking forever on a question nobody will see.
+
 ## Operations & State
 
 All operations that modify state—infrastructure (GlideFS, VXLAN, iptables, TAP devices) and application—**must be idempotent and atomic**.
