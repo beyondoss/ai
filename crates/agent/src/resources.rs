@@ -12,6 +12,107 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::path_utils::resolved_path;
 use crate::skills::{self, Skill};
 
+/// The agent's base identity/instructions. The tool list is generated from `registry` — the tools this
+/// process actually registered, after any `--tools`/`--exclude-tools`/`--no-tools` filtering — rather
+/// than hand-listed as a static string or assumed to be the full default set. A prior hardcoded version
+/// silently omitted the Beyond platform tools (fork/sync/logs) entirely, and a version that always
+/// listed `default_registry()` regardless of filtering would claim tools a restricted agent doesn't
+/// actually have, inviting the model to call one that gets rejected.
+///
+/// `extra_guidelines` are operator-supplied bullets (`--prompt-guideline`, repeatable) appended after
+/// the built-in ones — pi's own `promptGuidelines` (deduplicated and trimmed, matching pi's
+/// `buildSystemPrompt`). Deliberately *not* a full port of pi's system prompt: pi also renders a
+/// redundant per-tool text snippet list ("Available tools:\n- bash: Execute bash commands...")
+/// alongside the native tool-call JSON schema already describing each tool to the model — the same
+/// information twice, in two different places the model reads. This function's own dynamic tool-name
+/// listing (`Use them to accomplish...with tools: {names}`) already avoids that duplication, so only
+/// the genuinely useful, non-redundant half of pi's feature is ported here: the guideline-bullet
+/// mechanism itself, including its one built-in conditional (`bash` registered but none of its usual
+/// companions).
+///
+/// Lives here, not in `main.rs`, because a **subagent** must recompute it against its *own* (usually
+/// restricted) registry: a child given `tools: read,grep` must not be told it has `bash` and `edit`.
+pub fn default_system_prompt(
+    registry: &agent_core::ToolRegistry,
+    extra_guidelines: &[String],
+) -> String {
+    let names: Vec<String> = registry.definitions().into_iter().map(|d| d.name).collect();
+    let has = |n: &str| names.iter().any(|x| x == n);
+
+    let mut guidelines: Vec<String> = Vec::new();
+    let mut seen = HashSet::new();
+    let add = |g: String, guidelines: &mut Vec<String>, seen: &mut HashSet<String>| {
+        if seen.insert(g.clone()) {
+            guidelines.push(g);
+        }
+    };
+    // Matches pi's own conditional exactly: when `bash` is the only exploration tool registered (none
+    // of `grep`/`find`/`ls`), the model needs to be told it's the fallback for those operations too.
+    if has("bash") && !has("grep") && !has("find") && !has("ls") {
+        add(
+            "Use bash for file operations like ls, rg, find".to_string(),
+            &mut guidelines,
+            &mut seen,
+        );
+    }
+    // pi's own per-tool `promptGuidelines` (`read.ts`/`edit.ts`/`write.ts`) — declared on the tool
+    // definition itself and collected from whatever's actually registered. Adapted, not ported
+    // verbatim: pi's edit tool takes an `edits[].oldText`/`newText` array, ours takes `edits[].old_string`/
+    // `new_string` (see `tools/edit.rs`'s own schema) — porting pi's exact field names would tell the
+    // model to look for parameters that don't exist on our tool. `bash`/`grep`/`find`/`ls` carry no
+    // `promptGuidelines` on pi's side, so there's nothing to port for those.
+    if has("read") {
+        add(
+            "Use read to examine files instead of cat or sed.".to_string(),
+            &mut guidelines,
+            &mut seen,
+        );
+    }
+    if has("edit") {
+        for g in [
+            "Use edit for precise changes (edits[].old_string must match exactly)",
+            "When changing multiple separate locations in one file, use one edit call with multiple \
+             entries in edits[] instead of multiple edit calls",
+            "Each edits[].old_string is matched against the original file, not after earlier edits are \
+             applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
+            "Keep edits[].old_string as small as possible while still being unique in the file. Do not \
+             pad with large unchanged regions.",
+        ] {
+            add(g.to_string(), &mut guidelines, &mut seen);
+        }
+    }
+    if has("write") {
+        add(
+            "Use write only for new files or complete rewrites.".to_string(),
+            &mut guidelines,
+            &mut seen,
+        );
+    }
+    for g in extra_guidelines {
+        let g = g.trim();
+        if !g.is_empty() {
+            add(g.to_string(), &mut guidelines, &mut seen);
+        }
+    }
+    add(
+        "Show file paths clearly when working with files".to_string(),
+        &mut guidelines,
+        &mut seen,
+    );
+    let guidelines = guidelines
+        .into_iter()
+        .map(|g| format!("- {g}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "You are the Beyond coding agent. You operate inside a real working directory with tools: {}. \
+         Use them to accomplish the user's task directly — inspect before you change, make minimal \
+         edits, and verify your work. Be concise.\n\nGuidelines:\n{guidelines}",
+        names.join(", ")
+    )
+}
+
 /// Options controlling how the system prompt is assembled.
 pub struct PromptOptions<'a> {
     /// An explicit override for the base agent identity/instructions (`--system-prompt`), if the caller
@@ -24,7 +125,7 @@ pub struct PromptOptions<'a> {
     /// (`base` was always a plain, already-defaulted `&str`), so a project's `SYSTEM.md` always won even
     /// over an explicit flag.
     pub base: Option<&'a str>,
-    /// The computed built-in default base prompt (`main.rs::default_system_prompt`), used only when
+    /// The computed built-in default base prompt ([`default_system_prompt`]), used only when
     /// neither `base` nor an on-disk `SYSTEM.md` override applies. Cheap and pure to compute (no I/O),
     /// so a caller builds it eagerly even on the common path where it goes unused.
     pub default_base: &'a str,
@@ -63,6 +164,11 @@ pub struct PromptOptions<'a> {
     /// overrides and `~/.claude/skills` are unaffected either way: they're the operator's own machine,
     /// not something a repo checkout controls.
     pub project_trusted: bool,
+    /// Agent definitions to advertise in an `<available_agents>` block — the delegable personas the
+    /// `subagent` tool accepts (see [`crate::agents`]). Renders nothing when empty, so a prompt built for
+    /// a process (or a child) that has no `subagent` tool passes `&[]` and the section simply doesn't
+    /// appear. Discovery is the caller's job, mirroring `skills` above.
+    pub agents: &'a [crate::agents::AgentDef],
 }
 
 /// Build the full system prompt for a session: the static base (see [`build_static_system_prompt`])
@@ -132,6 +238,14 @@ pub fn build_static_system_prompt(opts: &PromptOptions) -> String {
             s.push_str("\n\n");
             s.push_str(&available);
         }
+    }
+
+    // The delegable agents, when this prompt is for a process that actually has the `subagent` tool. A
+    // caller without it passes `&[]`; `format_available` returns "" for that, so no empty shell appears.
+    let agents = crate::agents::format_available(opts.agents);
+    if !agents.is_empty() {
+        s.push_str("\n\n");
+        s.push_str(&agents);
     }
 
     s
@@ -487,6 +601,116 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_system_prompt_lists_every_registered_tool() {
+        // The whole point of generating this dynamically: it can't silently omit a tool the way the
+        // prior hardcoded string did (it never mentioned the Beyond platform tools at all).
+        let registry = crate::tools::default_registry();
+        let prompt = default_system_prompt(&registry, &[]);
+        for def in crate::tools::default_registry().definitions() {
+            assert!(
+                prompt.contains(&def.name),
+                "system prompt is missing registered tool {:?}: {prompt}",
+                def.name
+            );
+        }
+    }
+
+    #[test]
+    fn default_system_prompt_reflects_a_restricted_registry() {
+        // A tool-restricted agent's own system prompt must not claim tools it doesn't actually have —
+        // otherwise the model is invited to call one that's guaranteed to be rejected.
+        let mut registry = crate::tools::default_registry();
+        crate::tools::apply_filter(&mut registry, None, Some(&["bash".to_string()]), false);
+        let prompt = default_system_prompt(&registry, &[]);
+        assert!(!prompt.contains("bash"));
+        assert!(prompt.contains("read"));
+    }
+
+    #[test]
+    fn default_system_prompt_always_shows_the_file_paths_guideline() {
+        // pi: system-prompt.test.ts, "shows file paths guideline even with no tools" — a built-in
+        // guideline, always present regardless of the tool set (unlike the conditional bash one below).
+        let registry = crate::tools::default_registry();
+        let prompt = default_system_prompt(&registry, &[]);
+        assert!(prompt.contains("Show file paths clearly when working with files"));
+    }
+
+    #[test]
+    fn default_system_prompt_tells_the_model_to_use_bash_for_exploration_without_grep_find_ls() {
+        // pi: the one built-in conditional guideline — only fires when `bash` is registered but none
+        // of its usual companions are, since the model then has no other way to explore the filesystem.
+        let mut only_bash = agent_core::tool::ToolRegistry::new();
+        only_bash.register(std::sync::Arc::new(crate::tools::bash::Bash::real()));
+        let prompt = default_system_prompt(&only_bash, &[]);
+        assert!(prompt.contains("Use bash for file operations like ls, rg, find"));
+
+        // The guideline must not fire when grep/find/ls are also registered — bash isn't the only
+        // exploration tool anymore.
+        let full = crate::tools::default_registry();
+        let prompt = default_system_prompt(&full, &[]);
+        assert!(!prompt.contains("Use bash for file operations like ls, rg, find"));
+    }
+
+    #[test]
+    fn default_system_prompt_includes_pis_per_tool_guidelines_for_read_edit_write() {
+        // pi-parity fix: pi declares real default guidance on its read/edit/write tool definitions
+        // (`promptGuidelines`), collected automatically whenever the tool is registered — we ported
+        // only the operator-typed `--prompt-guideline` mechanism, not this content, so a model never
+        // got told (for example) edit's exact-match/non-overlapping-edit semantics unless an operator
+        // happened to type the same guidance in by hand.
+        let registry = crate::tools::default_registry();
+        let prompt = default_system_prompt(&registry, &[]);
+        assert!(
+            prompt.contains("Use read to examine files instead of cat or sed."),
+            "got: {prompt}"
+        );
+        assert!(
+            prompt.contains("Use edit for precise changes (edits[].old_string must match exactly)"),
+            "got: {prompt}"
+        );
+        assert!(
+            prompt.contains("Keep edits[].old_string as small as possible"),
+            "got: {prompt}"
+        );
+        assert!(
+            prompt.contains("Use write only for new files or complete rewrites."),
+            "got: {prompt}"
+        );
+    }
+
+    #[test]
+    fn default_system_prompt_omits_a_tools_guidelines_when_the_tool_is_not_registered() {
+        let mut only_bash = agent_core::tool::ToolRegistry::new();
+        only_bash.register(std::sync::Arc::new(crate::tools::bash::Bash::real()));
+        let prompt = default_system_prompt(&only_bash, &[]);
+        assert!(!prompt.contains("Use read to examine files"));
+        assert!(!prompt.contains("Use edit for precise changes"));
+        assert!(!prompt.contains("Use write only for new files"));
+    }
+
+    #[test]
+    fn default_system_prompt_appends_and_dedupes_extra_guidelines() {
+        // pi: system-prompt.test.ts, "appends promptGuidelines to default guidelines" /
+        // "deduplicates and trims promptGuidelines".
+        let registry = crate::tools::default_registry();
+        let prompt = default_system_prompt(
+            &registry,
+            &[
+                "Use dynamic_tool for project summaries.".to_string(),
+                "  Use dynamic_tool for project summaries.  ".to_string(),
+                "   ".to_string(),
+            ],
+        );
+        assert_eq!(
+            prompt
+                .matches("- Use dynamic_tool for project summaries.")
+                .count(),
+            1,
+            "got: {prompt}"
+        );
+    }
     use std::fs;
 
     #[test]
@@ -695,6 +919,7 @@ mod tests {
             skills: &[],
             has_read: true,
             project_trusted: true,
+            agents: &[],
         });
         assert!(prompt.contains("OVERRIDE IDENTITY"));
         assert!(
@@ -725,6 +950,7 @@ mod tests {
             skills: &[],
             has_read: true,
             project_trusted: true,
+            agents: &[],
         });
         assert!(prompt.contains("EXPLICIT IDENTITY"));
         assert!(
@@ -752,6 +978,7 @@ mod tests {
             skills: &[],
             has_read: true,
             project_trusted: false,
+            agents: &[],
         });
         assert!(prompt.contains("DEFAULT IDENTITY"));
         assert!(!prompt.contains("MALICIOUS OVERRIDE"));
@@ -782,6 +1009,7 @@ mod tests {
             skills: std::slice::from_ref(&skill),
             has_read: true,
             project_trusted: true,
+            agents: &[],
         });
         assert!(
             prompt.contains("already-discovered") && prompt.contains("found by the caller"),
@@ -813,6 +1041,7 @@ mod tests {
             skills: std::slice::from_ref(&skill),
             has_read: true,
             project_trusted: true,
+            agents: &[],
         });
         assert!(
             !prompt.contains("available_skills"),
@@ -843,6 +1072,7 @@ mod tests {
             skills: std::slice::from_ref(&skill),
             has_read: false,
             project_trusted: true,
+            agents: &[],
         });
         assert!(
             !prompt.contains("available_skills") && !prompt.contains("visible-but-unusable"),
@@ -866,6 +1096,7 @@ mod tests {
             skills: &[],
             has_read: true,
             project_trusted: true,
+            agents: &[],
         });
         assert!(prompt.contains("DEFAULT IDENTITY"));
         assert!(
@@ -890,6 +1121,7 @@ mod tests {
             skills: &[],
             has_read: true,
             project_trusted: false,
+            agents: &[],
         });
         assert!(!prompt.contains("MALICIOUS EXTRA RULES"));
     }
@@ -910,6 +1142,7 @@ mod tests {
             skills: &[],
             has_read: true,
             project_trusted: true,
+            agents: &[],
         });
         assert!(prompt.contains("CLI APPEND"));
         assert!(
@@ -979,6 +1212,7 @@ mod tests {
             skills: &[],
             has_read: true,
             project_trusted: false,
+            agents: &[],
         });
         assert!(prompt.contains("You are an agent."));
         assert!(prompt.contains("Stay terse."));
@@ -1007,6 +1241,7 @@ mod tests {
             skills: &[],
             has_read: true,
             project_trusted: false,
+            agents: &[],
         };
         let full = build_system_prompt(&opts);
         let static_part = build_static_system_prompt(&opts);
@@ -1036,6 +1271,7 @@ mod tests {
             skills: &[],
             has_read: true,
             project_trusted: false,
+            agents: &[],
         });
         assert!(!prompt.contains("<project_context>"));
     }

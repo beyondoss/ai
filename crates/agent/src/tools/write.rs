@@ -1,11 +1,28 @@
 //! `write` — create or overwrite a file (creating parent directories).
 
+use std::path::PathBuf;
+
 use agent_core::tool::Tool;
 use agent_core::{ToolError, ToolOutput};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-pub struct Write;
+#[derive(Default)]
+pub struct Write {
+    /// Relative `path` arguments resolve against this. Empty = the process cwd. See
+    /// [`super::resolve_against`].
+    root: PathBuf,
+}
+
+impl Write {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    fn resolve(&self, path: &str) -> String {
+        super::resolve_against(&self.root, path)
+    }
+}
 
 #[async_trait]
 impl Tool for Write {
@@ -30,8 +47,8 @@ impl Tool for Write {
         input
             .get("path")
             .and_then(Value::as_str)
-            .map(super::normalize_path)
-            .map(|p| super::canonical_write_target(&p))
+            .map(|p| self.resolve(p))
+            .map(|p| super::canonical_write_target(&self.root, &p))
     }
 
     async fn run(&self, input: Value) -> Result<ToolOutput, ToolError> {
@@ -39,7 +56,7 @@ impl Tool for Write {
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing `path`".into()))?;
-        let path = &super::normalize_path(path);
+        let path = &self.resolve(path);
         let content = input
             .get("content")
             .and_then(Value::as_str)
@@ -84,7 +101,7 @@ mod tests {
     async fn writes_and_creates_parents() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested/dir/file.txt");
-        let out = Write
+        let out = Write::default()
             .run(json!({ "path": path.to_str().unwrap(), "content": "hello" }))
             .await
             .unwrap()
@@ -101,7 +118,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("file.txt");
         let at_prefixed = format!("@{}", path.to_str().unwrap());
-        Write
+        Write::default()
             .run(json!({ "path": at_prefixed, "content": "hello" }))
             .await
             .unwrap();
@@ -117,10 +134,12 @@ mod tests {
         let path = dir.path().join("file.txt");
         std::fs::write(&path, "x").unwrap();
         let at_prefixed = format!("@{}", path.to_str().unwrap());
-        let plain = Write
+        let plain = Write::default()
             .write_target(&json!({ "path": path.to_str().unwrap() }))
             .unwrap();
-        let normalized = Write.write_target(&json!({ "path": at_prefixed })).unwrap();
+        let normalized = Write::default()
+            .write_target(&json!({ "path": at_prefixed }))
+            .unwrap();
         assert_eq!(plain, normalized);
     }
 
@@ -139,7 +158,7 @@ mod tests {
         perms.set_readonly(true);
         std::fs::set_permissions(&path, perms).unwrap();
 
-        let err = Write
+        let err = Write::default()
             .run(json!({ "path": path.to_str().unwrap(), "content": "new" }))
             .await
             .unwrap_err();
@@ -161,7 +180,10 @@ mod tests {
 
     #[tokio::test]
     async fn missing_content_is_invalid_input() {
-        let err = Write.run(json!({ "path": "/tmp/x" })).await.unwrap_err();
+        let err = Write::default()
+            .run(json!({ "path": "/tmp/x" }))
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput(_)));
     }
 
@@ -184,7 +206,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            Write.run(json!({ "path": fifo_path.to_str().unwrap(), "content": "x" })),
+            Write::default().run(json!({ "path": fifo_path.to_str().unwrap(), "content": "x" })),
         )
         .await
         .expect("write must reject a FIFO immediately, not hang");
@@ -197,7 +219,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("f.txt");
         std::fs::write(&path, "old contents").unwrap();
-        Write
+        Write::default()
             .run(json!({ "path": path.to_str().unwrap(), "content": "new" }))
             .await
             .unwrap();

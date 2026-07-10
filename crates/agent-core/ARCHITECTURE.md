@@ -585,6 +585,13 @@ Recoverable (no error): a streamed tool call whose JSON args never parse keeps i
 (with an empty `{}` input) and is fed back as an error `tool_result` the model can correct — the run
 continues rather than aborting.
 
+**Sink `Send` bound.** The event sink is bounded `FnMut(AgentEvent) + Send` (and `FnMut(&StreamEvent) +
+Send` for the stream-only entry points). The `+ Send` is what lets a *nested* agent run inside a
+`Tool::run` future — the `agent` crate's `subagent` tool drives a child `Agent` and awaits it directly,
+which requires the run future to be `Send`, which requires the sink to be. The loop's internal helpers
+hold the sink as `&mut (dyn FnMut(AgentEvent) + Send)` across `.await` for the same reason. Every
+existing sink (stdout writers, `serve`'s mpsc push, test collectors) is already `Send`.
+
 Dispatch gates on the presence of complete `tool_use` blocks alone (pi-parity fix) — never on
 `stop_reason` for any *other* value, which the diagram above no longer branches on. A `MaxTokens`-
 truncated turn that already emitted one or more complete tool calls before running out of room (the

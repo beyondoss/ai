@@ -62,21 +62,32 @@ pub struct Read {
     /// --no-image-auto-resize`/`agent settings --image-auto-resize false`) skips [`resize_image`]
     /// entirely and ships the normalized (format-converted, if a BMP) bytes as-is regardless of size,
     /// matching pi's `processImage`, which never calls `resizeImage` in that case either. Set once at
-    /// registry-construction time (see `default_registry_with_prefix_and_image_auto_resize` in
-    /// `tools/mod.rs`) rather than per-call — mirrors how `bash`'s own tunables (`default_timeout_ms`,
-    /// `shell_path`) are configured.
+    /// registry-construction time (see [`crate::tools::ToolConfig`]) rather than per-call — mirrors how
+    /// `bash`'s own tunables (`default_timeout_ms`, `shell_path`) are configured.
     image_auto_resize: bool,
+    /// Relative `path` arguments resolve against this. Empty = the process cwd. See
+    /// [`super::resolve_against`].
+    root: std::path::PathBuf,
 }
 
 impl Default for Read {
     fn default() -> Self {
         Self {
             image_auto_resize: true,
+            root: std::path::PathBuf::new(),
         }
     }
 }
 
 impl Read {
+    /// A `read` resolving relative paths against `root`. See [`super::resolve_against`].
+    pub fn new(root: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            ..Self::default()
+        }
+    }
+
     /// Builder-style: gate the resize/downscale path on `enabled` — see the field's own doc comment.
     pub fn with_image_auto_resize(mut self, enabled: bool) -> Self {
         self.image_auto_resize = enabled;
@@ -216,7 +227,7 @@ impl Tool for Read {
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing `path`".into()))?;
-        let path = resolve_read_path(&super::normalize_path(path));
+        let path = resolve_read_path(&super::resolve_against(&self.root, path));
         super::reject_non_regular_file(&path, "read")?;
 
         // Whether the active model can accept image input at all. `agent_core::tool::Tool::run` takes

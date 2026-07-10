@@ -2445,3 +2445,115 @@ async fn smoke_multi_attach_both_see_live_stream() {
         }
     }
 }
+
+/// Live: a real model delegates a file edit to a **worktree-isolated** subagent, and merge-back lands
+/// the change in the real tree. This is the only coverage where a real model *decides* to call
+/// `subagent` (the mock e2e tests script the call) and where the whole isolation path — worktree create,
+/// rooted child tools, `child_delta`, `git apply` — runs against a live model end to end.
+#[test]
+#[ignore = "live provider smoke; run via `mise run test:smoke:agent` with ANTHROPIC_API_KEY set"]
+fn smoke_subagent_worktree_merge_back() {
+    let Some(key) = env_key("ANTHROPIC_API_KEY") else {
+        eprintln!("smoke[subagent]: ANTHROPIC_API_KEY unset — skipping");
+        return;
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    // A real git repo with one commit (worktree isolation needs a HEAD).
+    for args in [
+        &["init", "--quiet", "-b", "main"][..],
+        &["config", "user.name", "t"],
+        &["config", "user.email", "t@t"],
+    ] {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .status()
+                .unwrap()
+                .success(),
+            "git {args:?} failed"
+        );
+    }
+    std::fs::write(repo.join("notes.txt"), "line one\n").unwrap();
+
+    // A worktree-isolated writer agent the model can delegate to.
+    let agents = repo.join(".claude/agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(
+        agents.join("writer.md"),
+        "---\nname: writer\ndescription: makes small, precise edits to files in this repo\ntools: read,edit,write,ls\nisolation: worktree\n---\n\
+         You are a careful file editor. Make exactly the change requested and nothing else, then report what you changed.\n",
+    )
+    .unwrap();
+
+    for args in [&["add", "-A"][..], &["commit", "--quiet", "-m", "init"]] {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .status()
+                .unwrap()
+                .success(),
+            "git {args:?} failed"
+        );
+    }
+
+    let (gw_port, mut gateway) = boot_gateway(repo, "anthropic", &key);
+    let output = Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+        .args([
+            "run",
+            "Delegate to the `writer` subagent: have it append a second line reading exactly \
+             SUBAGENT-WAS-HERE to notes.txt. Do not edit the file yourself — use the subagent tool.",
+            "--gateway-url",
+            &format!("http://127.0.0.1:{gw_port}"),
+            "--key",
+            DEV_TOKEN,
+            "--model",
+            "claude-haiku-4-5",
+            "--trust-project",
+            "--no-session-persistence",
+            "--max-steps",
+            "12",
+        ])
+        .current_dir(repo)
+        .output()
+        .expect("spawn agent");
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("--- subagent smoke stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
+    assert!(
+        output.status.success(),
+        "agent run failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    // The load-bearing assertion: the worktree child's edit was merged into the real tree.
+    let merged = std::fs::read_to_string(repo.join("notes.txt")).unwrap();
+    assert!(
+        merged.contains("SUBAGENT-WAS-HERE"),
+        "the worktree subagent's edit must be merged back into notes.txt.\nfile:\n{merged}"
+    );
+    assert!(
+        merged.contains("line one"),
+        "the original content must be preserved.\nfile:\n{merged}"
+    );
+
+    // No worktree left behind.
+    let listing = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "list"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&listing.stdout).lines().count(),
+        1,
+        "a clean-merged worktree must be removed"
+    );
+}

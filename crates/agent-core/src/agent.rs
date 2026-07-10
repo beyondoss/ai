@@ -525,7 +525,7 @@ impl Agent {
     /// without requesting tools, or errors with [`Error::MaxSteps`] if it never does.
     pub async fn run<F>(&self, session: &mut Session, mut on_event: F) -> Result<()>
     where
-        F: FnMut(&StreamEvent),
+        F: FnMut(&StreamEvent) + Send,
     {
         self.run_events(session, move |ev| {
             if let AgentEvent::Stream(s) = &ev {
@@ -545,7 +545,7 @@ impl Agent {
         cancel: CancellationToken,
     ) -> Result<()>
     where
-        F: FnMut(&StreamEvent),
+        F: FnMut(&StreamEvent) + Send,
     {
         self.run_events_cancellable(
             session,
@@ -564,7 +564,7 @@ impl Agent {
     /// its clients. Returns when the model ends its turn without tools, or [`Error::MaxSteps`].
     pub async fn run_events<F>(&self, session: &mut Session, sink: F) -> Result<()>
     where
-        F: FnMut(AgentEvent),
+        F: FnMut(AgentEvent) + Send,
     {
         // The plain entry point can't be cancelled; hand it a token that is never tripped.
         self.run_events_cancellable(session, sink, CancellationToken::new())
@@ -584,7 +584,7 @@ impl Agent {
         cancel: CancellationToken,
     ) -> Result<()>
     where
-        F: FnMut(AgentEvent),
+        F: FnMut(AgentEvent) + Send,
     {
         self.run_events_steered(session, sink, cancel, Steering::new())
             .await
@@ -613,7 +613,7 @@ impl Agent {
         steering: Steering,
     ) -> Result<()>
     where
-        F: FnMut(AgentEvent),
+        F: FnMut(AgentEvent) + Send,
     {
         // Every other interception point in this file (`before_tool_call`, `after_tool_call`,
         // `on_assistant_message`, `should_stop_after_turn`, `before_provider_request`/
@@ -1784,7 +1784,7 @@ impl Agent {
         calls: &[(String, String, Value)],
         malformed: &HashMap<String, String>,
         cancel: &CancellationToken,
-        sink: &mut dyn FnMut(AgentEvent),
+        sink: &mut (dyn FnMut(AgentEvent) + Send),
         tools: &ToolRegistry,
     ) -> (Vec<Option<ToolCallResult>>, bool) {
         let mut results: Vec<Option<ToolCallResult>> = vec![None; calls.len()];
@@ -1937,7 +1937,7 @@ impl Agent {
     async fn run_turn(
         &self,
         req: ModelRequest,
-        emit: &mut dyn FnMut(StreamEvent),
+        emit: &mut (dyn FnMut(StreamEvent) + Send),
         cancel: &CancellationToken,
         partial_out: &mut Option<Turn>,
     ) -> Result<Turn> {
@@ -1987,7 +1987,7 @@ impl Agent {
     async fn run_turn_once(
         &self,
         mut req: ModelRequest,
-        emit: &mut dyn FnMut(StreamEvent),
+        emit: &mut (dyn FnMut(StreamEvent) + Send),
         cancel: &CancellationToken,
         partial_out: &mut Option<Turn>,
     ) -> Result<Turn> {
@@ -2128,7 +2128,7 @@ impl Agent {
         session: &mut Session,
         reason: CompactionReason,
         cancel: &CancellationToken,
-        sink: &mut dyn FnMut(AgentEvent),
+        sink: &mut (dyn FnMut(AgentEvent) + Send),
         custom_instructions: Option<&str>,
     ) -> Result<CompactOutcome> {
         // `compact` is a public entry point in its own right (the manual `compact` RPC command calls
@@ -2310,7 +2310,7 @@ impl Agent {
         sink: &mut F,
     ) -> Result<()>
     where
-        F: FnMut(AgentEvent),
+        F: FnMut(AgentEvent) + Send,
     {
         match self.compact(session, reason, cancel, sink, None).await {
             Ok(_) => Ok(()),
@@ -2412,7 +2412,7 @@ fn turn_text(turn: &Turn) -> String {
 /// Turn one [`ToolUpdate`](crate::tool::ToolUpdate) from the per-turn progress channel into the
 /// matching [`AgentEvent`] and emit it — shared by the live-arriving path and the final flush of
 /// whatever was still buffered when the group stream finished.
-fn emit_tool_update(sink: &mut dyn FnMut(AgentEvent), update: crate::tool::ToolUpdate) {
+fn emit_tool_update(sink: &mut (dyn FnMut(AgentEvent) + Send), update: crate::tool::ToolUpdate) {
     match update {
         crate::tool::ToolUpdate::Progress {
             id,

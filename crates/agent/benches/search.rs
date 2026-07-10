@@ -194,7 +194,7 @@ fn ls_dir(bencher: Bencher) {
         .unwrap();
     bencher.bench_local(|| {
         let out = rt
-            .block_on(ls::Ls.run(serde_json::json!({ "path": path, "limit": 1000 })))
+            .block_on(ls::Ls::default().run(serde_json::json!({ "path": path, "limit": 1000 })))
             .unwrap();
         black_box(out.text.len());
     });

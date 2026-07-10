@@ -35,104 +35,6 @@ const DEFAULT_MODEL: &str = "claude-opus-4-8";
 /// Default gateway base URL.
 const DEFAULT_GATEWAY: &str = "http://ai.internal";
 
-/// The agent's base identity/instructions. The tool list is generated from `registry` — the tools this
-/// process actually registered, after any `--tools`/`--exclude-tools`/`--no-tools` filtering — rather
-/// than hand-listed as a static string or assumed to be the full default set. A prior hardcoded version
-/// silently omitted the Beyond platform tools (fork/sync/logs) entirely, and a version that always
-/// listed `default_registry()` regardless of filtering would claim tools a restricted agent doesn't
-/// actually have, inviting the model to call one that gets rejected.
-/// `extra_guidelines` are operator-supplied bullets (`--prompt-guideline`, repeatable) appended after
-/// the built-in ones — pi's own `promptGuidelines` (deduplicated and trimmed, matching pi's
-/// `buildSystemPrompt`). Deliberately *not* a full port of pi's system prompt: pi also renders a
-/// redundant per-tool text snippet list ("Available tools:\n- bash: Execute bash commands...")
-/// alongside the native tool-call JSON schema already describing each tool to the model — the same
-/// information twice, in two different places the model reads. This function's own dynamic tool-name
-/// listing (`Use them to accomplish...with tools: {names}`) already avoids that duplication, so only
-/// the genuinely useful, non-redundant half of pi's feature is ported here: the guideline-bullet
-/// mechanism itself, including its one built-in conditional (`bash` registered but none of its usual
-/// companions).
-fn default_system_prompt(
-    registry: &agent_core::ToolRegistry,
-    extra_guidelines: &[String],
-) -> String {
-    let names: Vec<String> = registry.definitions().into_iter().map(|d| d.name).collect();
-    let has = |n: &str| names.iter().any(|x| x == n);
-
-    let mut guidelines: Vec<String> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    let add =
-        |g: String, guidelines: &mut Vec<String>, seen: &mut std::collections::HashSet<String>| {
-            if seen.insert(g.clone()) {
-                guidelines.push(g);
-            }
-        };
-    // Matches pi's own conditional exactly: when `bash` is the only exploration tool registered (none
-    // of `grep`/`find`/`ls`), the model needs to be told it's the fallback for those operations too.
-    if has("bash") && !has("grep") && !has("find") && !has("ls") {
-        add(
-            "Use bash for file operations like ls, rg, find".to_string(),
-            &mut guidelines,
-            &mut seen,
-        );
-    }
-    // pi's own per-tool `promptGuidelines` (`read.ts`/`edit.ts`/`write.ts`) — declared on the tool
-    // definition itself and collected from whatever's actually registered. Adapted, not ported
-    // verbatim: pi's edit tool takes an `edits[].oldText`/`newText` array, ours takes `edits[].old_string`/
-    // `new_string` (see `tools/edit.rs`'s own schema) — porting pi's exact field names would tell the
-    // model to look for parameters that don't exist on our tool. `bash`/`grep`/`find`/`ls` carry no
-    // `promptGuidelines` on pi's side, so there's nothing to port for those.
-    if has("read") {
-        add(
-            "Use read to examine files instead of cat or sed.".to_string(),
-            &mut guidelines,
-            &mut seen,
-        );
-    }
-    if has("edit") {
-        for g in [
-            "Use edit for precise changes (edits[].old_string must match exactly)",
-            "When changing multiple separate locations in one file, use one edit call with multiple \
-             entries in edits[] instead of multiple edit calls",
-            "Each edits[].old_string is matched against the original file, not after earlier edits are \
-             applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
-            "Keep edits[].old_string as small as possible while still being unique in the file. Do not \
-             pad with large unchanged regions.",
-        ] {
-            add(g.to_string(), &mut guidelines, &mut seen);
-        }
-    }
-    if has("write") {
-        add(
-            "Use write only for new files or complete rewrites.".to_string(),
-            &mut guidelines,
-            &mut seen,
-        );
-    }
-    for g in extra_guidelines {
-        let g = g.trim();
-        if !g.is_empty() {
-            add(g.to_string(), &mut guidelines, &mut seen);
-        }
-    }
-    add(
-        "Show file paths clearly when working with files".to_string(),
-        &mut guidelines,
-        &mut seen,
-    );
-    let guidelines = guidelines
-        .into_iter()
-        .map(|g| format!("- {g}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    format!(
-        "You are the Beyond coding agent. You operate inside a real working directory with tools: {}. \
-         Use them to accomplish the user's task directly — inspect before you change, make minimal \
-         edits, and verify your work. Be concise.\n\nGuidelines:\n{guidelines}",
-        names.join(", ")
-    )
-}
-
 /// Parse `--reasoning-effort`'s value into the wire-neutral [`agent_core::ThinkingLevel`] — the same
 /// off-inclusive portable depth `--model <pattern>:<level>`'s suffix and the RPC-facing
 /// `set_reasoning_effort`/`set_thinking` commands already parse via `ThinkingLevel::parse`. Task 2
@@ -215,6 +117,50 @@ fn unknown_provider_error(provider: &str) -> String {
     format!(
         "unknown provider {provider:?}; expected one of: anthropic, github-copilot, openai-codex"
     )
+}
+
+/// The `run` path's per-model client construction, factored out so a **subagent** can build a
+/// transport for a child that names its own `model:`. Credentials and routing are model-keyed
+/// (`resolve_gateway_credential`, never cached across a model switch), so a child on a different model
+/// cannot reuse the parent's transport — it must re-resolve from the raw key and rebuild. Mirrors the
+/// parent build in `run_task` exactly (retry, header override, backoff, idle timeout); keep the two in
+/// step. Returns `String` errors because that's what [`tools::subagent::TransportFactory`] wants.
+#[allow(clippy::too_many_arguments)]
+fn build_run_gateway_client(
+    raw_key: Option<String>,
+    gateway: &str,
+    model: &str,
+    retry_max_retries: Option<u32>,
+    retry_base_delay_ms: Option<u64>,
+    retry_max_backoff_ms: Option<u64>,
+    idle_timeout_ms: Option<u64>,
+) -> Result<GatewayClient, String> {
+    let credential = resolve_gateway_credential(raw_key, model)?;
+    let mut client = match credential {
+        GatewayCredential::Static(key) => {
+            GatewayClient::new(gateway.to_string(), key).map_err(|e| e.to_string())?
+        }
+        GatewayCredential::Oauth(source) => {
+            GatewayClient::with_credential_source(gateway.to_string(), source)
+                .map_err(|e| e.to_string())?
+        }
+    }
+    .with_retry(
+        retry_max_retries.unwrap_or(agent_core::client::MAX_RETRIES),
+        retry_base_delay_ms
+            .map(std::time::Duration::from_millis)
+            .unwrap_or(agent_core::client::BASE_BACKOFF),
+    )
+    .with_extra_headers(model_override_extra_headers(model));
+    if let Some(ms) = retry_max_backoff_ms {
+        client = client.with_max_backoff(std::time::Duration::from_millis(ms));
+    }
+    if let Some(ms) = idle_timeout_ms {
+        client = client
+            .with_idle_timeout(std::time::Duration::from_millis(ms))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(client)
 }
 
 /// Drives `agent login`'s interactive prompts over stderr/stdin — the CLI's one implementation of
@@ -1652,7 +1598,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         exclude_tools.as_deref(),
                         no_tools,
                     );
-                    default_system_prompt(&reg, &prompt_guidelines)
+                    beyond_ai_agent::resources::default_system_prompt(&reg, &prompt_guidelines)
                 });
             // `--append-system-prompt` is repeatable (pi-parity fix: previously a second occurrence
             // silently clobbered the first instead of accumulating) — each occurrence is resolved
@@ -1892,6 +1838,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 exclude_tools,
                 no_tools,
                 mcp_tools,
+                // Discovered by `serve_session` itself, after it resolves project trust (a project-local
+                // definition is trust-gated, like a skill) — not here, where the interactive trust grant
+                // hasn't happened yet.
+                agents: Vec::new(),
                 sequential_tools,
                 deny_tool,
                 deny_bash_pattern,
@@ -3282,6 +3232,9 @@ async fn run_task(
     // `model`/`model_thinking_level` were already fully resolved above (before the `@file` composition
     // block), so `read_file_refs` could see the model's real `supports_vision` capability — see that
     // resolution's own doc comment (Task 3, pi-parity fix, pass 19).
+    // Captured before the shadowing below turns `key` into a resolved `GatewayCredential` — the
+    // subagent factory needs the *raw* key to re-resolve for a child model (credentials are model-keyed).
+    let raw_gateway_key = key.clone();
     let key = resolve_gateway_credential(key, &model)?;
     // Task #29 (pi-parity fix): whether the operator explicitly requested a specific reasoning depth
     // for *this* invocation — an explicit `--reasoning-effort` flag, or a `--model <pattern>:<level>`
@@ -3425,19 +3378,80 @@ async fn run_task(
         eprintln!("warning: {warning}");
     }
     timing.mark("connect mcp servers");
-    let mut registry = tools::default_registry_with_prefix_image_auto_resize_and_mcp_tools(
+    let mut registry = tools::default_registry_with_config(&tools::ToolConfig {
         bash_timeout_ms,
-        bash_shell_path.as_deref(),
-        bash_command_prefix.as_deref(),
+        bash_shell_path: bash_shell_path.as_deref(),
+        bash_command_prefix: bash_command_prefix.as_deref(),
         image_auto_resize,
-        &mcp_tools,
-    );
+        mcp_tools: &mcp_tools,
+        ..tools::ToolConfig::new()
+    });
     tools::apply_filter(
         &mut registry,
         tools_allow.as_deref(),
         tools_exclude.as_deref(),
         no_tools,
     );
+
+    // Subagents. A shared write-lock registry (rather than `Agent::new`'s private default) so the parent
+    // and every child serialize same-path writes against each other. Registered only when at least one
+    // agent definition exists — a `subagent` tool with no agents to call is dead weight in the prompt.
+    let write_locks = Arc::new(agent_core::WriteLockRegistry::new());
+    beyond_ai_agent::worktree::sweep(&cwd); // reap any worktree orphaned by a previous crash
+    let agent_defs = beyond_ai_agent::agents::discover(&cwd, project_trusted);
+    if !agent_defs.is_empty() {
+        use beyond_ai_agent::tools::subagent;
+        // `parent_tools` is what a child with no `tools:` of its own inherits — the parent's effective
+        // set minus `subagent` itself, so a restricted parent can't spawn a fully-armed child.
+        let parent_tools: Vec<String> = registry
+            .definitions()
+            .into_iter()
+            .map(|d| d.name)
+            .filter(|n| n != subagent::NAME)
+            .collect();
+        // The factory re-resolves credentials per child model (they're model-keyed). Captures the raw
+        // key and the parent's retry/timeout knobs, mirroring the parent client build below.
+        let raw_key = raw_gateway_key.clone();
+        let gateway_for_factory = gateway.clone();
+        let factory: subagent::TransportFactory = Arc::new(move |m: &str| {
+            build_run_gateway_client(
+                raw_key.clone(),
+                &gateway_for_factory,
+                m,
+                retry_max_retries,
+                retry_base_delay_ms,
+                retry_max_backoff_ms,
+                idle_timeout_ms,
+            )
+            .map(|c| Arc::new(c) as Arc<dyn agent_core::ModelTransport>)
+        });
+        let ctx = Arc::new(subagent::SubagentCtx {
+            factory,
+            agents: Arc::new(agent_defs.clone()),
+            skills: Arc::new(skills.clone()),
+            write_locks: write_locks.clone(),
+            mcp_tools: mcp_tools.clone(),
+            tool_cfg: subagent::ChildToolConfig {
+                bash_timeout_ms,
+                bash_shell_path: bash_shell_path.clone(),
+                bash_command_prefix: bash_command_prefix.clone(),
+                image_auto_resize,
+            },
+            cwd: cwd.clone(),
+            project_trusted,
+            prompt_guidelines: prompt_guidelines.clone(),
+            parent_model: model.clone(),
+            parent_cache_key: model.clone(),
+            parent_tools,
+            deny_tool: deny_tool.clone(),
+            deny_bash_pattern: deny_bash_pattern.clone(),
+            deny_path: deny_path.clone(),
+            child_max_steps: subagent::DEFAULT_CHILD_MAX_STEPS,
+            max_depth: subagent::DEFAULT_MAX_DEPTH,
+        });
+        registry.register(Arc::new(subagent::Subagent::new(ctx)));
+    }
+
     // `--system-prompt`/`--append-system-prompt` may each name an existing, readable file instead of
     // literal text (pi-parity fix — matches pi's own `resolvePromptInput`); resolved once, here, rather
     // than re-deriving it at each of the several places downstream that would otherwise need to repeat
@@ -3457,7 +3471,8 @@ async fn run_task(
     // `build_system_prompt` can tell "an explicit override was given" apart from "nothing given, use the
     // built-in default" — an explicit flag must win outright over a trusted project's on-disk
     // `SYSTEM.md`, which previously always won regardless (pi-parity fix).
-    let default_base = default_system_prompt(&registry, &prompt_guidelines);
+    let default_base =
+        beyond_ai_agent::resources::default_system_prompt(&registry, &prompt_guidelines);
     // Skills are discovered by path, not inlined into the prompt — invoking one relies on the model
     // being able to open its `SKILL.md` itself, so advertising them at all when `read` isn't registered
     // (a restricted `--tools`/`--exclude-tools` invocation) just adds dead weight (pi-parity fix).
@@ -3472,6 +3487,7 @@ async fn run_task(
             skills: &skills,
             has_read,
             project_trusted,
+            agents: &agent_defs,
         },
     );
     timing.mark("build system prompt");
@@ -3721,6 +3737,9 @@ async fn run_task(
         .with_cache_long(cache_long)
         .with_sequential_tools(sequential_tools)
         .with_cache_key(meta.id.clone())
+        // Shared with every subagent (see the `write_locks` construction above) so the parent's own
+        // edits and a child's serialize on the same path.
+        .with_write_locks(write_locks.clone())
         .with_checkpoint_hook(Arc::new(DirectCheckpoint(store.clone())));
     // Task #31 (pi-parity feature): independent of `compaction_reserve_tokens` above — see
     // `agent_core::Agent::with_branch_summary_reserve_tokens`'s own doc comment.
@@ -4269,6 +4288,7 @@ mod tests {
         /// willing to wait.
         struct GatedWrite {
             started: tokio::sync::watch::Sender<bool>,
+            inner: tools::write::Write,
         }
         #[async_trait]
         impl agent_core::tool::Tool for GatedWrite {
@@ -4279,10 +4299,10 @@ mod tests {
                 "gated write (test double delegating to the real `write` tool's schema/write_target)"
             }
             fn input_schema(&self) -> serde_json::Value {
-                tools::write::Write.input_schema()
+                self.inner.input_schema()
             }
             fn write_target(&self, input: &serde_json::Value) -> Option<String> {
-                tools::write::Write.write_target(input)
+                self.inner.write_target(input)
             }
             async fn run(
                 &self,
@@ -4299,8 +4319,12 @@ mod tests {
         /// The real `write` tool, plus a `started` signal fired the instant its `run` actually begins
         /// — i.e. the instant it has already acquired the write lock — so the test can tell "blocked,
         /// still waiting on the lock" apart from "running".
+        ///
+        /// Holds the real tool rather than constructing one per call: `Tool::description` returns a
+        /// `&str` borrowed from `&self`, so it has nothing to borrow from a temporary.
         struct ObservedWrite {
             started: Arc<tokio::sync::Notify>,
+            inner: tools::write::Write,
         }
         #[async_trait]
         impl agent_core::tool::Tool for ObservedWrite {
@@ -4308,20 +4332,20 @@ mod tests {
                 "write"
             }
             fn description(&self) -> &str {
-                tools::write::Write.description()
+                self.inner.description()
             }
             fn input_schema(&self) -> serde_json::Value {
-                tools::write::Write.input_schema()
+                self.inner.input_schema()
             }
             fn write_target(&self, input: &serde_json::Value) -> Option<String> {
-                tools::write::Write.write_target(input)
+                self.inner.write_target(input)
             }
             async fn run(
                 &self,
                 input: serde_json::Value,
             ) -> std::result::Result<ToolOutput, agent_core::ToolError> {
                 self.started.notify_one();
-                tools::write::Write.run(input).await
+                self.inner.run(input).await
             }
         }
 
@@ -4336,6 +4360,7 @@ mod tests {
         let mut tools_a = ToolRegistry::new();
         tools_a.register(Arc::new(GatedWrite {
             started: a_started_tx,
+            inner: tools::write::Write::default(),
         }));
         let write_args_a =
             serde_json::json!({ "path": target.to_str().unwrap(), "content": "first\n" })
@@ -4364,6 +4389,7 @@ mod tests {
         let mut tools_b = ToolRegistry::new();
         tools_b.register(Arc::new(ObservedWrite {
             started: b_started.clone(),
+            inner: tools::write::Write::default(),
         }));
         let write_args_b =
             serde_json::json!({ "path": target.to_str().unwrap(), "content": "second\n" })
@@ -4547,116 +4573,6 @@ mod tests {
         // Only agent_core's own internal (mid-stream) retries ran; our whole-run wrapper made no
         // second attempt at all, so the final scripted (would-have-succeeded) turn was never reached.
         assert_eq!(transport.calls(), INNER_RETRY_ATTEMPTS);
-    }
-
-    #[test]
-    fn default_system_prompt_lists_every_registered_tool() {
-        // The whole point of generating this dynamically: it can't silently omit a tool the way the
-        // prior hardcoded string did (it never mentioned the Beyond platform tools at all).
-        let registry = tools::default_registry();
-        let prompt = default_system_prompt(&registry, &[]);
-        for def in tools::default_registry().definitions() {
-            assert!(
-                prompt.contains(&def.name),
-                "system prompt is missing registered tool {:?}: {prompt}",
-                def.name
-            );
-        }
-    }
-
-    #[test]
-    fn default_system_prompt_reflects_a_restricted_registry() {
-        // A tool-restricted agent's own system prompt must not claim tools it doesn't actually have —
-        // otherwise the model is invited to call one that's guaranteed to be rejected.
-        let mut registry = tools::default_registry();
-        tools::apply_filter(&mut registry, None, Some(&["bash".to_string()]), false);
-        let prompt = default_system_prompt(&registry, &[]);
-        assert!(!prompt.contains("bash"));
-        assert!(prompt.contains("read"));
-    }
-
-    #[test]
-    fn default_system_prompt_always_shows_the_file_paths_guideline() {
-        // pi: system-prompt.test.ts, "shows file paths guideline even with no tools" — a built-in
-        // guideline, always present regardless of the tool set (unlike the conditional bash one below).
-        let registry = tools::default_registry();
-        let prompt = default_system_prompt(&registry, &[]);
-        assert!(prompt.contains("Show file paths clearly when working with files"));
-    }
-
-    #[test]
-    fn default_system_prompt_tells_the_model_to_use_bash_for_exploration_without_grep_find_ls() {
-        // pi: the one built-in conditional guideline — only fires when `bash` is registered but none
-        // of its usual companions are, since the model then has no other way to explore the filesystem.
-        let mut only_bash = agent_core::tool::ToolRegistry::new();
-        only_bash.register(std::sync::Arc::new(tools::bash::Bash::real()));
-        let prompt = default_system_prompt(&only_bash, &[]);
-        assert!(prompt.contains("Use bash for file operations like ls, rg, find"));
-
-        // The guideline must not fire when grep/find/ls are also registered — bash isn't the only
-        // exploration tool anymore.
-        let full = tools::default_registry();
-        let prompt = default_system_prompt(&full, &[]);
-        assert!(!prompt.contains("Use bash for file operations like ls, rg, find"));
-    }
-
-    #[test]
-    fn default_system_prompt_includes_pis_per_tool_guidelines_for_read_edit_write() {
-        // pi-parity fix: pi declares real default guidance on its read/edit/write tool definitions
-        // (`promptGuidelines`), collected automatically whenever the tool is registered — we ported
-        // only the operator-typed `--prompt-guideline` mechanism, not this content, so a model never
-        // got told (for example) edit's exact-match/non-overlapping-edit semantics unless an operator
-        // happened to type the same guidance in by hand.
-        let registry = tools::default_registry();
-        let prompt = default_system_prompt(&registry, &[]);
-        assert!(
-            prompt.contains("Use read to examine files instead of cat or sed."),
-            "got: {prompt}"
-        );
-        assert!(
-            prompt.contains("Use edit for precise changes (edits[].old_string must match exactly)"),
-            "got: {prompt}"
-        );
-        assert!(
-            prompt.contains("Keep edits[].old_string as small as possible"),
-            "got: {prompt}"
-        );
-        assert!(
-            prompt.contains("Use write only for new files or complete rewrites."),
-            "got: {prompt}"
-        );
-    }
-
-    #[test]
-    fn default_system_prompt_omits_a_tools_guidelines_when_the_tool_is_not_registered() {
-        let mut only_bash = agent_core::tool::ToolRegistry::new();
-        only_bash.register(std::sync::Arc::new(tools::bash::Bash::real()));
-        let prompt = default_system_prompt(&only_bash, &[]);
-        assert!(!prompt.contains("Use read to examine files"));
-        assert!(!prompt.contains("Use edit for precise changes"));
-        assert!(!prompt.contains("Use write only for new files"));
-    }
-
-    #[test]
-    fn default_system_prompt_appends_and_dedupes_extra_guidelines() {
-        // pi: system-prompt.test.ts, "appends promptGuidelines to default guidelines" /
-        // "deduplicates and trims promptGuidelines".
-        let registry = tools::default_registry();
-        let prompt = default_system_prompt(
-            &registry,
-            &[
-                "Use dynamic_tool for project summaries.".to_string(),
-                "  Use dynamic_tool for project summaries.  ".to_string(),
-                "   ".to_string(),
-            ],
-        );
-        assert_eq!(
-            prompt
-                .matches("- Use dynamic_tool for project summaries.")
-                .count(),
-            1,
-            "got: {prompt}"
-        );
     }
 
     #[test]

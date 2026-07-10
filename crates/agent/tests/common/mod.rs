@@ -157,6 +157,49 @@ pub fn spawn_model_server(responses: Vec<String>) -> (String, Arc<Mutex<Vec<Stri
     (format!("http://{addr}"), requests)
 }
 
+/// A model server that picks its reply by matching a substring against each request's body, rather than
+/// answering in arrival order. This is what parallel `subagent` tests need: several children hit the
+/// server concurrently in a nondeterministic order, so [`spawn_model_server`]'s strict FIFO queue would
+/// hand child A's reply to child B. Each `routes` entry is `(needle, sse_response)`; the first entry
+/// whose `needle` appears anywhere in the raw request wins. An unmatched request gets `fallback`.
+///
+/// A route may be used any number of times (a retry, or two children with the same marker), so this
+/// serves an unbounded number of requests until the listener is dropped. Records every raw request.
+pub fn spawn_model_server_routed(
+    routes: Vec<(String, String)>,
+    fallback: String,
+) -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let recorder = requests.clone();
+    thread::spawn(move || {
+        // Each accepted connection is served on its own thread so concurrent children don't serialize
+        // behind one another (a slow child must not block a fast sibling's reply).
+        for conn in listener.incoming() {
+            let Ok(mut stream) = conn else { break };
+            let routes = routes.clone();
+            let fallback = fallback.clone();
+            let recorder = recorder.clone();
+            thread::spawn(move || {
+                let req = read_http_request(&mut stream);
+                let resp = routes
+                    .iter()
+                    .find(|(needle, _)| req.contains(needle.as_str()))
+                    .map(|(_, r)| r.clone())
+                    .unwrap_or(fallback);
+                recorder.lock().unwrap().push(req);
+                let http = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{resp}"
+                );
+                let _ = stream.write_all(http.as_bytes());
+                let _ = stream.flush();
+            });
+        }
+    });
+    (format!("http://{addr}"), requests)
+}
+
 /// A model server whose first `fast.len()` requests get an instant response, and whose next request
 /// (e.g. the summarization call a `switch_branch{summarize:true}` triggers, or a plain `prompt`'s own
 /// model call) sends only a partial SSE body — proving the request genuinely reached the server and

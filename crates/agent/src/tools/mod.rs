@@ -3,6 +3,7 @@
 //! Each tool implements [`agent_core::Tool`]; [`default_registry`] assembles the set the agent
 //! advertises to the model. The Beyond platform tools (fork/sync/logs) register here too once added.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agent_core::{Tool, ToolError, ToolRegistry};
@@ -17,6 +18,7 @@ pub mod ls;
 pub mod mcp;
 pub mod output;
 pub mod read;
+pub mod subagent;
 pub mod write;
 
 /// Normalize a filesystem tool's `path` argument the way `bash` gets for free from the real shell it
@@ -250,15 +252,24 @@ fn temp_suffix() -> String {
 /// Never fails outright: a pathological input (e.g. one that can't even be joined) falls back to the
 /// original string unchanged, which only degrades grouping (calls that should serialize might not) —
 /// strictly no worse than today's un-canonicalized behavior, never a new correctness hazard.
-pub(crate) fn canonical_write_target(path: &str) -> String {
+///
+/// `root` is the tool's configured root (see [`resolve_against`]); a relative `path` is keyed against it
+/// rather than against the *process* cwd. This is what makes two subagents running in separate git
+/// worktrees, each editing `src/lib.rs`, resolve to two different keys — as they must, since those are
+/// two different files. Keying both against one process-wide cwd would serialize them against each other
+/// for no reason, and (worse) a shared `WriteLockRegistry` would report them as the same file. An empty
+/// `root` means "the process cwd", preserving the pre-root behavior exactly.
+pub(crate) fn canonical_write_target(root: &Path, path: &str) -> String {
     if let Ok(real) = std::fs::canonicalize(path) {
         return real.display().to_string();
     }
     let p = std::path::Path::new(path);
     let mut normalized = if p.is_absolute() {
-        std::path::PathBuf::new()
-    } else {
+        PathBuf::new()
+    } else if root.as_os_str().is_empty() {
         std::env::current_dir().unwrap_or_default()
+    } else {
+        root.to_path_buf()
     };
     for component in p.components() {
         match component {
@@ -270,6 +281,32 @@ pub(crate) fn canonical_write_target(path: &str) -> String {
         }
     }
     normalized.display().to_string()
+}
+
+/// Resolve a model-supplied `path` argument against a filesystem tool's configured `root`: normalize it
+/// ([`normalize_path`] — `~`, `file://`, a leading `@`, folded Unicode spaces), then, if it is still
+/// *relative*, join it onto `root`.
+///
+/// This is the seam that makes a per-child working directory possible at all. `read`/`write`/`edit` take
+/// whatever path the model names and hand it straight to `std::fs`, and `ls`/`grep`/`find` default their
+/// `path` to `"."` — so before this, every relative path resolved against the one *process-wide* cwd, and
+/// `std::env::set_current_dir` is not an option (it's process-global, and this crate deliberately avoids
+/// it; see `bash`'s own per-call `cwd` instead).
+///
+/// **An empty `root` means "the process cwd"**: the path is returned still-relative and the OS resolves
+/// it, exactly as before this function existed. That is `Default`'s value for every tool, so a registry
+/// built without an explicit root behaves identically to the pre-root code.
+///
+/// This is *not* containment. An absolute path is returned untouched, so a child can still name a file
+/// outside its root — the same contract Claude Code's `isolation: "worktree"` and pi's subagent `cwd`
+/// offer. The guarantee is that two cooperating children fanned out in parallel don't silently stomp each
+/// other, not that a determined one is jailed.
+pub(crate) fn resolve_against(root: &Path, path: &str) -> String {
+    let normalized = normalize_path(path);
+    if root.as_os_str().is_empty() || Path::new(&normalized).is_absolute() {
+        return normalized;
+    }
+    root.join(&normalized).display().to_string()
 }
 
 /// Reject any resolved path that isn't a regular file or a directory, *before* a caller ever opens it —
@@ -347,111 +384,113 @@ pub(crate) fn is_writable(path: &str) -> bool {
     }
 }
 
-/// The default tool set: pi's seven coding tools (read, write, edit, bash, ls, grep, find) plus the
-/// Beyond platform tools (fork, sync, logs).
-pub fn default_registry() -> ToolRegistry {
-    default_registry_with(None, None)
+/// Everything [`default_registry_with_config`] needs to build the tool set.
+///
+/// This replaces what used to be a ladder of five `default_registry_with_prefix_and_…` functions, each
+/// adding one positional knob and delegating down. That convention stopped paying for itself at
+/// `default_registry_with_prefix_image_auto_resize_and_mcp_tools`: a sixth knob (`root`, which subagents
+/// need) would have meant a sixth name and a sixth wrapper, for two real production call sites
+/// (`main.rs::run_task` and `serve.rs::build_tools`). `Default` + struct-update syntax gives every
+/// caller the same "only name what you override" ergonomics the ladder existed to provide.
+#[derive(Default)]
+pub struct ToolConfig<'a> {
+    /// `bash`'s default timeout, applied when the model omits `timeout_ms` (`--bash-timeout-ms`).
+    pub bash_timeout_ms: Option<u64>,
+    /// Which shell `bash` runs commands through (`--bash-shell-path`). Trusted as already validated at
+    /// CLI-argument time rather than re-checked on every registry rebuild (`set_model` rebuilds).
+    pub bash_shell_path: Option<&'a str>,
+    /// A line prepended to every `bash` command in the same shell invocation
+    /// (`--bash-command-prefix`, matching pi's `shellCommandPrefix`).
+    pub bash_command_prefix: Option<&'a str>,
+    /// Whether `read` downscales an oversized image to fit the inline budget (pi's
+    /// `ImageSettings.autoResize`). `Default` is `false` here but every constructor below sets it
+    /// `true` — see [`ToolConfig::new`], which is the only way this struct should be built.
+    pub image_auto_resize: bool,
+    /// The directory every filesystem tool resolves a *relative* path against, and `bash`'s default
+    /// `cwd`. **Empty means "the process cwd"** — the pre-root behavior — which is what `default_registry`
+    /// and every test that doesn't care about roots gets. A subagent running under `isolation: worktree`
+    /// passes its worktree here. See [`resolve_against`].
+    pub root: PathBuf,
+    /// Already-connected tools from configured MCP servers (see [`mcp::connect_all`]), registered after
+    /// every built-in so an allow/deny filter scopes them too.
+    ///
+    /// Already-resolved, not a list of servers to connect: connecting is async (a process spawn / HTTP
+    /// connection plus a `tools/list` round trip) while this whole construction path is deliberately
+    /// synchronous (see `tools::mcp`'s module doc). Each call site connects once at startup and passes
+    /// the resulting `Arc`s in on every rebuild, so a `serve` rebuild reuses live connections rather
+    /// than reconnecting to every server.
+    pub mcp_tools: &'a [Arc<dyn Tool>],
 }
 
-/// Like [`default_registry`], overriding `bash`'s default timeout (applied when the model omits
-/// `timeout_ms`) when `bash_timeout_ms` is `Some`, and/or which shell it runs commands through when
-/// `bash_shell_path` is `Some` — operator-tunable knobs (`--bash-timeout-ms`/`--bash-shell-path`),
-/// distinct from `default_registry`'s fixed defaults so callers that don't need either override (the
-/// `tools` listing command, tests) don't have to pass one. `bash_shell_path` is trusted as already
-/// validated (see `--bash-shell-path` in `main.rs`, checked once at CLI-argument time) rather than
-/// re-checked on every rebuild this feeds (`set_model`/`set_thinking` each rebuild the registry).
+impl<'a> ToolConfig<'a> {
+    /// A config with the production defaults: image auto-resize on, root = the process cwd, no bash
+    /// overrides, no MCP tools. Prefer this over `ToolConfig::default()` — `image_auto_resize` derives
+    /// to `false`, which is *not* the default the CLI or `serve` want.
+    pub fn new() -> Self {
+        Self {
+            image_auto_resize: true,
+            ..Self::default()
+        }
+    }
+
+    /// Set the filesystem root every tool resolves relative paths against. See [`ToolConfig::root`].
+    pub fn with_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.root = root.into();
+        self
+    }
+}
+
+/// The default tool set: pi's seven coding tools (read, write, edit, bash, ls, grep, find) plus the
+/// Beyond platform tools (fork, sync, logs), with production defaults and no root (process cwd).
+pub fn default_registry() -> ToolRegistry {
+    default_registry_with_config(&ToolConfig::new())
+}
+
+/// Like [`default_registry`], overriding `bash`'s default timeout and/or shell — the two knobs enough
+/// callers (tests, `serve_tools_bash.rs`) want on their own to be worth a shorthand over building a
+/// whole [`ToolConfig`].
 pub fn default_registry_with(
     bash_timeout_ms: Option<u64>,
     bash_shell_path: Option<&str>,
 ) -> ToolRegistry {
-    default_registry_with_prefix(bash_timeout_ms, bash_shell_path, None)
-}
-
-/// Like [`default_registry_with`], plus an optional line prepended to every `bash` command in the same
-/// shell invocation (`--bash-command-prefix`/`AI_AGENT_BASH_COMMAND_PREFIX`, matching pi's own
-/// `shellCommandPrefix` setting) — split out as its own function rather than a third parameter on the
-/// widely-called `default_registry_with` so every existing two-argument call site (tests included) stays
-/// unchanged. `read`'s image auto-resize defaults on (see
-/// [`default_registry_with_prefix_and_image_auto_resize`] for a caller that needs to turn it off).
-pub fn default_registry_with_prefix(
-    bash_timeout_ms: Option<u64>,
-    bash_shell_path: Option<&str>,
-    bash_command_prefix: Option<&str>,
-) -> ToolRegistry {
-    default_registry_with_prefix_and_image_auto_resize(
+    default_registry_with_config(&ToolConfig {
         bash_timeout_ms,
         bash_shell_path,
-        bash_command_prefix,
-        true,
-    )
+        ..ToolConfig::new()
+    })
 }
 
-/// Like [`default_registry_with_prefix`], additionally gating `read`'s image resize/downscale path on
-/// `image_auto_resize` (pi's `ImageSettings.autoResize`, `--no-image-auto-resize`/
-/// `agent settings --image-auto-resize`) — split out as its own function, rather than a fourth
-/// parameter on `default_registry_with_prefix` itself, so that function's existing call sites are
-/// unaffected by this addition.
-pub fn default_registry_with_prefix_and_image_auto_resize(
-    bash_timeout_ms: Option<u64>,
-    bash_shell_path: Option<&str>,
-    bash_command_prefix: Option<&str>,
-    image_auto_resize: bool,
-) -> ToolRegistry {
+/// Assemble the tool set described by `cfg`. The one real constructor; everything else here is a
+/// shorthand over it.
+pub fn default_registry_with_config(cfg: &ToolConfig<'_>) -> ToolRegistry {
+    let root = cfg.root.as_path();
     let mut reg = ToolRegistry::new();
     reg.register(Arc::new(
-        read::Read::default().with_image_auto_resize(image_auto_resize),
+        read::Read::new(root).with_image_auto_resize(cfg.image_auto_resize),
     ));
-    reg.register(Arc::new(write::Write));
-    reg.register(Arc::new(edit::Edit));
-    reg.register(Arc::new(ls::Ls));
-    reg.register(Arc::new(grep::Grep));
-    reg.register(Arc::new(find::Find));
-    let mut bash = match bash_timeout_ms {
+    reg.register(Arc::new(write::Write::new(root)));
+    reg.register(Arc::new(edit::Edit::new(root)));
+    reg.register(Arc::new(ls::Ls::new(root)));
+    reg.register(Arc::new(grep::Grep::new(root)));
+    reg.register(Arc::new(find::Find::new(root)));
+    let mut bash = match cfg.bash_timeout_ms {
         Some(ms) => bash::Bash::real().with_default_timeout_ms(ms),
         None => bash::Bash::real(),
     };
-    if let Some(path) = bash_shell_path {
+    bash = bash.with_root(root);
+    if let Some(path) = cfg.bash_shell_path {
         bash = bash.with_shell_path(path);
     }
-    if let Some(prefix) = bash_command_prefix {
+    if let Some(prefix) = cfg.bash_command_prefix {
         bash = bash.with_command_prefix(prefix);
     }
     reg.register(Arc::new(bash));
     reg.register(Arc::new(beyond::Fork::real()));
     reg.register(Arc::new(beyond::Sync::real()));
     reg.register(Arc::new(beyond::Logs::real()));
-    reg
-}
-
-/// Like [`default_registry_with_prefix_and_image_auto_resize`], additionally merging in `mcp_tools` —
-/// already-connected tools discovered from configured MCP servers (see [`mcp::connect_all`]),
-/// registered after every built-in tool — split out as its own function, rather than a fifth parameter
-/// on `default_registry_with_prefix_and_image_auto_resize` itself, so that function's existing call
-/// sites (and its own callers `default_registry_with_prefix`/`default_registry_with`/`default_registry`)
-/// are unaffected by this addition, matching this file's established convention for every prior knob
-/// added here.
-///
-/// `mcp_tools` is already-resolved, not a list of servers to connect here: connecting is inherently
-/// async (spawning a process / opening an HTTP connection, then a `tools/list` round trip), while this
-/// whole registry-construction call chain deliberately stays synchronous (see `tools::mcp`'s module doc
-/// comment for why). The two real call sites (`main.rs::run_task`, `serve.rs::build_tools`) each connect
-/// once, then pass the resulting `Vec<Arc<dyn Tool>>` in on every rebuild this function feeds — so a
-/// `serve` registry rebuild (`set_model`/`set_thinking`/...) reuses the already-connected MCP tools
-/// rather than reconnecting to every configured server on every rebuild.
-pub fn default_registry_with_prefix_image_auto_resize_and_mcp_tools(
-    bash_timeout_ms: Option<u64>,
-    bash_shell_path: Option<&str>,
-    bash_command_prefix: Option<&str>,
-    image_auto_resize: bool,
-    mcp_tools: &[Arc<dyn Tool>],
-) -> ToolRegistry {
-    let mut reg = default_registry_with_prefix_and_image_auto_resize(
-        bash_timeout_ms,
-        bash_shell_path,
-        bash_command_prefix,
-        image_auto_resize,
-    );
-    for tool in mcp_tools {
+    // After every built-in, so an allow/deny filter (`apply_filter`) scopes MCP tools too, and so a
+    // server can't shadow a built-in by name (the `mcp__<server>__<tool>` prefix already prevents that).
+    for tool in cfg.mcp_tools {
         reg.register(tool.clone());
     }
     reg
@@ -485,6 +524,8 @@ pub fn apply_filter(
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     #[test]
@@ -704,9 +745,9 @@ mod tests {
         let via_parent = dir.path().join("sub/../foo.rs");
         std::fs::create_dir_all(dir.path().join("sub")).unwrap();
 
-        let a = canonical_write_target(real.to_str().unwrap());
-        let b = canonical_write_target(dotted.to_str().unwrap());
-        let c = canonical_write_target(via_parent.to_str().unwrap());
+        let a = canonical_write_target(Path::new(""), real.to_str().unwrap());
+        let b = canonical_write_target(Path::new(""), dotted.to_str().unwrap());
+        let c = canonical_write_target(Path::new(""), via_parent.to_str().unwrap());
         assert_eq!(a, b, "absolute vs `./`-prefixed spelling must match");
         assert_eq!(a, c, "a path through `..` must resolve to the same key");
     }
@@ -723,8 +764,8 @@ mod tests {
         let link = dir.path().join("alias.txt");
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
-        let via_real = canonical_write_target(real.to_str().unwrap());
-        let via_symlink = canonical_write_target(link.to_str().unwrap());
+        let via_real = canonical_write_target(Path::new(""), real.to_str().unwrap());
+        let via_symlink = canonical_write_target(Path::new(""), link.to_str().unwrap());
         assert_eq!(
             via_real, via_symlink,
             "a symlink and its real target must canonicalize to the same write-lock key"
@@ -741,9 +782,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().canonicalize().unwrap();
 
-        let a = canonical_write_target(base.join("brand-new.rs").to_str().unwrap());
-        let b = canonical_write_target(base.join("./brand-new.rs").to_str().unwrap());
-        let c = canonical_write_target(base.join("sub/../brand-new.rs").to_str().unwrap());
+        let a = canonical_write_target(Path::new(""), base.join("brand-new.rs").to_str().unwrap());
+        let b =
+            canonical_write_target(Path::new(""), base.join("./brand-new.rs").to_str().unwrap());
+        let c = canonical_write_target(
+            Path::new(""),
+            base.join("sub/../brand-new.rs").to_str().unwrap(),
+        );
 
         assert_eq!(a, b);
         assert_eq!(a, c);
@@ -883,12 +928,13 @@ mod tests {
     }
 
     #[test]
-    fn default_registry_with_prefix_image_auto_resize_and_mcp_tools_merges_the_mcp_tools_in() {
+    fn default_registry_with_config_merges_the_mcp_tools_in() {
         let mcp_tools: Vec<Arc<dyn Tool>> =
             vec![Arc::new(FakeMcpTool("mcp__filesystem__read_file"))];
-        let reg = default_registry_with_prefix_image_auto_resize_and_mcp_tools(
-            None, None, None, true, &mcp_tools,
-        );
+        let reg = default_registry_with_config(&ToolConfig {
+            mcp_tools: &mcp_tools,
+            ..ToolConfig::new()
+        });
         // Every built-in is still there …
         for name in [
             "read", "write", "edit", "bash", "ls", "grep", "find", "fork", "sync", "logs",
@@ -901,16 +947,153 @@ mod tests {
     }
 
     #[test]
-    fn default_registry_with_prefix_image_auto_resize_and_mcp_tools_with_no_servers_matches_plain_default()
-     {
-        let reg = default_registry_with_prefix_image_auto_resize_and_mcp_tools(
-            None,
-            None,
-            None,
-            true,
-            &[],
-        );
+    fn default_registry_with_config_with_no_servers_matches_plain_default() {
+        let reg = default_registry_with_config(&ToolConfig::new());
         assert_eq!(reg.len(), default_registry().len());
+    }
+
+    #[test]
+    fn tool_config_new_enables_image_auto_resize_but_derived_default_does_not() {
+        // `ToolConfig::default()` exists only so `..ToolConfig::new()` struct-update syntax works; it
+        // derives `image_auto_resize: false`, which is *not* what any production caller wants. Anyone
+        // reaching for `default()` directly would silently disable image downscaling.
+        assert!(ToolConfig::new().image_auto_resize);
+        assert!(!ToolConfig::default().image_auto_resize);
+    }
+
+    #[test]
+    fn tool_config_defaults_to_an_empty_root_meaning_the_process_cwd() {
+        assert!(ToolConfig::new().root.as_os_str().is_empty());
+        assert_eq!(
+            ToolConfig::new().with_root("/tmp/wt").root,
+            PathBuf::from("/tmp/wt")
+        );
+    }
+
+    #[test]
+    fn resolve_against_joins_a_relative_path_onto_the_root() {
+        assert_eq!(
+            resolve_against(Path::new("/wt"), "src/lib.rs"),
+            "/wt/src/lib.rs"
+        );
+        // `ls`/`grep`/`find` all default their `path` argument to this.
+        assert_eq!(resolve_against(Path::new("/wt"), "."), "/wt/.");
+    }
+
+    #[test]
+    fn resolve_against_leaves_an_absolute_path_alone() {
+        // Deliberate: a worktree is conflict avoidance, not containment. A child naming an absolute
+        // path outside its root reaches it, exactly as under Claude Code's `isolation: "worktree"`.
+        assert_eq!(
+            resolve_against(Path::new("/wt"), "/etc/hosts"),
+            "/etc/hosts"
+        );
+    }
+
+    #[test]
+    fn resolve_against_with_an_empty_root_is_exactly_normalize_path() {
+        // The pre-root behavior, which every `default_registry()` caller and every test relies on: the
+        // path is left relative and the OS resolves it against the process cwd.
+        for input in [
+            "src/lib.rs",
+            ".",
+            "/etc/hosts",
+            "@/etc/hosts",
+            "file:///etc/hosts",
+        ] {
+            assert_eq!(
+                resolve_against(Path::new(""), input),
+                normalize_path(input),
+                "empty root must not change {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_against_still_applies_tilde_and_file_url_normalization_before_joining() {
+        // A `~`-prefixed path expands to an absolute home path, so it must NOT then be joined onto the
+        // root — otherwise `~/notes.md` under a worktree would become `<wt>/home/me/notes.md`.
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(
+            resolve_against(Path::new("/wt"), "~/notes.md"),
+            format!("{home}/notes.md")
+        );
+        assert_eq!(
+            resolve_against(Path::new("/wt"), "file:///etc/hosts"),
+            "/etc/hosts"
+        );
+        // A leading `@` is stripped, and what remains is still relative — so it joins onto the root.
+        assert_eq!(
+            resolve_against(Path::new("/wt"), "@notes.md"),
+            "/wt/notes.md"
+        );
+    }
+
+    #[test]
+    fn canonical_write_target_keys_the_same_relative_path_under_two_roots_differently() {
+        // The property the whole worktree design rests on: two subagents in separate worktrees editing
+        // `src/lib.rs` are editing two *different files*, so they must get two different write-lock
+        // keys. Keying both against one process-wide cwd would collapse them into one.
+        let tmp = tempfile::tempdir().unwrap();
+        let wt_a = tmp.path().join("a");
+        let wt_b = tmp.path().join("b");
+        std::fs::create_dir_all(&wt_a).unwrap();
+        std::fs::create_dir_all(&wt_b).unwrap();
+
+        let key_a = canonical_write_target(&wt_a, &resolve_against(&wt_a, "src/lib.rs"));
+        let key_b = canonical_write_target(&wt_b, &resolve_against(&wt_b, "src/lib.rs"));
+        assert_ne!(key_a, key_b);
+        assert!(key_a.ends_with("/a/src/lib.rs"), "{key_a}");
+        assert!(key_b.ends_with("/b/src/lib.rs"), "{key_b}");
+    }
+
+    #[test]
+    fn canonical_write_target_still_unifies_two_spellings_within_one_root() {
+        // …while, within a single root, differently-spelled references to the same not-yet-created file
+        // must still collapse to one key, or two same-turn `edit`s would race.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let plain = canonical_write_target(&root, &resolve_against(&root, "new.rs"));
+        let dotted = canonical_write_target(&root, &resolve_against(&root, "./new.rs"));
+        let via_parent = canonical_write_target(&root, &resolve_against(&root, "sub/../new.rs"));
+        assert_eq!(plain, dotted);
+        assert_eq!(plain, via_parent);
+    }
+
+    #[tokio::test]
+    async fn a_rooted_write_lands_inside_the_root_not_the_process_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write::Write::new(root)
+            .run(json!({ "path": "notes.md", "content": "hello" }))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("notes.md")).unwrap(),
+            "hello"
+        );
+        // And nothing was created relative to the process cwd.
+        assert!(!Path::new("notes.md").exists());
+    }
+
+    #[tokio::test]
+    async fn a_rooted_read_resolves_relative_to_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "content-in-root").unwrap();
+        let out = read::Read::new(tmp.path())
+            .run(json!({ "path": "a.txt" }))
+            .await
+            .unwrap();
+        assert!(out.text.contains("content-in-root"), "{}", out.text);
+    }
+
+    #[tokio::test]
+    async fn a_rooted_ls_lists_the_root_when_path_is_omitted() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("marker.txt"), "").unwrap();
+        // `path` omitted → defaults to "." → resolves to the root, not the process cwd.
+        let out = ls::Ls::new(tmp.path()).run(json!({})).await.unwrap();
+        assert!(out.text.contains("marker.txt"), "{}", out.text);
     }
 
     #[test]
