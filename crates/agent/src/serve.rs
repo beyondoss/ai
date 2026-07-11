@@ -458,6 +458,9 @@ pub struct ServeConfig {
     pub memory: Option<String>,
     /// Disable persistent memory entirely (`--no-memory`): no `memory` tool, no injected index.
     pub no_memory: bool,
+    /// Disable only the per-session `/session` working-memory mount (`--no-session-memory`), keeping the
+    /// durable `/memories` store. On by default whenever memory is enabled. See [`crate::memory`].
+    pub no_session_memory: bool,
     /// Use this exact session id instead of a freshly generated one, wherever a *new* `SessionMeta` is
     /// actually minted by [`Persistence::open`] — already-validated by `main.rs` (embedded directly into
     /// a persisted filename, so it must be sanitized before it ever reaches here). Matches `run`'s
@@ -2038,15 +2041,66 @@ pub(crate) async fn serve_session(
             )
         };
     let has_memory = memory_backend.is_some();
-    let memory_tool: Option<Arc<dyn agent_core::Tool>> = memory_backend
-        .clone()
-        .map(|b| Arc::new(crate::tools::memory::Memory::new(b)) as Arc<dyn agent_core::Tool>);
+    // The per-session working-memory mount (`/session`) rides a *shared, swappable* directory cell: a
+    // `switch_session`/`new_session`/`fork` re-points the cell (below) and every holder — this session's
+    // `memory` tool and every subagent sharing it by `Arc` — follows with no tool/agent rebuild. Off when
+    // memory is disabled or `--no-session-memory` was passed. See `crate::memory::session_dir`.
+    let session_dir_cell = crate::memory::file::SessionDir::new(crate::memory::session_dir(
+        persistence.session_file(),
+        persistence.session_id(),
+    ));
+    let mounts: Vec<crate::memory::Mount> = {
+        let mut v = Vec::new();
+        if let Some(backend) = &memory_backend {
+            v.push(crate::memory::Mount {
+                kind: crate::memory::MountKind::Durable,
+                backend: backend.clone(),
+            });
+            if !cfg.no_session_memory {
+                v.push(crate::memory::Mount {
+                    kind: crate::memory::MountKind::Session,
+                    backend: Arc::new(crate::memory::file::FileBackend::session_shared(
+                        session_dir_cell.clone(),
+                    )),
+                });
+            }
+        }
+        v
+    };
+    let memory_tool: Option<Arc<dyn agent_core::Tool>> = if mounts.is_empty() {
+        None
+    } else {
+        Some(
+            Arc::new(crate::tools::memory::Memory::mounted(mounts.clone()))
+                as Arc<dyn agent_core::Tool>,
+        )
+    };
+    // Whether a `/session` mount is live — gates the active compaction reminder pushed below. Stays valid
+    // across session switches (the mount is always present; only its dir cell re-points).
+    let session_memory_active = mounts
+        .iter()
+        .any(|m| m.kind == crate::memory::MountKind::Session);
     // Re-read at each `static_system` rebuild (a `set_model`/`set_thinking` switch, or a `prompt` whose
-    // output-schema changed — see `current_memory_index`) so a session that has written new memories
-    // injects the *current* index, not a stale startup snapshot. Steady-state within one model, the
-    // `memory` tool's own `view` is always live, so this need only refresh where the prompt is already
-    // being rebuilt — one small file read, never per turn.
-    let mut memory_index: Option<String> = current_memory_index(&memory_backend).await;
+    // output-schema changed) so a session that has written new memories injects the *current* index per
+    // mount, not a stale startup snapshot. Steady-state within one model, the `memory` tool's own `view`
+    // is always live, so this need only refresh where the prompt is already being rebuilt.
+    let mut memory_sections: Vec<(crate::memory::MountKind, String)> =
+        crate::memory::mount_sections(&mounts).await;
+
+    // Re-point the `/session` working-memory mount at whatever session is now active, after a
+    // `switch_session`/`new_session`/`fork`/`clone` has swapped `persistence` onto it. One cell write
+    // reaches the parent's `memory` tool and every subagent sharing the backend by `Arc`, so neither the
+    // tool nor the agent has to be rebuilt. Harmless when the session mount is disabled (nothing reads the
+    // cell). The injected `/session` index in the system prompt refreshes at the next prompt/`set_model`
+    // rebuild; the tool's own live `view /session` is authoritative in the meantime.
+    macro_rules! repoint_session_memory {
+        () => {
+            session_dir_cell.set(crate::memory::session_dir(
+                persistence.session_file(),
+                persistence.session_id(),
+            ));
+        };
+    }
 
     // The interactive approval gate. One per session, shared by every `build_agent` rebuild and by every
     // subagent child, so a remembered decision isn't re-asked and eight parallel children can't spam
@@ -2087,7 +2141,7 @@ pub(crate) async fn serve_session(
             has_todo,
             has_structured_output: structured_output.is_some(),
             has_memory,
-            memory_index: memory_index.as_deref(),
+            memory_sections: &memory_sections,
             project_trusted,
             agents: &cfg.agents,
         });
@@ -2233,7 +2287,7 @@ pub(crate) async fn serve_session(
                 &current_model,
                 &write_locks,
                 &skills,
-                memory_backend.clone(),
+                mounts.clone(),
                 approval.as_ref(),
             ))
         };
@@ -2381,6 +2435,7 @@ pub(crate) async fn serve_session(
             ) {
                 Ok(s) => {
                     session = s;
+                    repoint_session_memory!();
                     steering.clear();
                     let _ = out_tx.send(response(
                         $id,
@@ -2412,6 +2467,7 @@ pub(crate) async fn serve_session(
                 Some(target) => match persistence.switch(target) {
                     Ok(s) => {
                         session = s;
+                        repoint_session_memory!();
                         steering.clear();
                         // Restore whichever model/thinking-level this session was actually last
                         // running on, the same way `switch_branch` already does — without this, the
@@ -2536,6 +2592,7 @@ pub(crate) async fn serve_session(
             match persistence.fork(upto, target_id, before, starting_level) {
                 Ok((s, restored_model, restored_level)) => {
                     session = s;
+                    repoint_session_memory!();
                     steering.clear();
                     // Restore whichever model/thinking-level was actually active at the forked-from
                     // point, the same way `switch_session`/`switch_branch` already do.
@@ -2608,6 +2665,7 @@ pub(crate) async fn serve_session(
             match persistence.fork(usize::MAX, None, false, starting_level) {
                 Ok((s, restored_model, restored_level)) => {
                     session = s;
+                    repoint_session_memory!();
                     steering.clear();
                     let restored_level = agent_core::clamp_thinking_level(
                         &agent_core::capabilities(&restored_model),
@@ -2699,6 +2757,15 @@ pub(crate) async fn serve_session(
                             compacted_summary = Some(summary.clone());
                             compacted_tokens_after = Some(*tokens_after);
                             compacted_first_kept = Some(*first_kept);
+                            // Same active nudge as the auto-compaction path in the `prompt` run observer:
+                            // a manual `compact` also folds specifics into a lossy summary, so steer the
+                            // model to read back its `/session` working memory on its next turn.
+                            if session_memory_active {
+                                steering.push_steer(agent_core::SteeringMessage::new(
+                                    crate::memory::COMPACTION_REMINDER.to_string(),
+                                    Vec::new(),
+                                ));
+                            }
                         }
                         if let Some(frame) = event_frame(ev) {
                             let _ = tx.send(frame);
@@ -2868,7 +2935,7 @@ pub(crate) async fn serve_session(
                             None => None,
                         };
                         current_output_spec = spec;
-                        memory_index = current_memory_index(&memory_backend).await;
+                        memory_sections = crate::memory::mount_sections(&mounts).await;
                         static_system = crate::resources::build_static_system_prompt(
                             &crate::resources::PromptOptions {
                                 base: None,
@@ -2881,7 +2948,7 @@ pub(crate) async fn serve_session(
                                 has_todo,
                                 has_structured_output: structured_output.is_some(),
                                 has_memory,
-                                memory_index: memory_index.as_deref(),
+                                memory_sections: &memory_sections,
                                 project_trusted,
                                 agents: &cfg.agents,
                             },
@@ -3032,6 +3099,9 @@ pub(crate) async fn serve_session(
                     // from the same events a streaming client already observes.
                     let live_stats = Arc::new(LiveStats::from_session(&session));
                     let live_stats_sink = live_stats.clone();
+                    // A clone for the observer to push the compaction reminder through — consumed by this
+                    // attempt's `move` closure, so re-cloned per attempt.
+                    let steer_on_compact = steering.clone();
 
                     // Mark this session busy for the reaper's benefit (daemon mode) — it never reaps a
                     // session with a run in flight. Cleared once the attempt's future resolves, below.
@@ -3049,6 +3119,18 @@ pub(crate) async fn serve_session(
                                 );
                                 if let AgentEvent::Compacted { tokens_before, .. } = ev {
                                     tokens_before_sink.store(tokens_before, Ordering::Relaxed);
+                                    // Actively nudge the model to read back its `/session` working memory
+                                    // now that the raw transcript is a lossy summary. Rides the next
+                                    // post-compaction request as a mid-run steer. Once per compaction (the
+                                    // event fires once); skipped when no session mount is active.
+                                    if session_memory_active {
+                                        steer_on_compact.push_steer(
+                                            agent_core::SteeringMessage::new(
+                                                crate::memory::COMPACTION_REMINDER.to_string(),
+                                                Vec::new(),
+                                            ),
+                                        );
+                                    }
                                 }
                                 if let AgentEvent::TurnEnd { stop_reason, step } = &ev {
                                     refused_sink.store(
@@ -4361,11 +4443,11 @@ pub(crate) async fn serve_session(
                         &current_model,
                         &write_locks,
                         &skills,
-                        memory_backend.clone(),
+                        mounts.clone(),
                         approval.as_ref(),
                     ))
                 };
-                memory_index = current_memory_index(&memory_backend).await;
+                memory_sections = crate::memory::mount_sections(&mounts).await;
                 static_system = crate::resources::build_static_system_prompt(
                     &crate::resources::PromptOptions {
                         base: None,
@@ -4378,7 +4460,7 @@ pub(crate) async fn serve_session(
                         has_todo,
                         has_structured_output: structured_output.is_some(),
                         has_memory,
-                        memory_index: memory_index.as_deref(),
+                        memory_sections: &memory_sections,
                         project_trusted,
                         agents: &cfg.agents,
                     },
@@ -5831,17 +5913,6 @@ fn full_system(static_system: &str, cwd: &std::path::Path) -> String {
     format!("{static_system}{}", crate::resources::dynamic_footer(cwd))
 }
 
-/// The current `MEMORY.md` index for prompt injection, re-read from the backend so a rebuilt system
-/// prompt reflects memories written since startup. `None` when memory is disabled.
-async fn current_memory_index(
-    backend: &Option<Arc<dyn crate::memory::MemoryBackend>>,
-) -> Option<String> {
-    match backend {
-        Some(b) => Some(b.index().await.unwrap_or_default()),
-        None => None,
-    }
-}
-
 /// The `output_schema`/`output_description` a `prompt` command asks for, as the pair the session
 /// compares against what it already has installed. `None` means "answer in prose", the default.
 ///
@@ -5976,9 +6047,10 @@ fn build_subagent_ctx(
     parent_model: &str,
     write_locks: &Arc<agent_core::WriteLockRegistry>,
     skills: &[crate::skills::Skill],
-    // The parent's memory backend, shared by reference so the whole subagent tree reads/writes one
-    // durable store — see `SubagentCtx::memory_backend`.
-    memory_backend: Option<Arc<dyn crate::memory::MemoryBackend>>,
+    // The parent's memory mounts, shared by `Arc` clone so the whole subagent tree reads/writes the very
+    // same stores — including the `/session` cell that re-points on a session switch. See
+    // `SubagentCtx::memory_mounts`.
+    memory_mounts: Vec<crate::memory::Mount>,
     // Shared with the parent, not rebuilt — see `SubagentCtx::approval`.
     approval: Option<&crate::approval::ApprovalRuntime>,
 ) -> Arc<crate::tools::subagent::SubagentCtx> {
@@ -6009,7 +6081,7 @@ fn build_subagent_ctx(
         skills: Arc::new(skills.to_vec()),
         write_locks: write_locks.clone(),
         mcp_tools: cfg.mcp_tools.clone(),
-        memory_backend,
+        memory_mounts,
         tool_cfg: subagent::ChildToolConfig {
             bash_timeout_ms: cfg.bash_timeout_ms,
             bash_shell_path: cfg.bash_shell_path.clone(),

@@ -622,6 +622,10 @@ enum Command {
         /// index. Mirrors `--no-tools`'s opt-out style.
         #[arg(long, default_value_t = false)]
         no_memory: bool,
+        /// Disable only the per-session `/session` working-memory mount, keeping durable `/memories`. The
+        /// working store is the compaction-surviving scratchpad; on by default when memory is enabled.
+        #[arg(long, default_value_t = false)]
+        no_session_memory: bool,
         /// After the run completes, export the transcript as a self-contained HTML file at this path
         /// (parent directories are created as needed) — the same rendering `serve`'s `export_html` RPC
         /// command produces, for a one-shot run with no server involved.
@@ -718,6 +722,10 @@ enum Command {
         /// Disable persistent memory entirely: don't register the `memory` tool or inject the index.
         #[arg(long, default_value_t = false)]
         no_memory: bool,
+        /// Disable only the per-session `/session` working-memory mount, keeping durable `/memories`. On
+        /// by default when memory is enabled.
+        #[arg(long, default_value_t = false)]
+        no_session_memory: bool,
         /// Max loop iterations per prompt before bailing.
         #[arg(long, default_value_t = agent_core::agent::DEFAULT_MAX_STEPS)]
         max_steps: u32,
@@ -1514,6 +1522,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             no_session_persistence,
             memory,
             no_memory,
+            no_session_memory,
             export,
             json,
             output_schema,
@@ -1577,6 +1586,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 no_session_persistence,
                 memory,
                 no_memory,
+                no_session_memory,
                 export,
                 json,
                 output_schema,
@@ -1599,6 +1609,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             no_session_persistence,
             memory,
             no_memory,
+            no_session_memory,
             max_steps,
             max_tokens,
             system_prompt,
@@ -1897,6 +1908,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // knows the resolved `cwd`), like `agents`.
                 memory: memory.or_else(|| stored_settings.default_memory_backend.clone()),
                 no_memory,
+                no_session_memory,
                 listen,
                 listen_uds: listen_uds.clone(),
                 listen_uds_mode,
@@ -2867,6 +2879,7 @@ fn unwrap_turn_result(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_turn(
     agent: &Agent,
     session: &mut Session,
@@ -2875,10 +2888,20 @@ async fn run_turn(
     retry_policy: &beyond_ai_agent::retry::RunRetryPolicy,
     broken_pipe: &AtomicBool,
     steering: &agent_core::Steering,
+    session_memory_active: bool,
 ) -> agent_core::Result<agent_core::StopReason> {
     let mut attempt = 0u32;
     loop {
-        let result = run_turn_once(agent, session, json, cancel, broken_pipe, steering).await;
+        let result = run_turn_once(
+            agent,
+            session,
+            json,
+            cancel,
+            broken_pipe,
+            steering,
+            session_memory_active,
+        )
+        .await;
         match &result {
             Err(e)
                 if attempt < retry_policy.max_retries
@@ -2967,7 +2990,20 @@ async fn run_turn_once(
     cancel: &agent_core::CancellationToken,
     broken_pipe: &AtomicBool,
     steering: &agent_core::Steering,
+    // Whether a `/session` working-memory mount is active — gates the active compaction reminder pushed on
+    // each `Compacted` event, mirroring `serve`'s own observer. See `beyond_ai_agent::memory`.
+    session_memory_active: bool,
 ) -> agent_core::Result<agent_core::StopReason> {
+    // Push the working-memory recall nudge as a mid-run steer when this turn compacts, so the model reads
+    // back its `/session` specifics before continuing (the raw transcript is now a lossy summary).
+    let nudge_on_compaction = |ev: &agent_core::AgentEvent| {
+        if session_memory_active && matches!(ev, agent_core::AgentEvent::Compacted { .. }) {
+            steering.push_steer(agent_core::SteeringMessage::new(
+                beyond_ai_agent::memory::COMPACTION_REMINDER.to_string(),
+                Vec::new(),
+            ));
+        }
+    };
     let mut stop_reason = agent_core::StopReason::default();
     if json {
         agent
@@ -2977,6 +3013,7 @@ async fn run_turn_once(
                     if let agent_core::AgentEvent::TurnEnd { stop_reason: r, .. } = &ev {
                         stop_reason = *r;
                     }
+                    nudge_on_compaction(&ev);
                     if let Ok(line) = serde_json::to_string(&ev) {
                         write_stdout_or_exit(&line, cancel, broken_pipe);
                         write_stdout_or_exit("\n", cancel, broken_pipe);
@@ -2997,6 +3034,7 @@ async fn run_turn_once(
         .run_events_steered(
             session,
             |ev| {
+                nudge_on_compaction(&ev);
                 let agent_core::AgentEvent::Stream(ev) = &ev else {
                     return;
                 };
@@ -3148,6 +3186,7 @@ async fn run_task(
     no_session_persistence: bool,
     memory: Option<String>,
     no_memory: bool,
+    no_session_memory: bool,
     export: Option<String>,
     json: bool,
     output_schema: Option<String>,
@@ -3507,174 +3546,6 @@ async fn run_task(
         no_tools,
     );
 
-    // Persistent, cross-session memory. Resolved here (before the subagent context is built) so the same
-    // backend `Arc` is shared with every child — the whole subagent tree reads/writes one durable store.
-    // Registered *after* `apply_filter` (like `structured_output`/`subagent`) so a `--tools` allow-list
-    // can't strip the agent's memory; `--no-memory`/`--no-tools` opt out. A bad backend fails fast before
-    // a model call is billed. The `MEMORY.md` index is injected into the system prompt below.
-    let memory_backend: Option<Arc<dyn beyond_ai_agent::memory::MemoryBackend>> =
-        if no_memory || no_tools {
-            None
-        } else {
-            let dsn = memory.or_else(|| stored_settings.default_memory_backend.clone());
-            Some(
-                beyond_ai_agent::memory::open(dsn.as_deref(), &cwd).unwrap_or_else(|e| {
-                    eprintln!("{e}");
-                    std::process::exit(2);
-                }),
-            )
-        };
-    let memory_index: Option<String> = match &memory_backend {
-        Some(b) => {
-            let index = b.index().await.unwrap_or_default();
-            registry.register(Arc::new(tools::memory::Memory::new(b.clone())));
-            Some(index)
-        }
-        None => None,
-    };
-
-    // `--output-schema` turns this run into a callable function: the model must fill the schema in via
-    // `structured_output` rather than ending in prose, and the validated payload is this process's real
-    // return value (printed last, and the difference between exit 0 and exit 1 below).
-    //
-    // Registered *after* `apply_filter`, like `subagent` below: a `--tools read` allow-list is about
-    // scoping what the agent may *do*, and must not silently strip the one tool this flag exists to add
-    // — leaving a run that can never satisfy the contract it was started with.
-    //
-    // Fail fast on a bad schema, before a single model call is billed — the same discipline
-    // `ToolPolicy::validate_deny_path_patterns` uses for a malformed `--deny-path` glob.
-    let output_slot = tools::structured_output::OutputSlot::new();
-    let wants_structured_output = output_schema.is_some();
-    if let Some(arg) = &output_schema {
-        let schema = tools::structured_output::load_schema(arg).unwrap_or_else(|e| {
-            eprintln!("{e}");
-            std::process::exit(2);
-        });
-        let tool = tools::structured_output::StructuredOutput::new(
-            schema,
-            output_description,
-            output_slot.clone(),
-        )
-        .unwrap_or_else(|e| {
-            eprintln!("{e}");
-            std::process::exit(2);
-        });
-        registry.register(Arc::new(tool));
-    }
-
-    // Subagents. A shared write-lock registry (rather than `Agent::new`'s private default) so the parent
-    // and every child serialize same-path writes against each other. Registered only when at least one
-    // agent definition exists — a `subagent` tool with no agents to call is dead weight in the prompt.
-    let write_locks = Arc::new(agent_core::WriteLockRegistry::new());
-    beyond_ai_agent::worktree::sweep(&cwd); // reap any worktree orphaned by a previous crash
-    let agent_defs = beyond_ai_agent::agents::discover(&cwd, project_trusted);
-    if !agent_defs.is_empty() {
-        use beyond_ai_agent::tools::subagent;
-        // `parent_tools` is what a child with no `tools:` of its own inherits — the parent's effective
-        // set minus `subagent` itself, so a restricted parent can't spawn a fully-armed child.
-        let parent_tools: Vec<String> = registry
-            .definitions()
-            .into_iter()
-            .map(|d| d.name)
-            .filter(|n| n != subagent::NAME)
-            .collect();
-        // The factory re-resolves credentials per child model (they're model-keyed). Captures the raw
-        // key and the parent's retry/timeout knobs, mirroring the parent client build below.
-        let raw_key = raw_gateway_key.clone();
-        let gateway_for_factory = gateway.clone();
-        let factory: subagent::TransportFactory = Arc::new(move |m: &str| {
-            build_run_gateway_client(
-                raw_key.clone(),
-                &gateway_for_factory,
-                m,
-                retry_max_retries,
-                retry_base_delay_ms,
-                retry_max_backoff_ms,
-                idle_timeout_ms,
-            )
-            .map(|c| Arc::new(c) as Arc<dyn agent_core::ModelTransport>)
-        });
-        let ctx = Arc::new(subagent::SubagentCtx {
-            factory,
-            agents: Arc::new(agent_defs.clone()),
-            skills: Arc::new(skills.clone()),
-            write_locks: write_locks.clone(),
-            mcp_tools: mcp_tools.clone(),
-            memory_backend: memory_backend.clone(),
-            tool_cfg: subagent::ChildToolConfig {
-                bash_timeout_ms,
-                bash_shell_path: bash_shell_path.clone(),
-                bash_command_prefix: bash_command_prefix.clone(),
-                web_allow_private,
-                web_allow_hosts: web_allow_host.clone(),
-                web_timeout_ms,
-                image_auto_resize,
-            },
-            cwd: cwd.clone(),
-            project_trusted,
-            prompt_guidelines: prompt_guidelines.clone(),
-            parent_model: model.clone(),
-            parent_cache_key: model.clone(),
-            parent_tools,
-            deny_tool: deny_tool.clone(),
-            deny_bash_pattern: deny_bash_pattern.clone(),
-            deny_path: deny_path.clone(),
-            child_max_steps: subagent::DEFAULT_CHILD_MAX_STEPS,
-            max_depth: subagent::DEFAULT_MAX_DEPTH,
-            // `run` has no client to ask, so it has no interactive gate — only the static `--deny-*`
-            // lists, which `ChildHooks` still installs. See `crate::approval`'s module doc.
-            approval: None,
-        });
-        registry.register(Arc::new(subagent::Subagent::new(ctx)));
-    }
-
-    // `--system-prompt`/`--append-system-prompt` may each name an existing, readable file instead of
-    // literal text (pi-parity fix — matches pi's own `resolvePromptInput`); resolved once, here, rather
-    // than re-deriving it at each of the several places downstream that would otherwise need to repeat
-    // the same file-vs-literal check. `--append-system-prompt` is repeatable (pi-parity fix: previously
-    // a second occurrence silently clobbered the first instead of accumulating) — each occurrence is
-    // resolved independently, then joined into one block.
-    let system_prompt = system_prompt.as_deref().map(resolve_prompt_input);
-    let append_system_prompt = {
-        let resolved: Vec<String> = append_system_prompt
-            .iter()
-            .map(|s| resolve_prompt_input(s))
-            .collect();
-        (!resolved.is_empty()).then(|| resolved.join("\n\n"))
-    };
-    // `--system-prompt` replaces the built-in base entirely — matches `serve`'s identical flag. Threaded
-    // through as `Some`/`None` (rather than pre-collapsed with the computed default here) so
-    // `build_system_prompt` can tell "an explicit override was given" apart from "nothing given, use the
-    // built-in default" — an explicit flag must win outright over a trusted project's on-disk
-    // `SYSTEM.md`, which previously always won regardless (pi-parity fix).
-    let default_base =
-        beyond_ai_agent::resources::default_system_prompt(&registry, &prompt_guidelines);
-    // Skills are discovered by path, not inlined into the prompt — invoking one relies on the model
-    // being able to open its `SKILL.md` itself, so advertising them at all when `read` isn't registered
-    // (a restricted `--tools`/`--exclude-tools` invocation) just adds dead weight (pi-parity fix).
-    let has_read = registry.get("read").is_some();
-    let has_todo = registry.get("todo").is_some();
-    let has_structured_output = registry.get(tools::structured_output::NAME).is_some();
-    let has_memory = registry.get(tools::memory::NAME).is_some();
-    let system = beyond_ai_agent::resources::build_system_prompt(
-        &beyond_ai_agent::resources::PromptOptions {
-            base: system_prompt.as_deref(),
-            default_base: &default_base,
-            append: append_system_prompt.as_deref(),
-            cwd: &cwd,
-            include_context_files: !no_context_files,
-            skills: &skills,
-            has_read,
-            has_todo,
-            has_structured_output,
-            has_memory,
-            memory_index: memory_index.as_deref(),
-            project_trusted,
-            agents: &agent_defs,
-        },
-    );
-    timing.mark("build system prompt");
-
     // `--session`/`--continue` persist this run (and load prior history to continue it) exactly like
     // `serve`'s own repo/file modes. pi-parity fix: neither given previously kept `run` in-memory-only —
     // pi's own default (no flags at all, including one-shot print-mode) is a persisted, disk-backed
@@ -3796,6 +3667,209 @@ async fn run_task(
             None => (None, Session::new()),
         }
     };
+
+    // Persistent, cross-session memory. Resolved here (before the subagent context is built) so the same
+    // backend `Arc` is shared with every child — the whole subagent tree reads/writes one durable store.
+    // Registered *after* `apply_filter` (like `structured_output`/`subagent`) so a `--tools` allow-list
+    // can't strip the agent's memory; `--no-memory`/`--no-tools` opt out. A bad backend fails fast before
+    // a model call is billed. The `MEMORY.md` index is injected into the system prompt below.
+    let memory_backend: Option<Arc<dyn beyond_ai_agent::memory::MemoryBackend>> =
+        if no_memory || no_tools {
+            None
+        } else {
+            let dsn = memory.or_else(|| stored_settings.default_memory_backend.clone());
+            Some(
+                beyond_ai_agent::memory::open(dsn.as_deref(), &cwd).unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }),
+            )
+        };
+    // Build the mount list: durable `/memories`, plus (unless `--no-session-memory`) a per-session
+    // `/session` working-memory store — the compaction-surviving scratchpad. `run` is single-session, so
+    // the session dir is fixed for the whole process: the `<...>.memory/` sibling of a persisted session
+    // file (so `session_store` trashes/restores it together), or an id-keyed tempdir when ephemeral. The
+    // session-open block was hoisted above this so `store` is already resolved here. Shared with every
+    // subagent below by `Arc`, so a child sees the very same `/session` as the parent.
+    let mounts: Vec<beyond_ai_agent::memory::Mount> = {
+        use beyond_ai_agent::memory::{Mount, MountKind};
+        let mut v = Vec::new();
+        if let Some(backend) = &memory_backend {
+            v.push(Mount {
+                kind: MountKind::Durable,
+                backend: backend.clone(),
+            });
+            if !no_session_memory {
+                let session_file = store.as_ref().map(|s| s.path().to_path_buf());
+                let session_id = store
+                    .as_ref()
+                    .map(|s| s.meta().id.clone())
+                    .unwrap_or_else(|| fresh_meta().id);
+                let dir =
+                    beyond_ai_agent::memory::session_dir(session_file.as_deref(), &session_id);
+                v.push(Mount {
+                    kind: MountKind::Session,
+                    backend: Arc::new(beyond_ai_agent::memory::file::FileBackend::session_at(dir)),
+                });
+            }
+        }
+        v
+    };
+    let memory_sections: Vec<(beyond_ai_agent::memory::MountKind, String)> = if mounts.is_empty() {
+        Vec::new()
+    } else {
+        let sections = beyond_ai_agent::memory::mount_sections(&mounts).await;
+        registry.register(Arc::new(tools::memory::Memory::mounted(mounts.clone())));
+        sections
+    };
+    // Gates the active compaction reminder pushed on each `Compacted` (see `run_turn_once`): only when a
+    // `/session` working-memory mount is live.
+    let session_memory_active = mounts
+        .iter()
+        .any(|m| m.kind == beyond_ai_agent::memory::MountKind::Session);
+
+    // `--output-schema` turns this run into a callable function: the model must fill the schema in via
+    // `structured_output` rather than ending in prose, and the validated payload is this process's real
+    // return value (printed last, and the difference between exit 0 and exit 1 below).
+    //
+    // Registered *after* `apply_filter`, like `subagent` below: a `--tools read` allow-list is about
+    // scoping what the agent may *do*, and must not silently strip the one tool this flag exists to add
+    // — leaving a run that can never satisfy the contract it was started with.
+    //
+    // Fail fast on a bad schema, before a single model call is billed — the same discipline
+    // `ToolPolicy::validate_deny_path_patterns` uses for a malformed `--deny-path` glob.
+    let output_slot = tools::structured_output::OutputSlot::new();
+    let wants_structured_output = output_schema.is_some();
+    if let Some(arg) = &output_schema {
+        let schema = tools::structured_output::load_schema(arg).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2);
+        });
+        let tool = tools::structured_output::StructuredOutput::new(
+            schema,
+            output_description,
+            output_slot.clone(),
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2);
+        });
+        registry.register(Arc::new(tool));
+    }
+
+    // Subagents. A shared write-lock registry (rather than `Agent::new`'s private default) so the parent
+    // and every child serialize same-path writes against each other. Registered only when at least one
+    // agent definition exists — a `subagent` tool with no agents to call is dead weight in the prompt.
+    let write_locks = Arc::new(agent_core::WriteLockRegistry::new());
+    beyond_ai_agent::worktree::sweep(&cwd); // reap any worktree orphaned by a previous crash
+    let agent_defs = beyond_ai_agent::agents::discover(&cwd, project_trusted);
+    if !agent_defs.is_empty() {
+        use beyond_ai_agent::tools::subagent;
+        // `parent_tools` is what a child with no `tools:` of its own inherits — the parent's effective
+        // set minus `subagent` itself, so a restricted parent can't spawn a fully-armed child.
+        let parent_tools: Vec<String> = registry
+            .definitions()
+            .into_iter()
+            .map(|d| d.name)
+            .filter(|n| n != subagent::NAME)
+            .collect();
+        // The factory re-resolves credentials per child model (they're model-keyed). Captures the raw
+        // key and the parent's retry/timeout knobs, mirroring the parent client build below.
+        let raw_key = raw_gateway_key.clone();
+        let gateway_for_factory = gateway.clone();
+        let factory: subagent::TransportFactory = Arc::new(move |m: &str| {
+            build_run_gateway_client(
+                raw_key.clone(),
+                &gateway_for_factory,
+                m,
+                retry_max_retries,
+                retry_base_delay_ms,
+                retry_max_backoff_ms,
+                idle_timeout_ms,
+            )
+            .map(|c| Arc::new(c) as Arc<dyn agent_core::ModelTransport>)
+        });
+        let ctx = Arc::new(subagent::SubagentCtx {
+            factory,
+            agents: Arc::new(agent_defs.clone()),
+            skills: Arc::new(skills.clone()),
+            write_locks: write_locks.clone(),
+            mcp_tools: mcp_tools.clone(),
+            memory_mounts: mounts.clone(),
+            tool_cfg: subagent::ChildToolConfig {
+                bash_timeout_ms,
+                bash_shell_path: bash_shell_path.clone(),
+                bash_command_prefix: bash_command_prefix.clone(),
+                web_allow_private,
+                web_allow_hosts: web_allow_host.clone(),
+                web_timeout_ms,
+                image_auto_resize,
+            },
+            cwd: cwd.clone(),
+            project_trusted,
+            prompt_guidelines: prompt_guidelines.clone(),
+            parent_model: model.clone(),
+            parent_cache_key: model.clone(),
+            parent_tools,
+            deny_tool: deny_tool.clone(),
+            deny_bash_pattern: deny_bash_pattern.clone(),
+            deny_path: deny_path.clone(),
+            child_max_steps: subagent::DEFAULT_CHILD_MAX_STEPS,
+            max_depth: subagent::DEFAULT_MAX_DEPTH,
+            // `run` has no client to ask, so it has no interactive gate — only the static `--deny-*`
+            // lists, which `ChildHooks` still installs. See `crate::approval`'s module doc.
+            approval: None,
+        });
+        registry.register(Arc::new(subagent::Subagent::new(ctx)));
+    }
+
+    // `--system-prompt`/`--append-system-prompt` may each name an existing, readable file instead of
+    // literal text (pi-parity fix — matches pi's own `resolvePromptInput`); resolved once, here, rather
+    // than re-deriving it at each of the several places downstream that would otherwise need to repeat
+    // the same file-vs-literal check. `--append-system-prompt` is repeatable (pi-parity fix: previously
+    // a second occurrence silently clobbered the first instead of accumulating) — each occurrence is
+    // resolved independently, then joined into one block.
+    let system_prompt = system_prompt.as_deref().map(resolve_prompt_input);
+    let append_system_prompt = {
+        let resolved: Vec<String> = append_system_prompt
+            .iter()
+            .map(|s| resolve_prompt_input(s))
+            .collect();
+        (!resolved.is_empty()).then(|| resolved.join("\n\n"))
+    };
+    // `--system-prompt` replaces the built-in base entirely — matches `serve`'s identical flag. Threaded
+    // through as `Some`/`None` (rather than pre-collapsed with the computed default here) so
+    // `build_system_prompt` can tell "an explicit override was given" apart from "nothing given, use the
+    // built-in default" — an explicit flag must win outright over a trusted project's on-disk
+    // `SYSTEM.md`, which previously always won regardless (pi-parity fix).
+    let default_base =
+        beyond_ai_agent::resources::default_system_prompt(&registry, &prompt_guidelines);
+    // Skills are discovered by path, not inlined into the prompt — invoking one relies on the model
+    // being able to open its `SKILL.md` itself, so advertising them at all when `read` isn't registered
+    // (a restricted `--tools`/`--exclude-tools` invocation) just adds dead weight (pi-parity fix).
+    let has_read = registry.get("read").is_some();
+    let has_todo = registry.get("todo").is_some();
+    let has_structured_output = registry.get(tools::structured_output::NAME).is_some();
+    let has_memory = registry.get(tools::memory::NAME).is_some();
+    let system = beyond_ai_agent::resources::build_system_prompt(
+        &beyond_ai_agent::resources::PromptOptions {
+            base: system_prompt.as_deref(),
+            default_base: &default_base,
+            append: append_system_prompt.as_deref(),
+            cwd: &cwd,
+            include_context_files: !no_context_files,
+            skills: &skills,
+            has_read,
+            has_todo,
+            has_structured_output,
+            has_memory,
+            memory_sections: &memory_sections,
+            project_trusted,
+            agents: &agent_defs,
+        },
+    );
+    timing.mark("build system prompt");
+
     // `--name`, applied uniformly across every path above (mirrors `serve`'s own startup check) —
     // only for a genuinely fresh session (no messages, no title yet). `--continue`'s `resume_or_create`
     // branch above mints its own fresh `SessionMeta` internally when no cwd match exists, bypassing the
@@ -4044,6 +4118,7 @@ async fn run_task(
         &retry_policy,
         &broken_pipe,
         &steering,
+        session_memory_active,
     )
     .await;
     // Persist whatever's in `session` regardless of outcome: `run_events_cancellable` mutates
@@ -4067,6 +4142,7 @@ async fn run_task(
             &retry_policy,
             &broken_pipe,
             &steering,
+            session_memory_active,
         )
         .await;
         persist_run_tail(&store, &session)?;
@@ -4441,6 +4517,7 @@ mod tests {
             &beyond_ai_agent::retry::RunRetryPolicy::default(),
             &AtomicBool::new(false),
             &agent_core::Steering::new(),
+            false,
         )
         .await
         .unwrap();
@@ -4700,6 +4777,7 @@ mod tests {
             &beyond_ai_agent::retry::RunRetryPolicy::default(),
             &AtomicBool::new(false),
             &agent_core::Steering::new(),
+            false,
         )
         .await
         .expect("the whole-run retry must recover once a real turn is finally scripted");
@@ -4737,6 +4815,7 @@ mod tests {
             &beyond_ai_agent::retry::RunRetryPolicy::default(),
             &AtomicBool::new(false),
             &agent_core::Steering::new(),
+            false,
         )
         .await
         .expect_err("must eventually give up, not retry forever");
@@ -4782,6 +4861,7 @@ mod tests {
             &policy,
             &AtomicBool::new(false),
             &agent_core::Steering::new(),
+            false,
         )
         .await
         .expect_err(

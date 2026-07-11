@@ -14,18 +14,63 @@
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 
 use super::{
-    Entry, Hit, INDEX_FILE, INDEX_MAX_BYTES, INDEX_MAX_LINES, MemPath, MemoryBackend, MemoryError,
-    View,
+    Entry, Hit, INDEX_FILE, INDEX_MAX_BYTES, INDEX_MAX_LINES, MEMORY_ROOT, MemPath, MemoryBackend,
+    MemoryError, SESSION_ROOT, View,
 };
+
+/// Where a [`FileBackend`]'s directory comes from. A durable store lives at a `Fixed` path for its whole
+/// life; a session working-memory store points at a `Shared`, atomically-swappable path so a serve
+/// session switch (`switch_session`/`new_session`/`fork`) re-points every holder — parent and shared
+/// subagents alike — with one cell write, no tool or agent rebuild. See [`SessionDir`].
+#[derive(Clone)]
+enum DirSource {
+    Fixed(PathBuf),
+    Shared(SessionDir),
+}
+
+impl DirSource {
+    /// The current directory. Cheap (a clone / a short read lock) — called once per operation.
+    fn get(&self) -> PathBuf {
+        match self {
+            DirSource::Fixed(p) => p.clone(),
+            // Recover a poisoned lock rather than panicking: a path cell has no invariant a panicked
+            // writer could have left half-updated (it's a single atomic assignment), and the workspace
+            // forbids `unwrap`. The worst case of a poisoned read is a stale-but-valid path.
+            DirSource::Shared(cell) => cell.0.read().unwrap_or_else(|e| e.into_inner()).clone(),
+        }
+    }
+}
+
+/// A shared, swappable session-memory directory. Cloned (by `Arc`) into the session [`FileBackend`] and
+/// held by the host; the host re-points it on a session switch and every backend clone sees the change.
+#[derive(Clone)]
+pub struct SessionDir(Arc<RwLock<PathBuf>>);
+
+impl SessionDir {
+    /// A new cell starting at `dir`.
+    pub fn new(dir: PathBuf) -> Self {
+        Self(Arc::new(RwLock::new(dir)))
+    }
+
+    /// Re-point the cell at `dir` — the next memory operation (parent or subagent) uses it.
+    pub fn set(&self, dir: PathBuf) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = dir;
+    }
+}
 
 /// A memory store backed by a directory of files.
 pub struct FileBackend {
-    dir: PathBuf,
+    dir: DirSource,
+    /// The logical root this store is surfaced under (e.g. [`MEMORY_ROOT`] or [`SESSION_ROOT`]). Only
+    /// affects the paths reported back to the model (listings, search hits) — the on-disk layout is the
+    /// same regardless — so one backend type serves either mount.
+    root: &'static str,
 }
 
 impl FileBackend {
@@ -37,32 +82,61 @@ impl FileBackend {
             .join("projects")
             .join(encoded)
             .join("memory");
-        Self { dir }
+        Self {
+            dir: DirSource::Fixed(dir),
+            root: MEMORY_ROOT,
+        }
     }
 
-    /// A store at an explicit directory (a `--memory <path>` / `file://` override).
+    /// A durable store at an explicit directory (a `--memory <path>` / `file://` override).
     pub fn at(dir: PathBuf) -> Self {
-        Self { dir }
+        Self {
+            dir: DirSource::Fixed(dir),
+            root: MEMORY_ROOT,
+        }
+    }
+
+    /// A session working-memory store at a fixed `dir`, surfaced under [`SESSION_ROOT`] (`/session`). For
+    /// hosts with a single, non-switching session (`run`) and for tests.
+    pub fn session_at(dir: PathBuf) -> Self {
+        Self {
+            dir: DirSource::Fixed(dir),
+            root: SESSION_ROOT,
+        }
+    }
+
+    /// A session working-memory store whose directory tracks a shared [`SessionDir`] cell — for a host
+    /// (`serve`) that switches between sessions in one process.
+    pub fn session_shared(cell: SessionDir) -> Self {
+        Self {
+            dir: DirSource::Shared(cell),
+            root: SESSION_ROOT,
+        }
+    }
+
+    /// The store's current base directory.
+    fn dir(&self) -> PathBuf {
+        self.dir.get()
     }
 
     /// The real filesystem path for a logical [`MemPath`].
     fn resolve(&self, path: &MemPath) -> PathBuf {
         if path.is_root() {
-            self.dir.clone()
+            self.dir()
         } else {
-            self.dir.join(path.rel())
+            self.dir().join(path.rel())
         }
     }
 
     /// The store-wide lock path guarding every mutation (one lock for the whole store keeps cross-file
     /// operations like `rename` and index updates consistent).
     fn lock_path(&self) -> PathBuf {
-        self.dir.join(".memory.lock")
+        self.dir().join(".memory.lock")
     }
 
     /// Acquire the store lock, having ensured the store directory exists.
     fn lock(&self) -> Result<FileLock, MemoryError> {
-        fs::create_dir_all(&self.dir).map_err(|e| MemoryError::Backend(e.to_string()))?;
+        fs::create_dir_all(self.dir()).map_err(|e| MemoryError::Backend(e.to_string()))?;
         FileLock::acquire(&self.lock_path()).map_err(|e| MemoryError::Backend(e.to_string()))
     }
 
@@ -118,7 +192,7 @@ impl FileBackend {
                 continue;
             }
             let real = entry.path();
-            let Ok(logical) = real.strip_prefix(&self.dir) else {
+            let Ok(logical) = real.strip_prefix(self.dir()) else {
                 continue;
             };
             let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
@@ -128,7 +202,7 @@ impl FileBackend {
                 entry.metadata().map(|m| m.len()).unwrap_or(0)
             };
             out.push(Entry {
-                path: format!("{}/{}", super::MEMORY_ROOT, logical.to_string_lossy()),
+                path: format!("{}/{}", self.root, logical.to_string_lossy()),
                 is_dir,
                 size,
             });
@@ -164,7 +238,7 @@ fn cap_index(raw: &str) -> String {
 #[async_trait]
 impl MemoryBackend for FileBackend {
     async fn index(&self) -> Result<String, MemoryError> {
-        let path = self.dir.join(INDEX_FILE);
+        let path = self.dir().join(INDEX_FILE);
         match fs::read_to_string(&path) {
             Ok(raw) => Ok(cap_index(&raw)),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(String::new()),
@@ -324,7 +398,8 @@ impl MemoryBackend for FileBackend {
         if needle.is_empty() {
             return Ok(Vec::new());
         }
-        let entries = self.listing(&self.dir)?;
+        let dir = self.dir();
+        let entries = self.listing(&dir)?;
         let mut hits = Vec::new();
         for entry in entries {
             if entry.is_dir {
@@ -333,9 +408,9 @@ impl MemoryBackend for FileBackend {
             // Re-derive the real path from the logical one.
             let rel = entry
                 .path
-                .strip_prefix(&format!("{}/", super::MEMORY_ROOT))
+                .strip_prefix(&format!("{}/", self.root))
                 .unwrap_or(&entry.path);
-            let real = self.dir.join(rel);
+            let real = dir.join(rel);
             let Ok(text) = fs::read_to_string(&real) else {
                 continue;
             };
@@ -572,6 +647,30 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, "/memories/a.md");
         assert_eq!(hits[0].line, 1);
+    }
+
+    #[tokio::test]
+    async fn a_session_store_reports_paths_under_the_session_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = FileBackend::session_at(dir.path().join("session"));
+        b.create(
+            &MemPath::parse_in("/session/facts.md", SESSION_ROOT).unwrap(),
+            "port 5433\n",
+        )
+        .await
+        .unwrap();
+        // Listings and search hits carry /session, not /memories.
+        let View::Listing(entries) = b
+            .view(&MemPath::parse_in("/session", SESSION_ROOT).unwrap(), None)
+            .await
+            .unwrap()
+        else {
+            panic!("expected a listing");
+        };
+        assert!(entries.iter().any(|e| e.path == "/session/facts.md"));
+        let hits = b.search("5433").await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "/session/facts.md");
     }
 
     #[tokio::test]

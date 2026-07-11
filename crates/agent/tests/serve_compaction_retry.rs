@@ -379,6 +379,11 @@ fn serve_proactively_compacts_a_resumed_large_session_on_its_very_next_prompt() 
             "50",
             "--compaction-keep-recent-tokens",
             "1",
+            // This test counts model calls to prove proactive-compaction *timing*, nothing else. Session
+            // working memory is on by default and steers the model to consult `/session` after each
+            // compaction — an extra, intended turn (covered by `serve_session_memory`) that would make a
+            // third call here. Disable it to keep the count at the two calls compaction itself makes.
+            "--no-session-memory",
         ])
         .env("HOME", ISOLATED_HOME)
         .stdin(Stdio::piped())

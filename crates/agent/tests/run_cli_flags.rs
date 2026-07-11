@@ -1077,6 +1077,12 @@ fn run_binary_context_window_flag_forces_proactive_compaction_on_a_resumed_sessi
             "--compaction-keep-recent-tokens",
             "1",
             "--no-session-persistence",
+            // This test is about `--context-window` forcing compaction, nothing else. Session working
+            // memory is on by default now, and each compaction actively steers the model to consult
+            // `/session` — an extra, intended turn (proven in `run_session_memory`/`serve_session_memory`)
+            // that would add a third, unscripted model call here. Disable it to keep the assertion focused
+            // on the two calls compaction itself makes: the summarization, then the real answer.
+            "--no-session-memory",
         ])
         .stdin(Stdio::null())
         .output()

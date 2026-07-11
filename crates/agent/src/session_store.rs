@@ -2521,6 +2521,37 @@ pub struct TrashEntry {
     pub original_path: String,
 }
 
+/// A session's sibling `/session` working-memory directory is `<created_at>_<id>.memory/` next to its
+/// `<created_at>_<id>.jsonl` (see [`crate::memory::session_dir`]). This derives the memory dir's name for
+/// a given session file, so trash/restore can move the two together.
+fn sibling_memory_name(session_jsonl: &Path) -> Option<PathBuf> {
+    session_jsonl
+        .file_name()
+        .map(|n| Path::new(n).with_extension("memory"))
+}
+
+/// Best-effort move of a session's sibling working-memory dir into `dst_dir`, alongside a `.jsonl` that
+/// was just moved there (trash on delete, or back out on restore). Never errors: a missing dir (the
+/// session had no working memory, or predates this feature) or a failed rename must not fail the session
+/// operation — matching [`SessionRepo::delete`]'s best-effort contract for the soft-delete itself.
+fn move_sibling_memory(session_jsonl: &Path, dst_dir: &Path) {
+    let src_mem = session_jsonl.with_extension("memory");
+    if let Some(name) = sibling_memory_name(session_jsonl)
+        && src_mem.is_dir()
+    {
+        let _ = fs::rename(&src_mem, dst_dir.join(name));
+    }
+}
+
+/// Best-effort removal of a session's sibling working-memory dir, for the hard-delete fallback path where
+/// there is no `.trash/` to move it into. Same no-error contract as [`move_sibling_memory`].
+fn remove_sibling_memory(session_jsonl: &Path) {
+    let src_mem = session_jsonl.with_extension("memory");
+    if src_mem.is_dir() {
+        let _ = fs::remove_dir_all(&src_mem);
+    }
+}
+
 /// A directory of session files. `Clone` is just a `PathBuf` copy — cheap, and lets a caller move an
 /// owned handle into a `spawn_blocking` closure (see `serve.rs`'s `Persistence::list_with_progress`)
 /// without holding a borrow of the original across the `.await`.
@@ -2696,11 +2727,17 @@ impl SessionRepo {
             if fs::create_dir_all(&trash_dir).is_ok()
                 && fs::rename(&path, trash_dir.join(file_name)).is_ok()
             {
+                // The `/session` working-memory dir trashes alongside its session (best-effort).
+                move_sibling_memory(&path, &trash_dir);
                 return Ok(());
             }
         }
         match fs::remove_file(&path) {
-            Ok(()) => Ok(()),
+            // Hard-delete fallback: reap the sibling working-memory dir too so it doesn't leak.
+            Ok(()) => {
+                remove_sibling_memory(&path);
+                Ok(())
+            }
             // Raced with another deleter: the file vanished between `find_path` and `remove`. Still a
             // no-op success — the post-condition ("no session with this id") holds either way.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -2812,6 +2849,9 @@ impl SessionRepo {
             ));
         }
         fs::rename(&path, &dest)?;
+        // Bring the session's `/session` working-memory dir back out of `.trash/` too (best-effort — a
+        // missing dir just means the session had no working memory, or an older delete predates this).
+        move_sibling_memory(&path, &self.dir);
         Ok(true)
     }
 
@@ -6178,6 +6218,41 @@ mod tests {
         let listed = repo.list().unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, id);
+    }
+
+    #[test]
+    fn delete_and_restore_move_the_sibling_session_memory_dir_too() {
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let id = store.meta().id.clone();
+        let jsonl = store.path.clone();
+        // Simulate `/session` working memory written during the session — the `<...>.memory/` sibling.
+        let mem_dir = jsonl.with_extension("memory");
+        fs::create_dir_all(&mem_dir).unwrap();
+        fs::write(mem_dir.join("facts.md"), "the prod DB port is 5433\n").unwrap();
+
+        repo.delete(&id).unwrap();
+        assert!(
+            !mem_dir.exists(),
+            "the memory dir must leave its original location when the session is trashed"
+        );
+        let trashed_mem = dir.path().join(".trash").join(mem_dir.file_name().unwrap());
+        assert!(
+            trashed_mem.join("facts.md").exists(),
+            "the memory dir and its contents must move into .trash/ alongside the session"
+        );
+
+        assert!(repo.restore_session(&id).unwrap());
+        assert!(
+            !trashed_mem.exists(),
+            "the memory dir must leave .trash/ when the session is restored"
+        );
+        assert_eq!(
+            fs::read_to_string(mem_dir.join("facts.md")).unwrap(),
+            "the prod DB port is 5433\n",
+            "the restored working memory must have its contents intact"
+        );
     }
 
     #[test]

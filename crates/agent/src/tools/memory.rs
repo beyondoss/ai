@@ -1,16 +1,18 @@
-//! `memory` — the agent's durable, cross-session knowledge store.
+//! `memory` — the agent's knowledge store, across one or more mounted roots.
 //!
 //! One tool with a `command` enum (`view`/`create`/`str_replace`/`insert`/`delete`/`rename`/`search`)
-//! over a fixed `/memories` logical namespace, mirroring Anthropic's canonical `memory_20250818` tool so
-//! the model's existing skills transfer. The tool is a thin, backend-agnostic adapter: it validates the
-//! model's arguments (notably the [`MemPath`], which confines every operation to the store) and forwards
-//! to a [`MemoryBackend`]. What actually persists — local files today, a networked store later — is the
-//! backend's concern, not this tool's. See [`crate::memory`].
+//! over logical roots, mirroring Anthropic's canonical `memory_20250818` tool so the model's existing
+//! skills transfer. Two roots can be mounted at once: `/memories` (durable, cross-session project
+//! knowledge) and `/session` (per-session working memory that survives compaction and is cleared when
+//! the session ends). The tool is a thin, backend-agnostic adapter: it validates the model's arguments
+//! (notably the [`MemPath`], which confines every operation to a store), **routes the path to the mount
+//! whose root it names** ([`MemPath::classify`]), and forwards to that [`MemoryBackend`]. What actually
+//! persists — local files today, a networked store later — is the backend's concern. See [`crate::memory`].
 //!
-//! **The backend is host-owned.** It's an `Arc<dyn MemoryBackend>` cloned into the tool at registration,
-//! not a field the tool constructs — because the registry is rebuilt on every `set_model`/`set_thinking`,
-//! durable state must survive a rebuild (the same reason `structured_output`'s `OutputSlot` and
-//! `subagent`'s `SubagentCtx` are host-owned).
+//! **The mounts are host-owned.** Each is an `Arc<dyn MemoryBackend>` cloned into the tool at
+//! registration, not a field the tool constructs — because the registry is rebuilt on every
+//! `set_model`/`set_thinking`, durable state must survive a rebuild (the same reason
+//! `structured_output`'s `OutputSlot` and `subagent`'s `SubagentCtx` are host-owned).
 //!
 //! **`additionalProperties: false`** keeps the schema tight, which means the dispatch loop's
 //! `_model_supports_vision` stamp would otherwise fail validation — so it's stripped at the top of `run`,
@@ -23,24 +25,56 @@ use agent_core::{ToolError, ToolOutput};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::memory::{Entry, Hit, MemPath, MemoryBackend, MemoryError, View};
+use crate::memory::{Entry, Hit, MemPath, MemoryBackend, MemoryError, Mount, MountKind, View};
 use crate::tools::output::cap_listing_bytes;
 
 pub const NAME: &str = "memory";
 
-const DESCRIPTION: &str = "Durable, cross-session memory stored under `/memories`. Save facts worth \
-    remembering in future sessions (build/test commands, architecture decisions, debugging lessons, \
-    user preferences) and recall them later. Keep `MEMORY.md` as a lean index of one-line pointers to \
-    topic files.";
+const DESCRIPTION: &str = "Memory store. `/memories` is durable, cross-session project knowledge \
+    (build/test commands, architecture decisions, debugging lessons, user preferences). `/session`, when \
+    present, is private working memory for THIS task that survives your own context compaction and is \
+    cleared when the session ends — write precise facts there you don't want summarized away. Keep each \
+    root's `MEMORY.md` as a lean index of one-line pointers to topic files.";
 
-/// The `memory` tool. Holds the store behind an `Arc` cloned in at registration.
+/// The `memory` tool. Holds the mounted stores, each an `Arc` cloned in at registration.
 pub struct Memory {
-    backend: Arc<dyn MemoryBackend>,
+    mounts: Vec<Mount>,
 }
 
 impl Memory {
+    /// Single durable mount — the common single-root case (and what tests use).
     pub fn new(backend: Arc<dyn MemoryBackend>) -> Self {
-        Self { backend }
+        Self {
+            mounts: vec![Mount {
+                kind: MountKind::Durable,
+                backend,
+            }],
+        }
+    }
+
+    /// Mount an explicit set of stores (durable, and optionally session), in display order.
+    pub fn mounted(mounts: Vec<Mount>) -> Self {
+        Self { mounts }
+    }
+
+    /// The roots this tool serves, in mount order — the first is the default for a bare relative path.
+    fn roots(&self) -> Vec<&'static str> {
+        self.mounts.iter().map(Mount::root).collect()
+    }
+
+    /// Classify a model-supplied path across the mounted roots and return the owning backend plus the
+    /// validated, rel-only [`MemPath`]. An unknown/foreign root is a retryable `InvalidInput`.
+    fn resolve(&self, raw: &str) -> Result<(&Arc<dyn MemoryBackend>, MemPath), ToolError> {
+        let roots = self.roots();
+        let path = MemPath::classify(raw, &roots).map_err(map_err)?;
+        let mount = self
+            .mounts
+            .iter()
+            .find(|m| m.root() == path.root())
+            .ok_or_else(|| {
+                ToolError::InvalidInput(format!("no memory is mounted at {}", path.root()))
+            })?;
+        Ok((&mount.backend, path))
     }
 }
 
@@ -59,11 +93,6 @@ fn str_field<'a>(input: &'a Value, key: &str) -> Result<&'a str, ToolError> {
         .get(key)
         .and_then(Value::as_str)
         .ok_or_else(|| ToolError::InvalidInput(format!("missing `{key}`")))
-}
-
-fn mem_path(input: &Value, key: &str) -> Result<MemPath, ToolError> {
-    let raw = str_field(input, key)?;
-    MemPath::parse(raw).map_err(map_err)
 }
 
 /// Parse an optional `view_range` of `[start, end]` (1-indexed, inclusive).
@@ -151,8 +180,10 @@ impl Tool for Memory {
                 },
                 "path": {
                     "type": "string",
-                    "description": "Logical path under /memories, e.g. /memories/notes.md. For `view` of \
-                                    /memories, lists the whole store. Required for every command except `search`."
+                    "description": "Logical path under a mounted root — /memories/... (durable) or \
+                                    /session/... (this-session working memory, when available), e.g. \
+                                    /memories/notes.md. `view` of a bare root (/memories or /session) \
+                                    lists that store. Required for every command except `search`."
                 },
                 "file_text": {
                     "type": "string",
@@ -181,7 +212,8 @@ impl Tool for Memory {
                 },
                 "new_path": {
                     "type": "string",
-                    "description": "For `rename`: the destination path under /memories."
+                    "description": "For `rename`: the destination path (same root as `path` — a rename \
+                                    cannot move between /memories and /session)."
                 },
                 "query": {
                     "type": "string",
@@ -202,8 +234,9 @@ impl Tool for Memory {
             _ => return None,
         };
         let raw = input.get(key).and_then(Value::as_str)?;
-        // Group on the validated logical path so `/memories/x` and `memories/x` collide as they should.
-        let logical = MemPath::parse(raw).ok()?.display();
+        // Group on the validated full logical path (root included) so `/memories/x` and `memories/x`
+        // collide as they should, while `/memories/x` and `/session/x` stay independent.
+        let logical = MemPath::classify(raw, &self.roots()).ok()?.display();
         Some(format!("memory:{logical}"))
     }
 
@@ -217,32 +250,32 @@ impl Tool for Memory {
         let command = str_field(&input, "command")?;
         match command {
             "view" => {
-                let path = mem_path(&input, "path")?;
+                let (backend, path) = self.resolve(str_field(&input, "path")?)?;
                 let range = parse_range(&input)?;
-                match self.backend.view(&path, range).await.map_err(map_err)? {
+                match backend.view(&path, range).await.map_err(map_err)? {
                     View::Document(text) => Ok(render_doc(&path, text)),
                     View::Listing(entries) => Ok(render_listing(&entries)),
                 }
             }
             "create" => {
-                let path = mem_path(&input, "path")?;
+                let (backend, path) = self.resolve(str_field(&input, "path")?)?;
                 let text = str_field(&input, "file_text")?;
-                self.backend.create(&path, text).await.map_err(map_err)?;
+                backend.create(&path, text).await.map_err(map_err)?;
                 Ok(format!("Created {} ({} bytes).", path.display(), text.len()).into())
             }
             "str_replace" => {
-                let path = mem_path(&input, "path")?;
+                let (backend, path) = self.resolve(str_field(&input, "path")?)?;
                 let old = str_field(&input, "old_str")?;
                 // `new_str` may legitimately be absent (delete a snippet) → default to empty.
                 let new = input.get("new_str").and_then(Value::as_str).unwrap_or("");
-                self.backend
+                backend
                     .str_replace(&path, old, new)
                     .await
                     .map_err(map_err)?;
                 Ok(format!("Edited {}.", path.display()).into())
             }
             "insert" => {
-                let path = mem_path(&input, "path")?;
+                let (backend, path) = self.resolve(str_field(&input, "path")?)?;
                 let line = input
                     .get("insert_line")
                     .and_then(Value::as_u64)
@@ -250,26 +283,36 @@ impl Tool for Memory {
                     as usize;
                 let text =
                     str_field(&input, "insert_text").or_else(|_| str_field(&input, "file_text"))?;
-                self.backend
-                    .insert(&path, line, text)
-                    .await
-                    .map_err(map_err)?;
+                backend.insert(&path, line, text).await.map_err(map_err)?;
                 Ok(format!("Inserted into {}.", path.display()).into())
             }
             "delete" => {
-                let path = mem_path(&input, "path")?;
-                self.backend.delete(&path).await.map_err(map_err)?;
+                let (backend, path) = self.resolve(str_field(&input, "path")?)?;
+                backend.delete(&path).await.map_err(map_err)?;
                 Ok(format!("Deleted {}.", path.display()).into())
             }
             "rename" => {
-                let from = mem_path(&input, "path")?;
-                let to = mem_path(&input, "new_path")?;
-                self.backend.rename(&from, &to).await.map_err(map_err)?;
+                let (backend, from) = self.resolve(str_field(&input, "path")?)?;
+                let (_, to) = self.resolve(str_field(&input, "new_path")?)?;
+                // A backend can only move within itself; a cross-root rename has no meaning here.
+                if from.root() != to.root() {
+                    return Err(ToolError::InvalidInput(format!(
+                        "cannot rename across roots ({} → {}); copy the content instead",
+                        from.root(),
+                        to.root()
+                    )));
+                }
+                backend.rename(&from, &to).await.map_err(map_err)?;
                 Ok(format!("Renamed {} to {}.", from.display(), to.display()).into())
             }
             "search" => {
                 let query = str_field(&input, "query")?;
-                let hits = self.backend.search(query).await.map_err(map_err)?;
+                // Fan across every mount; each backend labels its hits with its own root, so the merged
+                // listing is unambiguous. Durable first (mount order), then session.
+                let mut hits: Vec<Hit> = Vec::new();
+                for mount in &self.mounts {
+                    hits.extend(mount.backend.search(query).await.map_err(map_err)?);
+                }
                 Ok(render_hits(query, &hits))
             }
             other => Err(ToolError::InvalidInput(format!(
@@ -288,6 +331,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let backend = Arc::new(FileBackend::at(dir.path().join("memory")));
         (dir, Memory::new(backend))
+    }
+
+    fn dual_tool() -> (tempfile::TempDir, Memory) {
+        let dir = tempfile::tempdir().unwrap();
+        let durable = Arc::new(FileBackend::at(dir.path().join("memory")));
+        let session = Arc::new(FileBackend::session_at(dir.path().join("session")));
+        let mounts = vec![
+            Mount {
+                kind: MountKind::Durable,
+                backend: durable,
+            },
+            Mount {
+                kind: MountKind::Session,
+                backend: session,
+            },
+        ];
+        (dir, Memory::mounted(mounts))
     }
 
     #[tokio::test]
@@ -363,6 +423,69 @@ mod tests {
             t.write_target(&json!({ "command": "view", "path": "/memories/a.md" })),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn dual_mounts_route_by_root_and_stay_isolated() {
+        let (_d, t) = dual_tool();
+        // Same rel path in each root writes to a different store.
+        t.run(json!({ "command": "create", "path": "/memories/x.md", "file_text": "durable" }))
+            .await
+            .unwrap();
+        t.run(json!({ "command": "create", "path": "/session/x.md", "file_text": "scratch" }))
+            .await
+            .unwrap();
+        let d = t
+            .run(json!({ "command": "view", "path": "/memories/x.md" }))
+            .await
+            .unwrap();
+        let s = t
+            .run(json!({ "command": "view", "path": "/session/x.md" }))
+            .await
+            .unwrap();
+        assert_eq!(d.text, "durable");
+        assert_eq!(s.text, "scratch");
+
+        // write_target distinguishes the two roots so their mutations don't serialize together.
+        assert_eq!(
+            t.write_target(&json!({ "command": "create", "path": "session/x.md" })),
+            Some("memory:/session/x.md".to_string())
+        );
+
+        // search fans across both mounts, each hit labeled with its own root.
+        let hits = t
+            .run(json!({ "command": "search", "query": "a" }))
+            .await
+            .unwrap();
+        assert!(hits.text.contains("/memories/x.md"));
+        assert!(hits.text.contains("/session/x.md"));
+    }
+
+    #[tokio::test]
+    async fn cross_root_rename_is_rejected() {
+        let (_d, t) = dual_tool();
+        t.run(json!({ "command": "create", "path": "/memories/x.md", "file_text": "hi" }))
+            .await
+            .unwrap();
+        let err = t
+            .run(json!({ "command": "rename", "path": "/memories/x.md", "new_path": "/session/x.md" }))
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::InvalidInput(msg) => assert!(msg.contains("across roots"), "got: {msg}"),
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unmounted_root_is_a_retryable_error() {
+        // Only durable is mounted; a /session path is rejected with guidance the model can act on.
+        let (_d, t) = tool();
+        let err = t
+            .run(json!({ "command": "view", "path": "/session/x.md" }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidInput(_)));
     }
 
     #[tokio::test]
