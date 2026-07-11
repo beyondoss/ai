@@ -34,6 +34,17 @@ unimplemented = "deny"
 
 # Release builds wrap arithmetic silently by default; turn that into a panic so an overflow on a
 # size/count never goes unnoticed. Profiles only take effect at the workspace root.
+# Test/dev builds keep only line tables, not full DWARF. Panic backtraces still resolve to file:line
+# (all a failing test needs), but the object files and — critically — the peak memory and disk during
+# the parallel link of the workspace's test binaries drop sharply. CI's `cargo test --lib` compiles every
+# crate's test binary at once; full debuginfo pushes that peak against a 7 GB hosted runner's usable RAM.
+# `line-tables-only` keeps CI comfortably under the ceiling without losing test-failure backtraces.
+[profile.test]
+debug = "line-tables-only"
+
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
 overflow-checks = true
 # Size + speed (no runtime cost): `strip` drops debug symbols (also shrinks the Docker image, which
