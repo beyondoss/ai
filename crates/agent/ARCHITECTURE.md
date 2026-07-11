@@ -2,8 +2,8 @@
 
 `beyond-ai-agent` (lib `beyond_ai_agent`, bin `beyond-ai-agent`) takes a task prompt or a stream of
 NDJSON commands on stdin and turns them into a running coding agent: it drives
-[`agent_core::Agent`](../agent-core/ARCHITECTURE.md) through a fixed set of ten tools (file I/O,
-search, shell, Beyond-platform) and streams the model's text and tool activity back out — to stdout
+[`agent_core::Agent`](../agent-core/ARCHITECTURE.md) through a set of built-in tools (file I/O,
+search, shell, Beyond-platform, and a `memory` store) and streams the model's text and tool activity back out — to stdout
 for a one-shot `run`, or as NDJSON event frames for a headless `serve` session. It holds no provider
 keys and makes no provider-specific decisions; all model traffic is one HTTP POST per turn to a
 Beyond gateway, authenticated with a `bai_v1` virtual key (or a BYO key the gateway forwards as-is).
@@ -416,6 +416,27 @@ The harness layers several capabilities over the bare tools + loop:
   no pool to justify the setup) rather than scanning one file at a time, and invoke `on_progress(scanned,
   total)` once per file so `serve` can put a live "scanning…" indicator on the wire for a listing large
   enough to take a moment; `list`/`list_all` are the same scan with a no-op progress callback.
+- **Persistent memory** ([`memory`](src/memory.rs), tool in [`tools::memory`](src/tools/memory.rs)) —
+  durable, cross-session knowledge the model curates itself, distinct from session persistence (which
+  records _the conversation_; memory records _what to carry forward_). A single backend-agnostic `memory`
+  tool exposes a `command` enum (`view`/`create`/`str_replace`/`insert`/`delete`/`rename`/`search`) over
+  a fixed `/memories` logical namespace, mirroring Anthropic's `memory_20250818` surface so the model's
+  skills transfer. Storage is behind the `MemoryBackend` trait so it isn't welded to local disk: v1 ships
+  `FileBackend` (per-project `*.md` files under `~/.claude/projects/<encoded-cwd>/memory/`, reusing
+  `config_dir_root`/`encode_cwd` and the `FileLock`+`mutate_locked`+atomic-write store discipline);
+  `redis://`/`postgres://` DSNs are recognized by `memory::open` but return a clear "not yet supported"
+  (the seam exists without the impl). The `MEMORY.md` index is read at session start (bounded to ~200
+  lines/25 KB) and injected into the system prompt (`resources::PromptOptions::memory_index`) — Claude
+  Code's auto-memory model — so a memory is surfaced without the model having to go looking. The tool is
+  host-owned (an `Arc<dyn MemoryBackend>` cloned into the tool at each registry rebuild, like
+  `structured_output`'s `OutputSlot`) and registered _after_ `apply_filter` so a `--tools` allow-list
+  can't strip it. `--memory <dsn>`/`AI_AGENT_MEMORY_URL` (with the stored `default_memory_backend`
+  setting folded in) selects a backend; `--no-memory` opts out entirely. **Subagents share the parent's
+  store**: the same backend `Arc` is threaded through `SubagentCtx` (not re-derived from the child's cwd,
+  so even a `worktree`-isolated child shares it rather than a private one), and every child gets the
+  `memory` tool plus the current injected index — a subagent grounds its work in what the project already
+  learned, its findings are visible to the parent and siblings, and concurrent writes across the tree are
+  serialized by the backend's cross-process lock.
 - **Tree-shaped history** — every message line also carries an `id`/`parent_id` (additive,
   `#[serde(default)]`; a pre-tree file's absent fields are migrated to synthesized, chained ids in
   memory only, never persisted back). The "active path" (`Session.messages`) is the `parent_id` chain

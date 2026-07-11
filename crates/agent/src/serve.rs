@@ -451,6 +451,13 @@ pub struct ServeConfig {
     /// Persist many sessions under this directory (a [`SessionRepo`]). Enables the multi-session
     /// commands (`list_sessions`, `switch_session`, `fork`, `set_session_name`).
     pub session_dir: Option<String>,
+    /// The persistent-memory backend DSN (`--memory`/`AI_AGENT_MEMORY_URL`, with the stored
+    /// `default_memory_backend` folded in by `main.rs`). `None` resolves to a per-project local-file
+    /// store. Resolved into a backend by `serve_session` itself — after project trust — not here, so it
+    /// shares the same resolved `cwd` (mirroring `agents`). See [`crate::memory`].
+    pub memory: Option<String>,
+    /// Disable persistent memory entirely (`--no-memory`): no `memory` tool, no injected index.
+    pub no_memory: bool,
     /// Use this exact session id instead of a freshly generated one, wherever a *new* `SessionMeta` is
     /// actually minted by [`Persistence::open`] — already-validated by `main.rs` (embedded directly into
     /// a persisted filename, so it must be sanitized before it ever reaches here). Matches `run`'s
@@ -2016,6 +2023,31 @@ pub(crate) async fn serve_session(
     let has_read = startup_tools.get("read").is_some();
     let has_todo = startup_tools.get(crate::tools::todo::NAME).is_some();
 
+    // Persistent memory (mirrors `run`): resolve the backend once here where `cwd` is known, then wrap it
+    // as a shared `Arc<dyn Tool>` that every `build_agent` rebuild registers (so a mid-run `set_model`
+    // doesn't drop it). `--no-memory` disables it; a bad backend DSN is fatal at startup, before any
+    // session runs. The `MEMORY.md` index is read once and injected into the system prompt — a session's
+    // memory is surfaced from its start (Claude Code's auto-memory model).
+    let memory_backend: Option<Arc<dyn crate::memory::MemoryBackend>> =
+        if cfg.no_memory || cfg.no_tools {
+            None
+        } else {
+            Some(
+                crate::memory::open(cfg.memory.as_deref(), &cwd)
+                    .map_err(Box::<dyn std::error::Error>::from)?,
+            )
+        };
+    let has_memory = memory_backend.is_some();
+    let memory_tool: Option<Arc<dyn agent_core::Tool>> = memory_backend
+        .clone()
+        .map(|b| Arc::new(crate::tools::memory::Memory::new(b)) as Arc<dyn agent_core::Tool>);
+    // Re-read at each `static_system` rebuild (a `set_model`/`set_thinking` switch, or a `prompt` whose
+    // output-schema changed — see `current_memory_index`) so a session that has written new memories
+    // injects the *current* index, not a stale startup snapshot. Steady-state within one model, the
+    // `memory` tool's own `view` is always live, so this need only refresh where the prompt is already
+    // being rebuilt — one small file read, never per turn.
+    let mut memory_index: Option<String> = current_memory_index(&memory_backend).await;
+
     // The interactive approval gate. One per session, shared by every `build_agent` rebuild and by every
     // subagent child, so a remembered decision isn't re-asked and eight parallel children can't spam
     // eight simultaneous questions. `pending_approvals` is the map the `approve` command resolves
@@ -2054,6 +2086,8 @@ pub(crate) async fn serve_session(
             has_read,
             has_todo,
             has_structured_output: structured_output.is_some(),
+            has_memory,
+            memory_index: memory_index.as_deref(),
             project_trusted,
             agents: &cfg.agents,
         });
@@ -2199,6 +2233,7 @@ pub(crate) async fn serve_session(
                 &current_model,
                 &write_locks,
                 &skills,
+                memory_backend.clone(),
                 approval.as_ref(),
             ))
         };
@@ -2239,6 +2274,7 @@ pub(crate) async fn serve_session(
         &checkpoint,
         subagent_ctx.as_ref(),
         structured_output.as_ref(),
+        memory_tool.as_ref(),
         approval.as_ref(),
     );
     timing.mark("build agent");
@@ -2423,6 +2459,7 @@ pub(crate) async fn serve_session(
                                 &checkpoint,
                                 subagent_ctx.as_ref(),
                                 structured_output.as_ref(),
+                                memory_tool.as_ref(),
                                 approval.as_ref(),
                                 );
                         }
@@ -2541,6 +2578,7 @@ pub(crate) async fn serve_session(
                             &checkpoint,
                             subagent_ctx.as_ref(),
                                 structured_output.as_ref(),
+                                memory_tool.as_ref(),
                                 approval.as_ref(),
                             );
                     }
@@ -2610,6 +2648,7 @@ pub(crate) async fn serve_session(
                             &checkpoint,
                             subagent_ctx.as_ref(),
                                 structured_output.as_ref(),
+                                memory_tool.as_ref(),
                                 approval.as_ref(),
                             );
                     }
@@ -2829,6 +2868,7 @@ pub(crate) async fn serve_session(
                             None => None,
                         };
                         current_output_spec = spec;
+                        memory_index = current_memory_index(&memory_backend).await;
                         static_system = crate::resources::build_static_system_prompt(
                             &crate::resources::PromptOptions {
                                 base: None,
@@ -2840,6 +2880,8 @@ pub(crate) async fn serve_session(
                                 has_read,
                                 has_todo,
                                 has_structured_output: structured_output.is_some(),
+                                has_memory,
+                                memory_index: memory_index.as_deref(),
                                 project_trusted,
                                 agents: &cfg.agents,
                             },
@@ -2860,6 +2902,7 @@ pub(crate) async fn serve_session(
                             &checkpoint,
                             subagent_ctx.as_ref(),
                             structured_output.as_ref(),
+                            memory_tool.as_ref(),
                             approval.as_ref(),
                         );
                     }
@@ -4318,9 +4361,11 @@ pub(crate) async fn serve_session(
                         &current_model,
                         &write_locks,
                         &skills,
+                        memory_backend.clone(),
                         approval.as_ref(),
                     ))
                 };
+                memory_index = current_memory_index(&memory_backend).await;
                 static_system = crate::resources::build_static_system_prompt(
                     &crate::resources::PromptOptions {
                         base: None,
@@ -4332,6 +4377,8 @@ pub(crate) async fn serve_session(
                         has_read,
                         has_todo,
                         has_structured_output: structured_output.is_some(),
+                        has_memory,
+                        memory_index: memory_index.as_deref(),
                         project_trusted,
                         agents: &cfg.agents,
                     },
@@ -4357,6 +4404,7 @@ pub(crate) async fn serve_session(
                     &checkpoint,
                     subagent_ctx.as_ref(),
                     structured_output.as_ref(),
+                    memory_tool.as_ref(),
                     approval.as_ref(),
                 );
                 emit!(response(id, "reload", true, None, None));
@@ -4447,6 +4495,7 @@ pub(crate) async fn serve_session(
                                         &checkpoint,
                                         subagent_ctx.as_ref(),
                                         structured_output.as_ref(),
+                                        memory_tool.as_ref(),
                                         approval.as_ref(),
                                     );
                                     emit!(response(
@@ -4503,6 +4552,7 @@ pub(crate) async fn serve_session(
                             &checkpoint,
                             subagent_ctx.as_ref(),
                             structured_output.as_ref(),
+                            memory_tool.as_ref(),
                             approval.as_ref(),
                         );
                         emit!(response(
@@ -4531,6 +4581,7 @@ pub(crate) async fn serve_session(
                             &checkpoint,
                             subagent_ctx.as_ref(),
                             structured_output.as_ref(),
+                            memory_tool.as_ref(),
                             approval.as_ref(),
                         );
                         emit!(response(
@@ -4597,6 +4648,7 @@ pub(crate) async fn serve_session(
                                     &checkpoint,
                                     subagent_ctx.as_ref(),
                                     structured_output.as_ref(),
+                                    memory_tool.as_ref(),
                                     approval.as_ref(),
                                 );
                                 let (thinking, reasoning_effort) = agent_core::thinking_for_level(
@@ -4701,6 +4753,7 @@ pub(crate) async fn serve_session(
                                     &checkpoint,
                                     subagent_ctx.as_ref(),
                                     structured_output.as_ref(),
+                                    memory_tool.as_ref(),
                                     approval.as_ref(),
                                 );
                                 let mut resp_data =
@@ -4756,6 +4809,7 @@ pub(crate) async fn serve_session(
                             &checkpoint,
                             subagent_ctx.as_ref(),
                             structured_output.as_ref(),
+                            memory_tool.as_ref(),
                             approval.as_ref(),
                         );
                         let (thinking, reasoning_effort) = agent_core::thinking_for_level(
@@ -4812,6 +4866,7 @@ pub(crate) async fn serve_session(
                         &checkpoint,
                         subagent_ctx.as_ref(),
                         structured_output.as_ref(),
+                        memory_tool.as_ref(),
                         approval.as_ref(),
                     );
                     emit!(response(
@@ -4849,6 +4904,7 @@ pub(crate) async fn serve_session(
                         &checkpoint,
                         subagent_ctx.as_ref(),
                         structured_output.as_ref(),
+                        memory_tool.as_ref(),
                         approval.as_ref(),
                     );
                     emit!(response(
@@ -4897,6 +4953,7 @@ pub(crate) async fn serve_session(
                         &checkpoint,
                         subagent_ctx.as_ref(),
                         structured_output.as_ref(),
+                        memory_tool.as_ref(),
                         approval.as_ref(),
                     );
                     emit!(response(
@@ -4938,6 +4995,7 @@ pub(crate) async fn serve_session(
                         &checkpoint,
                         subagent_ctx.as_ref(),
                         structured_output.as_ref(),
+                        memory_tool.as_ref(),
                         approval.as_ref(),
                     );
                     emit!(response(
@@ -5223,6 +5281,7 @@ pub(crate) async fn serve_session(
                                     &checkpoint,
                                     subagent_ctx.as_ref(),
                                     structured_output.as_ref(),
+                                    memory_tool.as_ref(),
                                     approval.as_ref(),
                                 );
                             }
@@ -5772,6 +5831,17 @@ fn full_system(static_system: &str, cwd: &std::path::Path) -> String {
     format!("{static_system}{}", crate::resources::dynamic_footer(cwd))
 }
 
+/// The current `MEMORY.md` index for prompt injection, re-read from the backend so a rebuilt system
+/// prompt reflects memories written since startup. `None` when memory is disabled.
+async fn current_memory_index(
+    backend: &Option<Arc<dyn crate::memory::MemoryBackend>>,
+) -> Option<String> {
+    match backend {
+        Some(b) => Some(b.index().await.unwrap_or_default()),
+        None => None,
+    }
+}
+
 /// The `output_schema`/`output_description` a `prompt` command asks for, as the pair the session
 /// compares against what it already has installed. `None` means "answer in prose", the default.
 ///
@@ -5898,6 +5968,7 @@ fn build_gateway_client(cfg: &ServeConfig, model: &str) -> Result<GatewayClient,
 /// `skills` are the parent session's own discovered skills, so a worktree/read-only child sees the same
 /// `<available_skills>` the parent does. `prompt_guidelines` is empty: `serve` renders its base prompt
 /// once into `cfg.system` and doesn't carry the raw guideline list past that.
+#[allow(clippy::too_many_arguments)]
 fn build_subagent_ctx(
     cfg: &ServeConfig,
     cwd: &Path,
@@ -5905,6 +5976,9 @@ fn build_subagent_ctx(
     parent_model: &str,
     write_locks: &Arc<agent_core::WriteLockRegistry>,
     skills: &[crate::skills::Skill],
+    // The parent's memory backend, shared by reference so the whole subagent tree reads/writes one
+    // durable store — see `SubagentCtx::memory_backend`.
+    memory_backend: Option<Arc<dyn crate::memory::MemoryBackend>>,
     // Shared with the parent, not rebuilt — see `SubagentCtx::approval`.
     approval: Option<&crate::approval::ApprovalRuntime>,
 ) -> Arc<crate::tools::subagent::SubagentCtx> {
@@ -5935,6 +6009,7 @@ fn build_subagent_ctx(
         skills: Arc::new(skills.to_vec()),
         write_locks: write_locks.clone(),
         mcp_tools: cfg.mcp_tools.clone(),
+        memory_backend,
         tool_cfg: subagent::ChildToolConfig {
             bash_timeout_ms: cfg.bash_timeout_ms,
             bash_shell_path: cfg.bash_shell_path.clone(),
@@ -5990,6 +6065,10 @@ fn build_agent(
     // reconstructed here: it owns the compiled validator, and — more importantly — the `OutputSlot` the
     // model's answer lands in, which must survive a mid-run `set_model` rebuild.
     structured_output: Option<&Arc<crate::tools::structured_output::StructuredOutput>>,
+    // The `memory` tool for this session, when memory is enabled. An `Arc<dyn Tool>` shared across every
+    // rebuild (like `structured_output`) so a mid-run `set_model` doesn't drop it — it wraps the
+    // host-owned `MemoryBackend`, whose store must persist across a model switch.
+    memory_tool: Option<&Arc<dyn agent_core::Tool>>,
     // The interactive approval gate, when `--approve` asked for one. Shared (not rebuilt) across every
     // `set_model` rebuild so the session's remembered "always allow" decisions — and the one
     // prompt-serializing lock the whole subagent tree queues behind — survive a model switch.
@@ -6020,6 +6099,11 @@ fn build_agent(
     // scopes what the agent may *do*, and must not strip the one tool a `prompt {output_schema}` exists
     // to add — leaving a run that can never satisfy the contract it was started with.
     if let Some(tool) = structured_output {
+        registry.register(tool.clone());
+    }
+    // Persistent memory, registered after the filter for the same reason as `structured_output`/
+    // `subagent`: a `--tools` allow-list scopes what the agent may *do* and must not strip its memory.
+    if let Some(tool) = memory_tool {
         registry.register(tool.clone());
     }
     let mut agent = Agent::new(transport, model.to_string())

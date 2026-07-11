@@ -55,6 +55,13 @@ pub struct Settings {
     /// Used when neither `--session-dir` nor `AI_AGENT_SESSION_DIR` is given — pi's `sessionDir`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_session_dir: Option<String>,
+    /// The persistent-memory backend DSN, used when neither `--memory` nor `AI_AGENT_MEMORY_URL` is
+    /// given. `None` (the default) resolves to a per-project local-file store under
+    /// `~/.claude/projects/<cwd>/memory/`; a bare path or `file://` names a specific directory; a
+    /// `redis://`/`postgres://` URL selects a networked backend (recognized, not yet implemented). See
+    /// [`crate::memory::open`]. Follows `default_session_dir`'s convention exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_memory_backend: Option<String>,
     /// Used when neither `--trust-project` nor `--force-untrusted` is given. See [`TrustPolicy`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_project_trust: Option<TrustPolicy>,
@@ -294,6 +301,10 @@ impl Settings {
                 .default_session_dir
                 .clone()
                 .or_else(|| self.default_session_dir.clone()),
+            default_memory_backend: project
+                .default_memory_backend
+                .clone()
+                .or_else(|| self.default_memory_backend.clone()),
             default_project_trust: project.default_project_trust.or(self.default_project_trust),
             compaction_enabled: project.compaction_enabled.or(self.compaction_enabled),
             default_reasoning_effort: project
@@ -473,6 +484,11 @@ impl SettingsStore {
     /// Set (`Some`) or clear (`None`) the stored default session directory, persisting atomically.
     pub fn set_default_session_dir(&mut self, dir: Option<String>) -> std::io::Result<()> {
         self.mutate_locked(move |s| s.default_session_dir = dir)
+    }
+
+    /// Set (`Some`) or clear (`None`) the stored default memory backend DSN, persisting atomically.
+    pub fn set_default_memory_backend(&mut self, dsn: Option<String>) -> std::io::Result<()> {
+        self.mutate_locked(move |s| s.default_memory_backend = dsn)
     }
 
     /// Set (`Some`) or clear (`None`) the stored default project-trust policy, persisting atomically.

@@ -239,6 +239,102 @@ fn smoke_tool_round_trip() {
     }
 }
 
+/// Persistent memory, live: a real model saves a durable fact to the `memory` tool in one session, it
+/// lands on disk, and a **fresh** session (new process) recalls it — through the injected `MEMORY.md`
+/// index and/or a live `memory view`. This is the only proof that a *real* model actually drives the
+/// memory tool well (every other memory test scripts the model); it exercises the whole feature end to
+/// end against real Anthropic. `HOME` is pinned to a tempdir so the store never touches the real
+/// `~/.claude`.
+#[test]
+#[ignore = "live provider smoke; run via `mise run test:smoke:agent` with ANTHROPIC_API_KEY set"]
+fn smoke_memory_persists_and_recalls_across_sessions() {
+    let Some(key) = env_key("ANTHROPIC_API_KEY") else {
+        eprintln!("smoke[memory]: ANTHROPIC_API_KEY unset — skipping");
+        return;
+    };
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let (gw_port, mut gateway) = boot_gateway(work.path(), "anthropic", &key);
+    let gw = format!("http://127.0.0.1:{gw_port}");
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let fact = "zig build test";
+
+    let run = |prompt: &str| {
+        Command::new(bin)
+            .args([
+                "run",
+                prompt,
+                "--gateway-url",
+                &gw,
+                "--key",
+                DEV_TOKEN,
+                "--model",
+                "claude-haiku-4-5",
+                "--max-steps",
+                "8",
+                "--no-session-persistence",
+            ])
+            .env("HOME", home.path())
+            .current_dir(work.path())
+            .output()
+            .expect("spawn agent")
+    };
+
+    // Session 1: the real model saves a durable fact to memory.
+    let out1 = run(&format!(
+        "Remember this for future sessions: the build command for this project is `{fact}`. \
+         Save it to your persistent memory (and note it in MEMORY.md) so a later session can recall it."
+    ));
+    eprintln!(
+        "--- [memory] session 1 ---\n{}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&out1.stdout),
+        String::from_utf8_lossy(&out1.stderr)
+    );
+    assert!(
+        out1.status.success(),
+        "session 1 (save to memory) must succeed"
+    );
+
+    // The model really wrote a memory file to disk containing the fact.
+    let projects = home.path().join(".claude/projects");
+    let proj = std::fs::read_dir(&projects)
+        .unwrap_or_else(|e| panic!("no projects dir at {}: {e}", projects.display()))
+        .next()
+        .expect("a per-project memory dir")
+        .unwrap()
+        .path();
+    let mem_dir = proj.join("memory");
+    let mut on_disk = String::new();
+    for entry in std::fs::read_dir(&mem_dir).expect("memory dir").flatten() {
+        if let Ok(text) = std::fs::read_to_string(entry.path()) {
+            on_disk.push_str(&text);
+            on_disk.push('\n');
+        }
+    }
+    eprintln!("--- [memory] on disk ---\n{on_disk}");
+    assert!(
+        on_disk.contains(fact),
+        "the real model must have persisted `{fact}` to a memory file: {on_disk}"
+    );
+
+    // Session 2: a fresh process, same HOME+cwd — recall via the injected index and/or a live view.
+    let out2 = run(
+        "What is the build command for this project? Consult your persistent memory, then answer with the command.",
+    );
+    let stdout2 = String::from_utf8_lossy(&out2.stdout);
+    eprintln!(
+        "--- [memory] session 2 (recall) ---\n{stdout2}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    assert!(out2.status.success(), "session 2 (recall) must succeed");
+    assert!(
+        stdout2.contains(fact),
+        "a fresh session must recall `{fact}` from persistent memory: {stdout2}"
+    );
+}
+
 /// Shared across providers: multimodal end-to-end. The `read` tool returns a real image as an
 /// attachment; the dialect encodes it (Anthropic content-array / OpenAI `image_url` fan-out) and the
 /// real provider's **vision** sees it. The agent reads a solid-red PNG and must name the colour —

@@ -167,6 +167,15 @@ pub struct PromptOptions<'a> {
     /// Completions dialect ignores it outright), *this prompt section is the forcing mechanism*: the tool
     /// itself ends the run, but nothing else tells the model to call it rather than answer in prose.
     pub has_structured_output: bool,
+    /// Whether the registered tool set includes `memory`. Gates the `## Memory` guidance block (how to
+    /// drive the tool and the curation discipline) — dead weight in a prompt for a process whose registry
+    /// never advertised the tool, same gate-on-what's-registered discipline as [`has_todo`](Self::has_todo).
+    pub has_memory: bool,
+    /// The current, already-bounded `MEMORY.md` index (from [`crate::memory::MemoryBackend::index`]) to
+    /// inject so a durable memory is surfaced at session start (Claude Code's auto-memory model). `None`
+    /// or empty renders just the guidance with an "index is empty" note. Only consulted when
+    /// [`has_memory`](Self::has_memory) is set.
+    pub memory_index: Option<&'a str>,
     /// Whether `cwd` is a trusted project (an explicit `--trust-project`/RPC override, or recorded in
     /// `TrustStore`). Gates the *project-local* `SYSTEM.md`/`APPEND_SYSTEM.md` overrides and the
     /// project-local skills root (`<cwd>/.claude/skills`, see `skills::discover`) — an untrusted
@@ -272,6 +281,15 @@ pub fn build_static_system_prompt(opts: &PromptOptions) -> String {
     if opts.has_structured_output {
         s.push_str("\n\n");
         s.push_str(STRUCTURED_OUTPUT_GUIDANCE);
+    }
+
+    // Durable, cross-session memory: the guidance block plus the current (already-bounded) MEMORY.md
+    // index, auto-injected so a memory is never silently forgotten. Gated on the tool being registered.
+    if opts.has_memory {
+        s.push_str("\n\n");
+        s.push_str(&crate::memory::render_section(
+            opts.memory_index.unwrap_or(""),
+        ));
     }
 
     s
@@ -973,6 +991,8 @@ mod tests {
             has_read: true,
             has_todo: false,
             has_structured_output: false,
+            has_memory: false,
+            memory_index: None,
             project_trusted: true,
             agents: &[],
         });
@@ -1006,6 +1026,8 @@ mod tests {
             has_read: true,
             has_todo: false,
             has_structured_output: false,
+            has_memory: false,
+            memory_index: None,
             project_trusted: true,
             agents: &[],
         });
@@ -1036,6 +1058,8 @@ mod tests {
             has_read: true,
             has_todo: false,
             has_structured_output: false,
+            has_memory: false,
+            memory_index: None,
             project_trusted: false,
             agents: &[],
         });
@@ -1069,6 +1093,8 @@ mod tests {
             has_read: true,
             has_todo: false,
             has_structured_output: false,
+            has_memory: false,
+            memory_index: None,
             project_trusted: true,
             agents: &[],
         });
@@ -1103,6 +1129,8 @@ mod tests {
             has_read: true,
             has_todo: false,
             has_structured_output: false,
+            has_memory: false,
+            memory_index: None,
             project_trusted: true,
             agents: &[],
         });
@@ -1136,6 +1164,8 @@ mod tests {
             has_read: false,
             has_todo: false,
             has_structured_output: false,
+            has_memory: false,
+            memory_index: None,
             project_trusted: true,
             agents: &[],
         });
@@ -1162,6 +1192,8 @@ mod tests {
             has_read: true,
             has_todo: false,
             has_structured_output: false,
+            has_memory: false,
+            memory_index: None,
             project_trusted: true,
             agents: &[],
         });
@@ -1189,6 +1221,8 @@ mod tests {
             has_read: true,
             has_todo: false,
             has_structured_output: false,
+            has_memory: false,
+            memory_index: None,
             project_trusted: false,
             agents: &[],
         });
@@ -1212,6 +1246,8 @@ mod tests {
             has_read: true,
             has_todo: false,
             has_structured_output: false,
+            has_memory: false,
+            memory_index: None,
             project_trusted: true,
             agents: &[],
         });
@@ -1282,6 +1318,8 @@ mod tests {
             has_read: true,
             has_todo,
             has_structured_output,
+            has_memory: false,
+            memory_index: None,
             project_trusted: false,
             agents: &[],
         }
@@ -1318,6 +1356,27 @@ mod tests {
     }
 
     #[test]
+    fn the_memory_section_and_index_are_injected_only_when_the_tool_is_registered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut opts = section_opts(tmp.path(), false, false);
+        opts.has_memory = true;
+        opts.memory_index = Some("- [notes](notes.md) — build & test");
+        let with = build_static_system_prompt(&opts);
+        assert!(with.contains("## Memory"), "the guidance block must appear");
+        assert!(
+            with.contains("[notes](notes.md)"),
+            "the index must be injected verbatim"
+        );
+
+        // No tool → no section, even if an index string is present.
+        let mut off = section_opts(tmp.path(), false, false);
+        off.memory_index = Some("- [notes](notes.md) — build & test");
+        let without = build_static_system_prompt(&off);
+        assert!(!without.contains("## Memory"));
+        assert!(!without.contains("[notes](notes.md)"));
+    }
+
+    #[test]
     fn system_prompt_includes_project_instructions_and_env() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("CLAUDE.md"), "Be excellent.").unwrap();
@@ -1331,6 +1390,8 @@ mod tests {
             has_read: true,
             has_todo: false,
             has_structured_output: false,
+            has_memory: false,
+            memory_index: None,
             project_trusted: false,
             agents: &[],
         });
@@ -1362,6 +1423,8 @@ mod tests {
             has_read: true,
             has_todo: false,
             has_structured_output: false,
+            has_memory: false,
+            memory_index: None,
             project_trusted: false,
             agents: &[],
         };
@@ -1394,6 +1457,8 @@ mod tests {
             has_read: true,
             has_todo: false,
             has_structured_output: false,
+            has_memory: false,
+            memory_index: None,
             project_trusted: false,
             agents: &[],
         });
