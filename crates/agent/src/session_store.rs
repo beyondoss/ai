@@ -367,6 +367,11 @@ enum Entry {
         /// `tool_use` block that carried it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         todos: Option<serde_json::Value>,
+        /// The `memory`-note paths carried across this round (see `CompactionProvenance::memory_notes`),
+        /// restored the same way so a restart past a compaction doesn't lose the model's awareness of what
+        /// it wrote to its working/durable memory.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        memory_notes: Vec<String>,
     },
     /// A record that the active model changed, anchored to whatever message was the tip at the moment
     /// it did — see [`SessionStore::record_model_change`]/[`SessionStore::model_at`]. `parent_id` here
@@ -945,6 +950,7 @@ impl SessionStore {
                     modified_files,
                     last_reason,
                     todos,
+                    memory_notes,
                     ..
                 }) => {
                     // Each record already carries every earlier round's file-provenance folded in (via
@@ -960,6 +966,7 @@ impl SessionStore {
                         compactions: 0, // replaced by `meta.compactions` (the authoritative counter) below
                         last_reason,
                         todos,
+                        memory_notes,
                     });
                     compactions.insert(
                         id,
@@ -1617,6 +1624,7 @@ impl SessionStore {
             modified_files: meta.provenance.modified_files,
             last_reason: meta.provenance.last_reason,
             todos: meta.provenance.todos,
+            memory_notes: meta.provenance.memory_notes,
         };
 
         // An updated header snapshot (the new `compactions`/`dropped_messages` counters) first, then the
@@ -4836,6 +4844,7 @@ mod tests {
             compactions: 1,
             last_reason: Some(agent_core::compaction::CompactionReason::Threshold),
             todos: None,
+            memory_notes: vec![],
         };
         store
             .rewrite_compacted(
@@ -4984,6 +4993,7 @@ mod tests {
             compactions: 1,
             last_reason: Some(agent_core::compaction::CompactionReason::Threshold),
             todos: None,
+            memory_notes: vec![],
         };
         store
             .rewrite_compacted(
@@ -5008,6 +5018,7 @@ mod tests {
             compactions: 2,
             last_reason: Some(agent_core::compaction::CompactionReason::Manual),
             todos: None,
+            memory_notes: vec![],
         };
         store
             .rewrite_compacted(

@@ -75,6 +75,14 @@ pub struct CompactionProvenance {
     /// older one — see [`merge_provenance`].
     #[serde(default)]
     pub todos: Option<Value>,
+    /// Logical paths the model has authored via the `memory` tool (a `create`/`str_replace`/`insert`),
+    /// deduped, oldest-first, across every round so far. Carried for the same reason as the file lists:
+    /// once `apply_summary` drops the prefix, the fact that the model *wrote itself a note* — and where —
+    /// is gone with it, so a model reminded to consult its working memory post-compaction would have no
+    /// idea what it saved or that it saved anything. Rendered into the summary by [`format_memory_notes`],
+    /// it becomes a guaranteed, zero-effort "here is what you recorded, recall the relevant ones" pointer.
+    #[serde(default)]
+    pub memory_notes: Vec<String>,
 }
 
 /// Fold `previous`'s provenance forward with whatever the current round's prefix (`messages`) adds, and
@@ -104,6 +112,12 @@ pub fn merge_provenance(
             modified.push(path);
         }
     }
+    let mut memory_notes = previous.memory_notes.clone();
+    for path in extract_memory_notes(messages) {
+        if !memory_notes.contains(&path) {
+            memory_notes.push(path);
+        }
+    }
     CompactionProvenance {
         read_files: read,
         modified_files: modified,
@@ -112,6 +126,7 @@ pub fn merge_provenance(
         // `or_else`, not `or`: a round whose prefix cleared the list (`todos: []`) yields `Some([])` and
         // must win over `previous`, or a cleared plan would silently reappear at the next compaction.
         todos: extract_todos(messages).or_else(|| previous.todos.clone()),
+        memory_notes,
     }
 }
 
@@ -656,6 +671,50 @@ pub fn extract_todos(messages: &[Message]) -> Option<Value> {
         })
 }
 
+/// The logical paths the model wrote to via the `memory` tool in `messages`, in first-seen order — a
+/// `create`, `str_replace`, or `insert` (the write commands; `view`/`search` read, `delete`/`rename`
+/// don't add content). Deduped within this scan; accumulated across rounds by [`merge_provenance`].
+///
+/// Keys on the tool name `"memory"` only, exactly as [`extract_todos`] keys on `"todo"` — it stays
+/// agnostic to *which* root (`/memories` vs `/session`) a note lives under, so the lower layer never has
+/// to know the host's memory-mount conventions. Both roots are worth surfacing: a note is a note.
+pub fn extract_memory_notes(messages: &[Message]) -> Vec<String> {
+    let mut notes = Vec::new();
+    for m in messages {
+        for b in &m.content {
+            if let ContentBlock::ToolUse { name, input, .. } = b
+                && name == "memory"
+                && matches!(
+                    input.get("command").and_then(Value::as_str),
+                    Some("create" | "str_replace" | "insert")
+                )
+                && let Some(path) = input.get("path").and_then(Value::as_str)
+            {
+                let path = path.to_string();
+                if !notes.contains(&path) {
+                    notes.push(path);
+                }
+            }
+        }
+    }
+    notes
+}
+
+/// Render the carried `memory` note paths as a `<memory-notes>` block appended to the summarization
+/// model's *output* — the same deterministic-carry contract [`format_todo_list`] documents. Returns `""`
+/// when there are none, so appending it to a summary is always safe. The model reads the block as: these
+/// are files I wrote myself; recall the relevant ones with the `memory` tool's `view`.
+pub fn format_memory_notes(memory_notes: &[String]) -> String {
+    if memory_notes.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\n<memory-notes>\n{}\n</memory-notes>",
+            memory_notes.join("\n")
+        )
+    }
+}
+
 /// Render a `todos` array as the compact checklist both the `todo` tool's own result and a compaction
 /// summary show the model. Shared so the two can never drift.
 ///
@@ -731,10 +790,11 @@ pub fn previous_summary(prefix: &[Message]) -> Option<&str> {
 
 /// The host-appended, deterministically-regenerated blocks a summary body carries at its tail, as
 /// `(open, close)` tag pairs. See [`format_file_operations`] / [`format_todo_list`].
-const CARRY_BLOCKS: [(&str, &str); 3] = [
+const CARRY_BLOCKS: [(&str, &str); 4] = [
     ("<read-files>", "</read-files>"),
     ("<modified-files>", "</modified-files>"),
     ("<todo_list>", "</todo_list>"),
+    ("<memory-notes>", "</memory-notes>"),
 ];
 
 /// Strip every trailing [`CARRY_BLOCKS`] block from a summary body, leaving only the model's own prose.
@@ -1751,6 +1811,7 @@ mod tests {
             compactions: 1,
             last_reason: Some(CompactionReason::Threshold),
             todos: None,
+            memory_notes: vec![],
         };
         let messages = vec![Message::assistant(vec![ContentBlock::tool_use(
             "1",
@@ -1935,6 +1996,81 @@ mod tests {
     #[test]
     fn extract_todos_is_none_without_a_todo_call() {
         assert!(extract_todos(&convo()).is_none());
+    }
+
+    fn mem_call(id: &str, command: &str, path: &str) -> Message {
+        Message::assistant(vec![ContentBlock::tool_use(
+            id,
+            "memory",
+            json!({ "command": command, "path": path }),
+        )])
+    }
+
+    #[test]
+    fn extract_memory_notes_collects_writes_first_seen_and_ignores_the_rest() {
+        let messages = vec![
+            mem_call("1", "create", "/session/facts.md"),
+            mem_call("2", "view", "/session/facts.md"), // a read — ignored
+            mem_call("3", "str_replace", "/session/facts.md"), // same path, deduped
+            mem_call("4", "insert", "/memories/notes.md"), // the other root counts too
+            mem_call("5", "delete", "/session/gone.md"), // a delete adds nothing
+            Message::assistant(vec![ContentBlock::tool_use(
+                "6",
+                "write", // a different tool that happens to carry a path — not memory
+                json!({ "path": "/session/decoy.md" }),
+            )]),
+        ];
+        assert_eq!(
+            extract_memory_notes(&messages),
+            vec![
+                "/session/facts.md".to_string(),
+                "/memories/notes.md".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn format_memory_notes_renders_a_block_or_nothing() {
+        assert_eq!(format_memory_notes(&[]), "");
+        let block = format_memory_notes(&["/session/a.md".into(), "/memories/b.md".into()]);
+        assert_eq!(
+            block,
+            "\n\n<memory-notes>\n/session/a.md\n/memories/b.md\n</memory-notes>"
+        );
+    }
+
+    #[test]
+    fn merge_provenance_accumulates_memory_notes_across_rounds_deduped() {
+        let round1 = merge_provenance(
+            &CompactionProvenance::default(),
+            &[mem_call("1", "create", "/session/a.md")],
+            CompactionReason::Threshold,
+        );
+        assert_eq!(round1.memory_notes, vec!["/session/a.md".to_string()]);
+        let round2 = merge_provenance(
+            &round1,
+            &[
+                mem_call("2", "str_replace", "/session/a.md"), // already known — deduped
+                mem_call("3", "create", "/session/b.md"),      // new
+            ],
+            CompactionReason::Threshold,
+        );
+        assert_eq!(
+            round2.memory_notes,
+            vec!["/session/a.md".to_string(), "/session/b.md".to_string()]
+        );
+    }
+
+    #[test]
+    fn previous_summary_strips_the_memory_notes_carry_block() {
+        // A summary body that ends with a memory-notes block must have it peeled off before it is fed
+        // forward, exactly like the file/todo blocks — otherwise every incremental round re-appends one.
+        let body = "The model saved some notes.\n\n<memory-notes>\n/session/a.md\n</memory-notes>";
+        let msg = Message::user(format!("{SUMMARY_MARKER}\n\n{body}"));
+        assert_eq!(
+            previous_summary(&[msg]),
+            Some("The model saved some notes.")
+        );
     }
 
     #[test]

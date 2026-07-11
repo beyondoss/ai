@@ -447,7 +447,11 @@ The harness layers several capabilities over the bare tools + loop:
   `/session` while it still has full detail; and a **post-compaction recall reminder**
   (`memory::COMPACTION_REMINDER`) fires on the cut, telling it to read `/session` back. Both are computed
   host-side from the `Usage` events the observer already sees (no agent-core change), gated on a session
-  mount, and pushed as mid-run steers. The tool is host-owned (each backend `Arc` cloned into the tool at each registry rebuild,
+  mount, and pushed as mid-run steers. Backing the reminder, the paths the model writes via the `memory`
+  tool ride the **deterministic-carry channel** (`agent_core::CompactionProvenance::memory_notes`,
+  parallel to the read/modified-file and `todo` lists): every summary carries a `<memory-notes>` block
+  naming them, so a summarizing model that never mentions a note can't erase the model's awareness that it
+  saved one and where — the guaranteed, zero-effort half of the save→carry→recall arc. The tool is host-owned (each backend `Arc` cloned into the tool at each registry rebuild,
   like `structured_output`'s `OutputSlot`) and registered _after_ `apply_filter` so a `--tools` allow-list
   can't strip it. In `serve` the `/session` mount rides a shared, swappable `SessionDir` cell so a
   `switch_session`/`new_session`/`fork` re-points every holder with one cell write — no tool or agent

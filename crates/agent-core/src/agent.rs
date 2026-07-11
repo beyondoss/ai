@@ -2265,9 +2265,10 @@ impl Agent {
         // reflect every round so far, not just this one's new activity. `previous_summary` strips these
         // same blocks back off before the body is ever fed forward, so they never accumulate.
         let summary = format!(
-            "{summary}{}{}",
+            "{summary}{}{}{}",
             compaction::format_file_operations(&file_ops.read_files, &file_ops.modified_files),
-            compaction::format_todo_list(file_ops.todos.as_ref())
+            compaction::format_todo_list(file_ops.todos.as_ref()),
+            compaction::format_memory_notes(&file_ops.memory_notes)
         );
         compaction::apply_summary(session, first_kept, &summary, tokens_before);
         session.compaction = file_ops;
@@ -7432,6 +7433,7 @@ mod tests {
             compactions: 1,
             last_reason: Some(CompactionReason::Threshold),
             modified_files: vec![],
+            memory_notes: vec![],
         };
 
         let mock = Arc::new(MockTransport::new(vec![turn::text("turn prefix summary")]));

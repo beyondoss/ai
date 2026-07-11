@@ -123,6 +123,14 @@ fn a_fact_written_to_session_survives_compaction_and_is_recovered_after_the_remi
         "the working memory must be untouched by compaction"
     );
 
+    // Deterministic carry: the summary itself lists the memory the model authored, so even a summarizer
+    // that never mentions it can't erase the fact that a `/session` note exists and where.
+    let transcript = std::fs::read_to_string(&session_file).unwrap();
+    assert!(
+        transcript.contains("<memory-notes>") && transcript.contains("/session/facts.md"),
+        "the compaction summary must carry a <memory-notes> block naming the note the model wrote"
+    );
+
     // --- Prompt 2: the reminder rides the next request, and the model recovers the value. ------------
     let before = bodies.lock().unwrap().len();
     send(
