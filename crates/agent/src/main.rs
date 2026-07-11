@@ -3507,6 +3507,32 @@ async fn run_task(
         no_tools,
     );
 
+    // Persistent, cross-session memory. Resolved here (before the subagent context is built) so the same
+    // backend `Arc` is shared with every child — the whole subagent tree reads/writes one durable store.
+    // Registered *after* `apply_filter` (like `structured_output`/`subagent`) so a `--tools` allow-list
+    // can't strip the agent's memory; `--no-memory`/`--no-tools` opt out. A bad backend fails fast before
+    // a model call is billed. The `MEMORY.md` index is injected into the system prompt below.
+    let memory_backend: Option<Arc<dyn beyond_ai_agent::memory::MemoryBackend>> =
+        if no_memory || no_tools {
+            None
+        } else {
+            let dsn = memory.or_else(|| stored_settings.default_memory_backend.clone());
+            Some(
+                beyond_ai_agent::memory::open(dsn.as_deref(), &cwd).unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }),
+            )
+        };
+    let memory_index: Option<String> = match &memory_backend {
+        Some(b) => {
+            let index = b.index().await.unwrap_or_default();
+            registry.register(Arc::new(tools::memory::Memory::new(b.clone())));
+            Some(index)
+        }
+        None => None,
+    };
+
     // `--output-schema` turns this run into a callable function: the model must fill the schema in via
     // `structured_output` rather than ending in prose, and the validated payload is this process's real
     // return value (printed last, and the difference between exit 0 and exit 1 below).
@@ -3574,6 +3600,7 @@ async fn run_task(
             skills: Arc::new(skills.clone()),
             write_locks: write_locks.clone(),
             mcp_tools: mcp_tools.clone(),
+            memory_backend: memory_backend.clone(),
             tool_cfg: subagent::ChildToolConfig {
                 bash_timeout_ms,
                 bash_shell_path: bash_shell_path.clone(),
@@ -3600,25 +3627,6 @@ async fn run_task(
         });
         registry.register(Arc::new(subagent::Subagent::new(ctx)));
     }
-
-    // Persistent, cross-session memory. Registered *after* `apply_filter` (like `structured_output`/
-    // `subagent`) so a `--tools` allow-list — which scopes *which* tools, not whether the agent has a
-    // memory — can't silently strip it. `--no-memory` opts out; so does `--no-tools`, the absolute "the
-    // agent may do nothing" switch (a pure text agent has no memory tool either). The DSN resolves
-    // flag/env → stored setting → per-project default; a bad backend fails fast before a model call is
-    // billed, mirroring `--output-schema`.
-    let memory_index: Option<String> = if no_memory || no_tools {
-        None
-    } else {
-        let dsn = memory.or_else(|| stored_settings.default_memory_backend.clone());
-        let backend = beyond_ai_agent::memory::open(dsn.as_deref(), &cwd).unwrap_or_else(|e| {
-            eprintln!("{e}");
-            std::process::exit(2);
-        });
-        let index = backend.index().await.unwrap_or_default();
-        registry.register(Arc::new(tools::memory::Memory::new(backend)));
-        Some(index)
-    };
 
     // `--system-prompt`/`--append-system-prompt` may each name an existing, readable file instead of
     // literal text (pi-parity fix — matches pi's own `resolvePromptInput`); resolved once, here, rather

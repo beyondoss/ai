@@ -108,6 +108,13 @@ pub struct SubagentCtx {
     /// Already-connected MCP tools. `Arc` clones share the live stdio child / HTTP connection, which is
     /// the entire reason an in-process child beats a subprocess.
     pub mcp_tools: Vec<Arc<dyn Tool>>,
+    /// The **parent's** memory backend, shared by reference so a child reads and writes the *same*
+    /// durable project store — a subagent grounds its work in what the project already learned, and its
+    /// findings are visible to the parent and siblings. Shared as the `Arc` (not re-derived from the
+    /// child's cwd) so even a `worktree`-isolated child, whose cwd differs, still shares the parent's
+    /// store rather than a private one. Concurrent writes across the tree are serialized by the backend's
+    /// own cross-process lock. `None` when the parent ran with `--no-memory`/`--no-tools`.
+    pub memory_backend: Option<Arc<dyn crate::memory::MemoryBackend>>,
     pub tool_cfg: ChildToolConfig,
     pub cwd: PathBuf,
     pub project_trusted: bool,
@@ -684,7 +691,13 @@ impl Subagent {
                 }
             }
         }
-        let system = self.build_child_system_prompt(def, &registry, &root);
+        // The current shared index, injected into the child's prompt so it starts aware of project
+        // memory (the same session-start recall the parent gets), read from the shared backend.
+        let memory_index = match &self.ctx.memory_backend {
+            Some(b) => Some(b.index().await.unwrap_or_default()),
+            None => None,
+        };
+        let system = self.build_child_system_prompt(def, &registry, &root, memory_index.as_deref());
         let model = def
             .model
             .clone()
@@ -881,6 +894,13 @@ impl Subagent {
         if wants_subagent && child_depth < self.ctx.max_depth {
             registry.register(Arc::new(Subagent::at_depth(self.ctx.clone(), child_depth)));
         }
+        // Shared memory: registered *after* the child's `--tools` filter (like the parent's own memory,
+        // and like `subagent`/`structured_output`), so a scoped child still has its project memory. It
+        // points at the parent's backend `Arc`, so the whole subagent tree reads and writes one durable
+        // store — even a `worktree`-isolated child, whose cwd would otherwise key a private one.
+        if let Some(backend) = &self.ctx.memory_backend {
+            registry.register(Arc::new(crate::tools::memory::Memory::new(backend.clone())));
+        }
         registry
     }
 
@@ -893,6 +913,7 @@ impl Subagent {
         def: &AgentDef,
         registry: &ToolRegistry,
         root: &Path,
+        memory_index: Option<&str>,
     ) -> String {
         let default_base =
             crate::resources::default_system_prompt(registry, &self.ctx.prompt_guidelines);
@@ -909,11 +930,11 @@ impl Subagent {
             has_structured_output: registry
                 .get(crate::tools::structured_output::NAME)
                 .is_some(),
-            // Children gate the memory section on whether they actually carry the `memory` tool. They
-            // don't get one in v1 (memory is host-registered on the parent only), so this is normally
-            // absent; kept as a real check so it lights up automatically if that changes.
+            // A child carries the shared `memory` tool whenever the parent has a backend (see
+            // `build_child_registry`), so the section — guidance plus the current shared index — appears
+            // for it exactly as for the parent.
             has_memory: registry.get(crate::tools::memory::NAME).is_some(),
-            memory_index: None,
+            memory_index,
             // A child never has `subagent` unless its definition asked for it and the depth cap allowed
             // it; there is no point listing agents it cannot delegate to.
             agents: if registry.get(NAME).is_some() {

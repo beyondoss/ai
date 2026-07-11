@@ -2233,6 +2233,7 @@ pub(crate) async fn serve_session(
                 &current_model,
                 &write_locks,
                 &skills,
+                memory_backend.clone(),
                 approval.as_ref(),
             ))
         };
@@ -4360,6 +4361,7 @@ pub(crate) async fn serve_session(
                         &current_model,
                         &write_locks,
                         &skills,
+                        memory_backend.clone(),
                         approval.as_ref(),
                     ))
                 };
@@ -5966,6 +5968,7 @@ fn build_gateway_client(cfg: &ServeConfig, model: &str) -> Result<GatewayClient,
 /// `skills` are the parent session's own discovered skills, so a worktree/read-only child sees the same
 /// `<available_skills>` the parent does. `prompt_guidelines` is empty: `serve` renders its base prompt
 /// once into `cfg.system` and doesn't carry the raw guideline list past that.
+#[allow(clippy::too_many_arguments)]
 fn build_subagent_ctx(
     cfg: &ServeConfig,
     cwd: &Path,
@@ -5973,6 +5976,9 @@ fn build_subagent_ctx(
     parent_model: &str,
     write_locks: &Arc<agent_core::WriteLockRegistry>,
     skills: &[crate::skills::Skill],
+    // The parent's memory backend, shared by reference so the whole subagent tree reads/writes one
+    // durable store — see `SubagentCtx::memory_backend`.
+    memory_backend: Option<Arc<dyn crate::memory::MemoryBackend>>,
     // Shared with the parent, not rebuilt — see `SubagentCtx::approval`.
     approval: Option<&crate::approval::ApprovalRuntime>,
 ) -> Arc<crate::tools::subagent::SubagentCtx> {
@@ -6003,6 +6009,7 @@ fn build_subagent_ctx(
         skills: Arc::new(skills.to_vec()),
         write_locks: write_locks.clone(),
         mcp_tools: cfg.mcp_tools.clone(),
+        memory_backend,
         tool_cfg: subagent::ChildToolConfig {
             bash_timeout_ms: cfg.bash_timeout_ms,
             bash_shell_path: cfg.bash_shell_path.clone(),

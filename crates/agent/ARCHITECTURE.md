@@ -431,7 +431,12 @@ The harness layers several capabilities over the bare tools + loop:
   host-owned (an `Arc<dyn MemoryBackend>` cloned into the tool at each registry rebuild, like
   `structured_output`'s `OutputSlot`) and registered _after_ `apply_filter` so a `--tools` allow-list
   can't strip it. `--memory <dsn>`/`AI_AGENT_MEMORY_URL` (with the stored `default_memory_backend`
-  setting folded in) selects a backend; `--no-memory` opts out entirely.
+  setting folded in) selects a backend; `--no-memory` opts out entirely. **Subagents share the parent's
+  store**: the same backend `Arc` is threaded through `SubagentCtx` (not re-derived from the child's cwd,
+  so even a `worktree`-isolated child shares it rather than a private one), and every child gets the
+  `memory` tool plus the current injected index — a subagent grounds its work in what the project already
+  learned, its findings are visible to the parent and siblings, and concurrent writes across the tree are
+  serialized by the backend's cross-process lock.
 - **Tree-shaped history** — every message line also carries an `id`/`parent_id` (additive,
   `#[serde(default)]`; a pre-tree file's absent fields are migrated to synthesized, chained ids in
   memory only, never persisted back). The "active path" (`Session.messages`) is the `parent_id` chain
