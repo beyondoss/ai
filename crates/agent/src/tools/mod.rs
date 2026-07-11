@@ -16,6 +16,7 @@ pub mod find;
 pub mod grep;
 pub mod ls;
 pub mod mcp;
+pub mod memory;
 pub mod output;
 pub mod read;
 pub mod structured_output;

@@ -612,6 +612,16 @@ enum Command {
         /// for opting out is the same either way.
         #[arg(long, default_value_t = false)]
         no_session_persistence: bool,
+        /// Persistent-memory backend DSN. Absent ⇒ the stored `default_memory_backend` setting, else a
+        /// per-project local-file store under `~/.claude/projects/<cwd>/memory/`. A bare path or
+        /// `file://` names a directory; `redis://`/`postgres://` select a networked backend (recognized,
+        /// not yet implemented). See [`beyond_ai_agent::memory`].
+        #[arg(long, env = "AI_AGENT_MEMORY_URL")]
+        memory: Option<String>,
+        /// Disable persistent memory entirely: don't register the `memory` tool or inject the MEMORY.md
+        /// index. Mirrors `--no-tools`'s opt-out style.
+        #[arg(long, default_value_t = false)]
+        no_memory: bool,
         /// After the run completes, export the transcript as a self-contained HTML file at this path
         /// (parent directories are created as needed) — the same rendering `serve`'s `export_html` RPC
         /// command produces, for a one-shot run with no server involved.
@@ -700,6 +710,14 @@ enum Command {
         /// short-lived test harness).
         #[arg(long, default_value_t = false)]
         no_session_persistence: bool,
+        /// Persistent-memory backend DSN. Absent ⇒ the stored `default_memory_backend` setting, else a
+        /// per-project local-file store. A bare path or `file://` names a directory; `redis://`/
+        /// `postgres://` select a networked backend (recognized, not yet implemented).
+        #[arg(long, env = "AI_AGENT_MEMORY_URL")]
+        memory: Option<String>,
+        /// Disable persistent memory entirely: don't register the `memory` tool or inject the index.
+        #[arg(long, default_value_t = false)]
+        no_memory: bool,
         /// Max loop iterations per prompt before bailing.
         #[arg(long, default_value_t = agent_core::agent::DEFAULT_MAX_STEPS)]
         max_steps: u32,
@@ -1494,6 +1512,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             r#continue,
             session_dir,
             no_session_persistence,
+            memory,
+            no_memory,
             export,
             json,
             output_schema,
@@ -1555,6 +1575,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 r#continue,
                 session_dir,
                 no_session_persistence,
+                memory,
+                no_memory,
                 export,
                 json,
                 output_schema,
@@ -1575,6 +1597,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             upstream_http2,
             session_id,
             no_session_persistence,
+            memory,
+            no_memory,
             max_steps,
             max_tokens,
             system_prompt,
@@ -1868,6 +1892,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 context_files: !no_context_files,
                 session_file,
                 session_dir: resolved_session_dir,
+                // Fold the stored default in when neither flag/env was given, mirroring the other
+                // `default_*` resolutions above. The backend itself is resolved by `serve_session` (which
+                // knows the resolved `cwd`), like `agents`.
+                memory: memory.or_else(|| stored_settings.default_memory_backend.clone()),
+                no_memory,
                 listen,
                 listen_uds: listen_uds.clone(),
                 listen_uds_mode,
@@ -3117,6 +3146,8 @@ async fn run_task(
     continue_session: bool,
     session_dir: Option<String>,
     no_session_persistence: bool,
+    memory: Option<String>,
+    no_memory: bool,
     export: Option<String>,
     json: bool,
     output_schema: Option<String>,
@@ -3570,6 +3601,25 @@ async fn run_task(
         registry.register(Arc::new(subagent::Subagent::new(ctx)));
     }
 
+    // Persistent, cross-session memory. Registered *after* `apply_filter` (like `structured_output`/
+    // `subagent`) so a `--tools` allow-list — which scopes *which* tools, not whether the agent has a
+    // memory — can't silently strip it. `--no-memory` opts out; so does `--no-tools`, the absolute "the
+    // agent may do nothing" switch (a pure text agent has no memory tool either). The DSN resolves
+    // flag/env → stored setting → per-project default; a bad backend fails fast before a model call is
+    // billed, mirroring `--output-schema`.
+    let memory_index: Option<String> = if no_memory || no_tools {
+        None
+    } else {
+        let dsn = memory.or_else(|| stored_settings.default_memory_backend.clone());
+        let backend = beyond_ai_agent::memory::open(dsn.as_deref(), &cwd).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2);
+        });
+        let index = backend.index().await.unwrap_or_default();
+        registry.register(Arc::new(tools::memory::Memory::new(backend)));
+        Some(index)
+    };
+
     // `--system-prompt`/`--append-system-prompt` may each name an existing, readable file instead of
     // literal text (pi-parity fix — matches pi's own `resolvePromptInput`); resolved once, here, rather
     // than re-deriving it at each of the several places downstream that would otherwise need to repeat
@@ -3597,6 +3647,7 @@ async fn run_task(
     let has_read = registry.get("read").is_some();
     let has_todo = registry.get("todo").is_some();
     let has_structured_output = registry.get(tools::structured_output::NAME).is_some();
+    let has_memory = registry.get(tools::memory::NAME).is_some();
     let system = beyond_ai_agent::resources::build_system_prompt(
         &beyond_ai_agent::resources::PromptOptions {
             base: system_prompt.as_deref(),
@@ -3608,6 +3659,8 @@ async fn run_task(
             has_read,
             has_todo,
             has_structured_output,
+            has_memory,
+            memory_index: memory_index.as_deref(),
             project_trusted,
             agents: &agent_defs,
         },

@@ -909,6 +909,11 @@ impl Subagent {
             has_structured_output: registry
                 .get(crate::tools::structured_output::NAME)
                 .is_some(),
+            // Children gate the memory section on whether they actually carry the `memory` tool. They
+            // don't get one in v1 (memory is host-registered on the parent only), so this is normally
+            // absent; kept as a real check so it lights up automatically if that changes.
+            has_memory: registry.get(crate::tools::memory::NAME).is_some(),
+            memory_index: None,
             // A child never has `subagent` unless its definition asked for it and the depth cap allowed
             // it; there is no point listing agents it cannot delegate to.
             agents: if registry.get(NAME).is_some() {
