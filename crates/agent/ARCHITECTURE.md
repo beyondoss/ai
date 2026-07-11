@@ -417,26 +417,42 @@ The harness layers several capabilities over the bare tools + loop:
   total)` once per file so `serve` can put a live "scanning…" indicator on the wire for a listing large
   enough to take a moment; `list`/`list_all` are the same scan with a no-op progress callback.
 - **Persistent memory** ([`memory`](src/memory.rs), tool in [`tools::memory`](src/tools/memory.rs)) —
-  durable, cross-session knowledge the model curates itself, distinct from session persistence (which
-  records _the conversation_; memory records _what to carry forward_). A single backend-agnostic `memory`
-  tool exposes a `command` enum (`view`/`create`/`str_replace`/`insert`/`delete`/`rename`/`search`) over
-  a fixed `/memories` logical namespace, mirroring Anthropic's `memory_20250818` surface so the model's
-  skills transfer. Storage is behind the `MemoryBackend` trait so it isn't welded to local disk: v1 ships
-  `FileBackend` (per-project `*.md` files under `~/.claude/projects/<encoded-cwd>/memory/`, reusing
-  `config_dir_root`/`encode_cwd` and the `FileLock`+`mutate_locked`+atomic-write store discipline);
-  `redis://`/`postgres://` DSNs are recognized by `memory::open` but return a clear "not yet supported"
-  (the seam exists without the impl). The `MEMORY.md` index is read at session start (bounded to ~200
-  lines/25 KB) and injected into the system prompt (`resources::PromptOptions::memory_index`) — Claude
-  Code's auto-memory model — so a memory is surfaced without the model having to go looking. The tool is
-  host-owned (an `Arc<dyn MemoryBackend>` cloned into the tool at each registry rebuild, like
-  `structured_output`'s `OutputSlot`) and registered _after_ `apply_filter` so a `--tools` allow-list
-  can't strip it. `--memory <dsn>`/`AI_AGENT_MEMORY_URL` (with the stored `default_memory_backend`
-  setting folded in) selects a backend; `--no-memory` opts out entirely. **Subagents share the parent's
-  store**: the same backend `Arc` is threaded through `SubagentCtx` (not re-derived from the child's cwd,
-  so even a `worktree`-isolated child shares it rather than a private one), and every child gets the
-  `memory` tool plus the current injected index — a subagent grounds its work in what the project already
-  learned, its findings are visible to the parent and siblings, and concurrent writes across the tree are
-  serialized by the backend's cross-process lock.
+  knowledge the model curates itself, distinct from session persistence (which records _the
+  conversation_; memory records _what to carry forward_). A single backend-agnostic `memory` tool exposes
+  a `command` enum (`view`/`create`/`str_replace`/`insert`/`delete`/`rename`/`search`) over one or more
+  mounted logical roots, mirroring Anthropic's `memory_20250818` surface so the model's skills transfer.
+  **Two mounts, two lifecycles:**
+  - `/memories` — **durable, cross-session** project knowledge. `FileBackend` over per-project `*.md`
+    files under `~/.claude/projects/<encoded-cwd>/memory/` (reusing `config_dir_root`/`encode_cwd` and the
+    `FileLock`+`mutate_locked`+atomic-write store discipline). Persists across sessions and runs.
+  - `/session` — **per-session working memory**, the compaction-surviving scratchpad. Same `FileBackend`,
+    rooted at a session-derived dir (`memory::session_dir`): the `<created_at>_<id>.memory/` sibling of a
+    persisted session's `.jsonl` (so `session_store`'s delete/restore trashes and restores it alongside
+    the session), or an id-keyed tempdir when persistence is off. This is the fix for the model's own
+    **compaction** dropping specifics: anything written here stays intact when the raw transcript is
+    folded into a lossy summary. On by default when memory is enabled; `--no-session-memory` drops just
+    this root.
+
+  Each mount is a `(kind, backend)` `Mount`; the tool routes a path to the owning root via
+  `MemPath::classify` and rejects a path under no known root. `MountKind` decides the root, the
+  system-prompt guidance, and (for the host) the on-disk location. Storage is behind the `MemoryBackend`
+  trait so it isn't welded to local disk; `redis://`/`postgres://` DSNs are recognized by `memory::open`
+  but return a clear "not yet supported" (the seam exists without the impl). Each root's `MEMORY.md` index
+  is read at session start (bounded to ~200 lines/25 KB) and injected into the system prompt as its own
+  guidance subsection (`resources::PromptOptions::memory_sections`, rendered by `memory::render_sections`)
+  — Claude Code's auto-memory model. On every compaction the host actively pushes a `<system-reminder>`
+  (`memory::COMPACTION_REMINDER`) as a mid-run steer, telling the model to read `/session` back before
+  continuing. The tool is host-owned (each backend `Arc` cloned into the tool at each registry rebuild,
+  like `structured_output`'s `OutputSlot`) and registered _after_ `apply_filter` so a `--tools` allow-list
+  can't strip it. In `serve` the `/session` mount rides a shared, swappable `SessionDir` cell so a
+  `switch_session`/`new_session`/`fork` re-points every holder with one cell write — no tool or agent
+  rebuild. `--memory <dsn>`/`AI_AGENT_MEMORY_URL` (with the stored `default_memory_backend` setting folded
+  in) selects the durable backend; `--no-memory` opts out entirely. **Subagents share the parent's
+  mounts**: the same backend `Arc`s are threaded through `SubagentCtx` (not re-derived from the child's
+  cwd, so even a `worktree`-isolated child shares them rather than private ones), and every child gets the
+  `memory` tool plus the current injected indices — a subagent grounds its work in what the project
+  already learned _and_ in the task's live `/session` scratch, its findings are visible to the parent and
+  siblings, and concurrent writes across the tree are serialized by each backend's cross-process lock.
 - **Tree-shaped history** — every message line also carries an `id`/`parent_id` (additive,
   `#[serde(default)]`; a pre-tree file's absent fields are migrated to synthesized, chained ids in
   memory only, never persisted back). The "active path" (`Session.messages`) is the `parent_id` chain

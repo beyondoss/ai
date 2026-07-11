@@ -818,6 +818,11 @@ fn run_binary_stored_default_compaction_tokens_force_compaction_with_no_explicit
             "--context-window",
             "200",
             "--no-session-persistence",
+            // This test proves stored compaction-token defaults reach the threshold check; it counts
+            // model calls. Session working memory is on by default and steers the model to consult
+            // `/session` after each compaction — an extra, intended turn (covered by the session-memory
+            // e2e tests) that would add a third call. Disable it to keep the count at compaction's two.
+            "--no-session-memory",
         ])
         .env("HOME", home.path())
         .stdin(Stdio::null())

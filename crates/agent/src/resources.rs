@@ -171,11 +171,13 @@ pub struct PromptOptions<'a> {
     /// drive the tool and the curation discipline) — dead weight in a prompt for a process whose registry
     /// never advertised the tool, same gate-on-what's-registered discipline as [`has_todo`](Self::has_todo).
     pub has_memory: bool,
-    /// The current, already-bounded `MEMORY.md` index (from [`crate::memory::MemoryBackend::index`]) to
-    /// inject so a durable memory is surfaced at session start (Claude Code's auto-memory model). `None`
-    /// or empty renders just the guidance with an "index is empty" note. Only consulted when
-    /// [`has_memory`](Self::has_memory) is set.
-    pub memory_index: Option<&'a str>,
+    /// The mounted memory stores to surface, each paired with its current, already-bounded `MEMORY.md`
+    /// index (from [`crate::memory::MemoryBackend::index`]), in display order. Typically the durable
+    /// `/memories` mount plus — when a session mount is active — the `/session` working-memory mount, so
+    /// both are auto-surfaced at session start (Claude Code's auto-memory model). Each entry renders its
+    /// own guidance + index (an empty index becomes an "index is empty" note). Only consulted when
+    /// [`has_memory`](Self::has_memory) is set; an empty slice there falls back to a bare durable section.
+    pub memory_sections: &'a [(crate::memory::MountKind, String)],
     /// Whether `cwd` is a trusted project (an explicit `--trust-project`/RPC override, or recorded in
     /// `TrustStore`). Gates the *project-local* `SYSTEM.md`/`APPEND_SYSTEM.md` overrides and the
     /// project-local skills root (`<cwd>/.claude/skills`, see `skills::discover`) — an untrusted
@@ -283,13 +285,18 @@ pub fn build_static_system_prompt(opts: &PromptOptions) -> String {
         s.push_str(STRUCTURED_OUTPUT_GUIDANCE);
     }
 
-    // Durable, cross-session memory: the guidance block plus the current (already-bounded) MEMORY.md
-    // index, auto-injected so a memory is never silently forgotten. Gated on the tool being registered.
+    // Memory: each mounted store's guidance block plus its current (already-bounded) MEMORY.md index,
+    // auto-injected so a memory is never silently forgotten. Gated on the tool being registered; an
+    // empty section list still surfaces the durable store's guidance so the model knows it exists.
     if opts.has_memory {
+        let durable_fallback = [(crate::memory::MountKind::Durable, String::new())];
+        let sections = if opts.memory_sections.is_empty() {
+            &durable_fallback[..]
+        } else {
+            opts.memory_sections
+        };
         s.push_str("\n\n");
-        s.push_str(&crate::memory::render_section(
-            opts.memory_index.unwrap_or(""),
-        ));
+        s.push_str(&crate::memory::render_sections(sections));
     }
 
     s
@@ -992,7 +999,7 @@ mod tests {
             has_todo: false,
             has_structured_output: false,
             has_memory: false,
-            memory_index: None,
+            memory_sections: &[],
             project_trusted: true,
             agents: &[],
         });
@@ -1027,7 +1034,7 @@ mod tests {
             has_todo: false,
             has_structured_output: false,
             has_memory: false,
-            memory_index: None,
+            memory_sections: &[],
             project_trusted: true,
             agents: &[],
         });
@@ -1059,7 +1066,7 @@ mod tests {
             has_todo: false,
             has_structured_output: false,
             has_memory: false,
-            memory_index: None,
+            memory_sections: &[],
             project_trusted: false,
             agents: &[],
         });
@@ -1094,7 +1101,7 @@ mod tests {
             has_todo: false,
             has_structured_output: false,
             has_memory: false,
-            memory_index: None,
+            memory_sections: &[],
             project_trusted: true,
             agents: &[],
         });
@@ -1130,7 +1137,7 @@ mod tests {
             has_todo: false,
             has_structured_output: false,
             has_memory: false,
-            memory_index: None,
+            memory_sections: &[],
             project_trusted: true,
             agents: &[],
         });
@@ -1165,7 +1172,7 @@ mod tests {
             has_todo: false,
             has_structured_output: false,
             has_memory: false,
-            memory_index: None,
+            memory_sections: &[],
             project_trusted: true,
             agents: &[],
         });
@@ -1193,7 +1200,7 @@ mod tests {
             has_todo: false,
             has_structured_output: false,
             has_memory: false,
-            memory_index: None,
+            memory_sections: &[],
             project_trusted: true,
             agents: &[],
         });
@@ -1222,7 +1229,7 @@ mod tests {
             has_todo: false,
             has_structured_output: false,
             has_memory: false,
-            memory_index: None,
+            memory_sections: &[],
             project_trusted: false,
             agents: &[],
         });
@@ -1247,7 +1254,7 @@ mod tests {
             has_todo: false,
             has_structured_output: false,
             has_memory: false,
-            memory_index: None,
+            memory_sections: &[],
             project_trusted: true,
             agents: &[],
         });
@@ -1319,7 +1326,7 @@ mod tests {
             has_todo,
             has_structured_output,
             has_memory: false,
-            memory_index: None,
+            memory_sections: &[],
             project_trusted: false,
             agents: &[],
         }
@@ -1358,9 +1365,13 @@ mod tests {
     #[test]
     fn the_memory_section_and_index_are_injected_only_when_the_tool_is_registered() {
         let tmp = tempfile::tempdir().unwrap();
+        let sections = [(
+            crate::memory::MountKind::Durable,
+            "- [notes](notes.md) — build & test".to_string(),
+        )];
         let mut opts = section_opts(tmp.path(), false, false);
         opts.has_memory = true;
-        opts.memory_index = Some("- [notes](notes.md) — build & test");
+        opts.memory_sections = &sections;
         let with = build_static_system_prompt(&opts);
         assert!(with.contains("## Memory"), "the guidance block must appear");
         assert!(
@@ -1370,10 +1381,34 @@ mod tests {
 
         // No tool → no section, even if an index string is present.
         let mut off = section_opts(tmp.path(), false, false);
-        off.memory_index = Some("- [notes](notes.md) — build & test");
+        off.memory_sections = &sections;
         let without = build_static_system_prompt(&off);
         assert!(!without.contains("## Memory"));
         assert!(!without.contains("[notes](notes.md)"));
+    }
+
+    #[test]
+    fn both_memory_mounts_render_with_distinct_roots_when_a_session_is_active() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sections = [
+            (
+                crate::memory::MountKind::Durable,
+                "- [proj](proj.md) — durable".to_string(),
+            ),
+            (
+                crate::memory::MountKind::Session,
+                "- [scratch](scratch.md) — this task".to_string(),
+            ),
+        ];
+        let mut opts = section_opts(tmp.path(), false, false);
+        opts.has_memory = true;
+        opts.memory_sections = &sections;
+        let out = build_static_system_prompt(&opts);
+        assert!(out.contains("Memory (durable, cross-session)"));
+        assert!(out.contains("Working memory (this session)"));
+        assert!(out.contains("/memories/MEMORY.md"));
+        assert!(out.contains("/session/MEMORY.md"));
+        assert!(out.contains("[proj](proj.md)") && out.contains("[scratch](scratch.md)"));
     }
 
     #[test]
@@ -1391,7 +1426,7 @@ mod tests {
             has_todo: false,
             has_structured_output: false,
             has_memory: false,
-            memory_index: None,
+            memory_sections: &[],
             project_trusted: false,
             agents: &[],
         });
@@ -1424,7 +1459,7 @@ mod tests {
             has_todo: false,
             has_structured_output: false,
             has_memory: false,
-            memory_index: None,
+            memory_sections: &[],
             project_trusted: false,
             agents: &[],
         };
@@ -1458,7 +1493,7 @@ mod tests {
             has_todo: false,
             has_structured_output: false,
             has_memory: false,
-            memory_index: None,
+            memory_sections: &[],
             project_trusted: false,
             agents: &[],
         });
