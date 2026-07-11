@@ -454,7 +454,7 @@ The harness layers several capabilities over the bare tools + loop:
   saved one and where — the guaranteed, zero-effort half of the save→carry→recall arc. Complementing the
   deterministic carry, the summarizer's own instructions (`agent_core::compaction::SUMMARY_SYSTEM` and the
   per-mode templates) demand that specifics most often smoothed away — `file:line` references, exact
-  literal values, commands and their key outputs — be copied *verbatim*, shrinking the loss at the source.
+  literal values, commands and their key outputs — be copied _verbatim_, shrinking the loss at the source.
   The tool is host-owned (each backend `Arc` cloned into the tool at each registry rebuild,
   like `structured_output`'s `OutputSlot`) and registered _after_ `apply_filter` so a `--tools` allow-list
   can't strip it. In `serve` the `/session` mount rides a shared, swappable `SessionDir` cell so a
