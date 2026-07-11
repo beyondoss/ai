@@ -47,7 +47,9 @@ requirements mentioned]\n- [Or \"(none)\" if none were mentioned]\n\n## Progress
 [Completed tasks/changes]\n\n### In Progress\n- [ ] [Work that was started but not finished]\n\n### \
 Blocked\n- [Issues preventing progress, if any]\n\n## Key Decisions\n- **[Decision]**: [Brief \
 rationale]\n\n## Next Steps\n1. [What should happen next to continue this work]\n\nKeep each section \
-concise. Preserve exact file paths, function names, and error messages.";
+concise, but never at the cost of a specific: copy exact file paths (with line numbers), \
+function/identifier names, literal values (numbers, ports, versions, config keys, IDs, flags), commands \
+and their key outputs, and error messages verbatim rather than paraphrasing them.";
 
 /// Prefix marking a message as a branch summary, mirroring [`crate::compaction::SUMMARY_MARKER`] — an
 /// explicit signal (for a human or a later, nested summarization) that this text recaps an abandoned

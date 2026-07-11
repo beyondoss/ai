@@ -174,9 +174,12 @@ impl Default for CompactionConfig {
 /// pi's "You are a context summarization assistant..." opener — functionally equivalent (both frame the
 /// call as compaction, not conversation), just not textually identical.
 pub const SUMMARY_SYSTEM: &str = "You compact a long agent transcript so the agent can keep working \
-with far fewer tokens but no loss of essential context. Be precise, concrete, and information-dense; \
-preserve file paths, identifiers, commands, and decisions exactly. Do NOT continue the conversation. \
-Do NOT respond to any questions in the conversation. ONLY output the structured summary.";
+with far fewer tokens but no loss of essential context. Be precise, concrete, and information-dense. \
+Copy specifics verbatim — never paraphrase, round, or elide them: file paths (with line numbers), \
+identifiers and function names, exact literal values (numbers, ports, versions, config keys, IDs, \
+flags), commands and their key outputs, error messages, and decisions and their rationale. A specific \
+you drop is gone for good — prefer keeping an exact value over smooth prose. Do NOT continue the \
+conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.";
 
 /// The instruction appended after the rendered transcript in the summarization call. Matches pi's own
 /// `SUMMARIZATION_PROMPT` (`compaction.ts`) structurally: a bracketed exemplar per section (telling the
@@ -192,8 +195,11 @@ mentioned by user]\n- [Or \"(none)\" if none were mentioned]\n\n## Progress\n###
 tasks/changes]\n\n### In Progress\n- [ ] [Current work]\n\n### Blocked\n- [Issues preventing progress, \
 if any]\n\n## Key Decisions\n- **[Decision]**: [Brief rationale]\n\n## Next Steps\n1. [Ordered list of \
 what should happen next]\n\n## Critical Context\n- [Any data, examples, or references needed to \
-continue]\n- [Or \"(none)\" if not applicable]\n\nKeep each section concise. Preserve exact file paths, \
-function names, and error messages.";
+continue — copy exact literal values (numbers, ports, versions, config keys, IDs, flags), commands and \
+their key outputs, and file:line references verbatim rather than describing them]\n- [Or \"(none)\" if \
+not applicable]\n\nKeep each section concise, but never at the cost of a specific: copy exact file paths \
+(with line numbers), function/identifier names, literal values, commands and their key outputs, and \
+error messages verbatim rather than paraphrasing them.";
 
 /// The instruction used when a *previous* summary already exists — an incremental update rather than a
 /// from-scratch re-summarization. Without this, each compaction re-summarizes the prior summary as raw
@@ -213,8 +219,10 @@ discovered]\n\n## Progress\n### Done\n- [x] [Include previously done items AND n
 items]\n\n### In Progress\n- [ ] [Current work - update based on progress]\n\n### Blocked\n- [Current \
 blockers - remove if resolved]\n\n## Key Decisions\n- **[Decision]**: [Brief rationale] (preserve all \
 previous, add new)\n\n## Next Steps\n1. [Update based on current state]\n\n## Critical Context\n- \
-[Preserve important context, add new if needed]\n\nKeep each section concise. Preserve exact file \
-paths, function names, and error messages.";
+[Preserve important context, add new if needed — keep exact literal values, commands and their key \
+outputs, and file:line references verbatim]\n\nKeep each section concise, but never at the cost of a \
+specific: copy exact file paths (with line numbers), function/identifier names, literal values, commands \
+and their key outputs, and error messages verbatim rather than paraphrasing them.";
 
 /// The instruction used when the cut point falls *inside* an in-progress turn (see [`is_split_turn`]):
 /// the prefix being summarized ends mid-tool-dispatch, so its concluding response — and the context
@@ -226,8 +234,9 @@ pub const SPLIT_TURN_INSTRUCTION: &str = "This is the PREFIX of a turn that was 
 The SUFFIX (recent work) is retained.\n\nSummarize the prefix to provide context for the retained \
 suffix:\n\n## Original Request\n[What did the user ask for in this turn?]\n\n## Early Progress\n- \
 [Key decisions and work done in the prefix]\n\n## Context for Suffix\n- [Information needed to \
-understand the retained recent work]\n\nBe concise. Focus on what's needed to understand the kept \
-suffix.";
+understand the retained recent work — copy exact file paths (with line numbers), literal values, \
+commands and their key outputs, and error messages verbatim]\n\nBe concise. Focus on what's needed to \
+understand the kept suffix.";
 
 /// Prefix marking a message as a compaction summary, so a later compaction recognizes it and updates
 /// it incrementally instead of re-summarizing it. Created by [`apply_summary`], detected by
@@ -1080,6 +1089,32 @@ mod tests {
             "SUMMARY_INSTRUCTION must give an explicit \"(none)\" fallback for optional sections: \
              {SUMMARY_INSTRUCTION}"
         );
+    }
+
+    #[test]
+    fn every_summary_prompt_demands_verbatim_specifics() {
+        // The one thing a summarizer must not do is smooth a specific away — every instruction that
+        // shapes a summary must explicitly demand the categories most often lost (line numbers, literal
+        // values, commands+outputs) be copied verbatim, not paraphrased.
+        for (name, text) in [
+            ("SUMMARY_SYSTEM", SUMMARY_SYSTEM),
+            ("SUMMARY_INSTRUCTION", SUMMARY_INSTRUCTION),
+            ("UPDATE_INSTRUCTION", UPDATE_INSTRUCTION),
+            ("SPLIT_TURN_INSTRUCTION", SPLIT_TURN_INSTRUCTION),
+            (
+                "BRANCH_SUMMARY_INSTRUCTION",
+                crate::branch_summary::BRANCH_SUMMARY_INSTRUCTION,
+            ),
+        ] {
+            assert!(
+                text.contains("verbatim"),
+                "{name} must demand specifics be copied verbatim: {text}"
+            );
+            assert!(
+                text.contains("line numbers"),
+                "{name} must name file:line references as something to preserve: {text}"
+            );
+        }
     }
 
     #[test]
