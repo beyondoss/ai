@@ -11,13 +11,26 @@ use std::io::{BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin};
 
-use common::{read_until_response, serve_cmd, spawn_model_server, turn_text, turn_tool_use};
+use common::{read_until_response, serve_cmd, spawn_model_server, sse, turn_text, turn_tool_use};
 use serde_json::{Value, json};
 
 const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
 fn mem_turn(id: &str, args: Value) -> String {
     turn_tool_use(id, "memory", &args.to_string())
+}
+
+/// A text turn that reports an explicit prompt (`input_tokens`) size, so a test can drive the live
+/// prompt across the compaction pressure point without actually building a huge conversation.
+fn turn_text_with_input(text: &str, input_tokens: u32) -> String {
+    sse(&[
+        json!({ "type": "message_start", "message": { "usage": { "input_tokens": input_tokens, "output_tokens": 1 } } }),
+        json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }),
+        json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": text } }),
+        json!({ "type": "content_block_stop", "index": 0 }),
+        json!({ "type": "message_delta", "delta": { "stop_reason": "end_turn" }, "usage": { "output_tokens": 6 } }),
+        json!({ "type": "message_stop" }),
+    ])
 }
 
 fn send(stdin: &mut ChildStdin, cmd: Value) {
@@ -173,6 +186,118 @@ fn no_session_memory_omits_the_session_root_but_keeps_durable() {
         "no /session store directory should be created under --no-session-memory"
     );
     kill(child);
+}
+
+fn compacted_event(frames: &[Value]) -> bool {
+    frames
+        .iter()
+        .any(|f| f["type"] == "event" && f["event"]["kind"] == json!("compacted"))
+}
+
+// window 10000, reserve 2000 -> compaction threshold 8000; pressure point = 8000/5*4 = 6400.
+// A 7000-token prompt is past the pressure point but well below the cut, with enough headroom that the
+// nudge's own tokens don't tip it over — so the nudge fires and NO compaction happens. The nudge is a
+// mid-run steer, so it rides the immediate continuation turn within the same prompt (a "checkpoint now"),
+// not a later prompt.
+#[test]
+fn a_pressure_nudge_fires_before_compaction_within_the_same_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_str = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+
+    let (base, bodies) = spawn_model_server(vec![
+        turn_text_with_input("ok", 7000), // turn 1: crosses the pressure point, stays below the cut
+        turn_text_with_input("done", 20), // turn 2: carries the queued nudge (steer continuation)
+    ]);
+    let mut child = serve_cmd(BIN, &base, &session_str)
+        .args([
+            "--context-window",
+            "10000",
+            "--compaction-reserve-tokens",
+            "2000",
+        ])
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    send(&mut stdin, json!({ "type": "prompt", "message": "first" }));
+    let p1 = read_until_response(&mut stdout, "prompt");
+    assert_eq!(p1.last().unwrap()["success"], true, "{p1:#?}");
+    assert!(
+        !compacted_event(&p1),
+        "the nudge must fire BEFORE any compaction"
+    );
+
+    // Two requests: the original turn, then the steer continuation the nudge forced.
+    let reqs = bodies.lock().unwrap().clone();
+    assert_eq!(
+        reqs.len(),
+        2,
+        "the nudge must drive one immediate checkpoint turn: {reqs:#?}"
+    );
+    assert!(
+        !reqs[0].contains("getting large"),
+        "the nudge must not appear in the request that triggered it"
+    );
+    assert!(
+        reqs[1].contains("getting large") && reqs[1].contains("/session"),
+        "the pressure nudge (checkpoint to /session) must ride the immediate continuation: {}",
+        reqs[1]
+    );
+    kill(child);
+}
+
+#[test]
+fn below_the_pressure_point_and_under_no_session_memory_no_nudge_fires() {
+    // Two guards in one process pair: a prompt that stays *under* the pressure point never nudges, and
+    // `--no-session-memory` suppresses the nudge even when the point is crossed.
+    for (extra, input_tokens, label) in [
+        (
+            vec![
+                "--context-window",
+                "1000",
+                "--compaction-reserve-tokens",
+                "200",
+            ],
+            100u32,
+            "below point",
+        ),
+        (
+            vec![
+                "--context-window",
+                "1000",
+                "--compaction-reserve-tokens",
+                "200",
+                "--no-session-memory",
+            ],
+            700,
+            "no-session-memory",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let session_str = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+        let (base, bodies) = spawn_model_server(vec![
+            turn_text_with_input("ok", input_tokens),
+            turn_text_with_input("done", 20),
+        ]);
+        let mut child = serve_cmd(BIN, &base, &session_str)
+            .args(extra)
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        send(&mut stdin, json!({ "type": "prompt", "message": "first" }));
+        read_until_response(&mut stdout, "prompt");
+        let before = bodies.lock().unwrap().len();
+        send(&mut stdin, json!({ "type": "prompt", "message": "second" }));
+        read_until_response(&mut stdout, "prompt");
+        let p2_req = bodies.lock().unwrap()[before].clone();
+        assert!(
+            !p2_req.contains("getting large"),
+            "no pressure nudge expected ({label}): {p2_req}"
+        );
+        kill(child);
+    }
 }
 
 // Guard: the session-memory sibling name derivation must match `session_store`'s trash/restore logic.
