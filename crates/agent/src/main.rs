@@ -2889,6 +2889,7 @@ async fn run_turn(
     broken_pipe: &AtomicBool,
     steering: &agent_core::Steering,
     session_memory_active: bool,
+    pressure_point: u32,
 ) -> agent_core::Result<agent_core::StopReason> {
     let mut attempt = 0u32;
     loop {
@@ -2900,6 +2901,7 @@ async fn run_turn(
             broken_pipe,
             steering,
             session_memory_active,
+            pressure_point,
         )
         .await;
         match &result {
@@ -2983,6 +2985,7 @@ fn handle_stdout_write_error(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_turn_once(
     agent: &Agent,
     session: &mut Session,
@@ -2990,18 +2993,42 @@ async fn run_turn_once(
     cancel: &agent_core::CancellationToken,
     broken_pipe: &AtomicBool,
     steering: &agent_core::Steering,
-    // Whether a `/session` working-memory mount is active — gates the active compaction reminder pushed on
-    // each `Compacted` event, mirroring `serve`'s own observer. See `beyond_ai_agent::memory`.
+    // Whether a `/session` working-memory mount is active — gates both the pre-compaction pressure nudge
+    // and the post-compaction recall reminder, mirroring `serve`'s own observer. See
+    // `beyond_ai_agent::memory`.
     session_memory_active: bool,
+    // The live-prompt size at which to warn of an approaching compaction
+    // (`memory::compaction_pressure_point`), fixed for the run (`run`'s model can't change mid-run).
+    pressure_point: u32,
 ) -> agent_core::Result<agent_core::StopReason> {
-    // Push the working-memory recall nudge as a mid-run steer when this turn compacts, so the model reads
-    // back its `/session` specifics before continuing (the raw transcript is now a lossy summary).
-    let nudge_on_compaction = |ev: &agent_core::AgentEvent| {
-        if session_memory_active && matches!(ev, agent_core::AgentEvent::Compacted { .. }) {
-            steering.push_steer(agent_core::SteeringMessage::new(
-                beyond_ai_agent::memory::COMPACTION_REMINDER.to_string(),
-                Vec::new(),
-            ));
+    // Two `/session` steers, mirroring `serve`'s observer: a *pre*-compaction pressure nudge (checkpoint
+    // now, while detail is intact) fired at most once per fill cycle, and a *post*-compaction recall
+    // reminder (read it back) fired on the cut. `pressure_armed` disarms on the pressure fire and re-arms
+    // on `Compacted`. Both are no-ops without a session mount.
+    let pressure_armed = std::sync::atomic::AtomicBool::new(true);
+    let session_steers = |ev: &agent_core::AgentEvent| {
+        if !session_memory_active {
+            return;
+        }
+        match ev {
+            agent_core::AgentEvent::Compacted { .. } => {
+                pressure_armed.store(true, std::sync::atomic::Ordering::Relaxed);
+                steering.push_steer(agent_core::SteeringMessage::new(
+                    beyond_ai_agent::memory::COMPACTION_REMINDER.to_string(),
+                    Vec::new(),
+                ));
+            }
+            agent_core::AgentEvent::Stream(agent_core::StreamEvent::Usage(usage)) => {
+                if beyond_ai_agent::memory::live_prompt_tokens(usage) > pressure_point
+                    && pressure_armed.swap(false, std::sync::atomic::Ordering::Relaxed)
+                {
+                    steering.push_steer(agent_core::SteeringMessage::new(
+                        beyond_ai_agent::memory::PRESSURE_NUDGE.to_string(),
+                        Vec::new(),
+                    ));
+                }
+            }
+            _ => {}
         }
     };
     let mut stop_reason = agent_core::StopReason::default();
@@ -3013,7 +3040,7 @@ async fn run_turn_once(
                     if let agent_core::AgentEvent::TurnEnd { stop_reason: r, .. } = &ev {
                         stop_reason = *r;
                     }
-                    nudge_on_compaction(&ev);
+                    session_steers(&ev);
                     if let Ok(line) = serde_json::to_string(&ev) {
                         write_stdout_or_exit(&line, cancel, broken_pipe);
                         write_stdout_or_exit("\n", cancel, broken_pipe);
@@ -3034,7 +3061,7 @@ async fn run_turn_once(
         .run_events_steered(
             session,
             |ev| {
-                nudge_on_compaction(&ev);
+                session_steers(&ev);
                 let agent_core::AgentEvent::Stream(ev) = &ev else {
                     return;
                 };
@@ -3981,6 +4008,12 @@ async fn run_task(
     if no_compaction {
         compaction.enabled = false;
     }
+    // The live-prompt size at which to warn the model that a compaction is approaching (see
+    // `run_turn_once`), derived from the same resolved window/reserve the agent will compact against.
+    let pressure_point = beyond_ai_agent::memory::compaction_pressure_point(
+        compaction.context_window,
+        compaction.reserve_tokens,
+    );
     // Captured before each is moved into the builder chain below — `Agent` exposes no getter for
     // either back, and `run --export`'s own call to `export_html_full` further down needs the exact
     // system prompt/tool set this run actually used, not a recomputed (and possibly out-of-sync) guess.
@@ -4119,6 +4152,7 @@ async fn run_task(
         &broken_pipe,
         &steering,
         session_memory_active,
+        pressure_point,
     )
     .await;
     // Persist whatever's in `session` regardless of outcome: `run_events_cancellable` mutates
@@ -4143,6 +4177,7 @@ async fn run_task(
             &broken_pipe,
             &steering,
             session_memory_active,
+            pressure_point,
         )
         .await;
         persist_run_tail(&store, &session)?;
@@ -4518,6 +4553,7 @@ mod tests {
             &AtomicBool::new(false),
             &agent_core::Steering::new(),
             false,
+            u32::MAX,
         )
         .await
         .unwrap();
@@ -4778,6 +4814,7 @@ mod tests {
             &AtomicBool::new(false),
             &agent_core::Steering::new(),
             false,
+            u32::MAX,
         )
         .await
         .expect("the whole-run retry must recover once a real turn is finally scripted");
@@ -4816,6 +4853,7 @@ mod tests {
             &AtomicBool::new(false),
             &agent_core::Steering::new(),
             false,
+            u32::MAX,
         )
         .await
         .expect_err("must eventually give up, not retry forever");
@@ -4862,6 +4900,7 @@ mod tests {
             &AtomicBool::new(false),
             &agent_core::Steering::new(),
             false,
+            u32::MAX,
         )
         .await
         .expect_err(

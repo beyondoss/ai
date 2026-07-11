@@ -440,9 +440,14 @@ The harness layers several capabilities over the bare tools + loop:
   but return a clear "not yet supported" (the seam exists without the impl). Each root's `MEMORY.md` index
   is read at session start (bounded to ~200 lines/25 KB) and injected into the system prompt as its own
   guidance subsection (`resources::PromptOptions::memory_sections`, rendered by `memory::render_sections`)
-  — Claude Code's auto-memory model. On every compaction the host actively pushes a `<system-reminder>`
-  (`memory::COMPACTION_REMINDER`) as a mid-run steer, telling the model to read `/session` back before
-  continuing. The tool is host-owned (each backend `Arc` cloned into the tool at each registry rebuild,
+  — Claude Code's auto-memory model. Two host-side steers bracket a compaction so the model prepares for
+  it rather than only reacting: a **pre-compaction pressure nudge** (`memory::PRESSURE_NUDGE`) fires once
+  per fill cycle when the live prompt first crosses `memory::compaction_pressure_point` (80% of the
+  `context_window - reserve_tokens` cut `should_compact` fires at), telling the model to checkpoint to
+  `/session` while it still has full detail; and a **post-compaction recall reminder**
+  (`memory::COMPACTION_REMINDER`) fires on the cut, telling it to read `/session` back. Both are computed
+  host-side from the `Usage` events the observer already sees (no agent-core change), gated on a session
+  mount, and pushed as mid-run steers. The tool is host-owned (each backend `Arc` cloned into the tool at each registry rebuild,
   like `structured_output`'s `OutputSlot`) and registered _after_ `apply_filter` so a `--tools` allow-list
   can't strip it. In `serve` the `/session` mount rides a shared, swappable `SessionDir` cell so a
   `switch_session`/`new_session`/`fork` re-points every holder with one cell write — no tool or agent

@@ -437,6 +437,36 @@ pub const COMPACTION_REMINDER: &str = "<system-reminder>Your earlier context was
     tool, `view /session`) to recover exact details — values, paths, decisions — you saved there.\
     </system-reminder>";
 
+/// The pre-compaction nudge, pushed as a mid-run steer when the live prompt first crosses
+/// [`compaction_pressure_point`] and a `/session` working-memory mount is present. The pre-emptive
+/// complement to [`COMPACTION_REMINDER`]: rather than helping the model recover *after* the cut, it warns
+/// it *before*, while it still has full detail, to checkpoint what it will want to keep. Fired at most
+/// once per fill cycle (re-armed on each `Compacted`).
+pub const PRESSURE_NUDGE: &str = "<system-reminder>Your context is getting large and will soon be \
+    compacted into a summary that drops specifics. While you still have the full detail, save anything \
+    you'll need afterward to your working memory now — use the `memory` tool to record it under \
+    `/session`: exact values, file paths and line numbers, key decisions and their rationale, and your \
+    current plan and progress. Then carry on.</system-reminder>";
+
+/// The live-prompt size at which to warn of an approaching compaction: 80% of the compaction threshold
+/// (`context_window - reserve_tokens`, the point [`agent_core::compaction::should_compact`] fires at).
+/// This leaves runway — typically a few turns — for the model to checkpoint to `/session` before the cut.
+/// Integer math (÷5 ×4) so there is no float cast and no overflow even at a 1M-token window.
+pub fn compaction_pressure_point(context_window: u32, reserve_tokens: u32) -> u32 {
+    context_window.saturating_sub(reserve_tokens) / 5 * 4
+}
+
+/// The full prompt size a [`agent_core::message::TokenUsage`] report implies — uncached input plus
+/// everything served from or written to the prompt cache. Matches what `Session::record_usage` folds
+/// into `last_input_tokens` (the figure the compaction trigger compares), so a host-side pressure check
+/// measures the same thing the trigger does.
+pub fn live_prompt_tokens(usage: &agent_core::message::TokenUsage) -> u32 {
+    usage
+        .input_tokens
+        .saturating_add(usage.cache_read_tokens)
+        .saturating_add(usage.cache_write_tokens)
+}
+
 /// Resolve the on-disk directory for a session's working memory.
 ///
 /// - With a persisted session file, a sibling of the `<created_at>_<id>.jsonl` — `<...>.memory/` — in
@@ -559,6 +589,31 @@ mod tests {
         assert!(msg.contains("/memories") && msg.contains("/session"));
         // Traversal is still rejected even under a known root.
         assert!(MemPath::classify("/session/../etc", &roots).is_err());
+    }
+
+    #[test]
+    fn pressure_point_is_below_the_compaction_threshold_with_runway() {
+        // threshold = 200_000 - 16_384 = 183_616; 80% = 146_892 (÷5×4 rounds the 183_616/5).
+        let p = compaction_pressure_point(200_000, 16_384);
+        assert!(p < 200_000 - 16_384, "must fire before the compaction cut");
+        assert!(p > (200_000 - 16_384) / 2, "but not absurdly early");
+        assert_eq!(p, 183_616 / 5 * 4);
+        // Degenerate windows don't panic or overflow.
+        assert_eq!(compaction_pressure_point(0, 16_384), 0);
+        assert_eq!(compaction_pressure_point(100, 200), 0);
+        assert_eq!(compaction_pressure_point(u32::MAX, 0), u32::MAX / 5 * 4);
+    }
+
+    #[test]
+    fn live_prompt_tokens_sums_uncached_and_cached_like_the_trigger() {
+        let usage = agent_core::message::TokenUsage {
+            input_tokens: 1000,
+            cache_read_tokens: 500,
+            cache_write_tokens: 200,
+            output_tokens: 9999, // must NOT be counted — it isn't part of the prompt
+            ..Default::default()
+        };
+        assert_eq!(live_prompt_tokens(&usage), 1700);
     }
 
     #[test]
