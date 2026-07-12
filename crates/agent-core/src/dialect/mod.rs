@@ -571,10 +571,28 @@ pub trait StreamDecoder: Send {
 #[derive(Default)]
 pub struct SseEventBuffer {
     data: Vec<String>,
+    /// Running total of every buffered payload's length, so the cap below is a single add and compare
+    /// rather than a walk of `data` on each line.
+    bytes: usize,
     /// This not-yet-flushed event's SSE-level `event:` field, if one was sent — e.g. `"error"` for an
     /// Anthropic `event: error` frame. Matches pi's `state.event` (`SseDecoderState`).
     event: Option<String>,
 }
+
+/// Ceiling on one buffered (un-terminated) *event* — the sum of every `data:` payload accumulated
+/// since the last blank line.
+///
+/// [`LineFramer::extend`]'s own `MAX_BUFFERED_LINE_BYTES` bounds a single un-terminated *line*, and
+/// its buffer is reset by `split_to` on every terminator — so it cannot bound this. An event is only
+/// drained on a blank line ([`SseEventBuffer::take`]), so a stream of short, well-terminated `data:`
+/// lines that never sends the blank-line event terminator (a spec-violating relay, or a proxy that
+/// strips blank lines) grows `data` by one `String` per line forever while the line cap never trips:
+/// the process OOMs instead of erroring out. The two caps are equal on purpose — a proxy that re-wraps
+/// one long logical line into several `data:` lines produces an event of exactly the size the line cap
+/// would have allowed unwrapped, so no stream the line cap accepts is rejected here.
+///
+/// [`LineFramer::extend`]: crate::client::LineFramer::extend
+const MAX_BUFFERED_EVENT_BYTES: usize = 32 * 1024 * 1024;
 
 impl SseEventBuffer {
     /// A buffer with no pending data lines.
@@ -583,9 +601,17 @@ impl SseEventBuffer {
     }
 
     /// Buffer one `data:` line's payload (already stripped of the `data:` prefix and surrounding
-    /// whitespace).
-    fn push_data(&mut self, payload: &str) {
+    /// whitespace). Errors if this event has accumulated more than [`MAX_BUFFERED_EVENT_BYTES`]
+    /// without a terminating blank line — see that constant's doc comment.
+    fn push_data(&mut self, payload: &str) -> Result<()> {
+        self.bytes = self.bytes.saturating_add(payload.len());
+        if self.bytes > MAX_BUFFERED_EVENT_BYTES {
+            return Err(Error::Transport(format!(
+                "SSE event exceeded {MAX_BUFFERED_EVENT_BYTES} bytes without a terminating blank line"
+            )));
+        }
         self.data.push(payload.to_string());
+        Ok(())
     }
 
     /// Record this event's SSE-level `event:` field, overwriting any earlier value buffered for the
@@ -602,6 +628,7 @@ impl SseEventBuffer {
     /// preserves existing behavior for a bare `event: ping`-style keepalive with no data.
     fn take(&mut self) -> Option<(Option<String>, String)> {
         let is_error_event = self.event.as_deref() == Some("error");
+        self.bytes = 0;
         if self.data.is_empty() && !is_error_event {
             self.event = None;
             return None;
@@ -690,7 +717,7 @@ pub fn push_sse_line(
     if payload.is_empty() || payload == "[DONE]" {
         return Ok(Vec::new());
     }
-    buf.push_data(payload);
+    buf.push_data(payload)?;
     Ok(Vec::new())
 }
 
@@ -784,6 +811,21 @@ fn repair_and_parse(decoder: &dyn StreamDecoder, payload: &str) -> Option<Value>
 /// Anthropic's `{"type":"error","error":{"message":…}}`, OpenAI Chat Completions' bare
 /// `{"error":{"message":…}}`, and the OpenAI Responses API's flat `{"type":"error","code":…,
 /// "message":…}` (no nested `error` object — a genuinely different shape from the other two, since
+/// Narrow a wire-reported token count to the `u32` the usage types carry, clamping rather than
+/// truncating.
+///
+/// Every dialect reads usage out of provider JSON as a `u64` and has to land it in a `u32`. A plain
+/// `as` cast is *not* covered by `overflow-checks` — it wraps silently — so a provider or proxy
+/// reporting `"prompt_tokens": 4294967297` would land `1`. That value feeds `Session::record_usage`
+/// → `last_input_tokens` → the compaction trigger, so a garbage-large report makes a nearly-full
+/// context look empty and *suppresses* the compaction that would have saved the turn, which is a
+/// strictly worse failure than over-reporting. `session`'s own accumulation is already saturating for
+/// exactly this reason (provider usage numbers carry no upper-bound validation); clamping here is
+/// what keeps that guarantee from being defeated one layer up.
+pub(crate) fn saturating_u32(n: u64) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
 /// Responses streams a top-level `error` *event* rather than an in-band error field). Returns `None`
 /// for ordinary stream events.
 // `pub(crate)`: also reused by `codex_websocket`'s WebSocket receive loop, which decodes the exact
@@ -1239,6 +1281,39 @@ data: {"type":"message_stop"}
                 .is_empty()
         );
         assert!(push_sse_line(&mut dec, &mut buf3, "").unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_event_that_never_terminates_errors_instead_of_growing_without_bound() {
+        // `LineFramer`'s own `MAX_BUFFERED_LINE_BYTES` bounds a single un-terminated *line*, and its
+        // buffer resets on every terminator — so short, well-terminated `data:` lines that never see a
+        // blank line slip past it entirely while this buffer grows one `String` per line forever. Feed
+        // exactly that shape (a relay that strips blank lines) and require an error, not an OOM.
+        let mut buf = SseEventBuffer::new();
+        let mut dec = anthropic::Decoder::default();
+        let payload = "x".repeat(64 * 1024);
+        let line = format!("data: {payload}");
+        // 32 MiB cap / 64 KiB per line = 512 lines to reach it; anything past that must error.
+        let mut err = None;
+        for _ in 0..1024 {
+            if let Err(e) = push_sse_line(&mut dec, &mut buf, &line) {
+                err = Some(e);
+                break;
+            }
+        }
+        let err = err.expect("an event with no terminating blank line must eventually error");
+        assert!(
+            matches!(&err, Error::Transport(m) if m.contains("without a terminating blank line")),
+            "expected a transport error naming the cap, got: {err:?}"
+        );
+
+        // The cap is per *event*, not per stream: a normal flush resets the counter, so a long-lived
+        // stream of ordinary events never accumulates toward it.
+        let mut buf = SseEventBuffer::new();
+        for _ in 0..1024 {
+            push_sse_line(&mut dec, &mut buf, &line).expect("each event is well under the cap");
+            let _ = push_sse_line(&mut dec, &mut buf, "");
+        }
     }
 
     #[test]

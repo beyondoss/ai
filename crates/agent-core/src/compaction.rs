@@ -146,6 +146,46 @@ pub struct CompactionConfig {
     pub enabled: bool,
 }
 
+impl CompactionConfig {
+    /// Defaults scaled to a model's real context window.
+    ///
+    /// [`Default`] is sized for a 200k-context Claude model and states both budgets as *absolutes*
+    /// (`reserve_tokens: 16_384`, `keep_recent_tokens: 20_000`). Seeding only `context_window` from the
+    /// model's capabilities and leaving those two at their 200k values — which is what [`Agent::new`]
+    /// used to do — silently breaks the one invariant the two budgets have to satisfy between them:
+    ///
+    /// > what a compaction *keeps* must be comfortably smaller than the threshold that *triggers* one.
+    ///
+    /// The trigger fires at `context_window - reserve_tokens`, so on a 32_768-token model (the smallest
+    /// in the catalogue) the un-scaled numbers give a trigger budget of 16_384 while `keep_recent_tokens`
+    /// retains 20_000 — a compaction that keeps *more* than the line it just crossed. Every turn then
+    /// re-triggers, each one spending a real summarization call, and the context never gets back under
+    /// the threshold. Scaling both budgets down with the window restores the invariant.
+    ///
+    /// The caps are deliberately one-sided (`min`, not a proportion): any window at or above ~64k gets
+    /// byte-for-byte the same tuning as before, since a quarter of the window already exceeds the
+    /// absolute reserve and half the remaining budget already exceeds `keep_recent_tokens`. Only the
+    /// genuinely small windows — the ones that were broken — see different numbers.
+    pub fn for_window(context_window: u32) -> Self {
+        let d = Self::default();
+        // Never hand the reserve more than a quarter of the window: at the absolute 16_384 a 32k model
+        // would surrender half its context to headroom before the first token is sent.
+        let reserve_tokens = d.reserve_tokens.min(context_window / 4);
+        // What's actually usable once the reserve is set aside — and the exact quantity the trigger
+        // compares against, so `keep_recent_tokens` must stay a fraction of *this*, not of the window.
+        let trigger_budget = context_window.saturating_sub(reserve_tokens);
+        // Half the trigger budget: a compaction lands the context at roughly 50% of the threshold, so
+        // there's real room to work before the next one fires rather than re-triggering immediately.
+        let keep_recent_tokens = d.keep_recent_tokens.min(trigger_budget / 2);
+        Self {
+            context_window,
+            reserve_tokens,
+            keep_recent_tokens,
+            ..d
+        }
+    }
+}
+
 impl Default for CompactionConfig {
     fn default() -> Self {
         // Defaults sized for a 200k-context Claude model; override per deployment. Matches pi's own
@@ -1005,6 +1045,44 @@ pub fn apply_summary(session: &mut Session, first_kept: usize, summary: &str, to
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn scaled_budgets_keep_less_than_the_threshold_that_triggers_a_compaction() {
+        // The invariant the two budgets have to satisfy between them, across every window in the
+        // catalogue: a compaction must *keep* less than the trigger threshold it just crossed.
+        // Otherwise the very next turn re-triggers, pays for another summarization, and never gets
+        // back under the line — which is exactly what the un-scaled 200k absolutes did on a 32k model
+        // (trigger budget 16_384, keep_recent 20_000).
+        for window in [4_096u32, 8_192, 32_768, 40_960, 128_000, 200_000, 1_000_000] {
+            let cfg = CompactionConfig::for_window(window);
+            let trigger_budget = window - cfg.reserve_tokens;
+            assert!(
+                cfg.keep_recent_tokens < trigger_budget,
+                "window {window}: keep_recent ({}) must stay under the trigger budget ({trigger_budget})",
+                cfg.keep_recent_tokens
+            );
+            assert!(
+                cfg.reserve_tokens < window,
+                "window {window}: the reserve must not swallow the whole context"
+            );
+        }
+    }
+
+    #[test]
+    fn scaling_leaves_every_large_window_byte_for_byte_unchanged() {
+        // The caps are one-sided on purpose: they must only bite on the small windows that were
+        // actually broken. Any window at or above ~64k keeps precisely the tuning it had before.
+        let d = CompactionConfig::default();
+        for window in [128_000u32, 200_000, 256_000, 1_000_000] {
+            let cfg = CompactionConfig::for_window(window);
+            assert_eq!(cfg.reserve_tokens, d.reserve_tokens, "window {window}");
+            assert_eq!(
+                cfg.keep_recent_tokens, d.keep_recent_tokens,
+                "window {window}"
+            );
+            assert_eq!(cfg.context_window, window);
+        }
+    }
 
     fn convo() -> Vec<Message> {
         vec![

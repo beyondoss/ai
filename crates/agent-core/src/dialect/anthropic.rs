@@ -1012,7 +1012,7 @@ fn str_at<'a>(v: Option<&'a Value>, key: &str) -> &'a str {
 fn u32_at(v: Option<&Value>, key: &str) -> u32 {
     v.and_then(|v| v.get(key))
         .and_then(Value::as_u64)
-        .unwrap_or(0) as u32
+        .map_or(0, super::saturating_u32)
 }
 
 /// Anthropic's own `content_block_start`/`_delta`/`_stop` all carry a real `index` — read it straight

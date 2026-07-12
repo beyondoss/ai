@@ -41,20 +41,28 @@
 //! [`checkin`](CodexWebSocketCache::checkin) are both plain, synchronous, sub-millisecond critical
 //! sections over a [`std::sync::Mutex`].
 //!
-//! Unlike pi, there is no proactive idle-timeout/max-age background timer
+//! Unlike pi, there is no *background* idle-timeout/max-age timer
 //! (`SESSION_WEBSOCKET_CACHE_TTL_MS`/`SESSION_WEBSOCKET_MAX_AGE_MS`, both enforced via `setTimeout` in
-//! the real client) — a spawned-per-connection sweep task is a meaningfully bigger commitment (this
-//! crate has never spawned a background task of its own before) for a purely eager-resource-reclaim
-//! optimization, not a correctness requirement. Instead, [`checkout`](CodexWebSocketCache::checkout)
-//! lazily evicts an entry past [`MAX_CONNECTION_AGE`] the next time it's looked up — a connection can
-//! sit open somewhat longer than pi's proactive close in a quiet session, which only matters for
-//! server-side resource pressure, not for this client's own correctness. A cached connection the
-//! *server* silently closed between turns (idle timeout, restart) is handled reactively instead of
-//! pi's `readyState`-checked-before-reuse: see [`Attempt`]'s "stale reused connection" retry, one
-//! connect-with-a-fresh-socket retry before the ordinary SSE-fallback path, so an otherwise-healthy
-//! session doesn't stick to SSE for its whole remaining lifetime just because one connection went
-//! idle. If a real need for the proactive sweep appears (a long-lived `serve` process visibly
-//! accumulating idle sockets), add it as its own follow-up.
+//! the real client): a spawned-per-connection sweep task is a meaningfully bigger commitment (this
+//! crate has never spawned a background task of its own before) than the reclaim it buys. What this
+//! cache does instead is sweep *every* entry past [`MAX_CONNECTION_AGE`] out of the map on every
+//! [`checkout`](CodexWebSocketCache::checkout) **and** [`checkin`](CodexWebSocketCache::checkin) — an
+//! O(n) pass over a map that holds at most one entry per live conversation, cheap enough to run
+//! unconditionally inside the same synchronous critical section, and not restricted to the one key
+//! being looked up. That distinction is the whole point: an entry whose key is never checked out
+//! again is exactly the entry that leaks, and a per-key lazy check can by construction never reach it.
+//! A [`CachedConnection`] is not free to leave parked — it holds an open fd, its TLS session state,
+//! and a [`Continuation`] carrying a full clone of that turn's entire input array — and nothing pumps
+//! an idle socket, so the server's own pings go unanswered while it sits there. Since every turn of
+//! every session touches this cache, any still-running client sweeps the corpses of the finished ones;
+//! only a client whose sessions have *all* gone quiet holds sockets past the ceiling, and it releases
+//! them when its next turn arrives or when it drops.
+//!
+//! A cached connection the *server* silently closed between turns (idle timeout, restart) is handled
+//! reactively rather than via pi's `readyState`-checked-before-reuse: see [`Attempt`]'s "stale reused
+//! connection" retry, one connect-with-a-fresh-socket retry before the ordinary SSE-fallback path, so
+//! an otherwise-healthy session doesn't stick to SSE for its whole remaining lifetime just because one
+//! connection went idle.
 //!
 //! # Delta diffing
 //!
@@ -129,11 +137,30 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// (600s): the gateway/backend can legitimately go quiet for a long extended-thinking gap, so this
 /// isn't a ceiling on total turn duration, only on "has this socket gone silently dead".
 const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
-/// A cached connection older than this is treated as expired at its next checkout and closed rather
-/// than reused — mirrors pi's `SESSION_WEBSOCKET_MAX_AGE_MS` (55 minutes), a defensive ceiling
-/// independent of activity (some backends cap a single connection's total lifetime regardless of how
-/// recently it was used).
+/// Cap on getting one turn's single outbound `response.create` frame out to the OS. `SinkExt::send` is
+/// feed-then-flush, so it stays pending until the bytes are actually accepted by the socket: a peer
+/// that completes the upgrade and then stops reading (a TCP zero-window, a wedged load balancer, or a
+/// *cached* socket whose peer went away without ever saying so) would otherwise park this await
+/// forever, and this is the only await in the module that isn't already bounded. Nothing else can
+/// break it — the SSE fallback is downstream of it, and the only remaining escape is the run's
+/// cancellation token, which a detached background session has nobody to press. Sized like
+/// [`CONNECT_TIMEOUT`] rather than [`IDLE_TIMEOUT`]: unlike a read, this
+/// write isn't waiting on the model to think, so a healthy path finishes in milliseconds and has no
+/// legitimate reason to outlast establishing the connection did.
+const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+/// A cached connection older than this is swept out of the idle pool and closed rather than reused —
+/// mirrors pi's `SESSION_WEBSOCKET_MAX_AGE_MS` (55 minutes), a defensive ceiling independent of
+/// activity (some backends cap a single connection's total lifetime regardless of how recently it was
+/// used).
 const MAX_CONNECTION_AGE: Duration = Duration::from_secs(55 * 60);
+/// Ceiling on how many distinct `cache_key`s one cache remembers as sticky-SSE. The marker is
+/// deliberately never *un*set for a key (see [`CodexWebSocketCache::mark_fallback`]), so without a
+/// ceiling the set is a strictly-growing string map for the whole life of a `GatewayClient` — bounded
+/// in practice by the number of conversations one client ever serves, which for a long-lived process
+/// is not a bound at all. Far above any realistic live-conversation count per client, so eviction only
+/// ever discards markers old enough that re-attempting the WebSocket for them is the right call
+/// anyway.
+const MAX_SSE_FALLBACK_KEYS: usize = 256;
 /// The OpenAI-Beta opt-in the real Codex backend's WebSocket upgrade requires — pi's
 /// `OPENAI_BETA_RESPONSES_WEBSOCKETS`.
 const OPENAI_BETA_RESPONSES_WEBSOCKETS: &str = "responses_websockets=2026-02-06";
@@ -276,47 +303,61 @@ struct CachedConnection {
     continuation: Option<Continuation>,
 }
 
+/// Drop every entry whose age is at or past [`MAX_CONNECTION_AGE`], regardless of key. Generic over
+/// the entry so the age policy itself is exercisable without a live TLS socket (a [`WsSocket`] can't
+/// be constructed without a real peer to hand it).
+///
+/// Callers run this with the map's guard already held: it is deliberately synchronous, and dropping a
+/// swept [`CachedConnection`] closes its fd without a WebSocket close handshake — the peer will see a
+/// TCP FIN on a socket it has heard nothing from for close to an hour, which is precisely what the
+/// ceiling exists to tell it.
+fn sweep_expired<T>(entries: &mut HashMap<String, T>, age_of: impl Fn(&T) -> Instant) {
+    entries.retain(|_, entry| age_of(entry).elapsed() < MAX_CONNECTION_AGE);
+}
+
 /// One per [`GatewayClient`](crate::client::GatewayClient) — see the module doc comment for the
 /// "present == idle" cache-key design.
 pub(crate) struct CodexWebSocketCache {
     idle: Mutex<HashMap<String, CachedConnection>>,
-    sse_fallback: Mutex<std::collections::HashSet<String>>,
+    /// Value is the instant the marker was set — read only to pick a victim when the map is at
+    /// [`MAX_SSE_FALLBACK_KEYS`], never to expire a marker on its own.
+    sse_fallback: Mutex<HashMap<String, Instant>>,
 }
 
 impl CodexWebSocketCache {
     pub(crate) fn new() -> Self {
         Self {
             idle: Mutex::new(HashMap::new()),
-            sse_fallback: Mutex::new(std::collections::HashSet::new()),
+            sse_fallback: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Take ownership of `key`'s cached connection, if any is idle and not past
-    /// [`MAX_CONNECTION_AGE`]. A brief, synchronous, lock-held critical section only — never awaits.
+    /// Take ownership of `key`'s cached connection, if one is idle and still inside
+    /// [`MAX_CONNECTION_AGE`], sweeping every *other* expired entry out on the way through. A brief,
+    /// synchronous, lock-held critical section only — never awaits.
     fn checkout(&self, key: &str) -> Option<CachedConnection> {
         let mut guard = self
             .idle
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let entry = guard.remove(key)?;
-        if entry.created_at.elapsed() >= MAX_CONNECTION_AGE {
-            // Dropped here: past its age ceiling, close it rather than hand it back for reuse.
-            None
-        } else {
-            Some(entry)
-        }
+        sweep_expired(&mut guard, |entry| entry.created_at);
+        guard.remove(key)
     }
 
-    /// Return a still-healthy connection to the idle pool after a clean turn completion. Overwrites
-    /// (and thus closes) any entry already present for `key` — the only way that can happen is two
-    /// concurrent turns on the same `cache_key` both completing and re-caching; whichever checks in
-    /// last wins, which is a benign, documented simplification (see the module doc comment) rather
+    /// Return a still-healthy connection to the idle pool after a clean turn completion, sweeping any
+    /// expired entries out at the same time — this is the moment a session goes quiet, so it's the
+    /// last chance to notice that some *other* session went quiet an hour ago and never came back.
+    ///
+    /// Overwrites (and thus closes) any entry already present for `key` — the only way that can happen
+    /// is two concurrent turns on the same `cache_key` both completing and re-caching; whichever checks
+    /// in last wins, which is a benign, documented simplification (see the module doc comment) rather
     /// than a correctness issue (each turn already sent/received its own complete, correct exchange).
     fn checkin(&self, key: String, connection: CachedConnection) {
         let mut guard = self
             .idle
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        sweep_expired(&mut guard, |entry| entry.created_at);
         guard.insert(key, connection);
     }
 
@@ -324,18 +365,33 @@ impl CodexWebSocketCache {
     /// `cache_key` skips the WebSocket attempt entirely and goes straight to HTTP/SSE, for the rest of
     /// this cache's lifetime (mirrors pi's `websocketSseFallbackSessions`, which is likewise never
     /// cleared except by an explicit debug/reset call this crate has no equivalent of).
+    ///
+    /// The set of marked keys is capped at [`MAX_SSE_FALLBACK_KEYS`], evicting the longest-marked key
+    /// to make room. Losing a marker is not a correctness problem — it costs the *next* turn on that
+    /// key one more failed WebSocket attempt before it falls back and re-marks — whereas an unbounded
+    /// map is a slow leak in any process whose `GatewayClient` outlives the conversations it serves.
     fn mark_fallback(&self, key: &str) {
-        self.sse_fallback
+        let mut guard = self
+            .sse_fallback
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(key.to_string());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.len() >= MAX_SSE_FALLBACK_KEYS && !guard.contains_key(key) {
+            let oldest = guard
+                .iter()
+                .min_by_key(|(_, marked_at)| *marked_at)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                guard.remove(&oldest);
+            }
+        }
+        guard.insert(key.to_string(), Instant::now());
     }
 
     fn is_fallback_active(&self, key: &str) -> bool {
         self.sse_fallback
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(key)
+            .contains_key(key)
     }
 }
 
@@ -719,9 +775,25 @@ async fn attempt_once(
     };
 
     let wire_body = build_wire_body(full_body, continuation.as_ref());
-    if let Err(e) = socket.send(Message::text(wire_frame(&wire_body))).await {
-        tracing::debug!(error = %e, "codex websocket send failed; using SSE for this turn");
-        return AttemptOnceOutcome::Fallback;
+    let send = socket.send(Message::text(wire_frame(&wire_body)));
+    match tokio::time::timeout(SEND_TIMEOUT, send).await {
+        // A peer that took the upgrade and then stopped reading our bytes is indistinguishable, from
+        // here, from one that rejected them outright — and the answer to both is the same: this turn
+        // goes out over HTTP/SSE. See [`SEND_TIMEOUT`] for why leaving the flush pending is not an
+        // option.
+        Err(_elapsed) => {
+            tracing::debug!(
+                timeout = ?SEND_TIMEOUT,
+                reused,
+                "codex websocket send timed out; using SSE for this turn"
+            );
+            return AttemptOnceOutcome::Fallback;
+        }
+        Ok(Err(e)) => {
+            tracing::debug!(error = %e, "codex websocket send failed; using SSE for this turn");
+            return AttemptOnceOutcome::Fallback;
+        }
+        Ok(Ok(())) => {}
     }
 
     let mut receiver = Receiver::new(socket);
@@ -1148,6 +1220,176 @@ mod tests {
         assert!(
             !cache.is_fallback_active("s2"),
             "the marker must not leak across keys"
+        );
+    }
+
+    /// The idle pool's own values are `CachedConnection`s, which can't be built without a live peer to
+    /// hand a `WsSocket` — so the sweep is generic over its entry (see [`sweep_expired`]) and its age
+    /// policy is exercised here against bare timestamps, which is the entire input it actually reads.
+    fn aged_map(entries: &[(&str, Duration)]) -> HashMap<String, Instant> {
+        let now = Instant::now();
+        entries
+            .iter()
+            .map(|(key, age)| {
+                let created_at = now.checked_sub(*age).expect("test ages fit in an Instant");
+                ((*key).to_string(), created_at)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_sweep_drops_every_expired_entry_not_just_the_one_being_looked_up() {
+        // The whole point of sweeping the map rather than age-checking one key: the entry that leaks
+        // is precisely the one whose session ended and will never be checked out again.
+        let mut entries = aged_map(&[
+            (
+                "finished_an_hour_ago",
+                MAX_CONNECTION_AGE + Duration::from_secs(60),
+            ),
+            ("exactly_at_the_ceiling", MAX_CONNECTION_AGE),
+            ("still_live", Duration::from_secs(30)),
+        ]);
+        sweep_expired(&mut entries, |created_at| *created_at);
+        assert_eq!(
+            entries.keys().collect::<Vec<_>>(),
+            vec!["still_live"],
+            "only the connection inside the age ceiling may survive: {entries:#?}"
+        );
+    }
+
+    #[test]
+    fn the_sweep_keeps_everything_inside_the_age_ceiling() {
+        let mut entries = aged_map(&[
+            ("a", Duration::ZERO),
+            ("b", MAX_CONNECTION_AGE - Duration::from_secs(1)),
+        ]);
+        sweep_expired(&mut entries, |created_at| *created_at);
+        assert_eq!(entries.len(), 2, "a healthy pool must not be evicted");
+    }
+
+    /// A `WsSocket` over a real (but never spoken-to) loopback TCP connection. The sweep only ever
+    /// reads an entry's `created_at` and drops the rest, so no handshake or peer is needed — but the
+    /// type is concrete, so *some* socket is.
+    async fn parked_socket() -> WsSocket {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind");
+        let addr = listener.local_addr().expect("bound port");
+        let client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        listener.accept().await.expect("accept");
+        tokio_tungstenite::WebSocketStream::from_raw_socket(
+            tokio_tungstenite::MaybeTlsStream::Plain(client),
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await
+    }
+
+    async fn cached(created_at: Instant) -> CachedConnection {
+        CachedConnection {
+            socket: parked_socket().await,
+            created_at,
+            continuation: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn checkout_and_checkin_both_sweep_expired_entries() {
+        // Both directions matter: checkin is the moment a session goes quiet (the last chance to
+        // notice that some *other* session went quiet an hour ago), checkout is every turn of every
+        // session. Either way the key being reaped is one nobody asked about.
+        let stale = Instant::now()
+            .checked_sub(MAX_CONNECTION_AGE + Duration::from_secs(1))
+            .expect("test ages fit in an Instant");
+
+        for entry_point in ["checkout", "checkin"] {
+            let cache = CodexWebSocketCache::new();
+            cache.checkin("abandoned".to_string(), cached(stale).await);
+
+            if entry_point == "checkout" {
+                assert!(cache.checkout("some_other_session").is_none());
+            } else {
+                cache.checkin(
+                    "some_other_session".to_string(),
+                    cached(Instant::now()).await,
+                );
+            }
+
+            let guard = cache.idle.lock().expect("uncontended in a unit test");
+            assert!(
+                !guard.contains_key("abandoned"),
+                "{entry_point} must reap the expired entry it wasn't asked about"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn checkout_returns_a_live_entry_and_refuses_an_expired_one() {
+        let cache = CodexWebSocketCache::new();
+        cache.checkin("live".to_string(), cached(Instant::now()).await);
+        assert!(cache.checkout("live").is_some(), "inside the age ceiling");
+        assert!(
+            cache.checkout("live").is_none(),
+            "checkout removes: a second concurrent turn on one key must not share the socket"
+        );
+
+        let stale = Instant::now()
+            .checked_sub(MAX_CONNECTION_AGE)
+            .expect("test ages fit in an Instant");
+        cache.checkin("old".to_string(), cached(stale).await);
+        assert!(
+            cache.checkout("old").is_none(),
+            "at the age ceiling it must be closed, not handed back"
+        );
+    }
+
+    #[test]
+    fn the_sticky_sse_marker_set_is_capped() {
+        // Never cleared per-key by design, so the only thing standing between a long-lived
+        // GatewayClient and an unbounded string map is this ceiling.
+        let cache = CodexWebSocketCache::new();
+        for n in 0..MAX_SSE_FALLBACK_KEYS {
+            cache.mark_fallback(&format!("session_{n}"));
+        }
+        assert_eq!(
+            cache
+                .sse_fallback
+                .lock()
+                .expect("uncontended in a unit test")
+                .len(),
+            MAX_SSE_FALLBACK_KEYS
+        );
+
+        cache.mark_fallback("one_too_many");
+        let guard = cache
+            .sse_fallback
+            .lock()
+            .expect("uncontended in a unit test");
+        assert_eq!(guard.len(), MAX_SSE_FALLBACK_KEYS, "the cap must hold");
+        assert!(
+            guard.contains_key("one_too_many"),
+            "the key that just failed is the one most worth remembering"
+        );
+        let survivors = (0..MAX_SSE_FALLBACK_KEYS)
+            .filter(|n| guard.contains_key(&format!("session_{n}")))
+            .count();
+        assert_eq!(
+            survivors,
+            MAX_SSE_FALLBACK_KEYS - 1,
+            "exactly one — the longest-marked — key may be evicted to make room"
+        );
+    }
+
+    #[test]
+    fn re_marking_a_key_already_at_the_cap_evicts_nothing() {
+        let cache = CodexWebSocketCache::new();
+        for n in 0..MAX_SSE_FALLBACK_KEYS {
+            cache.mark_fallback(&format!("session_{n}"));
+        }
+        cache.mark_fallback("session_0");
+        assert!(
+            (0..MAX_SSE_FALLBACK_KEYS).all(|n| cache.is_fallback_active(&format!("session_{n}"))),
+            "refreshing an existing marker doesn't need room made for it"
         );
     }
 }

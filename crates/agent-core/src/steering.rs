@@ -122,6 +122,52 @@ impl PartialEq<String> for SteeringMessage {
 
 type Queue = Arc<Mutex<VecDeque<SteeringMessage>>>;
 
+/// The most messages any one lane will hold. Every push into these lanes originates, in this
+/// codebase's real shape, at a *remote* RPC command (`serve.rs`'s `steer`/`follow_up`/`prompt`
+/// handlers, reachable over WebSocket and UDS), and a [`SteeringMessage`] carries `images` — base64
+/// payloads that can each be megabytes. The lanes, meanwhile, drain slowly by design: the default
+/// [`QueueMode::OneAtATime`] takes exactly one message per drain point, and while no run is in flight
+/// the steer lane has no drain point at all. A client that pushes faster than the agent drains — or
+/// pushes at all while idle — therefore pins heap in the daemon for the life of the session, and
+/// nothing but [`clear`](Steering::clear) ever gives it back. A cap is what turns that from unbounded
+/// into bounded.
+///
+/// 64 is chosen to be far above any plausible legitimate depth and still small enough to bound the
+/// worst case: these lanes hold *human-authored* redirects, drained roughly one per turn, so a lane
+/// even a dozen deep already means the client is producing faster than the agent can ever consume.
+/// A client that legitimately needs to hand the agent more than 64 pending instructions wants a
+/// prompt, not 64 steers.
+const MAX_QUEUED_PER_LANE: usize = 64;
+
+/// Push onto a lane unless it is already at [`MAX_QUEUED_PER_LANE`], returning whether the message was
+/// queued.
+///
+/// **Reject-newest, not drop-oldest.** The oldest message in a lane is the one the loop is about to
+/// inject — the instruction the client has been waiting on longest. Evicting it to make room for a
+/// newer one would silently reorder a client's own instruction stream (its later message lands, its
+/// earlier one vanishes) and, under a sustained flood, would keep the head of the queue perpetually
+/// churning so that *nothing* ever reaches the model. Refusing the newest instead keeps whatever is
+/// queued a faithful, in-order prefix of what the client sent, and puts the loss at the tail — where
+/// the client that caused it is still connected, still pushing, and gets `false` back to act on. This
+/// is backpressure, not eviction.
+///
+/// Never silent: a refusal is logged at `warn`, because a dropped steer is a user's words not reaching
+/// the model.
+fn push_capped(q: &Queue, lane: &'static str, message: SteeringMessage) -> bool {
+    let mut queue = lock(q);
+    if queue.len() >= MAX_QUEUED_PER_LANE {
+        tracing::warn!(
+            lane,
+            depth = queue.len(),
+            cap = MAX_QUEUED_PER_LANE,
+            "steering lane full; rejecting message (the queue is draining slower than it is being fed)"
+        );
+        return false;
+    }
+    queue.push_back(message);
+    true
+}
+
 /// How much of a lane [`Steering::drain_steer`]/[`Steering::drain_at_stop`] consumes per call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum QueueMode {
@@ -199,14 +245,20 @@ impl Steering {
 
     /// Queue a **follow-up**: injected when the run next reaches a stop boundary. Accepts a plain
     /// string or a [`SteeringMessage`] (with image attachments).
-    pub fn push(&self, message: impl Into<SteeringMessage>) {
-        lock(&self.follow_up).push_back(message.into());
+    ///
+    /// Returns `false` — and queues nothing — if the follow-up lane is already at
+    /// [`MAX_QUEUED_PER_LANE`]; see [`push_capped`] for why the *newest* message is the one refused.
+    pub fn push(&self, message: impl Into<SteeringMessage>) -> bool {
+        push_capped(&self.follow_up, "follow_up", message.into())
     }
 
     /// Queue a **steer**: injected mid-run, at the next tool-results turn, to redirect a busy agent.
     /// Accepts a plain string or a [`SteeringMessage`] (with image attachments).
-    pub fn push_steer(&self, message: impl Into<SteeringMessage>) {
-        lock(&self.steer).push_back(message.into());
+    ///
+    /// Returns `false` — and queues nothing — if the steer lane is already full; see
+    /// [`push`](Self::push).
+    pub fn push_steer(&self, message: impl Into<SteeringMessage>) -> bool {
+        push_capped(&self.steer, "steer", message.into())
     }
 
     /// Queue a **next-turn** message: folded onto the very first request of whatever run comes next,
@@ -215,8 +267,12 @@ impl Steering {
     /// to), though nothing here enforces that — a caller can queue one mid-run too, and it simply waits
     /// for the *next* fresh run to start. Accepts a plain string or a [`SteeringMessage`] (with image
     /// attachments).
-    pub fn push_next_turn(&self, message: impl Into<SteeringMessage>) {
-        lock(&self.next_turn).push_back(message.into());
+    ///
+    /// Returns `false` — and queues nothing — if the next-turn lane is already full; see
+    /// [`push`](Self::push). This lane is the one most likely to be pushed while nothing is draining
+    /// it (that's its whole purpose), so its cap is the one doing the most work.
+    pub fn push_next_turn(&self, message: impl Into<SteeringMessage>) -> bool {
+        push_capped(&self.next_turn, "next_turn", message.into())
     }
 
     /// Whether any lane currently holds any messages.
@@ -338,7 +394,10 @@ impl Steering {
         lock(&self.next_turn).clear();
         self.stop_requested.store(false, Ordering::Relaxed);
         *lock_opt(&self.model_switch) = None;
-        *lock_opt(&self.tool_switch) = None;
+        // Taken out and bound to a `let`, not assigned away as `*guard = None`: the discarded
+        // registry's destructor must not run while we hold the lock — see
+        // [`request_tool_set`](Self::request_tool_set).
+        let _discarded_tools = self.take_tool_switch();
     }
 
     /// Drop the steer and follow-up lanes, plus any pending stop request, mid-run model switch, and
@@ -372,7 +431,8 @@ impl Steering {
         lock(&self.follow_up).clear();
         self.stop_requested.store(false, Ordering::Relaxed);
         *lock_opt(&self.model_switch) = None;
-        *lock_opt(&self.tool_switch) = None;
+        // As in [`clear`](Self::clear): take it out, drop it after the guard is gone.
+        let _discarded_tools = self.take_tool_switch();
     }
 
     /// Request that the run stop gracefully at the next turn boundary — after the current turn's tool
@@ -432,8 +492,19 @@ impl Steering {
     /// A second call before the first is observed replaces it outright — same "no queue of switches,
     /// only the most recent request matters" contract
     /// [`request_model_switch`](Self::request_model_switch) uses.
+    ///
+    /// The registry being *replaced* is deliberately moved out of the slot and dropped by this
+    /// function's own scope, rather than written over with `*guard = Some(tools)`. An assignment
+    /// through the guard drops the old value in place, still holding the lock — and a `ToolRegistry`
+    /// is `Arc<dyn Tool>`s, so that runs arbitrary *host-supplied* destructors under our mutex. A host
+    /// tool whose `Drop` blocks, takes another lock, or re-enters `Steering` would stall or deadlock
+    /// every other lane behind it; one that panics would unwind out of the assignment with the slot
+    /// dropped-but-not-yet-overwritten and the mutex poisoned, and [`lock_opt`]'s poison recovery
+    /// hands that slot straight back to the next caller. Dropping after the guard is released costs
+    /// nothing and makes both moot: the `let` binding outlives the temporary guard, so the old
+    /// registry's destructor runs on an unlocked `Steering`.
     pub fn request_tool_set(&self, tools: ToolRegistry) {
-        *lock_opt(&self.tool_switch) = Some(tools);
+        let _replaced_tools = lock_opt(&self.tool_switch).replace(tools);
     }
 
     /// Consume and return the pending tool-set switch, if any. Each request is observed at most once.
@@ -968,6 +1039,93 @@ mod tests {
                 thinking: None,
                 thinking_level: Some(ThinkingLevel::Off),
             })
+        );
+    }
+
+    #[test]
+    fn a_full_lane_rejects_the_newest_message_and_keeps_the_queued_prefix_intact() {
+        // The lanes are fed straight from remote RPC and drained one message per turn boundary, so a
+        // client that pushes faster than the agent drains must hit a wall rather than grow the queue
+        // (and its base64 image payloads) without bound. The wall refuses the *newest* message: what
+        // is already queued stays queued, in order, so the client's instruction stream is truncated at
+        // the tail rather than silently reordered.
+        let s = Steering::new();
+        for i in 0..MAX_QUEUED_PER_LANE {
+            assert!(
+                s.push_steer(format!("m{i}")),
+                "message {i} is under the cap"
+            );
+        }
+        assert_eq!(s.pending_count(), MAX_QUEUED_PER_LANE);
+
+        assert!(
+            !s.push_steer("one too many"),
+            "the cap must refuse the push"
+        );
+        assert_eq!(
+            s.pending_count(),
+            MAX_QUEUED_PER_LANE,
+            "a refused push must not grow the lane"
+        );
+        let texts = s.steer_texts();
+        assert_eq!(
+            texts.first().map(String::as_str),
+            Some("m0"),
+            "the oldest message is untouched"
+        );
+        assert!(
+            !texts.iter().any(|t| t == "one too many"),
+            "the refused message must not have displaced anything"
+        );
+
+        // Draining frees exactly one slot: the cap is a live watermark, not a one-shot latch.
+        assert_eq!(s.drain_steer(), vec!["m0".to_string()]);
+        assert!(
+            s.push_steer("now there is room"),
+            "a drain makes room again"
+        );
+        assert!(!s.push_steer("but only one slot's worth"));
+    }
+
+    #[test]
+    fn each_lane_is_capped_independently() {
+        // One saturated lane must not starve the others — they have separate drain points, and a
+        // stalled steer lane says nothing about whether a follow-up or next-turn message can land.
+        let s = Steering::new();
+        for i in 0..MAX_QUEUED_PER_LANE {
+            assert!(s.push_steer(format!("s{i}")));
+        }
+        assert!(!s.push_steer("rejected"));
+        assert!(s.push("the follow-up lane has its own budget"));
+        assert!(s.push_next_turn("as does the next-turn lane"));
+        assert_eq!(s.pending_count(), MAX_QUEUED_PER_LANE + 2);
+    }
+
+    #[test]
+    fn the_follow_up_and_next_turn_lanes_are_capped_too() {
+        // The next-turn lane is the one most exposed: it is pushed while the agent is idle, and
+        // nothing drains it until some later prompt starts a fresh run.
+        let s = Steering::new();
+        for _ in 0..MAX_QUEUED_PER_LANE {
+            assert!(s.push("f"));
+            assert!(s.push_next_turn("n"));
+        }
+        assert!(!s.push("over"), "the follow-up lane is capped");
+        assert!(!s.push_next_turn("over"), "the next-turn lane is capped");
+        assert_eq!(s.pending_count(), MAX_QUEUED_PER_LANE * 2);
+    }
+
+    #[test]
+    fn clear_releases_a_saturated_lane() {
+        let s = Steering::new();
+        for _ in 0..MAX_QUEUED_PER_LANE {
+            s.push_steer("x");
+        }
+        assert!(!s.push_steer("full"));
+        s.clear();
+        assert!(
+            s.push_steer("room again"),
+            "clear must return the lane's whole budget, not leave it wedged"
         );
     }
 

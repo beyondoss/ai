@@ -210,7 +210,20 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   not a fraction of the already-scaled `summary_max_tokens`, which would instead compound the two scale
   factors into an effective ~0.4× `reserve_tokens`), merged under a "Turn Context (split turn)" header —
   closer to pi's two-template
-  approach than summarizing the whole prefix with one minimal-context call. `summary_max_tokens` scales
+  approach than summarizing the whole prefix with one minimal-context call. **Both token budgets scale
+  with the model's real context window** (`CompactionConfig::for_window`, used by `Agent::new`): the
+  struct's `Default` states `reserve_tokens`/`keep_recent_tokens` as 200k-model _absolutes_ (16_384 /
+  20_000), and seeding only `context_window` from the model's capabilities while leaving those two at
+  their 200k values breaks the invariant the pair has to satisfy between them — _what a compaction keeps
+  must stay comfortably under the threshold that triggers one_. The trigger fires at
+  `context_window - reserve_tokens`, so on the catalogue's smallest window (32_768) the un-scaled numbers
+  give a trigger budget of 16_384 while `keep_recent_tokens` retains 20_000: a compaction that keeps
+  _more_ than the line it just crossed, so every turn re-triggers, each spending a real summarization
+  call, and the context never gets back under the threshold. `for_window` caps the reserve at ¼ of the
+  window and `keep_recent_tokens` at half the resulting trigger budget. The caps are one-sided (`min`,
+  not a proportion) so every window at or above ~64k keeps byte-for-byte the tuning it had before — only
+  the genuinely small windows, the ones that were broken, see different numbers.
+  `summary_max_tokens` scales
   from the model's own `max_output` rather
   than a flat constant (`agent::scaled_summary_max_tokens`) — seeded by `Agent::new` and _rescaled_ by
   `with_compaction` whenever the incoming config still carries the struct's own flat default, so a
@@ -415,9 +428,16 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   while holding the same map lock every concurrent `lock()` call must also acquire to clone the `Arc`
   (mirrors pi's `file-mutation-queue.ts`'s identity-checked `finally`-block delete). Before this fix the
   map instead accumulated one entry per distinct path _ever_ locked for the registry's whole lifetime,
-  unbounded for a long-running `serve` process. Documented limitation: this
-  only serializes within one process — cross-process locking would need a filesystem advisory lock,
-  out of scope until a real multi-process use case needs it.
+  unbounded for a long-running `serve` process. The same eviction check also runs on the _acquire_ path
+  (a `PendingLock` drop guard, defused into the `WriteLockGuard` on success): a `lock()` future dropped
+  while still parked — a cancelled run — never constructs a guard, so without it the last reference to a
+  contended key could die with no one left to evict the entry, reintroducing exactly the leak above.
+  Two documented limitations: this only serializes within one process (cross-process locking would need
+  a filesystem advisory lock, out of scope until a real multi-process use case needs it); and
+  `futures::lock::Mutex` is _barging_, not FIFO — the registry guarantees mutual exclusion but no
+  fairness, so sustained contention on one path can starve a waiter. The only ordering that actually
+  matters (a turn's own same-target calls) is already guaranteed upstream, where they run serially in
+  call order as one group.
 - **Explicit reasoning/thinking disable** — `ModelCaps::reasoning_disableable` (per exact model id, not
   per `ThinkingShape`) drives an explicit "off" signal (Anthropic `{"type":"disabled"}`, OpenAI
   `{"effort":"none"}`) on a turn that isn't requesting thinking, for a model capable of one — instead of

@@ -3328,17 +3328,22 @@ pub(crate) async fn serve_session(
                                                         // `steer` redirects mid-run (injected at the next
                                                         // tool turn); `follow_up` waits for the stop
                                                         // boundary. Two separate lanes.
-                                                        if cmd == "steer" {
-                                                            steering.push_steer(m);
+                                                        let queued = if cmd == "steer" {
+                                                            steering.push_steer(m)
                                                         } else {
-                                                            steering.push(m);
-                                                        }
+                                                            steering.push(m)
+                                                        };
                                                         // Fix 5 (pi-parity gap): the pushing client
                                                         // learns what's actually queued from its own
                                                         // ack, same round trip — see `queue_content`'s
                                                         // own doc comment for why this doesn't also
-                                                        // need a separate unsolicited event.
-                                                        let _ = out_tx.send(response(cid, cmd, true, Some(queue_content(&steering)), None));
+                                                        // need a separate unsolicited event. A lane at
+                                                        // its cap refuses the newest message, so the ack
+                                                        // has to say so: acking `true` for a message that
+                                                        // was dropped is the one outcome a client can't
+                                                        // recover from, since it has no other signal that
+                                                        // its instruction never reached the model.
+                                                        let _ = out_tx.send(response(cid, cmd, queued, Some(queue_content(&steering)), (!queued).then_some(STEERING_QUEUE_FULL)));
                                                     }
                                                     None => {
                                                         let _ = out_tx.send(response(cid, cmd, false, None, Some("missing `message`")));
@@ -3362,13 +3367,16 @@ pub(crate) async fn serve_session(
                                                             m,
                                                             parse_images(c.get("images")),
                                                         );
-                                                        steering.push_steer(m);
+                                                        let queued = steering.push_steer(m);
                                                         // Fix 5 (pi-parity gap): same queue-content
                                                         // visibility the dedicated `steer`/`follow_up`
-                                                        // commands' own acks now carry.
+                                                        // commands' own acks now carry — including a
+                                                        // full lane's refusal (see the `steer` arm).
                                                         let mut data = queue_content(&steering);
-                                                        data["queued_as"] = json!("steer");
-                                                        let _ = out_tx.send(response(cid, "prompt", true, Some(data), None));
+                                                        if queued {
+                                                            data["queued_as"] = json!("steer");
+                                                        }
+                                                        let _ = out_tx.send(response(cid, "prompt", queued, Some(data), (!queued).then_some(STEERING_QUEUE_FULL)));
                                                     }
                                                     (Some("follow_up"), Some(m)) => {
                                                         let m = expand_message(m, &skills, &prompt_templates);
@@ -3376,10 +3384,12 @@ pub(crate) async fn serve_session(
                                                             m,
                                                             parse_images(c.get("images")),
                                                         );
-                                                        steering.push(m);
+                                                        let queued = steering.push(m);
                                                         let mut data = queue_content(&steering);
-                                                        data["queued_as"] = json!("follow_up");
-                                                        let _ = out_tx.send(response(cid, "prompt", true, Some(data), None));
+                                                        if queued {
+                                                            data["queued_as"] = json!("follow_up");
+                                                        }
+                                                        let _ = out_tx.send(response(cid, "prompt", queued, Some(data), (!queued).then_some(STEERING_QUEUE_FULL)));
                                                     }
                                                     _ => {
                                                         let _ = out_tx.send(response(cid, "prompt", false, None, Some("busy: a prompt is running; only `abort`/`steer`/`follow_up`, or a `prompt` with `streaming_behavior: \"steer\"|\"follow_up\"`, are accepted")));
@@ -3799,18 +3809,19 @@ pub(crate) async fn serve_session(
                         let m = expand_message(m, &skills, &prompt_templates);
                         let m =
                             agent_core::SteeringMessage::new(m, parse_images(cmd.get("images")));
-                        if cmd_type == "steer" {
-                            steering.push_steer(m);
+                        let queued = if cmd_type == "steer" {
+                            steering.push_steer(m)
                         } else {
-                            steering.push(m);
-                        }
-                        // Fix 5 (pi-parity gap): see `queue_content`'s own doc comment.
+                            steering.push(m)
+                        };
+                        // Fix 5 (pi-parity gap): see `queue_content`'s own doc comment. A lane at its
+                        // cap refuses the message; the ack reports that rather than claiming it queued.
                         emit!(response(
                             id,
                             cmd_type,
-                            true,
+                            queued,
                             Some(queue_content(&steering)),
-                            None
+                            (!queued).then_some(STEERING_QUEUE_FULL)
                         ));
                     }
                     None => emit!(response(
@@ -6379,6 +6390,16 @@ impl AgentHooks for ServeHooks {
 /// consulted only by [`ServeHooks::before_provider_request`], the one place this crate's own "what's
 /// actually sent to the model" transform lives.
 const HOST_BASH_EXCLUDED_LABEL: &str = "[Host bash command, excluded from model context]";
+
+/// Returned on a `steer`/`follow_up` (or a `prompt` routed into one of those lanes) whose queue is at
+/// its cap. The lanes are bounded because they're fed straight from remote RPC and drain at most one
+/// message per turn boundary — see `agent_core::steering`'s own cap. The client is told so explicitly:
+/// a lane that refuses the newest message while its ack still claims `success: true` would leave a
+/// client with no signal at all that its instruction never reached the model, which is the one outcome
+/// it cannot recover from on its own. The accompanying `queue_content` payload shows what *is* queued,
+/// so a client can see the depth it's up against and retry once the agent drains.
+const STEERING_QUEUE_FULL: &str = "steering queue full; retry once the agent drains a message";
+
 /// The ordinary (not excluded) counterpart to [`HOST_BASH_EXCLUDED_LABEL`] — unchanged from before Fix 9.
 const HOST_BASH_LABEL: &str = "[Host bash command, run outside the model's own turn]";
 /// Prefix for the structured `exit_code`/`cancelled`/`truncated`/`full_output_path` status line the

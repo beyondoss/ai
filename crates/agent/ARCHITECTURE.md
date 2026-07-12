@@ -634,7 +634,17 @@ The harness layers several capabilities over the bare tools + loop:
   variant — expands a `/skill:name`/`/name` invocation exactly like a fresh `prompt` does (`serve.rs`'s
   shared `expand_message` helper) and accepts the same optional `images` array a fresh `prompt` does
   (parsed via `parse_images` into an `agent_core::SteeringMessage`), so neither expansion nor image
-  attachments are a `prompt`-only behavior a client has to special-case. `compact`(optional `custom_instructions` steers what the summary
+  attachments are a `prompt`-only behavior a client has to special-case. **Each steering lane is
+  bounded** (`agent_core::steering`'s per-lane cap): the lanes are fed straight from remote RPC, carry
+  base64 image payloads, and drain at most one message per turn boundary — and the steer lane has no
+  drain point at all while idle — so an unbounded lane lets one client pin arbitrary heap in the daemon
+  for the session's life. A full lane **refuses the newest** message (rather than dropping the oldest,
+  which would silently reorder the client's own instruction stream and, under a sustained flood, churn
+  the head so nothing ever reaches the model), and the refusal is reported honestly: the ack comes back
+  `success: false` with a `steering queue full` error, alongside the usual `queue_content` payload so
+  the client can see the depth it's up against and retry once the agent drains. Acking `true` for a
+  message that was dropped is the one outcome a client cannot recover from, since it has no other signal
+  that its instruction never reached the model. `compact`(optional `custom_instructions` steers what the summary
   emphasizes, passed straight through to `Agent::compact` — matching pi's own `compact(customInstructions)`;
   response is `{compacted, reason, summary, tokens_before, tokens_after}` — all four of the latter `null`
   on a no-op, or a real compaction's own generated summary text and its `AgentEvent::Compacted`-carried
