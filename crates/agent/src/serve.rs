@@ -2858,6 +2858,10 @@ pub(crate) async fn serve_session(
     // flow resolves, success or failure, so a later `login` is accepted again.
     let pending_login: Arc<std::sync::Mutex<Option<PendingLogin>>> =
         Arc::new(std::sync::Mutex::new(None));
+    // Monotonic tag stamped on each login that claims the slot, so a late-winding-down task's guard can
+    // tell its own slot from a successor's (see `PendingLoginGuard`). Only ever touched from this
+    // single-threaded command loop, so a plain counter suffices.
+    let mut login_generation: u64 = 0;
     loop {
         let line = tokio::select! {
             biased;
@@ -5776,7 +5780,10 @@ pub(crate) async fn serve_session(
                         // browser flow. Only a second concurrent `login` is rejected (above).
                         let login_cancel = agent_core::CancellationToken::new();
                         let pending_code: PendingCodeSlot = Arc::new(std::sync::Mutex::new(None));
+                        login_generation += 1;
+                        let generation = login_generation;
                         *lock_ignoring_poison(&pending_login) = Some(PendingLogin {
+                            generation,
                             cancel: login_cancel.clone(),
                             pending_code: pending_code.clone(),
                         });
@@ -5784,10 +5791,12 @@ pub(crate) async fn serve_session(
                         let pending_login_bg = pending_login.clone();
                         let login_id = id.clone();
                         tokio::spawn(async move {
-                            // Always clears `pending_login` when this task ends, even on panic — see
-                            // `PendingLoginGuard`'s own doc comment.
-                            let _reset_pending_login_on_exit =
-                                PendingLoginGuard(pending_login_bg.clone());
+                            // Always clears `pending_login` when this task ends, even on panic — but only
+                            // if the slot still holds *this* login (see `PendingLoginGuard`'s doc comment).
+                            let _reset_pending_login_on_exit = PendingLoginGuard {
+                                slot: pending_login_bg.clone(),
+                                generation,
+                            };
                             let callbacks = ServeLoginCallbacks {
                                 out_tx: out_tx_bg.clone(),
                                 id: login_id.clone(),
@@ -5866,7 +5875,14 @@ pub(crate) async fn serve_session(
             }
             "abort_login" => {
                 // Idempotent no-op if none is in flight — matches `abort`'s own idle-mode convention.
-                if let Some(p) = lock_ignoring_poison(&pending_login).as_ref() {
+                // `take`, not `as_ref`: clear the slot *synchronously* here rather than leaving it for the
+                // detached task's `Drop` guard, so the very next `login` is accepted the instant this abort
+                // is acknowledged. Waiting for the guard raced the next command — a `login` arriving before
+                // the cancelled task wound down was spuriously rejected as "already in flight", hanging a
+                // client that (reasonably) expected `abort_login`'s success to mean the slot was free. The
+                // cancelled task still sends its own terminal `login` response; clearing the slot only frees
+                // the next login, and the guard's generation check keeps that task from wiping the successor.
+                if let Some(p) = lock_ignoring_poison(&pending_login).take() {
                     p.cancel.cancel();
                 }
                 emit!(response(id, "abort_login", true, None, None));
@@ -7196,7 +7212,14 @@ pub(crate) fn lock_ignoring_poison<T>(m: &std::sync::Mutex<T>) -> std::sync::Mut
 }
 
 /// Tracks the one `login` allowed in flight at a time — see `pending_login`'s own declaration.
+///
+/// `generation` is a monotonic tag stamped when this login claimed the slot. It's what lets the
+/// [`PendingLoginGuard`] tell "the slot still holds *my* login" from "a newer login has since taken it"
+/// on drop, so a task winding down late can't wipe a successor's slot — the race that made a subsequent
+/// `abort_login` silently no-op (the login it should have cancelled then never resolves). See
+/// [`PendingLoginGuard`].
 struct PendingLogin {
+    generation: u64,
     cancel: agent_core::CancellationToken,
     pending_code: PendingCodeSlot,
 }
@@ -7210,11 +7233,28 @@ struct PendingLogin {
 /// `abort_login` can't help — it just cancels a token nothing is left alive to observe). A `Drop`
 /// impl runs during unwinding, unlike a plain line of cleanup code placed after the panicking call,
 /// so this holds regardless of where in the task body things go wrong.
-struct PendingLoginGuard(Arc<std::sync::Mutex<Option<PendingLogin>>>);
+///
+/// **Clears only its own generation.** `abort_login` clears the slot *synchronously* (so the next
+/// `login` is accepted the instant the abort is acknowledged, not whenever this detached task happens to
+/// wind down), which means by the time this guard runs a *newer* login may already own the slot. Wiping
+/// it unconditionally would drop that newer login's marker — the next `abort_login` would then find an
+/// empty slot and no-op, leaving the newer login uncancellable and its client hung waiting for a terminal
+/// response that never comes. Comparing generations makes the guard a no-op unless the slot is still this
+/// login's.
+struct PendingLoginGuard {
+    slot: Arc<std::sync::Mutex<Option<PendingLogin>>>,
+    generation: u64,
+}
 
 impl Drop for PendingLoginGuard {
     fn drop(&mut self) {
-        *lock_ignoring_poison(&self.0) = None;
+        let mut slot = lock_ignoring_poison(&self.slot);
+        if slot
+            .as_ref()
+            .is_some_and(|p| p.generation == self.generation)
+        {
+            *slot = None;
+        }
     }
 }
 
@@ -7641,7 +7681,9 @@ impl OutFanout {
                     self.sinks.clear();
                 }
             }
-            _ => self.sinks.retain(|(_, tx)| tx.try_send(frame.clone()).is_ok()),
+            _ => self
+                .sinks
+                .retain(|(_, tx)| tx.try_send(frame.clone()).is_ok()),
         }
     }
 }
@@ -7901,12 +7943,16 @@ mod tests {
         // provider seam this module doesn't otherwise need.
         let pending_login: Arc<std::sync::Mutex<Option<PendingLogin>>> =
             Arc::new(std::sync::Mutex::new(Some(PendingLogin {
+                generation: 1,
                 cancel: CancellationToken::new(),
                 pending_code: Arc::new(std::sync::Mutex::new(None)),
             })));
         let slot = pending_login.clone();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = PendingLoginGuard(slot.clone());
+            let _guard = PendingLoginGuard {
+                slot: slot.clone(),
+                generation: 1,
+            };
             panic!("simulated failure inside the login task");
         }));
         assert!(
@@ -7917,6 +7963,41 @@ mod tests {
             lock_ignoring_poison(&pending_login).is_none(),
             "pending_login must be cleared even though the guarded scope panicked"
         );
+    }
+
+    #[test]
+    fn pending_login_guard_only_clears_its_own_generation_not_a_successor() {
+        // The race behind the flaky `serve_auth` abort-login hang: `abort_login` clears the slot
+        // synchronously, so a *newer* login can claim it before the cancelled task's guard runs. That
+        // guard must then be a no-op — wiping the successor's marker would make the next `abort_login`
+        // find an empty slot and silently no-op, leaving the newer login uncancellable (its client hangs).
+        let slot: Arc<std::sync::Mutex<Option<PendingLogin>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        // A newer login (generation 2) currently owns the slot.
+        let newer_cancel = CancellationToken::new();
+        *lock_ignoring_poison(&slot) = Some(PendingLogin {
+            generation: 2,
+            cancel: newer_cancel.clone(),
+            pending_code: Arc::new(std::sync::Mutex::new(None)),
+        });
+        // An older login's guard (generation 1) winds down now.
+        drop(PendingLoginGuard {
+            slot: slot.clone(),
+            generation: 1,
+        });
+        // The successor's marker must survive, and still be the cancel `abort_login` would reach.
+        let held = lock_ignoring_poison(&slot);
+        assert!(
+            held.as_ref().is_some_and(|p| p.generation == 2),
+            "the older guard must not clear the newer login's slot"
+        );
+        drop(held);
+        // And a guard whose generation *does* match clears it (the normal, own-slot case).
+        drop(PendingLoginGuard {
+            slot: slot.clone(),
+            generation: 2,
+        });
+        assert!(lock_ignoring_poison(&slot).is_none());
     }
 
     #[test]
