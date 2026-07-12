@@ -405,10 +405,18 @@ pub enum ApplyOutcome {
 /// patch and reports `<added>\t<deleted>\t<path>` **without modifying anything** — a hand-rolled patch
 /// parser here would be a second, subtly-different implementation of a format git already understands.
 async fn patch_paths(repo_root: &Path, patch: &[u8]) -> Result<Vec<String>, String> {
-    let out = git_stdout_with_stdin(repo_root, &["apply", "--numstat", "-"], patch).await?;
+    // `-z` is load-bearing, not cosmetic. Without it, git **C-quotes** any path containing non-ASCII
+    // or special bytes: `sécrets.env` is reported as `"s\303\251crets.env"` (wrapping quotes + octal
+    // escapes). That quoted form then slips past the deny-glob re-check in `apply_patch` — a glob like
+    // `**/*.env` can't match a string ending in `.env"` — silently merging a denied file back into the
+    // parent repo. `-z` emits each record as `<added>\t<deleted>\t<raw-path>\0`, NUL-terminated and
+    // unquoted (renames already normalized to their destination path, same as without `-z`), so the
+    // deny check sees the real filename.
+    let out = git_stdout_with_stdin(repo_root, &["apply", "--numstat", "-z", "-"], patch).await?;
     Ok(String::from_utf8_lossy(&out)
-        .lines()
-        .filter_map(|line| line.rsplit('\t').next())
+        .split('\0')
+        .filter(|record| !record.is_empty())
+        .filter_map(|record| record.rsplit('\t').next())
         .filter(|p| !p.is_empty())
         .map(str::to_string)
         .collect())

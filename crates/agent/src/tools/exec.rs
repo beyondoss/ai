@@ -246,6 +246,15 @@ impl Drop for GroupKillGuard {
                 let _ = tx.send(());
             });
             if let Ok(mut pending) = PENDING_GROUP_KILLS.lock() {
+                // Opportunistically reclaim entries whose kill thread has already finished (`Ok`) or
+                // whose sender was dropped (`Disconnected`), so this registry — otherwise drained in
+                // full only just before `process::exit` — can't grow for the whole lifetime of a
+                // long-lived `serve` daemon that cancels one bash after another. A still-running kill
+                // thread's receiver (`Err(Empty)`) is kept, so `wait_for_pending_group_kills` can still
+                // block on it.
+                pending.retain(|rx| {
+                    matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty))
+                });
                 pending.push(rx);
             }
         }

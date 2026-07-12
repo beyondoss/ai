@@ -1875,7 +1875,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
     // stdio has exactly one permanent "connection": stdout. Register it in the fanout as the sole sink.
     let out_conn: SharedOutConn =
         Arc::new(std::sync::Mutex::new(crate::serve::OutFanout::default()));
-    lock_ignoring_poison(&out_conn).add(conn_tx);
+    lock_ignoring_poison(&out_conn).add(crate::serve::OutSink::Unbounded(conn_tx));
     let stdout_task = tokio::spawn(async move {
         let mut out = tokio::io::stdout();
         while let Some(frame) = conn_rx.recv().await {
@@ -3917,7 +3917,21 @@ pub(crate) async fn serve_session(
                 // falling back to "everything" would look like a working incremental fetch that's
                 // actually just re-sending the full history, masking the bug instead of surfacing it.
                 if let Some(since) = cmd.get("since").and_then(Value::as_str) {
-                    match msg_ids.iter().position(|mid| mid == since) {
+                    // `idx` indexes `msg_ids` (the active *tree path*, which includes non-message
+                    // `Custom` entries), but the slice below is applied to `messages` (LLM messages
+                    // only). The two align 1:1 exactly when tagging above ran — i.e.
+                    // `arr.len() == msg_ids.len()`. When they don't (a `Custom` entry sits in the
+                    // path, or in-memory mode carries no ids), an `idx` past `messages`' end would make
+                    // `split_off(idx + 1)` panic. That's the same "nothing is tagged → error" case the
+                    // doc above already calls out, so fold it into the unmatched branch rather than
+                    // slicing blindly.
+                    let tagged =
+                        matches!(&messages, Value::Array(arr) if arr.len() == msg_ids.len());
+                    match msg_ids
+                        .iter()
+                        .position(|mid| mid == since)
+                        .filter(|_| tagged)
+                    {
                         Some(idx) => {
                             if let Value::Array(arr) = &mut messages {
                                 *arr = arr.split_off(idx + 1);
@@ -7564,15 +7578,39 @@ impl From<Value> for OutFrame {
 /// [`crate::serve_ws`]). The supervisor [`add`](OutFanout::add)s a sink on attach and
 /// [`remove`](OutFanout::remove)s it on disconnect. An `std::sync::Mutex` (not tokio's) is deliberate:
 /// it is only ever held across non-`await` `send`s into unbounded channels.
+/// One attached connection's output channel. A network transport (WebSocket/UDS) registers a
+/// **bounded** sink: a client whose socket has stalled under TCP backpressure (a locked phone, a dead
+/// tunnel) would otherwise let the still-running session buffer streamed frames without limit, growing
+/// memory until the OS TCP layer finally times the socket out. When the bounded channel fills,
+/// [`OutFanout::broadcast`] prunes the sink — a disconnect-on-full that drops the wedged connection and
+/// leaves it to reconnect and replay committed state via `get_messages {since}`. The in-process
+/// **stdio** transport is a single trusted local sink for the whole process life and stays
+/// **unbounded**: pruning it on a transient stdout stall would sever the only client.
+pub(crate) enum OutSink {
+    Bounded(mpsc::Sender<OutFrame>),
+    Unbounded(mpsc::UnboundedSender<OutFrame>),
+}
+
+impl OutSink {
+    /// Non-blocking send. `Err` means the sink is dead (receiver gone) or — for a bounded sink — its
+    /// buffer is full (a stalled connection); [`OutFanout::broadcast`] prunes it either way.
+    fn try_send(&self, frame: OutFrame) -> Result<(), ()> {
+        match self {
+            OutSink::Bounded(tx) => tx.try_send(frame).map_err(|_| ()),
+            OutSink::Unbounded(tx) => tx.send(frame).map_err(|_| ()),
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct OutFanout {
     next_id: u64,
-    sinks: Vec<(u64, mpsc::UnboundedSender<OutFrame>)>,
+    sinks: Vec<(u64, OutSink)>,
 }
 
 impl OutFanout {
     /// Register a connection's sink; returns an id to [`remove`](Self::remove) it by on disconnect.
-    pub(crate) fn add(&mut self, tx: mpsc::UnboundedSender<OutFrame>) -> u64 {
+    pub(crate) fn add(&mut self, tx: OutSink) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         self.sinks.push((id, tx));
@@ -7599,11 +7637,11 @@ impl OutFanout {
         match self.sinks.as_slice() {
             [] => {}
             [(_, tx)] => {
-                if tx.send(frame).is_err() {
+                if tx.try_send(frame).is_err() {
                     self.sinks.clear();
                 }
             }
-            _ => self.sinks.retain(|(_, tx)| tx.send(frame.clone()).is_ok()),
+            _ => self.sinks.retain(|(_, tx)| tx.try_send(frame.clone()).is_ok()),
         }
     }
 }

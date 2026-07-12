@@ -52,7 +52,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, 
 use tokio_util::sync::CancellationToken;
 
 use crate::serve::{
-    OutFanout, OutFrame, ServeConfig, SharedOutConn, Signal, UpstreamHttp2, frame_to_line,
+    OutFanout, OutFrame, OutSink, ServeConfig, SharedOutConn, Signal, UpstreamHttp2, frame_to_line,
     lock_ignoring_poison, serve_session,
 };
 use crate::session_store::{is_valid_session_id, new_id, scan_listings, scan_session_dir};
@@ -64,6 +64,14 @@ const WS_PATH: &str = "/_beyond/agent";
 /// How often the server sends an unsolicited `Ping` so an idle mobile connection isn't reaped by
 /// NAT/proxies. Also the granularity at which a wholly-dead socket is noticed (the ping send fails).
 const PING_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Depth of a single connection's outbound frame buffer. Bounds memory per attached socket: if a
+/// client's write half stalls under TCP backpressure without erroring, the session keeps broadcasting
+/// streamed frames into this channel — cap it so a wedged connection can't grow memory without limit
+/// (`OutFanout::broadcast` prunes the sink when it fills, dropping the dead connection). Sized to
+/// absorb a normal burst of streamed event frames while keeping the worst-case per-connection buffer
+/// to a few MB.
+const OUT_CHANNEL_BOUND: usize = 1024;
 
 /// A live session, reachable by id across connections. The retained `input_tx` is what makes a
 /// dropped socket *not* an EOF — the session's `input_rx.recv()` pends until the next command instead
@@ -204,12 +212,12 @@ impl Supervisor {
 
         // Register this connection's send channel as one of the session's output sinks — the session
         // broadcasts every frame to all registered sinks. Keep the `sink_id` to remove it on disconnect.
-        let (conn_tx, mut conn_rx) = mpsc::unbounded_channel::<OutFrame>();
+        let (conn_tx, mut conn_rx) = mpsc::channel::<OutFrame>(OUT_CHANNEL_BOUND);
         // A direct handle to *this* connection's send channel, for supervisor-level replies (the
         // `list_daemon_sessions` command below) that must go back to *this* socket only, not fan out to
         // the other attached connections. Feeds the same `conn_rx`/send task.
         let reply_tx = conn_tx.clone();
-        let sink_id = lock_ignoring_poison(&out_conn).add(conn_tx);
+        let sink_id = lock_ignoring_poison(&out_conn).add(OutSink::Bounded(conn_tx));
 
         let (mut sink, mut stream) = ws.split();
 
@@ -285,7 +293,7 @@ impl Supervisor {
                                             .and_then(serde_json::Value::as_str)
                                             .map(str::to_owned);
                                         let frame = self.list_daemon_sessions(client_id).await;
-                                        let _ = reply_tx.send(frame);
+                                        let _ = reply_tx.try_send(frame);
                                         continue;
                                     }
                                 }

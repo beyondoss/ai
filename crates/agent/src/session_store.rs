@@ -3799,8 +3799,22 @@ fn read_capped_line(reader: &mut impl BufRead, buf: &mut Vec<u8>) -> std::io::Re
 /// pulled off disk — so they should never be readable by anyone but the owner, independent of the
 /// process umask.
 fn create_private(path: &Path) -> std::io::Result<File> {
+    // Remove any leftover at this (deterministic `.tmp`) path first, then create it fresh with
+    // `create_new`. `.mode()` only takes effect when the file is actually *created*, so a plain
+    // `create(true).truncate(true)` on a pre-existing path would open-and-truncate a **pre-planted**
+    // file — keeping its existing, possibly world-readable, mode — or follow a pre-planted symlink to
+    // some other target, writing the transcript (which can hold secrets `read` pulled off disk)
+    // through it. A stale `.tmp` from a prior crash is the normal reason something is already here;
+    // unlink it (which removes a symlink itself, not its target) then create exclusively. If an
+    // attacker races a fresh plant in between, `create_new` fails outright — fail closed, never
+    // truncating or following it.
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
     let mut opts = OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
