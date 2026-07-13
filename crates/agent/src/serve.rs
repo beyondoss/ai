@@ -1850,6 +1850,23 @@ fn resolve_startup_model_and_level(
     )
 }
 
+/// Depth of a session's inbound command queue, shared by both transports.
+///
+/// The counterpart to [`crate::serve_ws::OUT_CHANNEL_BOUND`] on the way *in*. The consumer is a single
+/// session loop that runs one command to completion — and some commands are genuinely slow (a
+/// `list_sessions` walks the session directory) — so a client that pipelines faster than the loop drains
+/// will always be able to get ahead of it. Left unbounded, that queue is a client-driven allocation with
+/// no ceiling.
+///
+/// Bounded, but explicitly **not** drop-on-full the way the outbound fanout and the `Pong` queue are:
+/// those carry frames whose loss is a cosmetic degradation, whereas a *dropped command* is a
+/// correctness bug — the client is left waiting on a response that will never come, with no signal that
+/// anything went wrong. So a full queue makes the producer wait instead. On the WebSocket path that
+/// means the read loop stops pulling from the socket and TCP's own window carries the backpressure to
+/// the client; on stdio it simply pauses the stdin reader. Deep enough that ordinary pipelining never
+/// touches it, shallow enough that a flood can't grow memory without limit.
+pub(crate) const IN_CHANNEL_BOUND: usize = 256;
+
 /// Run the control loop until stdin closes.
 /// Headless `serve` over **stdio** — the default transport. A thin wrapper over the transport-
 /// agnostic [`serve_session`]: pump stdin lines into its input channel (EOF drops the sender, which
@@ -1858,13 +1875,17 @@ fn resolve_startup_model_and_level(
 /// `serve` behavior and test rides this path unchanged; [`crate::serve_ws`] is the parallel WebSocket
 /// entry point that reuses the same [`serve_session`] core.
 pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::error::Error>> {
-    let (input_tx, input_rx) = mpsc::unbounded_channel::<String>();
+    let (input_tx, input_rx) = mpsc::channel::<String>(IN_CHANNEL_BOUND);
     tokio::spawn(async move {
         let mut lines = BufReader::new(tokio::io::stdin()).lines();
         // A malformed-UTF-8 read error is treated as a clean EOF, matching the pre-refactor idle/busy
         // read loops (killing a long-running process over one bad stdin byte is far more disruptive).
         while let Ok(Some(line)) = lines.next_line().await {
-            if input_tx.send(line).is_err() {
+            // Awaits rather than dropping when the queue is full: a command the session never sees is a
+            // correctness bug (the client waits on a response that never comes), so the right answer to
+            // a producer outrunning the loop is to stop reading it, not to shed it. Here that simply
+            // pauses the stdin reader.
+            if input_tx.send(line).await.is_err() {
                 break; // the session ended; nothing left to feed
             }
         }
@@ -1909,7 +1930,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
 /// keeps going. The command protocol below is byte-identical across both transports.
 pub(crate) async fn serve_session(
     mut cfg: ServeConfig,
-    mut input_rx: mpsc::UnboundedReceiver<String>,
+    mut input_rx: mpsc::Receiver<String>,
     out_conn: SharedOutConn,
     // Set `true` for the duration of a `prompt` run, `false` otherwise. The daemon supervisor's idle
     // reaper reads this to never reap a session with an in-flight background run (see
@@ -5813,6 +5834,7 @@ pub(crate) async fn serve_session(
                                 id: login_id.clone(),
                                 provider: provider_id,
                                 pending_code,
+                                cancel: login_cancel.clone(),
                             };
                             let result =
                                 crate::oauth::login(provider_id, &callbacks, &login_cancel).await;
@@ -5981,6 +6003,19 @@ pub(crate) async fn serve_session(
         }
     }
 
+    // A `login` still in flight owns a detached task holding its own clone of `out_tx` — and the writer
+    // below ends *only* once every sender is gone. Without this cancel, a client that starts a login and
+    // then simply disconnects (or a SIGTERM arriving mid-flow) parks that task forever, `writer.await`
+    // never returns, and `serve_session` never completes: the OS thread, its runtime, the `Agent`, the
+    // `GatewayClient` and its pool, the session history, and the OAuth callback server's bound — and
+    // *fixed* — port all leak for the daemon's lifetime, which also makes every subsequent login on that
+    // port fail outright. In stdio `serve` the same hang means the process can never exit gracefully.
+    //
+    // `abort_login` is not a substitute: it only fires when a client explicitly sends it, which is
+    // exactly what an abandoned login never does. Teardown is the path that has to be unconditional.
+    if let Some(p) = lock_ignoring_poison(&pending_login).take() {
+        p.cancel.cancel();
+    }
     drop(out_tx);
     let _ = writer.await;
     Ok(shutdown_cause)
@@ -7539,7 +7574,25 @@ struct ServeLoginCallbacks {
     id: Option<String>,
     provider: crate::oauth::OAuthProviderId,
     pending_code: PendingCodeSlot,
+    /// This login's own token, so the wait below can lose a race against it. Not merely decorative:
+    /// two provider flows (`oauth::github_copilot`'s Enterprise-domain prompt, `oauth::openai_codex`'s
+    /// port-already-bound fallback) `await` `prompt_text` with *no other* cancellation observer in the
+    /// select, so if this wait doesn't watch the token itself, nothing does — `abort_login` becomes a
+    /// silent no-op and the task parks forever.
+    cancel: agent_core::CancellationToken,
 }
+
+/// How long an unanswered `manual_code` prompt waits before the login is abandoned.
+///
+/// The wait is on a human: read a browser page, copy a code, paste it back. Generous enough that a
+/// distracted user doesn't lose a legitimate flow, finite because the alternative is a task parked for
+/// the process's lifetime — and a parked login task is not cheap. It holds a clone of the session's
+/// `out_tx`, and the session's writer ends *only* when every sender drops, so a login nobody ever
+/// answers wedges `serve_session` itself: the OS thread, its runtime, the `Agent`, the `GatewayClient`
+/// and its pool, the whole message history, and the OAuth callback server's bound (and fixed) port all
+/// stay live until the daemon dies. Failing closed on silence is what keeps an abandoned browser tab
+/// from costing a session.
+const LOGIN_PROMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 #[async_trait::async_trait]
 impl crate::oauth::LoginCallbacks for ServeLoginCallbacks {
@@ -7598,8 +7651,26 @@ impl crate::oauth::LoginCallbacks for ServeLoginCallbacks {
             None,
             None,
         ));
-        rx.await
-            .map_err(|_| crate::oauth::OAuthError::LoginCancelled)
+        // The same shape `ServeApprovalGate::request` uses, and for the same reason: this is the second
+        // instance of the one human-in-the-loop seam, so it races the token and a timeout and **fails
+        // closed** — no answer, for any reason, abandons the login. A bare `rx.await` here (what this
+        // used to be) has no way out at all: the sender lives inside these callbacks, which the login
+        // future owns, so nothing external can even drop it to wake the wait.
+        //
+        // `biased` so a cancellation already signalled wins over a code that happened to land in the
+        // same poll — an aborted login must not quietly succeed on the strength of a late paste.
+        tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => Err(crate::oauth::OAuthError::LoginCancelled),
+            answer = rx => answer.map_err(|_| crate::oauth::OAuthError::LoginCancelled),
+            _ = tokio::time::sleep(LOGIN_PROMPT_TIMEOUT) => {
+                tracing::debug!(
+                    provider = %self.provider,
+                    "login code prompt went unanswered; abandoning the login"
+                );
+                Err(crate::oauth::OAuthError::LoginCancelled)
+            }
+        }
     }
 
     async fn select(

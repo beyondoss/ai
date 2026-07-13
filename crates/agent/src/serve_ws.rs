@@ -49,6 +49,7 @@ use tokio::time::{Duration, MissedTickBehavior};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_util::sync::CancellationToken;
 
 use crate::serve::{
@@ -71,7 +72,40 @@ const PING_INTERVAL: Duration = Duration::from_secs(30);
 /// (`OutFanout::broadcast` prunes the sink when it fills, dropping the dead connection). Sized to
 /// absorb a normal burst of streamed event frames while keeping the worst-case per-connection buffer
 /// to a few MB.
-const OUT_CHANNEL_BOUND: usize = 1024;
+pub(crate) const OUT_CHANNEL_BOUND: usize = 1024;
+
+/// Depth of a single connection's control-frame queue (the `Pong`s the read loop owes the client for
+/// its `Ping`s). Its drain is the send task, which stalls for as long as the socket's write half is
+/// backed up — so a client that floods `Ping`s while never reading would grow an unbounded queue of
+/// them. Bounded, and **dropped on full**: a lost `Pong` costs nothing (the client's next `Ping`
+/// re-asks, and liveness in the other direction is our own keepalive `Ping`, whose send failure is what
+/// actually detects a dead socket).
+const CTRL_CHANNEL_BOUND: usize = 8;
+
+/// Cap on a single inbound WebSocket message (tungstenite's own defaults are 64 MiB per message / 16 MiB
+/// per frame — far past anything this protocol needs). Every inbound message is one command line that
+/// gets queued for the session, so this is what bounds the cost of any one queued command; a client that
+/// exceeds it gets a protocol error and its connection closed, never a silently truncated command.
+/// Generous enough for a `prompt` carrying a large pasted body.
+const MAX_INBOUND_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+
+/// How long a **detached** session (no attached connection) stays live before the reaper reclaims it,
+/// when the operator gave no `--session-idle-timeout`. The default has to be finite: without a reaper
+/// the session map only grows — a connection that omits `?session_id=` mints a fresh id, and every id
+/// owns an OS thread, an `Agent`, and a gateway pool until the daemon stops. It also has to be *long*,
+/// because a detached session is not a dead one: re-attaching to a still-running run is the entire point
+/// of the design (see the module doc), so the window must comfortably outlast a tunnel, a locked screen,
+/// or a lunch break. An hour is both. Nothing is lost when it fires — a reaped session persisted on its
+/// way out, and reconnecting to its id respawns it and replays from disk.
+const DEFAULT_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
+/// How long a batch of session threads gets to persist and exit before the caller stops waiting on them.
+const JOIN_GRACE: Duration = Duration::from_secs(10);
+
+/// How often [`join_handles_within`] re-checks whether the session threads it's waiting on have exited.
+/// Short enough not to add perceptible latency to a graceful shutdown (the common case: every session
+/// persists in milliseconds), long enough to cost nothing while waiting.
+const JOIN_POLL: Duration = Duration::from_millis(10);
 
 /// A live session, reachable by id across connections. The retained `input_tx` is what makes a
 /// dropped socket *not* an EOF — the session's `input_rx.recv()` pends until the next command instead
@@ -80,7 +114,7 @@ struct SessionHandle {
     /// Feeds command lines into the session's [`serve_session`] loop. Held here (not by any socket) so
     /// the session outlives its connections. Every attached connection feeds this one channel, so any
     /// device can drive the session (its `mpsc` is multi-sender).
-    input_tx: mpsc::UnboundedSender<String>,
+    input_tx: mpsc::Sender<String>,
     /// The session's set of attached connections — its output is **broadcast** to all of them, so a
     /// phone and a TUI (or any N of the user's devices) on one session all see the live stream at once
     /// (see [`crate::serve::OutFanout`]). Each connection registers its sink on attach and removes it on
@@ -160,7 +194,7 @@ impl Supervisor {
             }
 
             let handle = sessions.entry(id.clone()).or_insert_with(|| {
-                let (input_tx, input_rx) = mpsc::unbounded_channel::<String>();
+                let (input_tx, input_rx) = mpsc::channel::<String>(crate::serve::IN_CHANNEL_BOUND);
                 let out_conn: SharedOutConn = Arc::new(Mutex::new(OutFanout::default()));
                 let cfg = self.session_cfg(&id);
                 let session_out = out_conn.clone();
@@ -223,8 +257,9 @@ impl Supervisor {
 
         // The send task owns the socket's write half. Everything outbound — protocol frames, `Pong`
         // replies, and periodic keepalive `Ping`s — funnels through it so the single sink has one
-        // writer. `ctrl_rx` carries the read loop's `Pong` replies.
-        let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<Message>();
+        // writer. `ctrl_rx` carries the read loop's `Pong` replies, bounded like every other queue a
+        // client can push into (see [`CTRL_CHANNEL_BOUND`]).
+        let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<Message>(CTRL_CHANNEL_BOUND);
         // Stops this connection's send task at teardown (when its read loop ends on socket close). The
         // send task also stops on its own if `conn_rx` closes (this connection's sink removed + `reply_tx`
         // dropped).
@@ -298,12 +333,23 @@ impl Supervisor {
                                     }
                                 }
                             }
-                            if input_tx.send(text.as_str().to_owned()).is_err() {
+                            // Never dropped, never coalesced: a client that got no error believes its
+                            // command was accepted, so discarding one leaves it waiting forever on a
+                            // response that will never come — a dropped command is a correctness bug,
+                            // not a shed load. So this *awaits* a full queue rather than shedding: the
+                            // read loop stops pulling from the socket, TCP's own window closes, and the
+                            // backpressure lands where it belongs — on the client that is outrunning the
+                            // session loop. Any one command is separately bounded by
+                            // [`MAX_INBOUND_MESSAGE_BYTES`], so a full queue is bounded in bytes too.
+                            if input_tx.send(text.as_str().to_owned()).await.is_err() {
                                 break; // session gone
                             }
                         }
                         Message::Ping(payload) => {
-                            let _ = ctrl_tx.send(Message::Pong(payload));
+                            // Drop-on-full (see [`CTRL_CHANNEL_BOUND`]): a `Pong` is a courtesy, and a
+                            // `Ping` flood from a client that never drains its read side must not be
+                            // able to queue work faster than the send task can write it out.
+                            let _ = ctrl_tx.try_send(Message::Pong(payload));
                         }
                         Message::Close(_) => break,
                         // Pong (keepalive ack), Binary (protocol is text JSON), and any future frame
@@ -403,23 +449,16 @@ impl Supervisor {
         }))
     }
 
-    /// Idle reaper (only spawned when [`ServeConfig::session_idle_timeout`] is set): reclaim every
-    /// session that has been **detached** (`attached == 0`) for at least `timeout`, whose input channel
-    /// is still open, and that isn't mid-`prompt` (`running`). Removing the handle drops its retained
+    /// Idle reaper: reclaim every session [`is_reapable`] names. Removing the handle drops its retained
     /// `input_tx`, so the session observes EOF and persists+exits exactly as in [`shutdown`]; the join
-    /// then waits for that persist to land. A reconnect to a just-reaped id transparently respawns and
-    /// replays via `get_messages{since}`.
+    /// then waits for that persist to land (and reclaims the thread of one that had already exited). A
+    /// reconnect to a just-reaped id transparently respawns and replays via `get_messages{since}`.
     async fn reap_idle(&self, timeout: Duration) {
         let joins: Vec<std::thread::JoinHandle<()>> = {
             let mut sessions = lock_ignoring_poison(&self.sessions);
             let reap: Vec<String> = sessions
                 .iter()
-                .filter(|(_, h)| {
-                    h.attached == 0
-                        && h.last_detached_at.is_some_and(|d| d.elapsed() >= timeout)
-                        && !h.input_tx.is_closed()
-                        && !h.running.load(Ordering::Relaxed)
-                })
+                .filter(|(_, h)| is_reapable(h, timeout))
                 .map(|(id, _)| id.clone())
                 .collect();
             reap.into_iter()
@@ -430,25 +469,86 @@ impl Supervisor {
     }
 }
 
-/// Wait for a batch of session threads to finish, bounded so a wedged session can't hang the caller
-/// forever. `JoinHandle::join` blocks, so it runs on the blocking pool with a total 10s cap; a
-/// straggler past the cap is left behind (graceful shutdown then falls back to `process::exit`, the
-/// reaper simply retries the id on its next tick). Shared by [`Supervisor::shutdown`] and
+/// Whether the reaper should reclaim this session.
+///
+/// A **closed `input_tx`** is the strongest reason of all: the session's loop is already gone (it
+/// returned early — no credential, an unwritable session dir — or hit an internal error), so nothing
+/// will ever read its input again. The entry is pure garbage: a `HashMap` slot, a `SharedOutConn`, and
+/// an unreclaimed `JoinHandle` for a thread that has already exited. Reap it whatever its attach state
+/// or clock says — a live connection still pinned to it is no reason to keep a corpse (that connection's
+/// next command fails its `input_tx.send` and tears the socket down; a reconnect respawns the id).
+///
+/// Otherwise the session is alive, and the ordinary conditions apply: **detached** (`attached == 0`) for
+/// at least `timeout`, and not mid-`prompt` — a detached background run is exactly what this design
+/// exists to keep alive, so `running` is never reaped out from under an in-flight turn.
+fn is_reapable(h: &SessionHandle, timeout: Duration) -> bool {
+    if h.input_tx.is_closed() {
+        return true;
+    }
+    h.attached == 0
+        && h.last_detached_at.is_some_and(|d| d.elapsed() >= timeout)
+        && !h.running.load(Ordering::Relaxed)
+}
+
+/// Wait for a batch of session threads to finish persisting, bounded by [`JOIN_GRACE`] so a wedged
+/// session can't hang the caller forever. Shared by [`Supervisor::shutdown`] and
 /// [`Supervisor::reap_idle`] so both persist-then-join on the same discipline.
 async fn join_handles(joins: Vec<std::thread::JoinHandle<()>>) {
+    join_handles_within(joins, JOIN_GRACE).await;
+}
+
+/// The waiting itself, with the grace period as a parameter so it can be tested.
+///
+/// The wait **polls `is_finished`** rather than parking a blocking join behind a timeout, because a
+/// timeout only abandons the *await* — the blocking join underneath it keeps running. Wedge one session
+/// and a `spawn_blocking(|| handle.join())` would sit on one of tokio's blocking threads (a finite pool)
+/// for the rest of the process's life; wedge enough of them and every `spawn_blocking` in the daemon
+/// stalls behind an empty pool, session persistence included. `join()` is therefore only ever called on
+/// a thread that has *already exited*, where it cannot block: it just reaps the thread.
+///
+/// A straggler past `grace` is dropped, which detaches it — the OS reclaims its stack when it finally
+/// does exit, and nothing (no caller, no pool thread) is left waiting on it. That is all the caller can
+/// do: a graceful shutdown falls through to `process::exit` regardless, and the reaper has already
+/// removed the id from the map, so it will never see that session again.
+async fn join_handles_within(joins: Vec<std::thread::JoinHandle<()>>, grace: Duration) {
     if joins.is_empty() {
         return;
     }
-    let waiter = tokio::task::spawn_blocking(move || {
-        for j in joins {
-            let _ = j.join();
+    let deadline = Instant::now() + grace;
+    let mut pending = joins;
+    loop {
+        let mut still = Vec::with_capacity(pending.len());
+        for j in pending {
+            if j.is_finished() {
+                let _ = j.join();
+            } else {
+                still.push(j);
+            }
         }
-    });
-    if tokio::time::timeout(Duration::from_secs(10), waiter)
-        .await
-        .is_err()
-    {
-        eprintln!("serve: some sessions did not persist within the join grace period");
+        pending = still;
+        if pending.is_empty() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(JOIN_POLL).await;
+    }
+    eprintln!(
+        "serve: {} session(s) did not persist within the join grace period",
+        pending.len()
+    );
+}
+
+/// Resolve the idle reaper's window from [`ServeConfig::session_idle_timeout`]: unset ⇒
+/// [`DEFAULT_SESSION_IDLE_TIMEOUT`] (the reaper is *on* by default — the map has no other way to shrink,
+/// see the const), and `0` ⇒ `None`, the explicit opt-out for an operator who genuinely wants every
+/// session pinned for the daemon's lifetime.
+fn resolve_idle_timeout(configured: Option<Duration>) -> Option<Duration> {
+    match configured {
+        Some(t) if t.is_zero() => None,
+        Some(t) => Some(t),
+        None => Some(DEFAULT_SESSION_IDLE_TIMEOUT),
     }
 }
 
@@ -672,9 +772,9 @@ pub async fn serve_ws(
     #[cfg(not(unix))]
     let uds_listener: Option<()> = None;
 
-    // Read before `cfg` is moved into the supervisor: whether (and how aggressively) to reap idle
-    // sessions.
-    let idle_timeout = cfg.session_idle_timeout;
+    // Read before `cfg` is moved into the supervisor: how aggressively to reap idle sessions (and
+    // whether the operator opted out of reaping altogether).
+    let idle_timeout = resolve_idle_timeout(cfg.session_idle_timeout);
 
     let supervisor = Arc::new(Supervisor {
         sessions: Mutex::new(HashMap::new()),
@@ -682,11 +782,17 @@ pub async fn serve_ws(
     });
     let mut shutdown = crate::serve::ShutdownSignal::new()?;
 
-    // The idle reaper (off unless `--session-idle-timeout` is set). A background ticker that reclaims
-    // detached, idle, not-mid-run sessions — the same drop-`input_tx` → persist → join path shutdown
-    // uses. Its handle is aborted on shutdown so the process can exit cleanly. Tick at half the timeout
-    // (so a session is reaped within ~1.5× the timeout at worst), capped at 30s so a long timeout still
-    // ticks at a sane cadence.
+    // The idle reaper (on unless `--session-idle-timeout 0` turned it off). A background ticker that
+    // reclaims dead and detached-idle-not-mid-run sessions — the same drop-`input_tx` → persist → join
+    // path shutdown uses. Its handle is aborted on shutdown so the process can exit cleanly. Tick at
+    // half the timeout (so a session is reaped within ~1.5× the timeout at worst), capped at 30s so a
+    // long timeout still ticks at a sane cadence.
+    if idle_timeout.is_none() {
+        eprintln!(
+            "serve: idle-session reaper OFF (--session-idle-timeout 0) — every session, including one \
+             no client ever re-attaches to, holds its thread and gateway pool until the daemon stops"
+        );
+    }
     let reaper = idle_timeout.map(|t| {
         let supervisor = supervisor.clone();
         eprintln!("serve: idle-session reaper on ({}s)", t.as_secs());
@@ -785,7 +891,13 @@ where
     // session id (parsed from the query) for use after the upgrade completes.
     let requested_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let slot = requested_id.clone();
-    let ws = tokio_tungstenite::accept_hdr_async(
+    // Every inbound message becomes one queued command line, so cap what a single one can cost us —
+    // tungstenite's defaults (64 MiB message / 16 MiB frame) let a client hand the session queue tens of
+    // MB at a time. Oversize is a hard protocol error (the connection closes); nothing is truncated.
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(MAX_INBOUND_MESSAGE_BYTES))
+        .max_frame_size(Some(MAX_INBOUND_MESSAGE_BYTES));
+    let ws = tokio_tungstenite::accept_hdr_async_with_config(
         stream,
         move |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
             let uri = req.uri();
@@ -806,6 +918,7 @@ where
             }
             Ok(resp)
         },
+        Some(config),
     )
     .await?;
 
@@ -822,4 +935,123 @@ where
 
     supervisor.attach(requested_id, ws).await;
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    /// Build a handle with no session behind it. `alive` keeps the input channel open (the receiver is
+    /// returned and must be held); dropping the receiver is how a test models a session whose loop ended.
+    fn handle(
+        attached: usize,
+        detached_ago: Option<Duration>,
+    ) -> (SessionHandle, mpsc::Receiver<String>) {
+        let (input_tx, input_rx) = mpsc::channel::<String>(crate::serve::IN_CHANNEL_BOUND);
+        let h = SessionHandle {
+            input_tx,
+            out_conn: Arc::new(Mutex::new(OutFanout::default())),
+            join: None,
+            attached,
+            last_detached_at: detached_ago.and_then(|d| Instant::now().checked_sub(d)),
+            running: Arc::new(AtomicBool::new(false)),
+        };
+        (h, input_rx)
+    }
+
+    #[test]
+    fn idle_timeout_defaults_to_a_finite_window_and_zero_opts_out() {
+        assert_eq!(
+            resolve_idle_timeout(None),
+            Some(DEFAULT_SESSION_IDLE_TIMEOUT),
+            "no --session-idle-timeout must still reap: the map has no other way to shrink"
+        );
+        assert_eq!(
+            resolve_idle_timeout(Some(Duration::ZERO)),
+            None,
+            "0 opts out"
+        );
+        assert_eq!(
+            resolve_idle_timeout(Some(Duration::from_secs(5))),
+            Some(Duration::from_secs(5))
+        );
+    }
+
+    #[test]
+    fn a_dead_session_is_reapable_however_it_looks_otherwise() {
+        // Its loop ended (input receiver gone) while a connection is *still attached* and its idle clock
+        // never started: every ordinary condition says "keep", and it must still be reaped — otherwise
+        // the entry, its fanout, and its exited thread's handle are retained for the daemon's life.
+        let (h, input_rx) = handle(1, None);
+        drop(input_rx);
+        assert!(is_reapable(&h, Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn a_live_session_is_reapable_only_once_detached_past_the_timeout() {
+        let timeout = Duration::from_secs(60);
+
+        let (attached, _rx) = handle(1, None);
+        assert!(!is_reapable(&attached, timeout), "attached: never");
+
+        let (fresh, _rx) = handle(0, None);
+        assert!(
+            !is_reapable(&fresh, timeout),
+            "detached but no clock started: never"
+        );
+
+        let (recent, _rx) = handle(0, Some(Duration::from_secs(10)));
+        assert!(
+            !is_reapable(&recent, timeout),
+            "detached, but not past the timeout"
+        );
+
+        let (idle, _rx) = handle(0, Some(Duration::from_secs(120)));
+        assert!(is_reapable(&idle, timeout), "detached past the timeout");
+
+        let (mid_run, _rx) = handle(0, Some(Duration::from_secs(120)));
+        mid_run.running.store(true, Ordering::Relaxed);
+        assert!(
+            !is_reapable(&mid_run, timeout),
+            "a detached background run must never be reaped out from under its turn"
+        );
+    }
+
+    /// A wedged session must not hold the caller (nor a blocking-pool thread) past the grace period, and
+    /// the threads that *did* exit must still be reaped in the same pass.
+    #[tokio::test]
+    async fn a_wedged_thread_does_not_hold_the_join_past_the_grace_period() {
+        let release = Arc::new(AtomicBool::new(false));
+        let wedged = {
+            let release = release.clone();
+            std::thread::spawn(move || {
+                while !release.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            })
+        };
+        let finished = std::thread::spawn(|| {});
+
+        let start = Instant::now();
+        join_handles_within(vec![finished, wedged], Duration::from_millis(200)).await;
+        let waited = start.elapsed();
+
+        assert!(
+            waited >= Duration::from_millis(200) && waited < Duration::from_secs(5),
+            "the wait must end at the grace period, not when the wedged session finally exits: {waited:?}"
+        );
+        release.store(true, Ordering::Relaxed);
+    }
+
+    #[tokio::test]
+    async fn joining_returns_as_soon_as_every_thread_has_exited() {
+        let threads: Vec<_> = (0..4).map(|_| std::thread::spawn(|| {})).collect();
+        let start = Instant::now();
+        join_handles_within(threads, Duration::from_secs(10)).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "finished threads must not wait out the grace period"
+        );
+    }
 }

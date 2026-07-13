@@ -686,8 +686,11 @@ enum Command {
         listen_uds_mode: Option<String>,
         /// Daemon mode only: reap a session that has had no attached connection for this many seconds
         /// and isn't mid-run — dropping it so it persists and exits, exactly like a graceful shutdown
-        /// does per-session. Absent (the default) keeps today's behavior: a detached session lives until
-        /// the daemon stops. Ignored without `--listen`/`--listen-uds`.
+        /// does per-session. Nothing is lost: reconnecting to a reaped id respawns it and replays from
+        /// disk. Absent ⇒ 3600 (one hour) — long enough that a client can drop its socket and re-attach
+        /// to a still-running session, finite so an unattended daemon's threads and gateway pools don't
+        /// accumulate forever. Pass `0` to disable reaping entirely (every session then lives until the
+        /// daemon stops). Ignored without `--listen`/`--listen-uds`.
         #[arg(long, env = "AI_AGENT_SESSION_IDLE_TIMEOUT")]
         session_idle_timeout: Option<u64>,
         /// How the daemon pools its upstream (agent→gateway) connections across sessions: `off` (the
@@ -2020,6 +2023,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // shutdown from a clean stdin-EOF one — previously every graceful path exited 0
             // unconditionally, matching neither pi's own `rpc-mode.ts` (143/129 for SIGTERM/SIGHUP)
             // nor a shell's own convention for reporting which signal actually stopped a process.
+            //
+            // A signal-triggered shutdown gets here by cancelling every live run, which drops any
+            // in-flight bash tool future and with it its `GroupKillGuard` — whose reaping happens on a
+            // detached thread that is *not* among the session threads `serve`/`serve_ws` joined on the
+            // way out, and that `process::exit` would otherwise terminate mid-`kill`, orphaning exactly
+            // the backgrounded grandchildren the guard exists to reap. Bounded, so a wedged `kill`/`ps`
+            // shell-out can't hold the daemon's own shutdown open.
+            #[cfg(unix)]
+            tools::exec::wait_for_pending_group_kills(std::time::Duration::from_secs(2));
             std::process::exit(shutdown_cause.map(serve::Signal::exit_code).unwrap_or(0));
         }
         Command::Tools => {
@@ -4163,6 +4175,12 @@ async fn run_task(
     // only ever captured here.
     persist_run_tail(&store, &session)?;
     if broken_pipe.load(Ordering::Relaxed) {
+        // Reached *because* `write_stdout_or_exit` tripped `cancel`, so the same in-flight bash tool
+        // future a signal would have dropped has just been dropped here too — with the same detached
+        // `GroupKillGuard` cleanup thread still running, and the same `process::exit` about to kill it
+        // mid-`kill`. See `unwrap_turn_result`, which pays this toll for the signal path.
+        #[cfg(unix)]
+        tools::exec::wait_for_pending_group_kills(std::time::Duration::from_secs(2));
         std::process::exit(0);
     }
     let mut stop_reason = unwrap_turn_result(turn_result, &shutdown_cause)?;
@@ -4182,6 +4200,10 @@ async fn run_task(
         .await;
         persist_run_tail(&store, &session)?;
         if broken_pipe.load(Ordering::Relaxed) {
+            // Same broken-pipe cancellation as the first turn's exit above — drain the pending
+            // process-group kills before tearing their threads down.
+            #[cfg(unix)]
+            tools::exec::wait_for_pending_group_kills(std::time::Duration::from_secs(2));
             std::process::exit(0);
         }
         stop_reason = unwrap_turn_result(turn_result, &shutdown_cause)?;

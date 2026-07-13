@@ -47,12 +47,17 @@ The harness layers several capabilities over the bare tools + loop:
   reference and the reconnect flow. Two supervisor-level daemon facilities sit above the per-session
   protocol: **`list_daemon_sessions`** — intercepted in the read loop (never forwarded to a session)
   and answered by unioning the live `session id → running session` map with an on-disk scan of
-  `<session-dir>/*.jsonl`, each entry tagged `live: true|false`; and an optional **idle reaper**
-  (`--session-idle-timeout <secs>`, off by default) — a background ticker that reclaims sessions with no
-  attached connection, idle past the timeout, and not mid-run (a per-session `running` flag `serve_session`
-  flips around a `prompt`), dropping the retained `input_tx` so the session persists and exits exactly as
-  graceful shutdown does per-entry (both share `join_handles`). A reconnect to a just-reaped id respawns
-  it from disk and replays via `get_messages {since}`. A third daemon facility, **shared upstream
+  `<session-dir>/*.jsonl`, each entry tagged `live: true|false`; and the **idle reaper**
+  (`--session-idle-timeout <secs>`, default 3600, `0` disables) — a background ticker that reclaims
+  sessions whose task has already ended (a closed `input_tx`: pure garbage, reaped on sight) plus those
+  with no attached connection, idle past the timeout, and not mid-run (a per-session `running` flag
+  `serve_session` flips around a `prompt`), dropping the retained `input_tx` so the session persists and
+  exits exactly as graceful shutdown does per-entry (both share `join_handles`, which polls
+  `JoinHandle::is_finished` under a grace period rather than parking a blocking join, so a wedged session
+  can't burn a blocking-pool thread for the daemon's life). The default has to be finite: a connection
+  that omits `?session_id=` mints a fresh id, and every id owns a thread, an `Agent`, and a gateway pool
+  until something reclaims it. A reconnect to a just-reaped id respawns it from disk and replays via
+  `get_messages {since}`. A third daemon facility, **shared upstream
   pooling** (`--upstream-http2 <off|auto|h2c>`, off by default): instead of each session building its own
   `reqwest::Client` (so N sessions ≈ N connections to the gateway on the plaintext HTTP/1.1 hop),
   `serve_ws` builds **one** client and injects it into every session via

@@ -1073,9 +1073,12 @@ fn diff_pair_html(old: &str, new: &str) -> String {
 /// Compute a real line-level diff between `old` and `new` (pi-parity Fix 1) — pi delegates this to the
 /// `diff` npm package's `diffLines` (`edit-diff.ts:385`); no equivalent crate is already a dependency of
 /// this workspace (checked `Cargo.lock` — nothing named `similar`/`diff`/`imara-diff`/`dissimilar`
-/// exists, transitively or otherwise), and this is render-time-only, bounded content (a single `edit`
-/// call's before/after text, not an arbitrarily large corpus), so a small hand-rolled diff is
+/// exists, transitively or otherwise), and this is render-time-only, so a small hand-rolled diff is
 /// appropriate rather than reaching for a new dependency.
+///
+/// The content is *not* bounded: `old`/`new` are whatever the model put in an `edit` call, and nothing
+/// on the export path truncates them. [`lcs_diff`] therefore caps its own quadratic table
+/// ([`MAX_LCS_CELLS`]) and degrades to a plain block rendering past it.
 ///
 /// A common prefix and suffix (lines identical between `old` and `new` at the very start/end) are
 /// trimmed off *before* running the actual O(n*m) LCS table in [`lcs_diff`] — the overwhelming majority
@@ -1116,21 +1119,44 @@ fn diff_lines<'a>(old: &'a str, new: &'a str) -> Vec<LineDiffOp<'a>> {
     ops
 }
 
+/// The largest LCS table [`lcs_diff`] will build, in cells. The quadratic table is the one place an
+/// export can be made to allocate without limit: prefix/suffix trimming shrinks a *typical* edit to a
+/// handful of changed lines, but an edit that rewrites a file wholesale leaves every line differing on
+/// both sides, and `dp` is then `len(old) * len(new)` cells — a 25k-line rewrite is ~2.5 GB, a
+/// single-shot OOM triggered by nothing more than exporting the session that contains it.
+///
+/// 1M cells is 4 MiB of `u32` and admits any changed region up to ~1000x1000 lines, which is already far
+/// past what a human reads as a diff; past it the rendering degrades but the content is all still there.
+const MAX_LCS_CELLS: usize = 1_000_000;
+
 /// A classic LCS (longest-common-subsequence) line diff over `old`/`new` — the textbook
 /// dynamic-programming table (`dp[i][j]` = length of the LCS of `old[i..]`/`new[j..]`), backtracked from
 /// `(0, 0)` to produce an edit script. `O(len(old) * len(new))` time and space, which is why
 /// [`diff_lines`] trims the common prefix/suffix first rather than calling this directly on the whole
-/// old/new pair.
+/// old/new pair, and why the table is capped at [`MAX_LCS_CELLS`].
 fn lcs_diff<'a>(old: &[&'a str], new: &[&'a str]) -> Vec<LineDiffOp<'a>> {
     let n = old.len();
     let m = new.len();
-    let mut dp = vec![vec![0u32; m + 1]; n + 1];
+    // Too big to diff: fall back to what this renderer did before the line-level diff existed — the whole
+    // old block `-`, the whole new block `+`. Linear in the input, and every line the model wrote still
+    // appears in the export; all that is lost is the pairing of unchanged lines across a pathologically
+    // large rewrite, which nobody was going to read line-by-line anyway.
+    if n.saturating_mul(m) > MAX_LCS_CELLS {
+        let mut ops = Vec::with_capacity(n + m);
+        ops.extend(old.iter().copied().map(LineDiffOp::Delete));
+        ops.extend(new.iter().copied().map(LineDiffOp::Insert));
+        return ops;
+    }
+    // One flat allocation with an explicit stride, rather than `vec![vec![]; n + 1]`: same cells, but
+    // `n + 1` fewer allocations and a contiguous, cache-friendly sweep.
+    let stride = m + 1;
+    let mut dp = vec![0u32; stride * (n + 1)];
     for i in (0..n).rev() {
         for j in (0..m).rev() {
-            dp[i][j] = if old[i] == new[j] {
-                dp[i + 1][j + 1] + 1
+            dp[i * stride + j] = if old[i] == new[j] {
+                dp[(i + 1) * stride + j + 1] + 1
             } else {
-                dp[i + 1][j].max(dp[i][j + 1])
+                dp[(i + 1) * stride + j].max(dp[i * stride + j + 1])
             };
         }
     }
@@ -1142,7 +1168,7 @@ fn lcs_diff<'a>(old: &[&'a str], new: &[&'a str]) -> Vec<LineDiffOp<'a>> {
             ops.push(LineDiffOp::Equal(old[i]));
             i += 1;
             j += 1;
-        } else if dp[i + 1][j] >= dp[i][j + 1] {
+        } else if dp[(i + 1) * stride + j] >= dp[i * stride + j + 1] {
             ops.push(LineDiffOp::Delete(old[i]));
             i += 1;
         } else {
@@ -3414,6 +3440,35 @@ mod tests {
         // They still appear, just as plain, uncolored context.
         assert!(html.contains("line one"), "{html}");
         assert!(html.contains("line five"), "{html}");
+    }
+
+    #[test]
+    fn a_wholesale_rewrite_past_the_lcs_cap_still_exports_and_still_shows_both_sides() {
+        // A file rewritten wholesale: every line differs, so prefix/suffix trimming saves nothing and the
+        // LCS table would be 5k x 5k = 25M cells (100 MB) — and a 25k-line rewrite would be ~2.5 GB.
+        // Past `MAX_LCS_CELLS` the diff degrades to plain `-` old / `+` new blocks: linear, and the
+        // content is all still in the document. The timing assert is what catches a regression to the
+        // quadratic path, which for this input takes seconds and 100 MB rather than milliseconds.
+        let old: String = (0..5_000).map(|i| format!("old line {i}\n")).collect();
+        let new: String = (0..5_000).map(|i| format!("new line {i}\n")).collect();
+        let messages = vec![Message::assistant(vec![ContentBlock::ToolUse {
+            id: "1".into(),
+            name: "edit".into(),
+            input: serde_json::json!({
+                "path": "src/lib.rs",
+                "old_string": old,
+                "new_string": new,
+            }),
+            thought_signature: None,
+        }])];
+        let started = std::time::Instant::now();
+        let html = render_html(&meta(), &messages, &[], None);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "export of an oversized edit fell back into the quadratic diff"
+        );
+        assert!(html.contains("class=\"diff-del\">-old line 4999"), "{html}");
+        assert!(html.contains("class=\"diff-add\">+new line 4999"), "{html}");
     }
 
     #[test]
