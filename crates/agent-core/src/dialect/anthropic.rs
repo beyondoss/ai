@@ -135,6 +135,15 @@ pub fn build_body(req: &ModelRequest, is_oauth: bool) -> Value {
             .map(|m| json!({ "role": m.role, "content": m.content }))
             .collect(),
     );
+    // …and the same argument, one level down. The `role`/`content` shape above makes a stray *message*
+    // field unreachable, but `content` is then serialized straight off `ContentBlock`, which carries
+    // fields no Anthropic block has: `Text::id`/`Text::phase` (OpenAI Responses item ids) and
+    // `ToolUse::thought_signature`. They are `None` on anything Anthropic itself produced — and are
+    // populated the moment a transcript passes through another dialect, which a session outlives.
+    // `run --model gpt-5 …` then `run --continue --model claude-…` 400s on
+    // `messages.N.content.0.text.id: Extra inputs are not permitted`, and cross-provider model switching
+    // is now an ordinary thing to do (`agent::gateway_credential`'s direct routes), not an exotic one.
+    prune_non_anthropic_block_fields(&mut messages);
     normalize_cross_model_tool_ids(&mut messages, &req.messages, &req.model);
     downgrade_unsigned_thinking(&mut messages);
     // Vision is gated on *both* the model's own real support and the request's explicit
@@ -294,6 +303,66 @@ fn canonicalize_tool_names(tools: &mut Value) {
                 let canonical = to_claude_code_name(name);
                 tool.insert("name".into(), Value::String(canonical));
             }
+        }
+    }
+}
+
+/// The keys each Anthropic content-block type is allowed to carry on the wire. Anything else is dropped
+/// by [`prune_non_anthropic_block_fields`].
+///
+/// An **allowlist**, not a blocklist, and deliberately so — the same reasoning [`build_body`]'s
+/// `role`/`content` construction spells out for message-level fields. A blocklist has to be updated
+/// every time `ContentBlock` gains a field, and the one time it lags is a 400 on every request carrying
+/// that field. An allowlist drops a new internal field by default: the failure mode of forgetting to
+/// update it is "a field Anthropic wanted goes missing", which the dialect's own tests catch loudly,
+/// rather than "a field Anthropic rejects gets sent", which only shows up as a live 400.
+///
+/// `cache_control` is absent on purpose: it is *added* by a later pass, after this one runs.
+/// `tool_result.images` is present even though Anthropic has no such key — a later pass consumes it into
+/// the real `content` array shape and removes it (see `attach_tool_result_images`), so it has to survive
+/// this one.
+const ANTHROPIC_BLOCK_KEYS: &[(&str, &[&str])] = &[
+    ("text", &["type", "text"]),
+    ("thinking", &["type", "thinking", "signature"]),
+    ("redacted_thinking", &["type", "data"]),
+    ("tool_use", &["type", "id", "name", "input"]),
+    (
+        "tool_result",
+        &["type", "tool_use_id", "content", "is_error", "images"],
+    ),
+    ("image", &["type", "source"]),
+];
+
+/// Drop every content-block field Anthropic's schema doesn't accept — see [`ANTHROPIC_BLOCK_KEYS`].
+///
+/// The fields this actually removes today (`text.id`, `text.phase`, `tool_use.thought_signature`) are all
+/// set by *other* dialects, and only ever reach here on a transcript that has crossed dialects: a session
+/// started on an OpenAI model and continued on a Claude one. Anthropic rejects unknown block fields
+/// outright (`Extra inputs are not permitted`), so this is a hard 400 on the whole request, not a quiet
+/// degradation.
+///
+/// A block whose `type` isn't in the table is left untouched: this prunes known shapes, and a shape it
+/// doesn't know about is not one it should be silently emptying.
+fn prune_non_anthropic_block_fields(messages: &mut Value) {
+    let Some(msgs) = messages.as_array_mut() else {
+        return;
+    };
+    for m in msgs {
+        let Some(content) = m.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for block in content.iter_mut() {
+            let Some(obj) = block.as_object_mut() else {
+                continue;
+            };
+            let Some(ty) = obj.get("type").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some((_, allowed)) = ANTHROPIC_BLOCK_KEYS.iter().find(|(name, _)| *name == ty)
+            else {
+                continue;
+            };
+            obj.retain(|key, _| allowed.contains(&key.as_str()));
         }
     }
 }
@@ -3045,5 +3114,89 @@ data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use"
             ),
             None
         );
+    }
+
+    /// The cross-dialect resume bug. A session started on an OpenAI model and continued on a Claude one
+    /// carries `Text::id`/`Text::phase` (OpenAI Responses item ids) and `ToolUse::thought_signature`
+    /// through history. Anthropic rejects unknown block fields outright — this used to 400 the entire
+    /// request with `messages.N.content.0.text.id: Extra inputs are not permitted`.
+    #[test]
+    fn a_transcript_that_crossed_dialects_carries_no_foreign_block_fields_to_anthropic() {
+        let assistant = Message::assistant(vec![
+            ContentBlock::Text {
+                text: "A".to_string(),
+                // What `openai_responses` stamps on every assistant text block.
+                id: Some("msg_010ec72a89156dda".to_string()),
+                phase: Some("final".to_string()),
+            },
+            ContentBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: "read".to_string(),
+                input: json!({"path": "a.txt"}),
+                thought_signature: Some("sig".to_string()),
+            },
+        ]);
+        let req = ModelRequest::new("claude-opus-4-8", vec![Message::user("hi"), assistant], 64);
+        let body = build_body(&req, false);
+
+        let blocks = body["messages"][1]["content"]
+            .as_array()
+            .expect("assistant content");
+        let text = blocks[0].as_object().expect("text block");
+        assert_eq!(text.get("text").and_then(Value::as_str), Some("A"));
+        assert!(
+            !text.contains_key("id") && !text.contains_key("phase"),
+            "a text block must reach Anthropic with no OpenAI item id: {text:?}"
+        );
+        let tool_use = blocks[1].as_object().expect("tool_use block");
+        assert_eq!(tool_use.get("name").and_then(Value::as_str), Some("read"));
+        assert!(
+            !tool_use.contains_key("thought_signature"),
+            "tool_use carries no thought_signature on the Anthropic wire: {tool_use:?}"
+        );
+    }
+
+    /// The allowlist must not eat fields Anthropic genuinely wants. Pairs with the test above: together
+    /// they pin both directions, so a future `ContentBlock` field can't silently break either one.
+    #[test]
+    fn pruning_keeps_every_field_anthropic_actually_needs() {
+        let assistant = Message::assistant(vec![
+            ContentBlock::Thinking {
+                text: "hmm".to_string(),
+                signature: "sig-abc".to_string(),
+            },
+            ContentBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: "read".to_string(),
+                input: json!({"path": "a.txt"}),
+                thought_signature: None,
+            },
+        ]);
+        let result = Message::tool_results(vec![ContentBlock::ToolResult {
+            tool_use_id: "call_1".to_string(),
+            content: "file contents".to_string(),
+            is_error: false,
+            images: Vec::new(),
+        }]);
+        let req = ModelRequest::new(
+            "claude-opus-4-8",
+            vec![Message::user("hi"), assistant, result],
+            64,
+        );
+        let body = build_body(&req, false);
+
+        let thinking = &body["messages"][1]["content"][0];
+        assert_eq!(thinking["thinking"], json!("hmm"));
+        assert_eq!(
+            thinking["signature"],
+            json!("sig-abc"),
+            "the thinking signature is load-bearing — Anthropic rejects a later tool turn without it"
+        );
+        let tool_use = &body["messages"][1]["content"][1];
+        assert_eq!(tool_use["input"], json!({"path": "a.txt"}));
+        assert_eq!(tool_use["id"], json!("call_1"));
+        let tool_result = &body["messages"][2]["content"][0];
+        assert_eq!(tool_result["tool_use_id"], json!("call_1"));
+        assert_eq!(tool_result["is_error"], json!(false));
     }
 }
