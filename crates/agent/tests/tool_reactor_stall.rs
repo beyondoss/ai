@@ -60,8 +60,11 @@ where
 }
 
 /// Generous enough that ordinary scheduler jitter on a loaded CI box can't trip it, yet far below the
-/// tens of milliseconds an inline implementation stalls for on these inputs.
-const MAX_STALL: Duration = Duration::from_millis(15);
+/// tens of milliseconds an inline implementation stalls for on these inputs. Raised 15ms → 25ms after a
+/// shared CI runner measured a 17.7ms gap on the `ls` case (5,000 stats) — ordinary runner load, not a
+/// regression — while an inline implementation still stalls for far longer (~73ms on `edit`'s 4 MB
+/// case; see `tools/edit.rs`), so the assertion keeps its teeth against the failure it actually guards.
+const MAX_STALL: Duration = Duration::from_millis(25);
 
 fn big_ascii_source(lines: usize) -> String {
     let mut s = String::with_capacity(lines * 56);

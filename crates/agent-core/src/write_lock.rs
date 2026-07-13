@@ -237,12 +237,21 @@ mod tests {
         // write/edit queue locked while an aborted write is still in flight"): releasing the lock the
         // instant a caller *requests* cancellation, even though the underlying write was still
         // physically in progress, let a second write interleave with the first's still-unflushed
-        // bytes. Our guard's release is tied to `Drop`, not a separate "I'm done" signal, so a second
-        // locker can only ever proceed once the first's guard has genuinely dropped — including when
-        // that drop is triggered by cancellation partway through an `.await` inside the critical
-        // section (simulating a future `spawn_blocking`-wrapped write). Pinning this so a refactor that
-        // moved the guard's lifetime *outside* the actual work (e.g. dropping it before awaiting a
-        // spawned blocking write's completion) would be caught here first.
+        // bytes. This pins the guard-level half of the guarantee: the guard's release is tied to
+        // `Drop`, not a separate "I'm done" signal, so a second locker can only ever proceed once the
+        // first's guard has genuinely dropped — including when that drop is triggered by cancellation
+        // partway through an `.await` inside the critical section.
+        //
+        // Note the scope of what *this* test can prove. It models the in-flight write with a
+        // `tokio::time::sleep`, which — unlike a real `spawn_blocking`-wrapped write — *is* cancellable:
+        // aborting the holder drops both the sleep and the guard together, so here guard-release and
+        // work-completion coincide by construction. The genuinely dangerous case is the opposite — a
+        // *non-cancellable* `spawn_blocking` write, where aborting the holder's dispatch future would
+        // drop the guard while the write ran on regardless — and that decoupling lives at the dispatch
+        // seam, not in the guard, so it can't be exercised from here. It's covered by
+        // `agent::tests::cancelling_a_write_holds_its_lock_until_the_in_flight_blocking_write_lands`,
+        // which drives the real `edit`-shaped path (the guard rides an `Arc` clone into the blocking
+        // closure via `ToolProgress::write_lock_keepalive`).
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::Duration;
 

@@ -60,6 +60,13 @@ pub struct ToolProgress {
     id: String,
     name: String,
     cancel: CancellationToken,
+    /// The dispatch-held write-lock guard for this call's target path, shared as an `Arc` so a tool
+    /// that hands its actual write off to a non-cancellable `spawn_blocking` (the `edit` tool) can move
+    /// a clone *into* that closure. The registry lock then releases only once every clone is dropped —
+    /// i.e. once the physical write has landed — not the instant the dispatch future is abandoned by
+    /// cancellation while the `spawn_blocking` runs on regardless (see `write_lock_keepalive`). `None`
+    /// for read-only calls, unguarded (`solo:`) calls, and any tool invoked outside the dispatch loop.
+    write_lock: Option<Arc<crate::write_lock::WriteLockGuard>>,
 }
 
 impl ToolProgress {
@@ -79,7 +86,31 @@ impl ToolProgress {
             id,
             name,
             cancel,
+            write_lock: None,
         }
+    }
+
+    /// Attach the dispatch-held write-lock guard (as a shared `Arc`) for this call's target path, so a
+    /// tool can extend the lock's lifetime past the abandonment of its own dispatch future — see the
+    /// `write_lock` field and [`write_lock_keepalive`](ToolProgress::write_lock_keepalive). Only the
+    /// dispatch loop calls this; a directly-invoked tool call carries no guard.
+    pub fn with_write_lock(
+        mut self,
+        guard: Option<Arc<crate::write_lock::WriteLockGuard>>,
+    ) -> Self {
+        self.write_lock = guard;
+        self
+    }
+
+    /// A clone of the shared write-lock guard held for this call's target path, if any. A tool that
+    /// performs its mutation on a `spawn_blocking` thread — which tokio cannot cancel — must move this
+    /// into that closure so the lock is released on the blocking thread when the write actually
+    /// completes, rather than on the reactor the instant a cancelled dispatch future is dropped (which
+    /// would leave the write physically in flight with the lock already free, letting another
+    /// turn/session interleave). Tools that mutate synchronously within their own future need not touch
+    /// it: their future can't be preempted mid-write, so the dispatch guard already covers them.
+    pub fn write_lock_keepalive(&self) -> Option<Arc<crate::write_lock::WriteLockGuard>> {
+        self.write_lock.clone()
     }
 
     /// Emit a progress snapshot (the full output so far) plus optional `details`. Best-effort: if the
