@@ -630,6 +630,31 @@ impl Agent {
         // instead of the raw one. `catch_sink_panic` is `catch_tool_panic`'s sync sibling — `sink`
         // itself isn't a future, so there's nothing to `.await` here.
         let mut sink = move |ev: AgentEvent| catch_sink_panic(|| sink(ev));
+        // A transcript produced by one model is not automatically replayable to another. Signed
+        // `Thinking` blocks and encrypted `RedactedThinking` blocks are bound to the model that made
+        // them; OpenAI-Responses combined `"call_id|item_id"` tool ids only pair with a `reasoning` item
+        // on that same dialect. Replay them across a switch and the provider rejects the whole request —
+        // `run --model gpt-5 …` then `run --continue --model claude-…` 400s with
+        // ``Invalid `signature` in `thinking` block``.
+        //
+        // `Session::scrub_cross_model_state` was written for exactly this and, until now, was called by
+        // nothing but its own tests. It belongs *here* rather than in each caller that can change the
+        // active model (`run --continue`, and `serve`'s `set_model`/`cycle_model`/`switch_session`/
+        // `fork`/`clone`/`switch_branch`): every one of them funnels into this function, and this is the
+        // single point where a model and the transcript it is about to be shown actually meet. At the
+        // choke point it is structurally impossible for a new model-switching entry point to forget —
+        // which is exactly how it ended up with no callers at all.
+        //
+        // Gated on a read-only scan: the scrub `Arc::make_mut`s the message vec, deep-cloning the whole
+        // transcript whenever that `Arc` is shared (it is). Same-model turns — nearly all of them — must
+        // not pay that to change nothing.
+        if session.needs_cross_model_scrub(&self.model) {
+            tracing::debug!(
+                model = %self.model,
+                "resuming on a different model: scrubbing thinking blocks and foreign tool-call ids"
+            );
+            session.scrub_cross_model_state(&self.model);
+        }
         // Clears any pending stop request when this call returns, by whatever path — normal
         // completion, an early `?`/`return Err`, cancellation, or a refusal — so a request this call
         // never got around to consuming can't leak into a later call that reuses `steering`.

@@ -199,6 +199,34 @@ impl Session {
         }
     }
 
+    /// Whether this session holds any state [`scrub_cross_model_state`](Self::scrub_cross_model_state)
+    /// would actually change, were the conversation resumed on `new_model`.
+    ///
+    /// A read-only pre-check, and the reason the scrub can sit unconditionally on the run path
+    /// ([`crate::agent::Agent::run_events_steered`]) without costing anything on the overwhelmingly
+    /// common same-model turn: the scrub itself calls `Arc::make_mut` on the message vec, which
+    /// **deep-clones the whole transcript** whenever the `Arc` is shared (it is — persistence holds a
+    /// handle). Paying that on every turn of a long session to almost always change nothing would be a
+    /// real regression, so the mutation is gated behind this scan, which allocates nothing.
+    ///
+    /// Deliberately narrower than "does any message have a foreign `model_id`". Every `User` message has
+    /// `model_id: None` and is therefore foreign by the scrub's own rule, so that question is `true` for
+    /// essentially every session and would gate nothing. What actually matters is whether a *foreign*
+    /// message carries state that doesn't survive the crossing: a `Thinking`/`RedactedThinking` block
+    /// (signature or ciphertext bound to the model that produced it) or an OpenAI-Responses combined
+    /// `"call_id|item_id"` tool-call id. Nothing else the scrub touches can differ.
+    pub fn needs_cross_model_scrub(&self, new_model: &str) -> bool {
+        self.messages
+            .iter()
+            .filter(|m| m.model_id.as_deref() != Some(new_model))
+            .flat_map(|m| m.content.iter())
+            .any(|block| match block {
+                ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => true,
+                ContentBlock::ToolUse { id, .. } => id.contains('|'),
+                _ => false,
+            })
+    }
+
     /// Fold a turn's token usage into the running totals and record the live context size.
     pub fn record_usage(&mut self, usage: TokenUsage) {
         self.input_tokens += u64::from(usage.input_tokens);
@@ -459,5 +487,59 @@ mod tests {
             "the snapshot's message-count boundary must also hold, not silently advance past the \
              unaccounted-for message that triggered this call"
         );
+    }
+
+    /// The gate must fire on exactly the state the scrub would change — and on nothing else, or every
+    /// turn of a long same-model session pays a full transcript deep-clone to change nothing.
+    #[test]
+    fn needs_cross_model_scrub_fires_only_on_state_that_does_not_survive_a_switch() {
+        // A same-model transcript with a signed thinking block: replayable as-is, nothing to do.
+        let mut s = Session::new();
+        s.push(Message {
+            model_id: Some("claude-opus-4-8".to_string()),
+            ..Message::assistant(vec![ContentBlock::Thinking {
+                text: "hmm".into(),
+                signature: "sig".into(),
+            }])
+        });
+        assert!(!s.needs_cross_model_scrub("claude-opus-4-8"));
+        // …the same block, now facing a different model: bound to the model that produced it.
+        assert!(s.needs_cross_model_scrub("gpt-5"));
+
+        // Plain text from a foreign model is perfectly replayable — this must NOT trigger a scrub, or
+        // the gate is just "is there any foreign message", which is true of essentially every session
+        // (every `User` message has `model_id: None`) and would gate nothing.
+        let mut plain = Session::new();
+        plain.push(Message::user("hi"));
+        plain.push(Message {
+            model_id: Some("gpt-5".to_string()),
+            ..Message::assistant(vec![ContentBlock::text("hello")])
+        });
+        assert!(!plain.needs_cross_model_scrub("claude-opus-4-8"));
+
+        // An OpenAI-Responses combined tool id from a foreign model does need truncating.
+        let mut combined = Session::new();
+        combined.push(Message {
+            model_id: Some("gpt-5".to_string()),
+            ..Message::assistant(vec![ContentBlock::ToolUse {
+                id: "call_1|item_1".into(),
+                name: "read".into(),
+                input: serde_json::json!({}),
+                thought_signature: None,
+            }])
+        });
+        assert!(combined.needs_cross_model_scrub("claude-opus-4-8"));
+        // An Anthropic-native id contains no `|`, so a switch away from it is a no-op.
+        let mut native = Session::new();
+        native.push(Message {
+            model_id: Some("claude-opus-4-8".to_string()),
+            ..Message::assistant(vec![ContentBlock::ToolUse {
+                id: "toolu_abc".into(),
+                name: "read".into(),
+                input: serde_json::json!({}),
+                thought_signature: None,
+            }])
+        });
+        assert!(!native.needs_cross_model_scrub("gpt-5"));
     }
 }
