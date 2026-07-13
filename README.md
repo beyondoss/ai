@@ -72,7 +72,7 @@ AI_GATEWAY_URL=http://ai.internal AI_AGENT_KEY=bai_v1... \
 # then: {"type":"prompt","message":"…"} → streamed event frames, then a response
 ```
 
-**Credential precedence.** A gateway is *configured* if `AI_GATEWAY_URL`, a stored `default_gateway_url`,
+**Credential precedence.** A gateway is _configured_ if `AI_GATEWAY_URL`, a stored `default_gateway_url`,
 or `AI_AGENT_KEY` is set — the `http://ai.internal` default is a fallback, not configuration. With one
 configured, the gateway is used (unless `AI_DIRECT=1`). Otherwise, routing is direct, in this order:
 
