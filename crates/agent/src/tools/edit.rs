@@ -2,6 +2,7 @@
 //! first, then a normalized fuzzy fallback (NFKC + unified quotes/dashes/spaces + per-line
 //! trailing-whitespace) so a model's slightly-off `old_string` still lands.
 
+use std::cell::OnceCell;
 use std::path::PathBuf;
 
 use agent_core::tool::Tool;
@@ -69,12 +70,23 @@ impl Tool for Edit {
             .map(|p| super::canonical_write_target(&self.root, &p))
     }
 
+    /// Argument parsing stays on the caller's task (it's a few `Value` lookups); everything from the
+    /// file read onward goes to `spawn_blocking`.
+    ///
+    /// This tool is the one that genuinely needed it. `serve_ws` runs each session on its own
+    /// `current_thread` runtime, so work done inline here pins that session's whole executor — its event
+    /// pump *and* its `abort`/`steer` command loop — for the duration. `read`/`grep`/`find`/`exec`
+    /// already hand their work off this way; `edit` did not, and on a multi-MB file it blocked the
+    /// runtime for tens of milliseconds (measured at ~73 ms on a 4 MB file — see
+    /// `tests/tool_reactor_stall.rs`, which now pins this invariant). `write` and `ls` were measured on
+    /// the same harness and don't come close to stalling, so they're deliberately left alone rather than
+    /// wrapped on principle.
     async fn run(&self, input: Value) -> Result<ToolOutput, ToolError> {
         let path = input
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing `path`".into()))?;
-        let path = &self.resolve(path);
+        let path = self.resolve(path);
         let edits = parse_edits(&input)?;
         let replace_all = input
             .get("replace_all")
@@ -86,6 +98,23 @@ impl Tool for Edit {
             ));
         }
 
+        match tokio::task::spawn_blocking(move || apply_edits(&path, edits, replace_all)).await {
+            Ok(result) => result,
+            // The closure returns its errors as `Err`, so a `JoinError` can only be a panic inside it.
+            // Re-raise rather than dressing it up as an ordinary tool failure.
+            Err(e) => std::panic::resume_unwind(e.into_panic()),
+        }
+    }
+}
+
+/// The whole synchronous body of an `edit`: read, writability probe, match, splice, write. Lives on
+/// `spawn_blocking`, never on the reactor — see [`Edit::run`].
+fn apply_edits(
+    path: &str,
+    edits: Vec<(String, String)>,
+    replace_all: bool,
+) -> Result<ToolOutput, ToolError> {
+    {
         let (raw, initial_mtime) = read_with_mtime(path)?;
         // Fail fast on a file this process can't actually write before spending any match/diff work on
         // it (fuzzy matching does NFKC normalization + ambiguity resolution — real CPU work, not free)
@@ -117,7 +146,12 @@ impl Tool for Edit {
         // `find_spans`'s ambiguity check on every edit, fuzzy or not) is computed once here rather than
         // once per edit — a multi-edit call used to renormalize the whole file from scratch for every
         // element of `edits`, even though the input to that normalization was always identical.
-        let (norm_working, working_map) = normalize_with_map(&working);
+        //
+        // The *offset map* back to the original bytes, though, is only read when an edit actually falls
+        // through to the fuzzy path — so it's built lazily, at most once, and not at all on the exact
+        // path that virtually every call takes. See `normalize_only`.
+        let norm_working = normalize_only(&working);
+        let working_map: OnceCell<Vec<u32>> = OnceCell::new();
         let total_edits = edits.len();
         // `(start, end, replacement, edit_index)` — `edit_index` rides along purely so the overlap
         // check below can name which `edits[i]`/`edits[j]` collided (pi-parity fix: matching pi's own
@@ -291,7 +325,7 @@ fn write_if_unchanged(
 fn find_spans(
     working: &str,
     norm_work: &str,
-    map: &[u32],
+    map: &OnceCell<Vec<u32>>,
     old: &str,
     replace_all: bool,
     edit_index: usize,
@@ -336,6 +370,10 @@ fn find_spans(
     if norm_old.is_empty() {
         return Err(not_found_message(old, edit_index, total_edits));
     }
+    // Only here — on a real fuzzy fallback — is the offset map actually needed, so only here is it
+    // built. Normalizing `working` a second time to produce it is deliberate: it keeps the eager,
+    // every-call path free of a table it never reads, and this branch is the rare one.
+    let map = map.get_or_init(|| normalize_with_map(working).1);
     let fuzzy: Vec<(usize, usize)> = norm_work
         .match_indices(&norm_old)
         .map(|(i, _)| (map[i] as usize, map[i + norm_old.len()] as usize))
@@ -420,10 +458,102 @@ fn fold_char(c: char) -> Option<char> {
 /// (half the width of the old `usize`): `edit` reads the whole file into a `String` first, so a >4 GiB
 /// file can't reach here.
 pub fn normalize_with_map(orig: &str) -> (String, Vec<u32>) {
+    normalize_inner::<true>(orig)
+}
+
+/// [`normalize_with_map`] without the offset map — the same normalized text, and nothing else.
+///
+/// The map is only ever read on the **fuzzy** path, to translate a match found in normalized space
+/// back to the original bytes. The exact path (the overwhelmingly common one — the model reproduces an
+/// `old_string` it just read verbatim) needs the normalized *text* alone, for `find_spans`'s ambiguity
+/// count, and never touches the map. Building it there cost a `Vec<u32>` four bytes wide per output
+/// byte — on the order of the file size, ×4 — plus a bounds-checked push per byte, for a table thrown
+/// away unread. See `benches/search.rs::edit_run_exact`.
+pub fn normalize_only(orig: &str) -> String {
+    normalize_inner::<false>(orig).0
+}
+
+/// The shared one-pass normalizer. `MAP` is a const generic rather than a runtime flag so the map
+/// pushes monomorphize away entirely when they aren't wanted — no branch per byte, no empty `Vec`.
+///
+/// Dispatches to [`normalize_ascii`] when the input has no non-ASCII byte, which for source code is
+/// almost always. See that function for why the two are equivalent there.
+fn normalize_inner<const MAP: bool>(orig: &str) -> (String, Vec<u32>) {
+    if orig.is_ascii() {
+        return normalize_ascii::<MAP>(orig);
+    }
+    normalize_general::<MAP>(orig)
+}
+
+/// The ASCII fast path — a byte scan, no `char` decoding, no NFKC iterator, no per-scalar fold.
+///
+/// It is *equivalent* to [`normalize_general`] on ASCII input, not an approximation of it, and that
+/// rests on two facts: NFKC is the identity on ASCII (every ASCII scalar is NFKC-stable), and every
+/// arm of [`fold_char`] matches a scalar at or above `U+00A0` — so neither transform can alter an
+/// ASCII byte. All that remains of normalization is dropping the spaces/tabs immediately before a
+/// `\n` or EOF, which is a byte-level operation.
+///
+/// This matters because the general path costs the same on pure-ASCII input as on Unicode: the price
+/// is the per-`char` machinery, not the content (`benches/search.rs` measures the two within a hair of
+/// each other). Source files are overwhelmingly ASCII, so that machinery was being paid for Unicode
+/// that isn't there. Bytes are copied in bulk runs between whitespace, rather than one at a time.
+fn normalize_ascii<const MAP: bool>(orig: &str) -> (String, Vec<u32>) {
+    let b = orig.as_bytes();
+    let mut out = String::with_capacity(b.len());
+    let mut map = Vec::<u32>::with_capacity(if MAP { b.len() + 1 } else { 0 });
+
+    // `cursor` is the first byte not yet emitted; `ws_start` marks the beginning of the whitespace run
+    // currently being held (trailing only if a `\n`/EOF proves it so — same rule as the general path).
+    let mut cursor = 0usize;
+    let mut ws_start: Option<usize> = None;
+
+    let emit = |out: &mut String, map: &mut Vec<u32>, from: usize, to: usize| {
+        if from >= to {
+            return;
+        }
+        // ASCII, so any byte index is a char boundary and this slice is valid UTF-8 by construction.
+        out.push_str(&orig[from..to]);
+        if MAP {
+            map.extend((from..to).map(|j| j as u32));
+        }
+    };
+
+    for (i, &c) in b.iter().enumerate() {
+        match c {
+            b' ' | b'\t' => {
+                if ws_start.is_none() {
+                    ws_start = Some(i);
+                }
+            }
+            b'\n' => {
+                // The held run was trailing → emit everything before it and resume at the `\n`, which
+                // the next bulk copy picks up.
+                if let Some(ws) = ws_start.take() {
+                    emit(&mut out, &mut map, cursor, ws);
+                    cursor = i;
+                }
+            }
+            // Any other byte proves the held run interior; it stays, so there's nothing to cut.
+            _ => ws_start = None,
+        }
+    }
+    // A trailing whitespace run at EOF is dropped, exactly as the general path leaves `pending`
+    // unflushed.
+    let end = ws_start.unwrap_or(b.len());
+    emit(&mut out, &mut map, cursor, end);
+    if MAP {
+        map.push(b.len() as u32); // sentinel
+    }
+    (out, map)
+}
+
+/// The general, fully-Unicode normalizer: per-scalar NFKC, then [`fold_char`], then trailing-whitespace
+/// stripping. Reached only when the input actually contains a non-ASCII byte.
+fn normalize_general<const MAP: bool>(orig: &str) -> (String, Vec<u32>) {
     use unicode_normalization::UnicodeNormalization;
 
     let mut out = String::with_capacity(orig.len());
-    let mut map = Vec::<u32>::with_capacity(orig.len() + 1);
+    let mut map = Vec::<u32>::with_capacity(if MAP { orig.len() + 1 } else { 0 });
     // A held run of candidate trailing whitespace: (byte — always ASCII ' '/'\t', source offset).
     let mut pending: Vec<(u8, u32)> = Vec::new();
     let mut buf = [0u8; 4];
@@ -439,25 +569,33 @@ pub fn normalize_with_map(orig: &str) -> (String, Vec<u32>) {
                 '\n' => {
                     pending.clear();
                     out.push('\n');
-                    map.push(off);
+                    if MAP {
+                        map.push(off);
+                    }
                 }
                 // Any other char: the held run was interior → flush it, then emit the char.
                 _ => {
                     for (b, o) in pending.drain(..) {
                         out.push(b as char);
-                        map.push(o);
+                        if MAP {
+                            map.push(o);
+                        }
                     }
                     let s = folded.encode_utf8(&mut buf);
                     out.push_str(s);
-                    for _ in 0..s.len() {
-                        map.push(off);
+                    if MAP {
+                        for _ in 0..s.len() {
+                            map.push(off);
+                        }
                     }
                 }
             }
         }
     }
     // A trailing whitespace run at EOF is dropped (`pending` left unflushed).
-    map.push(orig.len() as u32); // sentinel
+    if MAP {
+        map.push(orig.len() as u32); // sentinel
+    }
     (out, map)
 }
 
@@ -553,6 +691,48 @@ mod tests {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         f.write_all(contents.as_bytes()).unwrap();
         f
+    }
+
+    /// The ASCII fast path is only sound if it is *equivalent* to the general Unicode path, not merely
+    /// close to it — it produces both the normalized text and the offset map that `run` splices the
+    /// original bytes back together with, so a divergence in either would corrupt a file rather than
+    /// just mismatch. Pin that equivalence directly, on the shapes that actually distinguish the two:
+    /// trailing whitespace before a newline, at EOF, on blank lines, and interior whitespace that must
+    /// survive.
+    #[test]
+    fn ascii_fast_path_is_equivalent_to_the_general_unicode_path() {
+        let cases = [
+            "",
+            "\n",
+            "   ",
+            "\t\t\n",
+            "plain\n",
+            "trailing   \nnext\n",
+            "tabs\t\t\nnext",
+            "interior  spaces  stay\n",
+            "mixed \t \t\nand\t \tinterior x\n",
+            "no trailing newline   ",
+            "\n\n\n   \n\n",
+            "a   \n   b   \n   ",
+            "let x = 1;   \n    let y = 2;\t\n",
+        ];
+        for case in cases {
+            assert!(
+                case.is_ascii(),
+                "case must be ASCII to exercise the fast path"
+            );
+            let (fast_text, fast_map) = normalize_ascii::<true>(case);
+            let (slow_text, slow_map) = normalize_general::<true>(case);
+            assert_eq!(fast_text, slow_text, "text diverged for {case:?}");
+            assert_eq!(fast_map, slow_map, "offset map diverged for {case:?}");
+
+            // And the map-less variant must agree with the mapped one on the text it produces.
+            assert_eq!(
+                normalize_ascii::<false>(case).0,
+                fast_text,
+                "no-map text diverged for {case:?}"
+            );
+        }
     }
 
     #[tokio::test]

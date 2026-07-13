@@ -170,3 +170,10 @@ harness = false
 [[bench]]
 name = "serve_events"
 harness = false
+
+# Session persistence — the listing scan (whose cost grows with a user's whole history) and the
+# per-turn durable append. Deliberately runs its temp dirs on the real filesystem, not tmpfs: see the
+# bench's own `real_disk_tempdir` for why measuring `sync_all` on tmpfs answers nothing.
+[[bench]]
+name = "persistence"
+harness = false

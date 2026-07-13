@@ -169,6 +169,110 @@ fn edit_normalize(bencher: Bencher) {
     });
 }
 
+/// The same normalization *without* the offset map — the exact-match path's version. Sits next to
+/// `edit_normalize` on purpose: the pair is an A/B in a single run, so both arms see the same machine
+/// load. The gap between them is the entire prize for building the map lazily, and this box runs other
+/// work, so a cross-invocation comparison would be measuring the neighbours.
+#[divan::bench]
+fn edit_normalize_only(bencher: Bencher) {
+    let src = edit_src();
+    bencher.bench_local(|| {
+        let norm = edit::normalize_only(&src);
+        black_box(norm.len());
+    });
+}
+
+/// The same normalization over a **pure-ASCII** file — which is what source code overwhelmingly is.
+/// NFKC is the identity on ASCII and `fold_char` has nothing to fold, so everything the normalizer
+/// does here except trailing-whitespace stripping is provably wasted. Compare against
+/// `edit_normalize_only` (identical size, a handful of non-ASCII chars) to see what the Unicode
+/// machinery costs when there is no Unicode.
+#[divan::bench]
+fn edit_normalize_ascii(bencher: Bencher) {
+    let mut src = String::with_capacity(READ_LINES * 56);
+    for i in 0..READ_LINES {
+        src.push_str(&format!("    let x_{i} = compute(i, {i}) + adjust();\n"));
+    }
+    bencher.bench_local(|| {
+        let norm = edit::normalize_only(&src);
+        black_box(norm.len());
+    });
+}
+
+/// The realistic source file `edit_run_exact` edits — same shape `edit_normalize` normalizes.
+fn edit_src() -> String {
+    let mut src = String::with_capacity(READ_LINES * 56);
+    for i in 0..READ_LINES {
+        if i % 20 == 0 {
+            src.push_str(&format!("let s = \u{201c}line {i}\u{201d};   \n"));
+        } else {
+            src.push_str(&format!("    let x_{i} = compute(i, {i}) + adjust();\n"));
+        }
+    }
+    src
+}
+
+/// `edit`'s **whole** `run` over a pure-ASCII source file — the realistic common case twice over: the
+/// file is ASCII (source code overwhelmingly is) and the `old_string` matches exactly (the model
+/// reproduces text it just read). This is the number that represents what an `edit` tool call actually
+/// costs in practice.
+#[divan::bench(sample_count = 50)]
+fn edit_run_exact_ascii(bencher: Bencher) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("subject.rs");
+    let mut src = String::with_capacity(READ_LINES * 56);
+    for i in 0..READ_LINES {
+        src.push_str(&format!("    let x_{i} = compute(i, {i}) + adjust();\n"));
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let tool = edit::Edit::new(dir.path());
+    let p = path.to_str().unwrap().to_string();
+    let mut n = 0usize;
+    bencher.bench_local(|| {
+        std::fs::write(&path, &src).unwrap();
+        n += 1;
+        let out = rt
+            .block_on(tool.run(serde_json::json!({
+                "path": p,
+                "old_string": "    let x_1501 = compute(i, 1501) + adjust();",
+                "new_string": format!("    let x_1501 = compute(i, 1501) + adjust(); // {n}"),
+            })))
+            .unwrap();
+        black_box(out.text.len());
+    });
+}
+
+/// The same `run`, but over a file carrying a few non-ASCII characters, so it takes the general
+/// Unicode normalizer. Kept beside `edit_run_exact_ascii` as the guard rail: the ASCII fast path must
+/// not have *regressed* the path that still needs full NFKC.
+#[divan::bench(sample_count = 50)]
+fn edit_run_exact_unicode(bencher: Bencher) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("subject.rs");
+    let src = edit_src();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let tool = edit::Edit::new(dir.path());
+    let p = path.to_str().unwrap().to_string();
+    let mut n = 0usize;
+    bencher.bench_local(|| {
+        // Rewrite the subject each iteration so every sample edits the same pristine input.
+        std::fs::write(&path, &src).unwrap();
+        n += 1;
+        let out = rt
+            .block_on(tool.run(serde_json::json!({
+                "path": p,
+                "old_string": "    let x_1501 = compute(i, 1501) + adjust();",
+                "new_string": format!("    let x_1501 = compute(i, 1501) + adjust(); // {n}"),
+            })))
+            .unwrap();
+        black_box(out.text.len());
+    });
+}
+
 /// A directory of 500 subdirectories, for the `ls` bench — directory entries are exactly where the old
 /// `format!("{name}/")` allocated a second String per entry (and dropped the first).
 fn dir_of_subdirs() -> &'static PathBuf {
