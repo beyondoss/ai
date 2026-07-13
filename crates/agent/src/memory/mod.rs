@@ -452,8 +452,19 @@ pub const PRESSURE_NUDGE: &str = "<system-reminder>Your context is getting large
 /// (`context_window - reserve_tokens`, the point [`agent_core::compaction::should_compact`] fires at).
 /// This leaves runway — typically a few turns — for the model to checkpoint to `/session` before the cut.
 /// Integer math (÷5 ×4) so there is no float cast and no overflow even at a 1M-token window.
+///
+/// Returns [`u32::MAX`] (a "never fires" sentinel — `live_prompt > MAX` is always false) when
+/// `reserve_tokens >= context_window`, i.e. the threshold is 0. That is a pathological or test-only config
+/// with **no proactive window at all**: compaction fires the instant any real usage exists, so there is
+/// no runway to warn within. Without this guard the point would be 0, and `live_prompt > 0` is true on
+/// literally every turn — the nudge would fire on turn one of any small-window session, adding a spurious
+/// steer turn (and, against a fixed-response test server, potentially exhausting or stalling it).
 pub fn compaction_pressure_point(context_window: u32, reserve_tokens: u32) -> u32 {
-    context_window.saturating_sub(reserve_tokens) / 5 * 4
+    let threshold = context_window.saturating_sub(reserve_tokens);
+    if threshold == 0 {
+        return u32::MAX;
+    }
+    threshold / 5 * 4
 }
 
 /// The full prompt size a [`agent_core::message::TokenUsage`] report implies — uncached input plus
@@ -598,9 +609,13 @@ mod tests {
         assert!(p < 200_000 - 16_384, "must fire before the compaction cut");
         assert!(p > (200_000 - 16_384) / 2, "but not absurdly early");
         assert_eq!(p, 183_616 / 5 * 4);
-        // Degenerate windows don't panic or overflow.
-        assert_eq!(compaction_pressure_point(0, 16_384), 0);
-        assert_eq!(compaction_pressure_point(100, 200), 0);
+        // A window with no proactive room (reserve >= window) disables the nudge (never-fires sentinel)
+        // rather than collapsing to 0 — which, as `live_prompt > 0`, would fire on every turn.
+        assert_eq!(compaction_pressure_point(0, 16_384), u32::MAX);
+        assert_eq!(compaction_pressure_point(100, 200), u32::MAX);
+        assert_eq!(compaction_pressure_point(200, 200), u32::MAX);
+        // A real (if small) window still yields a finite, sub-threshold point.
+        assert_eq!(compaction_pressure_point(300, 200), (300 - 200) / 5 * 4);
         assert_eq!(compaction_pressure_point(u32::MAX, 0), u32::MAX / 5 * 4);
     }
 

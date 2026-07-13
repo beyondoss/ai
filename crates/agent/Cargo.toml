@@ -25,6 +25,10 @@ futures.workspace = true
 # Validates the `structured_output` tool's payload against the caller-supplied schema. See the
 # workspace manifest for why `default-features = false` matters here.
 jsonschema.workspace = true
+# The shared provider table: where each provider lives, which wire it speaks, which header its key goes
+# in, and which env var conventionally holds it. The same rows `crates/gateway` proxies on — so the
+# agent's direct route and the gateway's proxy route can never disagree about a provider.
+providers = { package = "beyond-ai-providers", path = "../providers" }
 serde.workspace = true
 serde_json.workspace = true
 # `skills.rs`'s `SKILL.md`/prompt-template frontmatter parsing — a real YAML parser instead of a
@@ -169,4 +173,11 @@ harness = false
 
 [[bench]]
 name = "serve_events"
+harness = false
+
+# Session persistence — the listing scan (whose cost grows with a user's whole history) and the
+# per-turn durable append. Deliberately runs its temp dirs on the real filesystem, not tmpfs: see the
+# bench's own `real_disk_tempdir` for why measuring `sync_all` on tmpfs answers nothing.
+[[bench]]
+name = "persistence"
 harness = false

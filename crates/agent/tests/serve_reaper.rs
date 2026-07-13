@@ -16,7 +16,7 @@ use common::{
 };
 use serde_json::{Value, json};
 
-/// Spawn a `serve --listen` child with the idle reaper armed at `idle_secs`.
+/// Spawn a `serve --listen` child with the idle reaper armed at `idle_secs` (`0` disables reaping).
 fn serve_reaper_child(base: &str, session_dir: &str, port: u16, idle_secs: u64) -> Child {
     Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
         .args([
@@ -106,6 +106,47 @@ async fn idle_session_is_reaped_but_its_turn_persists() {
     assert!(
         dump.contains("committedreply"),
         "the reaped session's committed turn must survive on disk: {dump}"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// (ia) The reaper is on by default (a finite idle window), so `--session-idle-timeout 0` is the
+/// explicit opt-out an operator uses to pin every session for the daemon's lifetime: a detached, idle
+/// session must still be `live` long after any default window would have reclaimed it.
+#[tokio::test]
+async fn zero_idle_timeout_disables_the_reaper() {
+    const SID: &str = "neverreaped001";
+    let (base, _requests) = spawn_model_server(vec![turn_text("pinnedreply")]);
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let mut child = serve_reaper_child(&base, dir.path().to_str().unwrap(), port, 0);
+    wait_for_port(port);
+
+    {
+        let mut ws = ws_connect(port, Some(SID)).await;
+        ws_send(
+            &mut ws,
+            json!({ "type": "prompt", "id": "p", "message": "hi" }),
+        )
+        .await;
+        let frames = ws_read_until_response(&mut ws, "prompt").await;
+        assert_eq!(frames.last().unwrap()["success"], true);
+        drop(ws);
+    }
+
+    // Longer than any reaper tick would need if one were armed at all.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let sessions = list_daemon_sessions(port).await;
+    let entry = sessions
+        .iter()
+        .find(|s| s["id"] == SID)
+        .unwrap_or_else(|| panic!("{SID} should still be listed: {sessions:#?}"));
+    assert_eq!(
+        entry["live"], true,
+        "--session-idle-timeout 0 must disable reaping entirely: {entry}"
     );
 
     let _ = child.kill();

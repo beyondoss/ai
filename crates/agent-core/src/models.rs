@@ -2556,52 +2556,25 @@ fn capabilities_impl(model: &str) -> ModelCaps {
     ModelCaps::unknown()
 }
 
-/// A third-party aggregator platform a request may be routed through — the host/route analogue of
-/// [`ApiKind`]'s wire-format distinction, for the class of bug this table's own section-header doc
-/// comment documents repeatedly: the same bare or vendor-slug model id served by two or more of these
-/// hosts, each with genuinely different real numbers, that [`capabilities`] alone (keyed purely on the
-/// id string) can't disambiguate. Consumed by [`capabilities_for_route_with_host`]; see
-/// [`crate::transport::ModelRequest::host`]'s own doc comment for how (and how much of) this is
+/// Which upstream a request is routed through — the host/route analogue of [`ApiKind`]'s wire-format
+/// distinction, for the class of bug this table's own section-header doc comment documents repeatedly:
+/// the same bare or vendor-slug model id served by two or more hosts, each with genuinely different
+/// real numbers, that [`capabilities`] alone (keyed purely on the id string) can't disambiguate.
+/// Consumed by [`capabilities_for_route_with_host`] and [`crate::dialect::Dialect::for_model_via_provider`];
+/// see [`crate::transport::ModelRequest::host`]'s own doc comment for how (and how much of) this is
 /// actually populated today.
 ///
-/// Not every variant here is a genuine same-string collision in practice — Fireworks ids, for
-/// instance, are already self-identifying by shape (`is_fireworks_model`) and need no host signal at
-/// all — but all nine are named here together so the one mechanism covers every aggregator platform
-/// this codebase routes to, rather than growing a new one-off per host as each collision is found.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AggregatorHost {
-    /// `api.together.ai` (`crates/gateway/src/route.rs`'s `"together"` `KNOWN_PROVIDERS` row).
-    Together,
-    /// `router.huggingface.co` — BYO-only (named via `ModelOverride::base_url`; no gateway-native
-    /// route exists for it).
-    HuggingFace,
-    /// `api.groq.com` (`"groq"` `KNOWN_PROVIDERS` row).
-    Groq,
-    /// `api.fireworks.ai` (`"fireworks"` `KNOWN_PROVIDERS` row) — already self-identifying by id shape
-    /// (`is_fireworks_model`); included for completeness of the mechanism, not because a host signal is
-    /// actually required to recognize one.
-    Fireworks,
-    /// NVIDIA NIM — BYO-only.
-    Nvidia,
-    /// `openrouter.ai` (`"openrouter"` `KNOWN_PROVIDERS` row).
-    OpenRouter,
-    /// `api.kimi.com/coding` — BYO-only, and already disambiguated from moonshotai-native by a
-    /// `ModelOverride::dialect`/`base_url` override rather than by id shape (see `dialect/mod.rs`'s own
-    /// Kimi-Coding handling) — included here too since its capability numbers still benefit from a
-    /// host signal the same way every other aggregator's do.
-    KimiCoding,
-    /// `opencode.ai/zen`(`/v1`) — pi's `opencode.models.ts` — BYO-only, named via
-    /// `ModelOverride::base_url`. Distinct from [`Self::OpenCodeGo`] below: both are nested under the
-    /// same registered domain (`opencode.ai`), but genuinely disagree on real numbers/wire dialect for
-    /// a handful of shared bare ids (`"minimax-m3"`, `"glm-5.1"`) — a hostname-only check the way every
-    /// other variant here uses can't tell the two apart; see
-    /// `crates/agent::gateway_credential::aggregator_host_for_base_url`'s own doc comment for how the
-    /// `/zen` vs `/zen/go` path segment disambiguates them.
-    OpenCodeZen,
-    /// `opencode.ai/zen/go`(`/v1`) — pi's `opencode-go.models.ts`. See [`Self::OpenCodeZen`]'s own doc
-    /// comment for why this needs to be a separate variant rather than folded into it.
-    OpenCodeGo,
-}
+/// This is the shared [`providers::ProviderId`], re-exported under the name this crate has always used
+/// it by. It was a nine-variant enum local to this file until the provider table was unified — the same
+/// nine hosts were also, separately, rows in the gateway's routing table and entries in the agent's
+/// base-URL→host lookup, and keeping three hand-maintained copies of "which upstream is this" in sync
+/// is what the shared crate ends. The extra variants it brings (native OpenAI, DeepSeek, xAI, …) are
+/// simply upstreams that never needed a *capability* override; every `match` on this type here already
+/// has a catch-all arm, so they cost nothing and cannot silently change a lookup.
+///
+/// Not every variant is a genuine same-string collision in practice — Fireworks ids, for instance, are
+/// already self-identifying by shape ([`is_fireworks_model`]) and need no host signal at all.
+pub use providers::ProviderId as AggregatorHost;
 
 /// Route-aware capability override for the handful of OpenAI ids whose real numbers/thinking-map
 /// diverge by which route serves them — native (`packages/ai/src/providers/openai.models.ts`), OpenAI

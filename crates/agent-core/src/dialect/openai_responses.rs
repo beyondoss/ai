@@ -612,14 +612,22 @@ fn str_at<'a>(v: Option<&'a Value>, key: &str) -> &'a str {
         .unwrap_or("")
 }
 
-fn i64_at(v: &Value, key: &str) -> i64 {
-    v.get(key).and_then(Value::as_i64).unwrap_or(-1)
+/// Read a wire-provided block index. `None` on a missing, non-numeric, or negative value — never
+/// defaulted, and in particular never defaulted to the `-1`-cast-to-`usize` (i.e. `usize::MAX`) this
+/// used to produce. Two `output_item.added` events that both lack an `output_index` would otherwise
+/// both open at that same synthetic index, and `Accumulator::apply`'s `open.insert(index, ..)` would
+/// silently *overwrite* the first with the second: one tool call disappears with no error, and both
+/// calls' argument fragments concatenate into a single malformed buffer. Dropping the malformed event
+/// instead is the same refuse-to-guess posture `dialect::anthropic`'s own `usize_at` documents.
+fn usize_at(v: &Value, key: &str) -> Option<usize> {
+    let n = v.get(key).and_then(Value::as_i64)?;
+    usize::try_from(n).ok()
 }
 
 fn u32_field(v: Option<&Value>, key: &str) -> u32 {
     v.and_then(|v| v.get(key))
         .and_then(Value::as_u64)
-        .unwrap_or(0) as u32
+        .map_or(0, super::saturating_u32)
 }
 
 /// Build the error message for a `response.failed` event, in the same `code: message` shape
@@ -726,7 +734,7 @@ fn message_item_id_phase(item: Option<&Value>) -> (Option<String>, Option<String
 /// anything a malformed/truncated stream left open.
 pub struct Decoder {
     started: bool,
-    open_indices: Vec<i64>,
+    open_indices: Vec<usize>,
     saw_terminal: bool,
     failed: Option<String>,
     saw_tool_call: bool,
@@ -750,7 +758,7 @@ impl Default for Decoder {
 
 impl Decoder {
     /// Emit `ev` for `index`, marking it open (a no-op if it already is).
-    fn emit(&mut self, out: &mut Vec<StreamEvent>, index: i64, ev: StreamEvent) {
+    fn emit(&mut self, out: &mut Vec<StreamEvent>, index: usize, ev: StreamEvent) {
         if !self.open_indices.contains(&index) {
             self.open_indices.push(index);
         }
@@ -759,12 +767,10 @@ impl Decoder {
 
     /// Close `index`, if it's actually open — a `done` for an index never opened is a stale/duplicate
     /// event, silently ignored rather than emitting a spurious close for a block that doesn't exist.
-    fn close(&mut self, out: &mut Vec<StreamEvent>, index: i64) {
+    fn close(&mut self, out: &mut Vec<StreamEvent>, index: usize) {
         if let Some(pos) = self.open_indices.iter().position(|&i| i == index) {
             self.open_indices.remove(pos);
-            out.push(StreamEvent::ContentBlockStop {
-                index: index as usize,
-            });
+            out.push(StreamEvent::ContentBlockStop { index });
         }
     }
 
@@ -789,9 +795,7 @@ impl Decoder {
         // event arrives — but a malformed/truncated stream must not silently drop whatever's still
         // open, at any index.
         for index in std::mem::take(&mut self.open_indices) {
-            out.push(StreamEvent::ContentBlockStop {
-                index: index as usize,
-            });
+            out.push(StreamEvent::ContentBlockStop { index });
         }
 
         let response = data.get("response");
@@ -849,7 +853,7 @@ impl Decoder {
 struct FastDeltaEvent {
     #[serde(rename = "type")]
     kind: FastDeltaKind,
-    output_index: i64,
+    output_index: usize,
     delta: String,
 }
 
@@ -873,16 +877,16 @@ impl StreamDecoder for Decoder {
         let index = parsed.output_index;
         let ev = match parsed.kind {
             FastDeltaKind::OutputText | FastDeltaKind::Refusal => StreamEvent::TextDelta {
-                index: index as usize,
+                index,
                 text: parsed.delta,
             },
             FastDeltaKind::FunctionCallArguments => StreamEvent::InputJsonDelta {
-                index: index as usize,
+                index,
                 partial_json: parsed.delta,
             },
             FastDeltaKind::ReasoningSummaryText | FastDeltaKind::ReasoningText => {
                 StreamEvent::ThinkingDelta {
-                    index: index as usize,
+                    index,
                     text: parsed.delta,
                 }
             }
@@ -910,7 +914,10 @@ impl StreamDecoder for Decoder {
         let kind = data.get("type").and_then(Value::as_str).unwrap_or("");
         match kind {
             "response.output_item.added" => {
-                let index = i64_at(data, "output_index");
+                let Some(index) = usize_at(data, "output_index") else {
+                    tracing::warn!(event = %kind, "responses event with no usable output_index; dropping");
+                    return out;
+                };
                 let item = data.get("item");
                 if item.and_then(|i| i.get("type")).and_then(Value::as_str) == Some("function_call")
                 {
@@ -926,11 +933,7 @@ impl StreamDecoder for Decoder {
                     self.emit(
                         &mut out,
                         index,
-                        StreamEvent::ToolUseStart {
-                            index: index as usize,
-                            id,
-                            name,
-                        },
+                        StreamEvent::ToolUseStart { index, id, name },
                     );
                 }
                 // A message/reasoning item has no explicit "start" `StreamEvent` — it opens implicitly
@@ -938,18 +941,24 @@ impl StreamDecoder for Decoder {
                 // Nothing to emit here for those.
             }
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
-                let index = i64_at(data, "output_index");
+                let Some(index) = usize_at(data, "output_index") else {
+                    tracing::warn!(event = %kind, "responses event with no usable output_index; dropping");
+                    return out;
+                };
                 self.emit(
                     &mut out,
                     index,
                     StreamEvent::ThinkingDelta {
-                        index: index as usize,
+                        index,
                         text: str_at(Some(data), "delta").to_string(),
                     },
                 );
             }
             "response.reasoning_summary_part.done" => {
-                let index = i64_at(data, "output_index");
+                let Some(index) = usize_at(data, "output_index") else {
+                    tracing::warn!(event = %kind, "responses event with no usable output_index; dropping");
+                    return out;
+                };
                 // Only meaningful for an index that's already open (accrued some reasoning text) —
                 // otherwise there's nothing to add a paragraph break to.
                 if self.open_indices.contains(&index) {
@@ -957,30 +966,36 @@ impl StreamDecoder for Decoder {
                         &mut out,
                         index,
                         StreamEvent::ThinkingDelta {
-                            index: index as usize,
+                            index,
                             text: "\n\n".to_string(),
                         },
                     );
                 }
             }
             "response.output_text.delta" | "response.refusal.delta" => {
-                let index = i64_at(data, "output_index");
+                let Some(index) = usize_at(data, "output_index") else {
+                    tracing::warn!(event = %kind, "responses event with no usable output_index; dropping");
+                    return out;
+                };
                 self.emit(
                     &mut out,
                     index,
                     StreamEvent::TextDelta {
-                        index: index as usize,
+                        index,
                         text: str_at(Some(data), "delta").to_string(),
                     },
                 );
             }
             "response.function_call_arguments.delta" => {
-                let index = i64_at(data, "output_index");
+                let Some(index) = usize_at(data, "output_index") else {
+                    tracing::warn!(event = %kind, "responses event with no usable output_index; dropping");
+                    return out;
+                };
                 self.emit(
                     &mut out,
                     index,
                     StreamEvent::InputJsonDelta {
-                        index: index as usize,
+                        index,
                         partial_json: str_at(Some(data), "delta").to_string(),
                     },
                 );
@@ -990,18 +1005,24 @@ impl StreamDecoder for Decoder {
                 // the streamed deltas produced so far, so a single dropped/duplicated mid-stream delta
                 // (a relay hiccup with no transport-level error — nothing else would ever catch it)
                 // can't silently leave the final call's arguments corrupted.
-                let index = i64_at(data, "output_index");
+                let Some(index) = usize_at(data, "output_index") else {
+                    tracing::warn!(event = %kind, "responses event with no usable output_index; dropping");
+                    return out;
+                };
                 self.emit(
                     &mut out,
                     index,
                     StreamEvent::InputJsonFinal {
-                        index: index as usize,
+                        index,
                         full_json: str_at(Some(data), "arguments").to_string(),
                     },
                 );
             }
             "response.output_item.done" => {
-                let index = i64_at(data, "output_index");
+                let Some(index) = usize_at(data, "output_index") else {
+                    tracing::warn!(event = %kind, "responses event with no usable output_index; dropping");
+                    return out;
+                };
                 if !self.open_indices.contains(&index) {
                     // A `done` for an index we never saw open — duplicate/stale event, ignored.
                 } else {
@@ -1015,7 +1036,7 @@ impl StreamDecoder for Decoder {
                                 &mut out,
                                 index,
                                 StreamEvent::SignatureDelta {
-                                    index: index as usize,
+                                    index,
                                     signature: item.map(ToString::to_string).unwrap_or_default(),
                                 },
                             );
@@ -1028,10 +1049,7 @@ impl StreamDecoder for Decoder {
                                 self.emit(
                                     &mut out,
                                     index,
-                                    StreamEvent::ThinkingFinal {
-                                        index: index as usize,
-                                        text,
-                                    },
+                                    StreamEvent::ThinkingFinal { index, text },
                                 );
                             }
                         }
@@ -1047,7 +1065,7 @@ impl StreamDecoder for Decoder {
                                     &mut out,
                                     index,
                                     StreamEvent::InputJsonFinal {
-                                        index: index as usize,
+                                        index,
                                         full_json: args.to_string(),
                                     },
                                 );
@@ -1060,7 +1078,7 @@ impl StreamDecoder for Decoder {
                                     &mut out,
                                     index,
                                     StreamEvent::TextFinal {
-                                        index: index as usize,
+                                        index,
                                         text,
                                         id,
                                         phase,
@@ -1142,6 +1160,64 @@ mod tests {
     use super::*;
     use crate::dialect::decode_sse;
     use crate::message::{ImageSource, Message, ToolDef};
+
+    #[test]
+    fn two_function_calls_with_no_output_index_are_dropped_not_collapsed_onto_one_index() {
+        // Regression: `output_index` used to default to `-1`, which every handler then cast with
+        // `as usize` — i.e. `usize::MAX`. Two `function_call` items lacking the field both opened at
+        // that one synthetic index, and the accumulator's `open.insert(index, ..)` silently overwrote
+        // the first call with the second: a tool call vanished with no error at all, and both calls'
+        // argument fragments ran together into one malformed buffer. Refuse to guess an index instead.
+        let sse = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"item\":",
+            "{\"type\":\"function_call\",\"call_id\":\"c1\",\"id\":\"i1\",\"name\":\"first\"}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"item\":",
+            "{\"type\":\"function_call\",\"call_id\":\"c2\",\"id\":\"i2\",\"name\":\"second\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+        );
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, sse).expect("a missing index must not error the stream");
+        let starts: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::ToolUseStart { .. }))
+            .collect();
+        assert!(
+            starts.is_empty(),
+            "an event with no usable output_index must be dropped, not opened at a synthetic \
+             index where a sibling call can silently overwrite it; got: {starts:?}"
+        );
+
+        // A negative index is the same class of malformed input and must be refused identically —
+        // it is what `-1` was being read as before, just spelled explicitly on the wire.
+        assert_eq!(
+            usize_at(&serde_json::json!({"output_index": -1}), "output_index"),
+            None
+        );
+        assert_eq!(usize_at(&serde_json::json!({}), "output_index"), None);
+        assert_eq!(
+            usize_at(&serde_json::json!({"output_index": 3}), "output_index"),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn an_absurd_provider_token_count_clamps_instead_of_wrapping_to_a_small_number() {
+        // `as u32` is not covered by `overflow-checks`: it wraps silently, so `u32::MAX + 2` used to
+        // land as `1`. A tiny `input_tokens` is the dangerous direction — it makes a nearly-full
+        // context look empty and *suppresses* the compaction that would have saved the turn.
+        let sse = concat!(
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",",
+            "\"usage\":{\"input_tokens\":4294967297,\"output_tokens\":5}}}\n\n",
+        );
+        let mut dec = Decoder::default();
+        decode_sse(&mut dec, sse).expect("decode");
+        assert_eq!(
+            dec.usage.input_tokens,
+            u32::MAX,
+            "an out-of-range token count must clamp to u32::MAX, never wrap to a small number"
+        );
+        assert_eq!(dec.usage.output_tokens, 5);
+    }
 
     #[test]
     fn build_body_sends_temperature_when_set() {

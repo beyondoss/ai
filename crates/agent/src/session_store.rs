@@ -367,6 +367,11 @@ enum Entry {
         /// `tool_use` block that carried it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         todos: Option<serde_json::Value>,
+        /// The `memory`-note paths carried across this round (see `CompactionProvenance::memory_notes`),
+        /// restored the same way so a restart past a compaction doesn't lose the model's awareness of what
+        /// it wrote to its working/durable memory.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        memory_notes: Vec<String>,
     },
     /// A record that the active model changed, anchored to whatever message was the tip at the moment
     /// it did — see [`SessionStore::record_model_change`]/[`SessionStore::model_at`]. `parent_id` here
@@ -568,7 +573,14 @@ enum NodeContent {
 #[derive(Clone)]
 struct Node {
     parent_id: Option<String>,
-    content: NodeContent,
+    /// Behind an `Arc` because a node's content is immutable once inserted (nothing here ever mutates
+    /// an existing entry — the file is append-only, and so is this index), and one message's content
+    /// can legitimately belong to two nodes at once: [`SessionStore::rewrite_compacted`] deliberately
+    /// keeps the pre-compaction chain intact (its provenance guarantee) *and* re-emits the surviving
+    /// suffix under fresh ids on the new active chain, so every kept message would otherwise be held
+    /// twice in memory — once per compaction round, forever. Sharing makes that duplication cost a
+    /// refcount instead of a full [`Message`] clone.
+    content: Arc<NodeContent>,
     /// Unix seconds this entry was actually appended, from [`Entry::Message`]/[`Entry::Custom`]'s own
     /// `timestamp` field — `0` for a node with no recorded timestamp (a legacy file written before this
     /// field existed, or a branch-summary-materialized node, which doesn't carry one). See
@@ -586,7 +598,7 @@ impl Node {
     /// pi's own `buildSessionContext` skipping `"custom"`-typed entries. See [`Entry::Custom`]'s doc
     /// comment.
     fn as_message(&self) -> Option<&Message> {
-        match &self.content {
+        match &*self.content {
             NodeContent::Message(m) => Some(m),
             NodeContent::Custom { .. } => None,
         }
@@ -871,7 +883,7 @@ impl SessionStore {
                         id.clone(),
                         Node {
                             parent_id,
-                            content: NodeContent::Message(message),
+                            content: Arc::new(NodeContent::Message(message)),
                             timestamp,
                         },
                     );
@@ -893,7 +905,9 @@ impl SessionStore {
                         id.clone(),
                         Node {
                             parent_id,
-                            content: NodeContent::Message(branch_summary_message(&summary)),
+                            content: Arc::new(NodeContent::Message(branch_summary_message(
+                                &summary,
+                            ))),
                             // Track L45 (pi-parity fix): `Entry::BranchSummary` now carries its own
                             // `timestamp`, same as `Entry::Message`/`Entry::Custom` — `0` here only for
                             // a legacy file written before this field existed (`#[serde(default)]`),
@@ -926,7 +940,7 @@ impl SessionStore {
                         id.clone(),
                         Node {
                             parent_id,
-                            content: NodeContent::Custom { kind, data },
+                            content: Arc::new(NodeContent::Custom { kind, data }),
                             timestamp,
                         },
                     );
@@ -945,6 +959,7 @@ impl SessionStore {
                     modified_files,
                     last_reason,
                     todos,
+                    memory_notes,
                     ..
                 }) => {
                     // Each record already carries every earlier round's file-provenance folded in (via
@@ -960,6 +975,7 @@ impl SessionStore {
                         compactions: 0, // replaced by `meta.compactions` (the authoritative counter) below
                         last_reason,
                         todos,
+                        memory_notes,
                     });
                     compactions.insert(
                         id,
@@ -1188,20 +1204,23 @@ impl SessionStore {
         for msg in &messages[self.persisted..] {
             let id = new_id();
             let timestamp = now_secs();
-            write_line(
+            // Serialized through `EntryRef`, which borrows `msg` — the `Node` below owns the one copy
+            // this loop legitimately needs (the in-memory tree keeps it), and the serializer no longer
+            // takes a second one it would drop on the next line.
+            write_line_ref(
                 &mut buf,
-                &Entry::Message {
-                    id: Some(id.clone()),
-                    parent_id: parent.clone(),
+                &EntryRef::Message {
+                    id: Some(&id),
+                    parent_id: parent.as_deref(),
                     timestamp,
-                    message: msg.clone(),
+                    message: msg,
                 },
             )?;
             staged.push((
                 id.clone(),
                 Node {
                     parent_id: parent.clone(),
-                    content: NodeContent::Message(msg.clone()),
+                    content: Arc::new(NodeContent::Message(msg.clone())),
                     timestamp,
                 },
             ));
@@ -1241,6 +1260,27 @@ impl SessionStore {
         kind: impl Into<String>,
         data: serde_json::Value,
     ) -> std::io::Result<String> {
+        // `data` is opaque and caller-supplied, and on the `serve` path the caller is a remote client
+        // (`{type:"append_custom", kind, data?}`). It is retained three times over — in the appended
+        // `Entry`, in `self.nodes`, and in `self.events` — and nothing downstream ever interprets or
+        // shrinks it, so an unbounded blob here is an unbounded write amplified threefold, on a single
+        // request. Everything else this store retains is at least proportional to conversation that
+        // actually happened; this is the one input a client can make arbitrarily large for free.
+        //
+        // Rejected outright rather than truncated: the entry is opaque by contract, so a *partial*
+        // `data` is not a degraded version of itself — it's corrupt, and this module has no way to know
+        // what that would break for whoever wrote it. The caller gets a real error and can decide.
+        let size = serde_json::to_vec(&data)
+            .map(|v| v.len())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        if size > MAX_CUSTOM_ENTRY_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "custom entry `data` is {size} bytes, over the {MAX_CUSTOM_ENTRY_BYTES}-byte limit"
+                ),
+            ));
+        }
         let kind = kind.into();
         let id = new_id();
         let timestamp = now_secs();
@@ -1261,7 +1301,7 @@ impl SessionStore {
             id.clone(),
             Node {
                 parent_id,
-                content: NodeContent::Custom { kind, data },
+                content: Arc::new(NodeContent::Custom { kind, data }),
                 timestamp,
             },
         );
@@ -1337,7 +1377,7 @@ impl SessionStore {
                 id.clone(),
                 Node {
                     parent_id: parent.clone(),
-                    content: NodeContent::Message(m.clone()),
+                    content: Arc::new(NodeContent::Message(m.clone())),
                     timestamp: now_secs(),
                 },
             ));
@@ -1379,7 +1419,7 @@ impl SessionStore {
             // `messages: &[Message]` admits nothing else. Round-tripping each back through its own
             // original `Entry` variant, not unconditionally `Entry::Message`, is what keeps a preserved
             // custom entry from being silently corrupted into an empty/default message by a rewrite.
-            match &node.content {
+            match &*node.content {
                 NodeContent::Message(m) => write_line(
                     &mut f,
                     &Entry::Message {
@@ -1562,7 +1602,7 @@ impl SessionStore {
                 id.clone(),
                 Node {
                     parent_id: parent.clone(),
-                    content: NodeContent::Message(summary.clone()),
+                    content: Arc::new(NodeContent::Message(summary.clone())),
                     timestamp: now_secs(),
                 },
             ));
@@ -1574,14 +1614,23 @@ impl SessionStore {
         // in lockstep by construction — see this method's doc comment); a custom id clones its content
         // unchanged.
         for id in &kept_suffix_ids {
-            let content = match &self.nodes[id].content {
-                NodeContent::Message(_) => match rest.next() {
-                    Some(m) => NodeContent::Message(m.clone()),
+            // The original node stays exactly where it is (that's the provenance guarantee above), so
+            // this new node's content is a second, identical copy of it — shared rather than cloned,
+            // since a node's content is immutable once inserted. Otherwise every compaction round would
+            // permanently double the memory held for every message that survived it. The equality check
+            // keeps the sharing an optimization and not a *trust*: `messages[1..]` is the kept suffix
+            // verbatim by construction, but if a caller ever broke that, its message still wins — the
+            // behavior is identical to cloning unconditionally, only cheaper.
+            let original = &self.nodes[id].content;
+            let content = match &**original {
+                NodeContent::Message(existing) => match rest.next() {
+                    Some(m) if m == existing => Arc::clone(original),
+                    Some(m) => Arc::new(NodeContent::Message(m.clone())),
                     None => unreachable!(
                         "kept_suffix_ids and messages[1..] must have the same message count"
                     ),
                 },
-                custom @ NodeContent::Custom { .. } => custom.clone(),
+                NodeContent::Custom { .. } => Arc::clone(original),
             };
             let new_node_id = new_id();
             new_nodes.push((
@@ -1617,6 +1666,7 @@ impl SessionStore {
             modified_files: meta.provenance.modified_files,
             last_reason: meta.provenance.last_reason,
             todos: meta.provenance.todos,
+            memory_notes: meta.provenance.memory_notes,
         };
 
         // An updated header snapshot (the new `compactions`/`dropped_messages` counters) first, then the
@@ -1671,7 +1721,7 @@ impl SessionStore {
             // carried forward from the kept suffix — round-tripped through its own original `Entry`
             // variant, not unconditionally `Entry::Message`, mirroring `rewrite`'s own preserved-node
             // handling.
-            match &node.content {
+            match &*node.content {
                 NodeContent::Message(m) => write_line(
                     &mut buf,
                     &Entry::Message {
@@ -1918,7 +1968,7 @@ impl SessionStore {
             .nodes
             .iter()
             .map(|(id, node)| {
-                let (role, preview, entry_kind) = match &node.content {
+                let (role, preview, entry_kind) = match &*node.content {
                     // A materialized branch-summary recap is a real `NodeContent::Message` (so it
                     // actually reaches the model — see `branch_summary_message`), indistinguishable
                     // from an ordinary message by content alone; `branch_summary_details` is exactly
@@ -2111,7 +2161,7 @@ impl SessionStore {
             entry_id.clone(),
             Node {
                 parent_id: Some(target_id.to_string()),
-                content: NodeContent::Message(branch_summary_message(&summary)),
+                content: Arc::new(NodeContent::Message(branch_summary_message(&summary))),
                 timestamp,
             },
         );
@@ -2213,7 +2263,7 @@ impl SessionStore {
             entry_id.clone(),
             Node {
                 parent_id: None,
-                content: NodeContent::Message(branch_summary_message(&summary)),
+                content: Arc::new(NodeContent::Message(branch_summary_message(&summary))),
                 timestamp,
             },
         );
@@ -3429,39 +3479,279 @@ pub(crate) fn scan_session_dir(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// The sidecar listing index: one per session directory, next to the `.jsonl` files it describes.
+///
+/// A listing needs a handful of derived fields (preview, message count, `updated_at`, search text), and
+/// the only way to recover them from a transcript is to read it end to end — `read_listing` is a
+/// streaming parse, but it is still O(bytes), and a session file grows without bound as its
+/// conversation does. Measured: listing a 13 MB session costs ~14 ms, of which only ~15% is reading the
+/// bytes; the other ~85% is `serde_json` *tokenizing* payload it then throws away. That's why no parser
+/// trick fixes this — skipping materialization doesn't skip tokenization (both were tried and both
+/// bought 0% wall time). The only way to make the scan cheaper is to not do it.
+///
+/// So each file's computed `SessionMeta` is cached here against the `(size, mtime)` it was computed
+/// from. A session file is append-only, so any change to it moves both — a stale entry can't survive a
+/// write. On a warm index a listing costs one `stat` per file instead of a full parse, which turns the
+/// scan from O(total transcript bytes) into O(sessions).
+///
+/// It is a **cache, and only a cache**: every read is best-effort, and any failure (missing, corrupt,
+/// unknown version, unreadable, unwritable directory) simply falls back to scanning the file, which is
+/// exactly what the code did before this existed. Nothing here is a source of truth, so a lost or
+/// clobbered index costs time, never correctness — which is also why concurrent writers need no locking
+/// beyond the atomic rename below.
+const LISTING_INDEX_FILE: &str = ".listings.json";
+
+/// Bumped whenever a change to the derived fields would make previously-cached entries wrong (a new
+/// field, a different preview rule). An index at any other version is ignored wholesale and rebuilt,
+/// so an upgrade can never serve stale-shaped metadata.
+const LISTING_INDEX_VERSION: u32 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct ListingIndex {
+    version: u32,
+    /// Keyed by file *name*, not full path — the index lives in the directory it describes, so the
+    /// directory component is implied, and the file stays valid if the whole tree is moved.
+    entries: HashMap<String, ListingIndexEntry>,
+}
+
+/// One file's cached listing.
+///
+/// The four derived fields are carried **explicitly** rather than riding along inside `meta`, because
+/// `SessionMeta` marks every one of them `#[serde(skip)]` — deliberately, so they can never go stale
+/// inside the on-disk *header* (see their doc comments). That is the right call there and exactly the
+/// wrong one here: serializing a `SessionMeta` into this index would silently drop the only fields the
+/// index exists to remember, and hand back a listing with `updated_at: 0` and no preview. Naming them
+/// here keeps the header's invariant intact while letting the cache do its job, and means adding a fifth
+/// derived field is a compile error in this struct rather than a silent hole in the cache.
+#[derive(Clone, Serialize, Deserialize)]
+struct ListingIndexEntry {
+    /// The `(size, mtime)` the cached listing was computed from. Both must match for it to be used.
+    size: u64,
+    mtime_ns: u128,
+    /// The persisted header fields (everything `SessionMeta` does serialize).
+    meta: SessionMeta,
+    updated_at: u64,
+    message_count: usize,
+    preview: Option<String>,
+    search_text: String,
+}
+
+impl ListingIndexEntry {
+    fn new(size: u64, mtime_ns: u128, meta: &SessionMeta) -> Self {
+        Self {
+            size,
+            mtime_ns,
+            meta: meta.clone(),
+            updated_at: meta.updated_at,
+            message_count: meta.message_count,
+            preview: meta.preview.clone(),
+            search_text: meta.search_text.clone(),
+        }
+    }
+
+    /// Reassemble the full `SessionMeta` a scan would have produced — header fields from `meta`, derived
+    /// fields from the ones stored beside it.
+    fn to_meta(&self) -> SessionMeta {
+        SessionMeta {
+            updated_at: self.updated_at,
+            message_count: self.message_count,
+            preview: self.preview.clone(),
+            search_text: self.search_text.clone(),
+            ..self.meta.clone()
+        }
+    }
+}
+
+/// A file's cache validity stamp. Nanosecond mtime rather than the whole-second [`mtime_secs`] used for
+/// display: two appends inside the same second are ordinary during a live session, and a
+/// second-resolution stamp would happily serve a stale listing for one of them. Size is carried too, so
+/// even a filesystem with a coarse clock still invalidates on any append.
+fn file_stamp(path: &Path) -> Option<(u64, u128)> {
+    let m = fs::metadata(path).ok()?;
+    let mtime = m.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    Some((m.len(), mtime.as_nanos()))
+}
+
+/// Best-effort load. Any problem at all yields an empty index and a full rescan.
+fn load_listing_index(dir: &Path) -> HashMap<String, ListingIndexEntry> {
+    let raw = match fs::read_to_string(dir.join(LISTING_INDEX_FILE)) {
+        Ok(raw) => raw,
+        Err(_) => return HashMap::new(),
+    };
+    match serde_json::from_str::<ListingIndex>(&raw) {
+        Ok(idx) if idx.version == LISTING_INDEX_VERSION => idx.entries,
+        _ => HashMap::new(),
+    }
+}
+
+/// Write the index atomically (temp file + rename), so a reader never observes a half-written one and a
+/// crash mid-write leaves the previous index intact rather than a corrupt one. No `fsync`: this is a
+/// cache, and paying durability costs to protect data we can always recompute would defeat the purpose.
+/// Concurrent writers race to rename and the last one wins — both wrote a valid index, so either is
+/// correct.
+///
+/// Every error is swallowed deliberately. A read-only or unwritable session directory must still *list*;
+/// it just doesn't get to keep a cache.
+fn store_listing_index(dir: &Path, entries: &HashMap<String, ListingIndexEntry>) {
+    let idx = ListingIndex {
+        version: LISTING_INDEX_VERSION,
+        entries: entries.clone(),
+    };
+    let Ok(bytes) = serde_json::to_vec(&idx) else {
+        return;
+    };
+    // Unique per process so two concurrent listers can't tear each other's temp file.
+    let tmp = dir.join(format!(".listings.{}.tmp", std::process::id()));
+    let write = (|| -> std::io::Result<()> {
+        let mut f = create_private(&tmp)?;
+        f.write_all(&bytes)?;
+        f.flush()?;
+        drop(f);
+        fs::rename(&tmp, dir.join(LISTING_INDEX_FILE))
+    })();
+    if write.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+}
+
 /// Scan every path in `paths` for its listing metadata, calling `on_progress(scanned, total)` once per
 /// path — including ones that turn out unreadable, which still count as scanned and just contribute
-/// nothing. `read_listing` is pure disk I/O plus parsing with no dependency between files, so the work
-/// fans out across a small worker pool (`std::thread::available_parallelism`, capped at one thread per
-/// path) rather than running strictly one file at a time; below two candidate workers it just runs
-/// inline; no thread pool to justify the setup cost for a one- or two-file listing. Returned in
-/// arbitrary order — every caller sorts the result itself.
+/// nothing.
+///
+/// Files whose `(size, mtime)` still match the sidecar [`ListingIndex`] are served from it without being
+/// opened; only the rest are actually parsed. Those misses are pure disk I/O plus parsing with no
+/// dependency between files, so they fan out across a small worker pool
+/// (`std::thread::available_parallelism`, capped at one thread per file) rather than running strictly one
+/// at a time; below two candidate workers it just runs inline, there being no thread pool worth its setup
+/// cost for a one- or two-file scan. Returned in arbitrary order — every caller sorts the result itself.
 pub(crate) fn scan_listings(
     paths: Vec<PathBuf>,
     on_progress: &(impl Fn(usize, usize) + Send + Sync),
 ) -> Vec<SessionMeta> {
     let total = paths.len();
+    if total == 0 {
+        return Vec::new();
+    }
+
+    // One index per directory — `list_all` spans many project directories in a single flat scan, and
+    // each keeps its own sidecar next to its own files.
+    let mut indexes: HashMap<PathBuf, HashMap<String, ListingIndexEntry>> = HashMap::new();
+    for p in &paths {
+        if let Some(dir) = p.parent() {
+            if !indexes.contains_key(dir) {
+                indexes.insert(dir.to_path_buf(), load_listing_index(dir));
+            }
+        }
+    }
+
+    // Split into cache hits (served from the index) and misses (must be parsed). A hit still counts as
+    // scanned, so `on_progress` stays monotonic and reaches `total` exactly as before.
+    let mut hits: Vec<SessionMeta> = Vec::new();
+    let mut misses: Vec<PathBuf> = Vec::new();
+    // The stamp each miss was read at, so the rebuilt index records what it was *actually* computed
+    // from. Stamping after the parse instead would race an append landing mid-scan and cache a listing
+    // against a file state it never saw.
+    let mut miss_stamps: HashMap<PathBuf, (u64, u128)> = HashMap::new();
+    let mut fresh: HashMap<PathBuf, HashMap<String, ListingIndexEntry>> = HashMap::new();
+    let mut scanned = 0usize;
+
+    for p in &paths {
+        let stamp = file_stamp(p);
+        let cached = (|| {
+            let (size, mtime_ns) = stamp?;
+            let dir = p.parent()?;
+            let name = p.file_name()?.to_str()?;
+            let e = indexes.get(dir)?.get(name)?;
+            (e.size == size && e.mtime_ns == mtime_ns).then(|| e.to_meta())
+        })();
+        match cached {
+            Some(meta) => {
+                if let (Some(dir), Some(name), Some((size, mtime_ns))) =
+                    (p.parent(), p.file_name().and_then(|n| n.to_str()), stamp)
+                {
+                    fresh
+                        .entry(dir.to_path_buf())
+                        .or_default()
+                        .insert(name.to_string(), ListingIndexEntry::new(size, mtime_ns, &meta));
+                }
+                hits.push(meta);
+                scanned += 1;
+                on_progress(scanned, total);
+            }
+            None => {
+                if let Some(s) = stamp {
+                    miss_stamps.insert(p.clone(), s);
+                }
+                misses.push(p.clone());
+            }
+        }
+    }
+
+    let mut metas = hits;
+    metas.reserve(misses.len());
+    for (path, meta) in scan_uncached(&misses, scanned, total, on_progress) {
+        // Only a file we managed to stamp *before* reading can be cached — otherwise there's nothing to
+        // validate a future hit against.
+        if let (Some(dir), Some(name), Some(&(size, mtime_ns))) = (
+            path.parent(),
+            path.file_name().and_then(|n| n.to_str()),
+            miss_stamps.get(&path),
+        ) {
+            fresh
+                .entry(dir.to_path_buf())
+                .or_default()
+                .insert(name.to_string(), ListingIndexEntry::new(size, mtime_ns, &meta));
+        }
+        metas.push(meta);
+    }
+
+    // Rebuilt from what this scan actually saw, so a deleted session's entry is dropped rather than
+    // accumulating forever. Only rewritten when it would differ from what's already on disk — a listing
+    // that was a pure cache hit does no I/O at all.
+    for (dir, entries) in fresh {
+        let unchanged = indexes
+            .get(&dir)
+            .is_some_and(|old| old.len() == entries.len() && misses.is_empty());
+        if !unchanged {
+            store_listing_index(&dir, &entries);
+        }
+    }
+    metas
+}
+
+/// The parse-every-byte path, for the files the index couldn't answer for. `base` is how many paths were
+/// already served from cache, so `on_progress` keeps counting up to `total` across both halves.
+fn scan_uncached(
+    paths: &[PathBuf],
+    base: usize,
+    total: usize,
+    on_progress: &(impl Fn(usize, usize) + Send + Sync),
+) -> Vec<(PathBuf, SessionMeta)> {
+    let total_uncached = paths.len();
+    if total_uncached == 0 {
+        return Vec::new();
+    }
     let workers = std::thread::available_parallelism()
         .map(std::num::NonZero::get)
         .unwrap_or(1)
-        .min(total);
+        .min(total_uncached);
     if workers < 2 {
         return paths
             .iter()
             .enumerate()
             .filter_map(|(i, path)| {
                 let meta = read_listing(path);
-                on_progress(i + 1, total);
-                meta
+                on_progress(base + i + 1, total);
+                meta.map(|m| (path.clone(), m))
             })
             .collect();
     }
 
     let scanned = AtomicUsize::new(0);
-    let metas = Mutex::new(Vec::with_capacity(total));
+    let metas = Mutex::new(Vec::with_capacity(total_uncached));
     let scanned_ref = &scanned;
     let metas_ref = &metas;
-    let chunk_size = total.div_ceil(workers);
+    let chunk_size = total_uncached.div_ceil(workers);
     std::thread::scope(|scope| {
         for chunk in paths.chunks(chunk_size) {
             scope.spawn(move || {
@@ -3470,9 +3760,12 @@ pub(crate) fn scan_listings(
                         metas_ref
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .push(meta);
+                            .push((path.clone(), meta));
                     }
-                    on_progress(scanned_ref.fetch_add(1, Ordering::Relaxed) + 1, total);
+                    on_progress(
+                        base + scanned_ref.fetch_add(1, Ordering::Relaxed) + 1,
+                        total,
+                    );
                 }
             });
         }
@@ -3745,6 +4038,16 @@ fn parse_entry_lenient(path: &Path, line: &str) -> Result<Entry, serde_json::Err
 /// unreadable, the same recovery path already used for a torn write.
 const MAX_LINE_BYTES: usize = 64 * 1024 * 1024;
 
+/// Ceiling on the opaque `data` payload of a single [`SessionStore::append_custom`] entry.
+///
+/// Comfortably above what the real producers write — a todo-list snapshot, a structured-output record,
+/// a client's own bit of session metadata — and far below [`MAX_LINE_BYTES`], which is a *corruption*
+/// backstop for the reader rather than a statement about what a well-behaved writer should send. The
+/// gap between the two is deliberate: an entry this large is a caller bug or an abuse, not a big-but-
+/// legitimate transcript line, and it should be refused at the point of writing rather than tolerated
+/// on the way back in.
+const MAX_CUSTOM_ENTRY_BYTES: usize = 256 * 1024;
+
 /// Read one `\n`-terminated line from `reader` into `buf` (cleared first, bytes only — the caller
 /// validates UTF-8), via `fill_buf`/`consume` so a pathologically long or unterminated line is
 /// processed in bounded chunks rather than by growing an unbounded `String` one byte at a time, the
@@ -3791,8 +4094,22 @@ fn read_capped_line(reader: &mut impl BufRead, buf: &mut Vec<u8>) -> std::io::Re
 /// pulled off disk — so they should never be readable by anyone but the owner, independent of the
 /// process umask.
 fn create_private(path: &Path) -> std::io::Result<File> {
+    // Remove any leftover at this (deterministic `.tmp`) path first, then create it fresh with
+    // `create_new`. `.mode()` only takes effect when the file is actually *created*, so a plain
+    // `create(true).truncate(true)` on a pre-existing path would open-and-truncate a **pre-planted**
+    // file — keeping its existing, possibly world-readable, mode — or follow a pre-planted symlink to
+    // some other target, writing the transcript (which can hold secrets `read` pulled off disk)
+    // through it. A stale `.tmp` from a prior crash is the normal reason something is already here;
+    // unlink it (which removes a symlink itself, not its target) then create exclusively. If an
+    // attacker races a fresh plant in between, `create_new` fails outright — fail closed, never
+    // truncating or following it.
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
     let mut opts = OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -3811,11 +4128,38 @@ fn fsync_dir(path: &Path) -> std::io::Result<()> {
 }
 
 /// Serialize one entry as a single JSON line (no embedded newlines — `serde_json` escapes them).
+///
+/// Straight to the writer, in one pass. It used to go `Entry` → owned `Value` tree → `String` → `w`,
+/// which is the same two-pass shape `serve::event_frame` was fixed out of and `benches/serve_events.rs`
+/// was written to condemn — the fix just never reached this module. An entry carrying a 100 KB tool
+/// result built a 100 KB `Value` tree solely to throw it away. See `benches/persistence.rs`.
 fn write_line(w: &mut impl Write, entry: &Entry) -> std::io::Result<()> {
-    let v = serde_json::to_value(entry).map_err(std::io::Error::other)?;
-    // Defensive: a serialized line must be one physical line.
-    debug_assert!(!serde_json::to_string(&v).unwrap_or_default().contains('\n'));
-    writeln!(w, "{}", Value::to_string(&v))
+    serde_json::to_writer(&mut *w, entry).map_err(std::io::Error::other)?;
+    w.write_all(b"\n")
+}
+
+/// The write-side mirror of [`Entry::Message`] that **borrows** its `Message` rather than owning one.
+///
+/// Byte-identical on the wire (same internal tag, same field names, same `flatten`) — it exists purely
+/// so [`SessionStore::append_new`] can persist a message without cloning it first. The in-memory `Node`
+/// legitimately owns its copy; the serializer never needed one, so a turn whose tool result is a 100 KB
+/// `read` output was copying those bytes once just to hand them to `serde`.
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum EntryRef<'a> {
+    Message {
+        id: Option<&'a str>,
+        parent_id: Option<&'a str>,
+        timestamp: u64,
+        #[serde(flatten)]
+        message: &'a Message,
+    },
+}
+
+/// [`write_line`]'s borrowing counterpart — same single-pass write, no owned `Entry` required.
+fn write_line_ref(w: &mut impl Write, entry: &EntryRef<'_>) -> std::io::Result<()> {
+    serde_json::to_writer(&mut *w, entry).map_err(std::io::Error::other)?;
+    w.write_all(b"\n")
 }
 
 /// Append one entry to the session file — an O(1) write, not a rewrite. Same durability posture as
@@ -4836,6 +5180,7 @@ mod tests {
             compactions: 1,
             last_reason: Some(agent_core::compaction::CompactionReason::Threshold),
             todos: None,
+            memory_notes: vec![],
         };
         store
             .rewrite_compacted(
@@ -4984,6 +5329,7 @@ mod tests {
             compactions: 1,
             last_reason: Some(agent_core::compaction::CompactionReason::Threshold),
             todos: None,
+            memory_notes: vec![],
         };
         store
             .rewrite_compacted(
@@ -5008,6 +5354,7 @@ mod tests {
             compactions: 2,
             last_reason: Some(agent_core::compaction::CompactionReason::Manual),
             todos: None,
+            memory_notes: vec![],
         };
         store
             .rewrite_compacted(
@@ -8621,6 +8968,41 @@ mod tests {
         // same cyclic structure from different entry points.
         let _ = store.list_branches();
         let _ = store.abandoned_by_switch("m1");
+    }
+
+    #[test]
+    fn an_oversized_custom_entry_is_refused_rather_than_written() {
+        // `data` is opaque and, on the `serve` path, remote-client-supplied — and it is retained three
+        // times over (the appended entry, `nodes`, `events`). It is the one input a client can make
+        // arbitrarily large for free, so it is the one that needs a ceiling.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+
+        let ok = store.append_custom("note", json!({ "v": "x".repeat(1024) }));
+        assert!(ok.is_ok(), "an ordinary payload must still be accepted");
+
+        let before = store.active_ids().len();
+        let bytes_before = std::fs::metadata(&store.path).unwrap().len();
+
+        let huge = json!({ "v": "x".repeat(MAX_CUSTOM_ENTRY_BYTES + 1) });
+        let err = store
+            .append_custom("note", huge)
+            .expect_err("a payload past the ceiling must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+        // Refused means *nothing happened*: the rejection must not half-append, advance the tip, or
+        // leave the blob behind in any of the three places it would otherwise be retained.
+        assert_eq!(
+            store.active_ids().len(),
+            before,
+            "a refused entry must not occupy a slot on the active chain"
+        );
+        assert_eq!(
+            std::fs::metadata(&store.path).unwrap().len(),
+            bytes_before,
+            "a refused entry must not have reached the file either"
+        );
     }
 
     #[test]

@@ -413,7 +413,16 @@ impl std::str::FromStr for UpstreamHttp2 {
 /// connections), every other field is a plain owned value.
 #[derive(Clone)]
 pub struct ServeConfig {
+    /// The gateway base URL. Still a plain `String` — `main.rs` resolves the `DEFAULT_GATEWAY` fallback
+    /// into it as before — but in **direct** mode (see [`Self::provider_env`]) it is simply never dialed:
+    /// every direct credential carries a `RouteOverride::Direct`, which replaces this outright at request
+    /// time. Which is why making the gateway optional needed no new plumbing through here.
     pub gateway: String,
+    /// The direct-routing environment (provider keys, `AI_PROVIDER`, `AI_BASE_URL`, and whether a gateway
+    /// is configured at all), read once at the CLI boundary. Threaded alongside [`Self::key`] and for the
+    /// same reason: [`resolve_gateway_credential`] is keyed on the *model*, so it is re-run on every model
+    /// switch, and it needs this each time.
+    pub provider_env: crate::gateway_credential::ProviderEnv,
     /// The raw `--key`/`AI_AGENT_KEY` value, if the operator gave one explicitly. Deliberately *not*
     /// pre-resolved into a [`GatewayCredential`] by `main.rs` before `serve` starts, unlike every other
     /// `ServeConfig` field: [`resolve_gateway_credential`] is keyed on the model, and this process's
@@ -1850,6 +1859,23 @@ fn resolve_startup_model_and_level(
     )
 }
 
+/// Depth of a session's inbound command queue, shared by both transports.
+///
+/// The counterpart to [`crate::serve_ws::OUT_CHANNEL_BOUND`] on the way *in*. The consumer is a single
+/// session loop that runs one command to completion — and some commands are genuinely slow (a
+/// `list_sessions` walks the session directory) — so a client that pipelines faster than the loop drains
+/// will always be able to get ahead of it. Left unbounded, that queue is a client-driven allocation with
+/// no ceiling.
+///
+/// Bounded, but explicitly **not** drop-on-full the way the outbound fanout and the `Pong` queue are:
+/// those carry frames whose loss is a cosmetic degradation, whereas a *dropped command* is a
+/// correctness bug — the client is left waiting on a response that will never come, with no signal that
+/// anything went wrong. So a full queue makes the producer wait instead. On the WebSocket path that
+/// means the read loop stops pulling from the socket and TCP's own window carries the backpressure to
+/// the client; on stdio it simply pauses the stdin reader. Deep enough that ordinary pipelining never
+/// touches it, shallow enough that a flood can't grow memory without limit.
+pub(crate) const IN_CHANNEL_BOUND: usize = 256;
+
 /// Run the control loop until stdin closes.
 /// Headless `serve` over **stdio** — the default transport. A thin wrapper over the transport-
 /// agnostic [`serve_session`]: pump stdin lines into its input channel (EOF drops the sender, which
@@ -1858,13 +1884,17 @@ fn resolve_startup_model_and_level(
 /// `serve` behavior and test rides this path unchanged; [`crate::serve_ws`] is the parallel WebSocket
 /// entry point that reuses the same [`serve_session`] core.
 pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::error::Error>> {
-    let (input_tx, input_rx) = mpsc::unbounded_channel::<String>();
+    let (input_tx, input_rx) = mpsc::channel::<String>(IN_CHANNEL_BOUND);
     tokio::spawn(async move {
         let mut lines = BufReader::new(tokio::io::stdin()).lines();
         // A malformed-UTF-8 read error is treated as a clean EOF, matching the pre-refactor idle/busy
         // read loops (killing a long-running process over one bad stdin byte is far more disruptive).
         while let Ok(Some(line)) = lines.next_line().await {
-            if input_tx.send(line).is_err() {
+            // Awaits rather than dropping when the queue is full: a command the session never sees is a
+            // correctness bug (the client waits on a response that never comes), so the right answer to
+            // a producer outrunning the loop is to stop reading it, not to shed it. Here that simply
+            // pauses the stdin reader.
+            if input_tx.send(line).await.is_err() {
                 break; // the session ended; nothing left to feed
             }
         }
@@ -1875,7 +1905,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
     // stdio has exactly one permanent "connection": stdout. Register it in the fanout as the sole sink.
     let out_conn: SharedOutConn =
         Arc::new(std::sync::Mutex::new(crate::serve::OutFanout::default()));
-    lock_ignoring_poison(&out_conn).add(conn_tx);
+    lock_ignoring_poison(&out_conn).add(crate::serve::OutSink::Unbounded(conn_tx));
     let stdout_task = tokio::spawn(async move {
         let mut out = tokio::io::stdout();
         while let Some(frame) = conn_rx.recv().await {
@@ -1909,7 +1939,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
 /// keeps going. The command protocol below is byte-identical across both transports.
 pub(crate) async fn serve_session(
     mut cfg: ServeConfig,
-    mut input_rx: mpsc::UnboundedReceiver<String>,
+    mut input_rx: mpsc::Receiver<String>,
     out_conn: SharedOutConn,
     // Set `true` for the duration of a `prompt` run, `false` otherwise. The daemon supervisor's idle
     // reaper reads this to never reap a session with an in-flight background run (see
@@ -2858,6 +2888,10 @@ pub(crate) async fn serve_session(
     // flow resolves, success or failure, so a later `login` is accepted again.
     let pending_login: Arc<std::sync::Mutex<Option<PendingLogin>>> =
         Arc::new(std::sync::Mutex::new(None));
+    // Monotonic tag stamped on each login that claims the slot, so a late-winding-down task's guard can
+    // tell its own slot from a successor's (see `PendingLoginGuard`). Only ever touched from this
+    // single-threaded command loop, so a plain counter suffices.
+    let mut login_generation: u64 = 0;
     loop {
         let line = tokio::select! {
             biased;
@@ -3324,17 +3358,22 @@ pub(crate) async fn serve_session(
                                                         // `steer` redirects mid-run (injected at the next
                                                         // tool turn); `follow_up` waits for the stop
                                                         // boundary. Two separate lanes.
-                                                        if cmd == "steer" {
-                                                            steering.push_steer(m);
+                                                        let queued = if cmd == "steer" {
+                                                            steering.push_steer(m)
                                                         } else {
-                                                            steering.push(m);
-                                                        }
+                                                            steering.push(m)
+                                                        };
                                                         // Fix 5 (pi-parity gap): the pushing client
                                                         // learns what's actually queued from its own
                                                         // ack, same round trip — see `queue_content`'s
                                                         // own doc comment for why this doesn't also
-                                                        // need a separate unsolicited event.
-                                                        let _ = out_tx.send(response(cid, cmd, true, Some(queue_content(&steering)), None));
+                                                        // need a separate unsolicited event. A lane at
+                                                        // its cap refuses the newest message, so the ack
+                                                        // has to say so: acking `true` for a message that
+                                                        // was dropped is the one outcome a client can't
+                                                        // recover from, since it has no other signal that
+                                                        // its instruction never reached the model.
+                                                        let _ = out_tx.send(response(cid, cmd, queued, Some(queue_content(&steering)), (!queued).then_some(STEERING_QUEUE_FULL)));
                                                     }
                                                     None => {
                                                         let _ = out_tx.send(response(cid, cmd, false, None, Some("missing `message`")));
@@ -3358,13 +3397,16 @@ pub(crate) async fn serve_session(
                                                             m,
                                                             parse_images(c.get("images")),
                                                         );
-                                                        steering.push_steer(m);
+                                                        let queued = steering.push_steer(m);
                                                         // Fix 5 (pi-parity gap): same queue-content
                                                         // visibility the dedicated `steer`/`follow_up`
-                                                        // commands' own acks now carry.
+                                                        // commands' own acks now carry — including a
+                                                        // full lane's refusal (see the `steer` arm).
                                                         let mut data = queue_content(&steering);
-                                                        data["queued_as"] = json!("steer");
-                                                        let _ = out_tx.send(response(cid, "prompt", true, Some(data), None));
+                                                        if queued {
+                                                            data["queued_as"] = json!("steer");
+                                                        }
+                                                        let _ = out_tx.send(response(cid, "prompt", queued, Some(data), (!queued).then_some(STEERING_QUEUE_FULL)));
                                                     }
                                                     (Some("follow_up"), Some(m)) => {
                                                         let m = expand_message(m, &skills, &prompt_templates);
@@ -3372,10 +3414,12 @@ pub(crate) async fn serve_session(
                                                             m,
                                                             parse_images(c.get("images")),
                                                         );
-                                                        steering.push(m);
+                                                        let queued = steering.push(m);
                                                         let mut data = queue_content(&steering);
-                                                        data["queued_as"] = json!("follow_up");
-                                                        let _ = out_tx.send(response(cid, "prompt", true, Some(data), None));
+                                                        if queued {
+                                                            data["queued_as"] = json!("follow_up");
+                                                        }
+                                                        let _ = out_tx.send(response(cid, "prompt", queued, Some(data), (!queued).then_some(STEERING_QUEUE_FULL)));
                                                     }
                                                     _ => {
                                                         let _ = out_tx.send(response(cid, "prompt", false, None, Some("busy: a prompt is running; only `abort`/`steer`/`follow_up`, or a `prompt` with `streaming_behavior: \"steer\"|\"follow_up\"`, are accepted")));
@@ -3795,18 +3839,19 @@ pub(crate) async fn serve_session(
                         let m = expand_message(m, &skills, &prompt_templates);
                         let m =
                             agent_core::SteeringMessage::new(m, parse_images(cmd.get("images")));
-                        if cmd_type == "steer" {
-                            steering.push_steer(m);
+                        let queued = if cmd_type == "steer" {
+                            steering.push_steer(m)
                         } else {
-                            steering.push(m);
-                        }
-                        // Fix 5 (pi-parity gap): see `queue_content`'s own doc comment.
+                            steering.push(m)
+                        };
+                        // Fix 5 (pi-parity gap): see `queue_content`'s own doc comment. A lane at its
+                        // cap refuses the message; the ack reports that rather than claiming it queued.
                         emit!(response(
                             id,
                             cmd_type,
-                            true,
+                            queued,
                             Some(queue_content(&steering)),
-                            None
+                            (!queued).then_some(STEERING_QUEUE_FULL)
                         ));
                     }
                     None => emit!(response(
@@ -3917,7 +3962,21 @@ pub(crate) async fn serve_session(
                 // falling back to "everything" would look like a working incremental fetch that's
                 // actually just re-sending the full history, masking the bug instead of surfacing it.
                 if let Some(since) = cmd.get("since").and_then(Value::as_str) {
-                    match msg_ids.iter().position(|mid| mid == since) {
+                    // `idx` indexes `msg_ids` (the active *tree path*, which includes non-message
+                    // `Custom` entries), but the slice below is applied to `messages` (LLM messages
+                    // only). The two align 1:1 exactly when tagging above ran — i.e.
+                    // `arr.len() == msg_ids.len()`. When they don't (a `Custom` entry sits in the
+                    // path, or in-memory mode carries no ids), an `idx` past `messages`' end would make
+                    // `split_off(idx + 1)` panic. That's the same "nothing is tagged → error" case the
+                    // doc above already calls out, so fold it into the unmatched branch rather than
+                    // slicing blindly.
+                    let tagged =
+                        matches!(&messages, Value::Array(arr) if arr.len() == msg_ids.len());
+                    match msg_ids
+                        .iter()
+                        .position(|mid| mid == since)
+                        .filter(|_| tagged)
+                    {
                         Some(idx) => {
                             if let Value::Array(arr) = &mut messages {
                                 *arr = arr.split_off(idx + 1);
@@ -5762,7 +5821,10 @@ pub(crate) async fn serve_session(
                         // browser flow. Only a second concurrent `login` is rejected (above).
                         let login_cancel = agent_core::CancellationToken::new();
                         let pending_code: PendingCodeSlot = Arc::new(std::sync::Mutex::new(None));
+                        login_generation += 1;
+                        let generation = login_generation;
                         *lock_ignoring_poison(&pending_login) = Some(PendingLogin {
+                            generation,
                             cancel: login_cancel.clone(),
                             pending_code: pending_code.clone(),
                         });
@@ -5770,15 +5832,18 @@ pub(crate) async fn serve_session(
                         let pending_login_bg = pending_login.clone();
                         let login_id = id.clone();
                         tokio::spawn(async move {
-                            // Always clears `pending_login` when this task ends, even on panic — see
-                            // `PendingLoginGuard`'s own doc comment.
-                            let _reset_pending_login_on_exit =
-                                PendingLoginGuard(pending_login_bg.clone());
+                            // Always clears `pending_login` when this task ends, even on panic — but only
+                            // if the slot still holds *this* login (see `PendingLoginGuard`'s doc comment).
+                            let _reset_pending_login_on_exit = PendingLoginGuard {
+                                slot: pending_login_bg.clone(),
+                                generation,
+                            };
                             let callbacks = ServeLoginCallbacks {
                                 out_tx: out_tx_bg.clone(),
                                 id: login_id.clone(),
                                 provider: provider_id,
                                 pending_code,
+                                cancel: login_cancel.clone(),
                             };
                             let result =
                                 crate::oauth::login(provider_id, &callbacks, &login_cancel).await;
@@ -5852,7 +5917,14 @@ pub(crate) async fn serve_session(
             }
             "abort_login" => {
                 // Idempotent no-op if none is in flight — matches `abort`'s own idle-mode convention.
-                if let Some(p) = lock_ignoring_poison(&pending_login).as_ref() {
+                // `take`, not `as_ref`: clear the slot *synchronously* here rather than leaving it for the
+                // detached task's `Drop` guard, so the very next `login` is accepted the instant this abort
+                // is acknowledged. Waiting for the guard raced the next command — a `login` arriving before
+                // the cancelled task wound down was spuriously rejected as "already in flight", hanging a
+                // client that (reasonably) expected `abort_login`'s success to mean the slot was free. The
+                // cancelled task still sends its own terminal `login` response; clearing the slot only frees
+                // the next login, and the guard's generation check keeps that task from wiping the successor.
+                if let Some(p) = lock_ignoring_poison(&pending_login).take() {
                     p.cancel.cancel();
                 }
                 emit!(response(id, "abort_login", true, None, None));
@@ -5940,6 +6012,19 @@ pub(crate) async fn serve_session(
         }
     }
 
+    // A `login` still in flight owns a detached task holding its own clone of `out_tx` — and the writer
+    // below ends *only* once every sender is gone. Without this cancel, a client that starts a login and
+    // then simply disconnects (or a SIGTERM arriving mid-flow) parks that task forever, `writer.await`
+    // never returns, and `serve_session` never completes: the OS thread, its runtime, the `Agent`, the
+    // `GatewayClient` and its pool, the session history, and the OAuth callback server's bound — and
+    // *fixed* — port all leak for the daemon's lifetime, which also makes every subsequent login on that
+    // port fail outright. In stdio `serve` the same hang means the process can never exit gracefully.
+    //
+    // `abort_login` is not a substitute: it only fires when a client explicitly sends it, which is
+    // exactly what an abandoned login never does. Teardown is the path that has to be unconditional.
+    if let Some(p) = lock_ignoring_poison(&pending_login).take() {
+        p.cancel.cancel();
+    }
     drop(out_tx);
     let _ = writer.await;
     Ok(shutdown_cause)
@@ -6004,7 +6089,7 @@ fn model_override_extra_headers(model: &str) -> std::collections::HashMap<String
 /// been resolved exactly once, before `serve` even started, and then silently reused — stale provider,
 /// stale routing — by every later model switch for the rest of the process's life.
 fn build_gateway_client(cfg: &ServeConfig, model: &str) -> Result<GatewayClient, String> {
-    let credential = resolve_gateway_credential(cfg.key.clone(), model)?;
+    let credential = resolve_gateway_credential(cfg.key.clone(), model, &cfg.provider_env)?;
     let client = match credential {
         GatewayCredential::Static(key) => {
             GatewayClient::new(cfg.gateway.clone(), key).map_err(|e| e.to_string())?
@@ -6349,6 +6434,16 @@ impl AgentHooks for ServeHooks {
 /// consulted only by [`ServeHooks::before_provider_request`], the one place this crate's own "what's
 /// actually sent to the model" transform lives.
 const HOST_BASH_EXCLUDED_LABEL: &str = "[Host bash command, excluded from model context]";
+
+/// Returned on a `steer`/`follow_up` (or a `prompt` routed into one of those lanes) whose queue is at
+/// its cap. The lanes are bounded because they're fed straight from remote RPC and drain at most one
+/// message per turn boundary — see `agent_core::steering`'s own cap. The client is told so explicitly:
+/// a lane that refuses the newest message while its ack still claims `success: true` would leave a
+/// client with no signal at all that its instruction never reached the model, which is the one outcome
+/// it cannot recover from on its own. The accompanying `queue_content` payload shows what *is* queued,
+/// so a client can see the depth it's up against and retry once the agent drains.
+const STEERING_QUEUE_FULL: &str = "steering queue full; retry once the agent drains a message";
+
 /// The ordinary (not excluded) counterpart to [`HOST_BASH_EXCLUDED_LABEL`] — unchanged from before Fix 9.
 const HOST_BASH_LABEL: &str = "[Host bash command, run outside the model's own turn]";
 /// Prefix for the structured `exit_code`/`cancelled`/`truncated`/`full_output_path` status line the
@@ -7182,7 +7277,14 @@ pub(crate) fn lock_ignoring_poison<T>(m: &std::sync::Mutex<T>) -> std::sync::Mut
 }
 
 /// Tracks the one `login` allowed in flight at a time — see `pending_login`'s own declaration.
+///
+/// `generation` is a monotonic tag stamped when this login claimed the slot. It's what lets the
+/// [`PendingLoginGuard`] tell "the slot still holds *my* login" from "a newer login has since taken it"
+/// on drop, so a task winding down late can't wipe a successor's slot — the race that made a subsequent
+/// `abort_login` silently no-op (the login it should have cancelled then never resolves). See
+/// [`PendingLoginGuard`].
 struct PendingLogin {
+    generation: u64,
     cancel: agent_core::CancellationToken,
     pending_code: PendingCodeSlot,
 }
@@ -7196,11 +7298,28 @@ struct PendingLogin {
 /// `abort_login` can't help — it just cancels a token nothing is left alive to observe). A `Drop`
 /// impl runs during unwinding, unlike a plain line of cleanup code placed after the panicking call,
 /// so this holds regardless of where in the task body things go wrong.
-struct PendingLoginGuard(Arc<std::sync::Mutex<Option<PendingLogin>>>);
+///
+/// **Clears only its own generation.** `abort_login` clears the slot *synchronously* (so the next
+/// `login` is accepted the instant the abort is acknowledged, not whenever this detached task happens to
+/// wind down), which means by the time this guard runs a *newer* login may already own the slot. Wiping
+/// it unconditionally would drop that newer login's marker — the next `abort_login` would then find an
+/// empty slot and no-op, leaving the newer login uncancellable and its client hung waiting for a terminal
+/// response that never comes. Comparing generations makes the guard a no-op unless the slot is still this
+/// login's.
+struct PendingLoginGuard {
+    slot: Arc<std::sync::Mutex<Option<PendingLogin>>>,
+    generation: u64,
+}
 
 impl Drop for PendingLoginGuard {
     fn drop(&mut self) {
-        *lock_ignoring_poison(&self.0) = None;
+        let mut slot = lock_ignoring_poison(&self.slot);
+        if slot
+            .as_ref()
+            .is_some_and(|p| p.generation == self.generation)
+        {
+            *slot = None;
+        }
     }
 }
 
@@ -7464,7 +7583,25 @@ struct ServeLoginCallbacks {
     id: Option<String>,
     provider: crate::oauth::OAuthProviderId,
     pending_code: PendingCodeSlot,
+    /// This login's own token, so the wait below can lose a race against it. Not merely decorative:
+    /// two provider flows (`oauth::github_copilot`'s Enterprise-domain prompt, `oauth::openai_codex`'s
+    /// port-already-bound fallback) `await` `prompt_text` with *no other* cancellation observer in the
+    /// select, so if this wait doesn't watch the token itself, nothing does — `abort_login` becomes a
+    /// silent no-op and the task parks forever.
+    cancel: agent_core::CancellationToken,
 }
+
+/// How long an unanswered `manual_code` prompt waits before the login is abandoned.
+///
+/// The wait is on a human: read a browser page, copy a code, paste it back. Generous enough that a
+/// distracted user doesn't lose a legitimate flow, finite because the alternative is a task parked for
+/// the process's lifetime — and a parked login task is not cheap. It holds a clone of the session's
+/// `out_tx`, and the session's writer ends *only* when every sender drops, so a login nobody ever
+/// answers wedges `serve_session` itself: the OS thread, its runtime, the `Agent`, the `GatewayClient`
+/// and its pool, the whole message history, and the OAuth callback server's bound (and fixed) port all
+/// stay live until the daemon dies. Failing closed on silence is what keeps an abandoned browser tab
+/// from costing a session.
+const LOGIN_PROMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 #[async_trait::async_trait]
 impl crate::oauth::LoginCallbacks for ServeLoginCallbacks {
@@ -7523,8 +7660,26 @@ impl crate::oauth::LoginCallbacks for ServeLoginCallbacks {
             None,
             None,
         ));
-        rx.await
-            .map_err(|_| crate::oauth::OAuthError::LoginCancelled)
+        // The same shape `ServeApprovalGate::request` uses, and for the same reason: this is the second
+        // instance of the one human-in-the-loop seam, so it races the token and a timeout and **fails
+        // closed** — no answer, for any reason, abandons the login. A bare `rx.await` here (what this
+        // used to be) has no way out at all: the sender lives inside these callbacks, which the login
+        // future owns, so nothing external can even drop it to wake the wait.
+        //
+        // `biased` so a cancellation already signalled wins over a code that happened to land in the
+        // same poll — an aborted login must not quietly succeed on the strength of a late paste.
+        tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => Err(crate::oauth::OAuthError::LoginCancelled),
+            answer = rx => answer.map_err(|_| crate::oauth::OAuthError::LoginCancelled),
+            _ = tokio::time::sleep(LOGIN_PROMPT_TIMEOUT) => {
+                tracing::debug!(
+                    provider = %self.provider,
+                    "login code prompt went unanswered; abandoning the login"
+                );
+                Err(crate::oauth::OAuthError::LoginCancelled)
+            }
+        }
     }
 
     async fn select(
@@ -7564,15 +7719,39 @@ impl From<Value> for OutFrame {
 /// [`crate::serve_ws`]). The supervisor [`add`](OutFanout::add)s a sink on attach and
 /// [`remove`](OutFanout::remove)s it on disconnect. An `std::sync::Mutex` (not tokio's) is deliberate:
 /// it is only ever held across non-`await` `send`s into unbounded channels.
+/// One attached connection's output channel. A network transport (WebSocket/UDS) registers a
+/// **bounded** sink: a client whose socket has stalled under TCP backpressure (a locked phone, a dead
+/// tunnel) would otherwise let the still-running session buffer streamed frames without limit, growing
+/// memory until the OS TCP layer finally times the socket out. When the bounded channel fills,
+/// [`OutFanout::broadcast`] prunes the sink — a disconnect-on-full that drops the wedged connection and
+/// leaves it to reconnect and replay committed state via `get_messages {since}`. The in-process
+/// **stdio** transport is a single trusted local sink for the whole process life and stays
+/// **unbounded**: pruning it on a transient stdout stall would sever the only client.
+pub(crate) enum OutSink {
+    Bounded(mpsc::Sender<OutFrame>),
+    Unbounded(mpsc::UnboundedSender<OutFrame>),
+}
+
+impl OutSink {
+    /// Non-blocking send. `Err` means the sink is dead (receiver gone) or — for a bounded sink — its
+    /// buffer is full (a stalled connection); [`OutFanout::broadcast`] prunes it either way.
+    fn try_send(&self, frame: OutFrame) -> Result<(), ()> {
+        match self {
+            OutSink::Bounded(tx) => tx.try_send(frame).map_err(|_| ()),
+            OutSink::Unbounded(tx) => tx.send(frame).map_err(|_| ()),
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct OutFanout {
     next_id: u64,
-    sinks: Vec<(u64, mpsc::UnboundedSender<OutFrame>)>,
+    sinks: Vec<(u64, OutSink)>,
 }
 
 impl OutFanout {
     /// Register a connection's sink; returns an id to [`remove`](Self::remove) it by on disconnect.
-    pub(crate) fn add(&mut self, tx: mpsc::UnboundedSender<OutFrame>) -> u64 {
+    pub(crate) fn add(&mut self, tx: OutSink) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         self.sinks.push((id, tx));
@@ -7599,11 +7778,13 @@ impl OutFanout {
         match self.sinks.as_slice() {
             [] => {}
             [(_, tx)] => {
-                if tx.send(frame).is_err() {
+                if tx.try_send(frame).is_err() {
                     self.sinks.clear();
                 }
             }
-            _ => self.sinks.retain(|(_, tx)| tx.send(frame.clone()).is_ok()),
+            _ => self
+                .sinks
+                .retain(|(_, tx)| tx.try_send(frame.clone()).is_ok()),
         }
     }
 }
@@ -7863,12 +8044,16 @@ mod tests {
         // provider seam this module doesn't otherwise need.
         let pending_login: Arc<std::sync::Mutex<Option<PendingLogin>>> =
             Arc::new(std::sync::Mutex::new(Some(PendingLogin {
+                generation: 1,
                 cancel: CancellationToken::new(),
                 pending_code: Arc::new(std::sync::Mutex::new(None)),
             })));
         let slot = pending_login.clone();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = PendingLoginGuard(slot.clone());
+            let _guard = PendingLoginGuard {
+                slot: slot.clone(),
+                generation: 1,
+            };
             panic!("simulated failure inside the login task");
         }));
         assert!(
@@ -7879,6 +8064,41 @@ mod tests {
             lock_ignoring_poison(&pending_login).is_none(),
             "pending_login must be cleared even though the guarded scope panicked"
         );
+    }
+
+    #[test]
+    fn pending_login_guard_only_clears_its_own_generation_not_a_successor() {
+        // The race behind the flaky `serve_auth` abort-login hang: `abort_login` clears the slot
+        // synchronously, so a *newer* login can claim it before the cancelled task's guard runs. That
+        // guard must then be a no-op — wiping the successor's marker would make the next `abort_login`
+        // find an empty slot and silently no-op, leaving the newer login uncancellable (its client hangs).
+        let slot: Arc<std::sync::Mutex<Option<PendingLogin>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        // A newer login (generation 2) currently owns the slot.
+        let newer_cancel = CancellationToken::new();
+        *lock_ignoring_poison(&slot) = Some(PendingLogin {
+            generation: 2,
+            cancel: newer_cancel.clone(),
+            pending_code: Arc::new(std::sync::Mutex::new(None)),
+        });
+        // An older login's guard (generation 1) winds down now.
+        drop(PendingLoginGuard {
+            slot: slot.clone(),
+            generation: 1,
+        });
+        // The successor's marker must survive, and still be the cancel `abort_login` would reach.
+        let held = lock_ignoring_poison(&slot);
+        assert!(
+            held.as_ref().is_some_and(|p| p.generation == 2),
+            "the older guard must not clear the newer login's slot"
+        );
+        drop(held);
+        // And a guard whose generation *does* match clears it (the normal, own-slot case).
+        drop(PendingLoginGuard {
+            slot: slot.clone(),
+            generation: 2,
+        });
+        assert!(lock_ignoring_poison(&slot).is_none());
     }
 
     #[test]

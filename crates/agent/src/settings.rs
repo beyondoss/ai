@@ -1073,18 +1073,14 @@ impl ModelOverride {
 ///   addressed the wire *body* shape (Anthropic vs. OpenAI) — without this header, requests may still
 ///   fail at the HTTP layer even with a correctly-shaped body.
 ///
-/// Matched by a plain substring check against `base_url` (not a parsed-host equality check, unlike
-/// `gateway_credential::is_azure_host`): both hosts here are always used with a fixed, single-segment
-/// path baked into pi's own catalog (`/v1`, `/coding`), so there's no meaningfully different shape an
-/// operator's own `base_url` could take that would make host-parsing worth the extra complexity.
+/// Both are now rows in the shared provider table (`providers::ProviderSpec::default_headers`), looked
+/// up by parsed host rather than the substring check this used to do — the same lookup a *direct*
+/// route uses to attach the identical headers (`gateway_credential::registry_direct_routing`). They are
+/// facts about the provider, so they live with the provider; a `models.json` override pointing at NVIDIA
+/// and a zero-config direct route to NVIDIA must not disagree about NIM's poll timeout.
 fn default_headers_for_base_url(base_url: &str) -> &'static [(&'static str, &'static str)] {
-    if base_url.contains("integrate.api.nvidia.com") {
-        &[("NVCF-POLL-SECONDS", "3600")]
-    } else if base_url.contains("api.kimi.com") {
-        &[("User-Agent", "KimiCLI/1.5")]
-    } else {
-        &[]
-    }
+    crate::gateway_credential::provider_for_base_url(base_url)
+        .map_or(&[], |spec| spec.default_headers)
 }
 
 /// Resolve a `models.json` `api_key`/header config value that may be a literal, an environment-variable

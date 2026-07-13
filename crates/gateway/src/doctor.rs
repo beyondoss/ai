@@ -115,7 +115,7 @@ async fn check_provider_dns(config: &AiConfig) -> Vec<CheckResult> {
     // Effective authority per provider name: the known default unless config overrides it, plus any
     // config-only provider. A BTreeMap dedups and keeps the output stable/ordered.
     let mut authorities: BTreeMap<&str, String> = BTreeMap::new();
-    for spec in route::KNOWN_PROVIDERS {
+    for spec in route::known_providers() {
         authorities.insert(spec.name, spec.authority.to_string());
     }
     for (name, authority) in &config.provider_authorities {
@@ -126,8 +126,7 @@ async fn check_provider_dns(config: &AiConfig) -> Vec<CheckResult> {
     for (name, authority) in authorities {
         // `CheckResult.name` is `&'static str`: a known provider lends its static name; a config-only
         // provider (non-'static) reports under a generic label, with the real name in the message.
-        let check_name: &'static str = route::KNOWN_PROVIDERS
-            .iter()
+        let check_name: &'static str = route::known_providers()
             .find(|s| s.name == name)
             .map_or("provider_dns", |s| s.name);
         let lookup = tokio::time::timeout(

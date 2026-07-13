@@ -229,17 +229,23 @@ fn login_acks_then_a_second_concurrent_login_is_rejected_then_abort_login_cancel
         "{rejection:#?}"
     );
 
-    // Cancel the first login; it must resolve with a failure response, not hang forever.
+    // Cancel the first login; it must resolve with a failure response, not hang forever. The
+    // `abort_login`'s own response (id 3) and the aborted login's terminal response (id 1) are produced
+    // by different tasks and race — accept them in either order rather than assuming one precedes the
+    // other (the assumption that made this test flaky under load).
     writeln!(stdin, "{}", json!({ "id": "3", "type": "abort_login" })).unwrap();
     stdin.flush().unwrap();
-    let abort_ack =
-        read_one_frame_matching(&mut stdout, |v| v["type"] == "response" && v["id"] == "3");
-    assert_eq!(abort_ack["success"], true, "{abort_ack:#?}");
-
-    let login_result = read_one_frame_matching(&mut stdout, |v| {
-        v["type"] == "response" && v["command"] == "login" && v["id"] == "1"
-    });
-    assert_eq!(login_result["success"], false, "{login_result:#?}");
+    let framed = read_frames_matching_all(
+        &mut stdout,
+        &[&|v| v["type"] == "response" && v["id"] == "3", &|v| {
+            v["type"] == "response" && v["command"] == "login" && v["id"] == "1"
+        }],
+    );
+    assert_eq!(framed[0]["success"], true, "abort_login: {framed:#?}");
+    assert_eq!(
+        framed[1]["success"], false,
+        "aborted login must resolve failed: {framed:#?}"
+    );
 
     // The slot must be cleared once the first login resolves — a fresh `login` is accepted again
     // immediately, not left rejected by a stale in-flight marker. Anthropic again (not a different
@@ -287,4 +293,32 @@ fn read_one_frame_matching(
             return v;
         }
     }
+}
+
+/// Read frames until **every** predicate in `preds` has matched at least one frame (in any order),
+/// returning the matched frames in predicate order. Necessary when several independent responses race
+/// and can interleave arbitrarily — e.g. an `abort_login`'s own synchronous response and the aborted
+/// `login`'s async terminal response, which are produced by different tasks with no ordering guarantee
+/// between them. Reading them with sequential `read_one_frame_matching` calls would discard whichever
+/// arrives first while waiting for the other, then hang forever on the one already thrown away.
+fn read_frames_matching_all(
+    reader: &mut impl std::io::BufRead,
+    preds: &[&dyn Fn(&Value) -> bool],
+) -> Vec<Value> {
+    let mut found: Vec<Option<Value>> = vec![None; preds.len()];
+    let mut line = String::new();
+    while found.iter().any(Option::is_none) {
+        line.clear();
+        let n = reader.read_line(&mut line).unwrap();
+        assert!(n > 0, "stream ended before all matching frames arrived");
+        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        for (i, pred) in preds.iter().enumerate() {
+            if found[i].is_none() && pred(&v) {
+                found[i] = Some(v.clone());
+            }
+        }
+    }
+    found.into_iter().map(Option::unwrap).collect()
 }

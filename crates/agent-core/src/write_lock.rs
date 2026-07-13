@@ -12,16 +12,35 @@
 //! serializes within one OS process — two separate `serve` processes against the same file would need
 //! a filesystem advisory lock (e.g. `flock`), which is out of scope here.
 //!
-//! Entries are evicted once nothing references them any more: when a [`WriteLockGuard`] drops, it
-//! checks whether the registry's map is the *only* remaining holder of that key's `Arc` (`strong_count
-//! == 1`) — i.e. no other guard and no other in-flight `lock()` call still needs it — and if so removes
-//! the map entry. The check-and-remove happens while holding the map's own lock, so a concurrent
-//! `lock()` call for the same key can never observe (or create) a state where the entry is removed out
-//! from under it: it either wins the race and clones the `Arc` before eviction runs (bumping the count
-//! so eviction is skipped), or it runs after eviction and simply inserts a fresh mutex. This mirrors
-//! pi's `file-mutation-queue.ts` `withFileMutationQueue`, which deletes its map entry in a `finally`
-//! block only if the map still points at that same queue object — the identity check there and the
-//! refcount check here both exist to avoid tearing down an entry a concurrent caller still needs.
+//! Entries are evicted once nothing references them any more, and *whichever* reference is the last
+//! one to go: the check — is the registry's map the only remaining holder of that key's `Arc`
+//! (`strong_count == 1`), i.e. no other guard and no other in-flight `lock()` call still needs it? —
+//! runs both when a [`WriteLockGuard`] drops and when a `lock()` future is dropped *before* it ever
+//! acquires (cancellation). Only covering the guard path would leak: a waiter that clones the `Arc`,
+//! parks behind a holder, and is then cancelled mid-`.await` never constructs a guard, so the holder's
+//! own drop (which saw `strong_count > 1` because the waiter was still queued) would have been the last
+//! chance to evict, and the entry would live in the map for the process's whole lifetime — one leaked
+//! `String` + `Arc<Mutex>` per distinct contended-then-cancelled path in a long-lived `serve` process.
+//! Making the *acquire* path carry its own drop-guard (rather than sweeping the map, or storing `Weak`s
+//! and reaping dead ones later) keeps eviction exact and immediate: the reference that dies last cleans
+//! up, with no scan and no window where a dead entry is still visible.
+//!
+//! The check-and-remove happens while holding the map's own lock, so a concurrent `lock()` call for the
+//! same key can never observe (or create) a state where the entry is removed out from under it: it
+//! either wins the race and clones the `Arc` before eviction runs (bumping the count so eviction is
+//! skipped), or it runs after eviction and simply inserts a fresh mutex. This mirrors pi's
+//! `file-mutation-queue.ts` `withFileMutationQueue`, which deletes its map entry in a `finally` block
+//! only if the map still points at that same queue object — the identity check there and the refcount
+//! check here both exist to avoid tearing down an entry a concurrent caller still needs.
+//!
+//! **Mutual exclusion, but no fairness.** `futures::lock::Mutex` is *barging*, not FIFO: a caller that
+//! polls at the right moment can take a just-released lock ahead of a waiter that queued long before it.
+//! So this registry guarantees that two writers to the same path never overlap — nothing more. It makes
+//! no ordering or anti-starvation promise across turns or across sessions, and sustained contention on
+//! one hot path can in principle starve a waiter indefinitely. That's an accepted trade: the ordering
+//! that actually matters — a single turn's own same-target calls applying in the order the model asked
+//! for them — is already guaranteed upstream, where `agent.rs`'s `group_runs` runs same-target calls
+//! serially in call order within one group, so they never race here in the first place.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as SyncMutex};
@@ -36,9 +55,12 @@ use futures::lock::{Mutex as AsyncMutex, OwnedMutexGuard};
 type LockMap = Arc<SyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>;
 
 /// A registry of per-key async mutexes. Cheap to construct and share via `Arc`. An entry exists only
-/// while at least one caller holds or is waiting on the lock for its key; the last [`WriteLockGuard`]
-/// to drop for a given key removes it (see the module doc comment), so the map stays bounded by the
-/// number of *currently* contended paths rather than growing for the registry's whole lifetime.
+/// while at least one caller holds or is waiting on the lock for its key; the last reference to drop —
+/// a [`WriteLockGuard`], or a `lock()` future cancelled before it ever acquired — removes it (see the
+/// module doc comment), so the map stays bounded by the number of *currently* contended paths rather
+/// than growing for the registry's whole lifetime.
+///
+/// Provides mutual exclusion only, not fairness — see the module doc comment.
 #[derive(Default)]
 pub struct WriteLockRegistry {
     locks: LockMap,
@@ -51,8 +73,10 @@ impl WriteLockRegistry {
 
     /// Acquire the lock for `key`, creating its entry if this is the first call for that key. The
     /// returned guard is `'static` (owns its `Arc`), so it can be held across `.await` points and moved
-    /// into a spawned task; dropping it releases the lock and, if no one else is waiting on this key,
-    /// evicts the key's entry from the registry.
+    /// into a spawned task; dropping it releases the lock and, if no one else is holding or waiting on
+    /// this key, evicts the key's entry from the registry. Dropping the *future* returned here before it
+    /// resolves (cancellation) is equally clean: nothing is locked, and the entry is evicted just the
+    /// same if this call was the last thing referencing it.
     pub async fn lock(&self, key: &str) -> WriteLockGuard {
         // Scoped to a block (rather than a named `let` binding dropped explicitly) so the sync
         // `MutexGuard` — not `Send` — provably ends its lifetime before the `.await` below, keeping
@@ -74,12 +98,19 @@ impl WriteLockRegistry {
                     .clone(),
             }
         };
-        let guard = mutex.lock_owned().await;
-        WriteLockGuard {
-            guard: Some(guard),
+        // Declared *before* the `lock_owned()` future below, and therefore dropped *after* it when this
+        // whole future is cancelled mid-`.await` (a suspended future drops its live locals in reverse
+        // creation order, and the awaited future is itself a later-created temporary). That order is
+        // what makes the strong-count check below exact: by the time this reservation's `Drop` runs, the
+        // queued `lock_owned()` future has already released its own clone of the `Arc`, so the count
+        // reflects only the map, this reservation, and any *genuinely other* holder or waiter.
+        let reservation = PendingLock {
             locks: self.locks.clone(),
             key: key.to_string(),
-        }
+            mutex: Some(mutex.clone()),
+        };
+        let guard = mutex.lock_owned().await;
+        reservation.into_guard(guard)
     }
 
     #[cfg(test)]
@@ -88,6 +119,61 @@ impl WriteLockRegistry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .len()
+    }
+}
+
+/// Remove `key`'s entry if the map is the only thing still referencing its `Arc` — no other guard, and
+/// no other `lock()` call still queued on it. Every caller must have released its *own* clone of the
+/// `Arc` before calling this, or it will see its own reference and decline to evict.
+///
+/// Checked and removed while holding the map's own lock, which every `lock()` call must also acquire to
+/// clone the `Arc`, so a concurrent caller can't slip in between the check and the removal.
+fn evict_if_unreferenced(locks: &LockMap, key: &str) {
+    let mut locks = locks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if locks
+        .get(key)
+        .is_some_and(|arc| Arc::strong_count(arc) == 1)
+    {
+        locks.remove(key);
+    }
+}
+
+/// The in-flight half of [`WriteLockRegistry::lock`]: it exists only while a caller is queued on a key's
+/// mutex but has not acquired it yet. Its `Drop` is what stops a *cancelled* waiter from orphaning the
+/// key's map entry — see the module doc comment. On a successful acquire it is defused by
+/// [`PendingLock::into_guard`], which hands eviction duty over to the [`WriteLockGuard`].
+struct PendingLock {
+    locks: LockMap,
+    key: String,
+    /// `Some` while this caller is still merely *waiting*. Taken (without evicting) once the lock is
+    /// acquired, which is how `Drop` tells cancellation apart from a normal handoff to the guard.
+    mutex: Option<Arc<AsyncMutex<()>>>,
+}
+
+impl PendingLock {
+    fn into_guard(mut self, guard: OwnedMutexGuard<()>) -> WriteLockGuard {
+        // Acquired: the `WriteLockGuard` now owns both the lock and the eviction check, so this
+        // reservation must not run its own. Dropping the `Arc` here is safe — `guard` holds one.
+        self.mutex = None;
+        WriteLockGuard {
+            guard: Some(guard),
+            locks: self.locks.clone(),
+            key: std::mem::take(&mut self.key),
+        }
+    }
+}
+
+impl Drop for PendingLock {
+    fn drop(&mut self) {
+        // `None` means `into_guard` already handed off; only a caller dropped *before* it acquired gets
+        // this far. Release our own clone of the `Arc` before the check, or we'd count ourselves.
+        let Some(mutex) = self.mutex.take() else {
+            return;
+        };
+        drop(mutex);
+        evict_if_unreferenced(&self.locks, &self.key);
     }
 }
 
@@ -105,19 +191,7 @@ impl Drop for WriteLockGuard {
         // Drop the mutex guard first: this both unlocks the per-key mutex and releases this holder's
         // own strong reference to its `Arc`, so the strong-count check below reflects reality.
         self.guard.take();
-        let mut locks = self
-            .locks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(arc) = locks.get(&self.key) {
-            // Only the map itself still references this key's `Arc` — no other guard or queued
-            // `lock()` caller holds a clone — so it's safe to evict. Checked while holding `locks`'
-            // own lock, which every `lock()` call must also acquire to clone the `Arc`, so a
-            // concurrent caller can't slip in between this check and the removal.
-            if Arc::strong_count(arc) == 1 {
-                locks.remove(&self.key);
-            }
-        }
+        evict_if_unreferenced(&self.locks, &self.key);
     }
 }
 
@@ -295,6 +369,42 @@ mod tests {
             registry.key_count(),
             0,
             "entry must be evicted once every concurrent holder has finished"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_waiter_cancelled_before_it_acquires_does_not_orphan_its_map_entry() {
+        // The leak this pins down needs a very specific interleaving, so it's driven by hand rather
+        // than with tasks and sleeps: a waiter must still be queued when the holder releases (so the
+        // holder's own drop sees `strong_count > 1` and declines to evict), and must then die without
+        // ever acquiring. With eviction living only in `WriteLockGuard::drop`, nothing would be left to
+        // clean up after it and the entry would sit in the map for the process's whole lifetime.
+        let registry = WriteLockRegistry::new();
+        let holder = registry.lock("cancelled.rs").await;
+        assert_eq!(registry.key_count(), 1);
+
+        // One poll is enough for the waiter to clone the key's `Arc` and queue on its mutex; it can't
+        // acquire, because `holder` still owns the lock.
+        let mut waiter = Box::pin(registry.lock("cancelled.rs"));
+        assert!(
+            futures::poll!(waiter.as_mut()).is_pending(),
+            "sanity check: the waiter must be parked behind the holder, not acquired"
+        );
+
+        drop(holder);
+        assert_eq!(
+            registry.key_count(),
+            1,
+            "the entry must survive the holder's release while a waiter still references it"
+        );
+
+        // The waiter's whole future is dropped mid-`lock_owned()` — cancellation — so it never
+        // constructs a guard.
+        drop(waiter);
+        assert_eq!(
+            registry.key_count(),
+            0,
+            "a waiter cancelled before acquiring must still evict the entry it was the last to reference"
         );
     }
 }

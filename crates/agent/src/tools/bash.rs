@@ -488,6 +488,12 @@ fn truncation_details(snap: &OutputSnapshot) -> Option<Value> {
                 "max_bytes": snap.truncation.max_bytes,
             },
             "full_output_path": snap.full_output_path,
+            // A spill file that hit its byte budget holds only a prefix of the stream (see
+            // `output::MAX_SPILL_BYTES`). A client rendering `full_output_path` as "the complete
+            // output, click to open" would otherwise present that prefix as the whole thing — the
+            // same dishonesty `format_output`'s marker guards against for the model's own text.
+            "full_output_capped": snap.full_output_capped,
+            "full_output_bytes": snap.full_output_bytes,
         })
     })
 }
@@ -578,6 +584,8 @@ mod tests {
                 max_bytes: DEFAULT_MAX_BYTES,
             },
             full_output_path: Some("/tmp/pi-bash-abc.log".into()),
+            full_output_capped: false,
+            full_output_bytes: 12345,
             last_line_bytes: 4,
         };
         let details = truncation_details(&snap).expect("truncated snapshot must carry details");
@@ -591,8 +599,40 @@ mod tests {
         assert_eq!(details["truncation"]["max_lines"], DEFAULT_MAX_LINES);
         assert_eq!(details["truncation"]["max_bytes"], DEFAULT_MAX_BYTES);
         assert_eq!(details["full_output_path"], "/tmp/pi-bash-abc.log");
+        assert_eq!(details["full_output_capped"], false);
+        assert_eq!(details["full_output_bytes"], 12345);
         // `full_output_path` is a sibling of `truncation`, not nested inside it.
         assert!(details["truncation"].get("full_output_path").is_none());
+    }
+
+    #[test]
+    fn truncation_details_tells_a_client_when_the_spill_file_holds_only_a_prefix() {
+        // A spill file that hit `output::MAX_SPILL_BYTES` stops short of the stream. A client that
+        // renders `full_output_path` as "the complete output" would otherwise show a firehose's first
+        // 128 MiB as if it were the whole thing — the wire payload has to carry the same admission the
+        // model's own marker text does.
+        let snap = OutputSnapshot {
+            content: "tail".into(),
+            truncation: Truncation {
+                truncated: true,
+                truncated_by: Some(TruncatedBy::Bytes),
+                total_lines: 900_000,
+                total_bytes: 4_000_000_000,
+                output_lines: 2000,
+                output_bytes: 51_200,
+                last_line_partial: false,
+                max_lines: DEFAULT_MAX_LINES,
+                max_bytes: DEFAULT_MAX_BYTES,
+            },
+            full_output_path: Some("/tmp/pi-bash-abc.log".into()),
+            full_output_capped: true,
+            full_output_bytes: 134_217_728,
+            last_line_bytes: 4,
+        };
+        let details = truncation_details(&snap).expect("truncated snapshot must carry details");
+        assert_eq!(details["full_output_capped"], true);
+        assert_eq!(details["full_output_bytes"], 134_217_728u64);
+        assert_eq!(details["truncation"]["total_bytes"], 4_000_000_000u64);
     }
 
     #[test]
@@ -611,6 +651,8 @@ mod tests {
                 max_bytes: DEFAULT_MAX_BYTES,
             },
             full_output_path: None,
+            full_output_capped: false,
+            full_output_bytes: 0,
             last_line_bytes: 3,
         };
         assert!(truncation_details(&snap).is_none());

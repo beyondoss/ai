@@ -75,6 +75,14 @@ pub struct CompactionProvenance {
     /// older one — see [`merge_provenance`].
     #[serde(default)]
     pub todos: Option<Value>,
+    /// Logical paths the model has authored via the `memory` tool (a `create`/`str_replace`/`insert`),
+    /// deduped, oldest-first, across every round so far. Carried for the same reason as the file lists:
+    /// once `apply_summary` drops the prefix, the fact that the model *wrote itself a note* — and where —
+    /// is gone with it, so a model reminded to consult its working memory post-compaction would have no
+    /// idea what it saved or that it saved anything. Rendered into the summary by [`format_memory_notes`],
+    /// it becomes a guaranteed, zero-effort "here is what you recorded, recall the relevant ones" pointer.
+    #[serde(default)]
+    pub memory_notes: Vec<String>,
 }
 
 /// Fold `previous`'s provenance forward with whatever the current round's prefix (`messages`) adds, and
@@ -104,6 +112,12 @@ pub fn merge_provenance(
             modified.push(path);
         }
     }
+    let mut memory_notes = previous.memory_notes.clone();
+    for path in extract_memory_notes(messages) {
+        if !memory_notes.contains(&path) {
+            memory_notes.push(path);
+        }
+    }
     CompactionProvenance {
         read_files: read,
         modified_files: modified,
@@ -112,6 +126,7 @@ pub fn merge_provenance(
         // `or_else`, not `or`: a round whose prefix cleared the list (`todos: []`) yields `Some([])` and
         // must win over `previous`, or a cleared plan would silently reappear at the next compaction.
         todos: extract_todos(messages).or_else(|| previous.todos.clone()),
+        memory_notes,
     }
 }
 
@@ -129,6 +144,46 @@ pub struct CompactionConfig {
     pub summary_max_tokens: u32,
     /// Whether automatic (threshold-triggered) compaction is on. Manual/overflow compaction ignores it.
     pub enabled: bool,
+}
+
+impl CompactionConfig {
+    /// Defaults scaled to a model's real context window.
+    ///
+    /// [`Default`] is sized for a 200k-context Claude model and states both budgets as *absolutes*
+    /// (`reserve_tokens: 16_384`, `keep_recent_tokens: 20_000`). Seeding only `context_window` from the
+    /// model's capabilities and leaving those two at their 200k values — which is what [`Agent::new`]
+    /// used to do — silently breaks the one invariant the two budgets have to satisfy between them:
+    ///
+    /// > what a compaction *keeps* must be comfortably smaller than the threshold that *triggers* one.
+    ///
+    /// The trigger fires at `context_window - reserve_tokens`, so on a 32_768-token model (the smallest
+    /// in the catalogue) the un-scaled numbers give a trigger budget of 16_384 while `keep_recent_tokens`
+    /// retains 20_000 — a compaction that keeps *more* than the line it just crossed. Every turn then
+    /// re-triggers, each one spending a real summarization call, and the context never gets back under
+    /// the threshold. Scaling both budgets down with the window restores the invariant.
+    ///
+    /// The caps are deliberately one-sided (`min`, not a proportion): any window at or above ~64k gets
+    /// byte-for-byte the same tuning as before, since a quarter of the window already exceeds the
+    /// absolute reserve and half the remaining budget already exceeds `keep_recent_tokens`. Only the
+    /// genuinely small windows — the ones that were broken — see different numbers.
+    pub fn for_window(context_window: u32) -> Self {
+        let d = Self::default();
+        // Never hand the reserve more than a quarter of the window: at the absolute 16_384 a 32k model
+        // would surrender half its context to headroom before the first token is sent.
+        let reserve_tokens = d.reserve_tokens.min(context_window / 4);
+        // What's actually usable once the reserve is set aside — and the exact quantity the trigger
+        // compares against, so `keep_recent_tokens` must stay a fraction of *this*, not of the window.
+        let trigger_budget = context_window.saturating_sub(reserve_tokens);
+        // Half the trigger budget: a compaction lands the context at roughly 50% of the threshold, so
+        // there's real room to work before the next one fires rather than re-triggering immediately.
+        let keep_recent_tokens = d.keep_recent_tokens.min(trigger_budget / 2);
+        Self {
+            context_window,
+            reserve_tokens,
+            keep_recent_tokens,
+            ..d
+        }
+    }
 }
 
 impl Default for CompactionConfig {
@@ -159,9 +214,12 @@ impl Default for CompactionConfig {
 /// pi's "You are a context summarization assistant..." opener — functionally equivalent (both frame the
 /// call as compaction, not conversation), just not textually identical.
 pub const SUMMARY_SYSTEM: &str = "You compact a long agent transcript so the agent can keep working \
-with far fewer tokens but no loss of essential context. Be precise, concrete, and information-dense; \
-preserve file paths, identifiers, commands, and decisions exactly. Do NOT continue the conversation. \
-Do NOT respond to any questions in the conversation. ONLY output the structured summary.";
+with far fewer tokens but no loss of essential context. Be precise, concrete, and information-dense. \
+Copy specifics verbatim — never paraphrase, round, or elide them: file paths (with line numbers), \
+identifiers and function names, exact literal values (numbers, ports, versions, config keys, IDs, \
+flags), commands and their key outputs, error messages, and decisions and their rationale. A specific \
+you drop is gone for good — prefer keeping an exact value over smooth prose. Do NOT continue the \
+conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.";
 
 /// The instruction appended after the rendered transcript in the summarization call. Matches pi's own
 /// `SUMMARIZATION_PROMPT` (`compaction.ts`) structurally: a bracketed exemplar per section (telling the
@@ -177,8 +235,11 @@ mentioned by user]\n- [Or \"(none)\" if none were mentioned]\n\n## Progress\n###
 tasks/changes]\n\n### In Progress\n- [ ] [Current work]\n\n### Blocked\n- [Issues preventing progress, \
 if any]\n\n## Key Decisions\n- **[Decision]**: [Brief rationale]\n\n## Next Steps\n1. [Ordered list of \
 what should happen next]\n\n## Critical Context\n- [Any data, examples, or references needed to \
-continue]\n- [Or \"(none)\" if not applicable]\n\nKeep each section concise. Preserve exact file paths, \
-function names, and error messages.";
+continue — copy exact literal values (numbers, ports, versions, config keys, IDs, flags), commands and \
+their key outputs, and file:line references verbatim rather than describing them]\n- [Or \"(none)\" if \
+not applicable]\n\nKeep each section concise, but never at the cost of a specific: copy exact file paths \
+(with line numbers), function/identifier names, literal values, commands and their key outputs, and \
+error messages verbatim rather than paraphrasing them.";
 
 /// The instruction used when a *previous* summary already exists — an incremental update rather than a
 /// from-scratch re-summarization. Without this, each compaction re-summarizes the prior summary as raw
@@ -198,8 +259,10 @@ discovered]\n\n## Progress\n### Done\n- [x] [Include previously done items AND n
 items]\n\n### In Progress\n- [ ] [Current work - update based on progress]\n\n### Blocked\n- [Current \
 blockers - remove if resolved]\n\n## Key Decisions\n- **[Decision]**: [Brief rationale] (preserve all \
 previous, add new)\n\n## Next Steps\n1. [Update based on current state]\n\n## Critical Context\n- \
-[Preserve important context, add new if needed]\n\nKeep each section concise. Preserve exact file \
-paths, function names, and error messages.";
+[Preserve important context, add new if needed — keep exact literal values, commands and their key \
+outputs, and file:line references verbatim]\n\nKeep each section concise, but never at the cost of a \
+specific: copy exact file paths (with line numbers), function/identifier names, literal values, commands \
+and their key outputs, and error messages verbatim rather than paraphrasing them.";
 
 /// The instruction used when the cut point falls *inside* an in-progress turn (see [`is_split_turn`]):
 /// the prefix being summarized ends mid-tool-dispatch, so its concluding response — and the context
@@ -211,8 +274,9 @@ pub const SPLIT_TURN_INSTRUCTION: &str = "This is the PREFIX of a turn that was 
 The SUFFIX (recent work) is retained.\n\nSummarize the prefix to provide context for the retained \
 suffix:\n\n## Original Request\n[What did the user ask for in this turn?]\n\n## Early Progress\n- \
 [Key decisions and work done in the prefix]\n\n## Context for Suffix\n- [Information needed to \
-understand the retained recent work]\n\nBe concise. Focus on what's needed to understand the kept \
-suffix.";
+understand the retained recent work — copy exact file paths (with line numbers), literal values, \
+commands and their key outputs, and error messages verbatim]\n\nBe concise. Focus on what's needed to \
+understand the kept suffix.";
 
 /// Prefix marking a message as a compaction summary, so a later compaction recognizes it and updates
 /// it incrementally instead of re-summarizing it. Created by [`apply_summary`], detected by
@@ -656,6 +720,50 @@ pub fn extract_todos(messages: &[Message]) -> Option<Value> {
         })
 }
 
+/// The logical paths the model wrote to via the `memory` tool in `messages`, in first-seen order — a
+/// `create`, `str_replace`, or `insert` (the write commands; `view`/`search` read, `delete`/`rename`
+/// don't add content). Deduped within this scan; accumulated across rounds by [`merge_provenance`].
+///
+/// Keys on the tool name `"memory"` only, exactly as [`extract_todos`] keys on `"todo"` — it stays
+/// agnostic to *which* root (`/memories` vs `/session`) a note lives under, so the lower layer never has
+/// to know the host's memory-mount conventions. Both roots are worth surfacing: a note is a note.
+pub fn extract_memory_notes(messages: &[Message]) -> Vec<String> {
+    let mut notes = Vec::new();
+    for m in messages {
+        for b in &m.content {
+            if let ContentBlock::ToolUse { name, input, .. } = b
+                && name == "memory"
+                && matches!(
+                    input.get("command").and_then(Value::as_str),
+                    Some("create" | "str_replace" | "insert")
+                )
+                && let Some(path) = input.get("path").and_then(Value::as_str)
+            {
+                let path = path.to_string();
+                if !notes.contains(&path) {
+                    notes.push(path);
+                }
+            }
+        }
+    }
+    notes
+}
+
+/// Render the carried `memory` note paths as a `<memory-notes>` block appended to the summarization
+/// model's *output* — the same deterministic-carry contract [`format_todo_list`] documents. Returns `""`
+/// when there are none, so appending it to a summary is always safe. The model reads the block as: these
+/// are files I wrote myself; recall the relevant ones with the `memory` tool's `view`.
+pub fn format_memory_notes(memory_notes: &[String]) -> String {
+    if memory_notes.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\n<memory-notes>\n{}\n</memory-notes>",
+            memory_notes.join("\n")
+        )
+    }
+}
+
 /// Render a `todos` array as the compact checklist both the `todo` tool's own result and a compaction
 /// summary show the model. Shared so the two can never drift.
 ///
@@ -731,10 +839,11 @@ pub fn previous_summary(prefix: &[Message]) -> Option<&str> {
 
 /// The host-appended, deterministically-regenerated blocks a summary body carries at its tail, as
 /// `(open, close)` tag pairs. See [`format_file_operations`] / [`format_todo_list`].
-const CARRY_BLOCKS: [(&str, &str); 3] = [
+const CARRY_BLOCKS: [(&str, &str); 4] = [
     ("<read-files>", "</read-files>"),
     ("<modified-files>", "</modified-files>"),
     ("<todo_list>", "</todo_list>"),
+    ("<memory-notes>", "</memory-notes>"),
 ];
 
 /// Strip every trailing [`CARRY_BLOCKS`] block from a summary body, leaving only the model's own prose.
@@ -937,6 +1046,44 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn scaled_budgets_keep_less_than_the_threshold_that_triggers_a_compaction() {
+        // The invariant the two budgets have to satisfy between them, across every window in the
+        // catalogue: a compaction must *keep* less than the trigger threshold it just crossed.
+        // Otherwise the very next turn re-triggers, pays for another summarization, and never gets
+        // back under the line — which is exactly what the un-scaled 200k absolutes did on a 32k model
+        // (trigger budget 16_384, keep_recent 20_000).
+        for window in [4_096u32, 8_192, 32_768, 40_960, 128_000, 200_000, 1_000_000] {
+            let cfg = CompactionConfig::for_window(window);
+            let trigger_budget = window - cfg.reserve_tokens;
+            assert!(
+                cfg.keep_recent_tokens < trigger_budget,
+                "window {window}: keep_recent ({}) must stay under the trigger budget ({trigger_budget})",
+                cfg.keep_recent_tokens
+            );
+            assert!(
+                cfg.reserve_tokens < window,
+                "window {window}: the reserve must not swallow the whole context"
+            );
+        }
+    }
+
+    #[test]
+    fn scaling_leaves_every_large_window_byte_for_byte_unchanged() {
+        // The caps are one-sided on purpose: they must only bite on the small windows that were
+        // actually broken. Any window at or above ~64k keeps precisely the tuning it had before.
+        let d = CompactionConfig::default();
+        for window in [128_000u32, 200_000, 256_000, 1_000_000] {
+            let cfg = CompactionConfig::for_window(window);
+            assert_eq!(cfg.reserve_tokens, d.reserve_tokens, "window {window}");
+            assert_eq!(
+                cfg.keep_recent_tokens, d.keep_recent_tokens,
+                "window {window}"
+            );
+            assert_eq!(cfg.context_window, window);
+        }
+    }
+
     fn convo() -> Vec<Message> {
         vec![
             Message::user("the original task: refactor foo"),
@@ -1020,6 +1167,32 @@ mod tests {
             "SUMMARY_INSTRUCTION must give an explicit \"(none)\" fallback for optional sections: \
              {SUMMARY_INSTRUCTION}"
         );
+    }
+
+    #[test]
+    fn every_summary_prompt_demands_verbatim_specifics() {
+        // The one thing a summarizer must not do is smooth a specific away — every instruction that
+        // shapes a summary must explicitly demand the categories most often lost (line numbers, literal
+        // values, commands+outputs) be copied verbatim, not paraphrased.
+        for (name, text) in [
+            ("SUMMARY_SYSTEM", SUMMARY_SYSTEM),
+            ("SUMMARY_INSTRUCTION", SUMMARY_INSTRUCTION),
+            ("UPDATE_INSTRUCTION", UPDATE_INSTRUCTION),
+            ("SPLIT_TURN_INSTRUCTION", SPLIT_TURN_INSTRUCTION),
+            (
+                "BRANCH_SUMMARY_INSTRUCTION",
+                crate::branch_summary::BRANCH_SUMMARY_INSTRUCTION,
+            ),
+        ] {
+            assert!(
+                text.contains("verbatim"),
+                "{name} must demand specifics be copied verbatim: {text}"
+            );
+            assert!(
+                text.contains("line numbers"),
+                "{name} must name file:line references as something to preserve: {text}"
+            );
+        }
     }
 
     #[test]
@@ -1751,6 +1924,7 @@ mod tests {
             compactions: 1,
             last_reason: Some(CompactionReason::Threshold),
             todos: None,
+            memory_notes: vec![],
         };
         let messages = vec![Message::assistant(vec![ContentBlock::tool_use(
             "1",
@@ -1935,6 +2109,81 @@ mod tests {
     #[test]
     fn extract_todos_is_none_without_a_todo_call() {
         assert!(extract_todos(&convo()).is_none());
+    }
+
+    fn mem_call(id: &str, command: &str, path: &str) -> Message {
+        Message::assistant(vec![ContentBlock::tool_use(
+            id,
+            "memory",
+            json!({ "command": command, "path": path }),
+        )])
+    }
+
+    #[test]
+    fn extract_memory_notes_collects_writes_first_seen_and_ignores_the_rest() {
+        let messages = vec![
+            mem_call("1", "create", "/session/facts.md"),
+            mem_call("2", "view", "/session/facts.md"), // a read — ignored
+            mem_call("3", "str_replace", "/session/facts.md"), // same path, deduped
+            mem_call("4", "insert", "/memories/notes.md"), // the other root counts too
+            mem_call("5", "delete", "/session/gone.md"), // a delete adds nothing
+            Message::assistant(vec![ContentBlock::tool_use(
+                "6",
+                "write", // a different tool that happens to carry a path — not memory
+                json!({ "path": "/session/decoy.md" }),
+            )]),
+        ];
+        assert_eq!(
+            extract_memory_notes(&messages),
+            vec![
+                "/session/facts.md".to_string(),
+                "/memories/notes.md".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn format_memory_notes_renders_a_block_or_nothing() {
+        assert_eq!(format_memory_notes(&[]), "");
+        let block = format_memory_notes(&["/session/a.md".into(), "/memories/b.md".into()]);
+        assert_eq!(
+            block,
+            "\n\n<memory-notes>\n/session/a.md\n/memories/b.md\n</memory-notes>"
+        );
+    }
+
+    #[test]
+    fn merge_provenance_accumulates_memory_notes_across_rounds_deduped() {
+        let round1 = merge_provenance(
+            &CompactionProvenance::default(),
+            &[mem_call("1", "create", "/session/a.md")],
+            CompactionReason::Threshold,
+        );
+        assert_eq!(round1.memory_notes, vec!["/session/a.md".to_string()]);
+        let round2 = merge_provenance(
+            &round1,
+            &[
+                mem_call("2", "str_replace", "/session/a.md"), // already known — deduped
+                mem_call("3", "create", "/session/b.md"),      // new
+            ],
+            CompactionReason::Threshold,
+        );
+        assert_eq!(
+            round2.memory_notes,
+            vec!["/session/a.md".to_string(), "/session/b.md".to_string()]
+        );
+    }
+
+    #[test]
+    fn previous_summary_strips_the_memory_notes_carry_block() {
+        // A summary body that ends with a memory-notes block must have it peeled off before it is fed
+        // forward, exactly like the file/todo blocks — otherwise every incremental round re-appends one.
+        let body = "The model saved some notes.\n\n<memory-notes>\n/session/a.md\n</memory-notes>";
+        let msg = Message::user(format!("{SUMMARY_MARKER}\n\n{body}"));
+        assert_eq!(
+            previous_summary(&[msg]),
+            Some("The model saved some notes.")
+        );
     }
 
     #[test]

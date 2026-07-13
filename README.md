@@ -31,10 +31,38 @@ client = OpenAI(base_url="http://ai.internal/v1", api_key="sk-your-openai-key")
 
 ## Agent Quick Start
 
-The agent harness routes through the gateway. Point it at a running gateway with a `bai_v1` key:
+**The gateway is optional.** Export a provider key and the agent goes straight to that provider — no
+gateway, no extra config. The auth header (`x-api-key` for Anthropic, `Authorization: Bearer` for
+everyone else) comes from the provider table; you never spell it out.
 
 ```sh
-# One-shot coding task
+# One-shot coding task, straight to Anthropic
+ANTHROPIC_API_KEY=sk-ant-... \
+  cargo run -p beyond-ai-agent -- run --model claude-opus-4-8 "add a CHANGELOG entry"
+
+# …or OpenAI, or any of the providers in the table (OPENROUTER_API_KEY, GROQ_API_KEY, …)
+OPENAI_API_KEY=sk-... cargo run -p beyond-ai-agent -- run --model gpt-5 "…"
+
+# A subscription login works too, with no gateway and no key at all
+cargo run -p beyond-ai-agent -- login anthropic
+```
+
+Aggregators serve other vendors' model ids, so they can't be inferred from one — name them:
+
+```sh
+AI_PROVIDER=openrouter OPENROUTER_API_KEY=sk-or-... \
+  cargo run -p beyond-ai-agent -- run --model anthropic/claude-sonnet-4.5 "…"
+
+# Any OpenAI-compatible endpoint (vLLM, Ollama, LM Studio, a corporate proxy)
+AI_BASE_URL=http://localhost:8000/v1 AI_API_KEY=local \
+  cargo run -p beyond-ai-agent -- run --model qwen3-coder "…"
+```
+
+Point it at a gateway instead when you want key-swapping, routing, and metering — that path is
+unchanged, and a configured gateway is never bypassed just because a key is in the environment
+(`AI_DIRECT=1` overrides that, if you want it):
+
+```sh
 AI_GATEWAY_URL=http://ai.internal AI_AGENT_KEY=bai_v1... \
   cargo run -p beyond-ai-agent -- run "add a CHANGELOG entry for the latest release"
 
@@ -43,6 +71,17 @@ AI_GATEWAY_URL=http://ai.internal AI_AGENT_KEY=bai_v1... \
   cargo run -p beyond-ai-agent -- serve --session-file /tmp/agent.json
 # then: {"type":"prompt","message":"…"} → streamed event frames, then a response
 ```
+
+**Credential precedence.** A gateway is *configured* if `AI_GATEWAY_URL`, a stored `default_gateway_url`,
+or `AI_AGENT_KEY` is set — the `http://ai.internal` default is a fallback, not configuration. With one
+configured, the gateway is used (unless `AI_DIRECT=1`). Otherwise, routing is direct, in this order:
+
+1. a `models.json` `base_url` override for the exact model id
+2. `AI_BASE_URL` + `AI_API_KEY`
+3. `AI_PROVIDER` + that provider's key
+4. a stored OAuth login (`agent login`) — **above** an ambient key, so a stray `ANTHROPIC_API_KEY` in
+   your shell never silently moves a subscription onto pay-per-token billing
+5. the provider key for whichever provider natively serves the model id
 
 Tools: `read`, `write`, `edit`, `bash`, `ls`, `grep`, `find` (pi's coding set) plus `fork`, `sync`, `logs` (Beyond platform). See [crates/agent-core/ARCHITECTURE.md](crates/agent-core/ARCHITECTURE.md).
 

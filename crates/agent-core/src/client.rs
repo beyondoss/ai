@@ -587,13 +587,18 @@ impl ModelTransport for GatewayClient {
                 .direct
                 .as_ref()
                 .is_some_and(|d| d.deployment_name.is_some());
-        // Same `RouteOverride::Prefixed` signal that already picked Codex's own URL/path above — not
-        // a second, independent detection path. See `ModelRequest::is_codex`'s own doc comment for the
+        // "Which provider is this?", asked directly. It used to be inferred from the route *shape*
+        // (`RouteOverride::Prefixed` was only ever Codex), which held exactly as long as the Codex
+        // backend was reachable one way — through the gateway. It is now also reachable directly
+        // (`https://chatgpt.com/backend-api/…`, when no gateway is deployed), and that route is a
+        // `Direct` like any other, so the shape no longer identifies the provider. The routing carries
+        // the provider id, so ask it. See `ModelRequest::is_codex`'s own doc comment for the
         // dialect-body branch this feeds.
-        req.is_codex = matches!(
-            credential.direct.as_ref().map(|d| &d.route),
-            Some(RouteOverride::Prefixed { .. })
-        );
+        req.is_codex = credential
+            .direct
+            .as_ref()
+            .and_then(|d| d.aggregator_host)
+            .is_some_and(|host| host == crate::models::AggregatorHost::OpenAiCodex);
         // `req.host` was already computed above, before dialect selection — see that assignment's own
         // comment.
         // Anthropic's own OAuth identity-spoofing headers (`CLAUDE_CODE_BETA`/`CLAUDE_CLI_IDENTITY`
@@ -603,8 +608,22 @@ impl ModelTransport for GatewayClient {
         // `credential.is_oauth` too, but must not also claim to be the Anthropic-official Claude Code
         // client to GitHub's Copilot proxy. Computed once and fed to both the request body and the
         // decoder (reversing tool_use names back) so the two halves of the round-trip always agree.
-        let has_direct_override = credential.direct.is_some();
-        let is_oauth = credential.is_oauth && !has_direct_override;
+        //
+        // "Is this a genuine direct-to-Anthropic request?" was previously approximated as "has no
+        // direct route override" — true while the *only* way to reach Anthropic natively was to relay
+        // through the gateway, so any override necessarily meant a third party. That stopped being
+        // true when the agent learned to route straight at `api.anthropic.com` with no gateway at all
+        // (an `ANTHROPIC_API_KEY`/OAuth direct route — `crates::agent::gateway_credential`): such a
+        // request carries an override *and* is the most first-party request there is, and suppressing
+        // the identity headers on it makes Anthropic's OAuth endpoint reject the token outright. So
+        // ask the routing which provider it actually points at, which it now knows, instead of
+        // inferring it from the mere presence of a route.
+        let routed_to_anthropic_natively = credential
+            .direct
+            .as_ref()
+            .is_some_and(|d| d.aggregator_host == Some(crate::models::AggregatorHost::Anthropic));
+        let is_oauth =
+            credential.is_oauth && (credential.direct.is_none() || routed_to_anthropic_natively);
         let mut body = dialect.build_body(&req, is_oauth);
         // Pi-parity Fix 2 (Round 2): Azure OpenAI's deployment name (`DirectRouting::deployment_name`)
         // overwrites just the wire-level `"model"` field `build_body` already set — never
@@ -1178,24 +1197,31 @@ async fn send_with_retry(
                 // since an upstream can return an arbitrarily large error page (an HTML error document
                 // from a misconfigured proxy, say) and this ends up in logs and `AgentEvent::Error`.
                 let detail = read_error_body_capped(resp).await;
-                // A live 401 (the gateway itself rejected the key, as opposed to `run`/`serve`'s own
-                // preflight "no key given at all" check, which this can't be — a request only reaches
-                // here with *some* key attached) gets a pointed, actionable message naming the actual
-                // cause instead of a bare status code: this crate has no CLI-flag names of its own to
-                // reference (agent-core is layered under any consumer's own `--key`/`AI_AGENT_KEY`-style
-                // flag), so this stays in terms of "the API key" generically, distinct from — and more
-                // specific than — the upstream body alone, which for a 401 is often just `{"error":
+                // A live 401 (the key was rejected, as opposed to `run`/`serve`'s own preflight "no key
+                // given at all" check, which this can't be — a request only reaches here with *some* key
+                // attached) gets a pointed, actionable message naming the actual cause instead of a bare
+                // status code: this crate has no CLI-flag names of its own to reference (agent-core is
+                // layered under any consumer's own `--key`/`AI_AGENT_KEY`-style flag), so this stays in
+                // terms of "the API key" generically, distinct from — and more specific than — the
+                // upstream body alone, which for a 401 is often just `{"error":
                 // {"type":"authentication_error"}}` with no hint at what to actually do about it.
+                //
+                // "gateway" is deliberately absent from both messages: this request may well not have gone
+                // through one (a direct provider route — `crates/agent::gateway_credential` — dials the
+                // provider itself), and telling someone with no gateway deployed that "the gateway
+                // rejected" their key sends them hunting for a component that isn't there. `who` names
+                // whichever host actually answered.
+                let who = url_host(url);
                 if status.as_u16() == 401 {
                     return Err(Error::Transport(format!(
-                        "gateway rejected the request as unauthorized (401) — the API key being used \
+                        "{who} rejected the request as unauthorized (401) — the API key being used \
                          is missing, invalid, expired, or lacks permission for this model; check the \
                          key and try again. Upstream detail: {}",
                         truncate_error_body(detail.trim())
                     )));
                 }
                 return Err(Error::Transport(format!(
-                    "gateway returned {status}: {}",
+                    "{who} returned {status}: {}",
                     truncate_error_body(detail.trim())
                 )));
             }
@@ -1347,6 +1373,24 @@ const MAX_ERROR_BODY_CHARS: usize = 4_000;
 /// `` `${text.slice(0, maxChars)}... [truncated ${text.length - maxChars} chars]` ``). The omitted
 /// count matters operationally: a bare "[truncated]" marker with no count leaves an on-call engineer
 /// unable to tell a 1-char overflow from a multi-megabyte proxy error page from the marker alone.
+/// The host an error message should blame — `api.anthropic.com`, `openrouter.ai`, whatever actually
+/// answered. Substring-sliced rather than URL-parsed: this crate takes no `url` dependency, the input is
+/// a URL this code built itself, and the result only ever lands in an error string. An unparseable one
+/// falls back to a neutral "the upstream" rather than fabricating a host.
+fn url_host(url: &str) -> &str {
+    let rest = match url.split_once("://") {
+        Some((_scheme, rest)) => rest,
+        None => return "the upstream",
+    };
+    let authority = rest.split(['/', '?']).next().unwrap_or("");
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    if host.is_empty() {
+        "the upstream"
+    } else {
+        host
+    }
+}
+
 fn truncate_error_body(s: &str) -> String {
     let total = s.chars().count();
     if total <= MAX_ERROR_BODY_CHARS {
@@ -3518,7 +3562,12 @@ mod tests {
             dialect_override: None,
             deployment_name: None,
             query: None,
-            aggregator_host: None,
+            // What marks this as the Codex backend (`req.is_codex`, and with it the instructions/zstd
+            // body this test asserts on). It used to be inferred from the `Prefixed` route shape alone —
+            // a proxy that held only while the gateway was the one way to reach Codex. Codex is now also
+            // reachable as a plain `Direct` route (no gateway deployed), so the provider id is the
+            // signal, and `gateway_credential` sets it on both routes. Mirrors the real credential.
+            aggregator_host: Some(crate::models::AggregatorHost::OpenAiCodex),
         };
         let client = GatewayClient::with_credential_source(
             format!("http://{addr}"),
@@ -3916,5 +3965,29 @@ mod tests {
             !lower.contains("\nauthorization:"),
             "Authorization must be entirely absent when auth_header overrides it, got:\n{request}"
         );
+    }
+
+    /// A 401 must blame whoever actually answered. Saying "the gateway rejected your key" to someone
+    /// running a direct provider route sends them hunting for a component they never deployed.
+    #[test]
+    fn url_host_names_the_upstream_that_answered() {
+        assert_eq!(
+            url_host("https://api.anthropic.com/v1/messages"),
+            "api.anthropic.com"
+        );
+        assert_eq!(
+            url_host("https://openrouter.ai/api/v1/chat/completions"),
+            "openrouter.ai"
+        );
+        assert_eq!(url_host("http://ai.internal/v1/messages"), "ai.internal");
+        assert_eq!(
+            url_host("http://127.0.0.1:8099/v1/messages"),
+            "127.0.0.1:8099"
+        );
+        assert_eq!(url_host("https://x.test/v1?api-version=v1"), "x.test");
+        // Credentials in the authority must not leak into an error string.
+        assert_eq!(url_host("https://user:pw@x.test/v1"), "x.test");
+        assert_eq!(url_host("not a url"), "the upstream");
+        assert_eq!(url_host(""), "the upstream");
     }
 }

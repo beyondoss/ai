@@ -60,7 +60,7 @@ mod route {
     use beyond_ai::route::{Dialect, dialect_default};
 
     // Dialect → default provider name: the per-request routing decision (sans override). 0-alloc.
-    #[divan::bench(args = [Dialect::OpenAI, Dialect::Anthropic])]
+    #[divan::bench(args = [Dialect::OpenAi, Dialect::Anthropic])]
     fn dialect_default_name(bencher: Bencher, dialect: Dialect) {
         bencher.bench(|| dialect_default(black_box(dialect)));
     }

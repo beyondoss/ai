@@ -47,12 +47,17 @@ The harness layers several capabilities over the bare tools + loop:
   reference and the reconnect flow. Two supervisor-level daemon facilities sit above the per-session
   protocol: **`list_daemon_sessions`** — intercepted in the read loop (never forwarded to a session)
   and answered by unioning the live `session id → running session` map with an on-disk scan of
-  `<session-dir>/*.jsonl`, each entry tagged `live: true|false`; and an optional **idle reaper**
-  (`--session-idle-timeout <secs>`, off by default) — a background ticker that reclaims sessions with no
-  attached connection, idle past the timeout, and not mid-run (a per-session `running` flag `serve_session`
-  flips around a `prompt`), dropping the retained `input_tx` so the session persists and exits exactly as
-  graceful shutdown does per-entry (both share `join_handles`). A reconnect to a just-reaped id respawns
-  it from disk and replays via `get_messages {since}`. A third daemon facility, **shared upstream
+  `<session-dir>/*.jsonl`, each entry tagged `live: true|false`; and the **idle reaper**
+  (`--session-idle-timeout <secs>`, default 3600, `0` disables) — a background ticker that reclaims
+  sessions whose task has already ended (a closed `input_tx`: pure garbage, reaped on sight) plus those
+  with no attached connection, idle past the timeout, and not mid-run (a per-session `running` flag
+  `serve_session` flips around a `prompt`), dropping the retained `input_tx` so the session persists and
+  exits exactly as graceful shutdown does per-entry (both share `join_handles`, which polls
+  `JoinHandle::is_finished` under a grace period rather than parking a blocking join, so a wedged session
+  can't burn a blocking-pool thread for the daemon's life). The default has to be finite: a connection
+  that omits `?session_id=` mints a fresh id, and every id owns a thread, an `Agent`, and a gateway pool
+  until something reclaims it. A reconnect to a just-reaped id respawns it from disk and replays via
+  `get_messages {since}`. A third daemon facility, **shared upstream
   pooling** (`--upstream-http2 <off|auto|h2c>`, off by default): instead of each session building its own
   `reqwest::Client` (so N sessions ≈ N connections to the gateway on the plaintext HTTP/1.1 hop),
   `serve_ws` builds **one** client and injects it into every session via
@@ -447,7 +452,15 @@ The harness layers several capabilities over the bare tools + loop:
   `/session` while it still has full detail; and a **post-compaction recall reminder**
   (`memory::COMPACTION_REMINDER`) fires on the cut, telling it to read `/session` back. Both are computed
   host-side from the `Usage` events the observer already sees (no agent-core change), gated on a session
-  mount, and pushed as mid-run steers. The tool is host-owned (each backend `Arc` cloned into the tool at each registry rebuild,
+  mount, and pushed as mid-run steers. Backing the reminder, the paths the model writes via the `memory`
+  tool ride the **deterministic-carry channel** (`agent_core::CompactionProvenance::memory_notes`,
+  parallel to the read/modified-file and `todo` lists): every summary carries a `<memory-notes>` block
+  naming them, so a summarizing model that never mentions a note can't erase the model's awareness that it
+  saved one and where — the guaranteed, zero-effort half of the save→carry→recall arc. Complementing the
+  deterministic carry, the summarizer's own instructions (`agent_core::compaction::SUMMARY_SYSTEM` and the
+  per-mode templates) demand that specifics most often smoothed away — `file:line` references, exact
+  literal values, commands and their key outputs — be copied _verbatim_, shrinking the loss at the source.
+  The tool is host-owned (each backend `Arc` cloned into the tool at each registry rebuild,
   like `structured_output`'s `OutputSlot`) and registered _after_ `apply_filter` so a `--tools` allow-list
   can't strip it. In `serve` the `/session` mount rides a shared, swappable `SessionDir` cell so a
   `switch_session`/`new_session`/`fork` re-points every holder with one cell write — no tool or agent
@@ -626,7 +639,17 @@ The harness layers several capabilities over the bare tools + loop:
   variant — expands a `/skill:name`/`/name` invocation exactly like a fresh `prompt` does (`serve.rs`'s
   shared `expand_message` helper) and accepts the same optional `images` array a fresh `prompt` does
   (parsed via `parse_images` into an `agent_core::SteeringMessage`), so neither expansion nor image
-  attachments are a `prompt`-only behavior a client has to special-case. `compact`(optional `custom_instructions` steers what the summary
+  attachments are a `prompt`-only behavior a client has to special-case. **Each steering lane is
+  bounded** (`agent_core::steering`'s per-lane cap): the lanes are fed straight from remote RPC, carry
+  base64 image payloads, and drain at most one message per turn boundary — and the steer lane has no
+  drain point at all while idle — so an unbounded lane lets one client pin arbitrary heap in the daemon
+  for the session's life. A full lane **refuses the newest** message (rather than dropping the oldest,
+  which would silently reorder the client's own instruction stream and, under a sustained flood, churn
+  the head so nothing ever reaches the model), and the refusal is reported honestly: the ack comes back
+  `success: false` with a `steering queue full` error, alongside the usual `queue_content` payload so
+  the client can see the depth it's up against and retry once the agent drains. Acking `true` for a
+  message that was dropped is the one outcome a client cannot recover from, since it has no other signal
+  that its instruction never reached the model. `compact`(optional `custom_instructions` steers what the summary
   emphasizes, passed straight through to `Agent::compact` — matching pi's own `compact(customInstructions)`;
   response is `{compacted, reason, summary, tokens_before, tokens_after}` — all four of the latter `null`
   on a no-op, or a real compaction's own generated summary text and its `AgentEvent::Compacted`-carried
@@ -996,6 +1019,100 @@ by every `build_agent` rebuild (`set_model`/`set_thinking`/`cycle_model`/`cycle_
 | **Virtual key** (`bai_v1…`)    | The bearer token this crate forwards to the gateway on every request                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | Not verified or interpreted here — Ed25519 signature check and deny-set live entirely in the gateway                                                                                                                                                                                                                                             |
 | **`max_steps`**                | Ceiling on loop iterations per `run` invocation, or per `prompt` in `serve` (default `agent_core::DEFAULT_MAX_STEPS`, 50)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | Not a token budget — `max_tokens` (seeded model-aware by `agent_core`'s `Agent::new`, ≥4096/turn) has no CLI flag in this crate; also not a permanent dead end — `Error::MaxSteps` is resumable with a fresh call                                                                                                                                |
 | **`HARD_CAP`** (grep/find)     | OOM guard: walk quits once 10,000 matches/paths are collected, before `limit` truncation runs                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | Not the reported limit — `limit` (default 100/1000) is the user-facing cap; `HARD_CAP` is a backstop far above it                                                                                                                                                                                                                                |
+
+---
+
+## Provider routing — the gateway is optional
+
+The agent reaches a model in one of two modes, chosen once per invocation
+(`gateway_credential::ProviderEnv::direct`):
+
+- **Gateway mode** — relay through the AI gateway, which swaps a `bai_v1…` virtual key for a real pool
+  key, routes to the provider, and meters the result.
+- **Direct mode** — dial the provider itself. `agent_core::client::RouteOverride::Direct` replaces
+  `GatewayClient`'s base URL outright at request time, so this needed no new transport: a direct
+  credential simply carries a route, and the gateway URL is never dialed.
+
+A gateway is **configured** if `--gateway-url`/`AI_GATEWAY_URL`, a stored `default_gateway_url`, or
+`--key`/`AI_AGENT_KEY` is set. `DEFAULT_GATEWAY` (`http://ai.internal`) is a _fallback, not
+configuration_ — treating it as configured is precisely what made the gateway mandatory, since the agent
+would then always believe it had one. With a gateway configured the gateway is used; `AI_DIRECT=1` forces
+direct anyway. With none configured, routing is direct.
+
+**A configured gateway is never silently bypassed** just because a provider key happens to be exported in
+someone's shell — that would move a deployment's traffic off the gateway and off its metering with nothing
+on screen to say so.
+
+### The table
+
+`crates/providers` (the `providers` crate) is the single source of truth: one row per upstream, carrying
+its gateway `authority`, its direct `base_url`, its `wire` format, its `auth` scheme, the `env_var` that
+conventionally holds a user's key, the model-id prefixes it serves natively, and any headers it requires.
+The gateway proxies on those rows; this crate routes directly on them. **A provider's auth scheme cannot
+be right in one and wrong in the other.** That is why `ANTHROPIC_API_KEY` gets `x-api-key` (bare) and
+`OPENAI_API_KEY` gets `Authorization: Bearer` with nobody configuring anything: the row says so.
+
+It absorbed four tables that previously had to be hand-synced — the gateway's `KNOWN_PROVIDERS`,
+`agent_core`'s `AggregatorHost` (now a re-export of `providers::ProviderId`), this crate's
+`aggregator_host_for_base_url`, and its `default_headers_for_base_url`.
+
+### Provider first, dialect second
+
+A model id **cannot** tell you the wire format. `anthropic/claude-sonnet-4.5` is an _OpenAI_-wire request
+when OpenRouter serves it — OpenRouter speaks the OpenAI wire for every model it hosts, Claude included.
+`Dialect::for_model`'s name heuristic ("contains `anthropic`" ⇒ Anthropic wire) is right for a native route
+and wrong for an aggregator, so deriving the dialect from the id and only then picking a provider inverts
+the dependency and POSTs an Anthropic body to a Chat Completions endpoint.
+
+So the provider is resolved first, and `agent_core::dialect::Dialect::for_model_via_provider` takes it:
+an OpenAI-wire row suppresses the name heuristic. The genuine per-model exceptions still win over the row
+(Fireworks is an OpenAI-wire provider that really does serve 14 ids over the Anthropic wire; OpenCode
+Zen/Go really do disagree with each other) — those come through `routes_to_anthropic_by_default`, which
+already takes the host.
+
+**Aggregators match no model-id prefix, deliberately.** OpenRouter/Groq/Together/Fireworks/Cerebras serve
+other vendors' ids, so any prefix that identified them would steal that vendor's own native route
+(`moonshotai/kimi-k2.6` is equally a Fireworks, Together, and OpenRouter id). They are named explicitly —
+`AI_PROVIDER=openrouter` — and an id no native provider claims is an error naming that variable, not a
+guess.
+
+### Precedence
+
+Within direct mode, in order:
+
+1. **`models.json` `base_url` override** for the exact model id — explicit, wins outright.
+2. **`AI_BASE_URL` + `AI_API_KEY`** — the OpenAI-compatible escape hatch for the long tail (vLLM, Ollama,
+   LM Studio, a corporate proxy). If the URL names a host the table knows, that row's auth scheme and
+   dialect apply; otherwise Bearer, and an empty key is legitimate (local servers ignore `Authorization`).
+   `OPENAI_BASE_URL` is honored too, but **only** as the OpenAI row's own base URL — it is a widely-
+   exported variable, and someone who points it at a proxy for one tool must not thereby have their
+   _Anthropic_ traffic redirected there.
+3. **`AI_PROVIDER=<name>`** + that row's key (or `AI_API_KEY`). The only way to reach an aggregator.
+4. **A stored OAuth login** (`agent login`) — Anthropic / OpenAI Codex / GitHub Copilot.
+5. **The provider key for whichever provider natively serves the model id** — the zero-config path.
+6. Otherwise an error naming the one variable that would fix it.
+
+**OAuth (4) sits above the ambient key (5) on purpose.** `agent login anthropic` is an explicit, durable
+act; `ANTHROPIC_API_KEY` is very often exported for some unrelated tool. Ranking the key above the login
+would silently move a subscriber onto pay-per-token API billing. Someone who genuinely wants the key
+despite a login says so explicitly with `AI_PROVIDER=anthropic`, which is tier 3.
+
+Two consequences worth naming, both of which direct mode forced into the open:
+
+- **An OAuth token is not an API key.** The Anthropic row's `x-api-key` scheme describes how Anthropic
+  takes an _API key_; a subscription token goes in `Authorization: Bearer` and is rejected in `x-api-key`.
+  The row is right about the host, wire, and path — the credential decides the header.
+- **Anthropic's OAuth identity headers survive a direct route.** `GatewayClient::stream` used to infer "is
+  this a genuine direct-to-Anthropic request?" from the _absence_ of a route override, which held only
+  while relaying through the gateway was the one way to reach Anthropic. It now asks the routing which
+  provider it points at (`routed_to_anthropic_natively`). The same correction applies to Codex: `is_codex`
+  reads the provider id rather than the `RouteOverride::Prefixed` route _shape_, which stopped identifying
+  Codex once Codex also became reachable as a plain `Direct` route.
+
+All of it is a pure function of its inputs: `ProviderEnv` is read once at the CLI boundary and passed in,
+and `resolve_with` takes the auth store and `models.json` as arguments. Nothing under
+`gateway_credential` reads `std::env` or `$HOME`, which is what makes every rule above an ordinary
+parallel-safe unit test rather than something only assertable by mutating process state.
 
 ---
 

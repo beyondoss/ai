@@ -45,7 +45,13 @@ impl CredentialSource for CodexCredential {
                 dialect_override: None,
                 deployment_name: None,
                 query: None,
-                aggregator_host: None,
+                // What marks this as the Codex backend (`ModelRequest::is_codex`, and with it the
+                // Responses body and the zstd-compressed HTTP/SSE fallback these tests assert on). It
+                // used to be inferred from the `Prefixed` route shape alone — which identified Codex only
+                // while the gateway was the one way to reach it. Codex is now also reachable as a plain
+                // `Direct` route (no gateway deployed), so the provider id carries the signal instead, and
+                // `gateway_credential` sets it on both routes. Mirrors the real credential.
+                aggregator_host: Some(agent_core::models::AggregatorHost::OpenAiCodex),
             }),
         )
     }

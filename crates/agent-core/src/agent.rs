@@ -311,8 +311,13 @@ impl Agent {
     pub fn new(transport: Arc<dyn ModelTransport>, model: impl Into<String>) -> Self {
         let model = model.into();
         let caps = crate::models::capabilities(&model);
-        let reserve_tokens = CompactionConfig::default().reserve_tokens;
-        let summary_max_tokens = scaled_summary_max_tokens(reserve_tokens, caps.max_output);
+        // Both compaction budgets scale with the model's real window (see `for_window`) — reading the
+        // reserve back off the *scaled* config rather than off `Default` matters here, because
+        // `scaled_summary_max_tokens` sizes the summarization call against the headroom that actually
+        // exists on this model, not against a 200k model's.
+        let compaction = CompactionConfig::for_window(caps.context_window);
+        let summary_max_tokens =
+            scaled_summary_max_tokens(compaction.reserve_tokens, caps.max_output);
         Self {
             transport,
             tools: ToolRegistry::new(),
@@ -326,9 +331,8 @@ impl Agent {
             reasoning_effort: None,
             temperature: None,
             compaction: CompactionConfig {
-                context_window: caps.context_window,
                 summary_max_tokens,
-                ..CompactionConfig::default()
+                ..compaction
             },
             auto_retry: true,
             sequential_tools: false,
@@ -626,6 +630,31 @@ impl Agent {
         // instead of the raw one. `catch_sink_panic` is `catch_tool_panic`'s sync sibling — `sink`
         // itself isn't a future, so there's nothing to `.await` here.
         let mut sink = move |ev: AgentEvent| catch_sink_panic(|| sink(ev));
+        // A transcript produced by one model is not automatically replayable to another. Signed
+        // `Thinking` blocks and encrypted `RedactedThinking` blocks are bound to the model that made
+        // them; OpenAI-Responses combined `"call_id|item_id"` tool ids only pair with a `reasoning` item
+        // on that same dialect. Replay them across a switch and the provider rejects the whole request —
+        // `run --model gpt-5 …` then `run --continue --model claude-…` 400s with
+        // ``Invalid `signature` in `thinking` block``.
+        //
+        // `Session::scrub_cross_model_state` was written for exactly this and, until now, was called by
+        // nothing but its own tests. It belongs *here* rather than in each caller that can change the
+        // active model (`run --continue`, and `serve`'s `set_model`/`cycle_model`/`switch_session`/
+        // `fork`/`clone`/`switch_branch`): every one of them funnels into this function, and this is the
+        // single point where a model and the transcript it is about to be shown actually meet. At the
+        // choke point it is structurally impossible for a new model-switching entry point to forget —
+        // which is exactly how it ended up with no callers at all.
+        //
+        // Gated on a read-only scan: the scrub `Arc::make_mut`s the message vec, deep-cloning the whole
+        // transcript whenever that `Arc` is shared (it is). Same-model turns — nearly all of them — must
+        // not pay that to change nothing.
+        if session.needs_cross_model_scrub(&self.model) {
+            tracing::debug!(
+                model = %self.model,
+                "resuming on a different model: scrubbing thinking blocks and foreign tool-call ids"
+            );
+            session.scrub_cross_model_state(&self.model);
+        }
         // Clears any pending stop request when this call returns, by whatever path — normal
         // completion, an early `?`/`return Err`, cancellation, or a refusal — so a request this call
         // never got around to consuming can't leak into a later call that reuses `steering`.
@@ -685,10 +714,20 @@ impl Agent {
         // called: a crash here must not lose it, exactly the exposure `CheckpointHook`'s own doc
         // comment used to call out (the very first turn of a run was the one point a crash lost the
         // user's own submitted prompt entirely).
-        self.checkpoint.checkpoint(session).await;
-        // Set once we've already compacted to recover from a context-overflow this turn, so a second
-        // overflow gives up instead of looping. Reset after each turn that lands cleanly.
+        self.checkpoint_guarded(session).await;
+        // Set once we've already compacted to recover from a context-overflow *error* this turn, so a
+        // second overflow gives up instead of looping. Reset after each turn that lands cleanly — which
+        // is sound for this flag precisely because both arms that read it (`Err(e) if
+        // is_context_overflow(..)`) are evaluated inside the `match` on the turn's result, i.e. strictly
+        // *before* the `Ok` path reaches that reset.
         let mut overflow_recovered = false;
+        // The same idea for the *silent-truncation* recovery path (a `MaxTokens` stop that
+        // `is_hard_overflow` recognizes), which needs its own flag rather than sharing the one above:
+        // that check lives on the `Ok` path, *downstream* of the reset, so a shared flag is always false
+        // by the time it's read and the guard it's supposed to provide can never fire. Read via
+        // `mem::replace` into a per-turn local instead (see the take below), which gives it a
+        // survives-exactly-one-iteration lifetime that no reset ordering can defeat.
+        let mut truncation_recovered = false;
         // Steps taken *by this call*, distinct from `session.steps` (a lifetime total across every
         // call, used only for observability — the `step` field on emitted events). Checking the
         // ceiling against this instead means `Error::MaxSteps` is a per-call backstop a client can
@@ -985,6 +1024,16 @@ impl Agent {
                 }
             };
             overflow_recovered = false;
+            // Take the truncation guard for *this* turn and disarm it in one move, so it survives
+            // exactly one iteration: the turn immediately after a truncation recovery sees `true` (and
+            // therefore refuses to recover a second time), and every turn after that sees `false` again.
+            // Reading it into a local here — rather than testing the field directly down in the
+            // `MaxTokens` branch — is what makes the guard immune to the reset-ordering bug that made
+            // its predecessor dead code: there is no longer any path on which the flag is cleared
+            // between being set and being read. It also re-arms correctly through a tool round-trip,
+            // which returns to the top of the loop without ever reaching that branch.
+            let recovered_truncation_last_turn =
+                std::mem::replace(&mut truncation_recovered, false);
             last_stop_reason = turn.stop_reason;
             let malformed: HashMap<String, String> =
                 std::mem::take(&mut turn.malformed).into_iter().collect();
@@ -1060,7 +1109,7 @@ impl Agent {
             // immediately instead, leaving the queue untouched (the same persistent `Steering` handle a
             // later `prompt` call reads from — see `serve.rs`).
             if turn.stop_reason == StopReason::Refusal {
-                self.checkpoint.checkpoint(session).await;
+                self.checkpoint_guarded(session).await;
                 sink(AgentEvent::AgentEnd {
                     steps: session.steps,
                 });
@@ -1092,13 +1141,13 @@ impl Agent {
                 // hard-truncated non-answer with no indication anything went wrong. If auto-compaction is
                 // enabled and the live prompt has genuinely reached (or this `MaxTokens` stop implies
                 // it's about to reach) the raw context window, compact and retry this same turn instead —
-                // pi's own `_checkCompaction`+silent-overflow handling does the same. Guarded by the same
-                // `overflow_recovered` flag the error-based overflow-retry arm uses (reset at the top of
-                // every turn), so a second silent truncation right after this recovery doesn't loop
-                // forever; a genuine improvement should always show up as *some* progress within one
-                // retry, same rationale as the error-based path.
+                // pi's own `_checkCompaction`+silent-overflow handling does the same. Guarded by
+                // `truncation_recovered` (see its declaration) so a second silent truncation right after
+                // this recovery gives up and reports the truncated answer instead of looping forever; a
+                // genuine improvement should always show up as *some* progress within one retry, same
+                // rationale as the error-based path.
                 if turn.stop_reason == StopReason::MaxTokens
-                    && !overflow_recovered
+                    && !recovered_truncation_last_turn
                     && self.compaction.enabled
                     && compaction::is_hard_overflow(
                         session,
@@ -1124,7 +1173,7 @@ impl Agent {
                             Arc::make_mut(&mut session.messages).pop();
                             session.steps -= 1;
                             steps_this_call -= 1;
-                            overflow_recovered = true;
+                            truncation_recovered = true;
                             continue;
                         }
                         Ok(_) => {
@@ -1159,7 +1208,7 @@ impl Agent {
                 // the tool-calling half of a turn ever reached a checkpoint; a plain conversational reply
                 // (the model's *most* common shape) never did, silently relying on a caller's own
                 // post-run persist to ever see it recorded.
-                self.checkpoint.checkpoint(session).await;
+                self.checkpoint_guarded(session).await;
                 // A pending graceful-stop request wins over draining follow-up/steer messages, exactly
                 // as it wins over continuing tool-call turns below — the queue is left untouched (same
                 // rationale as the refusal case above) so nothing queued for "next time" is lost. A
@@ -1206,7 +1255,7 @@ impl Agent {
                 sink(AgentEvent::Steered { messages: count });
                 // A plain user message ends the visible history here — a valid, resumable checkpoint
                 // (see `CheckpointHook`) before the next model call.
-                self.checkpoint.checkpoint(session).await;
+                self.checkpoint_guarded(session).await;
                 continue;
             }
 
@@ -1226,7 +1275,7 @@ impl Agent {
             // checkpoints its own tool-less case separately) — a call requesting tools never falls
             // through to that other checkpoint, so this is the one and only checkpoint a `tool_use` turn
             // pays for here.
-            self.checkpoint.checkpoint(session).await;
+            self.checkpoint_guarded(session).await;
 
             // Run the tools and feed results back as a single user turn. A tool's own failure becomes
             // an error `tool_result`, not an aborted run — the model can react to it next turn.
@@ -1679,7 +1728,7 @@ impl Agent {
                 terminate &= wants_terminate;
                 result_blocks.push(ContentBlock::ToolResult {
                     tool_use_id: id.clone(),
-                    content,
+                    content: cap_tool_result(content),
                     is_error,
                     images,
                 });
@@ -1702,7 +1751,7 @@ impl Agent {
             // A tool round-trip just landed: assistant `tool_use` and its matching `tool_result`s are
             // both committed now, so this is a valid, resumable checkpoint (see `CheckpointHook`) — the
             // one mid-run point a crash between here and the run's eventual end would otherwise lose.
-            self.checkpoint.checkpoint(session).await;
+            self.checkpoint_guarded(session).await;
             if terminate {
                 // A tool requested completion (e.g. an `attempt_completion`/`exit` tool) and the whole
                 // batch agreed. The results are already recorded; end the run as if the model had
@@ -2164,6 +2213,19 @@ impl Agent {
         if cut.turn_start.is_none()
             && compaction::previous_summary(&session.messages[..1]).is_some()
         {
+            // `first_kept == 1` on a clean boundary means the prefix handed to the summarizer is
+            // *exactly* the prior summary and nothing else — so the "fresh" summary is a summary of a
+            // summary, `apply_summary` splices back a list of identical length, and the round is pure
+            // loss: one paid model call, zero tokens freed, and (because a summary is already bounded
+            // by `summary_max_tokens`) no realistic shrink either. Unlike the broader budget check
+            // below this holds *regardless* of how much has landed since — the content since the
+            // summary is all in the kept suffix, which this cut doesn't touch. Bailing here, before
+            // `CompactionStart` is even emitted, is what keeps `Compacted` an honest signal that the
+            // caller made progress; the overflow-retry paths in `run_events_steered` branch on exactly
+            // that and would otherwise re-prompt the identical request forever.
+            if cut.first_kept == 1 {
+                return Ok(CompactOutcome::AlreadyCompacted);
+            }
             let since_last_summary: u32 = session.messages[1..]
                 .iter()
                 .map(compaction::estimate_message_tokens)
@@ -2265,9 +2327,10 @@ impl Agent {
         // reflect every round so far, not just this one's new activity. `previous_summary` strips these
         // same blocks back off before the body is ever fed forward, so they never accumulate.
         let summary = format!(
-            "{summary}{}{}",
+            "{summary}{}{}{}",
             compaction::format_file_operations(&file_ops.read_files, &file_ops.modified_files),
-            compaction::format_todo_list(file_ops.todos.as_ref())
+            compaction::format_todo_list(file_ops.todos.as_ref()),
+            compaction::format_memory_notes(&file_ops.memory_notes)
         );
         compaction::apply_summary(session, first_kept, &summary, tokens_before);
         session.compaction = file_ops;
@@ -2283,7 +2346,7 @@ impl Agent {
         // very next turn immediately re-triggers the identical (already-paid-for) compaction again, and
         // if this was overflow-recovery, the resumed session lands right back in the same
         // context-overflow condition it just paid to escape.
-        self.checkpoint.checkpoint(session).await;
+        self.checkpoint_guarded(session).await;
         sink(AgentEvent::Compacted {
             messages_before: before,
             messages_after: session.messages.len(),
@@ -2294,6 +2357,27 @@ impl Agent {
             first_kept,
         });
         Ok(CompactOutcome::Compacted)
+    }
+
+    /// Persist the session through the host's [`CheckpointHook`], containing a panic in the host's own
+    /// persistence code instead of letting it destroy the run.
+    ///
+    /// Every other host-supplied seam in this loop — every `AgentHooks` method, the event `sink` — is
+    /// already wrapped in [`catch_tool_panic`]/`catch_sink_panic` and fails open (or, for the approval
+    /// gate, deliberately closed). `checkpoint` was the one that wasn't, and it is the seam *most*
+    /// likely to touch failing I/O: its own trait doc invites the host to do blocking work there
+    /// ("appending to a session file"), so a full disk or an `EACCES` in a host persistence path that
+    /// unwraps would unwind straight through the agent loop and take the whole run — in `serve`, the
+    /// whole session task — down with it. A checkpoint is an optimization (it bounds what a crash
+    /// loses); failing to take one must degrade to "this checkpoint didn't persist", never to "the run
+    /// died". Logged at `error` because a host whose persistence is panicking genuinely wants to know.
+    async fn checkpoint_guarded(&self, session: &Session) {
+        if let Err(msg) = catch_tool_panic(self.checkpoint.checkpoint(session)).await {
+            tracing::error!(
+                error = %msg,
+                "checkpoint hook panicked; continuing without persisting this checkpoint"
+            );
+        }
     }
 
     /// Runs an *automatic* (proactive-threshold or hard-overflow) compaction and swallows a failure
@@ -2527,6 +2611,43 @@ fn catch_sink_panic(f: impl FnOnce()) {
 /// applies uniformly to every tool, not just `bash`, which is the point: one dispatch-layer mechanism
 /// handles cancellation safely for all current and future tools, rather than requiring each one to
 /// cooperatively watch a cancellation signal and preserve its own partial state.
+/// Hard ceiling, in bytes, on the tool-result content this loop will admit into a session.
+///
+/// Until this existed the only bound on tool output was a *per-tool convention* — the built-ins cap
+/// themselves at `tools::output::DEFAULT_MAX_BYTES` (50 KiB) — and a `Tool` is a public trait that
+/// hosts and MCP servers implement. Nothing stopped an implementation from handing back 200 MB, and
+/// nothing downstream would have clipped it: `compaction`'s `TOOL_RESULT_MAX_CHARS` truncates only
+/// what is rendered *into the summarization prompt*, while the raw content stays in `session.messages`,
+/// is `Arc`-cloned into every subsequent `ModelRequest`, and is serialized on every checkpoint. That
+/// makes the memory bound a property of every tool author rather than of the system, which is the
+/// wrong place for it.
+///
+/// An order of magnitude above what a compliant tool emits, so this never clips one in practice — it
+/// is a backstop against a rogue or buggy implementation, not a second opinion on how much a tool
+/// should return.
+const TOOL_RESULT_MAX_BYTES: usize = 1024 * 1024;
+
+/// Clamp one tool result to [`TOOL_RESULT_MAX_BYTES`], telling the model what happened rather than
+/// silently handing it a truncated document it would reason over as if complete.
+fn cap_tool_result(content: String) -> String {
+    if content.len() <= TOOL_RESULT_MAX_BYTES {
+        return content;
+    }
+    let dropped = content.len() - TOOL_RESULT_MAX_BYTES;
+    // `String` is UTF-8 and truncation is by bytes, so walk back to the nearest boundary — slicing
+    // mid-codepoint would panic, and this content is arbitrary tool output, not ASCII by assumption.
+    let mut end = TOOL_RESULT_MAX_BYTES;
+    while end > 0 && !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = content;
+    out.truncate(end);
+    out.push_str(&format!(
+        "\n\n[tool result truncated: {dropped} more bytes exceeded the {TOOL_RESULT_MAX_BYTES}-byte limit]"
+    ));
+    out
+}
+
 fn resolve_tool_result(result: Option<ToolCallResult>) -> ToolCallResult {
     result.unwrap_or_else(|| {
         (
@@ -4244,6 +4365,179 @@ mod tests {
             "a cancellation racing the MaxTokens recovery compaction must surface as \
              Error::Cancelled, not silently succeed with Ok(()), got: {result:?}"
         );
+    }
+
+    /// Regression: a model that keeps coming back `MaxTokens`-truncated with no tool calls used to spin
+    /// the silent-truncation recovery arm forever. Two independent defects combined to remove every
+    /// backstop: (1) `overflow_recovered` was reset on the `Ok` path *upstream* of the `MaxTokens`
+    /// check that read it, so the "don't recover twice in a row" guard was dead code; and (2) the
+    /// recovery arm decremented `steps_this_call`, so `max_steps` could not bound it either. Each round
+    /// billed two model calls (the turn + its summarization) and made no progress. Assert the run
+    /// terminates, and that it does so in a bounded number of model calls rather than by luck.
+    #[tokio::test]
+    async fn a_model_that_always_truncates_terminates_instead_of_looping_forever() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct AlwaysTruncates {
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl ModelTransport for AlwaysTruncates {
+            async fn stream(&self, req: ModelRequest) -> Result<crate::transport::EventStream> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                // The summarization call is the one that carries no tools and a system prompt — answer
+                // it with a real (short) summary so `compact()` genuinely succeeds and the loop reaches
+                // the retry it used to spin on. Every *live* turn truncates, forever.
+                let is_summarization = req.system.is_some() && req.tools.is_empty();
+                let text = if is_summarization {
+                    "a summary"
+                } else {
+                    "cut off"
+                };
+                let stop_reason = if is_summarization {
+                    StopReason::EndTurn
+                } else {
+                    StopReason::MaxTokens
+                };
+                let s = futures::stream::iter(vec![
+                    Ok(StreamEvent::MessageStart),
+                    Ok(StreamEvent::TextDelta {
+                        index: 0,
+                        text: text.into(),
+                    }),
+                    Ok(StreamEvent::ContentBlockStop { index: 0 }),
+                    Ok(StreamEvent::MessageStop { stop_reason }),
+                ]);
+                Ok(Box::pin(s))
+            }
+        }
+
+        let mut session = Session::new();
+        session.messages = Arc::new(vec![
+            Message::user("first request"),
+            Message::assistant(vec![ContentBlock::text("first done")]),
+            Message::user("second request"),
+            Message::assistant(vec![ContentBlock::text("second done")]),
+            Message::user("third request, the one that gets cut off"),
+        ]);
+
+        let transport = Arc::new(AlwaysTruncates {
+            calls: AtomicUsize::new(0),
+        });
+        let agent =
+            Agent::new(transport.clone(), "claude-opus-4-8").with_compaction(CompactionConfig {
+                // Trivially trips `is_hard_overflow` on a `MaxTokens` stop regardless of prompt size.
+                context_window: 10,
+                keep_recent_tokens: 1,
+                ..CompactionConfig::default()
+            });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            agent.run_events(&mut session, |_| {}),
+        )
+        .await
+        .expect("an always-truncating model must not loop forever");
+
+        assert!(
+            result.is_ok(),
+            "the truncated reply is the best available answer and should be reported, got: {result:?}"
+        );
+        // Exactly one recovery is allowed: live turn + summarization + the retried live turn. The lower
+        // bound proves the recovery arm was actually entered (otherwise this test would pass
+        // vacuously); the upper bound proves the guard then refused to enter it a second time.
+        let calls = transport.calls.load(Ordering::SeqCst);
+        assert!(
+            (3..=4).contains(&calls),
+            "the silent-truncation recovery must fire exactly once — entered (>=3 calls) and then \
+             refused a second time (<=4 calls); got {calls} calls"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_panicking_checkpoint_hook_degrades_instead_of_killing_the_run() {
+        // `checkpoint` is the host seam most likely to touch failing I/O — its own trait doc invites
+        // blocking work like "appending to a session file" — and it was the only one not wrapped in
+        // `catch_tool_panic`. A host persistence path that unwraps on a full disk used to unwind
+        // straight through the loop and take the whole run (in `serve`, the whole session task) with
+        // it. Failing to persist a checkpoint must cost the checkpoint, not the run.
+        struct PanickingCheckpoint {
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        #[async_trait]
+        impl CheckpointHook for PanickingCheckpoint {
+            async fn checkpoint(&self, _session: &Session) {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                panic!("disk is full");
+            }
+        }
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let transport = Arc::new(MockTransport::new(vec![vec![
+            StreamEvent::MessageStart,
+            StreamEvent::TextDelta {
+                index: 0,
+                text: "done".into(),
+            },
+            StreamEvent::ContentBlockStop { index: 0 },
+            StreamEvent::MessageStop {
+                stop_reason: StopReason::EndTurn,
+            },
+        ]]));
+        let agent = Agent::new(transport, "claude-opus-4-8").with_checkpoint_hook(Arc::new(
+            PanickingCheckpoint {
+                calls: Arc::clone(&calls),
+            },
+        ));
+
+        let mut session = Session::new();
+        session.push(Message::user("hi"));
+        let result = agent.run_events(&mut session, |_| {}).await;
+
+        assert!(
+            result.is_ok(),
+            "a panicking checkpoint hook must not fail the run, got: {result:?}"
+        );
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the hook must actually have been called (otherwise this passes vacuously)"
+        );
+        assert!(
+            session
+                .messages
+                .iter()
+                .any(|m| matches!(m.role, Role::Assistant)),
+            "the run must still have completed its turn normally"
+        );
+    }
+
+    #[test]
+    fn a_rogue_tool_result_is_capped_before_it_can_enter_the_session() {
+        // The built-in tools cap themselves at 50 KiB, but `Tool` is a public trait that hosts and MCP
+        // servers implement — so the bound has to live in the loop, not in every tool author's head.
+        // Anything under the ceiling must pass through byte-for-byte untouched.
+        let small = "x".repeat(1024);
+        assert_eq!(cap_tool_result(small.clone()), small);
+
+        let rogue = "x".repeat(TOOL_RESULT_MAX_BYTES + 5_000);
+        let capped = cap_tool_result(rogue);
+        assert!(
+            capped.len() < TOOL_RESULT_MAX_BYTES + 500,
+            "a rogue result must be clamped to roughly the ceiling, got {} bytes",
+            capped.len()
+        );
+        assert!(
+            capped.contains("truncated"),
+            "the model must be told the result was clipped rather than silently handed a partial \
+             document it would reason over as if complete"
+        );
+
+        // Tool output is arbitrary bytes, not ASCII by assumption: truncating mid-codepoint would
+        // panic, so the cut must walk back to a char boundary. A multi-byte char straddling the limit
+        // is the case that would have blown up.
+        let multibyte = "é".repeat(TOOL_RESULT_MAX_BYTES);
+        let capped = cap_tool_result(multibyte);
+        assert!(capped.contains("truncated"));
     }
 
     #[test]
@@ -7432,6 +7726,7 @@ mod tests {
             compactions: 1,
             last_reason: Some(CompactionReason::Threshold),
             modified_files: vec![],
+            memory_notes: vec![],
         };
 
         let mock = Arc::new(MockTransport::new(vec![turn::text("turn prefix summary")]));

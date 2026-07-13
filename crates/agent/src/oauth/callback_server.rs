@@ -60,13 +60,17 @@ impl CallbackServer {
         // Nudges the blocking accept loop awake the instant cancellation fires, rather than making it
         // wait out its own poll tick — a latency nicety, not a correctness requirement (the loop below
         // also checks `is_cancelled()` on every tick regardless).
-        let unblocker = {
+        // Aborted on *every* exit from this function, including an early drop of the whole future — not
+        // just the normal return. It holds its own `Arc<Server>`, so a task left parked on
+        // `cancel.cancelled()` for a token that never fires would keep the listener (and its bound,
+        // fixed port) alive no matter what the accept loop below does.
+        let unblocker = AbortOnDrop(Some({
             let server = server.clone();
             tokio::spawn(async move {
                 cancel.cancelled().await;
                 server.unblock();
             })
-        };
+        }));
 
         let result = tokio::task::spawn_blocking(move || {
             loop {
@@ -95,8 +99,37 @@ impl CallbackServer {
         .ok()
         .flatten();
 
-        unblocker.abort();
+        drop(unblocker);
         result
+    }
+}
+
+/// Aborts a task when it goes out of scope, however that happens — a normal return, an early `?`, or
+/// the enclosing future being dropped mid-`.await`. A bare `handle.abort()` at the end of a function
+/// only covers the first of those.
+struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(h) = self.0.take() {
+            h.abort();
+        }
+    }
+}
+
+impl Drop for CallbackServer {
+    /// Releases the listener — and with it the bound port — without relying on anyone to have cancelled
+    /// the token first.
+    ///
+    /// The accept loop runs on `spawn_blocking`, which cannot be aborted: it exits only by observing a
+    /// cancelled token or by `recv_timeout` failing. So if a caller merely *drops* the login future
+    /// rather than cancelling it, that loop keeps polling forever, holding its own `Arc<Server>` and the
+    /// port with it. `unblock()` makes the pending `recv_timeout` fail, the loop returns, and its `Arc`
+    /// goes with it. This matters more than it looks: the port is *fixed* per provider (53692 for
+    /// Anthropic, 1455 for Codex), not ephemeral, so a single leaked listener makes every subsequent
+    /// login on that provider fail outright with `PortBindFailed`.
+    fn drop(&mut self) {
+        self.server.unblock();
     }
 }
 

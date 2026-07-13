@@ -23,6 +23,25 @@ pub const DEFAULT_MAX_LINES: usize = 2000;
 /// Default cap on displayed bytes (50 KiB). Protects the model's context window.
 pub const DEFAULT_MAX_BYTES: usize = 50 * 1024;
 
+/// Hard ceiling on how many bytes any one spill file may take (128 MiB).
+///
+/// [`DEFAULT_MAX_BYTES`] bounds only what the *model is shown*; the full stream still reaches this
+/// accumulator, and the spill file used to grow for as long as the command kept talking. Memory stays
+/// bounded either way (the rolling tail, plus a pre-spill buffer that's flushed and freed) — the file
+/// was the unbounded side, and on this crate's deployment target the file *is* memory: the system temp
+/// dir is a tmpfs (see `worktree.rs`), so "spill to disk" is spill to RAM. With `bash`'s 30-minute
+/// default timeout, one `yes` or `cat /dev/urandom | base64` could fill it — and the file outlives the
+/// call by [`STALE_TEMP_FILE_AGE`], so the damage persists long after the command is gone.
+///
+/// The number is sized against the question "what is the largest output someone would genuinely want
+/// to page back through?": a fully verbose build log, a long test run, a chatty migration — real cases
+/// land in the low tens of MiB at the extreme. 128 MiB clears that by roughly an order of magnitude,
+/// so no legitimate command loses bytes it had a reader for, while several concurrent firehoses
+/// together still stay a small fraction of a multi-GiB tmpfs. Past the budget we simply stop writing:
+/// the accumulator keeps running, so the tail, the totals, and the truncation markers all stay
+/// correct — the only thing dropped is the middle of a stream nobody was going to read.
+pub const MAX_SPILL_BYTES: u64 = 128 * 1024 * 1024;
+
 /// Which limit tripped truncation. Mirrors pi's `truncatedBy: "lines" | "bytes" | null`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TruncatedBy {
@@ -68,8 +87,18 @@ pub struct OutputSnapshot {
     pub content: String,
     /// Truncation metadata for `content`.
     pub truncation: Truncation,
-    /// Path to the temp file holding the *complete* output, when one was opened.
+    /// Path to the temp file holding the complete output, when one was opened — or, when
+    /// `full_output_capped` is set, only its first `full_output_bytes`.
     pub full_output_path: Option<String>,
+    /// Whether the spill file stopped short of the complete stream because it hit
+    /// [`MAX_SPILL_BYTES`]. The file still holds a genuine *prefix* of the output (not a corrupt
+    /// one — see [`OutputAccumulator::mark_spill_broken`] for that case), so it's worth pointing the
+    /// model at; but a marker that names a path while the model assumes it's the whole document is
+    /// worse than naming no path at all, so [`format_output`] says so explicitly when this is set.
+    pub full_output_capped: bool,
+    /// How many bytes actually landed in the spill file. Equals `truncation.total_bytes` unless
+    /// `full_output_capped`.
+    pub full_output_bytes: u64,
     /// Full byte size of the current (last) line — used for the partial-line marker.
     pub last_line_bytes: u64,
 }
@@ -253,6 +282,13 @@ pub struct OutputAccumulator {
     temp_path: Option<PathBuf>,
     temp_writer: Option<BufWriter<File>>,
 
+    // The spill file's byte budget and what's been spent of it. `spill_capped` means the budget ran
+    // out and the writer was closed: the file holds a prefix, and further bytes are counted (totals,
+    // tail) but not written anywhere.
+    spill_budget: u64,
+    spill_bytes: u64,
+    spill_capped: bool,
+
     finished: bool,
 }
 
@@ -288,8 +324,20 @@ impl OutputAccumulator {
             spill_failed: false,
             temp_path: None,
             temp_writer: None,
+            spill_budget: MAX_SPILL_BYTES,
+            spill_bytes: 0,
+            spill_capped: false,
             finished: false,
         }
+    }
+
+    /// Builder-style: shrink the spill file's byte budget. Test-only — production always runs the
+    /// real [`MAX_SPILL_BYTES`], and a test that had to actually emit 128 MiB to reach it would be
+    /// writing that much to the same tmpfs the budget exists to protect.
+    #[cfg(test)]
+    fn with_spill_budget(mut self, budget: u64) -> Self {
+        self.spill_budget = budget;
+        self
     }
 
     /// Total lines over the complete stream: completed lines plus one for a trailing partial line.
@@ -310,12 +358,8 @@ impl OutputAccumulator {
         self.extend_tail(data);
 
         if self.spilled {
-            // Post-spill: stream straight to the file so memory stays bounded.
-            if let Some(w) = self.temp_writer.as_mut() {
-                if w.write_all(data).is_err() {
-                    self.mark_spill_broken();
-                }
-            }
+            // Post-spill: stream straight to the file so memory stays bounded — up to the budget.
+            self.write_spill(data);
         } else if !self.spill_failed {
             // Pre-spill: keep the complete bytes in memory so a later spill can flush them whole.
             self.raw_buffer.extend_from_slice(data);
@@ -394,6 +438,11 @@ impl OutputAccumulator {
                 .temp_path
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
+            // Only meaningful while there's still a file to describe: a spill that later *broke* has
+            // already dropped its path (`mark_spill_broken`), and a capped-then-broken file must read
+            // as "no full output", not as a prefix a reader can trust.
+            full_output_capped: self.spill_capped && self.temp_path.is_some(),
+            full_output_bytes: self.spill_bytes,
             last_line_bytes: self.current_line_bytes,
         }
     }
@@ -506,22 +555,61 @@ impl OutputAccumulator {
         }
         match opts.open(&path) {
             Ok(f) => {
-                let mut w = BufWriter::new(f);
-                if w.write_all(&self.raw_buffer).is_err() {
-                    self.spill_failed = true;
-                    self.raw_buffer = Vec::new();
-                    return;
-                }
-                self.raw_buffer = Vec::new();
                 self.temp_path = Some(path);
-                self.temp_writer = Some(w);
+                self.temp_writer = Some(BufWriter::new(f));
                 self.spilled = true;
+                // The buffered bytes go in through the same budgeted write as every later chunk —
+                // one place decides what the file is allowed to hold, so the flush of everything
+                // seen before the spill can't slip past the budget by writing itself whole.
+                let buffered = std::mem::take(&mut self.raw_buffer);
+                self.write_spill(&buffered);
             }
             Err(_) => {
                 self.spill_failed = true;
                 self.raw_buffer = Vec::new();
             }
         }
+    }
+
+    /// Write `data` to the spill file, spending it against the file's byte budget and writing nothing
+    /// once that budget is gone — see [`MAX_SPILL_BYTES`] for why an unbounded spill file is a memory
+    /// leak on this deployment target, not merely a disk one.
+    ///
+    /// Reaching the budget is deliberately *not* [`mark_spill_broken`](Self::mark_spill_broken): a
+    /// broken file is one whose contents no longer correspond to the command's output at all, so it
+    /// must stop being advertised; a budget-capped file is a genuine, complete prefix, still the best
+    /// thing the model can go read. What it must never do is masquerade as the whole document, hence
+    /// `spill_capped` — the flag [`format_output`] turns into an explicit "this file stops early"
+    /// marker. Everything else about the accumulator carries on unchanged past the budget: the running
+    /// totals and rolling tail are what make the truncation metadata honest about the bytes we dropped.
+    fn write_spill(&mut self, data: &[u8]) {
+        let remaining = self.spill_budget.saturating_sub(self.spill_bytes);
+        let take = remaining.min(data.len() as u64) as usize;
+        let Some(w) = self.temp_writer.as_mut() else {
+            return;
+        };
+        if take > 0 && w.write_all(&data[..take]).is_err() {
+            self.mark_spill_broken();
+            return;
+        }
+        self.spill_bytes += take as u64;
+        if self.spill_bytes >= self.spill_budget {
+            self.close_spill_at_budget();
+        }
+    }
+
+    /// Retire the spill writer once its byte budget is spent: flush what's buffered so the file on
+    /// disk is complete up to the budget, then drop the writer so the fd is released and no later
+    /// chunk can reopen the tap. `temp_path` stays — the prefix is still readable, and `spill_capped`
+    /// is what tells the caller it stops short.
+    fn close_spill_at_budget(&mut self) {
+        if let Some(mut w) = self.temp_writer.take() {
+            if w.flush().is_err() {
+                self.mark_spill_broken();
+                return;
+            }
+        }
+        self.spill_capped = true;
     }
 
     /// Mark the spill file as no longer trustworthy after a write/flush failure partway through
@@ -672,6 +760,32 @@ fn truncate_str_to_bytes_from_end(s: &str, max_bytes: usize) -> &str {
     &s[start..]
 }
 
+/// The `Full output: <path>` tail of a truncation marker — pi's string verbatim in the ordinary case,
+/// where the file really does hold everything the command printed.
+///
+/// When the spill file hit [`MAX_SPILL_BYTES`] it holds only the first N bytes of a much larger
+/// stream, and the marker has to say so: a bare `Full output: <path>` invites the model to read that
+/// file and reason about a firehose's opening moments as if they were the whole story — a silently
+/// partial document presented as complete, which is a worse failure than admitting the bytes are gone.
+/// The totals in the same marker (`of {total_lines}`) already describe the *complete* stream, so this
+/// segment names what's actually on disk against it.
+fn full_output_segment(snapshot: &OutputSnapshot) -> String {
+    // pi interpolates the path directly; when there is none we render an empty string rather than the
+    // literal "undefined" JS would produce.
+    let path = snapshot.full_output_path.as_deref().unwrap_or("");
+    if snapshot.full_output_capped {
+        // Sized from the snapshot, not from `MAX_SPILL_BYTES`: the marker must state the bytes that
+        // are actually in the file the model is about to read, whatever budget produced them.
+        format!(
+            "Full output too large to save — only the first {} of {} was written: {path}",
+            format_size(snapshot.full_output_bytes),
+            format_size(snapshot.truncation.total_bytes),
+        )
+    } else {
+        format!("Full output: {path}")
+    }
+}
+
 /// Render a snapshot as the bash tool's display text — a port of `bash.ts`'s `formatOutput`. When not
 /// truncated, returns `content` (or `empty_text` when `content` is empty). When truncated, appends a
 /// blank line and one of three markers, matching pi's strings byte-for-byte.
@@ -690,26 +804,23 @@ pub fn format_output(snapshot: &OutputSnapshot, empty_text: &str) -> String {
             .total_lines
             .saturating_sub(t.output_lines)
             .saturating_add(1);
-        // pi interpolates the path directly; when there is none we render an empty string rather
-        // than the literal "undefined" JS would produce.
-        let path = snapshot.full_output_path.as_deref().unwrap_or("");
+        let full = full_output_segment(snapshot);
 
         let marker = if t.last_line_partial {
             format!(
-                "[Showing last {} of line {} (line is {}). Full output: {}]",
+                "[Showing last {} of line {} (line is {}). {full}]",
                 format_size(t.output_bytes),
                 end_line,
                 format_size(snapshot.last_line_bytes),
-                path,
             )
         } else if matches!(t.truncated_by, Some(TruncatedBy::Lines)) {
             format!(
-                "[Showing lines {start_line}-{end_line} of {}. Full output: {path}]",
-                t.total_lines,
+                "[Showing lines {start_line}-{end_line} of {}. {full}]",
+                t.total_lines
             )
         } else {
             format!(
-                "[Showing lines {start_line}-{end_line} of {} ({} limit). Full output: {path}]",
+                "[Showing lines {start_line}-{end_line} of {} ({} limit). {full}]",
                 t.total_lines,
                 format_size(DEFAULT_MAX_BYTES as u64),
             )
@@ -959,6 +1070,122 @@ mod tests {
         assert!(acc.spill_failed);
     }
 
+    /// Feed `total` bytes of newline-terminated output through `acc` in 8 KiB chunks (the shape a
+    /// firehose actually arrives in), with the final line ending in `END` so a tail assertion can
+    /// prove the accumulator kept working past whatever the spill file did.
+    fn feed_firehose(acc: &mut OutputAccumulator, total: usize) {
+        let chunk = vec![b'f'; 8 * 1024];
+        let mut written = 0usize;
+        while written + chunk.len() <= total {
+            acc.append(&chunk);
+            written += chunk.len();
+        }
+        acc.append(b"\nEND\n");
+    }
+
+    #[test]
+    fn output_under_the_spill_budget_is_written_to_the_file_in_full() {
+        // The budget is a backstop, not a haircut: anything short of it must still land on disk
+        // byte-for-byte, with no "capped" admission attached to a file that is in fact complete.
+        let mut acc = OutputAccumulator::with_prefix("pi-bash").with_spill_budget(1024 * 1024);
+        let mut full = Vec::new();
+        for n in 0..300u32 {
+            let mut line = format!("chunk-{n:04}-").into_bytes();
+            line.resize(1023, b'x');
+            line.push(b'\n');
+            full.extend_from_slice(&line);
+            acc.append(&line);
+        }
+        acc.finish();
+        let snap = acc.snapshot(true);
+
+        let path = snap.full_output_path.clone().expect("must spill");
+        assert!(!snap.full_output_capped);
+        assert_eq!(snap.full_output_bytes, full.len() as u64);
+        assert_eq!(read_temp(&path), full);
+        // The ordinary marker, unchanged — an uncapped file says nothing about budgets.
+        let out = format_output(&snap, "(no output)");
+        assert!(out.contains(&format!("Full output: {path}]")), "got: {out}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_firehose_past_the_spill_budget_stops_growing_the_file() {
+        // The leak this guards: `DEFAULT_MAX_BYTES` caps only what the model is *shown*, so before the
+        // budget existed the spill file grew for as long as the command talked — and the system temp
+        // dir on this crate's deployment target is a tmpfs, so an unbounded spill file is unbounded
+        // *RAM* (see `MAX_SPILL_BYTES`). `bash: yes` under the 30-minute default timeout was enough.
+        let budget = 256 * 1024;
+        let mut acc = OutputAccumulator::with_prefix("pi-bash").with_spill_budget(budget as u64);
+        feed_firehose(&mut acc, 8 * 1024 * 1024); // 32x the budget
+        acc.finish();
+        let snap = acc.snapshot(true);
+
+        let path = snap.full_output_path.clone().expect("must spill");
+        let on_disk = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            on_disk <= budget as u64,
+            "spill file must never exceed its budget: {on_disk} > {budget}"
+        );
+        // And it must actually have written up to the budget, not bailed out at the first chunk.
+        assert_eq!(on_disk, budget as u64);
+        assert_eq!(snap.full_output_bytes, budget as u64);
+        assert!(snap.full_output_capped);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn truncation_metadata_stays_honest_after_the_spill_budget_is_hit() {
+        // Stopping the writes must not stop the accumulator: the tail the model reads, the totals it
+        // reasons about, and the marker that admits how much was dropped all have to survive the
+        // budget — otherwise a capped firehose would present its opening 256 KiB as the whole story.
+        let budget = 256 * 1024usize;
+        let total = 8 * 1024 * 1024usize;
+        let mut acc = OutputAccumulator::with_prefix("pi-bash").with_spill_budget(budget as u64);
+        feed_firehose(&mut acc, total);
+        acc.finish();
+        let snap = acc.snapshot(true);
+
+        // Totals cover the COMPLETE stream, not the bytes that made it to disk. `feed_firehose` writes
+        // whole 8 KiB chunks up to `total` and then "\nEND\n" (5 bytes, 2 newlines → 2 lines: the long
+        // 'f' run it terminates, and "END").
+        assert_eq!(snap.truncation.total_bytes, (total + 5) as u64);
+        assert_eq!(snap.truncation.total_lines, 2);
+        assert!(snap.truncation.truncated);
+        assert_eq!(snap.truncation.truncated_by, Some(TruncatedBy::Bytes));
+        assert!(snap.truncation.output_bytes <= DEFAULT_MAX_BYTES as u64);
+
+        // The tail still tracks bytes that arrived long after the file stopped taking them. (The 'f'
+        // run ahead of it is dropped by `snapshot_text`, which never shows a half-line at the top of
+        // the window — the rolling tail landed mid-line, as it must for a stream this size.)
+        assert_eq!(
+            snap.content.trim_end(),
+            "END",
+            "the rolling tail must keep working past the budget"
+        );
+
+        // And the rendered marker says plainly that the saved file stops short — the model must not
+        // read a 256 KiB prefix believing it's the complete 8 MiB output.
+        let path = snap.full_output_path.clone().expect("must spill");
+        let out = format_output(&snap, "(no output)");
+        assert!(
+            out.contains("only the first 256.0KB of 8.0MB was written"),
+            "the marker must quantify what was dropped: {out}"
+        );
+        assert!(
+            out.contains(&path),
+            "the prefix is still worth reading: {out}"
+        );
+        assert!(
+            !out.contains("Full output: "),
+            "a capped file must not be advertised as the full output: {out}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn line_count_alone_triggers_a_spill_well_under_the_byte_cap() {
         // Many short lines: total bytes stay far under the rolling byte cap, but the line count alone
@@ -1109,6 +1336,8 @@ mod tests {
                 max_bytes: DEFAULT_MAX_BYTES,
             },
             full_output_path: Some("/tmp/pi-bash-abc.log".to_string()),
+            full_output_capped: false,
+            full_output_bytes: 12345,
             last_line_bytes: 4,
         };
         assert_eq!(

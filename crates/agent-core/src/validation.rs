@@ -21,15 +21,66 @@
 //! are best-effort the way pi's own composition handling is (never fails the surrounding value over a
 //! member mismatch — see [`apply_composition`]); everywhere else in this module, a sub-schema that
 //! can't be coerced fails the whole call, matching AJV's own all-or-nothing `coerceTypes`.
+//!
+//! That recursion runs against a schema this process does not necessarily author — an MCP tool's schema
+//! is the remote server's verbatim advertisement — so the whole pass runs on a fixed work budget and
+//! degrades to a no-op rather than spinning when it runs out. See [`COERCION_NODE_BUDGET`].
 
 use serde_json::Value;
+
+/// How many schema nodes one `coerce_tool_arguments` call may visit before it stops coercing and hands
+/// the rest of the value back as-is.
+///
+/// This pass runs on *every* tool dispatch against the tool's own `input_schema()`, and for an MCP tool
+/// that schema is whatever the remote server advertised — verbatim, and therefore attacker-controlled if
+/// that server is hostile or compromised. Composition is what makes an un-budgeted pass dangerous:
+/// `allOf`/`anyOf`/`oneOf` visit *every* member with a full deep clone of the value, and each member
+/// re-enters the recursion, so the pass's cost is (schema nodes visited) × (size of the value being
+/// cloned at each one) — a hostile schema of a few hundred KB (thousands of composition members, nothing
+/// exotic) can therefore buy itself thousands of deep clones of the whole argument value and pin the
+/// dispatching task. Recursion *depth* is already safe — serde_json refuses to parse past 128 levels of
+/// nesting — so this is a work blowup, not a stack overflow, and a cap on nodes visited is the smallest
+/// thing that bounds it. It bounds every other shape of pathological schema at the same time.
+///
+/// 10k is orders of magnitude above any real tool schema (the largest here visit a few dozen nodes), so
+/// a legitimate call can never reach it, while a hostile one is capped at ~10k clones of a model-emitted
+/// argument value — milliseconds, not minutes.
+const COERCION_NODE_BUDGET: u32 = 10_000;
+
+/// Remaining nodes this coercion pass may visit. Exhaustion is not an error: coercion is a best-effort
+/// convenience (see the module doc comment), so running out just means the value stops being normalized
+/// and is handed back untouched — exactly what a value with no coercible schema at all would get. The
+/// tool's own validation still runs afterwards and still produces its own clear error if the arguments
+/// really are wrong.
+struct Budget(u32);
+
+impl Budget {
+    /// Charge one visited node. `false` once the budget is gone — the caller must then stop recursing
+    /// and return its value as-is.
+    fn spend(&mut self) -> bool {
+        self.0 = self.0.saturating_sub(1);
+        self.0 > 0
+    }
+}
 
 /// Coerce `input` to match `schema`'s declared type(s), recursing into `object` schemas' `properties`.
 /// Returns the coerced value on success, or an error string (unused by callers today beyond falling
 /// back to the original value — see the module doc comment) describing which type(s) it couldn't
 /// satisfy.
+///
+/// Bounded work: at most [`COERCION_NODE_BUDGET`] schema nodes are visited, after which the remaining
+/// value is returned un-coerced rather than coerced.
 pub fn coerce_tool_arguments(schema: &Value, input: Value) -> Result<Value, String> {
-    coerce_value(schema, input)
+    coerce_value(schema, input, &mut Budget(COERCION_NODE_BUDGET))
+}
+
+/// Coerce with an explicit budget, reporting what was left of it — the only way to observe from a test
+/// that the pass really did stop early rather than merely finishing fast.
+#[cfg(test)]
+fn coerce_with_budget(schema: &Value, input: Value, budget: u32) -> (Result<Value, String>, u32) {
+    let mut budget = Budget(budget);
+    let result = coerce_value(schema, input, &mut budget);
+    (result, budget.0)
 }
 
 fn declared_types(schema: &Value) -> Option<Vec<&str>> {
@@ -110,7 +161,11 @@ fn try_coerce(t: &str, input: &Value) -> Option<Value> {
 /// extra ones with no `additionalProperties` schema to coerce against, are left alone —
 /// presence/`required` enforcement stays each tool's own job (its existing
 /// `input.get("x").ok_or_else(...)` pattern), not this pass's.
-fn coerce_object_properties(schema: &Value, input: Value) -> Result<Value, String> {
+fn coerce_object_properties(
+    schema: &Value,
+    input: Value,
+    budget: &mut Budget,
+) -> Result<Value, String> {
     let Value::Object(mut obj) = input else {
         return Ok(input);
     };
@@ -121,7 +176,7 @@ fn coerce_object_properties(schema: &Value, input: Value) -> Result<Value, Strin
                 // A property that fails to coerce fails the *whole* call — matching AJV/pi's own
                 // all-or-nothing `validateToolArguments` (it throws on the first sub-schema mismatch, it
                 // doesn't silently null out just the offending field and let the rest through).
-                obj.insert(key.clone(), coerce_value(sub_schema, v)?);
+                obj.insert(key.clone(), coerce_value(sub_schema, v, budget)?);
             }
         }
     }
@@ -133,7 +188,7 @@ fn coerce_object_properties(schema: &Value, input: Value) -> Result<Value, Strin
             .collect();
         for key in extra_keys {
             if let Some(v) = obj.remove(&key) {
-                obj.insert(key, coerce_value(additional_schema, v)?);
+                obj.insert(key, coerce_value(additional_schema, v, budget)?);
             }
         }
     }
@@ -144,19 +199,19 @@ fn coerce_object_properties(schema: &Value, input: Value) -> Result<Value, Strin
 /// element (`"items": {...}`), or JSON Schema's positional "tuple validation" form (`"items": [...]`,
 /// one schema per index — an index past the tuple list's own length is left alone, same
 /// missing/extra-is-not-this-pass's-job rationale as `coerce_object_properties`).
-fn coerce_array_items(schema: &Value, input: Value) -> Result<Value, String> {
+fn coerce_array_items(schema: &Value, input: Value, budget: &mut Budget) -> Result<Value, String> {
     let Value::Array(mut items) = input else {
         return Ok(input);
     };
     match schema.get("items") {
         Some(Value::Array(item_schemas)) => {
             for (item, item_schema) in items.iter_mut().zip(item_schemas) {
-                *item = coerce_value(item_schema, item.take())?;
+                *item = coerce_value(item_schema, item.take(), budget)?;
             }
         }
         Some(item_schema) if item_schema.is_object() => {
             for item in items.iter_mut() {
-                *item = coerce_value(item_schema, item.take())?;
+                *item = coerce_value(item_schema, item.take(), budget)?;
             }
         }
         _ => {}
@@ -171,19 +226,24 @@ fn coerce_array_items(schema: &Value, input: Value) -> Result<Value, String> {
 /// member that *does* coerce, falling back to the value untouched if none do. Real, non-composition
 /// type mismatches are still caught downstream by `coerce_value`'s own `type` handling once composition
 /// hands its result off.
-fn apply_composition(schema: &Value, mut value: Value) -> Value {
+///
+/// This is the expensive corner of the pass — every `allOf` member is visited with a full deep clone of
+/// the value, and each one re-enters the recursion — so it is also where `budget` earns its keep: see
+/// [`COERCION_NODE_BUDGET`]. Once the budget is out the members are left unapplied and the value passes
+/// through, which is indistinguishable from a composition whose members simply didn't coerce anything.
+fn apply_composition(schema: &Value, mut value: Value, budget: &mut Budget) -> Value {
     if let Some(members) = schema.get("allOf").and_then(Value::as_array) {
         for member in members {
-            if let Ok(coerced) = coerce_value(member, value.clone()) {
+            if let Ok(coerced) = coerce_value(member, value.clone(), budget) {
                 value = coerced;
             }
         }
     }
     if let Some(members) = schema.get("anyOf").and_then(Value::as_array) {
-        value = coerce_union(members, value);
+        value = coerce_union(members, value, budget);
     }
     if let Some(members) = schema.get("oneOf").and_then(Value::as_array) {
-        value = coerce_union(members, value);
+        value = coerce_union(members, value, budget);
     }
     value
 }
@@ -191,9 +251,9 @@ fn apply_composition(schema: &Value, mut value: Value) -> Value {
 /// Try each union member in turn, keeping the first one that coerces cleanly; if none do, the value is
 /// handed back untouched rather than treated as a failure — same rationale as `apply_composition`'s own
 /// doc comment.
-fn coerce_union(members: &[Value], value: Value) -> Value {
+fn coerce_union(members: &[Value], value: Value, budget: &mut Budget) -> Value {
     for member in members {
-        if let Ok(coerced) = coerce_value(member, value.clone()) {
+        if let Ok(coerced) = coerce_value(member, value.clone(), budget) {
             return coerced;
         }
     }
@@ -227,8 +287,15 @@ fn retag_whole_number(value: Value) -> Value {
     }
 }
 
-fn coerce_value(schema: &Value, input: Value) -> Result<Value, String> {
-    let value = apply_composition(schema, input);
+fn coerce_value(schema: &Value, input: Value, budget: &mut Budget) -> Result<Value, String> {
+    // Every re-entry into the recursion — a property, an array element, an `allOf`/`anyOf` member —
+    // passes through here, so charging the budget at this single point bounds the whole pass. Bailing
+    // returns the value un-coerced rather than an error: a hostile schema must degrade this pass into a
+    // no-op, never into a failed dispatch.
+    if !budget.spend() {
+        return Ok(input);
+    }
+    let value = apply_composition(schema, input, budget);
 
     let Some(types) = declared_types(schema) else {
         // No `type` constraint at all — an object schema with only `properties`/`additionalProperties`
@@ -240,10 +307,10 @@ fn coerce_value(schema: &Value, input: Value) -> Result<Value, String> {
                     .get("additionalProperties")
                     .is_some_and(Value::is_object))
         {
-            return coerce_object_properties(schema, value);
+            return coerce_object_properties(schema, value, budget);
         }
         if value.is_array() && schema.get("items").is_some() {
-            return coerce_array_items(schema, value);
+            return coerce_array_items(schema, value, budget);
         }
         return Ok(value);
     };
@@ -251,8 +318,8 @@ fn coerce_value(schema: &Value, input: Value) -> Result<Value, String> {
     for t in &types {
         if matches_type_raw(t, &value) {
             return match *t {
-                "object" => coerce_object_properties(schema, value),
-                "array" => coerce_array_items(schema, value),
+                "object" => coerce_object_properties(schema, value, budget),
+                "array" => coerce_array_items(schema, value, budget),
                 "integer" | "number" => Ok(retag_whole_number(value)),
                 _ => Ok(value),
             };
@@ -498,6 +565,63 @@ mod tests {
             coerce_tool_arguments(&json!({"type": "number"}), non_whole.clone()).unwrap(),
             non_whole
         );
+    }
+
+    #[test]
+    fn a_pathological_nested_all_of_schema_stops_at_the_budget_instead_of_blowing_up() {
+        // The shape that turns this pass into a denial of service: every level is a two-member `allOf`
+        // whose members nest the level below, so the number of nodes the coercion visits doubles with
+        // each level — and each of those visits deep-clones the value being coerced.
+        //
+        // 15 levels (~65k nodes) rather than the ~25 a real attacker would send: a JSON Schema is a
+        // *tree*, with no `$ref` sharing here, so the schema document itself doubles right along with
+        // the visit count and a depth-25 fixture is 30M+ nodes — it OOMs the test process while it's
+        // still being *built*, before any coercion runs. Depth is capped here only to keep the fixture
+        // buildable; what's being pinned down is that the coercion stops at its budget no matter how far
+        // the schema goes, which the exhausted-budget assertion below shows directly (a wall-clock bound
+        // alone would prove nothing at a depth this small).
+        let mut schema = json!({"type": "string"});
+        let mut input = json!("innermost");
+        for _ in 0..15 {
+            let member = json!({"type": "object", "properties": {"p": schema}});
+            schema = json!({"allOf": [member.clone(), member]});
+            input = json!({"p": input});
+        }
+
+        let started = std::time::Instant::now();
+        let (got, remaining) = coerce_with_budget(&schema, input.clone(), COERCION_NODE_BUDGET);
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            remaining, 0,
+            "the fixture must actually exhaust the budget, or it isn't testing the bail-out at all"
+        );
+        // Bailing out is a no-op, not an error: the value comes back intact (every coercion this schema
+        // asks for is an identity one) for the tool's own validation to judge.
+        assert_eq!(
+            got,
+            Ok(input),
+            "an exhausted budget must hand the value back un-coerced, never fail the dispatch"
+        );
+        // A loose sanity bound, not a benchmark — it must not flake on a loaded CI box.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "coercion of a hostile schema must be bounded work, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn an_exhausted_budget_degrades_to_a_no_op_rather_than_an_error() {
+        // The bail-out has to be indistinguishable from "this schema had nothing to coerce": a hostile
+        // schema must be able to turn this pass off, never to turn a legitimate tool call into a failed
+        // dispatch. A budget of 1 is spent by the first node, so nothing is coerced.
+        let (got, remaining) = coerce_with_budget(&json!({"type": "integer"}), json!("42"), 1);
+        assert_eq!(got, Ok(json!("42")));
+        assert_eq!(remaining, 0);
+
+        // Same schema, same input, with budget to spare: coercion happens as normal.
+        let (got, _) = coerce_with_budget(&json!({"type": "integer"}), json!("42"), 2);
+        assert_eq!(got, Ok(json!(42)));
     }
 
     #[test]

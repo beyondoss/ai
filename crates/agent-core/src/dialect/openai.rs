@@ -1024,18 +1024,18 @@ impl StreamDecoder for Decoder {
                 .and_then(|d| d.get("cached_tokens"))
                 .and_then(Value::as_u64)
                 .or_else(|| usage.get("prompt_cache_hit_tokens").and_then(Value::as_u64))
-                .unwrap_or(0) as u32;
+                .map_or(0, super::saturating_u32);
             // OpenAI itself never emits `cache_write_tokens` (no such wire concept), but
             // OpenRouter-compatible providers can — separate from `cached_tokens` (cache *reads*).
             let cache_write = usage
                 .get("prompt_tokens_details")
                 .and_then(|d| d.get("cache_write_tokens"))
                 .and_then(Value::as_u64)
-                .unwrap_or(0) as u32;
+                .map_or(0, super::saturating_u32);
             let prompt = usage
                 .get("prompt_tokens")
                 .and_then(Value::as_u64)
-                .unwrap_or(0) as u32;
+                .map_or(0, super::saturating_u32);
             // OpenAI's `prompt_tokens` is the *whole* prompt including both cached (read) and
             // freshly cache-written tokens; bill only the genuinely uncached remainder as
             // `input_tokens` so accounting doesn't double-count either kind. Matches pi's
@@ -1046,12 +1046,12 @@ impl StreamDecoder for Decoder {
             self.usage.output_tokens = usage
                 .get("completion_tokens")
                 .and_then(Value::as_u64)
-                .unwrap_or(0) as u32;
+                .map_or(0, super::saturating_u32);
             self.usage.reasoning_tokens = usage
                 .get("completion_tokens_details")
                 .and_then(|d| d.get("reasoning_tokens"))
                 .and_then(Value::as_u64)
-                .unwrap_or(0) as u32;
+                .map_or(0, super::saturating_u32);
             out.push(StreamEvent::Usage(self.usage));
         }
 

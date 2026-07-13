@@ -405,10 +405,18 @@ pub enum ApplyOutcome {
 /// patch and reports `<added>\t<deleted>\t<path>` **without modifying anything** — a hand-rolled patch
 /// parser here would be a second, subtly-different implementation of a format git already understands.
 async fn patch_paths(repo_root: &Path, patch: &[u8]) -> Result<Vec<String>, String> {
-    let out = git_stdout_with_stdin(repo_root, &["apply", "--numstat", "-"], patch).await?;
+    // `-z` is load-bearing, not cosmetic. Without it, git **C-quotes** any path containing non-ASCII
+    // or special bytes: `sécrets.env` is reported as `"s\303\251crets.env"` (wrapping quotes + octal
+    // escapes). That quoted form then slips past the deny-glob re-check in `apply_patch` — a glob like
+    // `**/*.env` can't match a string ending in `.env"` — silently merging a denied file back into the
+    // parent repo. `-z` emits each record as `<added>\t<deleted>\t<raw-path>\0`, NUL-terminated and
+    // unquoted (renames already normalized to their destination path, same as without `-z`), so the
+    // deny check sees the real filename.
+    let out = git_stdout_with_stdin(repo_root, &["apply", "--numstat", "-z", "-"], patch).await?;
     Ok(String::from_utf8_lossy(&out)
-        .lines()
-        .filter_map(|line| line.rsplit('\t').next())
+        .split('\0')
+        .filter(|record| !record.is_empty())
+        .filter_map(|record| record.rsplit('\t').next())
         .filter(|p| !p.is_empty())
         .map(str::to_string)
         .collect())
@@ -487,29 +495,61 @@ async fn command_output_with_stdin(
     args: &[&str],
     stdin: &[u8],
 ) -> Result<std::process::Output, String> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(dir).args(args);
+    output_with_stdin(cmd, &format!("git {}", args.join(" ")), stdin).await
+}
+
+/// Feed `stdin` to `cmd` while **concurrently** draining its stdout and stderr, and return what it
+/// wrote once it exits.
+///
+/// The concurrency is the whole point of this function, not an optimization. A pipe holds about 64 KiB;
+/// past that a writer blocks until the far end reads. Push the entire patch in first and only then start
+/// reading, and any child that produces more than a pipeful of output before it has swallowed the whole
+/// patch wedges the pair of us forever: it blocks writing stdout, therefore stops reading stdin,
+/// therefore our `write_all` never returns. Both callers reach that shape on real input — `git apply
+/// --numstat -z` emits a record per file (a patch touching a few thousand files overruns the buffer),
+/// and `git apply --3way` emits a `U <path>` line per file on a heavily conflicted patch. The result
+/// would be a turn hung for the life of the process, holding a child and three pipe fds.
+///
+/// The `join!` also means the child is always waited on, including when the write fails.
+async fn output_with_stdin(
+    mut cmd: Command,
+    label: &str,
+    stdin: &[u8],
+) -> Result<std::process::Output, String> {
     use tokio::io::AsyncWriteExt;
 
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
+    let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
-    child
+        .map_err(|e| format!("{label}: {e}"))?;
+    let mut pipe = child
         .stdin
-        .as_mut()
-        .ok_or_else(|| "git stdin unavailable".to_string())?
-        .write_all(stdin)
-        .await
-        .map_err(|e| format!("git {}: writing patch: {e}", args.join(" ")))?;
-    drop(child.stdin.take());
-    child
-        .wait_with_output()
-        .await
-        .map_err(|e| format!("git {}: {e}", args.join(" ")))
+        .take()
+        .ok_or_else(|| format!("{label}: stdin unavailable"))?;
+
+    let feed = async move {
+        let result = pipe.write_all(stdin).await;
+        // Dropping the handle closes the write end: without that EOF the child keeps waiting for more
+        // input and `wait_with_output` never returns.
+        drop(pipe);
+        result
+    };
+    let (written, out) = tokio::join!(feed, child.wait_with_output());
+    let out = out.map_err(|e| format!("{label}: {e}"))?;
+    if let Err(e) = written {
+        // A child that decides the input is garbage and exits before reading all of it (`git apply` on a
+        // malformed patch) closes the pipe under us, and we see EPIPE. That is not the failure worth
+        // reporting — the exit status and stderr we did collect say what actually went wrong, and the
+        // callers already turn those into a real message. Anything else is a genuine I/O fault.
+        if e.kind() != std::io::ErrorKind::BrokenPipe {
+            return Err(format!("{label}: writing stdin: {e}"));
+        }
+    }
+    Ok(out)
 }
 
 /// [`command_output_with_stdin`], erroring on a non-zero exit and returning stdout.
@@ -1032,6 +1072,44 @@ mod tests {
             std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap(),
             "original\n"
         );
+    }
+
+    /// The pipe-deadlock regression guard. `cat` echoes its stdin straight back, so a payload far larger
+    /// than a pipe buffer (~64 KiB) in *both* directions is exactly the shape that wedges a
+    /// write-everything-then-drain implementation: the child blocks writing stdout, stops reading stdin,
+    /// and our `write_all` never returns. `git apply --numstat` on a patch touching thousands of files
+    /// does the same thing with less convenient setup. The timeout is what makes a regression *fail*
+    /// rather than hang CI forever.
+    #[tokio::test]
+    async fn feeding_a_child_that_floods_its_stdout_does_not_deadlock() {
+        let payload = vec![b'x'; 4 << 20];
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            output_with_stdin(Command::new("cat"), "cat", &payload),
+        )
+        .await
+        .expect("deadlocked writing stdin to a child that was flooding its stdout")
+        .expect("cat");
+        assert!(out.status.success());
+        assert_eq!(out.stdout.len(), payload.len());
+    }
+
+    /// A child that exits before reading its whole stdin hands us EPIPE on the write. That is not the
+    /// interesting failure — the caller wants the exit status and stderr, which is what says why it quit.
+    #[tokio::test]
+    async fn a_child_that_exits_without_reading_stdin_yields_its_output_not_a_write_error() {
+        let payload = vec![b'x'; 4 << 20];
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo nope >&2; exit 3"]);
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            output_with_stdin(cmd, "sh", &payload),
+        )
+        .await
+        .expect("deadlocked writing stdin to a child that never read it")
+        .expect("a broken stdin pipe must not mask the child's own output");
+        assert_eq!(out.status.code(), Some(3));
+        assert_eq!(String::from_utf8_lossy(&out.stderr).trim(), "nope");
     }
 
     #[test]

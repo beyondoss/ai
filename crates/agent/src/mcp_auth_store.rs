@@ -132,11 +132,54 @@ fn write_store_file(path: &Path, store: &OnDisk) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    // This file holds live MCP OAuth access/refresh tokens. `write_atomic` only *preserves* an
+    // existing file's permission bits — it never imposes one on a brand-new file, so the very first
+    // write would otherwise land at the umask default (commonly world-readable). Create it `0600`
+    // atomically first, exactly as `auth_store.rs` does for `auth.json`.
+    if !path.exists() {
+        create_private(path)?;
+    }
     let body = serde_json::to_string_pretty(store).map_err(std::io::Error::other)?;
     let path_str = path
         .to_str()
         .ok_or_else(|| std::io::Error::other(format!("non-UTF-8 path: {}", path.display())))?;
-    crate::tools::write_atomic(path_str, body.as_bytes())
+    crate::tools::write_atomic(path_str, body.as_bytes())?;
+    // Belt-and-suspenders on top of the atomic-at-creation `0600`: `write_atomic` only ever copies an
+    // existing file's mode forward, never re-asserts one, so a file loosened out-of-band (a stray
+    // `chmod`, a restore from backup) would stay that way forever. Re-assert `0600` after every write
+    // so it self-heals — mirrors `auth_store.rs::set_private`.
+    set_private(path)
+}
+
+/// Create an empty file at `path` with `0600` permissions set atomically at creation (Unix), closing
+/// the window a `set_permissions`-afterward approach would leave open. Mirrors
+/// `auth_store.rs`/`session_store.rs`'s identical helper (duplicated, not shared, per this codebase's
+/// small-self-contained-stores convention).
+fn create_private(path: &Path) -> std::io::Result<()> {
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)?;
+    Ok(())
+}
+
+/// Unconditionally re-assert `0600` on an already-written file (Unix only — a no-op elsewhere), so a
+/// mode loosened out-of-band self-heals on the next write. Mirrors `auth_store.rs::set_private`.
+fn set_private(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 /// Acquire the cross-process lock, re-read the store's current on-disk state, apply `mutate`, persist
