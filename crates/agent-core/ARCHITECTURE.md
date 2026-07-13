@@ -432,6 +432,17 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   (a `PendingLock` drop guard, defused into the `WriteLockGuard` on success): a `lock()` future dropped
   while still parked — a cancelled run — never constructs a guard, so without it the last reference to a
   contended key could die with no one left to evict the entry, reintroducing exactly the leak above.
+  The guard is acquired at the dispatch seam and normally held for the tool's whole run, releasing when
+  that run's future resolves. One case needs more than that: `edit` performs its atomic write on a
+  `spawn_blocking` thread, which tokio cannot cancel — on a cancelled run the dispatch future is dropped
+  (abandoning the `.await`) while that write runs on regardless. Releasing the guard when the dispatch
+  future drops would then free the lock with the write still physically in flight, letting another
+  turn/session acquire the same path and interleave (a lost update). So the guard is shared as an `Arc`
+  and a clone rides _into_ the `spawn_blocking` closure via `ToolProgress::write_lock_keepalive`: the
+  registry lock releases only once every clone is gone — i.e. once the write has landed — regardless of
+  when the dispatch future was dropped. (`write` needs no such move: it mutates synchronously within its
+  own future, which can't be preempted mid-write.) Pinned by
+  `agent::tests::cancelling_a_write_holds_its_lock_until_the_in_flight_blocking_write_lands`.
   Two documented limitations: this only serializes within one process (cross-process locking would need
   a filesystem advisory lock, out of scope until a real multi-process use case needs it); and
   `futures::lock::Mutex` is _barging_, not FIFO — the registry guarantees mutual exclusion but no
@@ -561,7 +572,7 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
 It ships **zero concrete `Tool` implementations** — `Read`/`Write`/`Edit`/`Bash`/`fork`/`sync`/`logs`
 all live in `crates/agent`. It has **no dependency on the gateway crate** — `GatewayClient`'s entire
 contract is "POST dialect JSON to a base URL, get SSE back"; routing, provider auth, and metering are
-the gateway's job. (It does depend on the `providers` crate, which sits *below* both: a table of static
+the gateway's job. (It does depend on the `providers` crate, which sits _below_ both: a table of static
 per-provider facts — host, wire format, auth header, env var — that the gateway routes on and this crate
 uses to pick a request dialect. That is a shared table, not a dependency on the gateway.) This split is what lets the loop, the dialect adapters, and the tool dispatch logic
 run as pure unit tests with `MockTransport` — no network, no live model, no gateway binary.

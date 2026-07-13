@@ -4,9 +4,10 @@
 
 use std::cell::OnceCell;
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use agent_core::tool::Tool;
-use agent_core::{ToolError, ToolOutput};
+use agent_core::tool::{Tool, ToolProgress};
+use agent_core::{ToolError, ToolOutput, WriteLockGuard};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
@@ -82,6 +83,30 @@ impl Tool for Edit {
     /// the same harness and don't come close to stalling, so they're deliberately left alone rather than
     /// wrapped on principle.
     async fn run(&self, input: Value) -> Result<ToolOutput, ToolError> {
+        // A directly-invoked call (outside the dispatch loop) carries no dispatch write-lock guard.
+        self.run_inner(input, None).await
+    }
+
+    async fn run_streaming(
+        &self,
+        input: Value,
+        progress: &ToolProgress,
+    ) -> Result<ToolOutput, ToolError> {
+        // The whole point of overriding `run_streaming` here: pull the dispatch-held write-lock guard
+        // off the progress handle so `run_inner` can move it *into* the `spawn_blocking` closure below.
+        // `edit`'s write is the one file mutation that runs on a blocking thread tokio cannot cancel, so
+        // its guard must be released from that thread when the write lands — not on the reactor when a
+        // cancelled dispatch future is dropped mid-write. See `ToolProgress::write_lock_keepalive`.
+        self.run_inner(input, progress.write_lock_keepalive()).await
+    }
+}
+
+impl Edit {
+    async fn run_inner(
+        &self,
+        input: Value,
+        write_lock: Option<Arc<WriteLockGuard>>,
+    ) -> Result<ToolOutput, ToolError> {
         let path = input
             .get("path")
             .and_then(Value::as_str)
@@ -98,7 +123,20 @@ impl Tool for Edit {
             ));
         }
 
-        match tokio::task::spawn_blocking(move || apply_edits(&path, edits, replace_all)).await {
+        // `write_lock` rides *into* the closure so its guard drops on this blocking thread, once
+        // `apply_edits`' `rename(2)` has landed — never before. tokio cannot cancel a running blocking
+        // task: on cancellation the `.await` below is abandoned and this future is dropped, but the
+        // closure runs to completion regardless. Were the guard held only by the dispatch future (as it
+        // was), it would release the instant that future dropped, leaving the write physically in flight
+        // with the lock already free — a second turn/session could then acquire it and interleave. Moving
+        // the guard here ties its release to the write itself. (`write` needs no such move: it mutates
+        // synchronously within its own future, which can't be preempted mid-write.)
+        match tokio::task::spawn_blocking(move || {
+            let _write_lock = write_lock;
+            apply_edits(&path, edits, replace_all)
+        })
+        .await
+        {
             Ok(result) => result,
             // The closure returns its errors as `Err`, so a `JoinError` can only be a panic inside it.
             // Re-raise rather than dressing it up as an ordinary tool failure.

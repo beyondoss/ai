@@ -64,7 +64,7 @@ pub use tool::{Tool, ToolOutput, ToolProgress, ToolRegistry, ToolUpdate};
 pub use transport::{
     ModelRequest, ModelTransport, ReasoningEffort, ReasoningSummary, ServiceTier, ToolChoice,
 };
-pub use write_lock::WriteLockRegistry;
+pub use write_lock::{WriteLockGuard, WriteLockRegistry};
 // Re-exported because it appears in `Agent::run_events_cancellable`'s signature — callers shouldn't
 // need a direct `tokio-util` dependency to drive a cancellable run.
 pub use tokio_util::sync::CancellationToken;

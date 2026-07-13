@@ -1540,8 +1540,17 @@ impl Agent {
                                 // across turn and session boundaries, so a concurrently-running turn (or a
                                 // different session sharing this `Agent`'s registry) touching the same path
                                 // really waits, not just calls within this one turn.
-                                let _write_guard = match &target {
-                                    Some(path) => Some(write_locks.lock(path).await),
+                                //
+                                // Wrapped in `Arc` so a clone can ride into a tool's non-cancellable
+                                // `spawn_blocking` write (via `ToolProgress::write_lock_keepalive`): the
+                                // registry lock then releases only once *both* this group future's clone and
+                                // the in-flight write's clone are gone — i.e. after the write has physically
+                                // landed — not the instant cancellation drops this future while the detached
+                                // `spawn_blocking` runs on regardless (see `write_lock.rs`).
+                                let write_guard = match &target {
+                                    Some(path) => {
+                                        Some(std::sync::Arc::new(write_locks.lock(path).await))
+                                    }
                                     None => None,
                                 };
                                 let mut out = Vec::with_capacity(indices.len());
@@ -1560,7 +1569,8 @@ impl Agent {
                                                 id.clone(),
                                                 name.clone(),
                                                 cancel.clone(),
-                                            );
+                                            )
+                                            .with_write_lock(write_guard.clone());
                                             let (text, images, is_error, terminate) =
                                                 match current_tools.get(name) {
                                                     Some(tool) => {
@@ -1902,14 +1912,19 @@ impl Agent {
                 break;
             }
             let target = tools.get(name).and_then(|t| t.write_target(&coerced));
-            let _write_guard = match &target {
-                Some(path) => Some(self.write_locks.lock(path).await),
+            // `Arc` so a clone can ride into a tool's non-cancellable `spawn_blocking` write and keep the
+            // registry lock held until the write has physically landed, rather than releasing it the
+            // instant this interleaved dispatch abandons the tool future on cancellation — see the
+            // matching guard in the default group path, and `write_lock.rs`.
+            let write_guard = match &target {
+                Some(path) => Some(std::sync::Arc::new(self.write_locks.lock(path).await)),
                 None => None,
             };
             let (prog_tx, mut prog_rx) =
                 futures::channel::mpsc::unbounded::<crate::tool::ToolUpdate>();
             let progress =
-                crate::tool::ToolProgress::new(prog_tx, id.clone(), name.clone(), cancel.clone());
+                crate::tool::ToolProgress::new(prog_tx, id.clone(), name.clone(), cancel.clone())
+                    .with_write_lock(write_guard.clone());
             let run_fut = async {
                 match tools.get(name) {
                     Some(tool) => {
@@ -5761,6 +5776,156 @@ mod tests {
             *log.lock().unwrap(),
             vec!["start:edit", "end:edit", "start:write", "end:write"],
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_a_write_holds_its_lock_until_the_in_flight_blocking_write_lands() {
+        // Regression: a guarded tool (one reporting a `write_target`) whose actual write runs on a
+        // `spawn_blocking` thread — the `edit` tool — must not release its registry write-lock the
+        // instant a cancelled dispatch future is dropped. tokio cannot cancel a running blocking task,
+        // so on cancellation that future is abandoned while the blocking write *runs on regardless*;
+        // if the write-lock guard were held only by the dispatch future (as it was), it would release
+        // with the write still physically in flight, letting another turn/session acquire the same
+        // path's lock and interleave — a lost update (see `write_lock.rs`, and `edit.rs`'s
+        // `run_inner`). The fix rides an `Arc` clone of the guard *into* the `spawn_blocking` closure
+        // (via `ToolProgress::write_lock_keepalive`) so the lock releases from the blocking thread when
+        // the write completes. This tool models `edit`'s exact shape — keepalive moved into a
+        // `spawn_blocking` we can hold open on demand — and drives it through the *real* dispatch loop.
+        //
+        // Deterministic, not timing-based: the blocking "write" parks on a channel the test controls,
+        // so while it's parked the lock is *genuinely* held and a competing `lock()` blocks forever
+        // (the negative wait below can only ever time out); it frees only once the test releases it.
+        struct BlockingWriteTool {
+            // A oneshot the closure fires the moment its (keepalive-holding) blocking write begins, so
+            // the test knows the write is in flight before it cancels.
+            started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+            // The closure blocks on this until the test releases it — standing in for a slow, atomic,
+            // non-cancellable `rename(2)`.
+            release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        }
+        #[async_trait]
+        impl Tool for BlockingWriteTool {
+            fn name(&self) -> &str {
+                "edit"
+            }
+            fn description(&self) -> &str {
+                "models edit's spawn_blocking write"
+            }
+            fn input_schema(&self) -> Value {
+                json!({ "type": "object" })
+            }
+            fn write_target(&self, input: &Value) -> Option<String> {
+                input
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            }
+            async fn run_streaming(
+                &self,
+                _input: Value,
+                progress: &crate::tool::ToolProgress,
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+                let keepalive = progress.write_lock_keepalive();
+                let started = self.started.lock().unwrap().take().unwrap();
+                let release = self.release.lock().unwrap().take().unwrap();
+                match tokio::task::spawn_blocking(move || {
+                    // Exactly the fix: the guard rides into the blocking closure, so it drops here —
+                    // when the write finishes — not on the reactor when the dispatch future is dropped.
+                    let _keepalive = keepalive;
+                    started.send(()).ok();
+                    // Block until the test lets the "write" complete. A detached (cancelled) closure
+                    // reaches and stays here, keepalive in hand.
+                    release.recv().ok();
+                })
+                .await
+                {
+                    Ok(()) => Ok("wrote".into()),
+                    Err(e) => std::panic::resume_unwind(e.into_panic()),
+                }
+            }
+            async fn run(
+                &self,
+                _input: Value,
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+                unreachable!("dispatch drives run_streaming")
+            }
+        }
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(BlockingWriteTool {
+            started: std::sync::Mutex::new(Some(started_tx)),
+            release: std::sync::Mutex::new(Some(release_rx)),
+        }));
+
+        // The registry is shared exactly as a `serve` process shares one across sessions — the seam the
+        // lock exists to protect. The competing `lock()` calls below go through this same registry.
+        let registry = Arc::new(crate::write_lock::WriteLockRegistry::new());
+
+        let one_call = vec![
+            StreamEvent::MessageStart,
+            StreamEvent::ToolUseStart {
+                index: 0,
+                id: "a".into(),
+                name: "edit".into(),
+            },
+            StreamEvent::InputJsonDelta {
+                index: 0,
+                partial_json: r#"{"path":"target.rs"}"#.into(),
+            },
+            StreamEvent::ContentBlockStop { index: 0 },
+            StreamEvent::MessageStop {
+                stop_reason: StopReason::ToolUse,
+            },
+        ];
+        let mock = Arc::new(MockTransport::new(vec![one_call, turn::text("done")]));
+        let agent = Agent::new(mock, "claude-opus-4-8")
+            .with_tools(tools)
+            .with_write_locks(registry.clone())
+            .with_max_steps(8);
+
+        let cancel = CancellationToken::new();
+        let cancel_for_run = cancel.clone();
+        let run = tokio::spawn(async move {
+            let mut session = Session::new();
+            session.user("go");
+            // Cancellation makes this return; its result (Ok/cancelled) is not what we're asserting.
+            let _ = agent
+                .run_events_cancellable(&mut session, |_| {}, cancel_for_run)
+                .await;
+        });
+
+        // The blocking write is now in flight, keepalive in hand.
+        started_rx
+            .await
+            .expect("tool's blocking write should start");
+        // Cancel: dispatch abandons the tool future (drops its own guard clone), but the detached
+        // blocking closure keeps the write — and its keepalive — alive.
+        cancel.cancel();
+        run.await
+            .expect("run task should return promptly on cancel");
+
+        // The write is still parked, so its lock must still be held: a competing locker on the same
+        // path cannot acquire. Pre-fix (guard held only by the dropped dispatch future) it would.
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                registry.lock("target.rs"),
+            )
+            .await
+            .is_err(),
+            "write lock was released while the write was still physically in flight",
+        );
+
+        // Let the write complete; the guard now drops on the blocking thread and the lock frees.
+        release_tx.send(()).expect("release the blocking write");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            registry.lock("target.rs"),
+        )
+        .await
+        .expect("write lock must release once the in-flight write completes");
     }
 
     #[tokio::test]
