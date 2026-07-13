@@ -3669,10 +3669,10 @@ pub(crate) fn scan_listings(
                 if let (Some(dir), Some(name), Some((size, mtime_ns))) =
                     (p.parent(), p.file_name().and_then(|n| n.to_str()), stamp)
                 {
-                    fresh
-                        .entry(dir.to_path_buf())
-                        .or_default()
-                        .insert(name.to_string(), ListingIndexEntry::new(size, mtime_ns, &meta));
+                    fresh.entry(dir.to_path_buf()).or_default().insert(
+                        name.to_string(),
+                        ListingIndexEntry::new(size, mtime_ns, &meta),
+                    );
                 }
                 hits.push(meta);
                 scanned += 1;
@@ -3697,10 +3697,10 @@ pub(crate) fn scan_listings(
             path.file_name().and_then(|n| n.to_str()),
             miss_stamps.get(&path),
         ) {
-            fresh
-                .entry(dir.to_path_buf())
-                .or_default()
-                .insert(name.to_string(), ListingIndexEntry::new(size, mtime_ns, &meta));
+            fresh.entry(dir.to_path_buf()).or_default().insert(
+                name.to_string(),
+                ListingIndexEntry::new(size, mtime_ns, &meta),
+            );
         }
         metas.push(meta);
     }

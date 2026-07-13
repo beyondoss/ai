@@ -41,7 +41,11 @@ fn assert_same(a: &[SessionMeta], b: &[SessionMeta]) {
     b.sort_by(|x, y| x.id.cmp(&y.id));
     for (x, y) in a.iter().zip(&b) {
         assert_eq!(x.id, y.id);
-        assert_eq!(x.updated_at, y.updated_at, "updated_at diverged for {}", x.id);
+        assert_eq!(
+            x.updated_at, y.updated_at,
+            "updated_at diverged for {}",
+            x.id
+        );
         assert_eq!(
             x.message_count, y.message_count,
             "message_count diverged for {}",
@@ -57,7 +61,9 @@ fn assert_same(a: &[SessionMeta], b: &[SessionMeta]) {
 fn a_warm_listing_matches_a_cold_one() {
     let (dir, repo) = repo();
     for i in 0..3 {
-        let mut store = repo.create(SessionMeta::new("/repo", "claude-sonnet-5")).unwrap();
+        let mut store = repo
+            .create(SessionMeta::new("/repo", "claude-sonnet-5"))
+            .unwrap();
         store
             .append_new(&[
                 Message::user(format!("question number {i}")),
@@ -85,7 +91,9 @@ fn a_warm_listing_matches_a_cold_one() {
 #[test]
 fn appending_to_a_session_invalidates_its_cached_listing() {
     let (dir, repo) = repo();
-    let mut store = repo.create(SessionMeta::new("/repo", "claude-sonnet-5")).unwrap();
+    let mut store = repo
+        .create(SessionMeta::new("/repo", "claude-sonnet-5"))
+        .unwrap();
     let mut messages = vec![Message::user("first")];
     store.append_new(&messages).unwrap();
 
@@ -112,11 +120,19 @@ fn appending_to_a_session_invalidates_its_cached_listing() {
 #[test]
 fn a_corrupt_index_falls_back_to_a_full_scan() {
     let (dir, repo) = repo();
-    let mut store = repo.create(SessionMeta::new("/repo", "claude-sonnet-5")).unwrap();
+    let mut store = repo
+        .create(SessionMeta::new("/repo", "claude-sonnet-5"))
+        .unwrap();
     store.append_new(&[Message::user("hello")]).unwrap();
     let expected = repo.list().unwrap();
 
-    for garbage in ["", "{", "null", r#"{"version":999,"entries":{}}"#, "not json at all"] {
+    for garbage in [
+        "",
+        "{",
+        "null",
+        r#"{"version":999,"entries":{}}"#,
+        "not json at all",
+    ] {
         std::fs::write(dir.path().join(INDEX), garbage).unwrap();
         let got = repo.list().unwrap();
         assert_same(&expected, &got);
@@ -128,7 +144,9 @@ fn a_corrupt_index_falls_back_to_a_full_scan() {
 #[test]
 fn an_index_at_an_unknown_version_is_discarded() {
     let (dir, repo) = repo();
-    let mut store = repo.create(SessionMeta::new("/repo", "claude-sonnet-5")).unwrap();
+    let mut store = repo
+        .create(SessionMeta::new("/repo", "claude-sonnet-5"))
+        .unwrap();
     store.append_new(&[Message::user("hello")]).unwrap();
     let expected = repo.list().unwrap();
 
@@ -146,11 +164,15 @@ fn an_index_at_an_unknown_version_is_discarded() {
 #[test]
 fn a_deleted_session_is_dropped_from_the_index() {
     let (dir, repo) = repo();
-    let keep = repo.create(SessionMeta::new("/repo", "claude-sonnet-5")).unwrap();
+    let keep = repo
+        .create(SessionMeta::new("/repo", "claude-sonnet-5"))
+        .unwrap();
     let mut keep_store = keep;
     keep_store.append_new(&[Message::user("keep me")]).unwrap();
 
-    let mut gone = repo.create(SessionMeta::new("/repo", "claude-sonnet-5")).unwrap();
+    let mut gone = repo
+        .create(SessionMeta::new("/repo", "claude-sonnet-5"))
+        .unwrap();
     gone.append_new(&[Message::user("delete me")]).unwrap();
     let gone_id = gone.meta().id.clone();
     let gone_path = gone.path().to_path_buf();
@@ -179,7 +201,9 @@ fn a_read_only_directory_still_lists() {
     use std::os::unix::fs::PermissionsExt;
 
     let (dir, repo) = repo();
-    let mut store = repo.create(SessionMeta::new("/repo", "claude-sonnet-5")).unwrap();
+    let mut store = repo
+        .create(SessionMeta::new("/repo", "claude-sonnet-5"))
+        .unwrap();
     store.append_new(&[Message::user("hello")]).unwrap();
     let expected = uncached(dir.path(), &repo);
 
@@ -193,5 +217,8 @@ fn a_read_only_directory_still_lists() {
     // Restore before asserting, so a failure can't leave an undeletable temp dir behind.
     std::fs::set_permissions(dir.path(), perms).unwrap();
 
-    assert_same(&expected, &got.expect("listing must not fail just because the cache can't be saved"));
+    assert_same(
+        &expected,
+        &got.expect("listing must not fail just because the cache can't be saved"),
+    );
 }
