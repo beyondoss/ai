@@ -130,12 +130,13 @@ fn build_run_gateway_client(
     raw_key: Option<String>,
     gateway: &str,
     model: &str,
+    provider_env: &beyond_ai_agent::gateway_credential::ProviderEnv,
     retry_max_retries: Option<u32>,
     retry_base_delay_ms: Option<u64>,
     retry_max_backoff_ms: Option<u64>,
     idle_timeout_ms: Option<u64>,
 ) -> Result<GatewayClient, String> {
-    let credential = resolve_gateway_credential(raw_key, model)?;
+    let credential = resolve_gateway_credential(raw_key, model, provider_env)?;
     let mut client = match credential {
         GatewayCredential::Static(key) => {
             GatewayClient::new(gateway.to_string(), key).map_err(|e| e.to_string())?
@@ -1891,10 +1892,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 None => None,
             };
+            // See `run`'s identical block below for why `DEFAULT_GATEWAY` must not count as "configured".
+            let configured_gateway = gateway_url
+                .or_else(|| stored_settings.default_gateway_url.clone())
+                .or_else(|| key.is_some().then(|| DEFAULT_GATEWAY.to_string()));
             let serve_cfg = serve::ServeConfig {
-                gateway: gateway_url
-                    .or_else(|| stored_settings.default_gateway_url.clone())
-                    .unwrap_or_else(|| DEFAULT_GATEWAY.to_string()),
+                provider_env: beyond_ai_agent::gateway_credential::ProviderEnv::from_process_env(
+                    configured_gateway.is_some(),
+                ),
+                gateway: configured_gateway.unwrap_or_else(|| DEFAULT_GATEWAY.to_string()),
                 key,
                 model: resolved_model,
                 model_explicit,
@@ -3366,9 +3372,19 @@ async fn run_task(
     let initial_message = parts.join("");
     timing.mark("compose initial message");
 
-    let gateway = gateway_url
+    // A gateway is *configured* only if someone actually said so — `--gateway-url`/`AI_GATEWAY_URL`, a
+    // stored `default_gateway_url`, or a `--key`/`AI_AGENT_KEY` to present to it. `DEFAULT_GATEWAY` is a
+    // fallback, not configuration: treating a fallback as a configured gateway is precisely what made the
+    // gateway mandatory, since the agent would then always believe it had one and never route direct.
+    let configured_gateway = gateway_url
         .or_else(|| stored_settings.default_gateway_url.clone())
-        .unwrap_or_else(|| DEFAULT_GATEWAY.to_string());
+        .or_else(|| key.is_some().then(|| DEFAULT_GATEWAY.to_string()));
+    let provider_env = beyond_ai_agent::gateway_credential::ProviderEnv::from_process_env(
+        configured_gateway.is_some(),
+    );
+    // Still materialized: in direct mode every credential carries a `RouteOverride::Direct` that replaces
+    // this base URL outright, so it is never dialed — no need to make the type `Option` all the way down.
+    let gateway = configured_gateway.unwrap_or_else(|| DEFAULT_GATEWAY.to_string());
     // Round 3 (pi-parity fix): five more flag/env-only settings gain the same "explicit flag/env, then
     // stored setting, then built-in default" precedence — `serve`'s identical block, in its own command
     // handler above, for the full set (including `--models`, `serve`-only).
@@ -3424,7 +3440,7 @@ async fn run_task(
     // Captured before the shadowing below turns `key` into a resolved `GatewayCredential` — the
     // subagent factory needs the *raw* key to re-resolve for a child model (credentials are model-keyed).
     let raw_gateway_key = key.clone();
-    let key = resolve_gateway_credential(key, &model)?;
+    let key = resolve_gateway_credential(key, &model, &provider_env)?;
     // Task #29 (pi-parity fix): whether the operator explicitly requested a specific reasoning depth
     // for *this* invocation — an explicit `--reasoning-effort` flag, or a `--model <pattern>:<level>`
     // suffix (`model_thinking_level`, including `:off`) — as opposed to neither ever being given at
@@ -3816,11 +3832,15 @@ async fn run_task(
         // key and the parent's retry/timeout knobs, mirroring the parent client build below.
         let raw_key = raw_gateway_key.clone();
         let gateway_for_factory = gateway.clone();
+        // Same direct/gateway resolution the parent uses — a subagent on a different model must reach it
+        // the same way the parent would have, gateway or not.
+        let provider_env_for_factory = provider_env.clone();
         let factory: subagent::TransportFactory = Arc::new(move |m: &str| {
             build_run_gateway_client(
                 raw_key.clone(),
                 &gateway_for_factory,
                 m,
+                &provider_env_for_factory,
                 retry_max_retries,
                 retry_base_delay_ms,
                 retry_max_backoff_ms,

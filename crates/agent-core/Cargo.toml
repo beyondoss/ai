@@ -27,6 +27,10 @@ futures-timer.workspace = true
 # line (the crate's highest-frequency operation). `memchr` vectorizes it; already in the build graph
 # (reqwest/tokio pull it), so this adds nothing to compile time.
 memchr = "2"
+# The shared provider table — `AggregatorHost` (re-exported from `models`) and the wire/auth facts that
+# let `Dialect::for_model_via_provider` know an OpenRouter-served `anthropic/claude-…` is an *OpenAI*-wire
+# request. Same rows the gateway routes on, so the two can't disagree. Zero-dependency, in-workspace.
+providers = { package = "beyond-ai-providers", path = "../providers" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

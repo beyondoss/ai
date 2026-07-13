@@ -199,6 +199,46 @@ impl Dialect {
         }
     }
 
+    /// Pick the dialect knowing **which provider will actually serve the request** — the only signal
+    /// that can settle it, and the one a model id alone genuinely cannot supply.
+    ///
+    /// [`Self::for_model_with_host`] reads the *name*: anything starting `claude` or containing
+    /// `anthropic` gets the Anthropic wire. That is right for a native route and wrong for an
+    /// aggregator. OpenRouter's ids are vendor-slugged — `anthropic/claude-sonnet-4.5` — but OpenRouter
+    /// speaks the **OpenAI** wire for every model it serves, Claude included. Deriving the dialect from
+    /// the id and only then picking a provider inverts the dependency and POSTs an Anthropic body to a
+    /// Chat Completions endpoint. So: resolve the provider first, then ask this.
+    ///
+    /// When the provider's [`providers::WireFormat`] is `OpenAi`, the name heuristic is suppressed and
+    /// the request shape comes from the model's own [`ApiKind`] (Responses vs Chat Completions) — that
+    /// split is a property of the model, not the provider, so an OpenAI-wire provider reaches both arms.
+    ///
+    /// The per-model exceptions still win over the row, because they are real rather than heuristic:
+    /// Fireworks is an OpenAI-wire provider that genuinely serves 14 ids over the Anthropic wire
+    /// ([`is_fireworks_anthropic_wire_model`]), and OpenCode Zen/Go genuinely disagree with each other
+    /// about several bare ids ([`anthropic_wire_bare_id_for_host`]). Both are consulted through
+    /// [`routes_to_anthropic_by_default`], which already takes the host — so an OpenAI-wire *row* with
+    /// an Anthropic-wire *model* still lands on the Anthropic wire.
+    ///
+    /// `provider: None` is **bit-identical** to [`Self::for_model_with_host`]`(model, None)`, which is
+    /// what lets every existing caller keep its behavior unchanged.
+    pub fn for_model_via_provider(
+        model: &str,
+        provider: Option<crate::models::AggregatorHost>,
+    ) -> Self {
+        if let Some(id) = provider
+            && providers::by_id(id).wire == providers::WireFormat::OpenAi
+            && !routes_to_anthropic_by_default(model, provider)
+        {
+            return if crate::models::capabilities(model).api == ApiKind::Responses {
+                Dialect::OpenAiResponses
+            } else {
+                Dialect::OpenAi
+            };
+        }
+        Self::for_model_with_host(model, provider)
+    }
+
     /// Same selection as [`Dialect::for_model_with_host`], but additionally consults whether this
     /// request is being proxied through GitHub Copilot's own endpoint (`via_copilot`) rather than sent
     /// to a provider natively — Copilot's proxy wants a different wire shape than the native provider
@@ -1597,5 +1637,112 @@ data: {"type":"message_stop"}
             vec![Role::User, Role::Assistant, Role::User],
             "must not collapse into two consecutive user turns"
         );
+    }
+
+    /// The bug this function exists to prevent. OpenRouter serves `anthropic/claude-…` over the OpenAI
+    /// wire; the name heuristic says Anthropic. Provider wins.
+    #[test]
+    fn openai_wire_provider_suppresses_the_anthropic_name_heuristic() {
+        use crate::models::AggregatorHost;
+        for model in [
+            "anthropic/claude-sonnet-4.5",
+            "anthropic/claude-opus-4.6",
+            "claude-opus-4-8",
+        ] {
+            assert_eq!(
+                Dialect::for_model_via_provider(model, Some(AggregatorHost::OpenRouter)),
+                Dialect::OpenAi,
+                "{model} via OpenRouter must build an OpenAI-wire body"
+            );
+            // …and the *native* route for the same id is still Anthropic-wire. Both must hold, or the
+            // fix has simply moved the mis-route to the other side.
+            assert_eq!(
+                Dialect::for_model_via_provider(model, Some(AggregatorHost::Anthropic)),
+                Dialect::Anthropic,
+                "{model} via Anthropic must build an Anthropic-wire body"
+            );
+        }
+    }
+
+    /// An OpenAI-wire *provider* serving an Anthropic-wire *model* still gets the Anthropic wire — the
+    /// per-model exceptions are real, not heuristics, and must survive the suppression above.
+    #[test]
+    fn per_model_anthropic_wire_exceptions_beat_the_provider_row() {
+        use crate::models::AggregatorHost;
+        // Fireworks: an OpenAI-wire row, but 14 of its ids are genuinely `anthropic-messages`.
+        assert_eq!(
+            Dialect::for_model_via_provider(
+                "accounts/fireworks/models/kimi-k2p6",
+                Some(AggregatorHost::Fireworks)
+            ),
+            Dialect::Anthropic
+        );
+        // OpenCode Zen: `qwen3.5-plus` is in NATIVE_ANTHROPIC_WIRE_BARE_IDS and has no host override.
+        assert_eq!(
+            Dialect::for_model_via_provider("qwen3.5-plus", Some(AggregatorHost::OpenCodeZen)),
+            Dialect::Anthropic
+        );
+        // …but `minimax-m3` on OpenCode Zen specifically is openai-completions (host override).
+        assert_eq!(
+            Dialect::for_model_via_provider("minimax-m3", Some(AggregatorHost::OpenCodeZen)),
+            Dialect::OpenAi
+        );
+        // …while the same id on OpenCode-Go keeps the Anthropic default.
+        assert_eq!(
+            Dialect::for_model_via_provider("minimax-m3", Some(AggregatorHost::OpenCodeGo)),
+            Dialect::Anthropic
+        );
+    }
+
+    /// An OpenAI-wire provider still reaches *both* OpenAI arms — Responses vs Chat Completions is a
+    /// property of the model, which is why the row carries a two-variant wire and not a dialect.
+    #[test]
+    fn openai_wire_provider_still_splits_responses_from_chat_completions() {
+        use crate::models::AggregatorHost;
+        assert_eq!(
+            Dialect::for_model_via_provider("gpt-5", Some(AggregatorHost::OpenAi)),
+            Dialect::OpenAiResponses
+        );
+        assert_eq!(
+            Dialect::for_model_via_provider("deepseek-v3", Some(AggregatorHost::DeepSeek)),
+            Dialect::OpenAi
+        );
+    }
+
+    /// The regression guard for every existing caller: with no provider signal, this is the old
+    /// function, exactly. If this ever fails, the new path has changed behavior for a route that never
+    /// asked for it.
+    #[test]
+    fn no_provider_is_identical_to_the_host_blind_heuristic() {
+        for model in [
+            "claude-opus-4-8",
+            "anthropic/claude-sonnet-4.5",
+            "gpt-5",
+            "gpt-4.1",
+            "o3",
+            "deepseek-v3",
+            "grok-4",
+            "minimax-m2.7",
+            "minimax-m3",
+            "qwen3.5-plus",
+            "qwen3.6-plus",
+            "kimi-k2-thinking",
+            "accounts/fireworks/models/kimi-k2p6",
+            "accounts/fireworks/models/glm-5p2",
+            "moonshotai/kimi-k2.6",
+            "glm-5.1",
+            "",
+        ] {
+            assert_eq!(
+                Dialect::for_model_via_provider(model, None),
+                Dialect::for_model_with_host(model, None),
+                "{model}: no-provider must be bit-identical to the old heuristic"
+            );
+            assert_eq!(
+                Dialect::for_model_via_provider(model, None),
+                Dialect::for_model(model),
+                "{model}"
+            );
+        }
     }
 }

@@ -1022,6 +1022,100 @@ by every `build_agent` rebuild (`set_model`/`set_thinking`/`cycle_model`/`cycle_
 
 ---
 
+## Provider routing — the gateway is optional
+
+The agent reaches a model in one of two modes, chosen once per invocation
+(`gateway_credential::ProviderEnv::direct`):
+
+- **Gateway mode** — relay through the AI gateway, which swaps a `bai_v1…` virtual key for a real pool
+  key, routes to the provider, and meters the result.
+- **Direct mode** — dial the provider itself. `agent_core::client::RouteOverride::Direct` replaces
+  `GatewayClient`'s base URL outright at request time, so this needed no new transport: a direct
+  credential simply carries a route, and the gateway URL is never dialed.
+
+A gateway is **configured** if `--gateway-url`/`AI_GATEWAY_URL`, a stored `default_gateway_url`, or
+`--key`/`AI_AGENT_KEY` is set. `DEFAULT_GATEWAY` (`http://ai.internal`) is a _fallback, not
+configuration_ — treating it as configured is precisely what made the gateway mandatory, since the agent
+would then always believe it had one. With a gateway configured the gateway is used; `AI_DIRECT=1` forces
+direct anyway. With none configured, routing is direct.
+
+**A configured gateway is never silently bypassed** just because a provider key happens to be exported in
+someone's shell — that would move a deployment's traffic off the gateway and off its metering with nothing
+on screen to say so.
+
+### The table
+
+`crates/providers` (the `providers` crate) is the single source of truth: one row per upstream, carrying
+its gateway `authority`, its direct `base_url`, its `wire` format, its `auth` scheme, the `env_var` that
+conventionally holds a user's key, the model-id prefixes it serves natively, and any headers it requires.
+The gateway proxies on those rows; this crate routes directly on them. **A provider's auth scheme cannot
+be right in one and wrong in the other.** That is why `ANTHROPIC_API_KEY` gets `x-api-key` (bare) and
+`OPENAI_API_KEY` gets `Authorization: Bearer` with nobody configuring anything: the row says so.
+
+It absorbed four tables that previously had to be hand-synced — the gateway's `KNOWN_PROVIDERS`,
+`agent_core`'s `AggregatorHost` (now a re-export of `providers::ProviderId`), this crate's
+`aggregator_host_for_base_url`, and its `default_headers_for_base_url`.
+
+### Provider first, dialect second
+
+A model id **cannot** tell you the wire format. `anthropic/claude-sonnet-4.5` is an _OpenAI_-wire request
+when OpenRouter serves it — OpenRouter speaks the OpenAI wire for every model it hosts, Claude included.
+`Dialect::for_model`'s name heuristic ("contains `anthropic`" ⇒ Anthropic wire) is right for a native route
+and wrong for an aggregator, so deriving the dialect from the id and only then picking a provider inverts
+the dependency and POSTs an Anthropic body to a Chat Completions endpoint.
+
+So the provider is resolved first, and `agent_core::dialect::Dialect::for_model_via_provider` takes it:
+an OpenAI-wire row suppresses the name heuristic. The genuine per-model exceptions still win over the row
+(Fireworks is an OpenAI-wire provider that really does serve 14 ids over the Anthropic wire; OpenCode
+Zen/Go really do disagree with each other) — those come through `routes_to_anthropic_by_default`, which
+already takes the host.
+
+**Aggregators match no model-id prefix, deliberately.** OpenRouter/Groq/Together/Fireworks/Cerebras serve
+other vendors' ids, so any prefix that identified them would steal that vendor's own native route
+(`moonshotai/kimi-k2.6` is equally a Fireworks, Together, and OpenRouter id). They are named explicitly —
+`AI_PROVIDER=openrouter` — and an id no native provider claims is an error naming that variable, not a
+guess.
+
+### Precedence
+
+Within direct mode, in order:
+
+1. **`models.json` `base_url` override** for the exact model id — explicit, wins outright.
+2. **`AI_BASE_URL` + `AI_API_KEY`** — the OpenAI-compatible escape hatch for the long tail (vLLM, Ollama,
+   LM Studio, a corporate proxy). If the URL names a host the table knows, that row's auth scheme and
+   dialect apply; otherwise Bearer, and an empty key is legitimate (local servers ignore `Authorization`).
+   `OPENAI_BASE_URL` is honored too, but **only** as the OpenAI row's own base URL — it is a widely-
+   exported variable, and someone who points it at a proxy for one tool must not thereby have their
+   _Anthropic_ traffic redirected there.
+3. **`AI_PROVIDER=<name>`** + that row's key (or `AI_API_KEY`). The only way to reach an aggregator.
+4. **A stored OAuth login** (`agent login`) — Anthropic / OpenAI Codex / GitHub Copilot.
+5. **The provider key for whichever provider natively serves the model id** — the zero-config path.
+6. Otherwise an error naming the one variable that would fix it.
+
+**OAuth (4) sits above the ambient key (5) on purpose.** `agent login anthropic` is an explicit, durable
+act; `ANTHROPIC_API_KEY` is very often exported for some unrelated tool. Ranking the key above the login
+would silently move a subscriber onto pay-per-token API billing. Someone who genuinely wants the key
+despite a login says so explicitly with `AI_PROVIDER=anthropic`, which is tier 3.
+
+Two consequences worth naming, both of which direct mode forced into the open:
+
+- **An OAuth token is not an API key.** The Anthropic row's `x-api-key` scheme describes how Anthropic
+  takes an _API key_; a subscription token goes in `Authorization: Bearer` and is rejected in `x-api-key`.
+  The row is right about the host, wire, and path — the credential decides the header.
+- **Anthropic's OAuth identity headers survive a direct route.** `GatewayClient::stream` used to infer "is
+  this a genuine direct-to-Anthropic request?" from the _absence_ of a route override, which held only
+  while relaying through the gateway was the one way to reach Anthropic. It now asks the routing which
+  provider it points at (`routed_to_anthropic_natively`). The same correction applies to Codex: `is_codex`
+  reads the provider id rather than the `RouteOverride::Prefixed` route _shape_, which stopped identifying
+  Codex once Codex also became reachable as a plain `Direct` route.
+
+All of it is a pure function of its inputs: `ProviderEnv` is read once at the CLI boundary and passed in,
+and `resolve_with` takes the auth store and `models.json` as arguments. Nothing under
+`gateway_credential` reads `std::env` or `$HOME`, which is what makes every rule above an ordinary
+parallel-safe unit test rather than something only assertable by mutating process state.
+
+---
+
 ## Core Mechanism
 
 ### Tool dispatch

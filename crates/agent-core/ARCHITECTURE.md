@@ -561,7 +561,9 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
 It ships **zero concrete `Tool` implementations** — `Read`/`Write`/`Edit`/`Bash`/`fork`/`sync`/`logs`
 all live in `crates/agent`. It has **no dependency on the gateway crate** — `GatewayClient`'s entire
 contract is "POST dialect JSON to a base URL, get SSE back"; routing, provider auth, and metering are
-the gateway's job. This split is what lets the loop, the dialect adapters, and the tool dispatch logic
+the gateway's job. (It does depend on the `providers` crate, which sits *below* both: a table of static
+per-provider facts — host, wire format, auth header, env var — that the gateway routes on and this crate
+uses to pick a request dialect. That is a shared table, not a dependency on the gateway.) This split is what lets the loop, the dialect adapters, and the tool dispatch logic
 run as pure unit tests with `MockTransport` — no network, no live model, no gateway binary.
 
 It is **not a plugin host**. pi has a real extension system (`core/extensions/`): dynamically loaded

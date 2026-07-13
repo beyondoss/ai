@@ -346,6 +346,7 @@ dependencies = [
  "arrayvec",
  "async-trait",
  "base64",
+ "beyond-ai-providers",
  "beyond-slipstream",
  "bytes",
  "clap",
@@ -385,6 +386,7 @@ dependencies = [
  "async-trait",
  "base64",
  "beyond-ai-agent-core",
+ "beyond-ai-providers",
  "clap",
  "divan",
  "futures",
@@ -429,6 +431,7 @@ version = "0.1.0"
 dependencies = [
  "async-stream",
  "async-trait",
+ "beyond-ai-providers",
  "bytes",
  "divan",
  "futures",
@@ -447,6 +450,10 @@ dependencies = [
  "zeroize",
  "zstd",
 ]
+
+[[package]]
+name = "beyond-ai-providers"
+version = "0.1.0"
 
 [[package]]
 name = "beyond-slipstream"

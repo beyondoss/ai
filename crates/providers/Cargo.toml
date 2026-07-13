@@ -1,0 +1,20 @@
+[package]
+name = "beyond-ai-providers"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "providers"
+path = "src/lib.rs"
+
+# Deliberately zero-dependency. This crate sits *below* both `gateway` and `agent-core`, so anything
+# added here lands in the gateway's Docker image and in the agent's static-musl release build. It is
+# a table of `&'static str` facts and the lookups over them — it needs nothing. In particular it does
+# NOT take `url`: callers that have a base URL parse it themselves and hand `for_host` the pieces
+# (see `agent::gateway_credential::provider_for_base_url`).
+[dependencies]
+
+[lints]
+workspace = true

@@ -24,12 +24,139 @@
 //! agent's file this round); this module only lands the identity-computation primitive itself, plus a
 //! unit test proving it distinguishes different upstreams and treats equivalent ones as equal.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use agent_core::client::{Credential, CredentialSource, DirectRouting, RouteOverride};
 use agent_core::models::AggregatorHost;
+use providers::ProviderSpec;
 
 use crate::oauth::{OAuthCredential, OAuthProviderId};
+
+/// Everything the resolver needs to know about the process environment, read **once** at the CLI
+/// boundary and passed in.
+///
+/// Not a convenience: this module reads no `std::env` at all, and must not start. `std::env::set_var`
+/// is `unsafe` under a multi-threaded test binary, so any code that reads process env directly is
+/// untestable except serially — a convention this repo states in several places (`resources.rs`,
+/// `skills.rs`, `agents.rs`) and has zero call sites against. `AI_AGENT_KEY` already arrives here as a
+/// parameter for exactly this reason (clap binds it in `main.rs`); the direct-routing env follows it
+/// through the same door, which is what lets every precedence rule below be an ordinary unit test.
+/// Pseudo-key under which `OPENAI_BASE_URL` is stashed in [`ProviderEnv::keys`] — a name no provider's
+/// `env_var` can collide with, since it isn't one.
+const OPENAI_BASE_URL_KEY: &str = "OPENAI_BASE_URL";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderEnv {
+    /// Provider key env vars that are actually set, keyed by the var name from
+    /// [`providers::ProviderSpec::env_var`] — `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, ….
+    keys: HashMap<&'static str, String>,
+    /// `AI_PROVIDER` — names a provider row explicitly. The only way to reach an *aggregator*
+    /// (OpenRouter, Groq, …), which by design no model id resolves to on its own.
+    pub provider: Option<String>,
+    /// `AI_BASE_URL` — the OpenAI-compatible escape hatch for the long tail (vLLM, Ollama, LM Studio,
+    /// a corporate proxy). Also fed by `OPENAI_BASE_URL`, but **only** to override the OpenAI row's own
+    /// base URL — see [`Self::from_process_env`].
+    pub base_url: Option<String>,
+    /// `AI_API_KEY` — the key that goes with [`Self::base_url`], and the fallback for an
+    /// `AI_PROVIDER` row whose own env var isn't set.
+    pub api_key: Option<String>,
+    /// `AI_DIRECT=1` — route direct even though a gateway *is* configured. Without it, a deployment
+    /// that has a gateway keeps using it: a stray `ANTHROPIC_API_KEY` in some engineer's shell must
+    /// never silently reroute production traffic off the gateway (and off its metering).
+    pub force_direct: bool,
+    /// Whether a gateway is genuinely *configured* — `--gateway-url`/`AI_GATEWAY_URL`, or
+    /// `settings.json`'s `default_gateway_url`, or a `--key`/`AI_AGENT_KEY`. Note the `DEFAULT_GATEWAY`
+    /// constant (`http://ai.internal`) is a **fallback, not configuration**: falling back to it must not
+    /// count, or the gateway could never be optional. Computed in `main.rs`, where all three inputs are.
+    pub gateway_configured: bool,
+}
+
+impl ProviderEnv {
+    /// Read the direct-routing environment. **The only place this crate touches `std::env`** for
+    /// provider resolution; everything below takes the result as a parameter.
+    ///
+    /// `gateway_configured` is passed in rather than read here because it also depends on the parsed
+    /// CLI flags and on `settings.json`, neither of which is env.
+    pub fn from_process_env(gateway_configured: bool) -> Self {
+        Self::from_lookup(&|name| std::env::var(name).ok(), gateway_configured)
+    }
+
+    /// [`Self::from_process_env`] over an explicit `(name, value)` list instead of the process — the same
+    /// code path, so a test can never diverge from what the binary actually does. Public because the
+    /// wire-level integration tests (`tests/direct_routing_wire.rs`) live outside this crate.
+    pub fn from_vars(vars: &[(&str, &str)], gateway_configured: bool) -> Self {
+        Self::from_lookup(
+            &|name| {
+                vars.iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| (*v).to_string())
+            },
+            gateway_configured,
+        )
+    }
+
+    fn from_lookup(lookup: &dyn Fn(&str) -> Option<String>, gateway_configured: bool) -> Self {
+        let var = |name: &str| {
+            lookup(name)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        let mut keys = HashMap::new();
+        for spec in providers::PROVIDERS {
+            if let Some(env_var) = spec.env_var
+                && let Some(value) = var(env_var)
+            {
+                keys.insert(env_var, value);
+            }
+        }
+        // `OPENAI_BASE_URL` is honored, but ONLY as the OpenAI row's own base URL — never as a second
+        // global escape hatch. It is a widely-exported variable (the OpenAI SDK reads it), and someone
+        // who points it at a proxy for one tool must not thereby have their *Anthropic* traffic silently
+        // redirected there. `AI_BASE_URL` is the generic hatch, and it wins.
+        if let Some(openai_base) = var("OPENAI_BASE_URL") {
+            keys.insert(OPENAI_BASE_URL_KEY, openai_base);
+        }
+        ProviderEnv {
+            keys,
+            provider: var("AI_PROVIDER"),
+            base_url: var("AI_BASE_URL"),
+            api_key: var("AI_API_KEY"),
+            force_direct: matches!(var("AI_DIRECT").as_deref(), Some("1" | "true" | "yes")),
+            gateway_configured,
+        }
+    }
+
+    /// The base URL to dial for `spec` — its own, unless `OPENAI_BASE_URL` overrides the OpenAI row's.
+    fn base_url_for(&self, spec: &ProviderSpec) -> Option<&str> {
+        if spec.id == AggregatorHost::OpenAi
+            && let Some(base) = self.keys.get(OPENAI_BASE_URL_KEY)
+        {
+            return Some(base);
+        }
+        spec.base_url
+    }
+
+    /// Whether this invocation routes straight to a provider rather than through the gateway. Direct is
+    /// the default *absence* case — no gateway configured means no gateway to use — and `AI_DIRECT=1`
+    /// is the opt-in override for when one is configured but unwanted.
+    pub fn direct(&self) -> bool {
+        self.force_direct || !self.gateway_configured
+    }
+
+    /// The user's own key for a provider row, if we have one: the row's conventional env var first
+    /// (`ANTHROPIC_API_KEY`), then `AI_API_KEY`, then whatever `--key`/`AI_AGENT_KEY` held.
+    ///
+    /// **A row's env var only ever pays for that row.** `ANTHROPIC_API_KEY` is never sent to
+    /// `AI_BASE_URL`, or to any other provider's host — the lookup is keyed on the row, not on "some
+    /// key we happen to have". A key leaked to the wrong host is a key the user must rotate.
+    fn key_for(&self, spec: &ProviderSpec, cli_key: Option<&str>) -> Option<String> {
+        spec.env_var
+            .and_then(|v| self.keys.get(v).cloned())
+            .or_else(|| self.api_key.clone())
+            .or_else(|| cli_key.map(str::to_string))
+    }
+}
 
 /// How the gateway client attaches a credential to every request — either a fixed `bai_v1…`/BYO
 /// string (the ordinary case), or a live, transparently-refreshed OAuth subscription login (see
@@ -108,8 +235,10 @@ impl CredentialSource for StaticDirectCredentialSource {
 pub fn resolve_gateway_credential(
     key: Option<String>,
     model: &str,
+    env: &ProviderEnv,
 ) -> Result<GatewayCredential, String> {
-    resolve_gateway_credential_with_identity(key, model).map(|(credential, _identity)| credential)
+    resolve_gateway_credential_with_identity(key, model, env)
+        .map(|(credential, _identity)| credential)
 }
 
 /// [`resolve_gateway_credential`], additionally returning a [`GatewayCredentialIdentity`] alongside
@@ -119,16 +248,43 @@ pub fn resolve_gateway_credential(
 pub fn resolve_gateway_credential_with_identity(
     key: Option<String>,
     model: &str,
+    env: &ProviderEnv,
 ) -> Result<(GatewayCredential, GatewayCredentialIdentity), String> {
     // Opened unconditionally, up front: both the `base_url`-override branch below (its own OAuth
     // fallback, pi-parity remediation pass 19 Task 2) and the plain non-override branches further down
     // need a stored-credential lookup, and a missing file is the cheap, ordinary case either way (see
     // `AuthStore::open_default`'s own doc comment).
-    let store = crate::auth_store::AuthStore::open_default();
+    resolve_with(
+        key,
+        model,
+        env,
+        &crate::auth_store::AuthStore::open_default(),
+        crate::auth_store::default_path(),
+        &crate::settings::ModelOverrides::open_default(),
+    )
+}
+
+/// [`resolve_gateway_credential_with_identity`] with its two `$HOME`-dependent inputs — the stored-OAuth
+/// credentials and `models.json` — passed in rather than read from disk.
+///
+/// The whole precedence ladder lives here, and this is the seam every test drives it through. Reading
+/// `~/.claude/*` inside the resolver would make the ladder testable only on a machine with the right
+/// files (and untestable in parallel, since the alternative is mutating `$HOME`) — so the two file reads
+/// stay in the thin wrapper above, and the logic below is a pure function of its arguments. Same
+/// convention `ProviderEnv` follows for process env.
+#[allow(clippy::too_many_arguments)]
+fn resolve_with(
+    key: Option<String>,
+    model: &str,
+    env: &ProviderEnv,
+    store: &crate::auth_store::AuthStore,
+    store_path: std::path::PathBuf,
+    overrides: &crate::settings::ModelOverrides,
+) -> Result<(GatewayCredential, GatewayCredentialIdentity), String> {
     let oauth_source = |provider: OAuthProviderId| {
         Arc::new(crate::auth_credential_source::OAuthCredentialSource::new(
             provider,
-            crate::auth_store::default_path(),
+            store_path.clone(),
         )) as Arc<dyn CredentialSource>
     };
 
@@ -148,7 +304,7 @@ pub fn resolve_gateway_credential_with_identity(
     // OAuth was never consulted at all for an override, silently going bearer-less for a model an
     // operator had a perfectly good subscription login for; this fix (and the paragraph above) make the
     // two agree.
-    if let Some(over) = crate::settings::ModelOverrides::open_default().get(model) {
+    if let Some(over) = overrides.get(model) {
         if let Some(base_url) = over.base_url.clone() {
             // Fix #39 (pi-parity audit, judgment call): a handful of third-party-aggregator model ids
             // (OpenCode Zen's `gemini-3-flash`/`gemini-3.1-pro`/`gemini-3.5-flash`) speak Google's own
@@ -281,7 +437,101 @@ pub fn resolve_gateway_credential_with_identity(
         }
     }
 
-    if let Some(key) = key {
+    // --- Direct tiers, part 1: the two *explicit* ones. -------------------------------------------
+    //
+    // Both sit above stored OAuth because both are per-invocation acts: someone who typed
+    // `AI_BASE_URL=…` or `AI_PROVIDER=…` for this run means it. The *ambient* tier (a provider key that
+    // merely happens to be exported in the shell) sits BELOW OAuth instead — see part 2, further down.
+    if env.direct() {
+        // The long tail: any OpenAI-compatible endpoint — vLLM, Ollama, LM Studio, a corporate proxy —
+        // with no registry row required. If the URL does happen to name a known provider we use that
+        // row (right auth header, right dialect) rather than assuming OpenAI-wire-and-Bearer; otherwise
+        // the id-only heuristic picks the wire and the key goes out as a plain Bearer. An empty key is
+        // legitimate here, not a failure: local servers routinely ignore `Authorization` entirely.
+        if let Some(base_url) = env.base_url.as_deref() {
+            if let Some(spec) = provider_for_base_url(base_url) {
+                let bearer = env.key_for(spec, key.as_deref()).unwrap_or_default();
+                let (routing, base_url, path) = registry_direct_routing(spec, base_url, model);
+                return Ok(direct_static(
+                    bearer,
+                    routing,
+                    base_url,
+                    path,
+                    Some(spec.id),
+                ));
+            }
+            let dialect = agent_core::dialect::Dialect::for_model_via_provider(model, None);
+            let (base_url, path) = direct_route_base_and_path(base_url, dialect, None);
+            // NOT `key_for`: with no row, there is no row-scoped env var to draw on, and reaching for
+            // one would be exactly the leak the invariant forbids — `ANTHROPIC_API_KEY` must never be
+            // handed to an arbitrary `AI_BASE_URL`. Only the key the user paired with this URL.
+            let bearer = env
+                .api_key
+                .clone()
+                .or_else(|| key.clone())
+                .unwrap_or_default();
+            let routing = DirectRouting {
+                route: RouteOverride::Direct {
+                    base_url: base_url.clone(),
+                    path,
+                },
+                static_headers: Vec::new(),
+                copilot_dynamic_headers: false,
+                auth_header: None,
+                auth_header_prefix: None,
+                dialect_override: Some(dialect),
+                deployment_name: None,
+                query: None,
+                aggregator_host: None,
+            };
+            return Ok(direct_static(bearer, routing, base_url, path, None));
+        }
+        // `AI_PROVIDER=openrouter` — the only way to reach an aggregator, and deliberately so: an
+        // aggregator serves other vendors' model ids, so no id can imply one without stealing that
+        // vendor's own native route (`providers::ProviderSpec::model_id_match`).
+        if let Some(name) = env.provider.as_deref() {
+            let spec = providers::by_name(name).ok_or_else(|| {
+                let known = providers::PROVIDERS
+                    .iter()
+                    .filter(|p| p.base_url.is_some())
+                    .map(|p| p.name)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("unknown AI_PROVIDER {name:?}; known providers: {known}")
+            })?;
+            let base_url = env.base_url_for(spec).ok_or_else(|| {
+                format!(
+                    "provider {:?} has no direct route: it is reachable only through a stored OAuth \
+                     login or an explicit models.json base_url",
+                    spec.name
+                )
+            })?;
+            let bearer = env.key_for(spec, key.as_deref()).ok_or_else(|| {
+                format!(
+                    "no key for provider {:?}: set {} (or AI_API_KEY)",
+                    spec.name,
+                    spec.env_var.unwrap_or("a provider key")
+                )
+            })?;
+            let (routing, base_url, path) = registry_direct_routing(spec, base_url, model);
+            return Ok(direct_static(
+                bearer,
+                routing,
+                base_url,
+                path,
+                Some(spec.id),
+            ));
+        }
+    }
+
+    // The gateway's own credential. Skipped in direct mode: `--key`/`AI_AGENT_KEY` is a *gateway*
+    // credential (a `bai_v1…` virtual key), and handing it to `GatewayClient` with no route override
+    // would send it to a gateway base URL we've just established isn't there. It stays available to the
+    // direct tiers as a last-resort BYO key (`ProviderEnv::key_for`), which is what makes
+    // `AI_DIRECT=1 --key sk-ant-…` do the obvious thing.
+    if !env.direct()
+        && let Some(key) = key
+    {
         let identity = GatewayCredentialIdentity::StaticKey(key.clone());
         return Ok((GatewayCredential::Static(key), identity));
     }
@@ -289,6 +539,32 @@ pub fn resolve_gateway_credential_with_identity(
     if agent_core::dialect::Dialect::for_model(model) == agent_core::dialect::Dialect::Anthropic
         && store.get("anthropic").is_some()
     {
+        // Gateway mode: no route override at all — relayed through the gateway, which knows Anthropic as
+        // a `KNOWN_PROVIDERS` row. Direct mode: the same OAuth token, sent straight to
+        // `api.anthropic.com`. The identity headers Anthropic's OAuth endpoint requires
+        // (`claude-code`/`oauth` betas, the CLI user-agent) survive the route override because
+        // `GatewayClient::stream` asks the routing *which provider it points at* rather than assuming
+        // any override means a third party — see its `routed_to_anthropic_natively`.
+        if env.direct() {
+            let spec = providers::by_id(AggregatorHost::Anthropic);
+            if let Some(base_url) = spec.base_url {
+                let (mut routing, base_url, path) = registry_direct_routing(spec, base_url, model);
+                // The row's `x-api-key` scheme describes how Anthropic takes an **API key**. An OAuth
+                // access token is not an API key: it goes in `Authorization: Bearer`, and sending it in
+                // `x-api-key` gets it rejected outright. The row is right about the host, the wire, and
+                // the path; the credential decides the header.
+                routing.auth_header = None;
+                routing.auth_header_prefix = None;
+                return Ok(direct_oauth(
+                    oauth_source(OAuthProviderId::Anthropic),
+                    routing,
+                    base_url,
+                    path,
+                    Some(spec.id),
+                    OAuthProviderId::Anthropic,
+                ));
+            }
+        }
         return Ok((
             GatewayCredential::Oauth(oauth_source(OAuthProviderId::Anthropic)),
             GatewayCredentialIdentity::Anthropic,
@@ -297,14 +573,24 @@ pub fn resolve_gateway_credential_with_identity(
     if model.contains("codex") {
         if let Some(stored) = store.get("openai-codex") {
             if let OAuthCredential::OpenaiCodex(c) = &stored.credential {
-                // Still relayed through the gateway (a new `KNOWN_PROVIDERS` row: `chatgpt.com` is a
-                // genuinely static host) under the `/openai-codex` prefix, with the account id this
-                // backend requires attached as a static header — see `RouteOverride::Prefixed`.
-                let routing = DirectRouting {
-                    route: RouteOverride::Prefixed {
+                // Gateway mode relays through the `/openai-codex` prefix (`chatgpt.com` is a genuinely
+                // static host, so it gets a real provider row). Direct mode dials that host itself — the
+                // prefix route is *defined* in terms of the gateway's base URL, so with no gateway it
+                // would resolve against a host that isn't there. Same account header, same path, same
+                // bearer either way; only where the URL is rooted changes.
+                let route = if env.direct() {
+                    RouteOverride::Direct {
+                        base_url: "https://chatgpt.com".to_string(),
+                        path: "/backend-api/codex/responses",
+                    }
+                } else {
+                    RouteOverride::Prefixed {
                         prefix: "/openai-codex",
                         path: "/backend-api/codex/responses",
-                    },
+                    }
+                };
+                let routing = DirectRouting {
+                    route,
                     static_headers: vec![
                         ("chatgpt-account-id", c.account_id.clone()),
                         ("originator", CODEX_ORIGINATOR.to_string()),
@@ -316,9 +602,11 @@ pub fn resolve_gateway_credential_with_identity(
                     dialect_override: None,
                     deployment_name: None,
                     query: None,
-                    // Codex is reached via its own fixed `RouteOverride::Prefixed` row, never a BYO
-                    // `base_url` override — no aggregator host of its own to report.
-                    aggregator_host: None,
+                    // What tells `GatewayClient::stream` this is the Codex backend (`req.is_codex`, and
+                    // with it the Responses-body/zstd-SSE branch). It used to read that off the
+                    // `Prefixed` route shape, which stopped identifying Codex the moment Codex also
+                    // became reachable as a plain `Direct` route above.
+                    aggregator_host: Some(AggregatorHost::OpenAiCodex),
                 };
                 let identity = GatewayCredentialIdentity::OpenaiCodex {
                     account_id: c.account_id.clone(),
@@ -361,7 +649,7 @@ pub fn resolve_gateway_credential_with_identity(
                     GatewayCredential::Oauth(Arc::new(
                         crate::oauth::github_copilot::CopilotRoutedCredentialSource {
                             inner: oauth_source(OAuthProviderId::GithubCopilot),
-                            store_path: crate::auth_store::default_path(),
+                            store_path: store_path.clone(),
                             enterprise_url: c.enterprise_url.clone(),
                             path,
                         },
@@ -372,10 +660,167 @@ pub fn resolve_gateway_credential_with_identity(
         }
     }
 
+    // --- Direct tiers, part 2: the *ambient* one. -------------------------------------------------
+    //
+    // A provider key sitting in the environment. This is the zero-config path — export
+    // `ANTHROPIC_API_KEY`, run the agent, done — and it is deliberately the LAST thing consulted.
+    //
+    // It sits below stored OAuth on purpose. `agent login anthropic` is an explicit, durable act;
+    // `ANTHROPIC_API_KEY` is very often exported in a shell for some unrelated tool. Ranking the key
+    // above the login would silently move a user who *has* a subscription onto pay-per-token API
+    // billing, with nothing on screen to say so. If someone genuinely wants the key despite a stored
+    // login, `AI_PROVIDER=anthropic` says so explicitly and is honored above (part 1).
+    if env.direct()
+        && let Some(spec) = providers::for_model_id(model)
+        && let Some(base_url) = env.base_url_for(spec)
+        && let Some(bearer) = spec
+            .env_var
+            .and_then(|v| env.keys.get(v).cloned())
+            .or_else(|| env.api_key.clone())
+    {
+        let (routing, base_url, path) = registry_direct_routing(spec, base_url, model);
+        return Ok(direct_static(
+            bearer,
+            routing,
+            base_url,
+            path,
+            Some(spec.id),
+        ));
+    }
+
+    // Name the one thing that would fix it. In direct mode we know which provider serves this model, so
+    // we can name its env var exactly; if we don't recognize the id at all, say *that* rather than
+    // suggest a variable that would be ignored.
+    if env.direct() {
+        return Err(match providers::for_model_id(model) {
+            Some(spec) => format!(
+                "no credential for model {model:?}: set {} (or run `agent login`, or set AI_PROVIDER \
+                 + AI_API_KEY, or point AI_BASE_URL at an OpenAI-compatible endpoint)",
+                spec.env_var.unwrap_or("a provider key")
+            ),
+            None => format!(
+                "no provider recognizes model {model:?}: set AI_PROVIDER (e.g. AI_PROVIDER=openrouter) \
+                 with that provider's key, or point AI_BASE_URL + AI_API_KEY at an OpenAI-compatible \
+                 endpoint"
+            ),
+        });
+    }
     Err(format!(
         "no gateway key: pass --key or set AI_AGENT_KEY (a bai_v1… virtual key), or run `agent login \
          <provider>` to use a subscription for model {model:?}"
     ))
+}
+
+/// A direct route authenticated by a fixed key — the shape every registry/`AI_BASE_URL` tier returns.
+/// Reuses [`StaticDirectCredentialSource`] and the existing [`GatewayCredentialIdentity::DirectOverride`]
+/// rather than minting parallel types: from `GatewayClient`'s point of view a registry-resolved route
+/// and a hand-written `models.json` route are the same thing, and they should stay the same thing.
+fn direct_static(
+    bearer: String,
+    routing: DirectRouting,
+    base_url: String,
+    path: &'static str,
+    aggregator_host: Option<AggregatorHost>,
+) -> (GatewayCredential, GatewayCredentialIdentity) {
+    let identity = GatewayCredentialIdentity::DirectOverride {
+        base_url,
+        path,
+        bearer: bearer.clone(),
+        auth_header: routing.auth_header.clone(),
+        auth_header_prefix: routing.auth_header_prefix.clone(),
+        deployment_name: None,
+        query: None,
+        aggregator_host,
+    };
+    (
+        GatewayCredential::Oauth(Arc::new(StaticDirectCredentialSource { bearer, routing })),
+        identity,
+    )
+}
+
+/// A direct route authenticated by a live, refreshing OAuth login — direct-mode Anthropic. Same
+/// reuse argument as [`direct_static`]: [`DirectRoutedCredentialSource`] already exists to bolt routing
+/// onto an OAuth source, and this is that, with a different destination.
+fn direct_oauth(
+    inner: Arc<dyn CredentialSource>,
+    routing: DirectRouting,
+    base_url: String,
+    path: &'static str,
+    aggregator_host: Option<AggregatorHost>,
+    provider: OAuthProviderId,
+) -> (GatewayCredential, GatewayCredentialIdentity) {
+    let identity = GatewayCredentialIdentity::DirectOverrideOauth {
+        base_url,
+        path,
+        auth_header: routing.auth_header.clone(),
+        auth_header_prefix: routing.auth_header_prefix.clone(),
+        deployment_name: None,
+        query: None,
+        aggregator_host,
+        provider,
+    };
+    (
+        GatewayCredential::Oauth(Arc::new(DirectRoutedCredentialSource { inner, routing })),
+        identity,
+    )
+}
+
+/// Build the [`DirectRouting`] for a provider row: base URL, endpoint path, wire dialect, auth header,
+/// and any headers the provider requires — all of it derived from the row, none of it configured.
+///
+/// This is the whole point of the shared table. **The user never spells out an auth scheme.** Anthropic
+/// gets `x-api-key` with a bare value and OpenAI gets `Authorization: Bearer` because
+/// [`providers::AuthScheme`] says so, and it says so in the same rows the gateway swaps its pool keys
+/// with — so the two can't disagree about a provider. `AuthScheme::Bearer` maps to `auth_header: None`,
+/// which is `GatewayClient`'s own `Authorization: Bearer` default (it would otherwise send the header
+/// twice).
+///
+/// `base_url` is passed rather than read from `spec.base_url` so `OPENAI_BASE_URL` can override the
+/// OpenAI row's own endpoint without a second copy of this function.
+fn registry_direct_routing(
+    spec: &'static ProviderSpec,
+    base_url: &str,
+    model: &str,
+) -> (DirectRouting, String, &'static str) {
+    // Provider first, dialect second — see `Dialect::for_model_via_provider`'s doc comment. Passing the
+    // row here is what stops an OpenRouter-served `anthropic/claude-…` from being built as an
+    // Anthropic-wire body.
+    let dialect = agent_core::dialect::Dialect::for_model_via_provider(model, Some(spec.id));
+    // Reused, not reimplemented: the same helper the `models.json` branch uses, so a registry route and
+    // a hand-written override compose their URL the same way (`/v1`-doubling detection included — which
+    // is exactly why Anthropic's `base_url` carries no `/v1` and the OpenAI-wire rows' do).
+    let (base_url, path) = direct_route_base_and_path(base_url, dialect, None);
+    let (auth_header, auth_header_prefix) = match spec.auth {
+        // `None` ⇒ `GatewayClient` sends its default `Authorization: Bearer <key>`.
+        providers::AuthScheme::Bearer => (None, None),
+        other => (
+            Some(other.header().to_string()),
+            other.value_prefix().map(str::to_string),
+        ),
+    };
+    let routing = DirectRouting {
+        route: RouteOverride::Direct {
+            base_url: base_url.clone(),
+            path,
+        },
+        // Hard upstream requirements, not conveniences: NVIDIA NIM's poll timeout, Kimi's `User-Agent`
+        // allowlist check. Empty for every other row.
+        static_headers: spec
+            .default_headers
+            .iter()
+            .map(|(name, value)| (*name, (*value).to_string()))
+            .collect(),
+        copilot_dynamic_headers: false,
+        auth_header,
+        auth_header_prefix,
+        // Pinned rather than left to be re-derived downstream: `GatewayClient::stream` would otherwise
+        // fall back to the id-only heuristic and disagree with the `path` just chosen above.
+        dialect_override: Some(dialect),
+        deployment_name: None,
+        query: None,
+        aggregator_host: Some(spec.id),
+    };
+    (routing, base_url, path)
 }
 
 /// Model ids that speak a wire format `agent_core::dialect::Dialect` has no variant for — currently
@@ -444,6 +889,21 @@ fn oauth_fallback_provider(
     None
 }
 
+/// Which provider a user-supplied `base_url` names — the `models.json`-override path, where the
+/// upstream is known only by where it points.
+///
+/// The host table itself lives in the shared `providers` crate (one row per upstream, the same rows the
+/// gateway proxies to); this is the thin parsing shim above it, kept here because `providers` is
+/// deliberately dependency-free and does not take `url`. `opencode.ai` needs the path as well as the
+/// host — it serves two providers that disagree on wire format — so both are passed through.
+///
+/// **This only ever covers a `base_url`-carrying route.** A *gateway*-routed request (a `bai_v1…`
+/// virtual key, no override) genuinely has no client-visible signal of which provider will serve it: the
+/// model id goes to the gateway's bare-path default route, there is no `/{provider}/…` segment, and the
+/// opaque virtual key (`crates/gateway/src/key.rs`) reveals nothing. So the gateway-routed case of
+/// `Together`/`Groq`/`OpenRouter` still can't be resolved from this crate — it would need the gateway to
+/// echo the resolved provider back. Unchanged by the direct-routing work, which sidesteps it: a *direct*
+/// route always knows its provider, because it picked it.
 /// Which of the 9 known third-party aggregator platforms (`agent_core::models::AggregatorHost`) a
 /// `models.json` override's (already-normalized) `base_url` names, if any (pi-parity remediation pass 19,
 /// Task 3; OpenCode Zen/OpenCode-Go added in pass 20, Task 5) — the "BYO/direct-routed" half of the host
@@ -487,28 +947,16 @@ fn oauth_fallback_provider(
 /// [`resolve_gateway_credential_with_identity`]'s own BYO-override branch, which reads
 /// `ModelRequest::host` from it via `GatewayClient::stream` — as well as this file's own
 /// [`GatewayCredentialIdentity`] `DirectOverride`/`DirectOverrideOauth` variants, unchanged.
-pub(crate) fn aggregator_host_for_base_url(base_url: &str) -> Option<AggregatorHost> {
+pub(crate) fn provider_for_base_url(base_url: &str) -> Option<&'static ProviderSpec> {
     let url = url::Url::parse(base_url).ok()?;
     let host = url.host_str()?.to_ascii_lowercase();
-    match host.as_str() {
-        "router.huggingface.co" => Some(AggregatorHost::HuggingFace),
-        "integrate.api.nvidia.com" => Some(AggregatorHost::Nvidia),
-        "api.kimi.com" => Some(AggregatorHost::KimiCoding),
-        "api.together.ai" | "api.together.xyz" => Some(AggregatorHost::Together),
-        "api.groq.com" => Some(AggregatorHost::Groq),
-        "openrouter.ai" => Some(AggregatorHost::OpenRouter),
-        "opencode.ai" => {
-            let path = url.path().trim_end_matches('/');
-            if path == "/zen/go" || path.starts_with("/zen/go/") {
-                Some(AggregatorHost::OpenCodeGo)
-            } else if path == "/zen" || path.starts_with("/zen/") {
-                Some(AggregatorHost::OpenCodeZen)
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
+    providers::for_host(&host, url.path())
+}
+
+/// Which upstream a `base_url` names, as an [`AggregatorHost`] — [`provider_for_base_url`]'s id half,
+/// which is what `DirectRouting::aggregator_host` and [`GatewayCredentialIdentity`] carry.
+pub(crate) fn aggregator_host_for_base_url(base_url: &str) -> Option<AggregatorHost> {
+    provider_for_base_url(base_url).map(|spec| spec.id)
 }
 
 /// A cheap, `PartialEq`-comparable summary of *which upstream* a resolved [`GatewayCredential`] talks
@@ -1634,5 +2082,486 @@ mod tests {
         };
         let debug = format!("{direct:?}");
         assert!(debug.contains("Together"), "got: {debug}");
+    }
+
+    // ---- Direct provider routing -----------------------------------------------------------------
+    //
+    // The whole precedence ladder, driven through `resolve_with` so every input — process env, stored
+    // OAuth, `models.json` — is injected rather than read from the machine the test happens to run on.
+    // No `std::env::set_var` anywhere: these are ordinary parallel-safe unit tests.
+
+    /// An empty stored-credential file and an empty `models.json` — the ordinary "developer with a key
+    /// in their shell and nothing else" starting state.
+    fn no_stored_creds() -> crate::auth_store::AuthStore {
+        crate::auth_store::AuthStore::open(std::path::PathBuf::from(
+            "/nonexistent/beyond-ai-test/auth.json",
+        ))
+    }
+    fn no_overrides() -> crate::settings::ModelOverrides {
+        crate::settings::ModelOverrides::open(std::path::PathBuf::from(
+            "/nonexistent/beyond-ai-test/models.json",
+        ))
+    }
+
+    fn resolve(
+        key: Option<&str>,
+        model: &str,
+        env: &ProviderEnv,
+    ) -> Result<GatewayCredentialIdentity, String> {
+        resolve_with(
+            key.map(str::to_string),
+            model,
+            env,
+            &no_stored_creds(),
+            std::path::PathBuf::from("/nonexistent/beyond-ai-test/auth.json"),
+            &no_overrides(),
+        )
+        .map(|(_credential, identity)| identity)
+    }
+
+    /// Pull the wire-level facts out of a resolved identity: where the request goes, and how it
+    /// authenticates. These four are the acceptance criteria.
+    fn wire(identity: &GatewayCredentialIdentity) -> (&str, &str, Option<&str>, Option<&str>) {
+        match identity {
+            GatewayCredentialIdentity::DirectOverride {
+                base_url,
+                path,
+                auth_header,
+                auth_header_prefix,
+                ..
+            }
+            | GatewayCredentialIdentity::DirectOverrideOauth {
+                base_url,
+                path,
+                auth_header,
+                auth_header_prefix,
+                ..
+            } => (
+                base_url,
+                path,
+                auth_header.as_deref(),
+                auth_header_prefix.as_deref(),
+            ),
+            other => panic!("expected a direct route, got {other:?}"),
+        }
+    }
+
+    /// THE acceptance criterion: no gateway, `ANTHROPIC_API_KEY` exported, a Claude model — the request
+    /// goes to Anthropic's own endpoint with an `x-api-key` header carrying the bare key. Nobody
+    /// configured the header; it fell out of the provider row.
+    #[test]
+    fn anthropic_key_alone_routes_direct_to_anthropic_with_x_api_key() {
+        let env = ProviderEnv::from_vars(&[("ANTHROPIC_API_KEY", "sk-ant-test")], false);
+        let identity = resolve(None, "claude-opus-4-8", &env).expect("must resolve");
+        assert_eq!(
+            wire(&identity),
+            (
+                "https://api.anthropic.com",
+                "/v1/messages",
+                Some("x-api-key"),
+                None
+            ),
+        );
+        let GatewayCredentialIdentity::DirectOverride {
+            bearer,
+            aggregator_host,
+            ..
+        } = &identity
+        else {
+            panic!("expected a static direct route")
+        };
+        assert_eq!(bearer, "sk-ant-test");
+        assert_eq!(*aggregator_host, Some(AggregatorHost::Anthropic));
+    }
+
+    /// Same for OpenAI — and note it lands on `/responses`, not `/chat/completions`: the provider row
+    /// says OpenAI-wire, the *model* says Responses. Both facts are needed and neither is guessed.
+    #[test]
+    fn openai_key_alone_routes_direct_to_openai_with_bearer() {
+        let env = ProviderEnv::from_vars(&[("OPENAI_API_KEY", "sk-test")], false);
+        let identity = resolve(None, "gpt-5", &env).expect("must resolve");
+        assert_eq!(
+            wire(&identity),
+            // `auth_header: None` is `GatewayClient`'s own `Authorization: Bearer` default.
+            ("https://api.openai.com/v1", "/responses", None, None),
+        );
+    }
+
+    #[test]
+    fn a_chat_completions_model_on_the_same_openai_wire_row_takes_the_other_path() {
+        let env = ProviderEnv::from_vars(&[("DEEPSEEK_API_KEY", "sk-ds")], false);
+        let identity = resolve(None, "deepseek-v3", &env).expect("must resolve");
+        assert_eq!(
+            wire(&identity),
+            (
+                "https://api.deepseek.com/v1",
+                "/chat/completions",
+                None,
+                None
+            ),
+        );
+    }
+
+    /// OpenRouter is an aggregator: no model id resolves to it, so it must be named. And once named, an
+    /// `anthropic/claude-…` id builds an **OpenAI**-wire body — the mis-route this design exists to
+    /// prevent. Provider first, dialect second.
+    #[test]
+    fn openrouter_is_named_explicitly_and_serves_claude_over_the_openai_wire() {
+        let env = ProviderEnv::from_vars(
+            &[
+                ("OPENROUTER_API_KEY", "sk-or"),
+                ("AI_PROVIDER", "openrouter"),
+            ],
+            false,
+        );
+        let identity = resolve(None, "anthropic/claude-sonnet-4.5", &env).expect("must resolve");
+        assert_eq!(
+            wire(&identity),
+            (
+                "https://openrouter.ai/api/v1",
+                "/chat/completions",
+                None,
+                None
+            ),
+            "OpenRouter speaks the OpenAI wire even for Claude ids"
+        );
+    }
+
+    /// Without `AI_PROVIDER`, an OpenRouter key is not enough — the id belongs to no native provider, so
+    /// there is nothing to infer, and we say so instead of guessing.
+    #[test]
+    fn an_aggregator_key_alone_does_not_capture_a_vendor_slug_id() {
+        let env = ProviderEnv::from_vars(&[("OPENROUTER_API_KEY", "sk-or")], false);
+        let err = resolve(None, "moonshotai/kimi-k2.6", &env).expect_err("must not guess");
+        assert!(err.contains("AI_PROVIDER"), "{err}");
+    }
+
+    /// The long tail: any OpenAI-compatible endpoint, no registry row.
+    #[test]
+    fn ai_base_url_routes_to_an_arbitrary_openai_compatible_endpoint() {
+        let env = ProviderEnv::from_vars(
+            &[
+                ("AI_BASE_URL", "http://localhost:8000/v1"),
+                ("AI_API_KEY", "local"),
+            ],
+            false,
+        );
+        let identity = resolve(None, "qwen3-coder", &env).expect("must resolve");
+        assert_eq!(
+            wire(&identity),
+            ("http://localhost:8000/v1", "/chat/completions", None, None),
+        );
+    }
+
+    /// A local server that ignores auth entirely is a legitimate setup, not a failure.
+    #[test]
+    fn ai_base_url_without_a_key_still_resolves() {
+        let env = ProviderEnv::from_vars(&[("AI_BASE_URL", "http://localhost:11434/v1")], false);
+        let identity = resolve(None, "qwen3-coder", &env).expect("must resolve");
+        let GatewayCredentialIdentity::DirectOverride { bearer, .. } = &identity else {
+            panic!("expected a static direct route")
+        };
+        assert_eq!(bearer, "");
+    }
+
+    /// **The key-leak invariant.** A row's env var pays for that row and nothing else. If someone points
+    /// `AI_BASE_URL` at their own endpoint while `ANTHROPIC_API_KEY` happens to be exported, that
+    /// Anthropic key must not be handed to their endpoint — a key sent to the wrong host is a key the
+    /// user has to rotate.
+    #[test]
+    fn a_row_scoped_key_is_never_sent_to_an_unrelated_base_url() {
+        let env = ProviderEnv::from_vars(
+            &[
+                ("ANTHROPIC_API_KEY", "sk-ant-secret"),
+                ("AI_BASE_URL", "https://someone-elses-proxy.example.com/v1"),
+            ],
+            false,
+        );
+        let identity = resolve(None, "claude-opus-4-8", &env).expect("must resolve");
+        let GatewayCredentialIdentity::DirectOverride {
+            bearer, base_url, ..
+        } = &identity
+        else {
+            panic!("expected a static direct route")
+        };
+        assert_eq!(base_url, "https://someone-elses-proxy.example.com/v1");
+        assert_eq!(
+            bearer, "",
+            "ANTHROPIC_API_KEY must not travel to an arbitrary AI_BASE_URL"
+        );
+    }
+
+    /// …but pointing `AI_BASE_URL` at Anthropic's *own* host is a different matter: that IS the row, so
+    /// the row's key and its `x-api-key` scheme apply.
+    #[test]
+    fn ai_base_url_naming_a_known_host_adopts_that_rows_auth_scheme() {
+        let env = ProviderEnv::from_vars(
+            &[
+                ("ANTHROPIC_API_KEY", "sk-ant-secret"),
+                ("AI_BASE_URL", "https://api.anthropic.com"),
+            ],
+            false,
+        );
+        let identity = resolve(None, "claude-opus-4-8", &env).expect("must resolve");
+        assert_eq!(wire(&identity).2, Some("x-api-key"));
+        let GatewayCredentialIdentity::DirectOverride { bearer, .. } = &identity else {
+            panic!("expected a static direct route")
+        };
+        assert_eq!(bearer, "sk-ant-secret");
+    }
+
+    /// **Regression: a configured gateway is never silently rerouted.** A key in the environment must not
+    /// move a gateway deployment's traffic off the gateway (and off its metering). Both ways of
+    /// configuring one are covered.
+    #[test]
+    fn a_configured_gateway_still_wins_over_an_ambient_provider_key() {
+        // Configured by `AI_GATEWAY_URL` (gateway_configured = true) with a virtual key.
+        let env = ProviderEnv::from_vars(&[("ANTHROPIC_API_KEY", "sk-ant")], true);
+        let identity = resolve(Some("bai_v1.abc"), "claude-opus-4-8", &env).expect("must resolve");
+        assert_eq!(
+            identity,
+            GatewayCredentialIdentity::StaticKey("bai_v1.abc".to_string()),
+            "a configured gateway must keep using the gateway"
+        );
+    }
+
+    /// `AI_DIRECT=1` is the explicit opt-out for a deployment that has a gateway but doesn't want it.
+    #[test]
+    fn ai_direct_forces_direct_even_with_a_gateway_configured() {
+        let env =
+            ProviderEnv::from_vars(&[("ANTHROPIC_API_KEY", "sk-ant"), ("AI_DIRECT", "1")], true);
+        let identity = resolve(Some("bai_v1.abc"), "claude-opus-4-8", &env).expect("must resolve");
+        assert_eq!(wire(&identity).0, "https://api.anthropic.com");
+    }
+
+    /// In direct mode `--key` is a BYO provider key, not a virtual key — so `AI_DIRECT=1 --key sk-ant-…`
+    /// does the obvious thing rather than trying to present it to a gateway that isn't there.
+    #[test]
+    fn direct_mode_falls_back_to_the_cli_key_for_the_resolved_provider() {
+        let env = ProviderEnv::from_vars(&[("AI_PROVIDER", "anthropic")], false);
+        let identity = resolve(Some("sk-ant-cli"), "claude-opus-4-8", &env).expect("must resolve");
+        let GatewayCredentialIdentity::DirectOverride { bearer, .. } = &identity else {
+            panic!("expected a static direct route")
+        };
+        assert_eq!(bearer, "sk-ant-cli");
+    }
+
+    /// With no gateway and no key at all, name the one variable that would fix it.
+    #[test]
+    fn the_no_credential_error_names_the_expected_env_var() {
+        let env = ProviderEnv::from_vars(&[], false);
+        let err = resolve(None, "claude-opus-4-8", &env).expect_err("nothing to resolve");
+        assert!(err.contains("ANTHROPIC_API_KEY"), "{err}");
+
+        let err = resolve(None, "gpt-5", &env).expect_err("nothing to resolve");
+        assert!(err.contains("OPENAI_API_KEY"), "{err}");
+
+        // An id no provider claims: say *that*, rather than name a variable that would be ignored.
+        let err = resolve(None, "some-local-model", &env).expect_err("nothing to resolve");
+        assert!(
+            err.contains("AI_PROVIDER") && err.contains("AI_BASE_URL"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_ai_provider_lists_the_known_ones() {
+        let env = ProviderEnv::from_vars(&[("AI_PROVIDER", "nope"), ("AI_API_KEY", "k")], false);
+        let err = resolve(None, "gpt-5", &env).expect_err("unknown provider");
+        assert!(err.contains("unknown AI_PROVIDER"), "{err}");
+        assert!(err.contains("openrouter"), "{err}");
+    }
+
+    /// Naming a provider whose key isn't set is a hard error that says which variable to set — not a
+    /// silent fallthrough to some other provider that happens to have one.
+    #[test]
+    fn a_named_provider_with_no_key_errors_instead_of_falling_through() {
+        let env = ProviderEnv::from_vars(
+            &[("AI_PROVIDER", "groq"), ("ANTHROPIC_API_KEY", "sk-ant")],
+            false,
+        );
+        let err = resolve(None, "claude-opus-4-8", &env).expect_err("groq has no key");
+        assert!(err.contains("GROQ_API_KEY"), "{err}");
+    }
+
+    /// A provider row's required headers ride along automatically — NVIDIA's NIM poll timeout is an
+    /// upstream requirement, not a tuning knob.
+    #[test]
+    fn a_rows_required_headers_are_attached_to_its_direct_route() {
+        let spec = providers::by_id(AggregatorHost::Nvidia);
+        let (routing, _, _) = registry_direct_routing(
+            spec,
+            spec.base_url.expect("nvidia has a base_url"),
+            "deepseek-ai/deepseek-v3",
+        );
+        assert_eq!(
+            routing.static_headers,
+            vec![("NVCF-POLL-SECONDS", "3600".to_string())]
+        );
+    }
+
+    /// A store with a stored Anthropic subscription login, written to a real temp file (the store is
+    /// file-backed; nothing here touches `$HOME` or process env).
+    fn store_with_anthropic_login(
+        dir: &std::path::Path,
+    ) -> (crate::auth_store::AuthStore, std::path::PathBuf) {
+        let path = dir.join("auth.json");
+        let mut store = crate::auth_store::AuthStore::open(path.clone());
+        store
+            .set(
+                "anthropic",
+                OAuthCredential::Anthropic(crate::oauth::anthropic::AnthropicCredential {
+                    access: "oauth-access".to_string(),
+                    refresh: "oauth-refresh".to_string(),
+                    expires_at_ms: i64::MAX,
+                }),
+            )
+            .expect("write the temp store");
+        (crate::auth_store::AuthStore::open(path.clone()), path)
+    }
+
+    /// **The precedence decision.** `agent login anthropic` is an explicit, durable act;
+    /// `ANTHROPIC_API_KEY` is very often exported in a shell for some unrelated tool. The login wins, so
+    /// a subscribed user is never silently moved onto pay-per-token API billing by a stray shell export.
+    #[test]
+    fn a_stored_oauth_login_beats_an_ambient_provider_key() {
+        let dir = tempdir();
+        let (store, path) = store_with_anthropic_login(&dir);
+        let env = ProviderEnv::from_vars(&[("ANTHROPIC_API_KEY", "sk-ant-ambient")], false);
+        let (_credential, identity) =
+            resolve_with(None, "claude-opus-4-8", &env, &store, path, &no_overrides())
+                .expect("must resolve");
+        // Direct-routed (there's no gateway), but authenticated by the OAuth source — not the API key.
+        let GatewayCredentialIdentity::DirectOverrideOauth {
+            provider, base_url, ..
+        } = &identity
+        else {
+            panic!("the stored login must win over the ambient key, got {identity:?}")
+        };
+        assert_eq!(*provider, OAuthProviderId::Anthropic);
+        assert_eq!(base_url, "https://api.anthropic.com");
+    }
+
+    /// …but an *explicit* per-invocation choice still beats the login: someone who types
+    /// `AI_PROVIDER=anthropic` with a key in hand means it.
+    #[test]
+    fn an_explicit_ai_provider_beats_a_stored_login() {
+        let dir = tempdir();
+        let (store, path) = store_with_anthropic_login(&dir);
+        let env = ProviderEnv::from_vars(
+            &[
+                ("ANTHROPIC_API_KEY", "sk-ant-ambient"),
+                ("AI_PROVIDER", "anthropic"),
+            ],
+            false,
+        );
+        let (_credential, identity) =
+            resolve_with(None, "claude-opus-4-8", &env, &store, path, &no_overrides())
+                .expect("must resolve");
+        let GatewayCredentialIdentity::DirectOverride { bearer, .. } = &identity else {
+            panic!("an explicit AI_PROVIDER must win, got {identity:?}")
+        };
+        assert_eq!(bearer, "sk-ant-ambient");
+    }
+
+    /// Direct-mode Anthropic OAuth must still reach Anthropic's *own* endpoint, not the gateway's.
+    /// Gateway mode is unchanged: no route override at all, relayed as before.
+    #[test]
+    fn anthropic_oauth_relays_through_a_configured_gateway_but_dials_anthropic_directly_without_one()
+     {
+        let dir = tempdir();
+        let (store, path) = store_with_anthropic_login(&dir);
+
+        let gateway_env = ProviderEnv::from_vars(&[], true);
+        let (_c, identity) = resolve_with(
+            None,
+            "claude-opus-4-8",
+            &gateway_env,
+            &store,
+            path.clone(),
+            &no_overrides(),
+        )
+        .expect("must resolve");
+        assert_eq!(
+            identity,
+            GatewayCredentialIdentity::Anthropic,
+            "with a gateway configured, OAuth is relayed through it exactly as before"
+        );
+
+        let direct_env = ProviderEnv::from_vars(&[], false);
+        let (_c, identity) = resolve_with(
+            None,
+            "claude-opus-4-8",
+            &direct_env,
+            &store,
+            path,
+            &no_overrides(),
+        )
+        .expect("must resolve");
+        assert_eq!(wire(&identity).0, "https://api.anthropic.com");
+    }
+
+    /// A unique temp dir without pulling in a dev-dependency — the store is file-backed and these tests
+    /// run in parallel, so each needs its own.
+    fn tempdir() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "beyond-ai-cred-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    /// An OAuth access token is **not** an API key. The Anthropic row's scheme (`x-api-key`, bare)
+    /// describes how Anthropic takes an API key; a subscription token goes in `Authorization: Bearer` and
+    /// is rejected outright in `x-api-key`. The row is right about the host, the wire, and the path — the
+    /// credential decides the header.
+    #[test]
+    fn a_direct_anthropic_oauth_route_authenticates_with_bearer_not_x_api_key() {
+        let dir = tempdir();
+        let (store, path) = store_with_anthropic_login(&dir);
+        let env = ProviderEnv::from_vars(&[], false);
+        let (_c, identity) =
+            resolve_with(None, "claude-opus-4-8", &env, &store, path, &no_overrides())
+                .expect("must resolve");
+        assert_eq!(
+            wire(&identity),
+            ("https://api.anthropic.com", "/v1/messages", None, None),
+            "auth_header must be None (i.e. Authorization: Bearer) for an OAuth token"
+        );
+    }
+
+    /// …while the same host reached with an actual API key does take `x-api-key`. Both rules, one row.
+    #[test]
+    fn a_direct_anthropic_api_key_route_still_uses_x_api_key() {
+        let env = ProviderEnv::from_vars(&[("ANTHROPIC_API_KEY", "sk-ant")], false);
+        let identity = resolve(None, "claude-opus-4-8", &env).expect("must resolve");
+        assert_eq!(wire(&identity).2, Some("x-api-key"));
+    }
+
+    /// `OPENAI_BASE_URL` moves the OpenAI row's endpoint and *nothing else* — a variable exported for
+    /// some other tool must not silently redirect Anthropic traffic.
+    #[test]
+    fn openai_base_url_is_scoped_to_the_openai_row() {
+        let env = ProviderEnv::from_vars(
+            &[
+                ("OPENAI_BASE_URL", "https://my-proxy.example.com/v1"),
+                ("OPENAI_API_KEY", "sk-oai"),
+                ("ANTHROPIC_API_KEY", "sk-ant"),
+            ],
+            false,
+        );
+        let openai = resolve(None, "gpt-5", &env).expect("must resolve");
+        assert_eq!(wire(&openai).0, "https://my-proxy.example.com/v1");
+
+        let anthropic = resolve(None, "claude-opus-4-8", &env).expect("must resolve");
+        assert_eq!(
+            wire(&anthropic).0,
+            "https://api.anthropic.com",
+            "OPENAI_BASE_URL must not redirect a non-OpenAI provider"
+        );
     }
 }

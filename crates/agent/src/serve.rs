@@ -413,7 +413,16 @@ impl std::str::FromStr for UpstreamHttp2 {
 /// connections), every other field is a plain owned value.
 #[derive(Clone)]
 pub struct ServeConfig {
+    /// The gateway base URL. Still a plain `String` — `main.rs` resolves the `DEFAULT_GATEWAY` fallback
+    /// into it as before — but in **direct** mode (see [`Self::provider_env`]) it is simply never dialed:
+    /// every direct credential carries a `RouteOverride::Direct`, which replaces this outright at request
+    /// time. Which is why making the gateway optional needed no new plumbing through here.
     pub gateway: String,
+    /// The direct-routing environment (provider keys, `AI_PROVIDER`, `AI_BASE_URL`, and whether a gateway
+    /// is configured at all), read once at the CLI boundary. Threaded alongside [`Self::key`] and for the
+    /// same reason: [`resolve_gateway_credential`] is keyed on the *model*, so it is re-run on every model
+    /// switch, and it needs this each time.
+    pub provider_env: crate::gateway_credential::ProviderEnv,
     /// The raw `--key`/`AI_AGENT_KEY` value, if the operator gave one explicitly. Deliberately *not*
     /// pre-resolved into a [`GatewayCredential`] by `main.rs` before `serve` starts, unlike every other
     /// `ServeConfig` field: [`resolve_gateway_credential`] is keyed on the model, and this process's
@@ -6080,7 +6089,7 @@ fn model_override_extra_headers(model: &str) -> std::collections::HashMap<String
 /// been resolved exactly once, before `serve` even started, and then silently reused — stale provider,
 /// stale routing — by every later model switch for the rest of the process's life.
 fn build_gateway_client(cfg: &ServeConfig, model: &str) -> Result<GatewayClient, String> {
-    let credential = resolve_gateway_credential(cfg.key.clone(), model)?;
+    let credential = resolve_gateway_credential(cfg.key.clone(), model, &cfg.provider_env)?;
     let client = match credential {
         GatewayCredential::Static(key) => {
             GatewayClient::new(cfg.gateway.clone(), key).map_err(|e| e.to_string())?

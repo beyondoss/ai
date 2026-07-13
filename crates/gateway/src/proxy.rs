@@ -271,7 +271,7 @@ fn dialect_for_path(path: &str) -> Dialect {
     if path.starts_with("/v1/messages") {
         Dialect::Anthropic
     } else {
-        Dialect::OpenAI
+        Dialect::OpenAi
     }
 }
 
@@ -500,7 +500,7 @@ impl ProxyHttp for AiProxy {
         // passthrough), OpenAI dialect only, streaming-capable paths only — so everything else still
         // streams through untouched. Checked on the forwarded path (suffix), so it's prefix-agnostic.
         let inject_eligible =
-            managed && dialect == Dialect::OpenAI && is_streamable_path(&forward_path);
+            managed && dialect == Dialect::OpenAi && is_streamable_path(&forward_path);
 
         // Circuit breaker (per provider, all traffic — a down provider is down regardless of whose
         // key is used). Checked here, after every other rejection, so claiming a half-open probe
@@ -934,8 +934,8 @@ impl ProxyHttp for AiProxy {
 
         // Extract usage facts from the tail (shape depends on dialect + streaming).
         let parsed = match (rc.dialect, rc.streaming) {
-            (Dialect::OpenAI, true) => usage::openai_stream(tail),
-            (Dialect::OpenAI, false) => usage::openai_body(tail),
+            (Dialect::OpenAi, true) => usage::openai_stream(tail),
+            (Dialect::OpenAi, false) => usage::openai_body(tail),
             (Dialect::Anthropic, true) => usage::anthropic_stream(tail),
             (Dialect::Anthropic, false) => usage::anthropic_body(tail),
         };
@@ -1151,9 +1151,9 @@ mod tests {
         // OpenAI-dialect. This locks that mapping so a refactor can't silently flip it.
         assert_eq!(dialect_for_path("/v1/messages"), Dialect::Anthropic);
         assert_eq!(dialect_for_path("/v1/messages/batches"), Dialect::Anthropic);
-        assert_eq!(dialect_for_path("/v1/chat/completions"), Dialect::OpenAI);
-        assert_eq!(dialect_for_path("/v1/embeddings"), Dialect::OpenAI);
-        assert_eq!(dialect_for_path("/"), Dialect::OpenAI);
+        assert_eq!(dialect_for_path("/v1/chat/completions"), Dialect::OpenAi);
+        assert_eq!(dialect_for_path("/v1/embeddings"), Dialect::OpenAi);
+        assert_eq!(dialect_for_path("/"), Dialect::OpenAi);
     }
 
     #[test]

@@ -25,6 +25,10 @@ futures.workspace = true
 # Validates the `structured_output` tool's payload against the caller-supplied schema. See the
 # workspace manifest for why `default-features = false` matters here.
 jsonschema.workspace = true
+# The shared provider table: where each provider lives, which wire it speaks, which header its key goes
+# in, and which env var conventionally holds it. The same rows `crates/gateway` proxies on — so the
+# agent's direct route and the gateway's proxy route can never disagree about a provider.
+providers = { package = "beyond-ai-providers", path = "../providers" }
 serde.workspace = true
 serde_json.workspace = true
 # `skills.rs`'s `SKILL.md`/prompt-template frontmatter parsing — a real YAML parser instead of a

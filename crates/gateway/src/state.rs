@@ -48,7 +48,7 @@ fn build_providers(config: &AiConfig, metrics: &Metrics) -> Result<HashMap<Strin
     };
 
     let mut providers = HashMap::new();
-    for spec in route::KNOWN_PROVIDERS {
+    for spec in route::known_providers() {
         let authority = config
             .provider_authorities
             .get(spec.name)
@@ -60,7 +60,7 @@ fn build_providers(config: &AiConfig, metrics: &Metrics) -> Result<HashMap<Strin
             Arc::new(Provider::resolve(
                 spec.name,
                 authority,
-                spec.dialect,
+                spec.wire,
                 spec.auth,
                 pool_key,
                 ProviderMetrics::resolve(metrics, spec.name),
@@ -86,7 +86,7 @@ fn build_providers(config: &AiConfig, metrics: &Metrics) -> Result<HashMap<Strin
                          (expected \"openai\" or \"anthropic\")"
                     ))
                 })?,
-                None => Dialect::OpenAI,
+                None => Dialect::OpenAi,
             };
             let auth = match config.provider_auth_schemes.get(name) {
                 Some(s) => AuthScheme::parse_config(s).ok_or_else(|| {
@@ -377,7 +377,7 @@ mod tests {
         };
         let providers = build_providers(&default_config, &test_metrics()).unwrap();
         let custom = providers.get("custom").unwrap();
-        assert_eq!(custom.dialect, Dialect::OpenAI);
+        assert_eq!(custom.dialect, Dialect::OpenAi);
         assert_eq!(custom.auth, AuthScheme::Bearer);
     }
 
