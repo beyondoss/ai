@@ -1,6 +1,6 @@
 name: Release Agent Binary
-# Builds beyond-ai-agent as a static musl binary for linux/amd64 and linux/arm64, UPX-compresses each,
-# and publishes them as GitHub Release assets, matching the beyond-<name>-v*-linux-<arch>.tar.gz
+# Builds beyond-ai-agent as a static musl binary for linux/amd64 and linux/arm64 and publishes them
+# as GitHub Release assets, matching the beyond-<name>-v*-linux-<arch>.tar.gz
 # convention dev/.scripts/publish-primitives.sh (in the beyond repo) expects for every other
 # externally-built primitive binary (beyond-pg, beyond-kv, ...). Separate from publish.yml (which
 # builds the gateway's Docker image) — this only runs on a version tag, not every push to main.
@@ -29,10 +29,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
-      - name: Install musl toolchain + upx
+      - name: Install musl toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools upx-ucl
+          sudo apt-get install -y musl-tools
           rustup target add ${{ matrix.target }}
       - name: Build beyond-ai-agent (static musl)
         run: |
@@ -44,10 +44,15 @@ jobs:
           export "$linker_env=musl-gcc"
           export "$cc_env=musl-gcc"
           cargo build --release -p beyond-ai-agent --target ${{ matrix.target }}
-      - name: Compress with UPX
-        # ~20 MB static binary → ~6 MB; a trivial one-time self-extract at exec. Verified locally that
-        # the static-pie musl binary compresses and still runs.
-        run: upx --best --lzma target/${{ matrix.target }}/release/beyond-ai-agent
+      # Deliberately NOT UPX-compressed. UPX self-extracts the whole image into anonymous memory at
+      # exec, which defeats demand paging: the text segment stops being a clean, shared, file-backed
+      # mapping and becomes private dirty anon that can't be evicted (only swapped) and can't be
+      # shared between processes. Measured on the release binary: idle RSS 12 MB → 29 MB (+19 MB, and
+      # ~27 MB of it unreclaimable), and `--version` 4.5 ms → 305 ms, since LZMA has to inflate all
+      # ~24 MB before `main` runs — including the code a given invocation never calls. The asset is
+      # already gzipped by the `tar -czf` below, so all that bought was 9.8 MB → 6.8 MB of one-time
+      # download. 3 MB off a download is not worth 19 MB of a session-multiplexing daemon's RAM, nor
+      # 300 ms on every CLI invocation.
       - name: Package release asset
         run: |
           mkdir -p dist
