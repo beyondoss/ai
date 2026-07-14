@@ -35,7 +35,26 @@ The harness layers several capabilities over the bare tools + loop:
   key property this buys the WebSocket path: **the session is a view, not owned by the connection** — a
   dropped mobile client does not abort the run (the retained input `Sender` means a dropped socket is
   not an EOF), and a reconnecting client (same `?session_id=`) re-attaches to the same still-running
-  session, catching up via `get_messages {since}`. `serve_ws` owns a `session id → running session`
+  session. **Catch-up is seeded server-side, at attach**, and is **base plus frames**: the connection is
+  queued a one-shot `catchup` frame (carrying `get_messages`' exact `{messages, leaf_id}` payload — the
+  transcript as of the current run's *start*), immediately followed by a replay of every frame that run
+  has emitted so far, and only then does its sink go live. The two together reconstruct exactly what a
+  client that never dropped has seen. Both halves are needed and neither suffices: deliver the backlog
+  late and the client renders the tail of a turn whose earlier messages it never saw; deliver committed
+  history *only* and it picks the in-flight turn up from the middle — a `tool_end` for a `tool_start` it
+  never got. (The base deliberately does not advance at mid-run checkpoints; if it did, a message
+  committed mid-turn would appear in the catch-up *and* again in the replayed frames, and render twice.)
+  This ordering is structural, not lucky: the history snapshot and the in-flight-turn recording both live
+  inside `OutFanout`, under the very same lock `broadcast` takes, so seed → replay → registration is one
+  critical section that a concurrent commit can neither interleave with nor slip past
+  (`OutFanout::add_with_catchup`). It has to be — frames carry no sequence number, so delivery order is
+  the only order a client has. The replay recording is capped (`TURN_REPLAY_MAX_BYTES`, 4 MiB per
+  session: one tool-heavy turn can emit megabytes and the daemon multiplexes many sessions); past the cap
+  it is dropped and the catch-up reports `turn_truncated: true` rather than handing over a turn with a
+  silent hole in it. For the same borrow reason, `get_messages` is answerable **mid-run** from that
+  snapshot rather than from `session` (which `run_events_steered` holds `&mut` for a run's whole duration
+  — the same escape hatch `LiveStats` gives `get_state`), so a client can reconcile instead of being told
+  to come back later. `serve_ws` owns a `session id → running session`
   map; each session runs on its own thread (its event sink isn't `Send`) and persists to its own
   `<session-dir>/<id>.jsonl`. **Multiple connections can attach to one session at once** (the user's own
   phone + TUI): the session's output is **broadcast** to every attached connection (`serve::OutFanout`,
@@ -56,8 +75,8 @@ The harness layers several capabilities over the bare tools + loop:
   `JoinHandle::is_finished` under a grace period rather than parking a blocking join, so a wedged session
   can't burn a blocking-pool thread for the daemon's life). The default has to be finite: a connection
   that omits `?session_id=` mints a fresh id, and every id owns a thread, an `Agent`, and a gateway pool
-  until something reclaims it. A reconnect to a just-reaped id respawns it from disk and replays via
-  `get_messages {since}`. A third daemon facility, **shared upstream
+  until something reclaims it. A reconnect to a just-reaped id respawns it from disk, and the `catchup`
+  frame seeded on attach replays its restored history. A third daemon facility, **shared upstream
   pooling** (`--upstream-http2 <off|auto|h2c>`, off by default): instead of each session building its own
   `reqwest::Client` (so N sessions ≈ N connections to the gateway on the plaintext HTTP/1.1 hop),
   `serve_ws` builds **one** client and injects it into every session via
