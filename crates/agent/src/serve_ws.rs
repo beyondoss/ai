@@ -251,7 +251,14 @@ impl Supervisor {
         // `list_daemon_sessions` command below) that must go back to *this* socket only, not fan out to
         // the other attached connections. Feeds the same `conn_rx`/send task.
         let reply_tx = conn_tx.clone();
-        let sink_id = lock_ignoring_poison(&out_conn).add(OutSink::Bounded(conn_tx));
+        // `add_with_catchup`, not `add`: the session's committed history is queued on this connection
+        // *ahead of* its sink going live, so a client re-attaching to a run already in flight receives
+        // what it missed before that run's live frames — not after them, and not never. Frames carry no
+        // sequence number, so delivery order is the only order a client has; leaving catch-up to a
+        // client round trip issued after connecting raced the very stream it was meant to precede. Both
+        // halves happen under the fanout's lock (which `broadcast` also takes), so the ordering is
+        // structural rather than lucky — see `OutFanout::add_with_catchup`.
+        let sink_id = lock_ignoring_poison(&out_conn).add_with_catchup(OutSink::Bounded(conn_tx));
 
         let (mut sink, mut stream) = ws.split();
 

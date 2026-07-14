@@ -13,8 +13,11 @@
 //! one frame per outbound text message. Both feed the transport-agnostic [`serve_session`] core, which
 //! reads commands from an `mpsc` channel and emits frames to whichever connection is currently
 //! attached — so a WebSocket session **outlives its connection**: a dropped mobile client reconnects
-//! (same `?session_id=`) and re-attaches to the same still-running run, catching up on anything
-//! committed while it was gone via `get_messages {since}`.
+//! (same `?session_id=`) and re-attaches to the same still-running run. It is caught up on whatever
+//! committed while it was gone by a `catchup` frame the server seeds on attach, *before* the connection
+//! starts receiving live frames — catch-up is not something the client asks for and hopes arrives first,
+//! because frames carry no sequence number and delivery order is the only order a client has (see
+//! [`OutFanout::add_with_catchup`]).
 //!
 //! Sessions persist as append-only JSONL: `--session-file` for one session, or `--session-dir` for a
 //! [`SessionRepo`](crate::session_store::SessionRepo) of many (WebSocket sessions get one file each,
@@ -312,6 +315,28 @@
 //! `session_info_changed`; see `set_session_name` above) — or `{type:"login_progress", id?,
 //! command:"login", provider, step, url?, user_code?, verification_uri?, expires_in?, message?}`,
 //! zero or more unsolicited updates for an in-flight `login`, correlated via `id` (see `login` above).
+//!
+//! `{type:"catchup", data:{messages, leaf_id}, turn_in_flight, turn_truncated}` is pushed **once,
+//! unsolicited, on attach** over the WebSocket/UDS transports (nothing is sent to a fresh session with
+//! no history and no run — there is no backlog). Its `data` is byte-for-byte the payload `get_messages`
+//! answers with, so a client parses one shape either way. It is the *first* frame the connection
+//! receives, queued ahead of the sink going live.
+//!
+//! Catch-up is **base plus frames**: `data.messages` is the transcript as of the current run's start,
+//! and — when `turn_in_flight` is `true` — every frame that run has emitted so far is *replayed*
+//! immediately after it, before the live stream resumes. The two together reconstruct exactly what a
+//! client that never dropped has seen, with nothing duplicated (which is why the base deliberately does
+//! not advance at mid-run checkpoints). Committed history alone would not do: the turn in flight hasn't
+//! committed, so a client would pick it up from the middle — a `tool_end` for a `tool_start` it never
+//! got. `turn_truncated: true` means that turn outgrew the replay budget
+//! ([`TURN_REPLAY_MAX_BYTES`]) and the client's view of it starts partway in, so it should reconcile
+//! with `get_messages` once the run ends.
+//!
+//! The ordering here is the only thing a client can rely on — frames carry no sequence number — and it
+//! is enforced structurally: catch-up, replay, and sink registration all happen inside one critical
+//! section on the lock `broadcast` itself takes ([`OutFanout::add_with_catchup`]), so nothing can
+//! interleave or be lost between them. It is not a race the client is expected to win. The stdio
+//! transport has one connection for the life of the process and no re-attach, so it is never sent one.
 //!
 //! Two more frames exist only when `--approve` installed an interactive gate (see [`crate::approval`]).
 //! `{type:"approval_request", request_id, tool, summary, scope_key, origin, options}` is broadcast to
@@ -2438,6 +2463,38 @@ pub(crate) async fn serve_session(
         };
     }
 
+    // The base transcript the *next* connection to attach is caught up with (see
+    // [`OutFanout::add_with_catchup`]), published from the top of the idle loop — which covers *every*
+    // command that mutates it (a completed run, `compact`, `fork`, `switch_session`, a branch switch, …)
+    // without having to find and annotate each one. Miss a site and a reconnecting client silently gets a
+    // stale backlog, which is the very class of bug this exists to fix.
+    //
+    // Deliberately **not** republished mid-run, even though the checkpoint arm has a perfectly good
+    // snapshot in hand: the catch-up's contract is `history` = the transcript as of the run's start, and
+    // `OutFanout::turn` = every frame since. That is what reconstructs a never-dropped client's view
+    // exactly. Advance `history` at each mid-run checkpoint and a message committed mid-turn would land
+    // in the catch-up *and* again in the replayed frames, and the client would render it twice.
+    //
+    // Cheap enough to call every pass: `Session::messages` is an `Arc`, so an unchanged transcript costs
+    // one pointer comparison. Only a genuine change pays for `active_ids()`.
+    let mut last_history: Arc<Vec<agent_core::Message>> = Arc::new(Vec::new());
+    macro_rules! sync_history {
+        () => {{
+            let changed = !Arc::ptr_eq(&session.messages, &last_history);
+            if changed {
+                last_history = session.messages.clone();
+            }
+            let mut fanout = lock_ignoring_poison(&out_conn);
+            if changed {
+                fanout.set_history(last_history.clone(), persistence.active_ids());
+            }
+            // Idle, so any run that was recording has finished and its messages are in the history just
+            // published. Drop the recording under this *same* lock: a connection attaching must never see
+            // the new history and then have the finished turn's frames replayed on top of it.
+            fanout.end_turn();
+        }};
+    }
+
     // pi-parity (Task 4, serve pass 19): the ordinary idle-path logic for `new_session`/
     // `switch_session`/`fork`/`clone`/`compact`, each extracted into a macro rather than a function —
     // `session`/`persistence`/`agent`/`client`/`current_model`/etc. are all plain local variables of
@@ -2893,6 +2950,11 @@ pub(crate) async fn serve_session(
     // single-threaded command loop, so a plain counter suffices.
     let mut login_generation: u64 = 0;
     loop {
+        // Idle: the transcript is whatever the last command left behind (including a run that just
+        // finished). Publish it for the next connection to attach — see `sync_history!`. Also seeds the
+        // very first snapshot, from the history `Persistence::open` restored off disk, so a client
+        // attaching to a resumed session is caught up before it has issued a single command.
+        sync_history!();
         let line = tokio::select! {
             biased;
             // Idle between commands: nothing is in flight, so a shutdown request needs no drain —
@@ -3073,6 +3135,13 @@ pub(crate) async fn serve_session(
                 // here (per prompt-run, fresh-armed) so it survives the per-retry-attempt observer rebuild
                 // below. See `crate::memory::PRESSURE_NUDGE`.
                 let pressure_armed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+                // Start recording this run's frames for mid-turn replay (see `OutFanout::turn`). Here,
+                // outside the auto-retry loop below, so one recording spans the whole `prompt`: a client
+                // that never dropped saw every attempt's frames and the `auto_retry_start` notices
+                // between them, and a client that re-attaches is owed the same. The idle loop's
+                // `sync_history!` ends the recording once the run is over and its messages have committed.
+                lock_ignoring_poison(&out_conn).begin_turn();
 
                 // Drive the run while staying responsive to stdin: `abort` cancels it, `steer` queues a
                 // mid-run injection and `follow_up` a stop-boundary one; any other command is
@@ -3273,6 +3342,15 @@ pub(crate) async fn serve_session(
                                 Some(messages) = checkpoint_rx.recv() => {
                                     let (p, r) = persist_messages_blocking(persistence, messages).await;
                                     persistence = p;
+                                    // Note this deliberately does *not* republish the fanout's catch-up
+                                    // history, even though a perfectly good snapshot is right here. The
+                                    // catch-up's contract is base-plus-frames: `history` is the transcript
+                                    // as of this run's start and `OutFanout::turn` is every frame since, so
+                                    // a reconnecting client reconstructs exactly what a never-dropped one
+                                    // saw. Advancing `history` here would put a mid-turn-committed message
+                                    // in the catch-up *and* again in the replayed frames — rendered twice.
+                                    // See `sync_history!`, which republishes once the run is over.
+                                    //
                                     // Logged, not tracked in `persist_error`: the unconditional final
                                     // persist below re-persists the whole session fresh regardless, so
                                     // this checkpoint's own outcome never affects what's reported to the
@@ -3455,6 +3533,33 @@ pub(crate) async fn serve_session(
                                                 }
                                                 let _ = out_tx.send(response(cid, "get_state", true, Some(data), None));
                                             }
+                                            // Answered from the fanout's committed-history snapshot — the
+                                            // same source an attach-time catch-up is seeded from — rather
+                                            // than from `session`, which this run holds `&mut` for its whole
+                                            // duration. Rejecting this as busy (as it was) left a client that
+                                            // re-attached mid-run unable to fetch the history it had missed
+                                            // for as long as the run lasted, having already been shown that
+                                            // run's live output: it rendered the tail of a turn whose earlier
+                                            // messages it had never seen, and could only reconcile once the
+                                            // run finally ended.
+                                            //
+                                            // The snapshot is the transcript as of this run's start (see
+                                            // `sync_history!` for why it deliberately doesn't advance
+                                            // mid-run). The turn in flight is carried by the event frames the
+                                            // client is concurrently receiving — replayed from `OutFanout::
+                                            // turn` if it attached partway in — so base-plus-frames still
+                                            // adds up to the whole picture. Its messages land here the moment
+                                            // the run ends.
+                                            "get_messages" => {
+                                                let (msgs, ids) = {
+                                                    let f = lock_ignoring_poison(&out_conn);
+                                                    f.history_snapshot()
+                                                };
+                                                match messages_payload(&msgs, &ids, cmd.get("since").and_then(Value::as_str)) {
+                                                    Ok(data) => { let _ = out_tx.send(response(cid, "get_messages", true, Some(data), None)); }
+                                                    Err(e) => { let _ = out_tx.send(response(cid, "get_messages", false, None, Some(&e))); }
+                                                }
+                                            }
                                             "get_session_stats" => {
                                                 // Fix 8 (pi-parity gap): previously the raw
                                                 // `LiveStats::snapshot()` verbatim — dropping
@@ -3592,7 +3697,7 @@ pub(crate) async fn serve_session(
                                                 pending_deferred.push((cid, c.clone()));
                                             }
                                             other => {
-                                                let _ = out_tx.send(response(cid, other, false, None, Some("busy: a prompt is running; only `abort`/`abort_retry`/`steer`/`follow_up`, `compact`/`switch_session`/`fork`/`clone`/`new_session` (which self-abort-and-proceed), or a handful of read-only commands (get_state/get_session_stats/get_commands/list_branches/get_tree/list_sessions/list_all_sessions/get_available_models), are accepted")));
+                                                let _ = out_tx.send(response(cid, other, false, None, Some("busy: a prompt is running; only `abort`/`abort_retry`/`steer`/`follow_up`, `compact`/`switch_session`/`fork`/`clone`/`new_session` (which self-abort-and-proceed), or a handful of read-only commands (get_state/get_session_stats/get_messages/get_commands/list_branches/get_tree/list_sessions/list_all_sessions/get_available_models), are accepted")));
                                             }
                                         }
                                     }
@@ -3937,75 +4042,18 @@ pub(crate) async fn serve_session(
                 emit!(response(id, "get_state", true, Some(data), None));
             }
             "get_messages" => {
-                // Tag each message with its tree id when persistence tracks one (parallel to
-                // `session.messages` — see `Persistence::active_ids`), so a client can pick a
-                // `target_id` for `switch_branch` from anywhere in the visible transcript, not only
-                // from a branch's leaf (which is all `list_branches` alone can offer). A length
-                // mismatch (in-memory mode, or a transient inconsistency) leaves messages untagged
-                // rather than mistagging them.
+                // Idle: `session` is ours to read. The busy loop answers the same command from the
+                // fanout's committed-history snapshot instead (the run holds `&mut session`), through
+                // this same [`messages_payload`] — one payload shape either way.
                 let msg_ids = persistence.active_ids();
-                let mut messages =
-                    serde_json::to_value(session.messages.as_ref()).unwrap_or(Value::Null);
-                if let Value::Array(arr) = &mut messages {
-                    if arr.len() == msg_ids.len() {
-                        for (m, mid) in arr.iter_mut().zip(msg_ids) {
-                            if let Value::Object(obj) = m {
-                                obj.insert("id".into(), json!(mid));
-                            }
-                        }
-                    }
+                match messages_payload(
+                    &session.messages,
+                    msg_ids,
+                    cmd.get("since").and_then(Value::as_str),
+                ) {
+                    Ok(data) => emit!(response(id, "get_messages", true, Some(data), None)),
+                    Err(e) => emit!(response(id, "get_messages", false, None, Some(&e))),
                 }
-                // `since`: return only what's new since a tree id the client already has — pi's own
-                // `get_entries({since})` — so a client polling for updates doesn't have to re-transfer
-                // the whole transcript every time. Unmatched, or given while nothing is tagged (a
-                // length mismatch, or in-memory-only mode with no ids at all), is an error: silently
-                // falling back to "everything" would look like a working incremental fetch that's
-                // actually just re-sending the full history, masking the bug instead of surfacing it.
-                if let Some(since) = cmd.get("since").and_then(Value::as_str) {
-                    // `idx` indexes `msg_ids` (the active *tree path*, which includes non-message
-                    // `Custom` entries), but the slice below is applied to `messages` (LLM messages
-                    // only). The two align 1:1 exactly when tagging above ran — i.e.
-                    // `arr.len() == msg_ids.len()`. When they don't (a `Custom` entry sits in the
-                    // path, or in-memory mode carries no ids), an `idx` past `messages`' end would make
-                    // `split_off(idx + 1)` panic. That's the same "nothing is tagged → error" case the
-                    // doc above already calls out, so fold it into the unmatched branch rather than
-                    // slicing blindly.
-                    let tagged =
-                        matches!(&messages, Value::Array(arr) if arr.len() == msg_ids.len());
-                    match msg_ids
-                        .iter()
-                        .position(|mid| mid == since)
-                        .filter(|_| tagged)
-                    {
-                        Some(idx) => {
-                            if let Value::Array(arr) = &mut messages {
-                                *arr = arr.split_off(idx + 1);
-                            }
-                        }
-                        None => {
-                            emit!(response(
-                                id,
-                                "get_messages",
-                                false,
-                                None,
-                                Some(&format!("no message with id {since} in this session"))
-                            ));
-                            continue;
-                        }
-                    }
-                }
-                // `leaf_id`: the same active-tip id `get_tree`'s response already carries (Fix 6,
-                // pi-parity gap — pi's own `get_entries({since})` returns `{entries, leafId}` in one
-                // round trip). Without this, a client fetching the transcript still had to issue a
-                // second `get_tree` call just to learn the current tip to pass as a future
-                // `switch_branch` target.
-                emit!(response(
-                    id,
-                    "get_messages",
-                    true,
-                    Some(json!({ "messages": messages, "leaf_id": msg_ids.last() })),
-                    None,
-                ));
             }
             "new_session" => do_new_session!(cmd, id),
             "list_sessions" => {
@@ -7712,13 +7760,30 @@ impl From<Value> for OutFrame {
     }
 }
 
+impl OutFrame {
+    /// Rough on-the-wire size, for budgeting the in-flight-turn recording against
+    /// [`TURN_REPLAY_MAX_BYTES`]. `Raw` — the hot `event` path, and so very nearly all of what a turn
+    /// emits — is already its final text and reports exactly. `Value` (acks, responses, progress notices:
+    /// a handful per turn, all small) is charged a flat nominal size rather than serialized just to
+    /// measure it, which would cost more than the budget it protects.
+    fn approx_len(&self) -> usize {
+        match self {
+            OutFrame::Raw(s) => s.len(),
+            OutFrame::Value(_) => 256,
+        }
+    }
+}
+
 /// The set of connections currently attached to a session, each an unbounded sink the session's single
 /// writer task **broadcasts** every [`OutFrame`] to — so a phone and a TUI (or any N of the user's own
 /// devices) on one session all render the same live stream, in the same order. Empty ⇒ detached, frames
-/// dropped (a reconnecting client replays committed state via `get_messages {since}` — see
-/// [`crate::serve_ws`]). The supervisor [`add`](OutFanout::add)s a sink on attach and
-/// [`remove`](OutFanout::remove)s it on disconnect. An `std::sync::Mutex` (not tokio's) is deliberate:
-/// it is only ever held across non-`await` `send`s into unbounded channels.
+/// dropped by design; the session keeps running, and the next connection to attach is caught up from
+/// the committed history the fanout carries ([`OutFanout::add_with_catchup`] — see [`crate::serve_ws`]).
+/// The supervisor [`add`](OutFanout::add)s a sink on attach and [`remove`](OutFanout::remove)s it on
+/// disconnect. An `std::sync::Mutex` (not tokio's) is deliberate: it is held across non-`await` `send`s
+/// into channels, and — once per attach, never on the event path — across serializing the catch-up
+/// payload, which is precisely what makes "seed the history, then register the sink" atomic against a
+/// concurrent `broadcast`.
 /// One attached connection's output channel. A network transport (WebSocket/UDS) registers a
 /// **bounded** sink: a client whose socket has stalled under TCP backpressure (a locked phone, a dead
 /// tunnel) would otherwise let the still-running session buffer streamed frames without limit, growing
@@ -7747,7 +7812,54 @@ impl OutSink {
 pub(crate) struct OutFanout {
     next_id: u64,
     sinks: Vec<(u64, OutSink)>,
+    /// The session's committed history, as of its last commit — what a connection attaching *now* has
+    /// missed. Kept here, under the very same lock as `sinks`, on purpose: a connection attaching must
+    /// be seeded with the history and registered as a sink **atomically**. Were these two behind
+    /// separate locks, a message could commit in between — broadcast to the old sink set (which this
+    /// connection is not yet in) *after* its history snapshot was taken — and would then appear in
+    /// neither the catch-up nor the live stream. It would be dropped from that client's view entirely.
+    /// See [`add_with_catchup`](Self::add_with_catchup).
+    history: Arc<Vec<agent_core::Message>>,
+    /// Tree ids parallel to `history` (see `Persistence::active_ids`), so a catch-up tags messages
+    /// exactly the way `get_messages` does. Empty when persistence tracks none (in-memory mode), which
+    /// [`messages_payload`] already treats as "leave them untagged".
+    history_ids: Arc<Vec<String>>,
+    /// Every frame this session has broadcast since the current run began — replayed to a connection
+    /// that attaches mid-turn, right after its catch-up.
+    ///
+    /// Committed history alone is not enough to reconstruct what a client sees. The turn in flight has
+    /// not committed yet, so it is nowhere in `history`, and the frames it has already emitted went out
+    /// before this connection existed. Without this, a client re-attaching mid-turn would pick the turn
+    /// up from the middle — a `tool_end` for a `tool_start` it never received, an assistant message
+    /// missing its opening — which is the same "the transcript is wrong when I reconnect" symptom as
+    /// delivering the backlog late.
+    ///
+    /// `history` deliberately does **not** advance across a run (only [`crate::serve::serve_session`]'s
+    /// idle loop publishes it, and a run never returns there), which is what makes `history + turn`
+    /// exactly reconstruct a never-dropped client's view with no overlap: the base is the transcript as
+    /// of the run's start, and these are every frame since. Were `history` to advance at each mid-run
+    /// checkpoint, a message would appear *both* in the catch-up and again in the replayed frames, and
+    /// the client would render it twice.
+    turn: Vec<OutFrame>,
+    /// Byte budget already spent on `turn`, against [`TURN_REPLAY_MAX_BYTES`].
+    turn_bytes: usize,
+    /// `true` only between [`begin_turn`](Self::begin_turn) and [`end_turn`](Self::end_turn) — a run is
+    /// in flight, so `broadcast` records what it sends. Idle, nothing is recorded and `turn` is empty.
+    recording: bool,
+    /// The in-flight turn outgrew [`TURN_REPLAY_MAX_BYTES`] and its recording was dropped to bound
+    /// memory. Surfaced on the catch-up as `turn_truncated: true` so a client that attaches knows its
+    /// view of the current turn starts mid-way and must be reconciled with `get_messages` once the run
+    /// ends — rather than silently rendering a turn with a hole in it.
+    turn_truncated: bool,
 }
+
+/// How much of an in-flight turn's output a session will hold for replay to a connection that attaches
+/// mid-turn (see [`OutFanout::turn`]). A cap is required, not optional: a single tool-heavy turn can emit
+/// megabytes (a `read` of a large file, a chatty `bash`), this buffer is **per session**, and the daemon
+/// multiplexes many — an unbounded recorder would turn one pathological turn into a per-session leak that
+/// lives until the run ends. 4 MiB comfortably covers ordinary turns; past it the recording is dropped
+/// and the catch-up says so.
+const TURN_REPLAY_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 impl OutFanout {
     /// Register a connection's sink; returns an id to [`remove`](Self::remove) it by on disconnect.
@@ -7756,6 +7868,98 @@ impl OutFanout {
         self.next_id += 1;
         self.sinks.push((id, tx));
         id
+    }
+
+    /// The committed history and its parallel tree ids, for a caller that needs to answer from a
+    /// snapshot rather than from `session` (a mid-run `get_messages` — the run holds `&mut session`).
+    /// Both are `Arc`s, so this is two refcount bumps and the lock is released immediately.
+    pub(crate) fn history_snapshot(&self) -> (Arc<Vec<agent_core::Message>>, Arc<Vec<String>>) {
+        (self.history.clone(), self.history_ids.clone())
+    }
+
+    /// Publish the session's committed history, for the next connection to be caught up with. Called by
+    /// the session whenever messages commit: at each mid-run durable checkpoint, and whenever an idle
+    /// command changes them.
+    ///
+    /// The transcript itself costs nothing to publish — `Session::messages` is already an `Arc`, so it's
+    /// a refcount bump. The ids are owned here (`Persistence::active_ids` only lends a slice), which is
+    /// the one real copy; callers gate on the transcript's `Arc` pointer actually having changed, so an
+    /// idle session never pays it.
+    pub(crate) fn set_history(&mut self, messages: Arc<Vec<agent_core::Message>>, ids: &[String]) {
+        self.history = messages;
+        self.history_ids = Arc::new(ids.to_vec());
+    }
+
+    /// Register a connection's sink, **seeding it with the committed history first** so the new
+    /// connection receives its backlog ahead of any live frame.
+    ///
+    /// This ordering is the whole point, and it is why the catch-up cannot be left to the client to ask
+    /// for after connecting. Frames carry no sequence number, so delivery order is the only order a
+    /// client has. A client that re-attaches to a session with a run in flight would otherwise start
+    /// receiving that run's live output immediately — while its catch-up request raced along behind —
+    /// and would render the tail of a turn whose earlier messages it had never seen.
+    ///
+    /// Seeding *before* [`add`](Self::add), under the lock [`broadcast`](Self::broadcast) also takes,
+    /// makes the ordering structural rather than a race this happens to usually win: any concurrent
+    /// broadcast either already ran (so its message is in `history`, or predates this connection) or
+    /// blocks until the sink is registered — landing strictly after the catch-up already queued ahead
+    /// of it.
+    ///
+    /// Nothing is sent when there is nothing to catch up on — a fresh session with no history and no run
+    /// in flight has no backlog, so its first client gets no unsolicited frame.
+    ///
+    /// The lock is held across a `serde_json` serialization of the history here — the one place it is
+    /// held across more than a channel send (see the type's own note). That is deliberate: it is what
+    /// buys the atomicity above, it is bounded by the transcript length, and it happens once per
+    /// *attach* (a client reconnecting), never on the hot event path.
+    pub(crate) fn add_with_catchup(&mut self, tx: OutSink) -> u64 {
+        if !self.history.is_empty() || self.recording {
+            if let Ok(data) = messages_payload(&self.history, &self.history_ids, None) {
+                let _ = tx.try_send(OutFrame::Value(json!({
+                    "type": "catchup",
+                    "data": data,
+                    // The turn in flight, if any, follows as replayed frames — unless it outgrew the
+                    // recorder, in which case say so rather than hand the client a turn with a hole in
+                    // it (see `turn_truncated`).
+                    "turn_in_flight": self.recording,
+                    "turn_truncated": self.turn_truncated,
+                })));
+            }
+        }
+        // Replay the in-flight turn *after* the catch-up and *before* the sink goes live: the base
+        // transcript, then every frame since the run began, then the live stream — byte-identical to
+        // what a client that never dropped has seen. All three inside this one critical section, so a
+        // concurrent `broadcast` can neither interleave with the replay nor slip in between it and the
+        // registration below.
+        for frame in &self.turn {
+            let _ = tx.try_send(frame.clone());
+        }
+        self.add(tx)
+    }
+
+    /// A run is starting: record what it broadcasts, for replay to anyone who attaches mid-turn.
+    ///
+    /// Called once per `prompt`, not per auto-retry attempt — a client that never dropped saw every
+    /// attempt's frames, including the `auto_retry_start` notices between them, so a reconnecting one is
+    /// owed the same.
+    pub(crate) fn begin_turn(&mut self) {
+        self.turn.clear();
+        self.turn_bytes = 0;
+        self.turn_truncated = false;
+        self.recording = true;
+    }
+
+    /// The run is over and its messages have committed into `history` — drop the recording, which would
+    /// now duplicate what the catch-up already carries.
+    ///
+    /// Idempotent, and called by the idle loop on every pass (including when no run ever started), which
+    /// is also what releases the memory a tool-heavy turn's recording held: the buffer is freed the
+    /// moment the session goes idle, not kept until the next run overwrites it.
+    pub(crate) fn end_turn(&mut self) {
+        self.turn = Vec::new();
+        self.turn_bytes = 0;
+        self.turn_truncated = false;
+        self.recording = false;
     }
 
     /// Drop the sink registered under `id` (a disconnected connection). Idempotent.
@@ -7774,7 +7978,27 @@ impl OutFanout {
     /// Send `frame` to every attached sink, pruning any whose receiver has gone away. The single-sink
     /// case (one connection — the common case) moves the frame with **no clone**, preserving the hot
     /// event path's zero-copy behavior; only 2+ attached connections pay a per-sink clone.
+    ///
+    /// While a run is in flight the frame is also recorded for replay (see [`Self::turn`]) — that clone
+    /// is the one allocation this path gains, and only for the duration of a turn. Note the recording
+    /// happens even with **zero** sinks attached: a fully detached session still has to be able to catch
+    /// the next client up on the turn it ran while nobody was watching, which is the whole point of a
+    /// session outliving its connection.
     pub(crate) fn broadcast(&mut self, frame: OutFrame) {
+        if self.recording && !self.turn_truncated {
+            let len = frame.approx_len();
+            if self.turn_bytes + len > TURN_REPLAY_MAX_BYTES {
+                // Past the budget: drop the whole recording (freeing it now, when the memory pressure is
+                // real) and mark the turn truncated. A client attaching from here on is told its view of
+                // this turn is partial rather than being handed one with a silent hole in it.
+                self.turn = Vec::new();
+                self.turn_bytes = 0;
+                self.turn_truncated = true;
+            } else {
+                self.turn_bytes += len;
+                self.turn.push(frame.clone());
+            }
+        }
         match self.sinks.as_slice() {
             [] => {}
             [(_, tx)] => {
@@ -7791,6 +8015,66 @@ impl OutFanout {
 
 /// Shared handle to a session's attached-connection set (see [`OutFanout`]).
 pub(crate) type SharedOutConn = Arc<std::sync::Mutex<OutFanout>>;
+
+/// The `data` payload `get_messages` answers with — and the identical payload an attach-time catch-up
+/// is seeded from, so a reconnecting client parses one shape, not two.
+///
+/// Deliberately takes the messages and ids **by reference** rather than reading `session`: during a run
+/// `run_events_steered` holds `&mut session` for the whole duration, so anything needing `&session`
+/// simply cannot answer. Taking a snapshot instead is what lets both a mid-run `get_messages` and the
+/// catch-up work at all (the same escape hatch `LiveStats` uses for `get_state`).
+///
+/// Each message is tagged with its tree id when persistence tracks one (parallel to `session.messages`
+/// — see `Persistence::active_ids`), so a client can pick a `switch_branch` `target_id` from anywhere in
+/// the visible transcript, not only from a branch's leaf (which is all `list_branches` alone can offer).
+/// A length mismatch (in-memory mode, or a transient inconsistency) leaves messages untagged rather than
+/// mistagging them.
+///
+/// `since` returns only what's new since a tree id the client already has — pi's own
+/// `get_entries({since})` — so a client polling for updates doesn't re-transfer the whole transcript.
+/// An unmatched `since`, or one given while nothing is tagged, is an `Err`, never a silent fallback to
+/// "everything": that would look like a working incremental fetch that is actually re-sending the full
+/// history, masking the bug instead of surfacing it.
+///
+/// `leaf_id` is the active-tip id `get_tree`'s response also carries, so a client fetching the
+/// transcript needn't issue a second `get_tree` just to learn the tip.
+fn messages_payload(
+    messages: &[agent_core::Message],
+    msg_ids: &[String],
+    since: Option<&str>,
+) -> Result<Value, String> {
+    let mut messages = serde_json::to_value(messages).unwrap_or(Value::Null);
+    if let Value::Array(arr) = &mut messages {
+        if arr.len() == msg_ids.len() {
+            for (m, mid) in arr.iter_mut().zip(msg_ids) {
+                if let Value::Object(obj) = m {
+                    obj.insert("id".into(), json!(mid));
+                }
+            }
+        }
+    }
+    if let Some(since) = since {
+        // `idx` indexes `msg_ids` (the active *tree path*, which includes non-message `Custom` entries),
+        // but the slice below applies to `messages` (LLM messages only). The two align 1:1 exactly when
+        // the tagging above ran — i.e. `arr.len() == msg_ids.len()`. When they don't, an `idx` past
+        // `messages`' end would make `split_off(idx + 1)` panic, so fold that into the unmatched branch
+        // rather than slicing blindly.
+        let tagged = matches!(&messages, Value::Array(arr) if arr.len() == msg_ids.len());
+        match msg_ids
+            .iter()
+            .position(|mid| mid == since)
+            .filter(|_| tagged)
+        {
+            Some(idx) => {
+                if let Value::Array(arr) = &mut messages {
+                    *arr = arr.split_off(idx + 1);
+                }
+            }
+            None => return Err(format!("no message with id {since} in this session")),
+        }
+    }
+    Ok(json!({ "messages": messages, "leaf_id": msg_ids.last() }))
+}
 
 /// Serialize one [`OutFrame`] to its final JSON line (no trailing newline). `Raw` (the hot
 /// `event`-frame path) is already the final text; only `Value` pays a `serde_json::to_string`. Returns
