@@ -37,13 +37,13 @@ The harness layers several capabilities over the bare tools + loop:
   not an EOF), and a reconnecting client (same `?session_id=`) re-attaches to the same still-running
   session. **Catch-up is seeded server-side, at attach**, and is **base plus frames**: the connection is
   queued a one-shot `catchup` frame (carrying `get_messages`' exact `{messages, leaf_id}` payload — the
-  transcript as of the current run's *start*), immediately followed by a replay of every frame that run
+  transcript as of the current run's _start_), immediately followed by a replay of every frame that run
   has emitted so far, and only then does its sink go live. The two together reconstruct exactly what a
   client that never dropped has seen. Both halves are needed and neither suffices: deliver the backlog
   late and the client renders the tail of a turn whose earlier messages it never saw; deliver committed
-  history *only* and it picks the in-flight turn up from the middle — a `tool_end` for a `tool_start` it
+  history _only_ and it picks the in-flight turn up from the middle — a `tool_end` for a `tool_start` it
   never got. (The base deliberately does not advance at mid-run checkpoints; if it did, a message
-  committed mid-turn would appear in the catch-up *and* again in the replayed frames, and render twice.)
+  committed mid-turn would appear in the catch-up _and_ again in the replayed frames, and render twice.)
   This ordering is structural, not lucky: the history snapshot and the in-flight-turn recording both live
   inside `OutFanout`, under the very same lock `broadcast` takes, so seed → replay → registration is one
   critical section that a concurrent commit can neither interleave with nor slip past
