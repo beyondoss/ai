@@ -274,9 +274,9 @@ enum Command {
         /// Virtual key (`bai_v1…`) or BYO provider key. Required; or set `AI_AGENT_KEY`.
         #[arg(long, env = "AI_AGENT_KEY")]
         key: Option<String>,
-        /// Max loop iterations before bailing.
-        #[arg(long, default_value_t = agent_core::agent::DEFAULT_MAX_STEPS)]
-        max_steps: u32,
+        /// Opt-in cap on model turns before bailing with an error (default: unbounded).
+        #[arg(long)]
+        max_steps: Option<u32>,
         /// Per-turn output token ceiling. `serve`'s identical flag; defaults to the model's own
         /// capability-table `max_output` (see `agent_core::models::capabilities`) when omitted.
         #[arg(long, env = "AI_AGENT_MAX_TOKENS")]
@@ -730,9 +730,9 @@ enum Command {
         /// by default when memory is enabled.
         #[arg(long, default_value_t = false)]
         no_session_memory: bool,
-        /// Max loop iterations per prompt before bailing.
-        #[arg(long, default_value_t = agent_core::agent::DEFAULT_MAX_STEPS)]
-        max_steps: u32,
+        /// Opt-in cap on model turns per prompt before bailing with an error (default: unbounded).
+        #[arg(long)]
+        max_steps: Option<u32>,
         /// Replace the built-in base system prompt entirely.
         #[arg(long, env = "AI_AGENT_SYSTEM_PROMPT")]
         system_prompt: Option<String>,
@@ -3178,7 +3178,7 @@ async fn run_task(
     model: Option<String>,
     gateway_url: Option<String>,
     key: Option<String>,
-    max_steps: u32,
+    max_steps: Option<u32>,
     max_tokens: Option<u32>,
     cache_long: bool,
     thinking: Option<u32>,
@@ -3873,7 +3873,7 @@ async fn run_task(
             deny_tool: deny_tool.clone(),
             deny_bash_pattern: deny_bash_pattern.clone(),
             deny_path: deny_path.clone(),
-            child_max_steps: subagent::DEFAULT_CHILD_MAX_STEPS,
+            child_max_steps: None,
             max_depth: subagent::DEFAULT_MAX_DEPTH,
             // `run` has no client to ask, so it has no interactive gate — only the static `--deny-*`
             // lists, which `ChildHooks` still installs. See `crate::approval`'s module doc.

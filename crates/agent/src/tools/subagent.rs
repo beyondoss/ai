@@ -54,10 +54,6 @@ const MAX_CONCURRENCY: usize = 4;
 /// `ToolProgress` details, so nothing is lost — only what the *model* is asked to read is bounded.
 const PER_TASK_CAP: usize = 50 * 1024;
 
-/// Children get fewer steps than the parent's 50 (`agent_core`'s `DEFAULT_MAX_STEPS`): a child is a
-/// scoped delegation, and eight of them at 50 steps each is a cost multiplier nobody asked for.
-pub const DEFAULT_CHILD_MAX_STEPS: u32 = 25;
-
 /// A child at depth `d` gets its own `subagent` tool only when `d < max_depth`. With the default `1`,
 /// children exist and grandchildren cannot. In-process there is no OS process limit to catch a fork
 /// bomb, and pi has no depth guard at all.
@@ -133,7 +129,9 @@ pub struct SubagentCtx {
     pub deny_tool: Vec<String>,
     pub deny_bash_pattern: Vec<String>,
     pub deny_path: Vec<String>,
-    pub child_max_steps: u32,
+    /// Opt-in cap on each child's model turns. `None` (the default) runs children unbounded, same as
+    /// the parent — see `agent_core::Agent::with_max_steps` for why unbounded is the default.
+    pub child_max_steps: Option<u32>,
     pub max_depth: u32,
     /// The parent's interactive approval gate, if it has one. Shared, not rebuilt: a child queues behind
     /// the same one-question-at-a-time lock its siblings do (eight parallel children must not raise eight
