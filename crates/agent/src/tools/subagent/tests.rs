@@ -118,7 +118,7 @@ fn ctx(defs: Vec<AgentDef>, factory: Factory) -> (Arc<SubagentCtx>, tempfile::Te
         deny_tool: Vec::new(),
         deny_bash_pattern: Vec::new(),
         deny_path: Vec::new(),
-        child_max_steps: DEFAULT_CHILD_MAX_STEPS,
+        child_max_steps: None,
         max_depth: DEFAULT_MAX_DEPTH,
         approval: None,
     });
@@ -597,7 +597,7 @@ fn ctx_with_gate(
         deny_tool: Vec::new(),
         deny_bash_pattern: Vec::new(),
         deny_path: Vec::new(),
-        child_max_steps: DEFAULT_CHILD_MAX_STEPS,
+        child_max_steps: None,
         max_depth: DEFAULT_MAX_DEPTH,
         approval: Some(crate::approval::ApprovalRuntime::new(
             gate,

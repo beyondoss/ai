@@ -2,7 +2,8 @@
 //!
 //! One iteration = one model turn: stream a completion, assemble the assistant message from the
 //! event stream, append it to the session, and — if the model asked for tools — run each tool and
-//! feed the results back as a new user turn. Repeat until the model ends its turn (or `max_steps`).
+//! feed the results back as a new user turn. Repeat until the model ends its turn (or an opt-in
+//! `max_steps` ceiling, unset by default, interrupts it first).
 //!
 //! The loop is dialect-blind (both wire dialects normalize to the same `StreamEvent` sequence) and
 //! network-blind (it depends only on [`ModelTransport`], so tests drive it with `MockTransport`).
@@ -145,20 +146,6 @@ pub enum AgentEvent {
 
 /// Default per-turn output token ceiling.
 const DEFAULT_MAX_TOKENS: u32 = 4096;
-/// Default ceiling on loop iterations before bailing — a runaway-tool-call backstop.
-///
-/// Deliberately kept hard and fatal, not just raised or removed: this agent can run unattended
-/// (`serve`, a homelab automation), with no human approving each tool call, and this repo's own
-/// operating principle is that automated actions stay bounded and safe to interrupt (see the root
-/// CLAUDE.md's "operations must be idempotent and atomic"). A bounded blast radius on a runaway loop
-/// is a feature this ceiling provides, not a limitation to engineer away. `Error::MaxSteps` is fully
-/// resumable, though — the check runs before any per-turn state is touched, so a client that hits it
-/// can simply issue another `prompt` to continue past it with a fresh budget. 50 (up from an earlier
-/// 24) gives a legitimate multi-file task more headroom before that ceiling interrupts it; operators
-/// can still override it per deployment via [`Agent::with_max_steps`]. `pub` so a CLI's own flag
-/// default (`agent run --max-steps`/`agent serve --max-steps`) can reference this one number instead
-/// of carrying a second, driftable copy of it.
-pub const DEFAULT_MAX_STEPS: u32 = 50;
 /// Cap on tool-call groups dispatched concurrently within one turn. A model usually batches a
 /// handful, but nothing bounds how many it requests; without a cap a turn asking for dozens of
 /// `bash`/`grep` calls would spawn that many subprocesses / parallel walks at once (and `grep` itself
@@ -238,7 +225,9 @@ pub struct Agent {
     /// composed together).
     system_fn: Option<Box<dyn Fn() -> String + Send + Sync>>,
     max_tokens: u32,
-    max_steps: u32,
+    /// Opt-in ceiling on loop iterations per `run` call. `None` (the default) runs until the model
+    /// ends its turn, like pi's loop — see [`Self::with_max_steps`] for why unbounded is the default.
+    max_steps: Option<u32>,
     /// Extended-thinking budget, when enabled. Applied to every turn's request.
     thinking: Option<u32>,
     /// Reasoning effort level (OpenAI reasoning models; Anthropic adaptive thinking). Applied to every
@@ -326,7 +315,7 @@ impl Agent {
             system: None,
             system_fn: None,
             max_tokens: caps.max_output.max(DEFAULT_MAX_TOKENS),
-            max_steps: DEFAULT_MAX_STEPS,
+            max_steps: None,
             thinking: None,
             reasoning_effort: None,
             temperature: None,
@@ -399,9 +388,17 @@ impl Agent {
         self
     }
 
-    /// Set the loop-iteration ceiling.
-    pub fn with_max_steps(mut self, max_steps: u32) -> Self {
-        self.max_steps = max_steps;
+    /// Cap loop iterations per `run` call (one step = one model turn; tool dispatch doesn't count
+    /// again). Unset by default: the loop runs until the model ends its turn, like pi's — the run is
+    /// already bounded by cancellation and by context/token spend, and a finite default proved to be
+    /// a proxy that interrupted legitimate deep tasks (its history went 24 → 50 → gone, each bump
+    /// driven by real work hitting it, with no recorded runaway it ever caught). Operators who want a
+    /// hard per-call budget opt in here; `Error::MaxSteps` is fully resumable — the check runs before
+    /// any per-turn state is touched, so a fresh `run`/`prompt` continues with a new budget. Takes
+    /// `impl Into<Option<u32>>` so both `with_max_steps(50)` and a config's `Option<u32>` pass
+    /// straight through; `None` clears it.
+    pub fn with_max_steps(mut self, max_steps: impl Into<Option<u32>>) -> Self {
+        self.max_steps = max_steps.into();
         self
     }
 
@@ -526,7 +523,8 @@ impl Agent {
 
     /// Drive the loop to completion against `session`, invoking `on_event` for every streamed event
     /// (use it to render assistant text/tool activity live). Returns when the model ends its turn
-    /// without requesting tools, or errors with [`Error::MaxSteps`] if it never does.
+    /// without requesting tools (or errors with [`Error::MaxSteps`], when a ceiling was opted into
+    /// via [`with_max_steps`](Self::with_max_steps)).
     pub async fn run<F>(&self, session: &mut Session, mut on_event: F) -> Result<()>
     where
         F: FnMut(&StreamEvent) + Send,
@@ -565,7 +563,8 @@ impl Agent {
 
     /// Drive the loop to completion, emitting an [`AgentEvent`] for every streamed model event, tool
     /// invocation, and turn boundary — the full observation surface the headless server streams to
-    /// its clients. Returns when the model ends its turn without tools, or [`Error::MaxSteps`].
+    /// its clients. Returns when the model ends its turn without tools (or [`Error::MaxSteps`],
+    /// when a ceiling was opted into).
     pub async fn run_events<F>(&self, session: &mut Session, sink: F) -> Result<()>
     where
         F: FnMut(AgentEvent) + Send,
@@ -835,12 +834,14 @@ impl Agent {
                     tool_names: current_tool_defs.iter().map(|d| d.name.clone()).collect(),
                 });
             }
-            if steps_this_call >= self.max_steps {
-                let err = Error::MaxSteps(self.max_steps);
-                sink(AgentEvent::Error {
-                    message: err.to_string(),
-                });
-                return Err(err);
+            if let Some(max_steps) = self.max_steps {
+                if steps_this_call >= max_steps {
+                    let err = Error::MaxSteps(max_steps);
+                    sink(AgentEvent::Error {
+                        message: err.to_string(),
+                    });
+                    return Err(err);
+                }
             }
 
             // Proactive compaction: once the live prompt crosses the threshold, summarize the prefix

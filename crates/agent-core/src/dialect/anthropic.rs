@@ -82,7 +82,7 @@ fn from_claude_code_name(name: &str, tools: &[ToolDef]) -> String {
 ///
 /// Three prompt-cache breakpoints are stamped in. An agent loop re-sends an ever-growing prefix —
 /// tools, then system, then the whole prior conversation — on every turn; without caching each turn
-/// re-bills that entire prefix at full input price, an O(n²) token cost over a `max_steps`-deep run.
+/// re-bills that entire prefix at full input price, an O(n²) token cost over an n-step run.
 /// Anthropic caches the request prefix up to each `cache_control` mark (reads cost ~10% of input
 /// tokens), so we anchor one breakpoint on the fixed tool block, one on the system prompt (a stable
 /// anchor that survives Anthropic's ~20-block breakpoint lookback on tool-heavy turns), and roll a

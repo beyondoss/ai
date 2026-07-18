@@ -472,7 +472,9 @@ pub struct ServeConfig {
     pub model_explicit: bool,
     /// Same idea as [`Self::model_explicit`], for `--reasoning-effort`/`starting_level`.
     pub reasoning_effort_explicit: bool,
-    pub max_steps: u32,
+    /// Opt-in cap on model turns per prompt (`--max-steps`). `None` (the default) runs unbounded —
+    /// see `agent_core::Agent::with_max_steps` for the rationale.
+    pub max_steps: Option<u32>,
     /// Base system prompt (agent identity). Project instructions, skills, and env are layered on top.
     pub system: String,
     /// Extra instructions appended after the base prompt (`--append-system-prompt`).
@@ -2434,8 +2436,8 @@ pub(crate) async fn serve_session(
     // The channel is intentionally unbounded. The event `sink` (see `Agent::run_events`) is a
     // synchronous `FnMut`, so the producer cannot `.await` to apply backpressure; a bounded channel
     // would force `try_send`, which silently drops frames and corrupts the event stream — unacceptable
-    // for a protocol. In practice the backlog is bounded by one in-flight turn's events (capped by
-    // `max_steps`), drained as fast as the attached connection accepts.
+    // for a protocol. In practice the backlog is bounded by one in-flight turn's events, drained as
+    // fast as the attached connection accepts.
     //
     // Unlike the old stdout-owning writer, this task does NOT tear down when the connection breaks: a
     // detached session (no connection, or a dead one) simply drops frames and keeps running, which is
@@ -6273,7 +6275,7 @@ fn build_subagent_ctx(
         deny_tool: cfg.deny_tool.clone(),
         deny_bash_pattern: cfg.deny_bash_pattern.clone(),
         deny_path: cfg.deny_path.clone(),
-        child_max_steps: subagent::DEFAULT_CHILD_MAX_STEPS,
+        child_max_steps: None,
         max_depth: subagent::DEFAULT_MAX_DEPTH,
         approval: approval.cloned(),
     })
