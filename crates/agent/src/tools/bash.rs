@@ -394,13 +394,39 @@ impl Bash {
             )));
         }
         let text = clean(format_output(&snap, "(no output)"));
-        match result.code {
-            Some(0) | None => Ok(text.into()),
+        match (result.code, result.signal) {
+            (Some(0), _) => Ok(text.into()),
             // Non-zero exit is an error result that still carries the output — pi throws here too.
-            Some(code) => Err(ToolError::Execution(append_status(
+            (Some(code), _) => Err(ToolError::Execution(append_status(
                 &text,
                 &format!("Command exited with code {code}"),
             ))),
+            // Killed by a signal: `ExitStatus::code()` is `None` in exactly this case, and this arm
+            // used to fall in with `Some(0)` and report **success**. An OOM-killed build, a SIGSEGV, a
+            // SIGTERM'd server — every one of them came back to the model as a clean run, silently, and
+            // with `"(no output)"` if the command hadn't printed anything before dying. The model then
+            // proceeds as though the step succeeded. The timeout case never reaches here (it returns
+            // via the `timed_out` branch above), so a `None` code with a signal is unambiguous.
+            (None, Some(signal)) => {
+                let named = match crate::tools::exec::signal_name(signal) {
+                    Some(name) => format!("{name} ({signal})"),
+                    None => format!("signal {signal}"),
+                };
+                let hint = if signal == 9 {
+                    " — typically the OOM killer or an external `kill -9`"
+                } else {
+                    ""
+                };
+                Err(ToolError::Execution(append_status(
+                    &text,
+                    &format!("Command was killed by {named}{hint}"),
+                )))
+            }
+            // No code and no signal: not reachable on Unix (the two are exhaustive there), and on a
+            // non-Unix host there is no signal concept to report. Genuinely unknown rather than known-
+            // bad, so this keeps the original benefit-of-the-doubt behavior instead of inventing a
+            // failure.
+            (None, None) => Ok(text.into()),
         }
     }
 }
@@ -891,6 +917,64 @@ mod tests {
         };
         assert!(msg.contains("boom"));
         assert!(msg.contains("Command exited with code 2"));
+    }
+
+    #[tokio::test]
+    async fn a_signal_killed_command_is_an_error_not_a_silent_success() {
+        // The regression: `ExitStatus::code()` is `None` for a signal-terminated process, and that
+        // `None` used to share an arm with `Some(0)` — so an OOM-killed build reported **success** to
+        // the model, with `"(no output)"` standing in for the output it never got to produce.
+        let runner = recording(ExecResult {
+            code: None,
+            signal: Some(9),
+            stdout: "compiling...".into(),
+            ..Default::default()
+        });
+        let err = Bash::with_runner(runner)
+            .run(json!({ "command": "make -j64" }))
+            .await
+            .unwrap_err();
+        let ToolError::Execution(msg) = err else {
+            panic!("expected Execution error, got: {err:?}")
+        };
+        assert!(msg.contains("compiling..."), "output must survive: {msg}");
+        assert!(msg.contains("SIGKILL"), "the signal must be named: {msg}");
+        assert!(
+            msg.contains("OOM"),
+            "SIGKILL's most likely cause is worth stating: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unnamed_signal_is_still_reported_as_a_failure_by_number() {
+        let runner = recording(ExecResult {
+            code: None,
+            signal: Some(31),
+            ..Default::default()
+        });
+        let err = Bash::with_runner(runner)
+            .run(json!({ "command": "weird" }))
+            .await
+            .unwrap_err();
+        let ToolError::Execution(msg) = err else {
+            panic!("expected Execution error, got: {err:?}")
+        };
+        assert!(msg.contains("signal 31"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn a_real_signal_killed_command_reports_failure_end_to_end() {
+        // Through the real runner and a real process, not a double: proves `exit_signal` actually
+        // populates `ExecResult::signal` off a genuine `ExitStatus` rather than the field only ever
+        // being set by test fixtures.
+        let err = Bash::real()
+            .run(json!({ "command": "kill -9 $$" }))
+            .await
+            .unwrap_err();
+        let ToolError::Execution(msg) = err else {
+            panic!("expected Execution error, got: {err:?}")
+        };
+        assert!(msg.contains("SIGKILL"), "got: {msg}");
     }
 
     #[tokio::test]
@@ -1430,6 +1514,7 @@ mod tests {
             *self.cwd.lock().unwrap() = Some(cwd.map(str::to_string));
             Ok(ExecResult {
                 code: Some(0),
+                signal: None,
                 stdout: String::new(),
                 stderr: String::new(),
                 timed_out: false,

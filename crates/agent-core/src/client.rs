@@ -459,6 +459,30 @@ impl GatewayClient {
 #[async_trait]
 impl ModelTransport for GatewayClient {
     async fn stream(&self, mut req: ModelRequest) -> Result<EventStream> {
+        // These two repairs are ORDER-DEPENDENT and must stay in this order.
+        //
+        // `ensure_non_empty_content` runs first because it *removes* content: it drops every block from
+        // an aborted/errored assistant turn (see its own doc comment). When such a turn carries a
+        // complete `ToolUse` block — the ordinary shape for a run cancelled, or a stream that died,
+        // right after a tool call finished streaming (`Agent::run_events_steered` persists both via
+        // `with_aborted`/`with_error`) — running it *second* was actively destructive: the orphan
+        // repair would first pair that `tool_use` with a synthetic `tool_result`, and then this pass
+        // would delete the `tool_use` out from under it, leaving a dangling `tool_result` referencing an
+        // id that no longer appears anywhere in the request. Anthropic rejects that outright ("tool_result
+        // block(s) provided when previous message does not contain any tool_use blocks"), and because
+        // nothing pops an *aborted* record from the session (`Session::pop_error_record` only fires on
+        // `error_message`), the bad shape was re-derived from history on every subsequent request — one
+        // abort mid-tool-call wedged the session permanently.
+        //
+        // Running it first means the `tool_use` is already gone before the orphan scan looks for one, so
+        // there is nothing to pair and nothing to dangle. The reverse dependency doesn't exist:
+        // `repair_orphaned_tool_use` only ever *adds* a `tool_result` block to a user turn, which is
+        // never empty and never aborted/errored, so it can't create work for the pass above it.
+        if let std::borrow::Cow::Owned(fixed) =
+            crate::dialect::ensure_non_empty_content(&req.messages)
+        {
+            req.messages = fixed.into();
+        }
         // Every dialect's wire shape requires a `tool_use` to be immediately followed by its
         // `tool_result` — repair any orphaned one (a hand-edited/externally-loaded session, or a
         // not-yet-discovered code path) before it can reach a request and 400. Cheap no-op when the
@@ -467,14 +491,6 @@ impl ModelTransport for GatewayClient {
             crate::dialect::repair_orphaned_tool_use(&req.messages)
         {
             req.messages = repaired.into();
-        }
-        // Every dialect rejects a message with empty/whitespace-only content and no tool calls —
-        // reachable via `Message::error()`'s closing record, an immediate-abort turn, or cross-model
-        // scrubbing. Fix the wire shape, not the persisted session (see the doc comment).
-        if let std::borrow::Cow::Owned(fixed) =
-            crate::dialect::ensure_non_empty_content(&req.messages)
-        {
-            req.messages = fixed.into();
         }
         // Resolved fresh for this turn rather than a field snapshot — the seam that lets a
         // credential expire and be refreshed mid-process (see `CredentialSource`'s doc comment).
@@ -2854,6 +2870,81 @@ mod tests {
             !body.contains("\"content\":[]"),
             "no message should reach the wire with empty content either, got body:\n{body}"
         );
+    }
+
+    /// The ordering regression between this module's two wire repairs (see the comment on their call
+    /// site in `stream`). An *aborted* assistant turn carrying a complete `ToolUse` block — what a run
+    /// cancelled right after a tool call finished streaming persists — used to reach the wire as a
+    /// dangling `tool_result`: `repair_orphaned_tool_use` paired the call, then
+    /// `ensure_non_empty_content` deleted the `tool_use` it had just been paired with. Anthropic 400s
+    /// on that, and since nothing pops an aborted record from the session it recurred on every later
+    /// request, wedging the session for good. Asserted structurally (every `tool_result` id must have a
+    /// matching `tool_use` id) rather than on substrings, so it fails for the right reason.
+    #[tokio::test]
+    async fn an_aborted_turns_tool_use_never_reaches_the_wire_as_a_dangling_tool_result() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let captured_clone = captured.clone();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap();
+            *captured_clone.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let sse = "data: {\"type\":\"message_stop\"}\n\n";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                sse.len(),
+                sse
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        });
+
+        let client = GatewayClient::new(format!("http://{addr}"), "test-key").unwrap();
+        let messages = vec![
+            crate::message::Message::user("do the thing"),
+            crate::message::Message::assistant(vec![crate::message::ContentBlock::tool_use(
+                "call_1",
+                "bash",
+                serde_json::json!({"command": "ls"}),
+            )])
+            .with_aborted(),
+            crate::message::Message::user("continue"),
+        ];
+        let req = ModelRequest::new("claude-opus-4-8", messages, 100);
+        let mut events = client.stream(req).await.unwrap();
+        let _ = events.next().await;
+        server.join().unwrap();
+
+        let request = captured.lock().unwrap().clone();
+        let body_start = request.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+        let body: serde_json::Value =
+            serde_json::from_str(&request[body_start..]).unwrap_or_else(|e| {
+                panic!("body was not valid JSON ({e}): {}", &request[body_start..])
+            });
+        let blocks = || {
+            body["messages"]
+                .as_array()
+                .expect("messages array")
+                .iter()
+                .flat_map(|m| m["content"].as_array().cloned().unwrap_or_default())
+        };
+        let tool_use_ids: Vec<String> = blocks()
+            .filter(|b| b["type"] == "tool_use")
+            .map(|b| b["id"].as_str().unwrap_or_default().to_string())
+            .collect();
+        let tool_result_ids: Vec<String> = blocks()
+            .filter(|b| b["type"] == "tool_result")
+            .map(|b| b["tool_use_id"].as_str().unwrap_or_default().to_string())
+            .collect();
+        for id in &tool_result_ids {
+            assert!(
+                tool_use_ids.contains(id),
+                "dangling tool_result `{id}` reached the wire with no matching tool_use \
+                 (uses={tool_use_ids:?}, results={tool_result_ids:?}) in body:\n{body:#}"
+            );
+        }
     }
 
     /// A fixed [`DirectRouting`]-carrying credential — the test double proving the routing mechanism

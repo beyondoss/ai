@@ -32,14 +32,55 @@ const POST_EXIT_IDLE_GRACE: Duration = Duration::from_millis(100);
 /// The result of running a command.
 #[derive(Debug, Clone, Default)]
 pub struct ExecResult {
-    /// Process exit code, or `None` if killed (e.g. timed out).
+    /// Process exit code, or `None` if the command never exited normally — it was killed by a signal
+    /// (see [`signal`](Self::signal)) or reaped for exceeding its timeout
+    /// ([`timed_out`](Self::timed_out)).
     pub code: Option<i32>,
+    /// The signal that terminated the command, when one did (Unix only; always `None` elsewhere, and
+    /// `None` whenever `code` is `Some`). Carried separately rather than folded into `code` as the
+    /// shell's `128 + N` convention so a consumer can tell a genuine `exit 137` apart from a real
+    /// SIGKILL — and so the reported message can name the signal, which is the difference between
+    /// "exited with code 137" and "killed by SIGKILL (typically the OOM killer)".
+    pub signal: Option<i32>,
     pub stdout: String,
     pub stderr: String,
     /// True if the command was killed for exceeding its timeout.
     pub timed_out: bool,
     /// True if either stream's middle was dropped because it exceeded the capture cap.
     pub truncated: bool,
+}
+
+/// The signal that killed `status`, if one did. `ExitStatus::code()` returns `None` in exactly this
+/// case on Unix, which is why a `None` code must never be read as "fine" — see [`ExecResult::signal`].
+#[cfg(unix)]
+fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    std::os::unix::process::ExitStatusExt::signal(status)
+}
+
+/// Non-Unix has no signal concept — a `None` exit code there really is just "unknown".
+#[cfg(not(unix))]
+fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
+    None
+}
+
+/// Human name for the signals a command realistically dies from, so the reported message says
+/// something a model (or a human reading the transcript) can act on. Anything outside this short list
+/// is reported by number alone rather than pulling in a libc-name lookup for it.
+pub fn signal_name(signal: i32) -> Option<&'static str> {
+    Some(match signal {
+        1 => "SIGHUP",
+        2 => "SIGINT",
+        3 => "SIGQUIT",
+        6 => "SIGABRT",
+        8 => "SIGFPE",
+        9 => "SIGKILL",
+        11 => "SIGSEGV",
+        13 => "SIGPIPE",
+        15 => "SIGTERM",
+        24 => "SIGXCPU",
+        25 => "SIGXFSZ",
+        _ => return None,
+    })
 }
 
 /// A sink for output chunks as they stream from a running command — used to surface live progress.
@@ -168,8 +209,10 @@ impl RealRunner {
             // `bash`-run command's output can be.
             Ok((status, (stdout, out_trunc), (stderr, err_trunc))) => {
                 guard.disarm();
+                let status = status?;
                 Ok(ExecResult {
-                    code: status?.code(),
+                    code: status.code(),
+                    signal: exit_signal(&status),
                     stdout: String::from_utf8_lossy(&stdout).into_owned(),
                     stderr: String::from_utf8_lossy(&stderr).into_owned(),
                     timed_out: false,
