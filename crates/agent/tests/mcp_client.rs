@@ -23,7 +23,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use common::{
-    read_until_response, run_cmd, serve_cmd, spawn_model_server, turn_text, turn_tool_use,
+    SpawnGuarded, read_until_response, run_cmd, serve_cmd, spawn_model_server, turn_text,
+    turn_tool_use,
 };
 use serde_json::{Value, json};
 
@@ -913,8 +914,7 @@ fn mcp_stdio_tool_is_discovered_and_callable_through_serve_too() {
     let (base, bodies) = spawn_model_server(vec![turn1, turn_text("done")]);
     let mut child = serve_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"), &base, &session_file)
         .env("HOME", home.path())
-        .spawn()
-        .unwrap();
+        .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 

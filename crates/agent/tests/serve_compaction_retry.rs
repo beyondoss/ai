@@ -7,7 +7,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 
 use common::{
-    ISOLATED_HOME, read_until_response, serve_cmd, spawn_model_server, turn_text, turn_tool_use,
+    ISOLATED_HOME, SpawnGuarded, read_until_response, serve_cmd, spawn_model_server, turn_text,
+    turn_tool_use,
 };
 use serde_json::{Value, json};
 
@@ -18,7 +19,7 @@ fn serve_set_auto_compaction_toggles_and_rejects_a_non_boolean() {
     let (base, _bodies) = spawn_model_server(vec![]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -69,8 +70,7 @@ fn serve_no_compaction_flag_starts_with_auto_compaction_disabled() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file)
         .args(["--no-compaction"])
-        .spawn()
-        .unwrap();
+        .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -102,8 +102,7 @@ fn serve_set_auto_compaction_persists_across_a_restart() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file)
         .env("HOME", home.path())
-        .spawn()
-        .unwrap();
+        .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
     writeln!(
@@ -124,8 +123,7 @@ fn serve_set_auto_compaction_persists_across_a_restart() {
     let session_file2 = dir.path().join("s2.jsonl").to_string_lossy().into_owned();
     let mut child2 = serve_cmd(bin, &base2, &session_file2)
         .env("HOME", home.path())
-        .spawn()
-        .unwrap();
+        .spawn_guarded();
     let mut stdin2 = child2.stdin.take().unwrap();
     let mut stdout2 = BufReader::new(child2.stdout.take().unwrap());
     writeln!(stdin2, "{}", json!({ "type": "get_state" })).unwrap();
@@ -176,8 +174,7 @@ fn serve_compact_forwards_custom_instructions_to_the_summarization_call() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+        .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -245,7 +242,7 @@ fn serve_compact_reports_too_small_reason_for_a_session_with_nothing_to_compact(
     let (base, _bodies) = spawn_model_server(vec![]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -302,7 +299,7 @@ fn serve_compact_reports_already_compacted_reason_when_nothing_new_followed_the_
     let (base, bodies) = spawn_model_server(vec![]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -389,8 +386,7 @@ fn serve_proactively_compacts_a_resumed_large_session_on_its_very_next_prompt() 
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+        .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -461,8 +457,7 @@ fn serve_compact_preserves_pre_compaction_entries_in_get_tree() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+        .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -545,8 +540,7 @@ fn serve_compact_reports_first_kept_entry_id_naming_a_real_pre_compaction_entry(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+        .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -618,7 +612,7 @@ fn serve_set_auto_retry_toggles_and_rejects_a_non_boolean() {
     let (base, _bodies) = spawn_model_server(vec![]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -669,7 +663,7 @@ fn serve_set_auto_retry_false_fails_immediately_instead_of_retrying_a_dropped_st
     let (base, bodies) = spawn_model_server(vec![truncated.to_string()]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -721,7 +715,7 @@ fn serve_auto_retries_a_whole_run_after_mid_stream_retry_is_exhausted() {
     ]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -817,7 +811,7 @@ fn serve_persists_the_retried_attempts_assistant_message_not_only_in_memory() {
     ]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -845,7 +839,7 @@ fn serve_persists_the_retried_attempts_assistant_message_not_only_in_memory() {
     child.wait().unwrap();
 
     // Reload the very same session file in a fresh process and ask again.
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
     writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
@@ -898,7 +892,7 @@ fn serve_whole_run_retry_recovery_attempt_can_itself_dispatch_tool_calls() {
     ]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -951,7 +945,7 @@ fn serve_whole_run_retry_succeeds_on_its_second_attempt_not_its_first() {
     ]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -1014,7 +1008,7 @@ fn serve_abort_retry_interrupts_a_pending_whole_run_retry_backoff() {
     ]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -1117,7 +1111,7 @@ fn serve_abort_retry_interrupts_a_pending_whole_run_retry_backoff() {
     child.wait().unwrap();
 
     // And it must survive a reload, not just live in memory.
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
     writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
@@ -1148,7 +1142,7 @@ fn serve_auto_retry_exhausts_all_attempts_and_reports_failure() {
     let (base, _bodies) = spawn_model_server(vec![truncated.to_string(); 12]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -1226,8 +1220,7 @@ fn serve_idle_timeout_ms_flag_causes_a_stalled_response_to_fail_quickly() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file)
         .args(["--idle-timeout-ms", "200", "--retry-max-retries", "0"])
-        .spawn()
-        .unwrap();
+        .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 

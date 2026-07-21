@@ -20,12 +20,12 @@ mod common;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::thread;
 
 use common::{
-    DEV_PUBKEY_B64, DEV_TOKEN, free_port, gateway_bin, wait_for_port, ws_connect, ws_connect_uds,
-    ws_next_frame, ws_read_until_response, ws_send,
+    ChildGuard, DEV_PUBKEY_B64, DEV_TOKEN, SpawnGuarded, free_port, gateway_bin, wait_for_port,
+    ws_connect, ws_connect_uds, ws_next_frame, ws_read_until_response, ws_send,
 };
 use serde_json::{Value, json};
 
@@ -77,14 +77,14 @@ fn available() -> Vec<&'static Provider> {
 
 /// Boot the real gateway in `dir`, fronting a REAL upstream with `key` as the managed pool key for
 /// `pool` (and the dev signing key). Returns its port and the child handle (kill it when done).
-fn boot_gateway(dir: &Path, pool: &str, key: &str) -> (u16, Child) {
+fn boot_gateway(dir: &Path, pool: &str, key: &str) -> (u16, ChildGuard) {
     boot_gateway_pools(dir, &[(pool, key)])
 }
 
 /// Like [`boot_gateway`] but registers *several* pool keys, so a single gateway can front more than
 /// one real provider at once — needed to exercise a cross-provider `set_model` switch (Anthropic →
 /// OpenAI) through one gateway, where each dialect's request routes to its own pool.
-fn boot_gateway_pools(dir: &Path, pools: &[(&str, &str)]) -> (u16, Child) {
+fn boot_gateway_pools(dir: &Path, pools: &[(&str, &str)]) -> (u16, ChildGuard) {
     let gw_port = free_port();
     let metrics_port = free_port();
     let pool_keys: String = pools
@@ -109,8 +109,7 @@ fn boot_gateway_pools(dir: &Path, pools: &[(&str, &str)]) -> (u16, Child) {
         .env("AI_LOG", "warn")
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn gateway");
+        .spawn_guarded();
     wait_for_port(gw_port);
     (gw_port, gateway)
 }
@@ -138,7 +137,7 @@ fn read_until_response(reader: &mut impl BufRead, command: &str) -> Vec<Value> {
 }
 
 /// Spawn the agent `serve` binary against the gateway, with extra args appended.
-fn serve_child(gw_port: u16, cwd: &Path, model: &str, extra: &[&str]) -> Child {
+fn serve_child(gw_port: u16, cwd: &Path, model: &str, extra: &[&str]) -> ChildGuard {
     serve_child_with_gateway_url(&format!("http://127.0.0.1:{gw_port}"), cwd, model, extra)
 }
 
@@ -150,7 +149,7 @@ fn serve_child_with_gateway_url(
     cwd: &Path,
     model: &str,
     extra: &[&str],
-) -> Child {
+) -> ChildGuard {
     let mut args = vec![
         "serve".to_string(),
         "--gateway-url".into(),
@@ -169,8 +168,7 @@ fn serve_child_with_gateway_url(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn agent serve")
+        .spawn_guarded()
 }
 
 /// Boot a gateway for `provider` and run the agent `run` one-shot with `prompt` in `cwd`. Returns the
@@ -2101,7 +2099,7 @@ fn serve_ws_child(
     model: &str,
     session_dir: &Path,
     ws_port: u16,
-) -> Child {
+) -> ChildGuard {
     Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
         .args([
             "serve",
@@ -2122,8 +2120,7 @@ fn serve_ws_child(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn serve --listen")
+        .spawn_guarded()
 }
 
 /// (iv) Live end-to-end over the **WebSocket** transport: a real prompt drives a real tool round-trip
@@ -2299,7 +2296,7 @@ fn serve_uds_child(
     model: &str,
     session_dir: &Path,
     sock: &Path,
-) -> Child {
+) -> ChildGuard {
     Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
         .args([
             "serve",
@@ -2320,8 +2317,7 @@ fn serve_uds_child(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn serve --listen-uds")
+        .spawn_guarded()
 }
 
 /// Block until `sock` accepts a Unix-socket connection, or panic after ~5s.
@@ -2434,8 +2430,7 @@ async fn smoke_h2c_shared_pool_live() {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
-            .spawn()
-            .expect("spawn serve --upstream-http2 h2c");
+            .spawn_guarded();
         wait_for_port(ws_port);
 
         // Two concurrent sessions, both reading the marker through the ONE shared h2c client.

@@ -8,8 +8,8 @@ use std::process::{Command, Stdio};
 
 use beyond_ai_agent::session_store::{SessionMeta, SessionRepo};
 use common::{
-    ISOLATED_HOME, message_ids, read_until_response, serve_cmd, serve_dir_cmd, spawn_model_server,
-    turn_text, turn_tool_use,
+    ISOLATED_HOME, SpawnGuarded, message_ids, read_until_response, serve_cmd, serve_dir_cmd,
+    spawn_model_server, turn_text, turn_tool_use,
 };
 use serde_json::{Value, json};
 
@@ -40,7 +40,7 @@ fn serve_export_html_writes_a_self_contained_transcript() {
     let (base, _bodies) = spawn_model_server(vec![turn_text("hello there")]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -95,7 +95,7 @@ fn serve_export_html_includes_model_change_and_label_events() {
     let (base, _bodies) = spawn_model_server(vec![turn_text("hello there")]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -176,7 +176,7 @@ fn serve_export_html_includes_abandoned_branches_not_just_the_active_path() {
         spawn_model_server(vec![turn_text("first answer"), turn_text("second answer")]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -258,7 +258,7 @@ fn serve_defaults_to_home_claude_sessions_when_no_session_flag_given() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut cmd = serve_default_persistence_cmd(bin, &base);
     cmd.current_dir(project.path()).env("HOME", home.path());
-    let mut child = cmd.spawn().unwrap();
+    let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -312,7 +312,7 @@ fn serve_resumes_newest_session_matching_cwd_not_globally_newest() {
         let (base, _bodies) = spawn_model_server(vec![turn_text("answer from A")]);
         let mut cmd = serve_dir_cmd(bin, &base, &session_dir);
         cmd.current_dir(project_a.path());
-        let mut child = cmd.spawn().unwrap();
+        let mut child = cmd.spawn_guarded();
         let mut stdin = child.stdin.take().unwrap();
         let mut stdout = BufReader::new(child.stdout.take().unwrap());
         writeln!(
@@ -333,7 +333,7 @@ fn serve_resumes_newest_session_matching_cwd_not_globally_newest() {
         let (base, _bodies) = spawn_model_server(vec![turn_text("answer from B")]);
         let mut cmd = serve_dir_cmd(bin, &base, &session_dir);
         cmd.current_dir(project_b.path());
-        let mut child = cmd.spawn().unwrap();
+        let mut child = cmd.spawn_guarded();
         let mut stdin = child.stdin.take().unwrap();
         let mut stdout = BufReader::new(child.stdout.take().unwrap());
         writeln!(
@@ -353,7 +353,7 @@ fn serve_resumes_newest_session_matching_cwd_not_globally_newest() {
         let (base, _bodies) = spawn_model_server(vec![]);
         let mut cmd = serve_dir_cmd(bin, &base, &session_dir);
         cmd.current_dir(project_a.path());
-        let mut child = cmd.spawn().unwrap();
+        let mut child = cmd.spawn_guarded();
         let mut stdin = child.stdin.take().unwrap();
         let mut stdout = BufReader::new(child.stdout.take().unwrap());
         writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
@@ -391,7 +391,7 @@ fn serve_reattaches_through_a_symlinked_cwd_to_the_session_recorded_under_its_re
         let (base, _bodies) = spawn_model_server(vec![turn_text("answer via real path")]);
         let mut cmd = serve_dir_cmd(bin, &base, &session_dir);
         cmd.current_dir(&real);
-        let mut child = cmd.spawn().unwrap();
+        let mut child = cmd.spawn_guarded();
         let mut stdin = child.stdin.take().unwrap();
         let mut stdout = BufReader::new(child.stdout.take().unwrap());
         writeln!(
@@ -411,7 +411,7 @@ fn serve_reattaches_through_a_symlinked_cwd_to_the_session_recorded_under_its_re
         let (base, _bodies) = spawn_model_server(vec![]);
         let mut cmd = serve_dir_cmd(bin, &base, &session_dir);
         cmd.current_dir(&link);
-        let mut child = cmd.spawn().unwrap();
+        let mut child = cmd.spawn_guarded();
         let mut stdin = child.stdin.take().unwrap();
         let mut stdout = BufReader::new(child.stdout.take().unwrap());
         writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
@@ -442,7 +442,7 @@ fn serve_list_sessions_streams_progress_frames_correlated_to_the_request_id() {
 
     let (base, _bodies) = spawn_model_server(vec![]);
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_dir_cmd(bin, &base, &session_dir).spawn().unwrap();
+    let mut child = serve_dir_cmd(bin, &base, &session_dir).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
     // Drain the `ready` banner.
@@ -538,7 +538,7 @@ fn serve_exits_gracefully_on_sigterm_mid_run() {
     let (base, _bodies) = spawn_model_server(vec![turn1]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let pid = child.id();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
@@ -622,7 +622,7 @@ fn serve_exits_gracefully_on_sighup_mid_run() {
     let (base, _bodies) = spawn_model_server(vec![turn1]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let pid = child.id();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
@@ -695,7 +695,7 @@ fn serve_exits_with_130_on_sigint_mid_run() {
     let (base, _bodies) = spawn_model_server(vec![turn1]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let pid = child.id();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
@@ -762,7 +762,7 @@ fn serve_streams_events_and_reattaches() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
     // --- First session: prompt, observe streamed events, read transcript ---
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -814,7 +814,7 @@ fn serve_streams_events_and_reattaches() {
     assert!(child.wait().unwrap().success());
 
     // --- Reattach: a fresh process over the same session file sees the prior transcript ---
-    let mut child2 = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child2 = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin2 = child2.stdin.take().unwrap();
     let mut stdout2 = BufReader::new(child2.stdout.take().unwrap());
     writeln!(stdin2, "{}", json!({ "type": "get_messages" })).unwrap();
@@ -862,7 +862,7 @@ fn serve_survives_a_hard_crash_mid_run_with_both_round_trips_tool_use_already_du
     let (base, _bodies) = spawn_model_server(vec![turn1, turn2, turn_text("done")]);
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "go" })).unwrap();
     stdin.flush().unwrap();
@@ -875,7 +875,7 @@ fn serve_survives_a_hard_crash_mid_run_with_both_round_trips_tool_use_already_du
 
     // Reattach with a fresh process and check what survived.
     let (base2, _bodies2) = spawn_model_server(vec![]);
-    let mut child2 = serve_cmd(bin, &base2, &session_file).spawn().unwrap();
+    let mut child2 = serve_cmd(bin, &base2, &session_file).spawn_guarded();
     let mut stdin2 = child2.stdin.take().unwrap();
     let mut stdout2 = BufReader::new(child2.stdout.take().unwrap());
     writeln!(stdin2, "{}", json!({ "type": "get_messages" })).unwrap();
@@ -930,7 +930,7 @@ fn serve_reports_success_when_a_failed_checkpoint_is_superseded_by_a_successful_
     let (base, _bodies) = spawn_model_server(vec![turn1, turn2, turn_text("done")]);
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -1005,8 +1005,7 @@ fn serve_stdout_stays_valid_json_even_when_a_load_warning_fires() {
     let mut child = serve_cmd(bin, &base, &session_file.to_string_lossy())
         .env("RUST_LOG", "warn")
         .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
     let mut stderr = BufReader::new(child.stderr.take().unwrap());
@@ -1079,7 +1078,7 @@ fn new_session_reports_failure_and_leaves_the_old_session_active_when_persist_fa
 
     let (base, _bodies) = spawn_model_server(vec![turn_text("hello-reply")]);
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -1141,7 +1140,7 @@ fn serve_unknown_command_type_reports_a_clear_failure_frame() {
     let (base, _bodies) = spawn_model_server(vec![turn_text("hi")]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -1177,7 +1176,7 @@ fn serve_jsonl_framing_preserves_u2028_and_u2029_inside_a_payload() {
     let (base, _bodies) = spawn_model_server(vec![]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -1222,7 +1221,7 @@ fn serve_jsonl_framing_handles_crlf_delimited_commands() {
     let (base, _bodies) = spawn_model_server(vec![]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -1263,7 +1262,7 @@ fn serve_jsonl_framing_handles_a_final_command_with_no_trailing_newline() {
     let (base, _bodies) = spawn_model_server(vec![]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -1298,8 +1297,7 @@ fn serve_name_flag_sets_the_initial_session_title() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file)
         .args(["--name", "my-serve-session"])
-        .spawn()
-        .unwrap();
+        .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -1328,8 +1326,7 @@ fn serve_session_id_flag_applies_to_a_brand_new_session_file() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file)
         .args(["--session-id", "my-chosen-serve-id"])
-        .spawn()
-        .unwrap();
+        .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -1368,7 +1365,7 @@ fn serve_session_id_flag_applies_to_the_default_repo_mode_when_no_session_exists
     cmd.current_dir(project.path())
         .env("HOME", home.path())
         .args(["--session-id", "my-chosen-repo-id"]);
-    let mut child = cmd.spawn().unwrap();
+    let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -1400,7 +1397,7 @@ fn serve_session_id_flag_is_ignored_when_reattaching_to_an_existing_session() {
         let (base, _bodies) = spawn_model_server(vec![turn_text("first")]);
         let mut cmd = serve_dir_cmd(bin, &base, &session_dir);
         cmd.current_dir(project.path());
-        let mut child = cmd.spawn().unwrap();
+        let mut child = cmd.spawn_guarded();
         let mut stdin = child.stdin.take().unwrap();
         let mut stdout = BufReader::new(child.stdout.take().unwrap());
         writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
@@ -1421,7 +1418,7 @@ fn serve_session_id_flag_is_ignored_when_reattaching_to_an_existing_session() {
     let mut cmd = serve_dir_cmd(bin, &base, &session_dir);
     cmd.current_dir(project.path())
         .args(["--session-id", "should-be-ignored"]);
-    let mut child = cmd.spawn().unwrap();
+    let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -1494,7 +1491,7 @@ fn invalid_utf8_on_stdin_while_idle_ends_the_session_gracefully_instead_of_crash
     let (base, _bodies) = spawn_model_server(vec![]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     // A lone 0xFF byte is never valid UTF-8 in any position — `AsyncBufReadExt::lines()` surfaces
     // this as an `io::Error` (`InvalidData`) rather than a decoded `String`.

@@ -6,7 +6,9 @@ mod common;
 use std::io::Write;
 use std::process::Stdio;
 
-use common::{run_cmd, spawn_model_server, sse, turn_refusal, turn_text, turn_tool_use};
+use common::{
+    SpawnGuarded, run_cmd, spawn_model_server, sse, turn_refusal, turn_text, turn_tool_use,
+};
 use serde_json::{Value, json};
 
 /// Build an Anthropic SSE turn that calls one tool with its JSON arguments split across multiple
@@ -599,8 +601,7 @@ fn run_binary_reads_piped_stdin_into_the_first_message() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn binary");
+        .spawn_guarded();
     child
         .stdin
         .take()

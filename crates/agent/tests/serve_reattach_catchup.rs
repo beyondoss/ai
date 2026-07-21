@@ -18,18 +18,18 @@
 
 mod common;
 
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 
 use common::{
-    ISOLATED_HOME, free_port, spawn_model_server, turn_text, turn_tool_use, wait_for_port,
-    ws_connect, ws_next_frame, ws_read_until_response, ws_send,
+    ChildGuard, ISOLATED_HOME, SpawnGuarded, free_port, spawn_model_server, turn_text,
+    turn_tool_use, wait_for_port, ws_connect, ws_next_frame, ws_read_until_response, ws_send,
 };
 use serde_json::{Value, json};
 
 /// Marker text the model commits in turn 1 — the history a re-attaching client must get back.
 const COMMITTED: &str = "COMMITTED_BEFORE_DROP";
 
-fn serve_ws_child(base: &str, session_dir: &str, port: u16) -> Child {
+fn serve_ws_child(base: &str, session_dir: &str, port: u16) -> ChildGuard {
     Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
         .args([
             "serve",
@@ -48,8 +48,7 @@ fn serve_ws_child(base: &str, session_dir: &str, port: u16) -> Child {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn serve --listen")
+        .spawn_guarded()
 }
 
 /// Drive a session to the state both tests need: one **committed** turn in history (containing
@@ -62,7 +61,7 @@ async fn session_with_history_and_a_run_in_flight(
     dir: &str,
     port: u16,
     sid: &str,
-) -> (Child, String) {
+) -> (ChildGuard, String) {
     let (base, _requests) = spawn_model_server(vec![
         turn_text(COMMITTED),
         turn_tool_use("t1", "bash", &json!({ "command": "sleep 5" }).to_string()),

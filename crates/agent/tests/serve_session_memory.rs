@@ -9,9 +9,12 @@ mod common;
 
 use std::io::{BufReader, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin};
+use std::process::ChildStdin;
 
-use common::{read_until_response, serve_cmd, spawn_model_server, sse, turn_text, turn_tool_use};
+use common::{
+    ChildGuard, SpawnGuarded, read_until_response, serve_cmd, spawn_model_server, sse, turn_text,
+    turn_tool_use,
+};
 use serde_json::{Value, json};
 
 const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
@@ -38,7 +41,7 @@ fn send(stdin: &mut ChildStdin, cmd: Value) {
     stdin.flush().unwrap();
 }
 
-fn kill(mut child: Child) {
+fn kill(mut child: ChildGuard) {
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -80,8 +83,7 @@ fn a_fact_written_to_session_survives_compaction_and_is_recovered_after_the_remi
     let mut child = serve_cmd(BIN, &base, &session_str)
         // Force an aggressive cut so the short session actually compacts (mirrors serve_todo's test).
         .args(["--compaction-keep-recent-tokens", "1"])
-        .spawn()
-        .unwrap();
+        .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -172,8 +174,7 @@ fn no_session_memory_omits_the_session_root_but_keeps_durable() {
     let (base, bodies) = spawn_model_server(vec![turn_text("nothing to do")]);
     let mut child = serve_cmd(BIN, &base, &session_str)
         .args(["--no-session-memory"])
-        .spawn()
-        .unwrap();
+        .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
     send(&mut stdin, json!({ "type": "prompt", "message": "hello" }));
@@ -223,8 +224,7 @@ fn a_pressure_nudge_fires_before_compaction_within_the_same_prompt() {
             "--compaction-reserve-tokens",
             "2000",
         ])
-        .spawn()
-        .unwrap();
+        .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -290,8 +290,7 @@ fn below_the_pressure_point_and_under_no_session_memory_no_nudge_fires() {
         ]);
         let mut child = serve_cmd(BIN, &base, &session_str)
             .args(extra)
-            .spawn()
-            .unwrap();
+            .spawn_guarded();
         let mut stdin = child.stdin.take().unwrap();
         let mut stdout = BufReader::new(child.stdout.take().unwrap());
         send(&mut stdin, json!({ "type": "prompt", "message": "first" }));

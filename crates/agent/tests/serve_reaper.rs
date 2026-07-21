@@ -7,17 +7,17 @@
 
 mod common;
 
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use common::{
-    ISOLATED_HOME, free_port, spawn_model_server, turn_text, turn_tool_use, wait_for_port,
-    ws_connect, ws_next_frame, ws_read_until_response, ws_send,
+    ChildGuard, ISOLATED_HOME, SpawnGuarded, free_port, spawn_model_server, turn_text,
+    turn_tool_use, wait_for_port, ws_connect, ws_next_frame, ws_read_until_response, ws_send,
 };
 use serde_json::{Value, json};
 
 /// Spawn a `serve --listen` child with the idle reaper armed at `idle_secs` (`0` disables reaping).
-fn serve_reaper_child(base: &str, session_dir: &str, port: u16, idle_secs: u64) -> Child {
+fn serve_reaper_child(base: &str, session_dir: &str, port: u16, idle_secs: u64) -> ChildGuard {
     Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
         .args([
             "serve",
@@ -38,8 +38,7 @@ fn serve_reaper_child(base: &str, session_dir: &str, port: u16, idle_secs: u64) 
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn serve --listen --session-idle-timeout")
+        .spawn_guarded()
 }
 
 /// Send `list_daemon_sessions` on a fresh connection and return the `data.sessions` array.

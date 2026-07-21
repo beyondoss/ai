@@ -22,7 +22,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use common::{
-    read_until_response, run_cmd, serve_cmd, spawn_model_server, turn_text, turn_tool_use,
+    SpawnGuarded, read_until_response, run_cmd, serve_cmd, spawn_model_server, turn_text,
+    turn_tool_use,
 };
 use serde_json::{Value, json};
 
@@ -419,8 +420,7 @@ fn mcp_login_completes_the_real_oauth_flow_and_the_token_authenticates_a_real_to
         .env("HOME", home.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .spawn_guarded();
     let mut stderr = BufReader::new(login.stderr.take().unwrap());
     let auth_url = read_printed_url(&mut stderr);
 
@@ -540,8 +540,7 @@ fn mcp_logout_removes_a_stored_credential_and_is_idempotent() {
         .env("HOME", home.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .spawn_guarded();
     let mut stderr = BufReader::new(login.stderr.take().unwrap());
     let auth_url = read_printed_url(&mut stderr);
     get_following_redirects(&auth_url, 3);
@@ -616,8 +615,7 @@ fn mcp_get_access_token_transparently_refreshes_an_expired_token_on_the_next_con
         .env("HOME", home.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .spawn_guarded();
     let mut stderr = BufReader::new(login.stderr.take().unwrap());
     let auth_url = read_printed_url(&mut stderr);
     get_following_redirects(&auth_url, 3);
@@ -688,8 +686,7 @@ fn mcp_login_established_credential_is_honored_by_serve_too_not_just_run() {
         .env("HOME", home.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .spawn_guarded();
     let mut stderr = BufReader::new(login.stderr.take().unwrap());
     let auth_url = read_printed_url(&mut stderr);
     get_following_redirects(&auth_url, 3);
@@ -705,8 +702,7 @@ fn mcp_login_established_credential_is_honored_by_serve_too_not_just_run() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let mut child = serve_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"), &base, &session_file)
         .env("HOME", home.path())
-        .spawn()
-        .unwrap();
+        .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
     writeln!(

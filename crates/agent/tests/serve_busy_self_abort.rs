@@ -10,11 +10,12 @@
 mod common;
 
 use std::io::{BufReader, Write};
-use std::process::{Child, ChildStdin, ChildStdout};
+use std::process::{ChildStdin, ChildStdout};
 use std::time::Duration;
 
 use common::{
-    read_until_response, serve_dir_cmd, spawn_model_server_with_stalled_response, turn_text,
+    ChildGuard, SpawnGuarded, read_until_response, serve_dir_cmd,
+    spawn_model_server_with_stalled_response, turn_text,
 };
 use serde_json::{Value, json};
 
@@ -26,8 +27,8 @@ fn spawn_and_warm_up(
     bin: &str,
     base: &str,
     session_dir: &str,
-) -> (Child, ChildStdin, BufReader<ChildStdout>) {
-    let mut child = serve_dir_cmd(bin, base, session_dir).spawn().unwrap();
+) -> (ChildGuard, ChildStdin, BufReader<ChildStdout>) {
+    let mut child = serve_dir_cmd(bin, base, session_dir).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
     writeln!(
@@ -96,7 +97,7 @@ fn serve_busy_compact_self_aborts_and_proceeds_in_one_round_trip() {
     let base =
         spawn_model_server_with_stalled_response(Vec::new(), Duration::from_secs(5), Vec::new());
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_dir_cmd(bin, &base, &session_dir).spawn().unwrap();
+    let mut child = serve_dir_cmd(bin, &base, &session_dir).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 

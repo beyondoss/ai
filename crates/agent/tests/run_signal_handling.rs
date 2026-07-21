@@ -12,7 +12,7 @@ use std::io::Read;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use common::{run_cmd, spawn_model_server, turn_tool_use};
+use common::{SpawnGuarded, run_cmd, spawn_model_server, turn_tool_use};
 use serde_json::json;
 
 /// Spawns `run` against a mock model server whose one turn calls `bash` with `script`, sends
@@ -45,8 +45,7 @@ fn run_and_signal(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .spawn_guarded();
 
     // Give the bash tool time to actually start (model response received, tool dispatched, shell
     // spawned) before sending the signal — otherwise this would race the tool call's own startup.

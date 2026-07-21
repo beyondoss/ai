@@ -8,10 +8,11 @@
 mod common;
 
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin};
+use std::process::ChildStdin;
 
 use common::{
-    advertised_tools, read_until_response, serve_cmd, spawn_model_server, turn_text, turn_tool_use,
+    ChildGuard, SpawnGuarded, advertised_tools, read_until_response, serve_cmd, spawn_model_server,
+    turn_text, turn_tool_use,
 };
 use serde_json::{Value, json};
 
@@ -48,7 +49,7 @@ fn prompt(stdin: &mut ChildStdin, stdout: &mut impl BufRead, cmd: Value) -> Valu
         .clone()
 }
 
-fn kill(mut child: Child) {
+fn kill(mut child: ChildGuard) {
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -59,7 +60,7 @@ fn a_prompt_with_a_schema_returns_the_validated_payload_on_its_terminal_response
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, bodies) = spawn_model_server(vec![so_turn("tu_1", "approved")]);
 
-    let mut child = serve_cmd(BIN, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(BIN, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -89,7 +90,7 @@ fn a_prompt_without_a_schema_carries_neither_the_tool_nor_the_field() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, bodies) = spawn_model_server(vec![turn_text("a prose answer")]);
 
-    let mut child = serve_cmd(BIN, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(BIN, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -122,7 +123,7 @@ fn a_run_that_never_calls_the_tool_reports_a_null_payload_rather_than_omitting_t
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![turn_text("prose instead")]);
 
-    let mut child = serve_cmd(BIN, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(BIN, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -142,7 +143,7 @@ fn a_malformed_schema_is_rejected_before_the_prompt_is_ever_acknowledged() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, bodies) = spawn_model_server(vec![]);
 
-    let mut child = serve_cmd(BIN, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(BIN, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -191,7 +192,7 @@ fn a_schema_installed_by_one_prompt_does_not_leak_into_the_next() {
         turn_text("now just prose"),
     ]);
 
-    let mut child = serve_cmd(BIN, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(BIN, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -245,7 +246,7 @@ fn a_second_prompt_reusing_the_same_schema_still_reports_only_its_own_answer() {
         so_turn("tu_3", "third"),
     ]);
 
-    let mut child = serve_cmd(BIN, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(BIN, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -285,7 +286,7 @@ fn changing_the_schema_between_prompts_rebuilds_the_tool() {
         ),
     ]);
 
-    let mut child = serve_cmd(BIN, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(BIN, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -326,7 +327,7 @@ fn a_schema_violation_is_fed_back_over_the_wire_and_the_model_corrects_itself() 
         so_turn("tu_2", "corrected"),
     ]);
 
-    let mut child = serve_cmd(BIN, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(BIN, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 

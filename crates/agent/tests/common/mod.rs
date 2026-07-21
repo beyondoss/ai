@@ -26,6 +26,83 @@ pub const DEV_TOKEN: &str = "bai_v1.1.AQAAAAAAAAABAAAAAAAAAA.WrWcPbklu91PS-4WuR6
 /// this afterward via its own `.env("HOME", ...)`, which simply wins — `Command::env` is last-write.
 pub const ISOLATED_HOME: &str = "/nonexistent-beyond-ai-agent-test-home";
 
+/// A spawned child process that is killed and reaped when it goes out of scope — **including when the
+/// enclosing test panics**.
+///
+/// `std::process::Child` deliberately does *not* kill on drop, so the usual test shape
+///
+/// ```ignore
+/// let mut child = serve_cmd(..).spawn().unwrap();
+/// assert_eq!(thing, other);   // <-- panics here
+/// let _ = child.kill();       // <-- never runs
+/// ```
+///
+/// orphans a real `serve` daemon on every failing assertion. Those orphans are reparented to init and
+/// survive the whole `cargo test` run: they hold their listening port, their session directory (long
+/// after the `TempDir` is gone), and tens of MB of RSS each. `--session-idle-timeout 0` tests pin
+/// sessions for the daemon's lifetime by design, so those leaks never self-reap at all.
+///
+/// The compounding is what makes this worth a guard rather than more `kill()` calls: one genuine
+/// failure leaks a daemon, the leak starves the *next* concurrent test of ports/memory, and that one
+/// fails too — turning a single real bug into a cascade of unrelated red tests, which is exactly the
+/// shape that makes a flaky suite impossible to read. Killing on drop makes a failure cost exactly one
+/// test.
+///
+/// Derefs to [`Child`], so `child.stdin.take()`, `child.kill()`, and `child.wait()` all keep working
+/// unchanged; an explicit `wait()` before the drop is fine (the drop's `kill` on an already-reaped pid
+/// fails harmlessly and is ignored).
+pub struct ChildGuard(Option<std::process::Child>);
+
+impl ChildGuard {
+    /// Spawn `cmd` under the guard. Panics with the command's name on failure, matching the
+    /// `.spawn().unwrap()` this replaces.
+    pub fn spawn(cmd: &mut Command) -> Self {
+        Self(Some(cmd.spawn().unwrap_or_else(|e| {
+            panic!("failed to spawn {:?}: {e}", cmd.get_program())
+        })))
+    }
+
+    /// [`Child::wait_with_output`], which consumes the child and so can't come through `Deref`. Taking
+    /// the child out disarms the guard — safe precisely because this call reaps the process itself.
+    pub fn wait_with_output(mut self) -> std::io::Result<std::process::Output> {
+        self.0.take().expect("child taken").wait_with_output()
+    }
+}
+
+impl std::ops::Deref for ChildGuard {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("child taken")
+    }
+}
+
+impl std::ops::DerefMut for ChildGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut().expect("child taken")
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// `cmd.spawn_guarded()` — [`ChildGuard::spawn`] as a method, so an existing
+/// `Command`-building chain only has to swap its trailing `.spawn().unwrap()`.
+pub trait SpawnGuarded {
+    fn spawn_guarded(&mut self) -> ChildGuard;
+}
+
+impl SpawnGuarded for Command {
+    fn spawn_guarded(&mut self) -> ChildGuard {
+        ChildGuard::spawn(self)
+    }
+}
+
 /// Locate the gateway binary (built beside the agent binary); build it on demand if absent.
 pub fn gateway_bin() -> PathBuf {
     let agent = PathBuf::from(env!("CARGO_BIN_EXE_beyond-ai-agent"));
